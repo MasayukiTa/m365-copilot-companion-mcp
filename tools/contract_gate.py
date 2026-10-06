@@ -59,15 +59,37 @@ _REPO = _THIS.parent.parent              # repo root
 _FLEET_DIR = _REPO / ".fleet"
 _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 
-# ── Gate directory (mirrors gate_ops.py / GATE_DIR) ──
-# Imported lazily inside functions to avoid circular imports at module load.
+# ── Gate directory ──
+# RESOLVED THROUGH gate_ops, NOT MIRRORED. This comment used to say the directory "mirrors
+# gate_ops.py / GATE_DIR", and the two copies below built `ALLOWED_BASE / ".companion_gates"`
+# by hand -- so `MCP_GATE_DIR`, which gate_ops honours, isolated gate_ops' writes and not
+# these. Measured 2026-09-12: an isolated run set the variable, and its approval gate still
+# landed in the operator's live directory (1433 -> 1434) while the sandbox stayed empty.
+# Partial isolation is worse than none: the variable existing tells a caller the writes are
+# contained, and half of them are.
+# Imported lazily inside the functions to avoid circular imports at module load.
+
+
+def _gate_dir():
+    """Where gate files live, as gate_ops decides it.
+
+    Falls back to the old hand-built path if gate_ops cannot be imported: a gate written in
+    the default place is recoverable, and a gate that cannot be written at all silently turns
+    an approval into an allow.
+    """
+    try:
+        from tools.gate_ops import GATE_DIR
+        return GATE_DIR
+    except Exception:
+        from tools.file_ops import ALLOWED_BASE
+        return ALLOWED_BASE / ".companion_gates"
 
 
 # ---------------------------------------------------------------------------
 # Contract loading
 # ---------------------------------------------------------------------------
 
-# HAS THIS PROCESS EVER SEEN AN ACTIVE CONTRACT, AND WAS IT RETIRED PROPERLY.
+# HAS ANY PROCESS EVER SEEN AN ACTIVE CONTRACT, AND WAS THAT ONE RETIRED PROPERLY.
 #
 # The policy file lives under .fleet, which every worker can write, and `load_contract`
 # answered "missing" and "corrupt" with the same value the caller uses for "no contract is
@@ -75,11 +97,84 @@ _CONTRACT_FILE = _FLEET_DIR / "active_contract.json"
 # same fail-open shape this repository has already been bitten by once, and it is recorded
 # as a rule: unknown must fall to the dangerous side.
 #
-# A worker can write files. It cannot write this process's memory. So the server remembers
-# that it saw a contract, and a contract that then VANISHES is treated as tampering rather
-# than as an absence -- unless it was retired through deactivate_contract(), which is the
-# legitimate way for it to go away.
-_SEEN = {"active_contract": False, "retired_via_api": False}
+# A worker can write files. So the server remembers that it saw a contract, and a contract
+# that then VANISHES is treated as tampering rather than as an absence -- unless it was
+# retired through deactivate_contract(), which is the legitimate way for it to go away.
+#
+# WHY THIS MEMORY IS A FILE, NOT A MODULE GLOBAL. It used to be a dict in this module. The
+# only place that records a legitimate retirement -- deactivate_contract() at the end of a
+# run -- executes in the fleet-runner PROCESS, while the gate that must honour it runs in
+# the MCP SERVER process. A module global cannot cross that boundary: the runner set its
+# flag and the server never saw it, so the server suspected forever and every gated op
+# queued a human approval. The same split appeared in tests -- one test setting the flag
+# left it set for the next, which then refused real git operations. Both are the same root:
+# per-process memory for a fact two processes share. The record now lives on disk beside the
+# contract, where any process reading .fleet sees the same answer.
+#
+# Two sidecar files, both under _FLEET_DIR next to active_contract.json:
+#   _SEEN_FILE     -- the identity of the last active contract observed (its `started`
+#                     stamp, or a hash of the contract when `started` is absent).
+#   _RETIRED_FILE  -- the identity of the contract that deactivate_contract() last retired.
+# A vanished contract is legitimate ONLY when a retirement record exists whose identity
+# matches the last-seen contract. A different contract's retirement does not excuse it, so
+# deleting a NEW active contract is still flagged -- the fail-closed default is preserved.
+
+
+def _seen_file() -> Path:
+    return _CONTRACT_FILE.parent / "contract_seen.json"
+
+
+def _retired_file() -> Path:
+    return _CONTRACT_FILE.parent / "contract_retired.json"
+
+
+def _contract_identity(data: dict) -> str:
+    """A stable id for one contract, independent of its mutable `active` flag.
+
+    `started` is the epoch a contract was activated and does not change while it is in
+    force, so it names THIS contract and not the next one. When it is absent, fall back to a
+    hash of the contract with `active` removed, so toggling active=false at retirement does
+    not change the identity. Never derive identity from `active` itself.
+    """
+    started = data.get("started")
+    if started is not None:
+        return "started:%r" % (started,)
+    ident = {k: v for k, v in data.items() if k != "active"}
+    blob = json.dumps(ident, sort_keys=True, ensure_ascii=False)
+    return "hash:" + hashlib.sha256(blob.encode("utf-8")).hexdigest()[:32]
+
+
+def _atomic_write_json(path: Path, obj: dict) -> None:
+    tmp = str(path) + ".tmp"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Path(tmp).write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, str(path))
+
+
+def _read_json_file(path: Path) -> Optional[dict]:
+    try:
+        if not path.is_file():
+            return None
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
+
+
+def _record_seen(identity: str) -> None:
+    """Persist that an active contract with this identity was observed.
+
+    Best-effort: a filesystem that will not accept the write leaves the sidecar absent,
+    which reads back as "never saw an active contract" -- the safe direction, because a
+    later absence is then treated as an ordinary no-contract case rather than excused.
+    """
+    try:
+        current = _read_json_file(_seen_file())
+        if current and current.get("identity") == identity:
+            return
+        _atomic_write_json(_seen_file(), {"identity": identity, "at": time.time()})
+    except Exception:
+        pass
 
 
 def contract_state() -> tuple:
@@ -102,7 +197,7 @@ def contract_state() -> tuple:
     if not isinstance(data, dict):
         return ("unreadable", None)
     if data.get("active"):
-        _SEEN["active_contract"] = True
+        _record_seen(_contract_identity(data))
         return ("active", data)
     return ("inactive", data)
 
@@ -110,13 +205,26 @@ def contract_state() -> tuple:
 def policy_state_is_suspect() -> Optional[str]:
     """Reason the policy state cannot be trusted right now, or None.
 
-    Two cases, and only two: the file is present and unreadable, or it is gone after this
-    process had seen an active one and nothing retired it.
+    Two cases, and only two: the file is present and unreadable, or it is gone after some
+    process had seen an active one and no matching retirement was recorded.
+
+    All three inputs are on disk, so this answer is the same in the MCP server process and
+    the fleet-runner process. FAIL CLOSED is preserved: an absence is excused ONLY when a
+    retirement record exists AND names the same contract that was last seen active. If the
+    seen record is missing (write failed, or genuinely never active) an absence is the
+    ordinary no-contract case; if it is present but no matching retirement exists, the
+    absence is tampering and gating stands.
     """
     state, _ = contract_state()
     if state == "unreadable":
         return "the contract file exists and could not be read as a policy object"
-    if state == "absent" and _SEEN["active_contract"] and not _SEEN["retired_via_api"]:
+    if state == "absent":
+        seen = _read_json_file(_seen_file())
+        if not seen or not seen.get("identity"):
+            return None
+        retired = _read_json_file(_retired_file())
+        if retired and retired.get("identity") == seen.get("identity"):
+            return None
         return "an active contract was in force and its file has since disappeared"
     return None
 
@@ -132,22 +240,111 @@ def load_contract() -> Optional[dict]:
     return data
 
 
+#: The only op_class values check_op() recognises (see its own docstring / the module
+#: header). Not otherwise enforced anywhere in this file until activate_contract() below --
+#: a contract naming "delet" instead of "delete" would previously write successfully and
+#: gate nothing, silently, forever. Kept as a tuple rather than duplicated as a set literal
+#: in two places.
+KNOWN_OP_CLASSES = ("delete", "outbound", "shell_destructive")
+
+
+def activate_contract(scope: str = "", ask_before=(), stop_when=(), budget_turns=None) -> dict:
+    """Write .fleet/active_contract.json with active=true. The missing half of
+    deactivate_contract() (codex-plan item 3, 2026-09-09): nothing in this codebase could
+    turn a contract ON before this, only off.
+
+    REFUSES rather than clobbers when a contract is ALREADY active -- two activations in a
+    row would mean the second one's `started` (its identity) silently replaces the first's,
+    and whoever is relying on the first contract's identity for their own retirement record
+    would then retire a contract that is no longer the one enforcing anything. Call
+    deactivate_contract() first if replacing an active contract is genuinely intended.
+
+    Validates ask_before/stop_when against KNOWN_OP_CLASSES for the same reason check_op's
+    own docstring enumerates them: an op_class this file does not recognise gates nothing,
+    silently, and a contract that silently gates nothing is worse than no contract -- it
+    reads as protection that was never there.
+
+    `scope` is accepted and stored for the operator's own reference (it appears in the
+    written file) but is NOT enforced anywhere in this module -- see the module docstring's
+    own "// informational folder scope". Once active, ask_before/stop_when apply to every
+    call to a gated tool on this machine, regardless of what path it touches. Callers who
+    need a narrow blast radius get it by choosing a narrow op_class list, not a narrow scope.
+
+    `budget_turns` IS enforced, and not by this module. relay/relay_fleet.py reads it once at
+    fleet launch and tightens every worker's cap to min(max_turns, budget_turns), with its own
+    stop reason for the case. That branch existed before this parameter did: `budget_turns`
+    appeared nowhere in this file, so the only function able to write a contract could never set
+    it, and the launcher's tightening was unreachable however carefully it had been written.
+    None leaves it out of the file entirely, which is what keeps `effective_max_turns ==
+    max_turns` the untouched default rather than a value this function chose.
+
+    Returns {"ok": True, "contract": <dict written>} or {"ok": False, "detail": <why>}.
+    """
+    state, _ = contract_state()
+    if state == "active":
+        return {"ok": False, "detail": "a contract is already active; "
+                                       "call deactivate_contract() first"}
+    bad = [c for c in list(ask_before) + list(stop_when) if c not in KNOWN_OP_CLASSES]
+    if bad:
+        return {"ok": False, "detail": "unknown op_class %r; known: %r" % (bad, KNOWN_OP_CLASSES)}
+    # VALIDATED HERE, BECAUSE THE READER CANNOT COMPLAIN. relay_fleet's check is
+    # `isinstance(..., int) and > 0`; anything else is silently ignored there, so a contract
+    # written with budget_turns="3" or 0 would read as a budget that was set and enforce
+    # nothing -- the same silent-no-op the op_class validation above exists to prevent.
+    # A bool is refused for the reason it is refused elsewhere in this repo: isinstance(True,
+    # int) is True, and a budget of "one turn" is not what anyone meant by passing True.
+    if budget_turns is not None:
+        if isinstance(budget_turns, bool) or not isinstance(budget_turns, int):
+            return {"ok": False,
+                    "detail": "budget_turns must be a positive int or None, not %r"
+                              % (budget_turns,)}
+        if budget_turns <= 0:
+            return {"ok": False,
+                    "detail": "budget_turns must be > 0; the launcher ignores anything else, so "
+                              "writing %r would look like a budget and enforce nothing"
+                              % (budget_turns,)}
+    data = {
+        "active": True,
+        "scope": str(scope or ""),
+        "ask_before": list(ask_before),
+        "stop_when": list(stop_when),
+        "started": time.time(),
+    }
+    if budget_turns is not None:
+        data["budget_turns"] = int(budget_turns)
+    try:
+        _atomic_write_json(_CONTRACT_FILE, data)
+    except Exception as e:
+        return {"ok": False, "detail": "write failed: %s" % e}
+    return {"ok": True, "contract": data}
+
+
 def deactivate_contract() -> None:
     """Set active=false in the contract file (called by fleet_runner on exit).
 
-    Also records that the contract went away legitimately, so its later absence is not read
-    as tampering."""
-    _SEEN["retired_via_api"] = True
+    Also records, ON DISK, that the contract went away legitimately, so its later absence is
+    not read as tampering by ANY process. The record names the specific contract retired
+    (its identity), so it excuses only that contract's disappearance and not a different one
+    that a later worker might delete. Written before the file is flipped/removed so the
+    record is never missing for a contract already gone."""
     try:
-        if not _CONTRACT_FILE.is_file():
-            return
-        data = json.loads(_CONTRACT_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return
-        data["active"] = False
-        tmp = str(_CONTRACT_FILE) + ".tmp"
-        Path(tmp).write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
-        os.replace(tmp, str(_CONTRACT_FILE))
+        data = None
+        if _CONTRACT_FILE.is_file():
+            loaded = json.loads(_CONTRACT_FILE.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+        if data is None:
+            # Nothing to identify; fall back to whatever we last saw active, so a retirement
+            # issued after the file is already gone still excuses that same contract.
+            seen = _read_json_file(_seen_file())
+            identity = seen.get("identity") if seen else None
+        else:
+            identity = _contract_identity(data)
+        if identity:
+            _atomic_write_json(_retired_file(), {"identity": identity, "at": time.time()})
+        if data is not None:
+            data["active"] = False
+            _atomic_write_json(_CONTRACT_FILE, data)
     except Exception:
         pass
 
@@ -485,9 +682,7 @@ def _stable_token(op_class: str, detail: str) -> str:
 def _find_existing_gate(token: str) -> Optional[dict]:
     """Return the gate file data for `token` if it exists, else None."""
     try:
-        from tools.file_ops import ALLOWED_BASE
-        gate_dir = ALLOWED_BASE / ".companion_gates"
-        gate_file = gate_dir / f"{token}.json"
+        gate_file = _gate_dir() / f"{token}.json"
         if not gate_file.is_file():
             return None
         return json.loads(gate_file.read_text(encoding="utf-8"))
@@ -498,9 +693,8 @@ def _find_existing_gate(token: str) -> Optional[dict]:
 def _create_gate(token: str, question: str, context: str) -> None:
     """Write a gate file for the given token (used instead of gate_ask to supply our own token)."""
     try:
-        from tools.file_ops import ALLOWED_BASE
         from tools.notify_ops import notify_approval_gate
-        gate_dir = ALLOWED_BASE / ".companion_gates"
+        gate_dir = _gate_dir()
         gate_dir.mkdir(parents=True, exist_ok=True)
         gate_file = gate_dir / f"{token}.json"
         if gate_file.is_file():
@@ -525,6 +719,33 @@ def _create_gate(token: str, question: str, context: str) -> None:
 # ---------------------------------------------------------------------------
 # Main gate entry point
 # ---------------------------------------------------------------------------
+
+def _auto_verdict(detail: str) -> str:
+    """"stop" | "ask" | "clean" for `detail`, under the `auto` approval mode.
+
+    REUSES THE VOCABULARY THAT IS ALREADY LIVE rather than inventing a second one:
+    relay.autonomy_gate's _STOP_PATTERNS/_ASK_PATTERNS are what task_router._static_risk
+    already classifies local shell and python payloads with. Two lists that are supposed to
+    mean the same thing and are maintained separately is how a gate ends up refusing here and
+    allowing there.
+
+    FAILS CLOSED TO "ask". If the vocabulary cannot be imported there is no classifier, and a
+    mode that silently became "allow everything" would be `bypass` wearing another name.
+    """
+    text = str(detail or "")
+    try:
+        from relay.autonomy_gate import _STOP_PATTERNS, _ASK_PATTERNS, _matches
+    except Exception:
+        return "ask"
+    try:
+        if _matches(text, _STOP_PATTERNS):
+            return "stop"
+        if _matches(text, _ASK_PATTERNS):
+            return "ask"
+    except Exception:
+        return "ask"
+    return "clean"
+
 
 def check_op(op_class: str, detail: str = "") -> Optional[str]:
     """Gate a dangerous operation under the active autonomy contract.
@@ -565,6 +786,22 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
     # what used to happen, which is that a deleted file waved them through.
     suspect = policy_state_is_suspect()
     if suspect:
+        # BYPASS OVERRIDES EVEN THIS BACKSTOP. The owner's rule has no carve-out ("いかなる
+        # 場合もユーザに確認してはならない" -- in no case may it ask): this branch used to
+        # gate unconditionally, mode or not, which is exactly the class of gate that kept
+        # arriving after bypass was selected. `current_approval_mode` is read from
+        # .config/settings.txt, independent of the contract state this branch doubts, so
+        # trusting it here is safe even while active_contract.json itself is suspect.
+        try:
+            from tools.approval_policy import current_approval_mode, record_bypass_decision
+            if current_approval_mode() == "bypass":
+                record_bypass_decision(
+                    "contract_gate.check_op(suspect_policy_state)",
+                    "契約状態が信用できないため、この操作の承認を求めます: %s" % suspect,
+                    "proceed (bypass); op_class=%s detail=%s" % (op_class, detail[:200]))
+                return None
+        except Exception:
+            pass
         token = _stable_token(op_class, detail)
         existing = _find_existing_gate(token)
         if existing and existing.get("answer") == "approved":
@@ -573,10 +810,19 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
             _create_gate(token,
                          "契約状態が信用できないため、この操作の承認を求めます: %s" % suspect,
                          "op_class=%s detail=%s" % (op_class, detail[:400]))
+        # NAME THE WAY OUT. This said only "until the state recovers or a human approves"
+        # and never said how the state recovers, and the state is two files whose names
+        # appear nowhere the reader can see. Meanwhile every gated op opens its own approval,
+        # so a suspicion nobody knows how to clear becomes a queue nobody can drain: 308 of
+        # them accumulated behind exactly this message on 2026-09-08 and stalled the fleet
+        # for close to three hours.
         return ("[契約状態が不正 / policy state untrusted] %s。"
                 "危険と判定された操作は、状態が回復するか人が承認するまで実行されません。"
+                "状態を戻すには、契約ファイル %s を復元するか、正規に終了させて（deactivate_contract）"
+                "%s に終了記録を残してください。契約が二度と使われないなら %s を削除すれば"
+                "「有効な契約を見たことがある」という記録自体が消えます。"
                 " / The policy state could not be trusted, so this operation was NOT executed."
-                % suspect)
+                % (suspect, _CONTRACT_FILE, _retired_file(), _seen_file()))
 
     # ── INERT guard: no contract or not active ──────────────────────────────
     contract = load_contract()
@@ -616,17 +862,64 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
                        "走り続けます。 / WARNING: the fleet-wide kill-switch is NOT engaged%s"
                        " -- other workers keep running." % (detail_msg, detail_msg))
 
-    # ── ask_before: HITL approval gate ─────────────────────────────────────
+    # ── ask_before: decided by the operator's approval mode ────────────────
     if op_class in ask_before:
-        # Bypass suppresses only human confirmation. The stop_when branch above
-        # remains an always-on hard stop, and external Skill trust uses its own
-        # exact-digest approval path.
+        # THREE MODES, NOT TWO. `auto` has been a valid, selectable setting since
+        # approval_policy was written and this function read only `bypass`, so an operator who
+        # chose it got the manual gate regardless -- a capability with no caller, inside the
+        # safety machinery, where nothing looks wrong because the gate still appears.
+        #
+        # The semantics are task_router.job_gate's, deliberately, so one word means one thing
+        # on both paths:
+        #
+        #   bypass   proceed; ask nobody -- the mode for discarding the list entirely
+        #   auto     ESCALATE ONLY: a STOP-pattern detail is refused outright instead of being
+        #            put to a human who could approve it; everything else on the list still
+        #            asks
+        #   default  every occurrence asks a human
+        #
+        # `auto` DOES NOT DROP THE ask_before LIST, and the first version of it did. CI caught
+        # that: `activate_contract(ask_before=["delete"])` then `check_op("delete", "demo
+        # scratch file")` returned None, because the classifier read the detail text, found it
+        # innocuous, and allowed an operation the operator had explicitly asked to be shown.
+        #
+        # Approval fatigue -- the reason this mode exists -- lives in task_router's `default`,
+        # where EVERY first-seen job class asks, forever, with no list and no end. A contract's
+        # ask_before fires only while a contract is active and only for the handful of classes
+        # a person wrote down; it is short and deliberate. Fixing the first by discarding the
+        # second leaves no mode meaning "decide the routine things for me but keep the promises
+        # I made explicitly" -- and `bypass` already exists for those who want the list gone.
+        #
+        # So here `auto` is strictly at least as strict as `default`: it can refuse where
+        # `default` would have asked, and it never allows where `default` would have asked.
+        #
+        # NEITHER MODE TOUCHES THE STOP_WHEN BRANCH ABOVE, which is an always-on hard stop
+        # that engages the fleet kill-switch, and external Skill trust keeps its own
+        # exact-digest path.
+        mode = "default"
         try:
             from tools.approval_policy import current_approval_mode
-            if current_approval_mode() == "bypass":
-                return None
+            mode = current_approval_mode()
         except Exception:
-            pass
+            mode = "default"
+        if mode == "bypass":
+            try:
+                from tools.approval_policy import record_bypass_decision
+                record_bypass_decision(
+                    "contract_gate.check_op(ask_before)",
+                    f"Approve {op_class}: {detail}?" if detail else f"Approve {op_class}?",
+                    "proceed (bypass); op_class=%s" % op_class)
+            except Exception:
+                pass
+            return None
+        if mode == "auto" and _auto_verdict(detail) == "stop":
+            return (
+                f"[自動判定で拒否 / Refused by the automatic classifier] op_class={op_class!r} "
+                f"の内容が禁止パターンに一致したため実行しません。承認モードを『毎回確認』に"
+                f"変更すれば人間が判断できます。"
+                f" / op_class={op_class!r} matched a prohibited pattern and was not executed. "
+                f"Switch the approval mode to manual confirmation to have a human decide."
+            )
         token = _stable_token(op_class, detail)
         existing = _find_existing_gate(token)
 
@@ -658,3 +951,79 @@ def check_op(op_class: str, detail: str = "") -> Optional[str]:
 
     # Not listed in either list — not gated
     return None
+
+
+# ── operator surface ──────────────────────────────────────────────────────────────────────
+#
+# WHY A CLI AND NOT AN AUTOMATIC CALL. activate_contract() existed with no caller, so the gate
+# could be turned off and never on: `.fleet/active_contract.json` had to be written by hand for
+# any of this file to do anything. The consuming side is fully wired -- run_relay_fleet reads
+# the contract and caps every worker's turns by budget_turns -- so the only missing piece was a
+# way to start it.
+#
+# Choosing WHEN to activate, and WHAT to gate, is not this file's to decide. `ask_before` and
+# `stop_when` change what the fleet will refuse to do; picking them automatically would be a
+# policy nobody chose, presented as one they did. The operator picks; this only makes picking
+# possible.
+
+
+def main(argv=None):
+    """Show, activate or retire the autonomy contract. Returns a process exit code."""
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python -m tools.contract_gate",
+        description="Inspect or set the autonomy contract the fleet enforces.")
+    sub = ap.add_subparsers(dest="cmd")
+
+    sub.add_parser("show", help="print the current state and exit")
+
+    on = sub.add_parser("activate", help="write an ACTIVE contract")
+    on.add_argument("--scope", default="",
+                    help="informational folder scope (recorded, not enforced)")
+    on.add_argument("--ask-before", default="",
+                    help="comma-separated op classes to gate for approval: %s"
+                         % ",".join(KNOWN_OP_CLASSES))
+    on.add_argument("--stop-when", default="",
+                    help="comma-separated op classes that hard-stop the run")
+    on.add_argument("--budget-turns", type=int, default=None,
+                    help="cap every worker's turns at this number")
+
+    sub.add_parser("deactivate", help="retire the active contract")
+
+    a = ap.parse_args(argv)
+    if not a.cmd or a.cmd == "show":
+        state, data = contract_state()
+        print("contract: %s" % state)
+        if data:
+            for k in ("scope", "ask_before", "stop_when", "budget_turns", "started"):
+                if k in data:
+                    print("  %-13s %s" % (k, data[k]))
+        if state == "absent":
+            print("  (nothing is gated; activate one to turn the gate on)")
+        return 0
+
+    if a.cmd == "deactivate":
+        deactivate_contract()
+        print("contract: retired")
+        return 0
+
+    def _classes(raw):
+        return tuple(x.strip() for x in (raw or "").split(",") if x.strip())
+
+    res = activate_contract(scope=a.scope, ask_before=_classes(a.ask_before),
+                            stop_when=_classes(a.stop_when), budget_turns=a.budget_turns)
+    # activate_contract REFUSES rather than clobbering an already-active contract, and says why
+    # in the returned dict. Printing its own words beats inventing a message here.
+    if not res.get("ok", True) or res.get("error") or res.get("reason"):
+        print("refused: %s" % (res.get("error") or res.get("reason") or res))
+        return 2
+    print("contract: active")
+    for k in ("scope", "ask_before", "stop_when", "budget_turns"):
+        if res.get(k) not in (None, "", (), []):
+            print("  %-13s %s" % (k, res[k]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

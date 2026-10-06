@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parent.parent
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
 WORKFLOW = ROOT / ".github" / "workflows" / "ci.yml"
 TEST_ROOTS = ("bench", "bridge", "relay", "scripts", "tests", "tools", "ui")
 
@@ -31,7 +34,13 @@ EXCLUDED = {
     # that reads a gitignored .fleet artifact absent from a fresh checkout. Those four should
     # be fixed and moved back, not left here; they are parked, not resolved.
     "bench/test_pro_batching.py":
-        "reads this machine's real free disk and RAM to size batches; asserts concrete concurrencies (>=3) that a CI runner does not have",
+        "MEASURED ON THE RUNNER 2026-09-20, after this exclusion was doubted and tested rather "
+        "than argued: FLEET_FLOOR_GIB comes from settings_disk_floor() and reads >5.6 GiB "
+        "there (not the 3.0 fallback that was assumed), so concurrency_for collapses to 1 and "
+        "four tests fail -- js at 8.0 GiB free wants >=3 and gets 1, python<js becomes 1<1, "
+        "and batch width stays [1,1,1,1,1]. One more reads .fleet/swe/pro_slice50_full.json, "
+        "which is gitignored and absent in a fresh checkout. Registering it in ci.yml turned "
+        "main red; the exclusion is live, not stale",
     "bench/test_swe_run_facts.py":
         "Windows path semantics (separator and case-insensitive joins); run by windows-install-smoke",
     "relay/test_acceptance_contract.py":
@@ -43,29 +52,45 @@ EXCLUDED = {
     "tools/test_instructions_do_not_accumulate_cases.py":
         "asserts that skills/ is non-empty, but skills/ is gitignored on purpose "
         "(data, never code), so a fresh checkout has none by design",
-    "tests/test_integration_evidence.py":
-        "same source-walk, same separator assumption",
-    "tests/test_outcome_enum_closed.py":
-        "walks the source tree for assignments and misses them under Linux path separators, reporting DONE as never produced. A test-side portability bug, not a code defect",
+    # tests/test_integration_evidence.py AND tests/test_outcome_enum_closed.py WERE HERE
+    # AND ARE GONE, 2026-09-22. Their reasons said the source walk missed assignments
+    # under Linux path separators. On 2026-09-19 a careful read of both said the same
+    # thing -- one of them handles both separators explicitly -- and that read was NOT
+    # acted on, because "no portability problem is visible in the source" is not "it runs
+    # on Linux", and the pro_batching exclusion had just proved the difference by turning
+    # main red.
+    #
+    # The reporting step added to the ubuntu job runs every excluded file there and
+    # prints the outcome. First run: 13 passed and 21 passed. So the reasons had expired,
+    # and these two are registered on evidence instead of on an argument. The read was
+    # also WRONG IN DEGREE -- it suspected three stale exclusions and two were.
     "tools/test_judge_live_roundtrip.py":
         "live round trip against a running judge; no service in CI",
 }
 
 
-def _git(*args) -> set[str] | None:
-    import subprocess
+class GitUnavailable(RuntimeError):
+    """git could not be run, or ran and failed. The audit cannot vouch for anything without
+    it -- see the module docstring: a filter that silently stops filtering is the same silent
+    pass this whole check exists to prevent."""
+
+
+def _git(*args) -> set[str]:
+    from tools.childproc import run as _run_child
     try:
-        out = subprocess.run(["git", *args], cwd=ROOT, capture_output=True,
-                             text=True, timeout=30)
-    except Exception:
-        return None
+        out = _run_child(["git", *args], cwd=ROOT, timeout=30)
+    except Exception as exc:
+        raise GitUnavailable(str(exc)) from exc
     if out.returncode != 0:
-        return None
+        why = (out.stderr or out.stdout or "").strip()[:300] or (
+            "git exited %d" % out.returncode)
+        raise GitUnavailable(why)
     return {line.strip() for line in out.stdout.splitlines() if line.strip()}
 
 
-def _tracked() -> set[str] | None:
-    """CI のチェックアウトに存在することになるファイル。取れなければ None（判定を諦める）。
+def _tracked() -> set[str]:
+    """CI のチェックアウトに存在することになるファイル。取れなければ GitUnavailable（判定を
+    諦めるのではなく、audit 自体を失敗させる -- 詳細は GitUnavailable のドキュメント参照）。
 
     追跡していないテストは CI のチェックアウトに存在しないので、一覧に載せようが
     ないし、載せれば CI が「そんなファイルは無い」で落ちる。手元にだけ置いてある
@@ -89,7 +114,7 @@ def discover_tests() -> set[str]:
         for glob in _TEST_GLOBS:
             for path in base.rglob(glob):
                 rel = path.relative_to(ROOT).as_posix()
-                if tracked is not None and rel not in tracked:
+                if rel not in tracked:
                     continue
                 found.add(rel)
     return found
@@ -189,8 +214,29 @@ def script_style_suites() -> set[str]:
         return set()
 
 
-def main() -> int:
-    discovered = discover_tests()
+def main(argv=None) -> int:
+    # `--strict-untracked` PROMOTES THE NOTE BELOW TO AN ERROR, and exists because the note was
+    # not enough. This module's own docstring already said the failure mode is procedural --
+    # 「実際に CI で落ちた原因はチェックの欠陥ではなく、add する前にチェックを走らせた手順の
+    # ほうにある」 -- and on 2026-09-14 it happened again exactly as written: preflight printed
+    # the note, exited 0, the file was committed, and CI went red on the next push.
+    #
+    # A note that is printed and ignored is a note that does not work. The gate keeps its
+    # lenient default, because run by hand while a test is being written it is right to be
+    # lenient -- but preflight, whose whole contract is "everything CI runs, run here", passes
+    # this flag. In CI the flag changes nothing: a checkout has no untracked test files.
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Audit the CI test manifest.")
+    ap.add_argument("--strict-untracked", action="store_true",
+                    help="fail when an untracked test file exists (pre-push use)")
+    args = ap.parse_args(argv)
+
+    try:
+        discovered = discover_tests()
+    except GitUnavailable as exc:
+        print("could not run git: %s; the audit did not run" % exc)
+        return 2
     listed = listed_tests()
     excluded = set(EXCLUDED)
     # Covered by the script-style runner rather than by pytest. Read from that module, not
@@ -253,11 +299,25 @@ def main() -> int:
     # so demanding they be listed would make CI fail on a file it cannot run. But saying
     # nothing about them lets a test be written, never committed, and never noticed. Named,
     # not enforced; the enforcement happens the moment they are added.
-    others = _git("ls-files", "--others", "--exclude-standard") or set()
+    try:
+        others = _git("ls-files", "--others", "--exclude-standard")
+    except GitUnavailable:
+        # Advisory-only section (see the comment above): git already proved usable in
+        # discover_tests() above, so a failure here is not "git is unavailable" -- it is not
+        # worth failing the whole audit over a NOTE-level, best-effort listing.
+        others = set()
     pending = sorted(p for p in others
                      if re.fullmatch(r"(?:%s)/(?:[^/]+/)*%s"
                                      % ("|".join(TEST_ROOTS), _TEST_FILE_RE), p))
     if pending:
+        if args.strict_untracked:
+            print("ERROR: untracked test file(s). Under --strict-untracked these are a "
+                  "failure, because a push turns them into a CI failure and this audit "
+                  "cannot see them until they are staged. `git add` them and list them in "
+                  "ci.yml, or add them to EXCLUDED with a reason:")
+            for path in pending:
+                print("  -", path)
+            return 1
         print("NOTE: not tracked yet, so not required yet -- but required the moment you "
               "`git add` them:")
         for path in pending:

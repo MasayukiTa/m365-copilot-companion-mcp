@@ -46,6 +46,95 @@ using System.Windows.Media;
 using System.Windows.Threading;
 using System.Web.Script.Serialization;
 
+// ── Startup / auto-repair gating, extracted here (not FleetCockpit.cs) for the same reason
+// FrozenGate lived here 2026-09-19 to 2026-09-24: this file has no Main, so a test harness can
+// compile it standalone (+ Theme.cs, +WPF refs) without colliding with CockpitProgram's Main in
+// FleetCockpit.cs. Both classes are used by FleetCockpit.cs's health-poll / auto-repair code;
+// neither does file or process I/O itself.
+//
+// THE INCIDENT THIS EXISTS TO FIX (2026-09-24, ~07:35-07:53): the startup banner kept
+// reappearing and startups queued behind each other for ~20 minutes. Mechanism, read off
+// process trees and .fleet/autofix.jsonl:
+//   (a) FleetCockpit's health-poll auto-heal called RunStartAll() on its OWN first sweep
+//       whenever server/tunnel read Red -- with no check for whether a start_all.ps1 was
+//       ALREADY mid-bring-up, including the one that had just launched THIS cockpit process.
+//       start_all.ps1 relaunches a stale UI while it is still starting the backend, so the new
+//       cockpit saw the same Red and launched ANOTHER start_all, which queued on start_all's
+//       own single-instance lock ("another start_all is already running... waiting for it to
+//       finish"), then relaunched the cockpit again.
+//   (b) The retry budget (AUTOFIX_MAX_ATTEMPTS) and RunStartAll's 120s cooldown lived in that
+//       process's memory alone, so every relaunched cockpit got a FRESH budget -- the loop in
+//       (a) never ran into either backstop.
+//   (c) repair.ps1 -Auto's Tier A repair for server/tunnel is itself another start_all.ps1
+//       invocation (`-NoUi -NoSplash`), so a repair triggered while start_all was already
+//       running added a second queued startup, not a fix; and unparsable repair.ps1 output
+//       fell back to a blind RunStartAll(), a THIRD way to add one.
+internal static class StartupGate
+{
+    internal struct Decision
+    {
+        public bool Allow;
+        public string ReasonKey;   // "" when Allow, or when disallowed for a reason nobody
+                                   // needs telling about; else a T() key to show the operator.
+    }
+
+    // startAllRunning: the SAME cross-process signal start_all.ps1's Enter-StartAllLock uses --
+    //   the "Global\m365-copilot-companion-start-all" mutex, currently held by another process.
+    //   Checked before EVERY automatic RunStartAll or repair(.ps1) launch, not just the first
+    //   sweep: repair.ps1's Tier A for server/tunnel is itself a start_all.ps1 invocation, so
+    //   the same "don't add a second queued startup" rule applies to it too.
+    // launchedByStartAll: this process's own M365_LAUNCHED_BY_START_ALL=1 environment flag,
+    //   set only in the child process start_all.ps1 itself launches (scripts/start_all.ps1,
+    //   the Start-Process block under "THE WINDOW MAY ASK 'WHO OPENED ME?'"). No start_all.ps1
+    //   change is needed: the flag already exists there and was simply never read here.
+    // isFirstSweep: true ONLY for the once-per-process startup auto-heal check. The ongoing
+    //   MaybeAutoFix loop and the manual Fix button are NOT first-sweep and are gated by
+    //   AutoFixBudget below instead, not by launchedByStartAll -- a cockpit start_all launched
+    //   can still need automatic repair ten minutes later, once start_all itself is long done,
+    //   and that later need must not be silenced by how this process was born.
+    internal static Decision GateAutomaticLaunch(bool startAllRunning, bool launchedByStartAll, bool isFirstSweep)
+    {
+        if (startAllRunning)
+            return new Decision { Allow = false, ReasonKey = "autofix_start_all_running" };
+        if (isFirstSweep && launchedByStartAll)
+            // Silent: nothing is wrong here. start_all just finished launching this very
+            // process; assuming its own bring-up already failed within the first ~15s of this
+            // cockpit's life is the assumption that caused the loop.
+            return new Decision { Allow = false, ReasonKey = "" };
+        return new Decision { Allow = true, ReasonKey = "" };
+    }
+}
+
+// A cross-process, bounded-backoff retry budget: at most `maxAttempts` within a trailing
+// `windowS`-second window, PER KEY, persisted to disk by the caller so a new process does not
+// get a fresh budget (bug (b) above). No I/O here on purpose -- FleetCockpit.cs loads a key's
+// recent attempt timestamps from .fleet/autofix_budget.json, calls Decide, and writes back
+// `Kept` regardless of the outcome (so a stale, long-exhausted key's timestamps still age out
+// of the window on the next read instead of pinning it exhausted forever).
+internal static class AutoFixBudget
+{
+    internal struct Decision
+    {
+        public bool Allow;
+        public bool Exhausted;              // Allow == false AND the cap (not some other reason) is why
+        public List<double> Kept;           // what the caller should persist for this key
+    }
+
+    internal static Decision Decide(List<double> attempts, double now, int maxAttempts, double windowS)
+    {
+        var kept = new List<double>();
+        if (attempts != null)
+            foreach (double t in attempts)
+                if (now - t < windowS) kept.Add(t);
+        bool allow = kept.Count < maxAttempts;
+        // Recording IS part of the decision, not a separate step: a caller that got Allow=true
+        // and then decided not to actually launch (a race with another gate) still consumed one
+        // slot of the budget, which is the conservative (under- not over-budget) side to err on.
+        if (allow) kept.Add(now);
+        return new Decision { Allow = allow, Exhausted = !allow, Kept = kept };
+    }
+}
+
 class SelfImproveDashboardWindow : Window
 {
     public const string WindowTitle = "Self-Improvement";
@@ -71,7 +160,7 @@ class SelfImproveDashboardWindow : Window
     readonly string _jsonPath;
     DispatcherTimer _timer;
     string _lastSig = "";
-    JavaScriptSerializer _js = new JavaScriptSerializer();
+    JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
     double _upm = 960;
     Dictionary<string, string> _glyphs = new Dictionary<string, string>();
 
@@ -164,7 +253,7 @@ class SelfImproveDashboardWindow : Window
               + "何も許可しないし、止めもしない。actor は自己申告で検証されていない。"
             : "Acts that changed what this system may become. The ledger is append-only and "
               + "chained; it authorises nothing and prevents nothing, and actor is self-reported.";
-        if (k == "auth_intact")   return ja ? "凍結セット照合" : "Frozen set";
+        if (k == "auth_intact")   return ja ? "自己改善の安全確認" : "Self-improvement check";
         if (k == "auth_ok")       return ja ? "一致" : "matches";
         if (k == "auth_broken")   return ja ? "不一致" : "differs";
         if (k == "auth_anchor")   return ja ? "アンカー" : "Anchor";
@@ -181,17 +270,34 @@ class SelfImproveDashboardWindow : Window
         if (k == "auth_revoke")   return ja ? "直前の再署名を取り消す" : "Revoke the last re-signing";
         if (k == "auth_revoke_q") return ja
             ? "直前の再署名を取り消します。\n\n戻すのは【承認】であって【コード】ではありません。"
-              + "ファイルは変わったままなので、直後に凍結セットは不一致になり、走行は止まります。"
+              + "ファイルは変わったままなので、直後に自己改善の安全確認は不一致になり、走行は止まります。"
               + "それが狙いです。\n\n戻り先: "
             : "Withdraw the last re-signing.\n\nThis undoes the APPROVAL, not the code. The files "
-              + "stay as they are, so the frozen set will differ immediately afterwards and runs "
-              + "will stop. That is the intent.\n\nRestoring: ";
+              + "stay as they are, so the self-improvement check will show a mismatch immediately "
+              + "afterwards and runs will stop. That is the intent.\n\nRestoring: ";
         if (k == "auth_revoke_t") return ja ? "最終確認" : "Final confirmation";
         if (k == "auth_revoke_ok") return ja
-            ? "取り消しました。凍結セットが不一致になっているのは正常です。"
-            : "Revoked. The frozen set differing now is the expected state.";
+            ? "取り消しました。自己改善の安全確認が不一致になっているのは正常です。"
+            : "Revoked. The self-improvement check showing a mismatch now is the expected state.";
         if (k == "auth_revoke_no") return ja ? "取り消せませんでした" : "Could not revoke";
         if (k == "auth_nothing")  return ja ? "取り消せる再署名がありません" : "No re-signing to withdraw";
+        // THE ACT, not a command to go and run elsewhere. See BuildAuthority.
+        if (k == "auth_resign")   return ja ? "ここで再署名する" : "Re-sign here";
+        if (k == "auth_resign_t") return ja ? "自己改善の安全確認を今の内容で承認する"
+                                            : "Approve the self-improvement check as it now stands";
+        if (k == "auth_resign_why") return ja
+            ? "自己改善の安全確認が不一致の間、自己改善ループは走れません。今の内容でよければ"
+              + "ここで再署名できます。あなたが書いた文がそのまま台帳に残ります。"
+              + "取り消しは下の「記録と取り消し」から。"
+            : "While the self-improvement check shows a mismatch, the self-improvement loop "
+              + "cannot run. If the files are right as they stand, re-sign here; what you write "
+              + "is kept in the ledger word for word. The undo is under Records and undo, below.";
+        if (k == "auth_r1")       return ja
+            ? "この変更は意図したもの。今の内容で承認する。"
+            : "This change was intended. Approve the set as it stands.";
+        if (k == "auth_r2")       return ja
+            ? "内容を確認した。判定器の守りは変わっていないので承認する。"
+            : "I have read the change; it does not weaken the judge. Approve.";
 
         // no-data friendly message
         if (k == "nodata_title") return ja ? "まだデータがありません" : "No data yet";
@@ -276,8 +382,8 @@ class SelfImproveDashboardWindow : Window
         if (k == "pending_copied") return ja ? "コピーしました" : "Copied";
         // The two outcomes of an approval that DOES something, rather than only records it.
         if (k == "pd_resign_done")   return ja
-            ? "再署名しました。凍結セットは新しい内容で承認され、自己改善ループは再び走れます。"
-            : "Re-signed. The frozen set is approved as it now stands and the loop can run again.";
+            ? "再署名しました。自己改善の安全確認は新しい内容で承認され、自己改善ループは再び走れます。"
+            : "Re-signed. The self-improvement check is approved as it now stands and the loop can run again.";
         if (k == "pd_resign_failed") return ja
             ? "承認は記録しましたが、再署名は実行されませんでした。理由は下記のとおりです。"
             : "The approval was recorded, but the re-signing did not run. The reason follows.";
@@ -304,8 +410,9 @@ class SelfImproveDashboardWindow : Window
             : "Adopted genomes (scaffold variants) and what each measured. QD cells = slots by problem type.";
 
         // metric labels
-        if (k == "u_completion")  return ja ? "完了率" : "Completion";
-        if (k == "u_recent")      return ja ? "直近完了率" : "Recent";
+        if (k == "u_completion")  return ja ? "完了率(通常)" : "Completion (ordinary)";
+        if (k == "u_recent")      return ja ? "直近完了率(通常)" : "Recent (ordinary)";
+        if (k == "u_split")       return ja ? "ベンチは別母集団（基底率が約10倍違うため分けて表示）" : "Benchmarks are a separate population (their base rate differs about tenfold)";
         if (k == "u_turns")       return ja ? "中央ターン数" : "Median turns";
         if (k == "u_tasks")       return ja ? "タスク数" : "Tasks";
         if (k == "u_trend")       return ja ? "完了率の推移（古い→新しい）" : "Completion trend (old → new)";
@@ -941,7 +1048,15 @@ class SelfImproveDashboardWindow : Window
     }
 
     // the frozen set, recomputed here from the baseline json and the files on disk
-    bool FrozenMatches(out int checkedCount, out List<string> differing, out bool anchorOk)
+    //
+    // STATIC ON PURPOSE. The cockpit publishes the always-visible health strip and has no
+    // dashboard window to ask; before this, the only place the frozen set was ever compared
+    // was inside a card at the bottom of a window somebody had to open. A second
+    // implementation over there would be a second thing to keep in step, and the two
+    // disagreeing is worse than neither existing. The only instance member it used was a
+    // stateless serializer.
+    internal static bool FrozenMatches(out int checkedCount, out List<string> differing,
+                              out bool anchorOk)
     {
         checkedCount = 0; differing = new List<string>(); anchorOk = false;
         try
@@ -949,8 +1064,8 @@ class SelfImproveDashboardWindow : Window
             string root = RepoRoot();
             string bp = Path.Combine(root, "relay", "selfimprove", "frozen_baseline.json");
             if (!File.Exists(bp)) { differing.Add("NO_BASELINE"); return false; }
-            var doc = (Dictionary<string, object>)_js.DeserializeObject(
-                File.ReadAllText(bp, Encoding.UTF8));
+            var doc = (Dictionary<string, object>)(new JavaScriptSerializer { MaxJsonLength = int.MaxValue }
+                .DeserializeObject(File.ReadAllText(bp, Encoding.UTF8)));
             object sumsObj; doc.TryGetValue("checksums", out sumsObj);
             var sums = sumsObj as Dictionary<string, object>;
             if (sums == null) { differing.Add("NO_CHECKSUMS"); return false; }
@@ -967,6 +1082,13 @@ class SelfImproveDashboardWindow : Window
         catch (Exception) { differing.Add("UNREADABLE"); }
         return differing.Count == 0;
     }
+
+    // SelfImproveInUse() / FrozenGate used to live here, feeding the cockpit health strip's
+    // 7th dot (added 8ce5c47, 2026-09-19; removed after owner feedback on 12b06fd,
+    // 2026-09-24 -- the label did not fit the strip and the strip was the wrong place for it:
+    // the self-improvement loop already refuses to run on drift, and this dashboard already
+    // shows the same fact below with its own re-sign button). Removed with the dot; nothing
+    // else called them.
 
     UIElement BuildAuthority()
     {
@@ -1041,6 +1163,68 @@ class SelfImproveDashboardWindow : Window
             okLine.TextWrapping = TextWrapping.Wrap;
             okLine.Margin = new Thickness(0, head.Children.Count > 0 ? 8 : 10, 0, 0);
             col.Children.Add(okLine);
+        }
+
+        // -- AND SOMEWHERE TO ACT, right under the chip that says something is wrong.
+        //
+        //    The pending card learned this once already, in its own comment: "a card that only
+        //    offers copy states that a decision is waiting without offering anywhere to make
+        //    it". This card said the frozen set was adrift and offered nothing at all, so every
+        //    re-signing went through a terminal -- and an approval made in a terminal is not on
+        //    the screen that exists to hold approvals. That is how the operator came to be
+        //    looking for this and not finding it.
+        //
+        //    IT IS NOT A SHORTCUT. It runs the same CLI with the same flags, so a re-signing
+        //    that reaches the files the standing delegation excludes is refused here exactly as
+        //    it is from a shell, and the refusal is shown rather than swallowed.
+        //
+        //    Rendered only when the set differs: there is nothing to press in the normal state,
+        //    and a button that is always there is one more thing to read past.
+        if (!intact)
+        {
+            var why = MuteRow(T("auth_resign_why"));
+            why.Margin = new Thickness(0, 12, 0, 0);
+            col.Children.Add(why);
+
+            string files  = string.Join(", ", differing.ToArray());
+            string theCmd = "python -m relay.selfimprove.frozen --snapshot --force"
+                          + " --reason \"" + files.Replace("\"", "'") + "\""
+                          + " --authorization \"" + (_lang == 0 ? "<あなたの言葉>" : "<your words>") + "\"";
+
+            var acts = new StackPanel();
+            acts.Orientation = Orientation.Horizontal;
+            acts.Margin = new Thickness(0, 8, 0, 0);
+
+            var go = new Button();
+            go.Content = T("auth_resign");
+            go.Padding = new Thickness(16, 5, 16, 5);
+            go.Margin  = new Thickness(0, 0, 8, 0);
+            string theFiles = files;
+            go.Click += delegate
+            {
+                string kind;
+                string said = AskForDecision(T("auth_resign_t"),
+                                             new string[] { T("auth_r1"), T("auth_r2") },
+                                             out kind);
+                if (said == null) return;              // closed, nothing done
+                CarryOutFrozenResign("re-signed on the dashboard: " + theFiles, said);
+                ForceRender();
+            };
+            acts.Children.Add(go);
+
+            // The command stays as the second way in. Somebody working from a shell, or on a
+            // machine where this window will not open, still needs the line.
+            var cp = new Button();
+            cp.Content = T("pending_copy");
+            cp.Padding = new Thickness(12, 5, 12, 5);
+            var cpRef = cp; string cmdRef = theCmd;
+            cp.Click += delegate
+            {
+                try { Clipboard.SetText(cmdRef); cpRef.Content = T("pending_copied"); }
+                catch (Exception) { }
+            };
+            acts.Children.Add(cp);
+            col.Children.Add(acts);
         }
 
         var toggle = new TextBlock();
@@ -1401,12 +1585,33 @@ class SelfImproveDashboardWindow : Window
         for (int i = 0; i < 4; i++)
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
         var goodBrush = new SolidColorBrush(StatusColorFor("good", _dark));
-        grid.Children.Add(MetricCell(T("u_completion"), Pct(u, "completion_rate"),  goodBrush, 0));
-        grid.Children.Add(MetricCell(T("u_recent"),     Pct(u, "recent_completion_rate"), Fg, 1));
+        // ORDINARY WORK IS THE HEADLINE, because that is what "how is the fleet doing" means.
+        // These cells used to show the blend of ordinary goals and benchmark workers, whose
+        // completion rates differ by about ten times -- so the number moved with whatever bulk
+        // job was queued. Measured 2026-09-12: this row read 0.39 / 0.20 while ordinary work
+        // stood at 0.45 / 0.89 and a SWE-bench arm filled 41 of the last 50 rows.
+        var wl   = Obj(u, "workload");
+        var ord_ = Obj(wl, "ordinary");
+        var bch  = Obj(wl, "bench");
+        grid.Children.Add(MetricCell(T("u_completion"), Pct(ord_, "completion_rate"),  goodBrush, 0));
+        grid.Children.Add(MetricCell(T("u_recent"),     Pct(ord_, "recent_completion_rate"), Fg, 1));
         grid.Children.Add(MetricCell(T("u_turns"),
             Num(u.ContainsKey("median_turns") ? u["median_turns"] : null, "0.#"), Fg, 2));
         grid.Children.Add(MetricCell(T("u_tasks"), I(u, "n_tasks").ToString(), Fg, 3));
         col.Children.Add(grid);
+
+        // EVERY RATE WITH ITS OWN DENOMINATOR, and the blend still visible. A rate over nine
+        // rows and a rate over forty-one must not be read as the same kind of thing, and a
+        // number that is hidden is one the next person re-derives wrongly.
+        var split = new TextBlock {
+            Text = string.Format("{0}  —  n={1} / {2}   ·   bench {3} (n={4} / {5})   ·   blended {6} / {7}",
+                                 T("u_split"),
+                                 I(ord_, "n"), I(ord_, "recent_n"),
+                                 Pct(bch, "completion_rate"), I(bch, "n"), I(bch, "recent_n"),
+                                 Pct(u, "completion_rate"), Pct(u, "recent_completion_rate")),
+            TextWrapping = TextWrapping.Wrap, FontSize = 11.5, Margin = new Thickness(2, 6, 2, 0) };
+        split.Foreground = Muted;
+        col.Children.Add(split);
 
         // status mix (counts by outcome)
         var mix = Obj(u, "status_mix");
@@ -1999,7 +2204,12 @@ class SelfImproveDashboardWindow : Window
     // standing delegation excludes is refused exactly as it is from a shell -- and the refusal
     // is shown rather than swallowed, because an approval that silently did nothing is the
     // failure this whole change is about.
-    void CarryOutFrozenResign(string pid, string words)
+    // TAKES THE REASON, NOT AN ID. It was written for the pending card, where the id WAS
+    // the reason ("decision <pid>"). The authority card has no card and no id -- the
+    // frozen set is simply adrift -- and a helper that can only name a queue row is a
+    // helper only that queue can use, which is why re-signing anything else still meant a
+    // terminal.
+    void CarryOutFrozenResign(string reasonText, string words)
     {
         try
         {
@@ -2010,8 +2220,11 @@ class SelfImproveDashboardWindow : Window
             // --authorization - reads the words from stdin, for the same reason RecordDecision
             // does: quoting them into argv mangled quotes and broke on newlines, and these are
             // the words a ledger promises are unaltered.
+            // The reason is quoted into argv, so a quote inside it would end the argument
+            // early and hand the rest to the parser as flags. The WORDS never go this way --
+            // they are read from stdin, unaltered, because the ledger promises that.
             psi.Arguments = "-m relay.selfimprove.frozen --snapshot --force"
-                          + " --reason \"approved on the dashboard (decision " + pid + ")\""
+                          + " --reason \"" + (reasonText ?? "").Replace("\"", "'") + "\""
                           + " --authorization -";
             psi.RedirectStandardInput  = true;
             psi.WorkingDirectory       = root;
@@ -2232,7 +2445,9 @@ class SelfImproveDashboardWindow : Window
                     // the Skill approvals are. The words they just typed are the
                     // authorization, so the ledger quotes the person who decided rather than
                     // a second invocation nobody recorded.
-                    if (theAction == "frozen_resign") CarryOutFrozenResign(theId, said);
+                    if (theAction == "frozen_resign")
+                        CarryOutFrozenResign("approved on the dashboard (decision "
+                                             + theId + ")", said);
                     ForceRender();
                 };
                 actions.Children.Add(yes);

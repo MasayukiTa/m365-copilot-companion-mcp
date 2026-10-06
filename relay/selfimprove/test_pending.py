@@ -203,8 +203,20 @@ def test_the_repo_wide_fixture_keeps_tests_out_of_the_live_queue():
 
 
 def test_this_suite_is_not_writing_to_the_real_queue():
-    """Belt and braces: the fixture above redirects it, and this asserts the redirection took."""
-    assert "live_records" in P.QUEUE_PATH or "Temp" in P.QUEUE_PATH or "tmp" in P.QUEUE_PATH.lower()
+    """Belt and braces: the fixture above redirects it, and this asserts the redirection took.
+
+    THIS USED TO CHECK THE PATH'S SPELLING ('live_records', 'Temp' or 'tmp' in it), and CI now
+    sets TMPDIR to the runner's own temp directory (/home/runner/work/_temp/...), which contains
+    none of those words though it is exactly as temporary as any other tmp_path. A spelling check
+    on a path is not a property of the path -- what matters is that the queue the suite writes to
+    is NOT the repository's real one, which is what the fixture exists to guarantee. So this
+    compares the redirected P.QUEUE_PATH against REAL_QUEUE (captured at import, before the
+    autouse fixture ran) rather than guessing at how a temp directory is usually named."""
+    import os
+    real = os.path.realpath(REAL_QUEUE)
+    redirected = os.path.realpath(P.QUEUE_PATH)
+    assert redirected != real, "the fixture did not move QUEUE_PATH off the real queue: %r" % (
+        P.QUEUE_PATH,)
 
 
 def test_a_refused_proposal_comes_back_after_it_was_dropped():
@@ -267,13 +279,29 @@ def test_the_words_can_be_read_from_stdin(monkeypatch, queue):
 
 def test_stdin_is_decoded_as_utf8_and_not_as_the_console_encoding(monkeypatch):
     """sys.stdin.read() uses the locale encoding, which on this machine is cp932 -- reading it
-    that way would corrupt exactly the text this path exists to carry unaltered."""
-    import inspect
-    src = inspect.getsource(P._cli)
-    assert 'sys.stdin.buffer.read().decode("utf-8"' in src
-    # The comment names the wrong way by name; the CODE must not use it.
-    code = chr(10).join(l.split("#")[0] for l in src.splitlines())
-    assert "sys.stdin.read()" not in code
+    that way would corrupt exactly the text this path exists to carry unaltered.
+
+    RE-POINTED, NOT DELETED. This asserted the decode appeared in the SOURCE OF `_cli`, and the
+    implementation moved to relay/selfimprove/stdin_arg.py -- because frozen.py took the same
+    flag, was called the same way by the same dashboard, and never implemented it, so every
+    re-signing recorded the literal "-" as the operator's words. A test pinned to where code
+    lives fails when code is moved for a good reason; one pinned to what comes out does not.
+    So it now measures the OUTPUT, through pending's own CLI, which is strictly stronger."""
+    pid = P.add(["a/b.py"], "a reason")
+    words = "\u518d\u7f72\u540d\u3069\u3046\u305e"          # 再署名どうぞ
+
+    class _Utf8Stdin:
+        def __init__(self):
+            self.buffer = self
+
+        def read(self):
+            return words.encode("utf-8")
+
+    monkeypatch.setattr(P.sys, "stdin", _Utf8Stdin())
+    assert P._cli(["--approve", pid, "--authorization", "-"]) == 0
+    got = [i for i in P.items(include_resolved=True) if i["id"] == pid][0]
+    assert got["authorization"] == words, \
+        "read with the locale encoding somewhere: %r" % got["authorization"]
 
 
 def test_the_dashboard_no_longer_rewrites_quotes():

@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from .copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver
 from relay import settle as _settle
 from tools.gate_ops import stop_check
+from tools import childproc
 
 load_dotenv()
 
@@ -109,6 +110,12 @@ class AgentProfile:
     # RESEARCHER/ANALYST (see _env_agent_url above). Not consumed at runtime by
     # open_agent()/ask_agent() themselves -- purely informational metadata.
     url_is_default: bool = False
+    # How long an UNMARKED block must be before it can be this agent's finished answer.
+    # None means the module default (SUBSTANTIAL_CHARS = 1000), which is a statement about
+    # the Researcher: its status lines are short and can sit still long enough to look
+    # settled. An Analyst asked a direct question answers in one line, so the same floor
+    # made every short ANALYZE time out with the answer already on the screen (2026-09-17).
+    min_report_chars: int | None = None
 
 
 PLAIN = AgentProfile(name="plain", url="", model_picker=None,
@@ -136,6 +143,16 @@ ANALYST = AgentProfile(
     model_picker=None,
     end_timeout_s=900, dwell_s=8.0, appear_timeout_s=180,
     url_is_default=ANALYST_URL_IS_DEFAULT,
+    # AN ANALYST ANSWER IS SHORT, and the answer to "what six characters are on this picture"
+    # can legitimately BE six characters -- so length cannot discriminate here, and a number
+    # chosen to clear one measured example would be fitted to that example. What separates a
+    # status line from an answer is _is_processing (a known progress marker AND under 40
+    # chars), which runs one branch earlier. The 1000-char floor is a second, blunter net for
+    # status phrases whose marker is not listed: cheap for the Researcher, and for the Analyst
+    # it meant no short answer could ever be accepted -- every ANALYZE timed out at 600s with
+    # the answer already on the screen (measured 2026-09-17). 4 rejects stray whitespace and
+    # leaves the discrimination where it is implemented.
+    min_report_chars=4,
 )
 
 PROFILES = {p.name: p for p in (PLAIN, RESEARCHER, ANALYST)}
@@ -161,6 +178,7 @@ def prompt_for_agent_url(env_key: str, reason: str = "") -> str:
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
              "-Only", env_key, "-Reason", (reason or "")],
             timeout=600, check=False,
+            creationflags=childproc.headless_creationflags(),
         )
     except Exception:
         return ""
@@ -317,6 +335,11 @@ _MARKER_HEAD, _MARKER_TAIL = 400, 600
 #: when no completion marker is present. Named because it is one half of a pair:
 #: `_looks_like_clarification` caps at 900, and the gap between them is the
 #: whole point -- see the note there.
+#: How long a block has to be before it can be a finished report, when it carries no
+#: completion marker. A deep-research STATUS line is short and can sit still long enough to
+#: look settled, which is what this floor rejects. It is a statement about the Researcher, so
+#: AgentProfile.min_report_chars overrides it per agent -- see ANALYST, whose answers are one
+#: line and which timed out for 600s with its answer already on the screen.
 SUBSTANTIAL_CHARS = 1000
 
 
@@ -584,6 +607,14 @@ class ResearchSession:
         #: passes no RAM gate, which is the point: measured today, ram_room_for_tab() was False
         #: and the fleet would have solved WITHOUT its research rather than waiting for one.
         self.socket = False
+        #: WHICH TRANSPORT ACTUALLY CARRIED THE TURN -- "socket", "tab", or "" if none did.
+        #: `self.socket` cannot answer this once the session is over: close() sets it False
+        #: and clears the page, so a finished socket deep-dive and a finished tab one look
+        #: identical afterwards. A probe read those flags after _finish() and reported that
+        #: the socket wiring had not taken effect, while the same run's log showed the
+        #: upload succeeding and the answer coming back -- the instrument was wrong, not the
+        #: code. Set when the query goes out and never cleared.
+        self.transport = ""
         #: Asked once. A capture costs a real turn on a real tab, so retrying it every poll
         #: would spend more than the tab it is trying to avoid.
         self._socket_tried = False
@@ -661,10 +692,19 @@ class ResearchSession:
         backend sends a completion frame and the turn is over by protocol.
         """
         self._socket_tried = True
-        if self.upload_path:
-            # The Analyst reads a local file from a real <input type=file>. See
-            # relay/transport_policy.py -- the one property measured to force a tab.
-            return False
+        # AN ATTACHMENT NO LONGER ENDS THE ATTEMPT HERE.
+        #
+        # This returned False for anything with an upload_path, on the premise
+        # transport_policy carried: "a socket has nowhere to put a local file". Both were
+        # retired on 2026-09-18, and retiring the POLICY alone changed nothing, because
+        # THIS is what the fleet consults -- a policy module can only decide what somebody
+        # asks it. Two places held the same rule and did not know about each other.
+        #
+        # The bytes go to UploadFile over HTTP and the id rides the socket as
+        # messageAnnotations. Measured: an image carrying a randomly generated phrase was
+        # uploaded, its docId sent on a socket turn, and the reply read the phrase back --
+        # it is in no filename, no path and no prompt, so the pixels are its only source.
+        _annotations = None
         try:
             from relay.relay_fleet import _socket_route
 
@@ -683,10 +723,27 @@ class ResearchSession:
                 frame_timeout_s=300.0)
             if drv is None:
                 return False
+            if self.upload_path:
+                # AFTER the route has a token, because the upload needs one, and BEFORE
+                # the turn goes out, because the Analyst needs the data before the
+                # question.
+                #
+                # A FAILED UPLOAD FALLS BACK TO A TAB, and that is not timidity: the tab
+                # path below names the failure it prevents -- "an instruction about a file
+                # that is not there comes back as a confident answer about nothing" -- and
+                # sending the question annotation-less would reintroduce exactly that.
+                from relay.socket_attachment import annotation_for
+
+                _annotations = annotation_for(self.context, url, self.upload_path,
+                                              route.token_for(url),
+                                              log=lambda m: print(m, flush=True))
+                if not _annotations:
+                    return False
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
             self.drv._count_before = 0
-            self.drv.send(self.query)
+            self.drv.send(self.query, annotations=_annotations)
+            self.transport = "socket"
             self._pending_open = False
             self._t_send = time.time()
             return True
@@ -706,12 +763,11 @@ class ResearchSession:
             if not open_agent(self.page, self.profile):
                 self._fail("the %s surface did not open" % self.profile.name); return
             if self.upload_path:
-                # AND THIS IS WHY THE ANALYST CANNOT USE A SOCKET: the file goes into a real
-                # <input type=file>, and a socket has nowhere to put one. Measured across
-                # twenty socket turns and eight request classes, it is the ONLY property found
-                # so far that structurally forces a tab -- and it is knowable here, from a
-                # parameter the caller already set, rather than predicted from request text.
-                # relay/transport_policy.py owns the transport decision; this belongs in it.
+                # THIS IS THE FALLBACK NOW, NOT THE ONLY WAY. It read "and this is why the
+                # Analyst cannot use a socket: a socket has nowhere to put a local file" --
+                # which was never measured and is false. _try_socket() above uploads the
+                # file and sends its id as messageAnnotations; a tab is what happens when
+                # that upload does not come back with one.
                 # THE ANALYST NEEDS THE DATA BEFORE THE QUESTION. A failed upload must end the
                 # session rather than send an instruction about a file that is not there --
                 # which would come back as a confident answer about nothing.
@@ -725,6 +781,7 @@ class ResearchSession:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
             self.drv.send(self.query)
+            self.transport = "tab"
             self._pending_open = False
             self._t_send = time.time()   # reset the clock to when the query actually went out
         except Exception as exc:
@@ -782,7 +839,19 @@ class ResearchSession:
             return self._done
         try:
             if self._t_send and time.time() - self._t_send > self.timeout_s:
-                self._fail("timeout: %ds without a finished report" % int(self.timeout_s))
+                # WHAT WAS ON THE SCREEN IS EVIDENCE. The sub-transcript used to record
+                # "(no report captured)", so an answer that was present but not accepted --
+                # the 2026-09-17 case exactly -- was indistinguishable from an agent that
+                # never replied. Best-effort: a failure to explain a failure must not raise.
+                try:
+                    seen = self.drv.read_last_response() or ""
+                except Exception:
+                    seen = ""
+                self._rejected = seen[:1500]
+                self._fail("timeout: %ds without a finished report%s"
+                           % (int(self.timeout_s),
+                              ("; last block on screen was %d chars" % len(seen)) if seen
+                              else "; nothing was on screen"))
                 return self._done
             if self.drv._answers().count() <= self._count_before:
                 return None
@@ -811,7 +880,13 @@ class ResearchSession:
             # a stable, SUBSTANTIAL block (completion marker OR >=1000 chars) is the finished
             # report; a short stalled status line is not (same gate as _wait_research_done). The
             # marker appears at the report header then the body streams, so require the full dwell.
-            substantial = _report_marker(t) or len(t) >= SUBSTANTIAL_CHARS
+            # getattr THROUGH the session too: unit tests build a ResearchSession with
+            # __new__ and set only the fields they exercise, so self.profile may not exist.
+            # A completion test that raises on a minimal object is a completion test that
+            # fails closed for the wrong reason.
+            _prof = getattr(self, "profile", None)
+            floor = getattr(_prof, "min_report_chars", None) or SUBSTANTIAL_CHARS
+            substantial = _report_marker(t) or len(t) >= floor
             if _settle.unified():
                 # THE ONE RULE. This site had no sample requirement either -- only a dwell,
                 # doubled unconditionally -- so a deep-research report that paused mid-stream

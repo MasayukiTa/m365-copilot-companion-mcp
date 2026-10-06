@@ -73,6 +73,7 @@ import sys
 import tempfile
 
 from bench.companionbench.agents import FLEET, FLEET_FIELDS
+from relay.temp_home import temp_home as _temp_home  # scratch under the swept temp home
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -136,6 +137,13 @@ try:
             # Episodes run side by side by running several of these children at once, which
             # is the runner's business; see `max_concurrent_episodes` on the class below.
             max_concurrent=1, refuter=payload.get("refuter", False),
+            # NO FAN-OUT IN A BENCHMARK EPISODE. One goal in one conversation is what this
+            # measures -- see the max_concurrent note directly above. A split ends this worker
+            # with outcome=FANOUT and no answer of its own, so the `last_response` read below
+            # would come back empty and the grader would score a miss for a goal that was
+            # merely divided. Explicit because the library default moved to True on
+            # 2026-09-13; a benchmark must not inherit a decision like that.
+            fanout=False,
             # max_transient / max_refute are LEFT UNSET on purpose: run_relay_fleet takes
             # them from the active manifest when they are None, and passing them here would
             # silence the very fields under test.
@@ -458,7 +466,7 @@ class FleetAgent:
         directory turns a paired comparison into a sequence: whatever the baseline learned is
         what the candidate starts from.
         """
-        d = tempfile.mkdtemp(prefix="cb_fleet_")
+        d = tempfile.mkdtemp(prefix="cb_fleet_", dir=_temp_home())
         state = os.path.join(d, ".fleet")
         if self.memory_seed and os.path.isdir(self.memory_seed):
             shutil.copytree(self.memory_seed, state)

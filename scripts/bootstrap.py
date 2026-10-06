@@ -21,6 +21,8 @@
 #   python scripts/bootstrap.py --status   print each step done/pending (no changes)
 #   python scripts/bootstrap.py --reset    clear saved state (no system changes)
 #   python scripts/bootstrap.py --only X   run a single step by name
+#   python scripts/bootstrap.py --check-deps  exit 0 if .venv satisfies requirements.txt, else 3
+#   python scripts/bootstrap.py --sync-deps   bring .venv up to date (start_all.ps1's daily path)
 # =============================================================================
 from __future__ import annotations
 
@@ -45,7 +47,38 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-from tools.secret_store import UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret
+
+#: THE OLDEST PYTHON THE REQUIREMENTS CAN BE INSTALLED ON, derived rather than chosen: fastmcp,
+#: mcp, anyio and ddgs all declare Requires-Python >=3.10 (read from their METADATA in the
+#: working .venv, 2026-09-24), and CI installs on exactly 3.10. There was no version check at
+#: all (D8), so a machine whose `py -3` was 3.9 built the venv on it and then failed
+#: "pip install -r requirements.txt ... (network or a wheel build)" on every run -- a wrong
+#: diagnosis in an endless loop. setup.bat carries the same number in its probes;
+#: scripts/test_install_path_python_version.py holds the two together.
+MIN_PYTHON = (3, 10)
+
+
+def _python_too_old_message(found: tuple, where: str) -> str:
+    return ("%s is Python %d.%d, and this project needs Python %d.%d or newer (its "
+            "dependencies will not install on anything older). Run setup.bat, which "
+            "provisions its own Python %d.12 with uv when the Python on PATH is too old, "
+            "or install Python 3.12 from https://www.python.org/downloads/windows/ "
+            "(per-user, no admin) and re-run setup.bat."
+            % (where, found[0], found[1], MIN_PYTHON[0], MIN_PYTHON[1], MIN_PYTHON[0]))
+
+
+# REFUSED BEFORE ANYTHING ELSE IS IMPORTED: the imports below may use syntax an old
+# interpreter cannot even parse, and a SyntaxError from a helper module is not a message.
+if __name__ == "__main__" and tuple(sys.version_info[:2]) < MIN_PYTHON:
+    print("ACTION NEEDED: " + _python_too_old_message(
+        tuple(sys.version_info[:2]), "The Python running setup (%s)" % sys.executable))
+    sys.exit(2)
+
+_SCRIPTS_DIR = str(Path(__file__).resolve().parent)
+if _SCRIPTS_DIR not in sys.path:
+    sys.path.append(_SCRIPTS_DIR)   # appended, not prepended: nothing here may shadow a package
+from tools.secret_store import UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret  # noqa: E402
+import env_file  # noqa: E402  (scripts/env_file.py -- the atomic .env writer)
 
 STATE_DIR = ROOT / ".setup"
 STATE_FILE = STATE_DIR / "state.json"
@@ -79,6 +112,16 @@ def _machine_suffix() -> str:
     return _sha256_hex(seed.lower())[:8]
 
 
+_GENERATED_NAME_RE = re.compile(
+    "^" + re.escape(DEFAULT_TUNNEL_NAME) + r"(-[0-9a-f]{6}|-[0-9a-f]{8}){0,2}$")
+
+
+def _is_generated_tunnel_name(name: str | None) -> bool:
+    """The default name, optionally followed by hex machine suffixes (8 = this scheme, 6 = the
+    legacy setup_devtunnel one). Same pattern as setup_devtunnel.ps1's Test-GeneratedTunnelName."""
+    return bool(name and _GENERATED_NAME_RE.match(name.strip().lower()))
+
+
 def _is_identifying_tunnel_name(name: str | None) -> bool:
     """Returns True if 'name' leaks an identifying token. Mirrors
     Test-IdentifyingTunnelName in setup_devtunnel.ps1 -- keep both in sync.
@@ -99,6 +142,14 @@ def _is_identifying_tunnel_name(name: str | None) -> bool:
 
     # 3. Generic runtime checks (no hash needed) -- catches folder-derived /
     #    user-derived names on any machine, beyond the specific blocklist above.
+    #    NOT FOR A NAME THIS REPOSITORY GENERATED (D29, mirrors setup_devtunnel.ps1's
+    #    Test-GeneratedTunnelName). Those are the fixed default plus a hash and carry nothing
+    #    user-derived, but the substring test below fired whenever the user name occurred
+    #    inside "m365-copilot-companion-<hex>" (a user named "pan", "com", "on", or a hex-only
+    #    name inside the suffix): the name was thrown away, regenerated identically, and
+    #    "The PUBLIC URL will change" was printed on every run while nothing changed.
+    if _is_generated_tunnel_name(name):
+        return False
     repo_leaf = ROOT.name.lower()
     user_name = getpass.getuser().lower()
     for t in tokens:
@@ -266,19 +317,46 @@ def _venv_runs() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
-        res = subprocess.run([str(VENV_PYTHON), "-c", "import sys"],
-                             capture_output=True, text=True, timeout=60)
+        from tools.childproc import run as _run_child
+        res = _run_child([str(VENV_PYTHON), "-c", "import sys"], timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
+
+
+def _venv_version() -> tuple | None:
+    """(major, minor) of the venv's interpreter, or None when it cannot be run or read.
+
+    RUN, NOT READ. pyvenv.cfg records the version the venv was CREATED with, and a venv whose
+    base Python was later upgraded or removed says something different when executed. What
+    matters is what runs.
+    """
+    if not VENV_PYTHON.exists():
+        return None
+    try:
+        from tools.childproc import run as _run_child
+        res = _run_child([str(VENV_PYTHON), "-c",
+                          "import sys; print('%d.%d' % sys.version_info[:2])"], timeout=60)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if res.returncode != 0:
+        return None
+    m = re.search(r"(\d+)\.(\d+)", res.stdout or "")
+    return (int(m.group(1)), int(m.group(2))) if m else None
+
+
+def _venv_usable() -> bool:
+    """The venv's interpreter runs AND is new enough for the requirements (D8, D20)."""
+    ver = _venv_version()
+    return ver is not None and ver >= MIN_PYTHON
 
 
 def _venv_has_pip() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
-        res = subprocess.run([str(VENV_PYTHON), "-m", "pip", "--version"],
-                             capture_output=True, text=True, timeout=60)
+        from tools.childproc import run as _run_child
+        res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"], timeout=60)
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
@@ -313,6 +391,14 @@ def _venv_is_healthy() -> bool:
     see _seed_pip for what that mistake cost on a fresh machine.
     """
     if not _venv_runs():
+        return False
+    # A VENV ON A TOO-OLD PYTHON RUNS FINE AND CAN NEVER HOLD THE REQUIREMENTS (D8). It has to
+    # be rebuilt on the interpreter running this script -- which setup.bat has already checked
+    # is new enough -- or install_deps fails on it for ever with a network-shaped message.
+    ver = _venv_version()
+    if ver is not None and ver < MIN_PYTHON:
+        log("    .venv runs Python %d.%d, older than the %d.%d the requirements need; "
+            "rebuilding it." % (ver[0], ver[1], MIN_PYTHON[0], MIN_PYTHON[1]))
         return False
     if _venv_has_pip():
         return True
@@ -373,56 +459,716 @@ def step_ensure_venv(state: dict | None = None, state_file: Path = STATE_FILE) -
 # --------------------------------------------------------------------------- #
 # STEP: install_deps
 # --------------------------------------------------------------------------- #
-def step_install_deps() -> None:
+REQUIREMENTS = ROOT / "requirements.txt"
+
+#: state.json key holding the sha256 of requirements.txt as it was when install_deps last
+#: succeeded (D5). The done flag alone said "dependencies were installed once" and was read as
+#: "the dependencies this checkout needs are installed", which stops being true at the first
+#: `git pull` that adds one: a new import in main.py then failed verify once (clearing the
+#: flags) so only the SECOND setup run reinstalled, and a lazily imported new package was
+#: never installed at all.
+DEPS_HASH_KEY = "install_deps_requirements_sha256"
+
+
+def requirements_hash(req: Path = None) -> str | None:
+    """sha256 of requirements.txt with line endings normalised (a CRLF/LF checkout of the
+    same file is the same requirements), or None when the file is absent."""
+    req = REQUIREMENTS if req is None else req
+    try:
+        data = Path(req).read_bytes()
+    except OSError:
+        return None
+    return hashlib.sha256(data.replace(b"\r\n", b"\n")).hexdigest()
+
+
+def deps_are_stale(state: dict, req: Path = None) -> bool:
+    """True when install_deps is marked done but not for THIS requirements.txt. A state
+    written before the hash existed has no hash, which is "unknown", which reinstalls: pip
+    over an up-to-date venv costs a minute, and trusting an unknown costs a broken tool."""
+    if not is_done(state, "install_deps"):
+        return False
+    return state.get(DEPS_HASH_KEY) != requirements_hash(req)
+
+
+# --------------------------------------------------------------------------- #
+# Dependency drift on the DAILY start path (start_all.ps1 -> --check-deps / --sync-deps)
+# --------------------------------------------------------------------------- #
+# WHY THIS EXISTS. --check-deps used to answer "is the stamp for this requirements.txt?" and
+# nothing else, so a state.json written before the stamp existed (every PC installed before
+# 2026-09) answered "stale" on every start forever, and start_all could only tell the operator
+# to run setup.bat. The question start_all actually needs answered is "does this .venv satisfy
+# requirements.txt?", and when it does not, start_all brings it up to date itself (owner's rule:
+# the only remedy start_all may give for its own environment is running start_all.bat again).
+#
+# THE STAMP IS STILL THE FAST PATH. A matching stamp is a hash of one small file; the probe
+# below reads installed metadata (~0.1-1 s) and only runs when the stamp is missing or differs.
+
+#: pip's output for an install started from the daily path. start_all runs hidden, so without a
+#: file its output would go nowhere; the failure line in the startup summary names this file.
+DEPS_LOG_DIR = STATE_DIR / "logs"
+
+#: Cross-process lock around "satisfied? -> pip install -> stamp". Two start_all copies are
+#: already serialised by start_all's own Global mutex, but setup/quickstart run bootstrap
+#: outside it, and two pip processes writing one .venv is the corruption quickstart_lock.ps1
+#: was written for. An OS byte-range lock (msvcrt / fcntl), not a marker file: the kernel drops
+#: it when the holder dies, so a killed install can never wedge the next one.
+INSTALL_LOCK_NAME = "install_deps.lock"
+INSTALL_LOCK_TIMEOUT_SEC = 1800
+
+_HELD_INSTALL_LOCKS: dict = {}
+
+
+class InstallLockTimeout(StepError):
+    """Another install into this venv held the lock for the whole timeout."""
+
+
+def _try_lock(fh) -> bool:
+    fh.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _unlock(fh) -> None:
+    fh.seek(0)
+    try:
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+class install_lock:
+    """`with install_lock(dir):` -- hold <dir>/install_deps.lock, waiting up to `timeout`.
+
+    RE-ENTRANT PER PROCESS: --sync-deps holds it across check + install + stamp and calls
+    step_install_deps, which takes it too; a second handle in the same process would otherwise
+    wait on itself (a Windows byte-range lock belongs to the handle, not the process)."""
+
+    def __init__(self, lock_dir, timeout: float = None, poll: float = 0.25):
+        self.path = Path(lock_dir) / INSTALL_LOCK_NAME
+        self.key = os.path.normcase(os.path.abspath(str(self.path)))
+        self.timeout = INSTALL_LOCK_TIMEOUT_SEC if timeout is None else timeout
+        self.poll = poll
+        self.fh = None
+
+    def __enter__(self):
+        held = _HELD_INSTALL_LOCKS.get(self.key)
+        if held:
+            held[1] += 1
+            return self
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(self.path, "a+b")
+        deadline = time.monotonic() + self.timeout
+        announced = False
+        while not _try_lock(fh):
+            if not announced:
+                log("    another dependency install into this .venv is running; waiting for it "
+                    "(lock: %s)" % self.path)
+                announced = True
+            if time.monotonic() >= deadline:
+                fh.close()
+                raise InstallLockTimeout(
+                    "another dependency install into this .venv was still running after %d "
+                    "minutes (lock: %s)" % (self.timeout // 60, self.path))
+            time.sleep(self.poll)
+        self.fh = fh
+        _HELD_INSTALL_LOCKS[self.key] = [fh, 1]
+        return self
+
+    def __exit__(self, *exc):
+        held = _HELD_INSTALL_LOCKS.get(self.key)
+        if not held:
+            return False
+        held[1] -= 1
+        if held[1] == 0:
+            del _HELD_INSTALL_LOCKS[self.key]
+            _unlock(held[0])
+            held[0].close()
+        return False
+
+
+def _load_packaging():
+    """(Requirement, InvalidRequirement) from `packaging`, else pip's vendored copy, else None."""
+    try:
+        from packaging.requirements import InvalidRequirement, Requirement
+        return Requirement, InvalidRequirement
+    except ImportError:
+        pass
+    try:
+        from pip._vendor.packaging.requirements import InvalidRequirement, Requirement
+        return Requirement, InvalidRequirement
+    except ImportError:
+        return None
+
+
+def _requirement_lines(text: str):
+    """The requirement lines of a requirements file: comments (whole-line, and inline after
+    whitespace, as pip reads them) and blank lines dropped."""
+    for raw in text.splitlines():
+        line = re.split(r"\s+#", raw.strip(), maxsplit=1)[0].strip()
+        if line and not line.startswith("#"):
+            yield line
+
+
+def _marker_applies(marker, extras) -> bool:
+    if marker is None:
+        return True
+    for extra in extras:
+        try:
+            if marker.evaluate({"extra": extra}):
+                return True
+        except Exception:
+            return True             # cannot tell -> treat it as needed (the install decides)
+    return False
+
+
+def _canonical_name(name: str) -> str:
+    return re.sub(r"[-_.]+", "-", name or "").lower()
+
+
+def _installed_index(md) -> dict:
+    """{canonical name: Distribution} from ONE pass over sys.path. md.distribution(name) scans
+    every path entry per call -- measured 1.3-2.1 s for this requirements.txt on the 2026-09
+    venv; one pass is the difference between a probe and a pause on every start. The first
+    entry for a name wins, which is the one `import` would find."""
+    index = {}
+    for dist in md.distributions():
+        try:
+            meta = dist.metadata            # parsed once here; re-reading it per use doubled the cost
+            key = _canonical_name(meta["Name"])
+        except Exception:
+            continue
+        if key and key not in index:
+            index[key] = (meta["Name"], meta["Version"], meta.get_all("Requires-Dist") or [])
+    return index
+
+
+_EXTRA_IN_MARKER = re.compile(r"""extra\s*==\s*['"]([^'"]+)['"]""")
+
+
+def _only_for_other_extras(dep: str, extras) -> bool:
+    """A Requires-Dist that applies only to extras nobody asked for -- most of them (test, dev,
+    docs) -- skipped before it is parsed: `packaging` parses with pyparsing at ~5 ms a line, and
+    those lines were most of the probe's time. Anything less plain than `...; extra == "x"`
+    (an `or` in the marker) is left to the full parse."""
+    _, sep, marker = dep.partition(";")
+    if not sep or " or " in marker:
+        return False
+    named = {_canonical_name(e) for e in _EXTRA_IN_MARKER.findall(marker)}
+    return bool(named) and not (named & {_canonical_name(e) for e in extras if e})
+
+
+def unsatisfied_requirements(req: Path = None) -> list:
+    """What THIS interpreter's installed distributions lack for requirements.txt -- one
+    readable line per problem, [] when every line (and everything those need, recursively,
+    with markers and extras evaluated) is satisfied.
+
+    Offline and read-only: importlib.metadata over the installed .dist-info, no pip, no
+    network. Anything it cannot judge -- an option line (-r, --index-url), a direct URL, no
+    `packaging` at all -- is reported as a problem, because "cannot tell" must lead to the
+    install (which pip then decides), never to a stamp that says it is fine."""
+    req = REQUIREMENTS if req is None else Path(req)
+    try:
+        text = req.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        return ["requirements.txt could not be read (%s)" % e]
+    loaded = _load_packaging()
+    if loaded is None:
+        return ["requirements.txt cannot be checked here: no 'packaging' module in %s"
+                % sys.executable]
+    Requirement, InvalidRequirement = loaded
+    import importlib.metadata as md
+
+    problems = []
+    todo = []
+    for line in _requirement_lines(text):
+        if line.startswith("-"):
+            problems.append("an option line cannot be checked without pip: %s" % line)
+            continue
+        try:
+            r = Requirement(line)
+        except InvalidRequirement:
+            problems.append("unreadable requirement line: %s" % line)
+            continue
+        if _marker_applies(r.marker, [""]):
+            todo.append((r, None))
+
+    seen = set()
+    parsed = {}
+    index = _installed_index(md)
+    while todo:
+        r, parent = todo.pop()
+        needed_by = "" if parent is None else " (needed by %s)" % parent
+        if getattr(r, "url", None):
+            problems.append("%s is a direct URL requirement, which only pip can check%s"
+                            % (r.name, needed_by))
+            continue
+        found = index.get(_canonical_name(r.name))
+        if found is None:
+            problems.append("%s is not installed%s" % (r.name, needed_by))
+            continue
+        name, version, requires = found
+        name = name or r.name
+        try:
+            ok = (not r.specifier) or r.specifier.contains(version, prereleases=True)
+        except Exception:
+            ok = False
+        if not ok:
+            problems.append("%s %s is installed, %s%s is required%s"
+                            % (name, version, r.name, r.specifier, needed_by))
+            continue
+        key = (_canonical_name(name), frozenset(r.extras))
+        if key in seen:
+            continue
+        seen.add(key)
+        extras = [""] + sorted(r.extras)
+        for dep in requires:
+            if _only_for_other_extras(dep, extras):
+                continue
+            d = parsed.get(dep)
+            if d is None:
+                try:
+                    d = parsed[dep] = Requirement(dep)
+                except InvalidRequirement:
+                    continue        # someone else's malformed metadata is not ours to judge
+            if _marker_applies(d.marker, extras):
+                todo.append((d, name))
+    # One line per problem, in a stable order, without repeats.
+    return sorted(set(problems))
+
+
+def distributions_missing_files(paths=None) -> list:
+    """[("name==version", "a missing file")] for every distribution in THIS interpreter whose
+    RECORD names a file that is not on disk. Bytecode caches are skipped (deleting them is
+    legitimate); everything else a RECORD lists -- .py, .pyd, data -- is expected to exist."""
+    import importlib.metadata as md
+    out = []
+    seen = set()
+    listing = {}
+
+    def present(path: str) -> bool:
+        # One directory listing per directory rather than one stat per file: a venv RECORD set
+        # is tens of thousands of files, and a per-file exists() took ~19 s on the owner's PC.
+        parent, name = os.path.split(os.path.normpath(path))
+        names = listing.get(parent)
+        if names is None:
+            try:
+                names = {n.lower() if os.name == "nt" else n for n in os.listdir(parent)}
+            except OSError:
+                names = set()
+            listing[parent] = names
+        return (name.lower() if os.name == "nt" else name) in names
+
+    for dist in (md.distributions() if paths is None else md.distributions(path=list(paths))):
+        try:
+            name, version = dist.metadata["Name"], dist.version
+            files = dist.files or []
+        except Exception:
+            continue
+        key = _canonical_name(name)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        for f in files:
+            s = str(f).replace("\\", "/")
+            if s.endswith(".pyc") or "__pycache__/" in s:
+                continue
+            try:
+                if not present(str(f.locate())):
+                    out.append(("%s==%s" % (name, version), s))
+                    break
+            except Exception:
+                continue
+    return out
+
+
+def _broken_distributions(py: str) -> list:
+    """distributions_missing_files() as seen by the interpreter `py` (the venv pip just wrote
+    into). A check that cannot run reports nothing: the import sentinel after it still runs."""
+    from tools.childproc import run as _run_child
+    try:
+        r = _run_child([py, str(Path(__file__).resolve()), "--list-broken-dists"], timeout=300)
+    except Exception:
+        return []
+    if r.returncode != 0:
+        return []
+    rows = []
+    for line in (r.stdout or "").splitlines():
+        if line.startswith("- ") and "\t" in line:
+            spec, _, missing = line[2:].partition("\t")
+            rows.append((spec.strip(), missing.strip()))
+    return rows
+
+
+def _running_in_project_venv() -> bool:
+    try:
+        return (sys.prefix != getattr(sys, "base_prefix", sys.prefix)
+                and os.path.samefile(sys.prefix, str(ROOT / ".venv")))
+    except OSError:
+        return False
+
+
+def venv_unsatisfied(req: Path = None) -> list:
+    """unsatisfied_requirements() as seen by the PROJECT venv, whichever interpreter is
+    running this. In-process when that is the venv (start_all runs --check-deps with it);
+    otherwise asked of the venv's own python, since another interpreter's site-packages says
+    nothing about the venv's."""
+    if _running_in_project_venv() or not VENV_PYTHON.exists():
+        return unsatisfied_requirements(req)
+    from tools.childproc import run as _run_child
+    args = [str(VENV_PYTHON), str(Path(__file__).resolve()), "--list-unsatisfied"]
+    if req is not None:
+        args += ["--requirements", str(req)]
+    r = _run_child(args, timeout=120)
+    if r.returncode != 0:
+        detail = (r.stderr or r.stdout or "").strip().splitlines()
+        return ["the .venv python could not check requirements.txt (%s)"
+                % (detail[-1] if detail else "exit %s" % r.returncode)]
+    return [l[2:] for l in r.stdout.splitlines() if l.startswith("- ")]
+
+
+def check_deps(state_file: Path = None, req: Path = None) -> tuple:
+    """(rc, problems) for --check-deps. rc 0: the venv satisfies requirements.txt (the stamp
+    matches, or it did not and the probe found everything installed -- the stamp is then
+    RECORDED, atomically, so the next start takes the fast path); rc 3: an install is needed.
+
+    Writes state.json only in that one case, and only the stamp."""
+    state_file = STATE_FILE if state_file is None else state_file
+    state = load_state(state_file)
+    if not is_done(state, "install_deps"):
+        return 3, ["install_deps has not completed on this machine"]
+    if not deps_are_stale(state, req):
+        return 0, []
+    problems = venv_unsatisfied(req)
+    if problems:
+        return 3, problems
+    state[DEPS_HASH_KEY] = requirements_hash(req)
+    save_state(state, state_file)
+    return 0, []
+
+
+def sync_deps(state_file: Path = None, req: Path = None, log_dir: Path = None) -> int:
+    """--sync-deps: bring the venv up to date with requirements.txt, for start_all.
+
+    Under install_lock the whole way: the state is re-read after the lock is taken, because the
+    copy that held it may just have done the install. Satisfied -> stamp (no pip). Otherwise the
+    install_deps step itself runs (pip's output to a file under .setup/logs, no pip self-upgrade)
+    and is marked done with its stamp. Prints exactly one verdict line last:
+        deps: ok | deps: recorded | deps: installed (...) | deps: failed: <what and what to do>
+    """
+    state_file = STATE_FILE if state_file is None else state_file
+    log_dir = DEPS_LOG_DIR if log_dir is None else Path(log_dir)
+    try:
+        with install_lock(Path(state_file).parent):
+            state = load_state(state_file)
+            done = is_done(state, "install_deps")
+            if done and not deps_are_stale(state, req):
+                _print_safe("deps: ok")
+                return 0
+            problems = venv_unsatisfied(req)
+            if done and not problems:
+                state[DEPS_HASH_KEY] = requirements_hash(req)
+                save_state(state, state_file)
+                _print_safe("deps: recorded (the .venv already satisfies requirements.txt)")
+                return 0
+            pip_log = log_dir / ("deps_install_%s.log" % time.strftime("%Y%m%d_%H%M%S"))
+            log("    .venv does not satisfy requirements.txt: %s" % "; ".join(problems[:5] or
+                ["install_deps has not completed on this machine"]))
+            log("    installing -- pip output: %s" % pip_log)
+            try:
+                step_install_deps(state=state, state_file=state_file, pip_log=pip_log,
+                                  rerun=RERUN_START_ALL, upgrade_pip=False)
+            except StepError as e:
+                log("    FAILED: %s" % e)
+                _print_safe("deps: failed: %s" % e)
+                return 1
+            mark_done(state, "install_deps", state_file)
+            _print_safe("deps: installed (pip output: %s)" % pip_log)
+            return 0
+    except InstallLockTimeout as e:
+        _print_safe("deps: failed: %s -- re-run %s once it has finished" % (e, RERUN_START_ALL))
+        return 1
+
+
+def configured_proxy() -> str | None:
+    """The proxy this run was given (setup.bat derives it from the system, D10), if any."""
+    for k in ("HTTPS_PROXY", "https_proxy", "HTTP_PROXY", "http_proxy", "ALL_PROXY"):
+        v = (os.environ.get(k) or "").strip()
+        if v:
+            return v
+    return None
+
+
+def _redact_userinfo(text: str) -> str:
+    """scheme://user:password@host -> scheme://***@host. A proxy that needs a password is set
+    as HTTPS_PROXY=http://USER:PASSWORD@host:port (setup.bat's own advice), and the failure
+    text below lands in the startup summary file and a desktop notification."""
+    return re.sub(r"(://)[^/@\s]+@", r"\1***@", text or "")
+
+
+#: Where each caller tells the reader to go after a pip failure. setup/quickstart are run by a
+#: person in a window; start_all runs hidden and fixes its own environment, so its reader is
+#: told to run start_all.bat again -- never to go and run setup.bat.
+RERUN_SETUP = "quickstart.bat (or setup.bat)"
+RERUN_START_ALL = "start_all.bat"
+
+
+def _pip_failure_message(rerun: str = RERUN_SETUP, detail: str = "") -> str:
+    """What to say when pip fails. On a proxied network the likely cause is the proxy, and
+    certificate advice sends the reader to the wrong fix (D10). `detail` is pip's own last
+    error line when its output was captured to a file (the start_all path runs hidden)."""
+    head = "pip install -r requirements.txt failed"
+    if detail:
+        head += ": " + detail
+    proxy = configured_proxy()
+    if proxy:
+        return _redact_userinfo(
+            "%s. This PC reaches the internet through a proxy (%s), and it was passed to pip. "
+            "If the error mentions 'ProxyError', '407', 'Tunnel connection failed' or a "
+            "timeout, the proxy refused the connection: ask IT whether pypi.org and "
+            "files.pythonhosted.org are allowed through it for your account, or set "
+            "HTTPS_PROXY to the proxy they tell you to use, then re-run %s."
+            % (head, proxy, rerun))
+    where = ("in this window first" if rerun == RERUN_SETUP
+             else "as a Windows user environment variable")
+    return _redact_userinfo(
+        "%s (network or a wheel build). If this network needs a proxy that Windows does not "
+        "know about, set HTTPS_PROXY=http://<proxy-host>:<port> %s. Re-running %s retries "
+        "this step." % (head, where, rerun))
+
+
+def _last_pip_error(pip_log: Path) -> str:
+    """The line of pip's output that says what went wrong: its last 'ERROR:' line, else the
+    last line naming an error, else the last line at all. Bounded, and never raises."""
+    try:
+        lines = [l.strip() for l in Path(pip_log).read_text(encoding="utf-8", errors="replace")
+                 .splitlines() if l.strip()]
+    except OSError:
+        return ""
+    # pip prints "ERROR: pip's dependency resolver does not currently take into account ..." on
+    # SUCCESSFUL installs too (measured in this repo's 2026-09-24 install log); it names no failure.
+    lines = [l for l in lines if "dependency resolver does not currently take into account" not in l]
+    pick = ([l for l in lines if l.startswith("ERROR:")]
+            or [l for l in lines if "error" in l.lower()]
+            or lines)
+    return _redact_userinfo(pick[-1][:300]) if pick else ""
+
+
+#: The PEM setup.bat / start_all.ps1 build with scripts/ca_bundle.ps1: every root and
+#: intermediate this machine trusts (LocalMachine + CurrentUser), plus .setup/ca-extra.pem.
+CA_BUNDLE = ROOT / ".setup" / "ca-bundle.pem"
+
+#: The explicit, last-resort switch that turns pip's certificate checking OFF for PyPI.
+INSECURE_PIP_ENV = "SETUP_PIP_TRUSTED_HOST"
+
+_PYPI_HOSTS = ("pypi.org", "files.pythonhosted.org", "pypi.python.org")
+
+
+def _usable_pem(path: str | os.PathLike | None) -> str | None:
+    """`path` if it is a readable file holding at least one PEM certificate, else None. A path
+    that names nothing, or a DER .cer, given to pip --cert fails every download with an error
+    about the bundle rather than the network -- so it is not offered to pip at all."""
+    if not path:
+        return None
+    try:
+        p = Path(str(path).strip().strip('"'))
+        with open(p, "rb") as fh:
+            head = fh.read(1 << 20)
+    except OSError:
+        return None
+    return str(p) if b"-----BEGIN CERTIFICATE-----" in head else None
+
+
+def pip_tls_args() -> tuple:
+    """(pip arguments, one line saying what they are) for talking to PyPI (INST-09).
+
+    WHAT THIS REPLACED. Every install used to pass --trusted-host for the three PyPI hosts,
+    i.e. pip's certificate checking was OFF on every machine, every run -- the workaround for a
+    TLS-inspecting proxy whose root CA pip's bundled certifi does not carry. But setup.bat and
+    start_all.ps1 already export the roots this machine trusts (ca_bundle.ps1, which reads the
+    Windows stores the proxy's CA is deployed to), so the fix that keeps verification ON was
+    already on disk: point pip at it with --cert. ON THE COMMAND LINE, not only through
+    REQUESTS_CA_BUNDLE: a pre-set PIP_CERT / pip.ini `cert` would otherwise win, and the venv's
+    pip may be the pre-truststore one ensurepip seeded, which reads nothing else.
+
+    WHICH BUNDLE. PIP_CERT first (the operator's own pip setting), then the exported machine
+    bundle, then REQUESTS_CA_BUNDLE / CURL_CA_BUNDLE, then SSL_CERT_FILE last -- on a real PC
+    here SSL_CERT_FILE is an operator's single-root .cer kept for another tool, which is not a
+    bundle PyPI can be verified against off that network.
+
+    NO BUNDLE is not a reason to disable anything: pip >= 24.2 verifies against the Windows
+    certificate store itself (truststore), the same store ca_bundle.ps1 reads -- so where that
+    export fails (it refuses when fewer than 5 roots are readable) pip's default is still the
+    right thing to try.
+
+    --trusted-host SURVIVES ONLY AS AN EXPLICIT OPT-IN (SETUP_PIP_TRUSTED_HOST=1), never as an
+    automatic fallback: a retry-without-verification on a certificate error is exactly what a
+    man-in-the-middle would provoke. When it is set, it is said, every run."""
+    if (os.environ.get(INSECURE_PIP_ENV) or "").strip() in ("1", "true", "yes"):
+        args = []
+        for h in _PYPI_HOSTS:
+            args += ["--trusted-host", h]
+        return args, ("pip TLS: certificate checking is OFF for %s because %s=1 is set. "
+                      "Remove it once .setup\\ca-extra.pem holds this network's root CA."
+                      % (", ".join(_PYPI_HOSTS), INSECURE_PIP_ENV))
+    for source, value in (("PIP_CERT", os.environ.get("PIP_CERT")),
+                          ("ca_bundle.ps1", CA_BUNDLE),
+                          ("REQUESTS_CA_BUNDLE", os.environ.get("REQUESTS_CA_BUNDLE")),
+                          ("CURL_CA_BUNDLE", os.environ.get("CURL_CA_BUNDLE")),
+                          ("SSL_CERT_FILE", os.environ.get("SSL_CERT_FILE"))):
+        pem = _usable_pem(value)
+        if pem:
+            return ["--cert", pem], "pip TLS: verified against %s (%s)" % (pem, source)
+    return [], ("pip TLS: verified against pip's own roots and the Windows certificate store "
+                "(no exported bundle at %s)" % CA_BUNDLE)
+
+
+def _looks_like_tls_failure(text: str) -> bool:
+    t = (text or "").upper()
+    return any(k in t for k in ("CERTIFICATE_VERIFY_FAILED", "SSLERROR", "SSLCERTVERIFICATIONERROR",
+                                "UNABLE TO GET LOCAL ISSUER", "SELF SIGNED CERTIFICATE IN"))
+
+
+def _tls_failure_advice(rerun: str) -> str:
+    return ("pip could not verify PyPI's certificate. This network inspects TLS with a root CA "
+            "this PC's certificate stores do not hold. Ask IT for that root CA (.cer or .pem), "
+            "save it as %s, and re-run %s -- it is added to the bundle and checking stays on. "
+            "Only if that is impossible: set %s=1 and re-run, which turns certificate checking "
+            "OFF for PyPI. / PyPI の証明書を検証できませんでした。社内のルート CA 証明書を "
+            "%s に置いて %s を再実行してください。"
+            % (ROOT / ".setup" / "ca-extra.pem", rerun, INSECURE_PIP_ENV,
+               ROOT / ".setup" / "ca-extra.pem", rerun))
+
+
+def step_install_deps(state: dict | None = None, state_file: Path = None, *,
+                      pip_log: Path | None = None, rerun: str = RERUN_SETUP,
+                      upgrade_pip: bool = True) -> None:
+    """pip install -r requirements.txt into the venv, then prove the core imports work.
+
+    `pip_log`: pip's output goes to this file instead of the console (the hidden start_all
+    path, where a console is nobody's to read). `rerun`: what the failure text tells the
+    reader to run again. `upgrade_pip`: the best-effort pip self-upgrade needs the network even
+    when every requirement is already met, which the daily path must not wait on.
+
+    Serialised against every other install into this venv by install_lock (re-entrant, so the
+    --sync-deps caller that already holds it is not blocked by itself)."""
+    state_file = STATE_FILE if state_file is None else state_file
+    with install_lock(Path(state_file).parent):
+        _install_deps_locked(state, pip_log=pip_log, rerun=rerun, upgrade_pip=upgrade_pip)
+
+
+def _install_deps_locked(state, *, pip_log, rerun, upgrade_pip) -> None:
     step_header("Installing Python dependencies (requirements.txt)")
     py = str(venv_python())
-    req = ROOT / "requirements.txt"
+    req = REQUIREMENTS
     if not req.exists():
         raise StepError("requirements.txt not found at repo root.")
 
-    # Corporate TLS-inspecting proxy: its root CA is not in pip's bundled certifi store,
-    # so pip otherwise dies with SSL CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
-    # certificate") on pypi.org / files.pythonhosted.org. Pass --trusted-host ON THE COMMAND
-    # LINE so the bypass applies regardless of whether a user/system pip.ini is read (the
-    # venv may be a uv-provisioned CPython that does not pick up %APPDATA%\pip\pip.ini).
-    trusted = [
-        "--trusted-host", "pypi.org",
-        "--trusted-host", "files.pythonhosted.org",
-        "--trusted-host", "pypi.python.org",
-    ]
+    # TLS: verified, with this machine's own trusted roots (INST-09). See pip_tls_args.
+    trusted, tls_note = pip_tls_args()
+    log("    " + tls_note)
 
-    # Best-effort pip upgrade; never fatal.
-    subprocess.call([py, "-m", "pip", "install", *trusted, "--upgrade", "pip", "--quiet"])
-
-    rc = subprocess.call([py, "-m", "pip", "install", *trusted, "-r", str(req)])
+    out = None
+    if pip_log is not None:
+        Path(pip_log).parent.mkdir(parents=True, exist_ok=True)
+        out = open(pip_log, "a", encoding="utf-8")
+    try:
+        redirect = {} if out is None else {"stdout": out, "stderr": subprocess.STDOUT}
+        if upgrade_pip:
+            # Best-effort pip upgrade; never fatal.
+            subprocess.call([py, "-m", "pip", "install", *trusted, "--upgrade", "pip", "--quiet"],
+                            **redirect)
+        if out is not None:
+            out.flush()
+        # A FILE THAT MOVED BETWEEN DISTRIBUTIONS IS DELETED BY THE UPGRADE THAT MOVED IT.
+        # Measured on this repository's own venv, 2026-09-24: fastmcp 2.14.7 -> 3.4.7 moved the
+        # fastmcp/ package into the new fastmcp-slim distribution. pip installed fastmcp-slim
+        # first, THEN uninstalled fastmcp 2.14.7 -- whose RECORD still listed
+        # fastmcp/server/server.py, dependencies.py, ... -- and deleted the files it had just
+        # written. pip exited 0, `import fastmcp` still worked (the old sentinel import passed),
+        # and the server and the bridge died on `cannot import name 'FastMCP'` /
+        # `fastmcp.server.dependencies`. A fresh venv (CI) never sees it; an upgrade of an
+        # existing one does, on setup.bat and start_all alike. So every distribution's RECORD is
+        # checked against the disk before and after, and whatever pip left missing files is
+        # reinstalled in place at the version now installed (--force-reinstall --no-deps).
+        # BEFORE AND AFTER, NOT AFTER ALONE: a venv carries old, harmless gaps of its own (a
+        # RECORD naming a MANIFEST.in the wheel never shipped); repairing those on every
+        # install would fetch packages this install never touched, and one that stays "broken"
+        # after its reinstall would fail every install forever.
+        before = {spec for spec, _ in _broken_distributions(py)}
+        rc = subprocess.call([py, "-m", "pip", "install", *trusted, "-r", str(req)], **redirect)
+        broken = []
+        if rc == 0:
+            broken = [b for b in _broken_distributions(py) if b[0] not in before]
+            if broken:
+                log("    pip left installed packages missing their own files; reinstalling "
+                    "them in place: %s" % ", ".join(b[0] for b in broken))
+                if out is not None:
+                    out.flush()
+                rc2 = subprocess.call([py, "-m", "pip", "install", *trusted, "--force-reinstall",
+                                       "--no-deps", *[b[0] for b in broken]], **redirect)
+                if rc2 == 0:
+                    still = {spec for spec, _ in _broken_distributions(py)}
+                    broken = [b for b in broken if b[0] in still]
+    finally:
+        if out is not None:
+            out.close()
     if rc != 0:
+        if pip_log is not None:
+            detail = _last_pip_error(pip_log) or "(pip printed nothing)"
+            try:
+                whole = Path(pip_log).read_text(encoding="utf-8", errors="replace")[-20000:]
+            except OSError:
+                whole = detail
+            if _looks_like_tls_failure(whole):
+                raise StepError("pip install -r requirements.txt failed: %s -- full pip output: "
+                                "%s. %s" % (detail, pip_log, _tls_failure_advice(rerun)))
+            raise StepError(_pip_failure_message(
+                rerun, "%s -- full pip output: %s" % (detail, pip_log)))
+        # pip's own output went to this console, so the reader has the error text in front of
+        # them; say what to do if it is the certificate one.
+        raise StepError(_pip_failure_message(rerun) + " If pip's error above mentions "
+                        "CERTIFICATE_VERIFY_FAILED: " + _tls_failure_advice(rerun))
+    if broken:
+        where = (" -- full pip output: %s" % pip_log) if pip_log is not None else ""
         raise StepError(
-            "pip install -r requirements.txt failed (network or a wheel build). "
-            "Re-running quickstart.bat (or setup.bat) retries this step."
-        )
+            "pip reported success, but these installed packages are missing their own files "
+            "and reinstalling them did not restore them: %s%s. Re-running %s retries this step."
+            % ("; ".join("%s (missing e.g. %s)" % (b[0], b[1]) for b in broken[:5]), where, rerun))
 
-    # pip returning 0 is NECESSARY but not SUFFICIENT: a partial download, a
-    # broken wheel, or an install against the wrong interpreter can leave core
-    # deps unimportable while pip still exits 0. Verify by actually importing a
-    # CORE sentinel packages in the venv (including the v0.3 headless LOCAL_LOOP
-    # execution path). sqlite3 is from the standard library, but checking it here also
-    # catches unusually stripped Python distributions. If any import fails to
-    # import, the environment is not usable; raise a novice-readable StepError.
-    sentinels = ["fastmcp", "httpx", "dotenv", "playwright", "psutil", "sqlite3"]
-    check = subprocess.run(
-        [py, "-c", "import " + ", ".join(sentinels)],
-        capture_output=True, text=True,
-    )
-    if check.returncode != 0:
-        detail = (check.stderr or check.stdout or "").strip().splitlines()
-        last = detail[-1] if detail else "(no error text)"
+    # pip returning 0 is NECESSARY but not SUFFICIENT -- the fastmcp-slim case above passed
+    # `import fastmcp`. So the proof is the one the verify step uses: main.py imported in a child
+    # on the venv's python, and its registered tools counted. .env may not exist yet on a first
+    # install (gen_env runs after this step), and main.py reads MCP_API_KEY at import, so the
+    # child gets .env's values and a placeholder key when there is none -- never written anywhere.
+    count, detail = _import_main_in_venv(for_install=True)
+    if count is _IMPORT_TIMED_OUT:
+        # Not evidence of a broken install (D26: a first import under antivirus can be slow);
+        # the verify step and the server's own start still import it.
+        log("    WARN: importing main.py took longer than %d s; not treated as a failure"
+            % VERIFY_IMPORT_TIMEOUT_S)
+    elif count is None:
+        where = (" (pip output: %s)" % pip_log) if pip_log is not None else ""
         raise StepError(
-            "Dependencies did not import after install: could not 'import %s' in "
-            ".venv. This usually means the download was incomplete or a package "
-            "failed to build. Check your internet connection, then re-run "
-            "quickstart.bat (or setup.bat) to retry. Technical detail: %s"
-            % (", ".join(sentinels), last)
-        )
+            "Dependencies installed, but the server code (main.py) does not import with them, "
+            "so the environment is not usable%s. This usually means a download was incomplete "
+            "or a package failed to build. Check your internet connection, then re-run %s to "
+            "retry. Technical detail: %s" % (where, rerun, detail or "(no error text)"))
+    else:
+        log("    OK: main.py imports with the installed packages; registered tool count = %d"
+            % count)
 
     # IMPORTANT: 'playwright' is pulled in (for the optional relay/bridge), but
     # we deliberately DO NOT run 'playwright install'. The relay attaches to an
@@ -430,33 +1176,185 @@ def step_install_deps() -> None:
     # existing Edge/Chrome -- it never drives a Playwright-managed browser. A
     # 'playwright install' would download ~400MB of browser binaries for nothing
     # and can require extra permissions. So: no browser download here, on purpose.
-    log("    OK: dependencies installed and import-verified (server + headless LOCAL_LOOP)")
+    log("    OK: dependencies installed and verified")
+    # RECORDED BESIDE THE FLAG, AND ONLY ON SUCCESS: the hash names the requirements.txt this
+    # install satisfied, so run_all can tell when a pull has changed it (D5). The driver's
+    # mark_done saves it together with the flag.
+    if state is not None:
+        state[DEPS_HASH_KEY] = requirements_hash(req)
 
 
 # --------------------------------------------------------------------------- #
 # STEP: gen_env
 # --------------------------------------------------------------------------- #
+#: Used only when .env.example is missing from the checkout. The template is the source of
+#: truth; this is the floor under it.
+_FALLBACK_DEFAULTS = (
+    ("MCP_UNLOCK_TTL_DAYS", "30"),
+    # SEC-02: an unlocked identity alone never suffices. Also tools/security.py's own default.
+    ("MCP_REQUIRE_UNLOCK_TOKEN", "1"),
+    ("MCP_ALLOWED_BASE", "~"),
+    ("TASK_JOB_APPROVAL_MODE", "default"),
+    ("MCP_TOOL_MAP", "1"),
+    ("MCP_TOOL_MAP_MAX", "8"),
+    ("MCP_REVIEW_P2C", "0"),
+    ("MCP_EXECUTION_PROFILES", "0"),
+    ("MCP_DEEP_REVIEW_TRANSPORT", "auto"),
+    ("MCP_LOCAL_REVIEW_MAX_CONCURRENT", "2"),
+    ("MCP_LOCAL_ROTATE_AFTER_TURNS", "3"),
+    ("MCP_LOCAL_EDGE_MB_LIMIT", "1400"),
+)
+
+#: Template keys that are SECRETS: never copied from the template (its values are
+#: placeholders); the secret branch below mints them instead.
+_SECRET_TEMPLATE_KEYS = ("MCP_API_KEY", "MCP_API_KEY_PROTECTED", "MCP_UNLOCK_PASSWORD", "MCP_UNLOCK_PASSWORD_PROTECTED")
+
+
+def missing_template_lines(current: str, example_text: str | None) -> tuple:
+    """(lines_to_append, keys_left_commented) for an EXISTING .env.
+
+    EVERY ACTIVE KEY OF THE TEMPLATE, NOT A HAND-KEPT SUBSET (D6). This used to append seven
+    named defaults, so a .env that existed before bootstrap ran -- configure_env.ps1 creates
+    one holding only the agent URLs when start_all runs first -- never received the other
+    template keys: MCP_ALLOWED_BASE=~ (absent, the file tools reached every drive),
+    MCP_TOOL_MAP=1 / MCP_TOOL_MAP_MAX (absent, Copilot Studio's tool budget overflowed) and
+    MCP_UNLOCK_TTL_DAYS. The list had to be remembered and was not; deriving it cannot drift.
+
+    NEVER OVERWRITES. A key with an active line keeps its value, whatever it is. A key the
+    user has COMMENTED OUT is also left alone and reported: `# MCP_TOOL_MAP=1` is a statement
+    (e.g. a Claude Code user who wants every tool registered), and re-activating it behind
+    their back would be the overwrite this function promises not to do.
+    """
+    have = env_file.active_keys(current)
+    commented = env_file.commented_keys(current) - have
+    if example_text is not None:
+        pairs = env_file.example_assignments(example_text)
+    else:
+        pairs = [(k, "%s=%s" % (k, v)) for k, v in _FALLBACK_DEFAULTS]
+    out, left, seen = [], [], set()
+    for key, line in pairs:
+        if key in seen or key in _SECRET_TEMPLATE_KEYS or key in have:
+            seen.add(key)
+            continue
+        seen.add(key)
+        if key in commented:
+            left.append(key)
+            continue
+        out.append(line)
+    return out, left
+
+
+#: Secrets minted by THIS process, held in memory only, so the end of the run can repeat them
+#: (D1). Never written anywhere; show_only is the only thing that reads it.
+_MINTED_THIS_RUN: list = []
+
+
+def _show_secrets_box(items: list, repeated: bool = False) -> None:
+    """Frame the freshly minted secrets so they cannot scroll past unnoticed (D1).
+
+    The unlock password was printed as one plain line in the middle of the install output, and
+    .env keeps only its DPAPI-protected form -- so a window closed before it was copied lost it,
+    and nothing on screen said where to find it again (the two messages that tried both pointed
+    at a script that did not print it). Framed, repeated at the end of setup, and naming the
+    command that shows it again.
+    """
+    bar = "    " + "#" * 75
+    show_only("")
+    show_only(bar)
+    if repeated:
+        show_only("    #  YOUR SECRETS AGAIN (the same values printed earlier in this run)")
+    else:
+        show_only("    #  COPY THESE NOW -- you paste them into Copilot Studio")
+    show_only("    #")
+    for label, value in items:
+        show_only("    #  %-32s %s" % (label + ":", value))
+    show_only("    #")
+    show_only("    #  .env keeps the unlock password only in PROTECTED form, so opening .env")
+    show_only("    #  will not show it. To see both again at any time, double-click")
+    show_only("    #      copilot_studio_values.bat      (in this folder)")
+    show_only(bar)
+    show_only("")
+
+
+def _remember_and_show(items: list) -> None:
+    _MINTED_THIS_RUN.extend(items)
+    _show_secrets_box(items)
+
+
+def repeat_minted_secrets() -> None:
+    """Called at the very end of a run: the one-time display must be impossible to miss."""
+    if _MINTED_THIS_RUN:
+        _show_secrets_box(list(_MINTED_THIS_RUN), repeated=True)
+
+
+_AGAIN_HINT = ("Show them again with copilot_studio_values.bat "
+               "(scripts\\copilot_studio_values.ps1)")
+
+
 def step_gen_env() -> None:
     step_header("Preparing .env")
     env_path = ROOT / ".env"
     example = ROOT / ".env.example"
 
     if env_path.exists():
-        # Preserve every existing value/secret, but backfill newly introduced safe defaults.
-        # This is deliberately append-only and never changes a user's explicit 0/1/2 choice.
-        current = env_path.read_text(encoding="utf-8-sig")
-        missing = []
-        for key, value in (
-            ("TASK_JOB_APPROVAL_MODE", "default"),
-            ("MCP_REVIEW_P2C", "0"),
-            ("MCP_EXECUTION_PROFILES", "0"),
-            ("MCP_DEEP_REVIEW_TRANSPORT", "auto"),
-            ("MCP_LOCAL_REVIEW_MAX_CONCURRENT", "2"),
-            ("MCP_LOCAL_ROTATE_AFTER_TURNS", "3"),
-            ("MCP_LOCAL_EDGE_MB_LIMIT", "1400"),
-        ):
-            if not any(line.strip().startswith(key + "=") for line in current.splitlines()):
-                missing.append(f"{key}={value}")
+        # Preserve every existing value/secret, but backfill every key the template defines
+        # and this file lacks. Append-only; never changes a value the user has.
+        # Read with its own line endings kept, so the append below writes in the same ones.
+        current = env_file.read_text(env_path)
+        # SECURITY MIGRATION: normalize BOTH legacy plaintext auth aliases in memory before
+        # the first persistence call.  Migrating API -> writing -> migrating unlock used to
+        # transiently re-save the still-plaintext unlock password.  The final env sink now
+        # fails closed on either legacy alias, so the conversion is deliberately one batch.
+        _lines = current.splitlines()
+        _had_trailing_nl = current.endswith(("\n", "\r"))
+        _nl = env_file.newline_of(current)
+        _has_protected_api = any(
+            line.lstrip().startswith("MCP_API_KEY_PROTECTED=") for line in _lines)
+        _has_protected_unlock = any(
+            line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=") for line in _lines)
+        _legacy_api = None
+        _legacy_unlock = None
+        _kept = []
+        for _line in _lines:
+            _stripped = _line.lstrip()
+            if _stripped.startswith("MCP_API_KEY="):
+                if _legacy_api is None:
+                    _legacy_api = _line.split("=", 1)[1].strip()
+                continue
+            if _stripped.startswith("MCP_UNLOCK_PASSWORD="):
+                if _legacy_unlock is None:
+                    _legacy_unlock = _line.split("=", 1)[1].strip()
+                continue
+            _kept.append(_line)
+
+        def _legacy_env_value(raw):
+            if raw is None:
+                return None
+            if len(raw) >= 2 and raw[0] == raw[-1] and raw[0] in ("'", '"'):
+                return raw[1:-1]
+            return raw
+
+        _migrated_keys = []
+        if _legacy_api is not None:
+            if not _has_protected_api:
+                _kept.append("MCP_API_KEY_PROTECTED="
+                             + protect_secret(_legacy_env_value(_legacy_api)))
+            _migrated_keys.append("MCP_API_KEY")
+        if _legacy_unlock is not None:
+            if not _has_protected_unlock:
+                _kept.append(UNLOCK_PASSWORD_PROTECTED_VAR + "="
+                             + protect_secret(_legacy_env_value(_legacy_unlock)))
+            _migrated_keys.append("MCP_UNLOCK_PASSWORD")
+        if _migrated_keys:
+            current = _nl.join(_kept) + (_nl if _had_trailing_nl else "")
+            env_file.atomic_write_text(env_path, current)
+            log("    OK: migrated legacy clear-text auth secret(s) to DPAPI-protected storage: "
+                + ", ".join(_migrated_keys))
+        example_text = example.read_text(encoding="utf-8-sig") if example.exists() else None
+        missing, left_commented = missing_template_lines(current, example_text)
+        if left_commented:
+            log("    NOTE: left commented out as you had them (not re-enabled): "
+                + ", ".join(left_commented))
 
         # THE SECRETS ARE ALSO A MISSING KEY. The block above only ever backfilled non-secret
         # defaults, so an existing .env that had lost MCP_API_KEY or the unlock password (a bad
@@ -468,36 +1366,59 @@ def step_gen_env() -> None:
         # if the key is already present (even blank/placeholder -- that is the user's value to
         # keep or fix), it is NOT touched. We never overwrite an existing secret here.
         secret_lines = []
-        have_api = any(line.lstrip().startswith("MCP_API_KEY=") for line in current.splitlines())
+        have_api = any((line.lstrip().startswith("MCP_API_KEY=") or line.lstrip().startswith("MCP_API_KEY_PROTECTED=")) for line in current.splitlines())
         have_unlock = any(
             line.lstrip().startswith("MCP_UNLOCK_PASSWORD=")
             or line.lstrip().startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "=")
             for line in current.splitlines()
         )
         minted_unlock = None
+        # THE KEY NAMES ARE COLLECTED SEPARATELY, NOT RECOVERED FROM THE LINES LATER.
+        #
+        # The transcript line below used to read them back with `s.split("=", 1)[0]`, which is
+        # correct and is a sanitizer nobody can see: it leaves a data flow from the minted
+        # secret to the file write sitting in the source, so the clear-text-storage finding
+        # stayed open (alert #30) and a later edit dropping the split would restore a real leak
+        # silently. show_only, twenty lines up, was made a separate function rather than a
+        # `transcribe=False` flag for exactly this reason -- "a property of the shape rather
+        # than of an argument" -- and this is the same rule applied to the same file twice.
+        #
+        # A list of names that never held a value cannot leak one.
+        minted_keys = []
+        minted_api = None
         if not have_api:
-            secret_lines.append("MCP_API_KEY=" + secrets.token_hex(20))
+            minted_api = secrets.token_hex(20)
+            secret_lines.append("MCP_API_KEY_PROTECTED=" + protect_secret(minted_api))
+            minted_keys.append("MCP_API_KEY_PROTECTED")
         if not have_unlock:
             minted_unlock = secrets.token_hex(8)
             secret_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protect_secret(minted_unlock))
+            minted_keys.append(UNLOCK_PASSWORD_PROTECTED_VAR)
 
         appended = missing + secret_lines
         if appended:
-            suffix = "" if not current or current.endswith(("\n", "\r")) else "\n"
-            env_path.write_text(current + suffix + "\n".join(appended) + "\n", encoding="utf-8")
+            # ATOMIC (D28): a truncated .env makes the next run mint a new MCP_API_KEY, and
+            # Copilot Studio then gets 401 with every local check green.
+            env_file.atomic_edit_text(env_path, env_file.append_lines(current, appended))
             if missing:
-                log("    OK: .env already exists; added safe default(s): " + ", ".join(missing))
-            if secret_lines:
+                log("    OK: .env already exists; added the template key(s) it lacked: "
+                    + ", ".join(line.split("=", 1)[0] for line in missing))
+            if minted_keys:
                 # Name the KEYS, never the values, in the transcript -- same rule the fresh-.env
                 # path follows: the log file is what an operator is asked to send when setup fails.
                 log("    OK: .env was missing required secret(s); generated: "
-                    + ", ".join(s.split("=", 1)[0] for s in secret_lines))
+                    + ", ".join(minted_keys))
+                # ON SCREEN ONLY (show_only never reaches the transcript). A NEW BEARER IS SHOWN
+                # TOO: it replaces whatever Copilot Studio holds, so it must be re-pasted, and it
+                # used to be minted without a word.
+                shown = []
+                if minted_api is not None:
+                    shown.append(("Bearer token (MCP_API_KEY)", minted_api))
                 if minted_unlock is not None:
-                    # ON SCREEN ONLY (show_only never reaches the transcript): the protected form
-                    # is what lands in .env, so this print is the one chance to read the real value.
-                    show_only("    Your unlock password:           " + minted_unlock)
-                    _transcribe("    (a new unlock password was shown on screen; not recorded here. "
-                                "Re-read it with scripts/copilot_studio_values.ps1)")
+                    shown.append(("Unlock password", minted_unlock))
+                _remember_and_show(shown)
+                _transcribe("    (the new secret(s) were shown on screen; not recorded here. "
+                            + _AGAIN_HINT + ")")
         else:
             log("    OK: .env already exists (left untouched)")
         return
@@ -510,8 +1431,8 @@ def step_gen_env() -> None:
         lines = example.read_text(encoding="utf-8-sig").splitlines()
     else:
         lines = [
-            "MCP_API_KEY=replace",
-            "MCP_UNLOCK_PASSWORD=replace",
+            "MCP_API_KEY_PROTECTED=dpapi:generated-by-setup",
+            "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:generated-by-setup",
             "MCP_UNLOCK_TTL_DAYS=30",
             "MCP_ALLOWED_BASE=~",
         ]
@@ -519,9 +1440,9 @@ def step_gen_env() -> None:
     out_lines = []
     for line in lines:
         stripped = line.lstrip()
-        if stripped.startswith("MCP_API_KEY="):
-            out_lines.append("MCP_API_KEY=" + api_key)
-        elif stripped.startswith("MCP_UNLOCK_PASSWORD="):
+        if stripped.startswith("MCP_API_KEY=") or stripped.startswith("MCP_API_KEY_PROTECTED="):
+            out_lines.append("MCP_API_KEY_PROTECTED=" + protect_secret(api_key))
+        elif stripped.startswith("MCP_UNLOCK_PASSWORD=") or stripped.startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "="):
             out_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protected_unlock_code)
         else:
             # Keep MCP_ALLOWED_BASE=~ and leave the agent-URL vars commented as-is.
@@ -530,16 +1451,20 @@ def step_gen_env() -> None:
     # Note: the MCP_*_AGENT_URL / bridge vars stay commented in .env.example, so
     # they remain commented here too. They are optional and embed tenant GUIDs;
     # the user fills them in only if they use the relay/bridge.
-    env_path.write_text("\n".join(out_lines) + "\n", encoding="utf-8")
+    # ATOMIC (D28). Two quickstarts at once each saw no .env and each wrote one with different
+    # secrets; the lock in quickstart.bat stops that, and this makes sure the file that wins is
+    # whole.
+    # CRLF, as the text-mode write_text this replaces produced on Windows.
+    env_file.atomic_write_text(env_path, "\r\n".join(out_lines) + "\r\n")
     log("    OK: wrote .env with fresh random MCP_API_KEY and MCP_UNLOCK_PASSWORD")
     # ON SCREEN ONLY. These two are freshly minted and are printed so they can be copied into
     # Copilot Studio; they must not reach .setup/bootstrap.log, which is the file an operator
     # is asked to send when setup fails. A note goes to the transcript in their place, because
     # "the credentials were shown here" is worth recording and the values are not.
-    show_only("    Your Bearer token (MCP_API_KEY): " + api_key)
-    show_only("    Your unlock password:           " + unlock_code)
-    _transcribe("    (Bearer token and unlock password were shown on screen; "
-                "not recorded here. Re-read them with scripts/copilot_studio_values.ps1)")
+    _remember_and_show([("Bearer token (MCP_API_KEY)", api_key),
+                        ("Unlock password", unlock_code)])
+    _transcribe("    (the Bearer token and unlock password were shown on screen; not recorded "
+                "here. " + _AGAIN_HINT + ")")
     log("    Keep these secret. Optional MCP_*_AGENT_URL vars stay commented in .env.")
 
 
@@ -651,18 +1576,22 @@ def step_dev_tunnel() -> None:
     else:
         log("      devtunnel create %s" % tunnel)
     log("      devtunnel port create %s -p 8000 --protocol http" % tunnel)
+    # --tenant IS A FLAG, NOT A VALUE (D16; `devtunnel access create --help`, CLI 1.0.1516:
+    # "Allow or deny all users in the current Entra tenant"). The text told people to append a
+    # tenant id, which the CLI takes as a stray argument.
     if anon:
         log("      devtunnel access create %s -p 8000 --anonymous" % tunnel)
     else:
-        log("      devtunnel access create %s -p 8000 --tenant <your-tenant-id>   # Entra-scoped (hardened)" % tunnel)
+        log("      devtunnel access create %s -p 8000 --tenant   # the signed-in account's Entra tenant"
+            % tunnel)
     log("      devtunnel host %s" % tunnel)
     if not anon:
         log("    NOTE: MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1, so anonymous access is NOT")
-        log("          granted above. A remote client (e.g. Copilot Studio) will NOT be able to")
-        log("          reach this tunnel until you either (a) set MCP_TUNNEL_ALLOW_ANONYMOUS=1 and")
-        log("          re-run (accepts exposing the server to the anonymous internet, gated only")
-        log("          by the MCP_API_KEY app-layer key), or (b) use Entra/tenant-scoped access")
-        log("          instead (devtunnel access create <name> --tenant <your-tenant-id>).")
+        log("          granted, and an anonymous grant already on the tunnel is REMOVED. A remote")
+        log("          client (e.g. Copilot Studio) will NOT be able to reach this tunnel until")
+        log("          quickstart.bat asks how it may connect (A = anonymous, gated only by the")
+        log("          MCP_API_KEY app-layer key; T = the signed-in account's Entra tenant,")
+        log("          'devtunnel access create <name> --tenant').")
 
     # Whether the tunnel has actually been created/logged-in is something we
     # cannot complete unattended: 'devtunnel user login' needs an interactive
@@ -677,14 +1606,62 @@ def step_dev_tunnel() -> None:
         return
     log("    OK: devtunnel reports a signed-in user.")
 
-    # Short-circuit: if .env already has a non-empty MCP_TUNNEL_URL, the tunnel
-    # was already provisioned on a previous run. Do NOT re-host (each host costs
-    # ~30s) on every resume -- just report it and move on.
+    # Short-circuit: if .env already carries a URL THIS MACHINE minted, the tunnel was
+    # provisioned on a previous run here. Do NOT re-host (each host costs ~30s) on every
+    # resume -- just report it and move on.
+    #
+    # "ALREADY SET" WAS NOT THE QUESTION. This tested only that the value was non-empty, and
+    # the comment justified that with "provisioned on a previous run" -- true only if the
+    # previous run was on this machine. A .env carried over from another PC, which is how a
+    # new machine is normally set up, also has a non-empty URL, so setup skipped provisioning
+    # and left the old machine's tunnel address in place. Everything reported OK; the URL
+    # pasted into Copilot Studio pointed at a tunnel this machine does not host, and the
+    # operator was left with a working-looking setup that cannot connect. Reported from a
+    # real new-PC setup, 2026-09-08.
+    #
+    # So the URL is trusted only when MCP_TUNNEL_HOST says this machine minted it. A URL with
+    # no host recorded is of unknown provenance: re-provision, because hosting the SAME tunnel
+    # name yields the same URL, so the cost of being wrong is ~30s while the cost of trusting
+    # it is the silent failure above. The re-host writes MCP_TUNNEL_HOST, so this is a
+    # one-time correction per machine.
+    #
+    # AND A .env THAT PROVABLY CAME FROM ANOTHER MACHINE LOSES ITS TUNNEL KEYS FIRST (D7). This
+    # step used to re-provision with the RECORDED name and then stamp it as this machine's --
+    # so when the same Microsoft account owned that tunnel, BOTH machines hosted it and Copilot
+    # Studio's calls were split between them; setup_devtunnel.ps1's fix was undone here, one
+    # step earlier. The same test as there ("provably" = a host stamp naming another machine,
+    # or no stamp and a generated name with another machine's suffix), and the same classifier:
+    # tools/env_portability.machine_bound_keys_in decides which keys cannot travel.
+    env_path = ROOT / ".env"
+    env_text = env_file.read_text(env_path)
+    foreign = _foreign_env_reason(env_text)
+    if foreign:
+        aside = _set_aside_machine_bound_tunnel_keys(env_path, env_text)
+        if aside is None:
+            log("    WARN: .env came from another machine (%s), and tools/env_portability.py "
+                "could not be used to decide what to set aside. Not provisioning here; quickstart "
+                "STEP 4 (setup_devtunnel.ps1) will handle it." % foreign)
+            return
+        log("    NOTE: .env came from another machine: %s." % foreign)
+        log("          Hosting that tunnel here too would make both machines serve one URL, so")
+        log("          these are set aside (kept as comments): %s" % (", ".join(aside) or "(none)"))
+        log("          This machine gets its own tunnel; paste its NEW URL into Copilot Studio.")
+        tunnel = safe_default
+
     existing_url = _read_env_value("MCP_TUNNEL_URL")
-    if existing_url:
-        log("    OK: MCP_TUNNEL_URL already set in .env (%s); skipping re-host."
+    recorded_host = _read_env_value("MCP_TUNNEL_HOST")
+    if existing_url and recorded_host and _host_is_mine(recorded_host):
+        log("    OK: MCP_TUNNEL_URL already set in .env by this machine (%s); skipping re-host."
             % existing_url)
         return
+    if existing_url and recorded_host:
+        log("    NOTE: .env carries a MCP_TUNNEL_URL minted on '%s', not this machine (%s)."
+            % (recorded_host, _this_host()))
+        log("          That tunnel is not hosted here, so the URL would not connect. "
+            "Re-provisioning for this machine.")
+    elif existing_url:
+        log("    NOTE: .env carries a MCP_TUNNEL_URL with no record of which machine minted "
+            "it. Re-provisioning to be sure it belongs to this one.")
 
     # Signed in and no URL recorded yet: finish the rest unattended -- create the
     # tunnel + port + access (idempotent), briefly host it to obtain the public
@@ -715,6 +1692,52 @@ def _anon_opt_in() -> bool:
     return (v or "").strip().lower() in ("1", "true", "yes")
 
 
+#: `devtunnel access list` prints an allow entry as "+Anonymous [connect]" (measured on the
+#: owner's machine; the same parse as setup_devtunnel.ps1's Test-AnonymousInListing).
+_ANONYMOUS_GRANT_RE = re.compile(r"\+\s*Anonymous\b")
+
+
+def _access_level_args(tunnel: str, level: int | None) -> list:
+    return [tunnel] + (["-p", str(level)] if level else [])
+
+
+def _grant_anonymous_access(dt: str, tunnel: str, port: int) -> None:
+    """Grant anonymous connect at the tunnel and at its port. An "already exists"/"conflict"
+    answer is success; anything else is a real error for the caller to report."""
+    for level in (None, port):
+        res = _dt_run(dt, "access", "create", *_access_level_args(tunnel, level), "--anonymous")
+        text = (res.stdout or "") + (res.stderr or "")
+        if res.returncode != 0 and not re.search(r"already exists|already in use|conflict", text, re.I):
+            raise StepError("'devtunnel access create %s --anonymous' failed (rc=%d)"
+                            % (" ".join(_access_level_args(tunnel, level)), res.returncode))
+
+
+def _revoke_anonymous_access(dt: str, tunnel: str, port: int) -> list:
+    """Reset every level whose access list shows an anonymous grant or cannot be read.
+    Returns the levels reset (None = the tunnel itself). A failed reset raises: the grant may
+    still be in place, and saying nothing would be the defect this exists to fix."""
+    reset = []
+    for level in (None, port):
+        where = ("port %d of '%s'" % (level, tunnel)) if level else ("tunnel '%s'" % tunnel)
+        res = _dt_run(dt, "access", "list", *_access_level_args(tunnel, level))
+        listing = (res.stdout or "") + (res.stderr or "")
+        if res.returncode == 0 and not _ANONYMOUS_GRANT_RE.search(listing):
+            continue
+        if res.returncode != 0:
+            log("    could not read the access list of %s -> resetting it so no anonymous "
+                "grant can remain" % where)
+        else:
+            log("    %s has an ANONYMOUS grant from an earlier choice -> removing it "
+                "(access reset)" % where)
+        r = _dt_run(dt, "access", "reset", *_access_level_args(tunnel, level))
+        if r.returncode != 0:
+            raise StepError("'devtunnel access reset' failed for %s (rc=%d), so an anonymous "
+                            "grant may still be in place. quickstart STEP 4 tries again and "
+                            "stops if it cannot remove it" % (where, r.returncode))
+        reset.append(level)
+    return reset
+
+
 def _provision_dev_tunnel(dt: str, tunnel: str) -> None:
     """Ensure the tunnel exists, host it briefly to learn its public URL, and
     write MCP_TUNNEL_NAME/MCP_TUNNEL_URL into .env. Mirrors setup_devtunnel.ps1
@@ -735,26 +1758,27 @@ def _provision_dev_tunnel(dt: str, tunnel: str) -> None:
             log("    Creating tunnel '%s' (NOT anonymous-reachable)..." % tunnel)
             rc1 = _dt_run(dt, "create", tunnel).returncode
         rc2 = _dt_run(dt, "port", "create", tunnel, "-p", str(port), "--protocol", "http").returncode
-        if anon:
-            rc3 = _dt_run(dt, "access", "create", tunnel, "-p", str(port), "--anonymous").returncode
-        else:
-            rc3 = 0
         if rc1 != 0:
             # If create itself failed the tunnel won't be usable; bubble up so the
             # caller turns it into an ActionNeeded with the manual sequence.
             raise StepError("'devtunnel create %s' failed (rc=%d)." % (tunnel, rc1))
-        if rc2 != 0 or (anon and rc3 != 0):
-            log("    WARN: port/access create returned non-zero "
-                "(rc2=%d rc3=%d); continuing -- they may already exist." % (rc2, rc3))
-        if not anon:
-            log("    NOTE: tunnel created WITHOUT anonymous access (MCP_TUNNEL_ALLOW_ANONYMOUS")
-            log("          is not set to 1). A remote client (e.g. Copilot Studio) will NOT be")
-            log("          able to connect until you either:")
-            log("            (a) set MCP_TUNNEL_ALLOW_ANONYMOUS=1 and re-run this step (accepts")
-            log("                exposing the server to the anonymous internet, gated only by the")
-            log("                MCP_API_KEY app-layer key), or")
-            log("            (b) grant Entra/tenant-scoped access instead, e.g.:")
-            log("                devtunnel access create %s --tenant <your-tenant-id>" % tunnel)
+        if rc2 != 0:
+            log("    WARN: port create returned non-zero (rc=%d); continuing -- it may "
+                "already exist." % rc2)
+
+    # ACCESS ON EVERY RUN, BOTH WAYS (D4). This step granted anonymous access when the tunnel
+    # was CREATED and never looked again: an existing tunnel was not re-granted when anonymous
+    # WAS chosen, and -- the dangerous half -- an anonymous grant from an earlier choice was
+    # never REMOVED when it was not. Same rule as setup_devtunnel.ps1 (Resolve-AccessMode,
+    # Revoke-AnonymousAccess): this step has no tenant input, so the mode is "anonymous" when
+    # MCP_TUNNEL_ALLOW_ANONYMOUS opts in, else "none", and "none" resets any level (the tunnel,
+    # or its port) whose access list shows +Anonymous -- or cannot be read, because then the
+    # absence of a grant cannot be shown. A tenant grant on a level without an anonymous one is
+    # left alone; the tenant grant itself is STEP 4's to apply (quickstart asks for it).
+    if anon:
+        _grant_anonymous_access(dt, tunnel, port)
+    else:
+        _revoke_anonymous_access(dt, tunnel, port)
 
     # 2. Obtain the public URL. A freshly-created tunnel has NO port URL in
     #    'devtunnel show' until it has been HOSTED at least once (Host
@@ -811,10 +1835,8 @@ def _dt_run(dt: str, *args: str) -> subprocess.CompletedProcess:
     """Run a devtunnel subcommand, capturing output, never raising. Returns the
     CompletedProcess (rc 124-style sentinel on timeout/spawn failure)."""
     try:
-        return subprocess.run(
-            [dt, *args],
-            capture_output=True, text=True, timeout=60,
-        )
+        from tools.childproc import run as _run_child
+        return _run_child([dt, *args], timeout=60)
     except (OSError, subprocess.SubprocessError):
         return subprocess.CompletedProcess(args=[dt, *args], returncode=124, stdout="", stderr="")
 
@@ -831,6 +1853,93 @@ def _dt_tunnel_url(dt: str, tunnel: str) -> str | None:
     text = (res.stdout or "") + "\n" + (res.stderr or "")
     m = _TUNNEL_URL_RE.search(text)
     return m.group(0) if m else None
+
+
+def _this_host() -> str:
+    """The machine identity recorded beside a minted tunnel URL.
+
+    A devtunnel URL is only reachable while some machine HOSTS that tunnel, so a URL is a
+    fact about a machine, not about an account -- and .env travels between machines. This is
+    what lets a later run tell "I minted this" from "I inherited this".
+
+    platform.node() rather than COMPUTERNAME: same answer on Windows, and it does not return
+    an empty string on a box where the variable is unset. Lowercased because Windows reports
+    the name in either case depending on how it is read, and a case flip must not read as a
+    different machine.
+    """
+    return (platform.node() or "").strip().lower()
+
+
+def _host_is_mine(stamp: str | None) -> bool:
+    """A host stamp names THIS machine: the current identity, or setup_devtunnel.ps1's legacy
+    %COMPUTERNAME% stamp (D22), which is migrated on the next write rather than distrusted."""
+    s = (stamp or "").strip().lower()
+    return bool(s) and s in (_this_host(), (os.environ.get("COMPUTERNAME") or "").strip().lower())
+
+
+def _env_text_value(text: str, key: str) -> str:
+    for line in text.splitlines():
+        s = line.strip()
+        if s.startswith(key + "="):
+            return s.split("=", 1)[1].strip()
+    return ""
+
+
+def _foreign_env_reason(text: str) -> str:
+    """Why the .env `text` provably came from another machine, or "" when nothing proves it (D7).
+
+    Mirrors setup_devtunnel.ps1 section [0]: a host stamp naming a different machine, or -- with
+    no stamp -- a GENERATED name whose hash suffix is not this machine's. A custom name with no
+    stamp proves nothing and is kept: dropping a name this machine really owns would change a
+    working URL.
+
+    DECIDED ON THE TEXT THAT WILL BE REWRITTEN, not through _read_env_value: a decision made from
+    one read and acted on through another can disagree -- and did, in a test that stubbed the
+    reader and so rewrote the real .env it had never looked at."""
+    stamp = _env_text_value(text, "MCP_TUNNEL_HOST").lower()
+    name = _env_text_value(text, "MCP_TUNNEL_NAME")
+    if stamp and not _host_is_mine(stamp):
+        return "its tunnel was recorded on '%s', not this machine ('%s')" % (stamp, _this_host())
+    if not stamp and _is_generated_tunnel_name(name):
+        m = re.match(r"^-([0-9a-f]+)", name.lower()[len(DEFAULT_TUNNEL_NAME):])
+        if m:
+            suffix = m.group(1)
+            # Legacy setup used a 6-hex SHA-1(machine|user) fingerprint. Recomputing SHA-1 over
+            # identifying data is unnecessary and triggers a real weak-hash finding. Without a
+            # host stamp an old 6-hex name is simply not PROVABLY foreign, so preserve it. New
+            # 8-hex names use SHA-256 and remain attributable to this machine.
+            if len(suffix) == 8 and suffix != _machine_suffix():
+                return ("its tunnel name '%s' was generated on another machine (the suffix is not "
+                        "this machine's)" % name)
+    return ""
+
+
+def _set_aside_machine_bound_tunnel_keys(env_path: Path, text: str) -> list | None:
+    """Comment out, in `text` (the content of `env_path`), the MCP_TUNNEL_* keys
+    tools/env_portability says cannot move to a new machine, and write it back atomically.
+    Returns the keys set aside, or None when the classifier could not be used. The values stay
+    readable as comments, as setup_devtunnel.ps1 leaves them."""
+    try:
+        from tools.env_portability import machine_bound_keys_in
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        keys = [k for k in machine_bound_keys_in(text) if k.startswith("MCP_TUNNEL_")]
+    except Exception:  # noqa: BLE001
+        return None
+    if not keys:
+        return []
+    nl = env_file.newline_of(text)
+    out = []
+    for line in text.splitlines():
+        m = re.match(r"^\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", line)
+        if m and m.group(1) in keys:
+            out.append("# set aside by bootstrap.py: made on another machine, not valid on this one")
+            out.append("# " + line)
+        else:
+            out.append(line)
+    env_file.atomic_edit_text(env_path, nl.join(out) + nl)
+    return keys
 
 
 def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
@@ -866,6 +1975,7 @@ def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
             ln.startswith("# devtunnel (auto)")
             or ln.startswith("MCP_TUNNEL_NAME=")
             or ln.startswith("MCP_TUNNEL_URL=")
+            or ln.startswith("MCP_TUNNEL_HOST=")
         )
     ]
     kept.append(
@@ -875,18 +1985,22 @@ def _write_tunnel_to_env(tunnel: str, url: str | None) -> None:
     kept.append("MCP_TUNNEL_NAME=" + tunnel)
     if url:
         kept.append("MCP_TUNNEL_URL=" + url)
-    # CRLF endings, UTF-8 WITHOUT BOM (encoding='utf-8' never emits a BOM).
-    env_path.write_text("\r\n".join(kept) + "\r\n", encoding="utf-8", newline="")
+        # STAMPED ONLY BESIDE A URL. The host answers "who minted this URL", so writing it
+        # without one would claim provenance for a value that is not there -- and a later run
+        # would then trust an inherited URL that arrives afterwards. When the URL below is a
+        # preserved earlier value rather than one minted now, this still names the machine
+        # that is keeping it, which is the machine that must host it.
+        kept.append("MCP_TUNNEL_HOST=" + _this_host())
+    # CRLF endings, UTF-8 WITHOUT BOM, and ATOMIC (D28): tmp file + rename, never a truncate.
+    env_file.atomic_edit_text(env_path, "\r\n".join(kept) + "\r\n")
 
 
 def _devtunnel_logged_in(dt: str) -> bool:
     """Best-effort: returns True only if 'devtunnel user show' clearly reports a
     logged-in account. Any error / 'not logged in' text -> False (we pause)."""
     try:
-        out = subprocess.run(
-            [dt, "user", "show"],
-            capture_output=True, text=True, timeout=20,
-        )
+        from tools.childproc import run as _run_child
+        out = _run_child([dt, "user", "show"], timeout=20)
     except (OSError, subprocess.SubprocessError):
         return False
     text = (out.stdout + out.stderr).lower()
@@ -917,7 +2031,7 @@ def step_gen_connector() -> None:
     step_header("Generating Copilot Studio connector helper (generated/copilot-connector.md)")
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
     out = GENERATED_DIR / "copilot-connector.md"
-    out.write_text(_connector_markdown("<your MCP_API_KEY from .env>"), encoding="utf-8")
+    out.write_text(_connector_markdown("<Bearer token shown by copilot_studio_values.bat>"), encoding="utf-8")
     log("    OK: wrote " + str(out))
 
 
@@ -930,10 +2044,10 @@ sign-in. The bootstrap does NOT automate the Studio UI.
 
 ## What you need
 
-- The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `.\\scripts\\start.ps1`)
+- The server running locally:  `http://127.0.0.1:8000/mcp`  (start with `quickstart.bat` or `start_all.bat`)
 - A public HTTPS URL via Dev Tunnels:
   `https://<your-tunnel>-8000.<region>.devtunnels.ms/mcp`
-- Your Bearer key (from `.env`, `MCP_API_KEY`):
+- Your Bearer key (stored DPAPI-protected; reveal it with `copilot_studio_values.bat`):
 
       Authorization: Bearer {bearer_value}
 
@@ -960,11 +2074,13 @@ sign-in. The bootstrap does NOT automate the Studio UI.
   Bearer key above plus a per-IP `unlock(password)` for mutating tools still
   apply -- but the tunnel itself is then reachable by anyone on the internet,
   so only opt in if you accept that. The hardened alternative is Entra/tenant-
-  scoped access (`devtunnel access create <name> --tenant <your-tenant-id>`).
+  scoped access (`devtunnel access create <name> --tenant`: `--tenant` is a flag
+  meaning the Entra tenant of the account devtunnel is signed in with; it takes
+  no id).
 - If Microsoft changes the Studio UI, the field names may differ slightly but
   the three inputs are always: server URL, header name, header value.
-- Keep the Bearer key secret. Rotate it by editing `MCP_API_KEY` in `.env` and
-  restarting the server.
+- Keep the Bearer key secret. Rotate it with `rotate_secrets.bat --api-key`, then
+  restart the server and run `copilot_studio_values.bat` to copy the new value.
 """
 
 
@@ -975,7 +2091,7 @@ def step_verify() -> None:
     step_header("Verifying environment")
 
     # 1. Required .env keys must be present and non-placeholder.
-    required = ["MCP_API_KEY"]
+    required = ["MCP_API_KEY_PROTECTED"]
     missing = []
     for k in required:
         v = _read_env_value(k)
@@ -990,12 +2106,19 @@ def step_verify() -> None:
             ".env is missing or has placeholder values for: " + ", ".join(missing)
             + ". Re-run quickstart.bat (or setup.bat) (the gen_env step fills these)."
         )
-    log("    OK: .env has required keys (MCP_API_KEY and unlock password)")
+    log("    OK: .env has protected Bearer and unlock credentials")
 
-    # 2. Import main.py and report the tool count. main.py reads MCP_API_KEY from
+    # 2. Import main.py and report the tool count. main.py materializes MCP_API_KEY from
     #    the environment at import, so load .env into os.environ first.
     _load_dotenv_into_env(ROOT / ".env")
     count = _count_tools_via_subprocess()
+    if count is _IMPORT_TIMED_OUT:
+        raise VerifyTimedOut(
+            "Importing main.py took longer than %d seconds, so it was stopped before it "
+            "finished. Nothing is known to be broken: this happens on a slow PC, often while "
+            "antivirus scans the freshly installed packages for the first time. The installed "
+            "packages are KEPT. Wait a minute and re-run quickstart.bat (or setup.bat); a second "
+            "import is much faster." % VERIFY_IMPORT_TIMEOUT_S)
     if count is None:
         raise StepError(
             "Could not import main.py to count tools. Check that dependencies "
@@ -1023,41 +2146,101 @@ def _load_dotenv_into_env(env_path: Path) -> None:
         os.environ[k.strip()] = v.strip()
 
 
-def _count_tools_via_subprocess() -> int | None:
+#: How long the verify import of main.py may take (D26). MEASURED 2026-09-24 on the owner's PC:
+#: a fresh clone (no __pycache__) importing main with the real .venv took 8.7 s, 8.8 s and
+#: 10.2 s. The old cap of 120 s was ~12x that; a slow PC with on-access antivirus scanning a
+#: few thousand freshly installed .pyc files for the first time can plausibly spend a good part
+#: of it. 300 s is ~30x the measurement: generous for a one-off first import, and still short
+#: enough that a genuinely hung import is reported within a coffee break.
+VERIFY_IMPORT_TIMEOUT_S = 300
+
+#: Sentinel: the import was stopped by the timeout, as opposed to failing.
+_IMPORT_TIMED_OUT = object()
+
+
+class VerifyTimedOut(StepError):
+    """verify could not finish in time. NOT evidence that the install is broken, so the
+    driver must not clear install_deps over it (D26): clearing it turned a slow first import
+    into a full reinstall on every run -- each reinstall re-triggering the same antivirus scan
+    that made the import slow."""
+
+
+def _count_tools_via_subprocess():
     """Import main.py in a CHILD process (using the venv interpreter) and print
     the registered tool count. A child process keeps main.py's import side
     effects (and its heavy deps) out of the bootstrap process, and uses the
-    venv where the deps were actually installed."""
-    py = str(venv_python())
-    code = (
-        "import os, sys; "
-        "sys.path.insert(0, r'%s'); "
-        "import main; "
-        "tm = getattr(main.mcp, '_tool_manager', None); "
-        "n = len(tm._tools) if tm is not None else len(main.TOOLS); "
-        "print(n)" % str(ROOT)
-    )
-    env = dict(os.environ)
-    try:
-        res = subprocess.run(
-            [py, "-c", code],
-            capture_output=True, text=True, cwd=str(ROOT), env=env, timeout=120,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return None
-    if res.returncode != 0:
+    venv where the deps were actually installed.
+
+    Returns the count, None on a failed import, or _IMPORT_TIMED_OUT."""
+    count, detail = _import_main_in_venv()
+    if count is None and detail:
         # Explain the wall of traceback to a novice BEFORE dumping it, so they
         # know the stack trace below is the reason main.py would not load (not
         # some unrelated crash of the bootstrap itself).
         sys.stderr.write(
             "The server code (main.py) failed to load; the technical error follows:\n"
         )
-        sys.stderr.write(res.stderr)
-        return None
+        sys.stderr.write(detail if detail.endswith("\n") else detail + "\n")
+    return count
+
+
+def _import_main_in_venv(for_install: bool = False):
+    """(count | None | _IMPORT_TIMED_OUT, error text) -- THE check the verify step and the
+    install step share: import main.py in a child on the venv's python, count its tools.
+
+    for_install: the child's environment also gets .env's values and, when there is still no
+    MCP_API_KEY (a first install runs before gen_env), a placeholder -- in the CHILD only."""
+    py = str(venv_python())
+    # %r, NOT r'%s' (D23): a raw string literal cannot hold a path with an apostrophe in it
+    # (<repo> under a folder named with a quote), so verify failed on every run there and cleared
+    # install_deps each time. repr() produces a literal that round-trips any path.
+    code = (
+        "import os, sys; "
+        "sys.path.insert(0, %r); "
+        "import main; "
+        "tm = getattr(main.mcp, '_tool_manager', None); "
+        "n = len(tm._tools) if tm is not None else len(main.TOOLS); "
+        "print(n)" % str(ROOT)
+    )
+    env = dict(os.environ)
+    if for_install:
+        env.update(_dotenv_values(ROOT / ".env"))
+        if not (env.get("MCP_API_KEY") or "").strip():
+            env["MCP_API_KEY"] = "install-verify-placeholder"
     try:
-        return int(res.stdout.strip().splitlines()[-1])
+        from tools.childproc import run as _run_child
+        res = _run_child([py, "-c", code], cwd=str(ROOT), env=env,
+                         timeout=VERIFY_IMPORT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        return _IMPORT_TIMED_OUT, ""
+    except (OSError, subprocess.SubprocessError) as e:
+        return None, str(e)
+    if res.returncode != 0:
+        err = (res.stderr or res.stdout or "").strip()
+        if for_install:
+            lines = err.splitlines()
+            err = lines[-1] if lines else ""
+        return None, err
+    try:
+        return int(res.stdout.strip().splitlines()[-1]), ""
     except (ValueError, IndexError):
-        return None
+        return None, "main.py imported but printed no tool count: %r" % (res.stdout or "")[-200:]
+
+
+def _dotenv_values(env_path: Path) -> dict:
+    """.env as a dict, parsed exactly as _load_dotenv_into_env does, without touching os.environ."""
+    out = {}
+    try:
+        text = env_path.read_text(encoding="utf-8-sig")
+    except OSError:
+        return out
+    for line in text.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#") or "=" not in s:
+            continue
+        k, v = s.split("=", 1)
+        out[k.strip()] = v.strip()
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1109,6 +2292,24 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
         if cleared:
             log("    .venv is missing, so these are not done after all: %s" % ", ".join(cleared))
             save_state(state, state_file)
+    elif is_done(state, "ensure_venv") and not _venv_usable():
+        # EXISTS IS NOT USABLE (D20, D8). A .venv whose python cannot run, or runs a Python too
+        # old for the requirements, passed the existence check above and was then skipped on
+        # its flag -- so ensure_venv, the step that repairs exactly this, never ran again.
+        cleared = [n for n in ("ensure_venv", "install_deps", "verify")
+                   if state.get("done", {}).pop(n, None)]
+        log("    .venv exists but cannot run or is older than Python %d.%d, so these are not "
+            "done after all: %s" % (MIN_PYTHON[0], MIN_PYTHON[1], ", ".join(cleared)))
+        save_state(state, state_file)
+
+    # A DONE FLAG FOR A DIFFERENT requirements.txt IS NOT DONE (D5). Cleared, not merely
+    # warned about: a `git pull` that adds a dependency is the normal way this file changes,
+    # and the only thing that installs it is this step running again.
+    if deps_are_stale(state):
+        state.get("done", {}).pop("install_deps", None)
+        log("    requirements.txt has changed since dependencies were last installed "
+            "(or this install predates that record); installing them again.")
+        save_state(state, state_file)
 
     # First-line resume banner: when at least one step is already done, tell the
     # user up front how far along we are and which step we resume from, so an
@@ -1137,13 +2338,16 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             log("")
             log("ACTION NEEDED: %s; then re-run quickstart.bat (or setup.bat)" % str(e))
             log("(Progress saved. Completed steps will be skipped on the next run.)")
+            repeat_minted_secrets()
             return 2
         except StepError as e:
             # RE-RUNNING MUST REPAIR, NOT RETRY THE SAME SKIP. When verification fails, the steps
             # that were supposed to produce what it verifies are no longer trustworthy -- whatever
             # their flags say -- so they are cleared. Otherwise the advice below sends the reader
             # back into a run that skips straight to the same failure.
-            if name in ALWAYS_REVALIDATE:
+            # EXCEPT WHEN IT DID NOT FAIL BUT RAN OUT OF TIME (D26): a timeout says nothing about
+            # the install, and clearing it made a slow PC reinstall everything on every run.
+            if name in ALWAYS_REVALIDATE and not isinstance(e, VerifyTimedOut):
                 for stale in REPAIRED_BY_RERUN:
                     if state.get("done", {}).pop(stale, None):
                         log("    (cleared '%s' so the next run rebuilds it)" % stale)
@@ -1151,10 +2355,17 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             log("")
             log("FAILED at step '%s': %s" % (name, str(e)))
             log("(Progress saved. Re-run quickstart.bat (or setup.bat) to retry this step.)")
+            repeat_minted_secrets()
             return 1
     log("")
     log("All steps complete. Environment is ready.")
-    log("Next: start the server with  .\\scripts\\start.ps1")
+    # NOT .\scripts\start.ps1 -- a person never runs a .ps1 by hand; quickstart.bat (which calls
+    # this) and start_all.bat are the only entry points documented for that. quickstart.bat's own
+    # STEP 1 already reads this and moves straight on to its later steps, so this line is mainly
+    # seen when setup.bat/bootstrap.py are run on their own (--status, a retry, etc.).
+    log("Next: quickstart.bat continues automatically from here. To start the server on its "
+        "own (no quickstart), run start_all.bat.")
+    repeat_minted_secrets()
     return 0
 
 
@@ -1206,6 +2417,49 @@ def reset_state(state_file: Path = STATE_FILE) -> int:
     return 0
 
 
+#: What quickstart.bat shows when STEP 4 ends without a usable tunnel access grant. Here, not in
+#: the .bat: cmd corrupts non-ASCII text, and this has to be readable in Japanese too.
+#: Keys: setup_devtunnel.ps1 exit 3 = "none", exit 4 = "unapplied"; "unanswered" = the A/T/N
+#: prompt got no key (no keyboard reached it).
+TUNNEL_ACCESS_ADVICE = {
+    "none": (
+        "STOPPED: no remote access was chosen (N), so nothing remote -- Copilot Studio\n"
+        "included -- can connect, and the remaining steps would fail. Nothing about that needs\n"
+        "fixing right now: local chat and the fleet already work without a Dev Tunnel, and no\n"
+        "Microsoft sign-in was needed for this run either.\n"
+        "Run quickstart.bat again and press:\n"
+        "  A  anonymous: what a Copilot Studio connector using an API key needs (the Bearer\n"
+        "     token is then the only gate in front of the server), or\n"
+        "  T  your Entra tenant only (not verified to work with an API-key connector).\n"
+        "Either one is when the Microsoft sign-in and the Dev Tunnel actually get created.\n"
+        "\n"
+        "停止しました: 外部からの接続は選択されませんでした（N）。Copilot Studio を含め、外部からは\n"
+        "一切接続できないため、この先の手順は失敗します。今すぐ直す必要はありません -- ローカルの\n"
+        "チャットとフリートは Dev Tunnel なしでも動作します。今回は Microsoft のサインインも不要でした。\n"
+        "quickstart.bat をもう一度実行し、次のどちらかを押してください:\n"
+        "  A  匿名: API キーで接続する Copilot Studio のコネクタにはこれが必要です\n"
+        "     （サーバーの前にある関門は Bearer トークンだけになります）\n"
+        "  T  自分の Entra テナントのみ（API キーのコネクタで通るかは未検証）\n"
+        "どちらを選んでも、そのときに Microsoft のサインインと Dev Tunnel の作成が行われます。"),
+    "unapplied": (
+        "STOPPED: the access you chose (A or T) is not on the Dev Tunnel when read back, so\n"
+        "nothing remote can connect yet. Run quickstart.bat again and press the same key. If it\n"
+        "repeats, the lines above show what 'devtunnel access list' returned.\n"
+        "\n"
+        "停止しました: 選択したアクセス許可（A または T）が Dev Tunnel に設定されていません。\n"
+        "このままでは外部から接続できません。quickstart.bat をもう一度実行し、同じキーを押して\n"
+        "ください。繰り返す場合は、上に表示された 'devtunnel access list' の結果を確認してください。"),
+    "unanswered": (
+        "STOPPED: the question \"how should Copilot Studio reach this machine\" got no answer (no\n"
+        "keyboard input reached it), so nothing was granted and the tunnel was not set up.\n"
+        "Double-click quickstart.bat (so it runs in a window you can type into) and press A or T.\n"
+        "\n"
+        "停止しました: 「Copilot Studio からこの PC への接続方法」の質問に回答がありませんでした\n"
+        "（キーボード入力が届いていません）。何も許可せず、トンネルも設定していません。\n"
+        "quickstart.bat をダブルクリックで起動し、A または T を押してください。"),
+}
+
+
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description="Resumable environment bootstrap for m365-copilot-companion-mcp.",
@@ -1214,8 +2468,47 @@ def main(argv=None) -> int:
     g.add_argument("--status", action="store_true", help="print each step done/pending, change nothing")
     g.add_argument("--reset", action="store_true", help="clear saved progress, change nothing on the system")
     g.add_argument("--only", metavar="STEP", help="run a single step by name")
+    g.add_argument("--check-deps", action="store_true",
+                   help="exit 0 if .venv satisfies requirements.txt (recording that in "
+                        ".setup/state.json when only the record was missing), else 3")
+    g.add_argument("--sync-deps", action="store_true",
+                   help="bring .venv up to date with requirements.txt (start_all's daily "
+                        "path): lock, re-check, install if needed, record")
+    g.add_argument("--list-unsatisfied", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--list-broken-dists", action="store_true", help=argparse.SUPPRESS)
+    g.add_argument("--tunnel-access-advice", choices=sorted(TUNNEL_ACCESS_ADVICE),
+                   help=argparse.SUPPRESS)
+    parser.add_argument("--requirements", default=None, help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
 
+    if args.tunnel_access_advice:
+        # quickstart.bat STEP 4: prints only, changes nothing.
+        _print_safe(TUNNEL_ACCESS_ADVICE[args.tunnel_access_advice])
+        return 0
+
+    if args.list_broken_dists:
+        # Internal: step_install_deps asks the venv's python this after every pip install.
+        for spec, missing in distributions_missing_files():
+            _print_safe("- %s\t%s" % (spec, missing))
+        return 0
+    if args.list_unsatisfied:
+        # Internal: venv_unsatisfied() asks the venv's own python this when bootstrap itself
+        # runs on another interpreter.
+        for p in unsatisfied_requirements(Path(args.requirements) if args.requirements else None):
+            _print_safe("- " + p)
+        return 0
+    if args.check_deps:
+        # FOR THE DAILY START PATH (D5). start_all.ps1 asks this on every start; the matching
+        # stamp answers in milliseconds, and only a missing/different stamp reads the installed
+        # metadata. Exit 3 is "an install is needed" -- start_all then runs --sync-deps itself.
+        rc, problems = check_deps()
+        if rc == 0:
+            log("Dependencies satisfy requirements.txt.")
+            return 0
+        log("The .venv does not satisfy requirements.txt: %s" % "; ".join(problems[:8]))
+        return 3
+    if args.sync_deps:
+        return sync_deps()
     if args.status:
         return print_status()
     if args.reset:

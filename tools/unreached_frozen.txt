@@ -1,0 +1,88 @@
+# The unreached inventory as it stood on 2026-09-13, after the burn-down from 94.
+#
+# NOT THE CURRENT STATE -- the current state is BASELINE in
+# tools/test_nothing_new_is_built_without_a_caller.py, which may only shrink. This file never
+# changes. Its only job is to distinguish a name that was already here from one somebody added,
+# because the two are indistinguishable once both sit in the same set.
+#
+# A name added after this snapshot must carry a reason in that module s REASONS table. The
+# entries below carry none: they predate the requirement, and back-filling 77 reasons by
+# guesswork would have produced 77 sentences nobody had checked.
+
+bench/attempt_snapshots.py::transitions
+bench/companionbench/baseline.py::repeat_suite
+bench/companionbench/baseline.py::why_they_flip
+bench/companionbench/job_authority.py::free_port
+bench/companionbench/runner.py::solver_feedback_entries
+bench/remote/broker_client.py::ping
+bench/skill_use_log.py::compare_runs
+bridge/session_store.py::latest_attached
+bridge/session_store.py::search_turns
+relay/autonomy_gate.py::constraints_text
+relay/autonomy_gate.py::judge_autonomy
+relay/bestofn_run.py::load_candidate_dir
+relay/chathub.py::collect_text
+relay/execution_profiles.py::validate_runtime
+relay/fleet_toolset.py::unknown_tools
+relay/mechanism_telemetry.py::patch_hash
+relay/profile_token.py::discard_template
+relay/project_memory.py::authorities_in
+relay/project_memory.py::list_themes
+relay/provenance.py::adjudicate
+relay/provenance.py::outranks
+relay/provenance.py::resolved_value
+relay/quota_meter.py::sustainable_workers
+relay/relay_fleet.py::connector_proven
+relay/review_resilience.py::diagnose_after_fresh_replay
+relay/review_resilience.py::looks_like_capability_failure
+relay/review_resilience.py::looks_like_output_filter
+relay/review_resilience.py::looks_like_transient_error
+relay/selfimprove/apply.py::revert
+relay/selfimprove/apply.py::safe_commit
+relay/selfimprove/autonomy.py::lower_to
+relay/selfimprove/autonomy.py::raise_to
+relay/selfimprove/autonomy.py::require
+relay/selfimprove/branches.py::materialize_to_file
+relay/selfimprove/compare.py::transport_versions_differ
+relay/selfimprove/compare.py::withdraw
+relay/selfimprove/diversify.py::diversity_report
+relay/selfimprove/guards.py::is_domain_general
+relay/selfimprove/guards.py::launch_detached
+relay/selfimprove/guards.py::partition_outcomes
+relay/selfimprove/harness_tree.py::branches
+relay/selfimprove/harness_tree.py::justified
+relay/selfimprove/l2.py::run_until
+relay/selfimprove/propose.py::propose_candidates
+relay/selfimprove/record_summary.py::summary_for
+relay/selfimprove/routing.py::held_out_advantage
+relay/selfimprove/run_archive.py::revisions
+relay/selfimprove/runtime_config.py::active_harness_id
+relay/selfimprove/solver_feedback.py::to_hypotheses
+relay/selfimprove/solver_feedback.py::where_distribution
+relay/selfimprove/trace_to_eval.py::record_correction
+relay/solve_policy.py::finalize
+relay/solve_policy.py::plan_and_explain
+relay/transport_policy.py::evolvable_fields
+relay/turn_outcome.py::classify_turns
+relay/turn_outcome.py::is_capacity_signal
+scripts/collect_lens_corpus.py::all_inconclusive
+scripts/collect_lens_corpus.py::load_corpus
+scripts/stale_server_check.py::decide_post_update_action
+scripts/stale_server_check.py::fleet_is_running
+scripts/win/capture_budget.py::acknowledge
+tools/coding_ops.py::survey_worktrees
+tools/coding_ops.py::worktree_scope
+tools/env_portability.py::merge_for_new_machine
+tools/golden.py::run_trajectory
+tools/judge_backend.py::ask_human_async
+tools/judge_backend.py::sampling_judge_async
+tools/lock_state.py::locked_recently
+tools/lock_state.py::locked_since
+tools/lock_state.py::matching_record
+tools/lock_state.py::token_gap
+tools/security.py::clear_presented_token
+tools/security.py::get_client_ip
+tools/security.py::is_trusted_local
+tools/tool_probe.py::classify_probe_reply
+tools/tool_probe.py::next_probe_instruction
+tools/tool_probe.py::verify_probe_reply

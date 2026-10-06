@@ -26,29 +26,69 @@ state machine so the open ones interleave. No threads, no async.
 from __future__ import annotations
 
 import ctypes
+import io
 import json
 import os
 import re
 import threading
 import time
 
-from .acceptance import Check, normalize_checks, run_all_blocking
+from .acceptance import (
+    Check, MalformedCheck as AcceptanceError, normalize_checks, run_all_blocking,
+)
+from . import splittability as _splittability
+from .send_errors import FreshSubmitAmbiguous
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
     GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
-    _is_processing, default_notify, extract_analyze, extract_research, goal_not_seen,
-    has_end_marker,
+    _is_processing, _next_retry_job, default_notify, extract_analyze, extract_research,
+    goal_not_seen, has_end_marker,
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
     conversation_start_label,
 )
 from relay import settle as _settle
 from relay import fanout as fanout_mod
+from relay import fanout_budget as fanout_budget_mod
+from relay import fleet_resume as resume_mod
+from relay.control_markers import CLOSING_INSTRUCTION
+from relay import invariants as _invariants
+
+#: RECORD, not RAISE -- see the check in reset_socket_route. A reset runs after a browser has
+#: already died and an exception there costs the run the reset was meant to save.
+_INV_RESET_KEEPS_NO_TOKEN = _invariants.register(
+    "socket_route.reset_keeps_no_token", "relay.relay_fleet", _invariants.RECORD,
+    "reset_socket_route's docstring says \"Nothing is preserved: not the token, which belongs "
+    "to the context that just died\". It was false for weeks: profile_token kept its own _MEMO "
+    "and the next send could be handed a token minted against a dead browser context")
+# BOUND ONCE, HERE. This was imported inside each of eight call sites, and two sites did
+# not have it in scope: RelayWorker.__init__'s per-goal fan-out judgement and
+# _spawn_children's split event. Both raised NameError into an `except Exception: pass`,
+# so across 5629 telemetry rows neither rung was ever written -- the two that say whether
+# fan-out was eligible for a goal and whether it actually split one. A module-level name
+# cannot be forgotten at a call site; relay/test_a_swallowed_record_is_no_record.py fails
+# if one ever is again. mechanism_telemetry imports nothing but the standard library, so
+# there is no cycle to avoid by deferring it.
+from relay import mechanism_telemetry as _mt
+from relay import first_reply_check
 from relay import effort as effort_mod
+from relay import effort_policy as effort_policy_mod
+from relay import conversation_saving as conv_saving_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
-    freeze_goal_dict, looks_like_policy_refusal, same_task_envelope,
-    task_envelope_from_goal,
+    RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
+    looks_like_policy_refusal, same_task_envelope, task_envelope_from_goal,
 )
+
+#: RecoveryAction -> the word that goes in the record. NOT the enum's own value: "recovered"
+#: reads better than "fresh_replay" to whoever opens the cockpit, and the two strings already in
+#: use are kept exactly so nothing downstream sees a new vocabulary. The two new rows are the
+#: answers that were unreachable while the diagnosis was typed out by hand.
+_RECOVERY_RESULT = {
+    RecoveryAction.FRESH_REPLAY: "recovered",
+    RecoveryAction.DECOMPOSE: "needs_decomposition",
+    RecoveryAction.RETRY_TRANSIENT: "retry_transient",
+    RecoveryAction.MARK_UNRESOLVED: "unresolved",
+}
 
 # A STATUS BELONGS HERE ONLY IF SOMETHING SETS IT. `unresolved_refusal` was in this tuple,
 # in the label map below, in the cockpit's pill table and in the outcome enum -- five places
@@ -58,6 +98,10 @@ from .review_resilience import (
 # The cost of a phantom is not nothing: it reads as a state the system can reach, so anybody
 # reasoning about refusals had a case to consider that cannot occur, and anybody adding a
 # real one would have found the name taken.
+# "interrupted" is DELIBERATELY not here: it is written only by relay/fleet_reaper.py into the
+# sidecars of a DEAD coordinator (resumable work), so no live coordinator ever holds it. Adding
+# it would make an interrupted worker count as finished. Pinned by
+# tests/test_interrupted_status_is_classified_everywhere.py.
 TERMINAL = (
     "done", "stuck", "maxturns", "error", "cancelled",
     "content_refused",
@@ -339,6 +383,166 @@ AGENT_ERR_WINDOW_S = float(os.environ.get("MCP_AGENT_ERR_S", "1200"))     # agen
 # genuinely wedged endpoint stops burning wall-clock quickly.
 NET_RETRY_NOPROGRESS_MAX = int(os.environ.get("MCP_NET_RETRY_NOPROGRESS_MAX", "3"))
 
+# STUCK-CONVERGENCE DETECTOR (mined incident: .fleet/transcripts/r6aa8fc73_a0_w0.jsonl, worker
+# a0_w0, turns 2-11). The no-progress check above only catches a STUCK reply that repeats
+# ITSELF near-verbatim (_norm_for_progress strips a GUID/timestamp and compares what's left).
+# It does NOT catch a worker that reaches the same dead end and writes a fresh paragraph
+# explaining it every time -- which is what actually happened: turn 2 named the exact unresolved
+# question, and every one of the next 9 turns restated the same finding in different words. Each
+# was scored as "progress" (the normalized text never matched the last one) and answered with
+# another RETRY_JOB, so the run spent 9 turns asking the worker to retry a lookup it had already
+# told us, in its own words, would not change.
+#
+# "Reached the same conclusion" therefore cannot be exact-text matching -- it has to be judged
+# on CONTENT, and this reuses the shape tools/skill_lessons.py already settled on for exactly
+# that problem (grouping two freely-worded passages as "the same work"). That module's docstring
+# explains at length why it is NOT `skill_candidates.normalise`-style exact matching: normalising
+# two texts apart just because their wording differs would make this detector require the very
+# byte-identical repetition the no-progress check above already catches, and never fire on the
+# case that actually happened here.
+#
+# DIGITS ARE CONTENT, DELIBERATELY, WHICH IS WHERE THIS DIFFERS FROM skill_lessons._WORD. A
+# number inside a STUCK reason is usually the specific thing distinguishing one failure from
+# another -- a turn count, an error code, an item id -- so two reasons differing only in their
+# digits are NOT the same finding restated; a NEW error code is a new fact, exactly the "genuinely
+# narrows the problem or adds a new fact" case this detector must never stop on. Proven wrong the
+# other way once already: test_admission.py's changing_replies_do_not_early_exit feeds a worker
+# STUCK replies that differ ONLY by an embedded turn number and error code ("一時的なエラー(0回目)、
+# 詳細コード=0", then (1回目)/37, (2回目)/74, ...) to prove a genuinely changing transient outage
+# is never mistaken for a dead end. Dropping digits made every one of those replies tokenise to
+# the exact same five words and read as "converged" on the second reply -- the false stop that
+# test exists to catch, from a second mechanism it predates.
+_STUCK_CONTENT_WORD = re.compile(r"[A-Za-z]{3,}|[0-9]+|[一-鿿]{2,}|[゠-ヿ]{2,}")
+_STUCK_STOPWORDS = frozenset(
+    "the and for with from this that you your please into out all any are was were have "
+    "has had not but its use using can will should".split())
+
+#: Overlap fraction above which two STUCK reasons count as "the same conclusion, reworded".
+#:
+#: NOT tools/skill_lessons.py's MIN_SIMILARITY (0.5) -- CALIBRATED AGAINST BOTH SIDES OF THE
+#: SAME FAILURE, not tuned until one test passed. Including digits above is not enough by
+#: itself: test_admission.py's changing-error-code fixture still shares 5 of its ~6-7 words
+#: turn to turn (only the digits differ), measured at Jaccard 0.56-0.63 across every consecutive
+#: pair -- a genuinely different failure that still reads as mostly-the-same TEXT. The real mined
+#: transcript's STUCK reasons, in contrast, are 15-26 words of dense prose restating one finding;
+#: measured pairwise, turns 5-6/8-9/9-10/10-11 sit at 0.77-1.00 and turn 4-5 (the pair right after
+#: the incident's second STUCK) at 0.57. A threshold has to clear 0.63 to never fire on the
+#: fixture; 0.7 does that with margin and still catches the transcript's clear convergence at
+#: turns 5-6 -- one turn later than a looser bound would have, in exchange for never mistaking a
+#: changing error code for a repeated conclusion. (It misses turn 4-5's 0.57 specifically; that
+#: is the cost of the margin, paid once, not a tuning accident -- see
+#: test_a_nudge_that_repeats_itself_is_not_a_retry.py's real-transcript sanity check.)
+STUCK_CONVERGENCE_SIMILARITY = 0.7
+
+#: Below this many content words, overlap is not evidence either way -- a short reason can
+#: overlap or fail to overlap by chance alone. This is a floor against near-empty text, not the
+#: mechanism that excludes the admission-test fixture above (that fixture has 6-7 words, easily
+#: over any floor low enough to still admit a real one-sentence STUCK reason) -- STUCK_CONVERGENCE_
+#: SIMILARITY is what excludes it, deliberately, so this can stay low.
+STUCK_CONVERGENCE_MIN_WORDS = 4
+
+#: Marks the worker's own conclusion inside a "STUCK: <reason>" reply. The LAST occurrence is
+#: used because the protocol wants the marker on the closing line, but a worker's reasoning
+#: sometimes discusses the word earlier (quoting the instruction back to itself).
+_STUCK_REASON_MARK = re.compile(r"STUCK[:：]\s*", re.IGNORECASE)
+
+
+def _stuck_words(text):
+    return {w.lower() for w in _STUCK_CONTENT_WORD.findall(text or "")} - _STUCK_STOPWORDS
+
+
+def stuck_reason_text(resp, limit=400):
+    """The worker's own stated reason from a "STUCK: <reason>" reply, so that a STUCK THIS
+    MODULE declares on the worker's behalf still carries what the worker actually said, rather
+    than a generic "gave up". In the mined transcript, the operator's real answer was sitting in
+    the worker's own turn-2 reply the entire time; every later turn told it to try again instead
+    of surfacing that reply. Falls back to the whole (trimmed) reply if the marker is somehow
+    absent -- callers only reach this after reported_stuck(resp) has already confirmed one is
+    present, so this is defensive, not the expected path."""
+    text = resp or ""
+    marks = list(_STUCK_REASON_MARK.finditer(text))
+    if not marks:
+        return text.strip()[:limit]
+    tail = text[marks[-1].end():].strip()
+    return (tail or text.strip())[:limit]
+
+
+def _stuck_converged(previous_reason, current_reason):
+    """True when two CONSECUTIVE STUCK reasons are substantially the same conclusion, worded
+    differently. Two is deliberately enough evidence -- the mined incident needed only a second
+    restatement of turn 2's finding to know nothing was going to change; waiting for a third
+    repetition (matching the shape of NET_RETRY_NOPROGRESS_MAX above) would spend another whole
+    retry proving what the second restatement already showed."""
+    a, b = _stuck_words(previous_reason), _stuck_words(current_reason)
+    if len(a) < STUCK_CONVERGENCE_MIN_WORDS or len(b) < STUCK_CONVERGENCE_MIN_WORDS:
+        return False
+    return len(a & b) / float(len(a | b)) >= STUCK_CONVERGENCE_SIMILARITY
+
+# EXHAUSTIVE-COVERAGE-CLAIM OVERRIDE -- a second defect found in the SAME mined incident.
+# Turns 3-11 didn't just restate the same conclusion in different words; several asserted
+# outright that every route had already been checked ("結論不変。全経路実測済みのため再照会
+# はしません", "追加の探索経路はありません"). The claim was false: one table that would have
+# held the answer was never opened. A worker that BELIEVES it already looked everywhere cannot
+# be talked out of that belief by a nudge that argues with it -- "consider a different source"
+# (the fourth _RETRY_ESCALATION_PHRASES entry, copilot_autopilot_relay.py) asks it to
+# reconsider a possibility it has just told us it already ruled out, and gets back a
+# restatement of the same claim, which is exactly what those nine turns are. A second, unrelated
+# run the same day showed the identical shape from a different cause: a worker whose tools were
+# locked wrote that it had verified content against a source it could not actually read. Both are
+# a worker asserting exhaustiveness/verification that did not happen, and both are unfalsifiable
+# from out here -- nothing in this loop can inspect what the worker actually queried.
+#
+# The claim can't be argued with, but it CAN be turned into something checkable: ask the worker
+# to enumerate what it actually looked at, against its own turns, instead of restating its
+# conclusion. In the mined transcript this would have surfaced the never-opened table on the
+# first ask. Deliberately literal and conservative (a handful of phrasings actually seen in
+# these two incidents, not an inferred pattern) -- a false positive here costs one extra turn
+# asking for a list; a false negative costs the ten turns this incident actually cost.
+_EXHAUSTIVE_CLAIM_MARKERS = (
+    "全経路", "追加の探索経路はありません", "全て確認", "全件", "横断",
+)
+
+
+def _claims_exhaustive_search(resp):
+    """True when a reply asserts (in these literal, previously-seen phrasings) that it already
+    covered everything, as opposed to explaining a specific thing it could not find or do."""
+    return any(m in (resp or "") for m in _EXHAUSTIVE_CLAIM_MARKERS)
+
+
+#: One or two sentences, a person's length, naming no source: the enumeration is something the
+#: worker can check against its own turns, and naming a guessed source would just hand it an
+#: answer instead of asking it to find one.
+_EXHAUSTIVE_CLAIM_NUDGE = (
+    "「すべて確認した」という結論そのものには反論しません。代わりに、実際に確認した対象を"
+    "具体的に列挙し、まだ確認していない候補があればそれも挙げてください。"
+    "列挙してもなお本当に手がかりが無ければ最後の行に STUCK: と理由を、見つかれば DONE と"
+    "書いてください。"
+)
+
+
+def _stuck_retry_nudge(resp, count):
+    """The nudge text for the count-th (1-based) transient retry after a STUCK reply.
+
+    PRECEDENCE: an exhaustive-coverage claim (_claims_exhaustive_search) overrides the normal
+    count-based escalation (_next_retry_job) AT ANY COUNT -- including the back-compat window
+    (counts 1-2) that otherwise keeps RETRY_JOB byte-identical for a plain transient failure.
+    Once a worker has asserted it already checked everything, every phrase in the count-based
+    ladder (check your arguments/paths/permissions, or even "consider a different source") asks
+    it to act on a possibility it has just told us it already ruled out. Only the enumeration ask
+    is left that such a worker can actually answer with something NEW (a list of its own turns)
+    rather than a restatement of its conclusion.
+
+    THIS MUST NOT DEFEAT STUCK-CONVERGENCE (_stuck_converged) above, and by construction it
+    can't: the caller runs the convergence comparison and updates self._last_stuck_reason BEFORE
+    choosing a nudge text (this function is only reached once that comparison has already said
+    "not converged yet"). So a worker that answers this enumeration ask with the same conclusion
+    again is simply the NEXT pair _stuck_converged sees, and is caught on its own reply, same as
+    any other repeated STUCK -- the enumeration is one extra chance to notice a gap, not a fresh
+    retry budget."""
+    if _claims_exhaustive_search(resp):
+        return _EXHAUSTIVE_CLAIM_NUDGE
+    return _next_retry_job(count)
+
 # TOOL-BACKEND-UNREACHABLE detector. When the MCP tool path (devtunnel) drops for even a moment, the
 # agent's tool calls fail and it WRONGLY concludes its tools don't exist / aren't assigned and self-
 # locks ("再試行では解消しません / won't respond without new input"). That is INFRA-FALSE (the tools
@@ -464,16 +668,81 @@ CANNED_NONANSWER_MARKERS = (
 _PROCESS_START = time.time()
 
 
-def connector_proven():
-    """True once a tool call has reached this machine's MCP server during this run."""
+#: A SECOND WAY TO BE PROVEN, because process scope has a hole in it. "One process per run, so
+#: process scope is run scope" holds only while a run has SIBLINGS. A single-goal run has one
+#: worker, and that worker is the only possible witness -- so if its first reply is the canned
+#: non-answer, no tool call can ever land in this process and connector_proven() is False by
+#: construction, whatever the truth is. Measured 2026-09-09: an autostarted single-goal run was
+#: filed INFRA_STUCK at 11:34 while .fleet/probe_inbound.json recorded a real list_directory
+#: call arriving at 11:47 -- the connector was demonstrably alive on both sides of the run.
+#: A 900-worker run never shows this: one sibling proves it within seconds and every worker in
+#: the process inherits the proof. So the classification was reliable exactly where it was not
+#: needed, and structurally wrong for the runs autostart produces.
+#:
+#: The bridge's liveness probe stamps that file every MCP_TOOL_PROBE_SEC, independently of any
+#: fleet. It is the SAME kind of evidence -- a tool call actually arriving at this machine's
+#: server, which only the custom agent can cause -- just not one this process caused. Recency
+#: is what makes it mean anything, so the window is derived from the probe interval rather than
+#: picked: shorter than one interval and a healthy machine still reads as unproven.
+#:
+#: THE INTERVAL IS NO LONGER A CONSTANT (the probe now runs only when nothing else has proved the
+#: tool path for a whole interval, default 30 min), so the window follows the configured interval
+#: instead of the old fixed 600 s, and a real tool call that succeeded within it counts as the same
+#: kind of evidence (see connector_proof_source) -- while a fleet is busy no probe is sent at all.
+def _default_proof_window_s():
+    try:
+        from tools import tool_probe as _tp
+        return 2.0 * float(_tp.configured_interval_s())
+    except Exception:
+        return 1200.0
+
+
+CONNECTOR_PROOF_WINDOW_S = float(os.environ.get(
+    "MCP_CONNECTOR_PROOF_S", str(_default_proof_window_s())))
+
+
+def connector_proof_source(now=None):
+    """WHY the connector counts as proven: "run", "probe", or "" for not proven.
+
+    The caller needs the reason, not just the verdict: the REFUSED message used to say a
+    sibling worker had answered, which is true for "run" and false for "probe". Reporting the
+    wrong evidence is its own defect even when the verdict is right.
+    """
     try:
         from tools import tool_probe
-        return float(tool_probe.last_inbound_ts() or 0.0) > _PROCESS_START
+        ts = float(tool_probe.last_inbound_ts() or 0.0)
     except Exception:
-        # Unknowable is not the same as proven. Saying False keeps the old diagnosis, which is
+        # Unknowable is not the same as proven. Saying "" keeps the old diagnosis, which is
         # the conservative direction: it tells the operator to check the browser, which wastes
         # time, rather than telling them a broken connector is fine, which loses the run.
-        return False
+        return ""
+    if ts > _PROCESS_START:
+        return "run"
+    if ts > 0.0 and CONNECTOR_PROOF_WINDOW_S > 0:
+        now = time.time() if now is None else now
+        age = now - ts
+        # A stamp from the FUTURE is a clock problem, not proof. Bounding below costs nothing
+        # and stops a skewed clock reading as permanently proven.
+        if 0.0 <= age <= CONNECTOR_PROOF_WINDOW_S:
+            return "probe"
+    if CONNECTOR_PROOF_WINDOW_S > 0:
+        # THE PROBE NO LONGER RUNS WHILE REAL CALLS ARE LANDING, so its stamp can be hours old on
+        # a machine whose connector is working right now. A real, successful, non-probe tool call
+        # in the window is the same evidence (a call arrived at this server, which only the custom
+        # agent can cause) and the probe skipped itself precisely because of it.
+        try:
+            from tools import fleet_tool_health
+            now = time.time() if now is None else now
+            if fleet_tool_health.last_real_success(now, CONNECTOR_PROOF_WINDOW_S) is not None:
+                return "call"
+        except Exception:
+            pass
+    return ""
+
+
+def connector_proven(now=None):
+    """True once a tool call has reached this machine's MCP server recently enough to count."""
+    return connector_proof_source(now) != ""
 # How long (wall clock) to keep riding out a login-wall canned-non-answer streak before giving up
 # as INFRA_STUCK (sign-in required). Mirrors the AGENT_ERR_WINDOW_S style of bounded-but-generous
 # infra windows. Env-tunable.
@@ -524,12 +793,22 @@ def edge_recover_surface(port=None, open_url=""):
 
 # UNLOCK-REQUIRED detector. Write/exec MCP tools require unlock(password) per client IP
 # (tools/security.py::require_unlocked). When the agent calls a write/exec tool before the
-# (rotating M365 backend) IP is unlocked, the server returns ONE of its two literal error
-# strings (tools/security.py require_unlocked(), ~line 129 and ~line 138):
+# (rotating M365 backend) IP is unlocked, the server returns ONE of its THREE literal error
+# strings (tools/security.py require_unlocked(), ~line 493, ~line 562 and ~line 570):
 #   "[locked: no HTTP request context] Denied: this call ran in-process (test, CLI, or an internal hook), not through the MCP HTTP server. unlock() cannot help here -- it needs the same HTTP context and will fail the same way; do not retry it. Either route the call through the HTTP server, or use an internal *_local path that does not pass this gate (memory_save_local / runlog_append_local)."
+#   "[locked: no valid unlock token for 'x.x.x.x'] The identity in the forwarding header is
+#    not sufficient on its own. Call unlock(password='<password>') and pass the returned
+#    `unlock_token` with the call. ..." -- the IP is already unlocked but neither a matching
+#    fallback token nor an authorized current MCP session established the second factor.
 #   "[locked client IP: 'x.x.x.x'] Mutating and execution tools require an unlock. Call
 #    unlock(password='<password>') first. The unlock is stored per client IP for
 #    MCP_UNLOCK_TTL_DAYS days."
+# This comment used to say "ONE of its two literal error strings" -- true when it was written,
+# false since 2026-08-18 (commit "Make the second key something a caller holds, not something
+# it states") added the middle one above without anyone coming back to update the reader. See
+# relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py for the guard that
+# now makes that kind of drift fail loudly instead of silently: it re-reads tools/security.py's
+# source for every "[locked" literal and asserts LOCKED_MARKERS below covers each one.
 # which the agent echoes. We AUTO-INJECT the unlock: re-anchor the turn to first call the
 # 'unlock' tool with MCP_UNLOCK_PASSWORD read LOCALLY from .env -- deliberately NOT baked into
 # the agent's Copilot Studio instructions (that would expose the password permanently). The
@@ -551,32 +830,12 @@ def edge_recover_surface(port=None, open_url=""):
 #      the raw tool error rather than a long analysis that merely quotes/mentions it.
 # The loose "unlock(password=" phrasing is kept only as documentation of what NOT to use alone;
 # it is deliberately NOT part of LOCKED_MARKERS below.
-LOCKED_MARKERS = ("locked client ip", "[locked:")
-# A real lock error (see the two literal strings above) is ~90-230 chars. A security-review /
-# analytical response that merely mentions unlock() runs to many hundreds/thousands of chars.
-# Chosen well above the longest real error and well below a genuine multi-sentence review.
-LOCKED_DOMINANCE_MAX_CHARS = 400
-MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
-#: THE TOKEN IS THE SECOND FACTOR AND THIS TEXT USED TO DENY IT EXISTED. The old wording told
-#: the worker that once unlock succeeded the tools "使えるので" -- just work on that connection.
-#: That is only true while MCP_REQUIRE_UNLOCK_TOKEN is off. With it on, tools/security.py
-#: unlocks the IP and then refuses every mutating call that arrives without the token it just
-#: handed back, saying so in as many words: "Call unlock(password='<password>') and pass the
-#: returned `unlock_token` with the call." The worker followed this prefix, believed the
-#: connection was now open, never passed the token, and was refused until its attempts ran out
-#: -- at which point the stuck reason below blamed a rotating IP or a wrong password, neither of
-#: which was true. Two jobs lost seventeen and six turns to that on 2026-09-07 before the cause
-#: was found. The password alone was never the whole story; say what the server actually wants.
-UNLOCK_PREFIX = (
-    "【要解錠】書込/実行ツールはロック解除が必要です。まず最初に call_tool で "
-    "'unlock' ツールを引数 {\"password\": \"%s\"} で1回だけ実行してください。"
-    "**その戻り値に含まれる unlock_token を必ず保持し、以後の書込/実行系の call_tool すべてに "
-    "引数 unlock_token として渡してください。** IPの解錠だけでは足りず、トークンを付けない呼び出しは "
-    "拒否されます（拒否メッセージ自体にもそう書かれています）。トークンを付けて解錠できたら"
-    "当初のゴールをそのまま続行してください。解錠後は password を二度と出力しないこと"
-    "（unlock_token は引数として渡すのは必要です）。\n--- 元のゴール ---\n"
-)
 
+#: The exact variable-prefix start of tools/security.py's remote-IP refusal. Keep the opening
+#: bracket and colon: the old bare "locked client ip" marker also matched ordinary diagnostic
+#: prose such as "the locked client IP message is absent", re-opening the 2026-07 false-positive
+#: class even when the worker was explicitly describing a non-lock backend failure.
+REMOTE_IP_REFUSAL = "[locked client ip:"
 
 #: The exact prefix tools/security.py writes when it denies a caller that arrived with no HTTP
 #: request context. Pinned here because that module is frozen and cannot import from this one,
@@ -584,8 +843,567 @@ UNLOCK_PREFIX = (
 #: asserts the two match rather than trusting the copy.
 NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
 
+#: The bracketed prefix tools/security.py writes when the caller's client IP is ALREADY
+#: unlocked but neither the presented fallback token nor the current MCP session is authorized --
+#: require_unlocked()
+#: ~line 562, added 2026-08-18. Stops before "for {ip!r}", the varying part, same convention as
+#: NO_CONTEXT_REFUSAL above. This is not a rare edge: measured 2026-09-10 (see
+#: tests/test_security_xff.py), 489 of 492 lock refusals in two days were this branch, one
+#: already-unlocked identity that never presented a token. Named explicitly, and listed in
+#: LOCKED_MARKERS below, instead of relying on it merely sharing a bracket prefix with
+#: NO_CONTEXT_REFUSAL -- see the paragraph below for why that distinction matters.
+TOKEN_MISSING_REFUSAL = "[locked: no valid unlock token"
 
-def _looks_locked(resp: str, since: float = 0.0) -> bool:
+# THIRD MARKER, NAMED RATHER THAN LEFT TO COINCIDENCE. Before this change LOCKED_MARKERS was
+# ("locked client ip", "[locked:"), and that bare "[locked:" happens to also be a prefix of
+# TOKEN_MISSING_REFUSAL (both open "[locked: "), so the no-valid-unlock-token refusal was in
+# fact already being matched -- by accident of two unrelated messages sharing a bracket format,
+# never because anyone verified it. Nothing had proven that on purpose, nothing would have
+# caught it silently breaking if either message's wording drifted apart to no longer share that
+# prefix, and the big comment above this tuple kept telling the next reader there were only two
+# messages to worry about. Spelling out NO_CONTEXT_REFUSAL and TOKEN_MISSING_REFUSAL by name,
+# and covering both in
+# relay/test_every_refusal_the_server_can_speak_is_one_the_fleet_can_hear.py's source-sweep of
+# tools/security.py, turns "happens to work" into "is checked".
+LOCKED_MARKERS = (REMOTE_IP_REFUSAL, NO_CONTEXT_REFUSAL.lower(), TOKEN_MISSING_REFUSAL.lower())
+# A real lock error (see the three literal strings above) is ~90-330 chars. A security-review /
+# analytical response that merely mentions unlock() runs to many hundreds/thousands of chars.
+# Chosen well above the longest real error and well below a genuine multi-sentence review.
+LOCKED_DOMINANCE_MAX_CHARS = 400
+MAX_UNLOCK_ATTEMPTS = int(os.environ.get("MCP_FLEET_MAX_UNLOCK", "4"))
+
+# ── OPERATOR E, WIRED IN (HITL gate raised BY THE RELAY, not left to STUCK/retry alone) ──
+#
+# tools/gate_ops.py could already pause a loop and ask a human, and fleet_runner.py already
+# surfaced any open gate into status.json's pending_gates for the cockpit to show and answer.
+# Nothing FIRED one: a worker that could not proceed without a person spent its whole retry
+# budget being nudged, then went STUCK with no human ever notified there was a decision to
+# make. Mined incident (.fleet/transcripts/r6aa8fc73_a0_w0.jsonl, read-only, not checked in):
+# the worker asked a precise, answerable question on turn 2 (which of several candidate names
+# an abbreviation it had been given corresponded to, in a database it had already searched
+# exhaustively) and was answered nine more times with a nudge to just try again, as if the
+# problem were a transient blip -- it was never going to resolve without a person naming the
+# term. The three places below that now raise a gate instead of continuing to retry/settle
+# are the three places this module already KNEW a person was needed and said so only in a log
+# line: STUCK-convergence (a worker restating the same conclusion), unlock exhaustion (a
+# worker that cannot proceed without a password/token only a person can supply), and a retry
+# count past which continuing to nudge is no longer plausibly worth it.
+#
+# RAISED FROM HERE, NOT FROM THE WORKER. gate_ask (the MCP tool surface) requires
+# require_unlocked(), and fleet_toolset.py already denies a worker the tool outright
+# ("a worker must not create the approval it would then be answering") -- and the worker most
+# likely to need this, one STUCK because it cannot unlock, is exactly the one that cannot pass
+# that gate: it has no move that works, same failure class tools/gate_ops.py's
+# gate_ask_local docstring documents for memory_save_local. This process (the relay) already
+# holds MCP_ALLOWED_BASE and the .env password and already has the worker's own words, so it
+# asks via gate_ask_local (in-process, no unlock check) on the worker's behalf.
+#
+# NOT max_transient (10, the existing back-stop that still applies if a gate can't be raised
+# at all -- gate_ask_local failing outright, e.g. disk full, must never silently swallow the
+# worker). Chosen at roughly HALF that budget: NET_RETRY_NOPROGRESS_MAX and STUCK_CONVERGENCE
+# above already catch a worker that is visibly repeating itself well before 5 retries, so this
+# is specifically the backstop for a STUCK streak whose wording keeps drifting just enough to
+# dodge STUCK_CONVERGENCE_SIMILARITY (0.7) -- the mined incident shows exactly this shape: no
+# two of turns 2-5 clear that threshold, and the wording only converges (per that constant's
+# own calibration notes) at turns 5-6. 5 retries leaves room for a genuine transient blip to
+# clear (the mined incident's real failure was never transient) while stopping well short of
+# spending the whole budget re-asking a question only a person can answer.
+GATE_AFTER_STUCK_RETRIES = int(os.environ.get("MCP_FLEET_GATE_AFTER_RETRIES", "5"))
+
+#: How long an unanswered HITL gate may hold a worker before it gives up. A question nobody
+#: answers cannot hold a worker forever -- the worker settles STUCK with the question itself
+#: preserved in the reason, so the record says what was asked and that nobody answered, rather
+#: than the worker silently sitting there until max_turns/an operator notices by accident.
+#: 30 MINUTES, THE SAME WINDOW NET_RETRY_WINDOW_S ALREADY USES for "how long is it reasonable
+#: to wait before concluding this needs a terminal decision" -- not a fresh number invented for
+#: this path. Long enough that a person mid-meeting or stepping away briefly still has a real
+#: chance to see the desktop toast and answer; short enough that a run does not sit silently
+#: parked for hours on a question nobody was ever going to see.
+GATE_ANSWER_TIMEOUT_S = float(os.environ.get("MCP_FLEET_GATE_TIMEOUT_S", "1800") or 1800)
+
+#: UNLOCK RECOVERY CONTRACT, ALIGNED WITH tools/security.py. Since 2026-09-09 a successful
+#: unlock() authorizes the current Mcp-Session-Id itself. The model therefore does NOT need to
+#: remember a random unlock_token and re-attach it forever; asking it to do so was the incident
+#: that session authorization was introduced to fix. The token remains a transport fallback
+#: when session auth is explicitly disabled or unavailable, but it is not the normal fleet
+#: contract. The load-bearing instructions are now: call unlock once in THIS conversation,
+#: observe success, retry the blocked operation in the SAME conversation, and do not go hunting
+#: through .env or other files for credentials already supplied in this transient recovery turn.
+UNLOCK_PREFIX = (
+    "【要解錠】書込/実行ツールはロック解除が必要です。まず call_tool の 'unlock' を "
+    "引数 {\"password\": \"%s\"} で1回実行してください。"
+    "unlock が成功したら、同じ会話のまま直前に拒否された書込/実行ツールを再試行してください。"
+    "現行サーバは unlock 成功時にこの会話の MCP session 自体を認可するため、通常は "
+    "unlock_token をモデルが保持して毎回再添付する必要はありません。"
+    "返却 token は transport fallback であり、探したり保存したりしないでください。"
+    "password はこの指示に既にあるので探しに行かないこと。特に .env は読まないこと。"
+    "読み取り専用の作業に unlock は不要です。"
+    "\n--- 元のゴール ---\n"
+)
+
+#: Distinctive marker for text generated by this process itself.
+_UNLOCK_MARKER = "【要解錠】"
+
+
+def is_recovery_payload(text: str) -> bool:
+    """True if `text` is _inject_unlock's own UNLOCK_PREFIX payload coming back around through
+    a redelivery channel (steer_msgs / fleet_runner's follow-up), rather than a message that
+    actually originated with a person.
+
+    Why this matters: both channels used to label EVERYTHING they carry as
+    "【ユーザーからの追加指示】" ("additional instruction FROM THE USER"). That is true for a
+    real cockpit steer and false for this specific payload -- and a false "from the user" label
+    wrapped around mid-conversation text that hands over a password and directs a tool call is
+    precisely the shape a safety-aligned model should refuse as a prompt injection. It is not
+    the model mis-judging; the label was lying. Recognising the payload here lets the caller
+    use an honest, system-authored label instead (see SYSTEM_RECOVERY_PREFIX) without touching
+    how genuine human steers are framed.
+    """
+    return bool(text) and _UNLOCK_MARKER in text
+
+
+#: The heading UNLOCK_PREFIX / RECYCLE_PREFIX end with; what follows it must be the goal.
+GOAL_HEADING = "--- 元のゴール ---"
+
+#: Upper bound, in characters, on what a continuation prompt restates of the goal (the wording
+#: line plus the ledger). NOT a user setting. The conversation's FIRST message carries the whole
+#: goal; every later prompt carries only this ledger, because the context window is small and
+#: handing the full text back every turn (PR #80) spends it on repetition. The owner rejected
+#: that design on 2026-09-30. The bound is a hard one: the ledger builder budgets to it.
+LEDGER_MAX_CHARS = 1000
+_LEDGER_TASK_CAP = 120          # the one-line task: the goal's first sentence
+_LEDGER_SENTENCE_CAP = 160      # one fixed-constraint sentence
+_LEDGER_SCOPE_CAP = 320         # a fan-out child's scope block
+_LEDGER_TAIL_SENTENCES = 2      # fallback when no sentence carries a marker
+
+# A sentence states a hard requirement when it contains one of these (a transparent rule, not a
+# model): Japanese markers match as substrings, English ones as whole words.
+_STRONG_JA = ("絶対", "必ず", "動かせ", "変えられ")
+_WEAK_JA = ("ただし", "条件", "制約", "前提", "以外", "だけ", "まで")
+_STRONG_EN = re.compile(r"\b(must|never|required|mandatory)\b", re.I)
+_WEAK_EN = re.compile(r"\b(only|at most|at least|no later than|by)\b", re.I)
+# ...or when it contains a time, a date, an amount, or a quoted name.
+_FACT_RE = re.compile(
+    r"\d{1,2}:\d{2}"
+    r"|\d{1,2}/\d{1,2}|\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}月|"
+    r"\b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}\b"
+    r"|[万千百]?円(?![滑満環周形])|ドル|[$¥￥€]\s?\d|\b(?:USD|JPY)\b"
+    r"|「[^」]+」|\"[^\"]+\"|“[^”]+”"
+)
+_SENTENCE_SPLIT = re.compile(r"(?<=[。！？!?])\s*|\n+|(?<=\.)\s+")
+_SCOPE_START = "【この会話が担当する範囲"
+_SCOPE_DONT_TOUCH = "手を出さないこと。"
+_SCOPE_REPORT = "担当範囲を完了したら"
+
+
+class EmptyGoalError(ValueError):
+    """A fresh-conversation prompt was about to be built with no goal in it."""
+
+
+def _clip(text: str, cap: int) -> str:
+    text = " ".join(str(text or "").split())
+    return text if len(text) <= cap else text[:max(cap - 1, 0)] + "…"
+
+
+def _split_scope_block(text: str):
+    """(scope block, the rest) for a fan-out child's goal, or ("", text). The block is the
+    '担当範囲 N/M' header, its step, and the 'do not touch the other parts' line."""
+    start = text.rfind(_SCOPE_START)   # the LAST block is this conversation's own
+    if start < 0:
+        return "", text
+    dont = text.find(_SCOPE_DONT_TOUCH, start)
+    if dont < 0:
+        return text[start:], text[:start]
+    end = dont + len(_SCOPE_DONT_TOUCH)
+    report = text.find(_SCOPE_REPORT, end)
+    if 0 <= report - end < 8:
+        stop = text.find("。", report)
+        end = stop + 1 if stop >= 0 else len(text)
+    return text[start:end], text[:start] + text[end:]
+
+
+def _scope_line(block: str, cap: int) -> str:
+    """The scope block compressed to header + step + the do-not-touch line, within `cap`."""
+    if not block:
+        return ""
+    head, _, body = block.partition("】")
+    head = _clip(head + "】", 80)
+    body = body.strip()
+    dont_at = body.find("上の範囲だけを")
+    step = body if dont_at < 0 else body[:dont_at]
+    dont = body[dont_at:] if dont_at >= 0 else ""
+    if dont:
+        stop = dont.find(_SCOPE_DONT_TOUCH)
+        dont = dont[:stop + len(_SCOPE_DONT_TOUCH)] if stop >= 0 else _clip(dont, 90)
+    room = max(cap - len(head) - len(dont) - 2, 20)
+    return " ".join([head, _clip(step, room), dont]).strip()
+
+
+def _sentences(text: str):
+    return [s.strip() for s in _SENTENCE_SPLIT.split(text) if s and s.strip()]
+
+
+def _marker_rank(sentence: str):
+    """0 = strong requirement (kept first when space runs out), 1 = weak, None = no marker."""
+    if any(m in sentence for m in _STRONG_JA) or _STRONG_EN.search(sentence) \
+            or _FACT_RE.search(sentence):
+        return 0
+    if any(m in sentence for m in _WEAK_JA) or _WEAK_EN.search(sentence):
+        return 1
+    return None
+
+
+def goal_ledger(goal: str, job_id: str = "", cap: int = LEDGER_MAX_CHARS) -> str:
+    """A compact, DETERMINISTIC ledger of `goal`, at most `cap` characters ("" for no goal).
+
+    Lines: the task (the first sentence), the fixed constraints (the goal's sentences that
+    carry a requirement marker, a time, a date, an amount or a quoted name -- or, when none
+    does, its closing sentences), a fan-out child's scope block, and a pointer to the full
+    goal (the first message of the conversation). It is a transparent heuristic: a constraint
+    phrased without any marker is not extracted (the first message still holds it)."""
+    goal = str(goal or "").replace(CLOSING_INSTRUCTION, "").strip()
+    if not goal:
+        return ""
+    scope_block, rest = _split_scope_block(goal)
+    sents = _sentences(rest)
+    if not sents and not scope_block:
+        return ""
+    task = _clip(sents[0], _LEDGER_TASK_CAP) if sents else ""
+    scope = _scope_line(scope_block, _LEDGER_SCOPE_CAP)
+    pointer = "(全文: この会話の最初のメッセージ" + (" / ジョブID: %s" % _clip(job_id, 60)
+                                                  if job_id else "") + ")"
+    fixed = ("タスク: %s\n" % task if task else "") + (
+        "担当範囲: %s\n" % scope if scope else "") + pointer + "\n"
+    budget = cap - len(fixed) - len("固定条件:\n") - 24   # 24: the "(他N件)" note
+    picked = []
+    candidates = [(i, s) for i, s in enumerate(sents)
+                  if not (i == 0 and len(s) <= _LEDGER_TASK_CAP)]
+    marked = [(i, s) for i, s in candidates if _marker_rank(s) is not None]
+    if not marked:
+        marked = candidates[-_LEDGER_TAIL_SENTENCES:] if len(sents) > 1 else []
+    order = sorted(marked, key=lambda t: (_marker_rank(t[1]) if _marker_rank(t[1]) is not None
+                                          else 0, t[0]))
+    used = 0
+    for i, s in order:
+        line = _clip(s, _LEDGER_SENTENCE_CAP)
+        if used + len(line) + 3 > budget:
+            continue
+        picked.append((i, line))
+        used += len(line) + 3
+    picked.sort()
+    out = ""
+    if task:
+        out += "タスク: %s\n" % task
+    if picked or marked:
+        out += "固定条件:\n" + "".join("- %s\n" % line for _, line in picked)
+        if len(picked) < len(marked):
+            out += "(他%d件は原文)\n" % (len(marked) - len(picked))
+    if scope:
+        out += "担当範囲: %s\n" % scope
+    out += pointer + "\n"
+    if len(out) > cap:
+        out = out[:max(cap - 1, 0)] + "…"
+    return out
+
+
+def effective_goal(goal: str) -> str:
+    """The goal a prompt should restate. When `goal` is really a recovery payload (the
+    unlock text, or a follow-up wrapper around it, became the worker's goal), only what
+    follows the goal heading is the goal -- the password/instruction text never is."""
+    goal = str(goal or "")
+    if is_recovery_payload(goal):
+        if GOAL_HEADING in goal:
+            return goal.split(GOAL_HEADING, 1)[1].strip()
+        return ""
+    return goal
+
+
+def fill_recovery_goal(text: str, goal: str, job_id: str = "") -> str:
+    """Re-insert the goal LEDGER into a recovery payload whose goal section is empty.
+
+    UNLOCK_PREFIX ends with the goal heading and the delivery channels (reunlock steer,
+    follow-up) send it bare, so the worker received a turn with no task in it."""
+    try:
+        if not is_recovery_payload(text) or GOAL_HEADING not in text:
+            return text
+        head, tail = text.split(GOAL_HEADING, 1)
+        goal = effective_goal(goal).strip()
+        if tail.strip() or not goal:
+            return text
+        ledger = goal_ledger(goal, job_id)
+        if not ledger:
+            return text
+        return head + GOAL_HEADING + "\n" + ledger
+    except Exception:
+        return text
+
+
+#: Honest replacement for "【ユーザーからの追加指示】" when what is being redelivered is
+#: _inject_unlock's own payload, not anything a person wrote. Says what is actually true --
+#: this machine's own recovery automation composed it -- instead of claiming user authorship.
+SYSTEM_RECOVERY_PREFIX = (
+    "【システムからの運用連絡(このマシン上の自動復旧機構が生成した内容。ユーザー発言ではありません)】"
+)
+
+
+#: Ways a worker says it was refused for lock when it is NOT pasting the server's error back.
+#: Deliberately loose, and deliberately never used on its own -- see _looks_locked's
+#: session branch, which only consults this once the server's own record already says a
+#: refusal happened in this turn's window and names exactly one session it could belong to.
+#: On its own this is the 2026-07 false positive verbatim; paired with the record it is the
+#: half that survives the paraphrasing the output discipline asks for.
+_LOCK_PARAPHRASES = (
+    "unlock_token", "unlock token", "未解錠", "解錠", "locked", "ロック解除",
+    "施錠", "アンロック",
+)
+
+
+_UNLOCK_NOT_REQUIRED_RE = (
+    # English: keep this meaning-specific. Merely saying "did not execute unlock" is NOT enough
+    # because a genuinely blocked worker says that when the password/tool is unavailable.
+    re.compile(r"\bno\s+unlock\s+(?:is\s+)?(?:required|needed)\b", re.I),
+    re.compile(r"\bunlock\b.{0,60}\b(?:is\s+|was\s+)?(?:not\s+required|not\s+needed|unnecessary|unneeded)\b", re.I),
+    # Japanese, including the real calendar/read-only replies preserved in the research corpus.
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,80}?(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません)", re.I),
+    re.compile(r"(?:不要|必要(?:は|が)?(?:ない|ありません)|要りません).{0,80}?(?:unlock|解錠|ロック解除)", re.I),
+    # Negative diagnostic wording from a real backend outage (r6abe3de4_a0_w5). The worker
+    # explicitly distinguished a generic tool-gateway failure from the server lock error while
+    # quoting the marker name in prose. Quoting the marker must not manufacture an unlock need.
+    re.compile(r"(?:locked client ip|lock marker).{0,40}?(?:文言|表示|エラー).{0,30}?(?:は|が)?(?:無い|ない|ありません|出ていない|見当たらない)", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,40}?(?:では|じゃ).{0,30}?(?:解消|改善|復旧|直).{0,20}?(?:しない|しません|できない|ならない)", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除)(?:対象)?(?:の)?(?:エラー|事象|問題|エラー文言)?[^。\n]{0,50}?(?:ではなく|ではない|じゃない)", re.I),
+)
+
+# Contradictory prose fails closed. These are deliberately narrower than the negative patterns;
+# their job is only to stop a sentence that ALSO says a real unlock is required from being
+# suppressed by an earlier "not required" quote/example.
+_UNLOCK_REQUIRED_RE = (
+    re.compile(r"\b(?:requires?|need(?:s)?|must|have\s+to)\s+(?:an?\s+|to\s+)?unlock\b", re.I),
+    re.compile(r"\bunlock\b.{0,30}\b(?:is|was)\s+(?!not\b)(?:required|needed)\b", re.I),
+    re.compile(r"(?:unlock|解錠|ロック解除).{0,30}?(?:が必要|は必要|必要です|必要とな)", re.I),
+)
+
+
+def _explicit_unlock_not_required(resp: str) -> bool:
+    """True only for an explicit semantic statement that unlock is unnecessary.
+
+    This is NEGATIVE lock evidence for the prose/fallback/probe paths.  It is intentionally not
+    a generic "no tool call" detector: "I did not execute unlock because the password is missing"
+    is a real blocked state and must still fail closed.  Likewise contradictory prose containing
+    a positive requirement wins.  The server's literal lock markers and exclusive attribution
+    are evaluated before this helper by `_looks_locked`, so they can never be hidden by prose.
+    """
+    text = resp or ""
+    negative = [m for rx in _UNLOCK_NOT_REQUIRED_RE for m in rx.finditer(text)]
+    if not negative:
+        return False
+
+    # "No unlock is required" and 「ロック解除は必要ありません」 necessarily contain the
+    # lexical positive fragments "unlock is required" / 「は必要」. Those are not
+    # contradictions; they are part of the negative phrase. Only a SEPARATE positive requirement
+    # elsewhere in the reply defeats the guard.
+    def overlaps_negative(match):
+        a, b = match.span()
+        return any(a < nb and b > na for na, nb in (n.span() for n in negative))
+
+    for rx in _UNLOCK_REQUIRED_RE:
+        for match in rx.finditer(text):
+            if not overlaps_negative(match):
+                return False
+    return True
+
+
+def _mentions_being_locked(resp: str) -> bool:
+    """Does this reply affirmatively talk about being refused for lock, in any wording at all."""
+    if _explicit_unlock_not_required(resp):
+        return False
+    low = (resp or "").lower()
+    return any(p.lower() in low for p in _LOCK_PARAPHRASES)
+
+
+#: Markup a model emits when it means to CALL a tool. Seeing it in the reply TEXT means the
+#: call was written out as prose instead of being made -- the reply is the evidence that an
+#: invocation was attempted, and the ledger is the evidence about whether it arrived.
+_INVOKE_MARKUP = ("<invoke name=", "antml:invoke", "<parameter name=")
+
+
+#: DO NOT ADD A "DID ANY CALL LAND IN THE WINDOW" TEST BACK ALONGSIDE THIS. A helper doing
+#: exactly that stood here until 2026-09-17 with a passing test and no caller. The appeal is
+#: real -- the negative form needs no attribution, since a window with no calls from anybody
+#: contains none of this worker's either -- but it was measured against the run it was written
+#: for and the window held 19 landed calls, 18 of them successful. Only the malformed blocks
+#: landed nowhere, so the conjunction was false exactly when it was needed. The reply's markup
+#: is the whole of the evidence; adding the ledger back only makes the branch unreachable again.
+def _tried_to_call_a_tool(resp: str) -> bool:
+    """Does the reply contain an invocation the model wrote out instead of making?"""
+    low = (resp or "")
+    return any(m in low for m in _INVOKE_MARKUP)
+
+
+def _exclusively_refused(worker: str, since: float, *, return_record: bool = False):
+    """Did the SERVER refuse a call that could only have been this worker's?
+
+    By default this keeps the historical boolean contract. `return_record=True` is used by the
+    classifier so the exact refusal row survives into `classified_locked.consumed` instead of
+    disappearing behind a boolean. That row carries the MCP session id, which is the only stable
+    join to a later grant when several workers overlap by the time unlock() succeeds.
+    """
+    empty = None if return_record else False
+    if not worker or since <= 0:
+        return empty
+    try:
+        from tools import lock_state as _ls
+        from relay import turn_windows as _tw
+
+        for rec in _ls.matching_records(since):
+            if str(rec.get("detail") or "").startswith(NO_CONTEXT_REFUSAL):
+                # An in-process call, not this worker's HTTP turn.
+                continue
+            ts = float(rec.get("ts") or 0)
+            if ts and _tw.belongs_to(worker, ts):
+                return rec if return_record else True
+    except Exception:
+        return empty
+    return empty
+
+
+#: How far back _worker_recently_granted ASKS to look for a grant it can attribute to a
+#: worker about to be declared unlock-exhausted. Generous on purpose, because nothing on
+#: this worker tracks when its unlock streak began -- but the real ceiling is
+#: tools.lock_state.DEFAULT_FRESH_SEC (180s), which granted_records' underlying _scan
+#: enforces regardless of what is passed here (a record older than 180s from "now" is
+#: dropped even if `since` would have admitted it). 180s already covers the measured
+#: incident (a grant 29s after the last refusal); this constant is intentionally larger
+#: than that ceiling so a future change to DEFAULT_FRESH_SEC widens this for free instead
+#: of silently staying capped at today's number.
+_RECENT_GRANT_LOOKBACK_S = 1200.0
+
+
+def _worker_recently_granted(
+        worker: str, lookback_s: float = _RECENT_GRANT_LOOKBACK_S, *, since: float = 0.0) -> bool:
+    """Did the server grant the lock episode that this worker is recovering from?
+
+    `True` is deliberately a proof and `False` is only "not established". There are two proof
+    paths, strongest first:
+
+    1. A `classified_locked` row owned *exclusively* by this worker names the exact refusal row
+       and therefore its MCP session. A later `granted` row for that same session is an exact
+       join even if the grant timestamp itself occurs while several workers are in flight.
+    2. Backward-compatible fallback: the grant timestamp itself is exclusively attributable to
+       this worker through relay.turn_windows.
+
+    `since` narrows both paths to the current turn/lock episode. This matters when a session id is
+    reused or an earlier authorization aged out: a grant older than the refusal must never cancel
+    recovery for a new refusal.
+    """
+    if not worker:
+        return False
+    try:
+        from tools import lock_state as _ls
+        from relay import turn_windows as _tw
+
+        lower = time.time() - max(1.0, float(lookback_s))
+        try:
+            requested = float(since or 0.0)
+        except (TypeError, ValueError):
+            requested = 0.0
+        if requested > 0.0:
+            lower = max(lower, requested)
+
+        grants = list(_ls.granted_records(lower))
+
+        # STRONG PATH: join the exact refusal session to a later grant. Only classifications
+        # whose refusal attribution was exclusive are allowed to establish this; using an
+        # ambiguous consumed row would turn another worker's success into ours.
+        try:
+            classes = list(_ls.classifications(lower))
+        except Exception:
+            classes = []
+        for cls in classes:
+            attr = cls.get("attribution") or {}
+            if str(attr.get("worker") or "") != str(worker) or not bool(attr.get("exclusive")):
+                continue
+            consumed = cls.get("consumed") or {}
+            session = str(consumed.get("session") or attr.get("session") or "")
+            if not session:
+                continue
+            try:
+                refusal_ts = float(consumed.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                refusal_ts = 0.0
+            if refusal_ts <= 0.0 or refusal_ts < lower:
+                continue
+            for rec in grants:
+                if str(rec.get("session") or "") != session:
+                    continue
+                try:
+                    grant_ts = float(rec.get("ts") or 0.0)
+                except (TypeError, ValueError):
+                    continue
+                if grant_ts >= refusal_ts:
+                    return True
+
+        # WEAKER BUT STILL PROVABLE FALLBACK: the grant instant itself had one exclusive owner.
+        for rec in grants:
+            ts = float(rec.get("ts") or 0)
+            if ts and _tw.belongs_to(worker, ts):
+                return True
+    except Exception:
+        return False
+    return False
+
+
+def _refusal_candidates_exclude(rec, worker: str):
+    """None when `rec` may be attributed to `worker`; else the in-flight candidate count.
+
+    The prose and fallback branches of `_looks_locked` read the server's refusal ledger without
+    identity, so every worker that had a turn open when ONE refusal landed was classified as
+    locked and spent its own unlock budget (measured on a 439-worker run: 58 of 120 refusal
+    records injected more than one worker; workers that had already replied DONE were finally
+    marked STUCK by their siblings' refusals). A refusal belongs to a worker only when that
+    worker is the sole turn in flight at the refusal's instant. When nobody is known to be in
+    flight (no windows opened: single-shot callers, tests) the historical behaviour is kept.
+    """
+    if not worker:
+        return None
+    try:
+        ts = float((rec or {}).get("ts") or 0)
+        if not ts:
+            return None
+        from relay import turn_windows as _tw
+        cands = _tw.candidates(ts)
+    except Exception:
+        return None
+    if not cands:
+        return None
+    if len(cands) == 1 and cands[0] == str(worker):
+        return None
+    return len(cands)
+
+
+def _reply_completed_without_claiming_lock(resp: str, since: float, worker: str) -> bool:
+    """True when `resp` ends in a DONE/CONTINUE marker and carries no lock evidence of its own.
+
+    STUCK/FAIL are deliberately not included: a worker that was really refused writes
+    "STUCK: unlock ..." and is the one the unlock steer exists for. A worker that already
+    reported DONE/CONTINUE and quotes no server refusal must never be sent an unlock steer
+    on the strength of someone else's refusal.
+    """
+    try:
+        from relay.control_markers import parse as _parse_marker
+        mk = _parse_marker(resp)
+        if mk is None or mk.kind not in ("DONE", "CONTINUE"):
+            return False
+        low = (resp or "").lower()
+        if any(m in low for m in LOCKED_MARKERS):
+            return False
+        return not _exclusively_refused(worker, since)
+    except Exception:
+        return False
+
+
+def _looks_locked(resp: str, since: float = 0.0, worker: str = "",
+                  on_unattributed=None) -> bool:
     """True iff `resp` looks like the SERVER's require_unlocked() lock error, not a worker's
     prose that merely discusses/quotes the unlock() API (see the FALSE-POSITIVE FIX comment
     above LOCKED_MARKERS for the incident this guards against: a security-review worker
@@ -598,12 +1416,24 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
          entire (short) tool-call return value; a long analytical response merely mentioning
          unlock(password=...) is not.
     """
+    exclusive = _exclusively_refused(worker, since, return_record=True)
+    if exclusive:
+        _note_locked("exclusive-attribution", resp, since, exclusive, worker)
+        return True
     low = (resp or "").lower()
     if any(m in low for m in LOCKED_MARKERS):
         hit = len(resp or "") < LOCKED_DOMINANCE_MAX_CHARS
         if hit:
             _note_locked("marker", resp, since, None)
-        return hit
+            return True
+        # A long marker is only quoted/prose evidence.  If that same prose explicitly says the
+        # current task does not require unlock, do not let a concurrent refusal turn the quote
+        # into a lock classification; `_looks_locked_ambiguous` applies the same rule to probes.
+        if _explicit_unlock_not_required(resp):
+            return False
+
+    if _explicit_unlock_not_required(resp):
+        return False
 
     # The marker rule only fires while the agent pastes the tool error back
     # verbatim. It often does not: the operator discipline injected into every
@@ -623,13 +1453,92 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
     # refusal reply ("I cannot assist with that request") was then read as a lock.
     if since <= 0.0:
         return False
+
+    # ── ATTRIBUTE BY SESSION, NOT BY LENGTH.
+    #
+    # The dominance rule below exists because "the refusal record is a single global slot with
+    # no client identity, so under concurrency one caller's refusal colours everyone's reply".
+    # That was true when it was written and it is not true now: tools/lock_state.py records the
+    # MCP session each refusal arrived on, and its own docstring says the field exists so a
+    # refusal can be joined to the session it belongs to. Measured 2026-09-15: 36 refusals in
+    # two hours carrying 13 distinct sessions -- the identity is there and it discriminates.
+    # The reader was simply never told, which is the third time today that a writer grew a
+    # field and the code that keys on it kept guessing.
+    #
+    # WHAT THE LENGTH RULE COSTS WHEN IDENTITY EXISTS. Detection keyed on the server's literal
+    # bracketed marker only fires while the agent pastes the error back verbatim, and it
+    # usually paraphrases -- the operator discipline in every turn tells it to. Today a worker
+    # wrote 「screen_look は「no valid unlock token」で拒否」: the words are there, the bracket
+    # is not, so no marker matched; and every one of its replies ran past 400 characters, so
+    # the record branch below was closed too. Four turns were spent telling it to retry a
+    # transient failure before one reply happened to come in under the cap and let the
+    # recovery through. Nothing about that recovery was about the reply's length.
+    #
+    # THE RULE. A refusal genuinely happened inside this turn's window, and the reply talks
+    # about being refused in ANY wording rather than only in the server's bracketed one.
+    #
+    # WHY THERE IS NO IDENTITY CHECK HERE, HAVING JUST ARGUED THAT IDENTITY EXISTS. The first
+    # version of this branch also required that exactly ONE session appear among the window's
+    # refusals, so that there was nobody else the refusal could belong to. Replayed against
+    # the two runs that died today, with the clock frozen at each turn so the freshness window
+    # means what it meant then, that condition never once held: fourteen refusals sat in the
+    # window, from several sessions, because several workers are locked at the same time. It
+    # is the normal state of a fleet, not an edge case, and a rule that only fires when the
+    # machine is idle is a rule that never fires.
+    #
+    # AND THE BRANCH BELOW ALREADY ATTRIBUTES WITHOUT ANY IDENTITY AT ALL. It asks only
+    # "was anything refused in this window" and answers yes for any reply under the length
+    # cap -- including a reply that never mentions locks. So requiring identity here, and
+    # only here, would hold the long replies to a standard the short ones have never met,
+    # while the short path keeps the exposure. This branch is that same attribution with one
+    # ADDITIONAL requirement -- that the reply be about being refused -- applied to the
+    # replies the cap excludes. It adds no risk class that is not already carried; it removes
+    # a length test that was standing in for an identity check the code could not make.
+    #
+    # The asymmetry settles what remains: a false positive costs one injected turn, bounded
+    # by MAX_UNLOCK_ATTEMPTS. A false negative costs the whole goal, which is what it cost
+    # today, twice.
+    try:
+        from tools import lock_state as _ls
+
+        _recs = [r for r in _ls.matching_records(since)
+                 if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
+        if _recs and _mentions_being_locked(resp):
+            # ONLY A REFUSAL THIS WORKER ALONE COULD HAVE PRODUCED IS ITS OWN. Several turns in
+            # flight means the record could be any of theirs; injecting all of them spends each
+            # bystander's unlock budget (see _refusal_candidates_exclude).
+            _own = [r for r in _recs if _refusal_candidates_exclude(r, worker) is None]
+            if _own:
+                _note_locked("paraphrase", resp, since, _own[-1], worker)
+                return True
+            if on_unattributed is not None:
+                on_unattributed(_refusal_candidates_exclude(_recs[-1], worker) or 0)
+                on_unattributed = None
+    except Exception:
+        pass
     # THE SAME DOMINANCE RULE THE MARKER BRANCH USES. Without it this branch judged replies of
     # any length: a 533-character summary of a meeting was classified as a lock error because
-    # some OTHER concurrent worker had been refused within the freshness window. The refusal
-    # record is a single global slot with no client identity, so under concurrency one caller's
-    # refusal colours everyone's reply -- and a long, ordinary answer is exactly what the
-    # dominance rule exists to exclude. Identity is the real fix and it is not available here;
-    # this removes the case that fired.
+    # some OTHER concurrent worker had been refused within the freshness window, and a long,
+    # ordinary answer is exactly what the dominance rule exists to exclude.
+    #
+    # THIS COMMENT USED TO END "identity is the real fix and it is not available here", AND
+    # THAT SENTENCE WAS STALE. tools/lock_state.py records the MCP session on every refusal
+    # and its docstring says the field exists so a refusal can be joined to the session it
+    # belongs to; measured 2026-09-15, 36 refusals in two hours carrying 13 distinct sessions.
+    # The identity is there.
+    #
+    # IT IS STILL NOT USED, AND THAT IS A MEASUREMENT RATHER THAN AN OVERSIGHT. The branch
+    # above was first written to require exactly one session among the window's refusals, so
+    # that there was nobody else the refusal could belong to. Replayed against the two runs
+    # that died on 2026-09-15, with the clock frozen at each turn so the freshness window
+    # meant what it meant then, that condition never once held: fourteen refusals sat in the
+    # window, from several sessions, because several workers are locked at the same time.
+    # Knowing WHICH session is this worker's would fix it, and the relay has no join to that;
+    # knowing that SOME session was refused does not narrow anything. So the branch above
+    # attributes without identity -- exactly as this one always has -- and pays for it with a
+    # requirement this one does not make, that the reply be about being refused at all.
+    #
+    # What remains here is the length rule, kept for the replies that say nothing about locks.
     if len(resp or "") >= LOCKED_DOMINANCE_MAX_CHARS:
         return False
     try:
@@ -659,15 +1568,51 @@ def _looks_locked(resp: str, since: float = 0.0) -> bool:
                 if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
         if not mine:
             return False
+        # Same attribution rule as the paraphrase branch: a refusal that several in-flight
+        # workers could each have produced is nobody's in particular.
+        _own = [r for r in mine if _refusal_candidates_exclude(r, worker) is None]
+        if not _own:
+            if on_unattributed is not None:
+                on_unattributed(_refusal_candidates_exclude(mine[-1], worker) or 0)
+            return False
+        mine = _own
         # Name the record actually decided on, not merely the last one to arrive. The note is
         # the only way to check afterwards whether a classification had evidence behind it.
-        _note_locked("fallback", resp, since, mine[-1])
+        _note_locked("fallback", resp, since, mine[-1], worker)
         return True
     except Exception:
         return False
 
 
-def _note_locked(branch, resp, since, consumed):
+def _attribution_of(consumed, worker=""):
+    """Who ELSE could that refusal have belonged to?
+
+    relay/turn_windows.candidates() already answers this and nothing asked it. A refusal
+    consumed by the prose or fallback branch carries no identity, so the only record of how
+    much was being assumed is the size of the candidate set at that instant. Never raises: a
+    note that cannot be taken must not change what the fleet does.
+    """
+    try:
+        ts = float((consumed or {}).get("ts") or 0)
+        if not ts:
+            return {}
+        from relay import turn_windows as _tw
+        cands = _tw.candidates(ts)
+        return {
+            "worker": str(worker or ""),
+            "candidates": cands,
+            "n_candidates": len(cands),
+            # EXCLUSIVE means the refusal could only have been this worker's. False covers
+            # both "several were in flight" and "nobody was", which are different and are
+            # both distinguishable from the list above.
+            "exclusive": len(cands) == 1 and bool(worker) and cands[0] == str(worker),
+            "session": str((consumed or {}).get("session") or ""),
+        }
+    except Exception:
+        return {}
+
+
+def _note_locked(branch, resp, since, consumed, worker=""):
     """Say which branch classified a reply as locked, and on what evidence. Never raises.
 
     Written because the last incident could not be reconstructed: five workers reported an
@@ -678,9 +1623,68 @@ def _note_locked(branch, resp, since, consumed):
     try:
         from tools import lock_state
         lock_state.record_classification(branch, resp_len=len(resp or ""), since=since,
-                                         consumed=consumed)
+                                         consumed=consumed,
+                                         attribution=_attribution_of(consumed, worker))
     except Exception:
         pass
+
+
+def _looks_locked_ambiguous(resp: str) -> bool:
+    """True iff `resp` carries a distinctive LOCKED_MARKERS marker but is too long for
+    _looks_locked's dominance rule to trust on its own (len(resp) >= LOCKED_DOMINANCE_MAX_CHARS)
+    -- the exact case _looks_locked drops ON PURPOSE (see its docstring) so that a long
+    security-review reply merely quoting the marker is never mistaken for the genuine short
+    server error.
+
+    Mutually exclusive with a True result from _looks_locked: that function's marker branch
+    only returns True when the SAME marker check ALSO satisfies dominance (len < the cap).
+    So this function existing, and being checked, cannot change anything _looks_locked already
+    decides -- it only names the leftover case, where neither of _looks_locked's two branches
+    fires because the marker is real but the reply is long.
+
+    THE INCIDENT THIS EXISTS FOR: worker r6aa8e10b_a0_w0 (2026-09-15) had its IP unlocked but no
+    per-call unlock_token, was refused a third time, and wrote a long multi-paragraph analysis
+    that QUOTED "[locked: no valid unlock token]" (in the shortened form the server actually
+    emits, with no "for '<ip>'" tail) and concluded the task was blocked. Over 400 chars, so
+    _looks_locked returned False and no unlock was ever injected -- the goal was lost. This
+    function is the trigger for the PROBE path in _decide: instead of guessing from length,
+    ask the worker whether that reply really was a lock refusal.
+    """
+    if _explicit_unlock_not_required(resp):
+        return False
+    low = (resp or "").lower()
+    return (any(m in low for m in LOCKED_MARKERS)
+            and len(resp or "") >= LOCKED_DOMINANCE_MAX_CHARS)
+
+
+#: The probe question sent to a worker when _looks_locked_ambiguous() fires. Deliberately the
+#: length a person would actually type for a yes/no check-in -- NOT an explanation of why we're
+#: asking, and NOT a mention of "unlock" or "password": a probe that describes the expected
+#: answer is not a probe, it is a leading question, and would just reproduce the same
+#: length-based guess this path exists to replace. Matches the shape of the other short control
+#: turns in this module (RETRY_JOB, CONTINUE_JOB, etc. in copilot_autopilot_relay.py): one or
+#: two plain sentences, no goal restatement, sent as `self.job` through the ordinary send path.
+LOCK_PROBE_QUESTION = (
+    "直前の call_tool は locked で拒否されましたか。"
+    "「はい」か「いいえ」だけで答えてください。"
+)
+
+
+def _probe_answer_is_yes(resp: str) -> bool:
+    """True iff a LOCK_PROBE_QUESTION reply is an unambiguous affirmative ("はい" / "yes"),
+    read as a whole-word/whole-phrase token rather than a bare substring -- "いいえ、はい違いで
+    はなく..." must not match on "はい" appearing inside a negative sentence. Anything else
+    (a negative, a hedge, silence, garbage) reads as "no" -- the safe direction, since that is
+    what happens today when no probe exists at all."""
+    text = (resp or "").strip()
+    if not text:
+        return False
+    low = text.lower()
+    if "いいえ" in text or re.search(r"\bno\b", low):
+        return False
+    if "はい" in text or re.search(r"\byes\b", low):
+        return True
+    return False
 
 
 def _unlock_password():
@@ -698,6 +1702,12 @@ def _unlock_password():
 #: Named apart from _CONV_GUID_RE below, which pulls a guid OUT of a URL. The first version of
 #: this reused that name and was silently overwritten by it, so every id classified as a URL
 #: and every resume fell back to a tab -- working, slower, and with no symptom.
+#: The synthetic reference for a conversation that has no navigable URL. Defined by the
+#: bridge (copilot_bridge.SESSREF_PREFIX) and repeated here rather than imported, because the
+#: relay must not pull in the bridge module -- `_conversation_id_or_empty` below already
+#: hard-codes the same five characters, so this names what that literal meant.
+SESSREF_PREFIX = "sess:"
+
 _BARE_CONV_GUID_RE = re.compile(
     r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$")
 
@@ -710,47 +1720,60 @@ def _conversation_id_or_empty(resume_conv) -> str:
     and looks identical when it works.
     """
     text = str(resume_conv or "").strip()
-    if text.startswith("sess:"):
-        text = text[5:].strip()
+    if text.startswith(SESSREF_PREFIX):
+        text = text[len(SESSREF_PREFIX):].strip()
     return text if _BARE_CONV_GUID_RE.match(text) else ""
 
 
 def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
-    """Build the first worker turn with a proactive unlock when local credentials exist.
+    """Build the first worker turn.
 
-    Waiting for a write/exec tool to fail is too late: the agent may give up before it has
-    discovered the usable tool set.  The unlock must still be called by the M365-side agent
-    because the gate is keyed to that remote client IP, so the password is injected only into
-    this transient first turn and never into persistent agent configuration.
+    CHANGED 2026-09-25: turn 1 (non-plan_mode -- the normal, always-on fleet mode) no longer
+    proactively injects UNLOCK_PREFIX/the literal password into the very first message sent to
+    the M365 Copilot agent. Production transcripts (.fleet/transcripts/r6ab5aa80_a0_w0.jsonl and
+    others, 07:41/07:55/07:58/08:05 on 2026-09-25) showed Microsoft 365 Copilot's own
+    safety/DLP filter refusing that exact message shape -- "call a tool with a password
+    argument" -- with a byte-identical boilerplate non-answer every single time. That is
+    deterministic, not transient, so the existing REFUSED-outcome auto-retry (which resends
+    byte-identical text) could never succeed; it just repeated the same doomed send forever.
+    That was the "fleet never makes progress" bug.
+    Turn 1 is now always the plain composed goal (opening_turn(goal, PROTOCOL) / PLAN_PROMPT +
+    goal under plan_mode). The reactive path -- _looks_locked() -> _inject_unlock(), called from
+    _decide_impl near line 4886, plus the ambiguous-lock-probe path -- is unaffected: it still
+    injects the password, but only once a genuine write/exec-tool refusal is actually observed
+    in a reply, which is a shape M365 Copilot does not blanket-refuse.
+    Original rationale for being proactive ("waiting for a write/exec tool to fail is too late:
+    the agent may give up before it has discovered the usable tool set") still matters -- that is
+    why the reactive path fires on the FIRST refusal rather than waiting for the retry budget to
+    run out -- but it no longer justifies putting the password in turn 1 itself.
+
+    plan_mode (operator-set, plan-then-WAIT) is a separate, deliberately different operator
+    mode and is UNCHANGED here: it still injects proactively, exactly as before.
     """
-    # plan_mode (operator-set, plan-then-WAIT) is unchanged. When it is off, which version
-    # of the planner component opens the turn is the evolvable choice -- see
-    # planner.PLANNER_VERSIONS for why an unattended plan-first arm is the comparable one.
-    if plan_mode:
-        original = PLAN_PROMPT + goal
-        opening = PLAN_PROMPT + goal
-    else:
-        original = goal
-        opening = opening_turn(goal, PROTOCOL)
-    pw = _unlock_password()
-    if not pw:
-        return opening, False
     if plan_mode:
         # Operator-set plan-then-wait: not a component, and not this function's to reinterpret.
-        return PROTOCOL + (UNLOCK_PREFIX % pw) + original, True
-    # THROUGH THE PLANNER, NOT AROUND IT.
-    #
-    # This composed the turn by hand whenever a password existed, which is the normal
-    # configuration -- so opening_turn, and with it the whole `planner` component, was reached
-    # only when unlock was NOT being injected. The effect was that planner/v1 and planner/v2
-    # produced byte-identical first turns in every ordinary run: an A/B whose two arms are the
-    # same program, which is precisely what PLANNER_VERSIONS was created to end. The comment
-    # above that table says so about its predecessor; the same hole was open one file over.
-    #
-    # The unlock text belongs where the protocol goes, before the goal, so passing it as part
-    # of the protocol reproduces the previous byte layout exactly under planner/v1 and lets
-    # planner/v2 differ where it is supposed to.
-    return opening_turn(original, PROTOCOL + (UNLOCK_PREFIX % pw)), True
+        opening = PLAN_PROMPT + goal
+        pw = _unlock_password()
+        if not pw:
+            return opening, False
+        return PROTOCOL + (UNLOCK_PREFIX % pw) + opening, True
+    # Non-plan_mode (normal fleet mode): always the plain goal, never the password, regardless
+    # of whether a local unlock password is configured. Which version of the planner component
+    # opens the turn is the evolvable choice -- see planner.PLANNER_VERSIONS.
+    return opening_turn(goal, PROTOCOL), False
+
+
+def build_reactive_unlock_turn(resume_text: str) -> str:
+    """Return the existing system-authored reactive recovery turn, or empty if unavailable.
+
+    This is the same composition `_inject_unlock` already uses after a genuine refusal. Side
+    sessions call this only after their own non-decisive reply reports that authorization blocked
+    the work; it is intentionally NOT an opening-turn helper.
+    """
+    material = _unlock_password()
+    if not material:
+        return ""
+    return PROTOCOL + (UNLOCK_PREFIX % material) + str(resume_text or "")
 
 
 def _redact_unlock_password(text: str) -> str:
@@ -763,12 +1786,30 @@ def _redact_unlock_password(text: str) -> str:
     Not just the unlock password: an agent that read .env once echoed it back, and the
     API key and HF token landed in a transcript in clear text. Selection is by NAME in
     one shared place, so a newly added key is not missed the same way.
+
+    FAILS CLOSED. Both excepts here used to return the ORIGINAL text, so a redactor that
+    could not be imported or fell over wrote the injected unlock password into the transcript
+    verbatim. A failure now writes _REDACTION_FAILED_MARKER instead and says so on stderr.
+    Only the stored copy is withheld -- the turn itself was already composed and is sent
+    unredacted by its own path, so the live run is untouched.
     """
     try:
         from tools.secret_store import redact_secrets
         return redact_secrets(text)
-    except Exception:
-        return text or ""
+    except Exception as exc:
+        try:
+            import sys as _sys
+            _sys.stderr.write("[transcript] redaction failed (%s); wrote %r instead of the "
+                              "text\n" % (type(exc).__name__, _REDACTION_FAILED_MARKER))
+            _sys.stderr.flush()
+        except Exception:
+            pass
+        return _REDACTION_FAILED_MARKER
+
+
+#: The literal tools.secret_store.REDACTION_FAILED_MARKER holds, repeated here because the case
+#: it is for is the one where that module could not be imported. A test holds the two equal.
+_REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
 
 
 def _mcp_tunnel_url():
@@ -964,6 +2005,25 @@ VERIFY_STATUSES = ("verifying",)
 # is still eventually recovered. Beyond this, a non-advancing status is treated as wedged.
 EVAL_STALL_CEILING_S = 1500
 
+# How long the socket->tab fallback may block the sweep before it is fair to call the browser
+# wedged. NOT a guess and NOT a round number: _open_fresh allows three navigation attempts of
+# 45s plus a 25s composer wait each (210s), and its own comment allows "up to ~300s" once a
+# sign-in page has been surfaced, because a person may be mid-MFA.
+#
+# It exists because the watchdog reset a HEALTHY Edge four times in one run: the fallback is
+# synchronous on the single-threaded round-robin, so status.json stops advancing while it runs,
+# and 150s of no progress with nothing declared is the watchdog's definition of a wedge. Each
+# reset threw away every unfinished goal's progress (16, then 11, then 4), and the run captured
+# nothing in 102 minutes.
+FALLBACK_OPEN_CEILING_S = float(os.environ.get("MCP_FALLBACK_OPEN_CEILING_S", "300") or 300)
+
+# The settle-time tree hash, bounded by what it was MEASURED to cost rather than by the
+# acceptance ceiling. supervisor_verify.tree_hash took 7.3s on an idle astropy worktree and
+# 29.8s on the same tree under a loaded run. It was declaring _eval_ceiling_s() -- at least
+# 1500s -- which is fifty times the operation and would leave the watchdog vouching for a
+# browser for twenty-five minutes if the hash ever wedged.
+TREE_HASH_CEILING_S = float(os.environ.get("MCP_TREE_HASH_CEILING_S", "120") or 120)
+
 
 class FleetContextLost(Exception):
     """Raised when the underlying Edge/CDP context died mid-run (wedged or hard-reset).
@@ -971,6 +2031,17 @@ class FleetContextLost(Exception):
     def __init__(self, unfinished):
         super().__init__("fleet CDP context lost")
         self.unfinished = unfinished
+
+
+def _report_store_failure(what, exc):
+    """Say on stderr that a database write failed. Never raises (a log line must not cost a turn)."""
+    try:
+        import sys as _sys
+        _sys.stderr.write("[session_store] %s was NOT recorded: %s: %s\n"
+                          % (what, type(exc).__name__, str(exc)[:200]))
+        _sys.stderr.flush()
+    except Exception:
+        pass
 
 
 class _Transcript:
@@ -1031,8 +2102,10 @@ class _Transcript:
             from bridge.session_store import record_fleet_turn
             record_fleet_turn(self.key, obj, name=getattr(self, "_name", ""),
                               goal=getattr(self, "_goal", ""))
-        except Exception:
-            pass
+        except Exception as exc:
+            # NOT `pass`: a mirror that fails without a word is a database that silently holds
+            # nothing (the chat-persist lesson, #130). The fleet still carries on.
+            _report_store_failure("transcript mirror", exc)
 
     def _append(self, obj):
         self._to_db(obj)
@@ -1047,6 +2120,25 @@ class _Transcript:
 
     def user(self, turn, text):
         self._append({"turn": turn, "role": "user", "text": _redact_unlock_password(text), "ts": time.time()})
+
+    def wire(self, turn, text, route="", round=0, run_id=""):
+        """The string actually handed to the transport for this turn, in full, in the database.
+
+        DATABASE ONLY (not the JSONL beside it): the `user` row above is the job as composed;
+        this one is what the agent RECEIVED -- on the socket route the protocol preamble and the
+        tool catalogue the transport prepends, on a tab the whitespace-collapsed single line.
+        Redaction and the size cap are applied by the store's single write path; the cap, if it
+        ever bites, is flagged on the row.
+        """
+        try:
+            from bridge.session_store import record_wire_turn
+            ok = record_wire_turn(self.key, turn, text, name=getattr(self, "_name", ""),
+                                  goal=getattr(self, "_goal", ""), run_id=run_id,
+                                  route=route, round=round)
+            if not ok:
+                _report_store_failure("wire turn", RuntimeError("record_wire_turn returned False"))
+        except Exception as exc:
+            _report_store_failure("wire turn", exc)
 
     def assistant(self, turn, text):
         # 返ってきた側にも掛ける。こちらが送った文だけ伏せても、相手が復唱すれば
@@ -1107,7 +2199,12 @@ def avail_phys_mb() -> float:
 #: exhaustion once wedged the Edge badly enough that the watchdog hard-reset it; 512 is more
 #: permissive than what the fleet has been doing, so a box that starts thrashing should have this
 #: raised rather than the gates re-forked.
-FLEET_RAM_FLOOR_MB = float(os.environ.get("MCP_FLEET_RAM_FLOOR_MB", "512"))
+#: The literal 512 lived here, 1400 lived on --autoscale-headroom-mb and 2048 lived in the
+#: cockpit. One declaration now, in tools/settings_keys.py, which the panel mirrors and a test
+#: pins. The environment override stays: it is how a bench host asks for something else.
+FLEET_RAM_FLOOR_MB = float(os.environ.get(
+    "MCP_FLEET_RAM_FLOOR_MB", str(__import__("tools.settings_keys", fromlist=["default"])
+                                  .default("ram_floor_mb"))))
 
 #: What ONE Copilot tab is budgeted to cost. Separate from the floor because they answer
 #: different questions: the floor is what must remain, this is what the NEXT tab will take.
@@ -1170,6 +2267,47 @@ FLEET_HEAP_RECYCLE_MB = float(os.environ.get("MCP_FLEET_HEAP_RECYCLE_MB", "500")
 #: would cost more turns than the disease.
 FLEET_HEAP_MIN_TURNS = int(os.environ.get("MCP_FLEET_HEAP_MIN_TURNS", "12"))
 
+#: A fresh conversation that hits the token limit on its FIRST reply, this many times in a row,
+#: cannot be helped by another recycle: the re-anchored goal makes the agent repeat the same
+#: oversized tool call each time (2026-10-01: up to max_recycles identical overflows).
+_FUTILE_RECYCLES = 2
+
+
+def _recycle_is_futile(worker, exhausted):
+    """Record one token-limit exhaustion on `worker`; True once the recycling is going nowhere.
+
+    CONSERVATIVE VARIANT. The fleet worker does not see tool calls, so "same tool, identical
+    arguments" cannot be read here. What can be read is the turn counter: an exhaustion on the
+    first reply after a recycle (turn advanced by exactly one) means the very first thing the
+    fresh conversation did overflowed it, and that happening _FUTILE_RECYCLES times consecutively
+    is the same symptom. Any recycle that got further than one turn resets the streak.
+    """
+    if not exhausted:
+        return False
+    turn = int(getattr(worker, "turn", 0) or 0)
+    last = getattr(worker, "_exhaust_turn", None)
+    streak = int(getattr(worker, "_exhaust_immediate", 0) or 0)
+    worker._exhaust_turn = turn
+    if last is not None and turn - last == 1:
+        streak += 1
+    else:
+        streak = 0
+    worker._exhaust_immediate = streak
+    return streak >= _FUTILE_RECYCLES
+
+
+def _goal_is_live(workers, text, exclude=None):
+    """Whether a worker for exactly this goal text is queued or running (not terminal)."""
+    text = (text or "").strip()
+    if not text:
+        return False
+    for w in workers:
+        if w is exclude or w.status in TERMINAL:
+            continue
+        if (getattr(w, "goal", "") or "").strip() == text:
+            return True
+    return False
+
 
 def _holds_slot(w):
     """Whether this worker is admitted and consuming the fleet's budget right now.
@@ -1229,6 +2367,29 @@ def _socket_route():
 _REOPEN_POLICY = None
 
 
+def _consider_socket_refresh(route, agent_url):
+    """Kick a credential refresh without ever blocking the fleet sweep.
+
+    The manager lives on the route instance so a reset automatically gets a fresh manager and a
+    late result from the old browser can only install into the old, unreachable route object.
+    """
+    try:
+        manager = getattr(route, "_async_capture_manager", None)
+        if manager is None:
+            from relay.socket_capture_async import AsyncCaptureManager
+            manager = AsyncCaptureManager(log=lambda m: print(m, flush=True))
+            setattr(route, "_async_capture_manager", manager)
+        return bool(manager.consider(route, agent_url,
+                                     os.environ.get("MCP_CDP_URL", "http://localhost:9222")))
+    except Exception as exc:
+        try:
+            print("[socket_capture_async] launch declined: %s: %s"
+                  % (type(exc).__name__, str(exc)[:160]), flush=True)
+        except Exception:
+            pass
+        return False
+
+
 def _reopen_policy():
     """The run's reopen policy, built once. Backoff is stateful, so it must outlive a pass.
 
@@ -1272,6 +2433,35 @@ def reset_socket_route():
     # new route starting life one vote short for no reason anybody could see.
     with _ROUTE_FAULT_LOCK:
         _LAST_ROUTE_FAULT[0] = 0.0
+    # AND THE TOKEN, WHICH THIS DOCSTRING ALREADY CLAIMED. "Nothing is preserved: not the
+    # token, which belongs to the context that just died" was false: profile_token keeps its
+    # own module-level _MEMO of the last answer per surface, and `reset_socket_route` cleared
+    # only _SOCKET_ROUTE and the fault clock. A memo entry inside MIN_CAPTURE_INTERVAL_S with
+    # life left is served straight back after the reset -- a token minted against a browser
+    # context that no longer exists.
+    #
+    # `profile_token.forget_memo` exists for this exact case ("for a browser that was reset
+    # underneath us") and had no caller. Not fatal on its own -- the light path fails and
+    # falls through to a fresh capture -- but it spends an attempt per call on a token that
+    # cannot work, and it made a docstring assert something the code did not do.
+    try:
+        from relay import profile_token as _pt
+        _pt.forget_memo()
+    except Exception:
+        pass
+    # AND THE POST-CONDITION, CHECKED RATHER THAN ASSERTED IN PROSE. The sentence above this
+    # function's body -- "Nothing is preserved: not the token" -- was false for long enough to
+    # be quoted, and nothing would have said so. RECORD, not RAISE: this runs after a browser
+    # has already died, and turning a recoverable reset into an exception would trade a wasted
+    # attempt for a lost run. The violation lands in .fleet/invariants.jsonl either way, which
+    # is the part that was missing.
+    try:
+        from relay import invariants as _iv
+        from relay import profile_token as _pt2
+        _iv.assert_invariant(_INV_RESET_KEEPS_NO_TOKEN, not getattr(_pt2, "_MEMO", None),
+                    "a token survived the browser it was minted against")
+    except Exception:
+        pass
 
 
 
@@ -1395,6 +2585,74 @@ def socket_fault_is_transport(reason):
         return False
 
 
+#: An absolute Windows or POSIX path written into an instruction. Deliberately does not try to
+#: resolve a relative or prose location ("デスクトップの ogf フォルダ") -- guessing which of
+#: several plausible folders an operator meant would make the effect check look somewhere the
+#: worker never wrote, report `absent`, and re-send an act that already ran. A path this cannot
+#: read is a path the caller falls back to `cwd` for, or gives up on.
+_GOAL_PATH = re.compile(r"[A-Za-z]:[\\/][^\s\"'<>|、。，））\]]+|/(?:home|tmp|usr|var)/[^\s\"'<>|、。]+")
+
+
+def _folders_named_in(goal):
+    """The existing folders an instruction names, longest first, de-duplicated.
+
+    A path that names a FILE contributes its directory: "…\\ogf\\report.pptx に出して" is an
+    instruction about the ogf folder as much as one that names the folder outright.
+    """
+    seen, out = set(), []
+    for raw in _GOAL_PATH.findall(goal or ""):
+        path = raw.rstrip(".,、。)]　")
+        try:
+            if os.path.isdir(path):
+                folder = path
+            elif os.path.splitext(path)[1]:
+                # A path with an extension names a FILE, and an instruction about a file is an
+                # instruction about the folder it goes in -- whether or not it exists yet, which
+                # for an output is the normal case.
+                folder = os.path.dirname(path)
+            else:
+                # No extension and not a directory: the operator named a FOLDER that is not
+                # there. Walking up to its parent would check somewhere they never mentioned,
+                # find whatever else lives there, and answer a question nobody asked.
+                continue
+        except (OSError, ValueError):
+            continue
+        if not folder:
+            continue
+        key = os.path.normcase(os.path.normpath(folder))
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(folder)
+    out.sort(key=len, reverse=True)
+    return out
+
+
+def _commit_subject_from_goal(goal):
+    """The commit subject a goal names, so `git log` can be asked whether it is already there.
+
+    Read, never invented. If the goal quotes a subject -- `commit "fix the empty-input case"`
+    or a `-m "..."` -- that quoted text is the thing to look for; a subject this function made
+    up would be looked for, not found, and reported as `absent`, which is the one wrong answer
+    that turns the safe check into a re-send. So when nothing is quoted, this returns None and
+    the caller falls back to refusing rather than guessing.
+
+    Matches the first quoted run after a commit/-m cue, single or double quotes, English or
+    the Japanese コミット cue. Whitespace is collapsed the way `%s` output is, so a subject
+    wrapped across lines in the goal still equals the one git prints.
+    """
+    text = goal or ""
+    if not text:
+        return None
+    import re as _re
+    cue = _re.search(r"(?:-m|commit|コミット)\b", text, _re.IGNORECASE)
+    scope = text[cue.start():] if cue else text
+    m = _re.search(r"[\"'「“]([^\"'」”]{3,200})[\"'」”]", scope)
+    if not m:
+        return None
+    return " ".join(m.group(1).split()).strip() or None
+
+
 def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=100):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
@@ -1512,6 +2770,24 @@ SOCKET_REFRESH_MARGIN_S = float(os.environ.get("MCP_FLEET_SOCKET_MARGIN_S", "150
 # token about twice an hour, which is the other cost being traded here -- each refresh opens a
 # capture tab for ~40 seconds.
 SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
+# A socket can remain technically alive on ping frames after useful work has stopped. Do not
+# confuse transport liveness with agent progress: after this much time with neither answer growth
+# nor a progress frame, fail the socket turn and let the existing reconnect/fallback policy act.
+# Long research is unaffected as long as it emits progress.
+#
+# Evidence for the 60 s default (2026-09-30 live GUI probe): the longest
+# healthy continuous meaningful-idle gap observed was 46.165 s (the turn later completed DONE
+# after 214.8 s total), while the one no-reply stall crossed 60 s and then 90 s continuously.
+# 45 s would therefore cut a measured healthy turn; 60 s keeps ~14 s observed headroom while
+# recovering the measured stall ~30 s earlier than the old 90 s default. The env override remains.
+SOCKET_MEANINGFUL_IDLE_DEFAULT_S = 60.0
+SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get(
+    "MCP_FLEET_SOCKET_IDLE_S", str(SOCKET_MEANINGFUL_IDLE_DEFAULT_S)))
+# Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so future
+# evidence can move the default again without guessing. These do not affect recovery, retry
+# budgets or transport state. Keep the 90 s bucket even though the default is 60 s: an explicit
+# env override may still choose a longer watchdog and the probe should remain useful there.
+SOCKET_IDLE_PROBE_BUCKETS = (5.0, 10.0, 20.0, 30.0, 45.0, 60.0, 90.0)
 
 
 def free_disk_gb(path=None):
@@ -1567,18 +2843,78 @@ def repo_eval_gb(inst):
 _DISK_DEFER_LAST = [0.0]
 DISK_DEFER_NOTICE_S = 60.0
 
+#: When the current run of deferrals began (0.0 = not currently deferring), and when a
+#: notification about it last left this process.
+_DISK_DEFER_SINCE = [0.0]
+_DISK_DEFER_NOTIFIED = [0.0]
 
-def _note_disk_defer(floor_gb, waiting):
-    """Print why nothing is being admitted. Never raises; never becomes the log itself."""
+#: How long admission must stay blocked before anyone outside this process is told. A dip below
+#: the floor for a few sweeps while a finished job's eval is reclaimed is ordinary and not worth
+#: a notification; a block that outlives this is the shape that has twice sat silent for
+#: twenty-five minutes with the submitter told only "queued".
+DISK_DEFER_ALERT_AFTER_S = 240.0
+
+#: And how often to say it again while it persists. Long, because the message does not change
+#: and the second one is only there so a person who walked away still finds out.
+DISK_DEFER_ALERT_REPEAT_S = 1800.0
+
+
+def disk_defer_clear():
+    """Admission succeeded: forget the deferral, so the next block is timed from its own start."""
+    _DISK_DEFER_SINCE[0] = 0.0
+    _DISK_DEFER_NOTIFIED[0] = 0.0
+
+
+def _note_disk_defer(floor_gb, waiting, notify=None, now=None):
+    """Say why nothing is being admitted -- and say it somewhere outside this process.
+
+    THE LOG WAS NOT ENOUGH, and that is the whole reason this function grew. `relay/task_router`
+    hard-codes `--disk-floor-gb 0` for autostarted goals, and its comment explains why: with the
+    bench floor inherited, admission refused everything, forever, printing the reason "once a
+    minute into the coordinator's log, which is the one place a person holding a phone cannot
+    look", while the submitter had already been told the goal was queued. Disabling the gate
+    made the silence go away by removing the refusal -- and on 2026-09-14 C: reached **zero
+    bytes** with the fleet still admitting, which took down git, the fleet's own writes, and a
+    business folder's backups in one go.
+
+    Both failures are the same failure: a decision nobody outside the process could see. So the
+    block is reported outward once it has lasted `DISK_DEFER_ALERT_AFTER_S`, and the floor can
+    go back to protecting the machine.
+
+    `notify` and `now` are injectable so a test can watch this without a desktop.
+    """
     try:
-        now = time.time()
-        if now - _DISK_DEFER_LAST[0] < DISK_DEFER_NOTICE_S:
-            return
-        _DISK_DEFER_LAST[0] = now
+        now = float(now if now is not None else time.time())
         free = free_disk_gb()
-        print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB -- %d goal(s) "
-              "waiting. Free disk; lowering the floor turns this refusal into a crash."
-              % (free, float(floor_gb or DEFAULT_DISK_FLOOR_GB), waiting), flush=True)
+        # `or` TREATS A DISABLED GATE AS AN ABSENT ONE. 0.0 is falsy, and 0 is exactly what
+        # 強制開始 writes to turn the disk gate off -- so the message explaining a deferral
+        # claimed a 6 GB floor for a run that had none. disk_admission_ok, the function that
+        # actually decides, already distinguishes them with `is None`; this is the sentence a
+        # person reads, and it was the one that lied.
+        floor = float(DEFAULT_DISK_FLOOR_GB if floor_gb is None else floor_gb)
+
+        if _DISK_DEFER_SINCE[0] <= 0.0:
+            _DISK_DEFER_SINCE[0] = now
+        blocked_for = now - _DISK_DEFER_SINCE[0]
+
+        if now - _DISK_DEFER_LAST[0] >= DISK_DEFER_NOTICE_S:
+            _DISK_DEFER_LAST[0] = now
+            print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB -- %d goal(s) "
+                  "waiting for %.0f min. Free disk; lowering the floor turns this refusal into "
+                  "a crash." % (free, floor, waiting, blocked_for / 60.0), flush=True)
+
+        if blocked_for < DISK_DEFER_ALERT_AFTER_S:
+            return
+        if _DISK_DEFER_NOTIFIED[0] and \
+                (now - _DISK_DEFER_NOTIFIED[0]) < DISK_DEFER_ALERT_REPEAT_S:
+            return
+        _DISK_DEFER_NOTIFIED[0] = now
+        if notify is None:
+            from tools.notify_ops import notify_desktop as notify
+        notify("Fleet is admitting nothing",
+               "%d goal(s) have been waiting %.0f minutes: C: has %.2f GB free and the floor "
+               "is %.1f GB. Free disk to let them start."
+               % (waiting, blocked_for / 60.0, free, floor))
     except Exception:
         pass
 
@@ -1607,6 +2943,31 @@ def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0, res
     eval_gb = DEFAULT_EVAL_DISK_GB if eval_gb is None else float(eval_gb)
     reserve = eval_gb * (1 + max(0, int(building)))
     return (free - reserve) >= floor
+
+
+def admits_another_tab(active_open: int, projected_peak: int, tab_weight: int,
+                       cap) -> bool:
+    """True when one more worker fits the LIVE tab budget. `cap` is `mc_box[0]`.
+
+    WHY THIS HAS A NAME NOW. The settings path is file -> box -> decision. The first half
+    got a name (`fleet_runner.build_settings_follower`) and a behavioural test; the second
+    stayed inside a 700-line run(), so the only thing holding it was a source assertion --
+    and relay/test_a_setting_the_operator_changed_reaches_a_running_fleet.py said so in as
+    many words rather than implying it was covered. A source assertion cannot catch a cap
+    that is read from the wrong place, or compared the wrong way round.
+
+    THE FIRST CLAUSE IS NOT A ROUNDING DETAIL. With `active_open == 0` the fleet admits one
+    worker whatever the cap says, because a cap that can reach zero would otherwise stop the
+    fleet permanently with work queued and nothing running -- and `mc_box[0]` is written by
+    the RAM autoscale, which genuinely can drive it down. `max(1, cap)` is the same guard
+    from the other side, for the case where something is already open.
+
+    Kept as a free function taking numbers, not a method on the run: the whole point is to
+    be callable without a browser, a clock, or a worker.
+    """
+    if active_open == 0:
+        return True
+    return projected_peak + tab_weight <= max(1, cap)
 
 
 def ram_target_cap(open_now, current_cap, ceiling,
@@ -1881,11 +3242,13 @@ _PHASE_LABELS = {
     "refuting":    "Reviewing",
     "verifying":   "Verifying",
     "awaiting":    "Needs input",
+    "awaiting_gate": "Needs input (human gate)",
     "done":        "Done",
     "stuck":       "Needs attention",
     "maxturns":    "Needs attention",
     "error":       "Stopped (error)",
     "cancelled":   "Stopped",
+    "interrupted": "Interrupted",   # written only by relay/fleet_reaper.py; never held live
     "fresh_replay": "Fresh replay",
     "content_refused": "Content refused",
 }
@@ -1936,7 +3299,7 @@ class RelayWorker:
                  max_transient=10, transcript_dir=None, run_id="", busy_writer=None,
                  max_research=3, contract_budget=None, max_continue=6,
                  resilience_profile="off", max_fresh_replays=0,
-                 fanout=False, spawn_fn=None):
+                 fanout=True, spawn_fn=None):
         self.page = None
         self.drv = None
         #: True while this worker is talking over a socket instead of holding a tab. It still
@@ -1947,6 +3310,10 @@ class RelayWorker:
         #: it nothing reports SUCCESS, the breaker's consecutive counter never resets, and a
         #: long healthy run closes the route on three failures scattered across hours.
         self._socket_turns_seen = 0
+        # Diagnostic crossing memory for meaningful-idle telemetry. Reset lazily when `turn`
+        # changes so a healthy long-lived worker emits at most seven tiny records per turn.
+        self._socket_idle_probe_turn = -1
+        self._socket_idle_probe_seen = set()
         #: Whether this worker STARTED on a socket and had to open a tab. Distinct from
         #: `socket`, which is False afterwards and so cannot answer "which route did this
         #: goal actually need" -- the one question the classifier will be built to predict.
@@ -1955,6 +3322,15 @@ class RelayWorker:
         #: Which slice of a split this worker owns, so the merge can label its report. Read
         #: from the goal because that is where child_goals put it; absent for ordinary goals.
         self.subtask_index = goal.get("subtask_index") if isinstance(goal, dict) else None
+        #: THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09), NOT the same thing as
+        #: `run_id` above -- run_id names the fleet SWEEP this worker happens to run inside
+        #: and is shared by every worker in it; jid names the ADMITTED GOAL and is unique per
+        #: goal, minted once by task_router.py at submission time. Neither can stand in for
+        #: the other: a run_id join finds every worker of one sweep, a jid join finds the one
+        #: worker (across however many retries/reconciles) that answers one admitted request.
+        #: Empty for goals that never passed through admission (a bare -g flag, an interactive
+        #: retry) -- absence here is meaningful, not a bug to paper over with a minted value.
+        self.jid = goal.get("jid") if isinstance(goal, dict) else None
         text, checks, cwd = goal_fields(goal)
         self.goal = text
         self.checks = checks
@@ -2015,6 +3391,11 @@ class RelayWorker:
         self._goal_resends = 0
         self._cooldown_until = 0.0
         self.verified = None          # None=not checked, True/False after a gate ran
+        #: The tree digest at the moment every acceptance check passed, and whether it still
+        #: matched when the worker settled. None on both = the question was never asked, which
+        #: is the same tri-state discipline `verified` above is built on.
+        self._verified_tree = ""
+        self.tree_stable = None
         self.last_verify_detail = ""
         self._pending_checks = []     # acceptance.Check specs left to run this gate
         self._active_check = None     # the Check currently running (non-blocking)
@@ -2035,6 +3416,12 @@ class RelayWorker:
         #: bytes go out again next sweep -- see _refute_fix_job for the measurement.
         self._refute_reason = ""
         self._refute_attempt = 0
+        # Preserve the last substantive DONE candidate while an independent reviewer asks for
+        # a correction. If that correction turn never answers, the truthful result is not
+        # STUCK-with-no-result: the candidate exists but its claim remains contradicted.
+        self._candidate_done_reply = ""
+        self._candidate_done_turn = 0
+        self._refute_fix_pending = False
         #: The last job text actually sent, so a re-send can be recognised as one.
         self._last_sent_job = ""
         # deep-research delegation (ported from the single-agent relay): a fleet worker can emit
@@ -2063,6 +3450,30 @@ class RelayWorker:
         self._signin_surfaced_ok = False  # TRUTHFUL result of that surface() call (see edge_recover.surface)
         self._headed_recovery_done = False  # forced a HEADED companion relaunch once (last resort)
         self._unlock_attempts = 0       # auto-injected unlock(password) turns (write/exec gate)
+        # None = use the outcome-wide retry policy; False/True = this worker has stronger
+        # evidence about THIS terminal event. Deterministic STUCK/content refusal must not be
+        # turned into a fresh conversation merely because another STUCK was transient once.
+        self.retryable_override = None
+        # HITL GATE (operator E, wired in -- see GATE_AFTER_STUCK_RETRIES above): the token of
+        # this worker's OWN standing gate, or None. ONE GATE PER WORKER AT A TIME -- a worker
+        # that has already asked (token set) must not ask again while its question stands; see
+        # _raise_stuck_gate. _gate_question is kept alongside the token so an unanswered gate
+        # can settle STUCK with the question preserved even after the gate file itself is gone
+        # (answered/deleted out from under it) or unreadable.
+        self._gate_token = None
+        self._gate_question = ""
+        self._gate_deadline = 0.0       # epoch time this standing gate settles STUCK unanswered
+        # LOCK-AMBIGUITY PROBE (see _decide's handling of _looks_locked_ambiguous()): a reply
+        # carries a LOCKED_MARKERS marker but is too long for _looks_locked's dominance rule to
+        # trust on its own -- the case that lost r6aa8e10b_a0_w0's whole goal on 2026-09-15
+        # (a long analysis that quoted "[locked: no valid unlock token]" and concluded STUCK,
+        # never auto-unlocked because len(resp) >= LOCKED_DOMINANCE_MAX_CHARS). Rather than guess
+        # from length, ask the worker directly. Bounded to ONE probe per worker, EVER (not one
+        # per episode) -- `_lock_probe_used` never resets.
+        self._lock_probe_used = False    # a probe has already been spent (budget is 1, lifetime)
+        self._lock_probe_pending = False  # a probe question is in flight; the NEXT reply answers it
+        self._lock_probe_resp = None     # the ambiguous reply the probe is deciding on
+        self._lock_probe_since = 0.0     # its `since` (turn-sent) timestamp, for _note_locked/unlock
         self._recycles = 0              # fresh-conversation recycles after a token-limit exhaustion
         try:
             self._max_recycles = int(os.environ.get("MCP_MAX_RECYCLES", "8"))
@@ -2113,6 +3524,13 @@ class RelayWorker:
         # Deliberately explicit rather than "the same goal text resumes itself". Re-running a
         # goal is a fresh attempt, and silently continuing the old conversation would carry an
         # earlier run's mistakes into it while looking like a clean start.
+        # WHICH DOOR THE RESUME CAME THROUGH, said out loud. An id handed in is identity; a
+        # lookup by goal text is a guess that happened to land, and the two are worth telling
+        # apart afterwards -- for a fortnight "continuing through the fleet works" was true of
+        # neither, and nothing in the record distinguished them.
+        if self.resume_conv:
+            print("[fleet] %s: resuming by id (%s)"
+                  % (self.name, str(self.resume_conv)[:48]), flush=True)
         if not self.resume_conv and isinstance(goal, dict) and goal.get("follow_up_to"):
             try:
                 found = _socket_route().conversation_for_goal(str(goal["follow_up_to"]))
@@ -2120,6 +3538,9 @@ class RelayWorker:
                 found = ""
             if found:
                 self.resume_conv = found
+                print("[fleet] %s: no id was supplied; matched a conversation by goal TEXT. "
+                      "That is a guess -- the caller should carry resume_conv." % self.name,
+                      flush=True)
             else:
                 # Said out loud. A follow-up that silently became a fresh conversation is
                 # exactly the failure being fixed, and it answers plausibly either way.
@@ -2128,6 +3549,23 @@ class RelayWorker:
         self.conv_url = ""         # filled once the conversation gets its /conversation/<id>
         self.conv_title = ""       # Copilot's auto-generated chat title (best-effort scrape)
         self.steer_msgs = []       # user steering messages to inject on the next turn(s)
+        # AND A RECORD OF THE ONES ALREADY DELIVERED. self.goal is this worker's identity and
+        # must not change (see the note where it is set), but a steer changes what the worker
+        # has been ASKED to do -- and until 2026-09-16 nothing downstream knew that.
+        #
+        # What that cost, observed live: a screen-inspection goal was running when a person
+        # typed an unrelated git-history question into the chat surface bound to that
+        # conversation. The chat sends to a live worker as a steer by construction
+        # (ui/CopilotChat.cs, SendToFleetConversation). The worker did the new task, reported
+        # it, and the refuter -- holding only the ORIGINAL goal -- ruled the goal unmet. The
+        # worker then argued back that the git question "was an additional request from the
+        # user and is complete", to a judge that had never been told there was one. It
+        # oscillated between the two tasks for turns on end.
+        #
+        # Nothing here decides whether a steer SHOULD have been allowed. It makes the
+        # amendment visible to the parts of the system that judge the result, which were
+        # deciding against a contract the human had already changed.
+        self.steers_applied = []
         self._last_was_steer = False   # so the FOLLOWING continue bridges off the steer
         self.max_turns = max_turns
         # autonomy-contract turn budget (None = no contract budget, inert). When set to an
@@ -2166,8 +3604,13 @@ class RelayWorker:
         # applies to every worker -- unlike the coding-discipline block, which is gated on a
         # verification card. theme_text stays the bare goal so the theme bucket is still
         # derived from the goal, not from the contract.
+        # THE BODY ONLY WHERE IT IS THE DECISION. `fanout` here is the caller's request, not
+        # the settled verdict (self.fanout is computed further down and also requires depth 0
+        # and a splittable goal) -- but it is the right gate: a worker that was never asked to
+        # split cannot need the procedure's content to decide a split, so it gets the pointer.
         composed_goal = _with_repo_contract(
-            _with_theme_memory(_with_matched_skill(self.goal), theme_text=self.goal))
+            _with_theme_memory(_with_matched_skill(self.goal, want_body=bool(fanout)),
+                               theme_text=self.goal))
         initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)
         # Kept for the branches that REBUILD the job for a fresh conversation -- a replay and
         # a token-limit recycle. Both hand the agent a chat with no history at all, so they
@@ -2193,8 +3636,64 @@ class RelayWorker:
         # runaway goal becomes an unbounded number of conversations, and the depth on the
         # envelope is what makes that structural rather than a promise.
         self._spawn_fn = spawn_fn
-        self.fanout = bool(fanout) and int(getattr(self.task_envelope, "depth", 0) or 0) == 0
+        # codex-plan item 6 (2026-09-09): `fanout` here is the run-wide launch-time switch
+        # (operator/--fanout/autostart's length-proxy decision on the BATCH) and depth==0 is
+        # purely structural (a child cannot re-split). Neither says anything about whether
+        # THIS goal's own text is actually independent/parallelizable work -- and because
+        # every worker, including ones added mid-run via add_box/add_goal_to_live_fleet, is
+        # built through this same constructor, a goal added after launch previously just
+        # inherited whatever the launch-time flag happened to be, never independently judged.
+        # `splittability.judge` is the real per-goal signal (see that module's docstring for
+        # what it is built from); it runs here so launch-time and mid-run goals get the same
+        # live judgment instead of one being a hand-me-down of the other. A judging failure
+        # must not grant fan-out it would otherwise have refused -- same "failure is not
+        # permission" rule tools/command_judge.py states for JudgeUnavailable -- so any
+        # exception here falls back to NOT wanting to split, never to the old length-only
+        # permissiveness.
+        # (depth below the configured maximum, read now; a merge worker never splits)
+        _depth0 = (fanout_mod.may_split_at(getattr(self.task_envelope, "depth", 0))
+                   and getattr(self.task_envelope, "role", "") != "aggregator")
+        _goal_splittable = False
+        # WHY THE VERDICT IS KEPT RATHER THAN RECORDED HERE: `self.run_id` is assigned further
+        # down this constructor, so a telemetry call beside the judgement would raise
+        # AttributeError on exactly the path that has something to report. This file has paid
+        # for that ordering once already -- see the `follow_up_to` block above, whose only
+        # informative branch raised because `self.name` was assigned later.
+        self._split_reason = ""
+        if fanout and _depth0:
+            try:
+                _v = _splittability.judge(
+                    self.goal, depth=int(getattr(self.task_envelope, "depth", 0) or 0),
+                    max_depth=fanout_mod.effective_max_depth())
+                # TRIAGE, NOT VERDICT. The offline rules decide whether one turn is worth
+                # spending on the question; the agent -- which can read the goal -- decides
+                # whether to split, and may answer NO_SPLIT. UNCERTAIN means the rules say
+                # they cannot tell, and `should_split` used to resolve that silently to "no":
+                # a regex heuristic settling a question it documents itself as unable to
+                # settle. It is asked now. NO_SPLIT still costs nothing, which is what keeps
+                # the default-on capability free for goals that fit.
+                _d = getattr(_v, "decision", "?")
+                _goal_splittable = bool(_v.should_split) or _d == _splittability.UNCERTAIN
+                self._split_reason = "%s: %s" % (_d, (getattr(_v, "reason", "") or "")[:200])
+            except Exception as _exc:
+                _goal_splittable = False
+                self._split_reason = "judge failed (%s); failure is not permission" % type(_exc).__name__
+        elif not _depth0:
+            self._split_reason = "a child may not split again (depth > 0)"
+        else:
+            self._split_reason = "the run was not launched fan-out-capable"
+        self.fanout = bool(fanout) and _depth0 and _goal_splittable
+        # KEPT SEPARATELY FROM THE VERDICT. `self.fanout` is the answer to "should this goal
+        # split", taken before the work started; this is the answer to "is splitting even
+        # possible here", which no later evidence can change. A mid-run split needs the second
+        # and must not be blocked by the first -- the whole point is that the first was made
+        # when nothing was known.
+        self._fanout_capable = bool(fanout) and _depth0 and self._spawn_fn is not None
         self._fanout_done = False
+        #: A mid-run split is offered ONCE. A second refusal is the agent telling us the
+        #: same thing twice, and asking again would spend the remaining turns on the question
+        #: instead of on the work.
+        self._midrun_split_asked = False
         if self.fanout:
             # Turn 1 asks for the split instead of the work. The goal still travels in full,
             # because the split has to be made against the real instructions -- an agent
@@ -2212,14 +3711,27 @@ class RelayWorker:
             # exactly what the theme notes hold.
             self.job = (conversation_start_label(self.name) + PROTOCOL + composed_goal
                         + "\n\n" + fanout_mod.SPLIT_JOB)
+        # THE FIRST MESSAGE, KEPT, so that it can be delivered again if the agent shows it never
+        # acted on it (see _first_reply_gate). None for a worker that resumes an existing
+        # conversation: there the first message is long gone and is not ours to repeat.
+        self._first_message = None if self.resume_conv else self.job
+        self._first_absorbed = False
+        self._first_verdict = None
+        self._first_redeliveries = 0
         self.turn = 0
         self._turn_sent_at = 0.0
         self.no_progress = 0
         self.last_norm = None
+        # The worker's own STUCK reason from its immediately preceding turn, for the
+        # STUCK-CONVERGENCE detector above; None means "no STUCK yet this streak", which is
+        # also why the very first STUCK of a streak can never converge (there's nothing to
+        # compare it to yet) -- it always earns its one retry.
+        self._last_stuck_reason = None
         # phase_events MUST be initialized before `self.status = PENDING` so the setter
         # can append the initial "Queued" event immediately on construction.
         self.phase_events = []
-        self.status = PENDING      # pending | ready | waiting | done | stuck | maxturns | error
+        self.status = PENDING      # pending | ready | waiting | verifying | researching |
+                                   # refuting | awaiting_gate | done | stuck | maxturns | error
         self.outcome = None
         self.reason = ""
         self.last_response = ""
@@ -2230,10 +3742,28 @@ class RelayWorker:
         self._last_text = None
         self._stable_since = None
         self._t_send = 0.0
+        # WHEN A CONVERSATION WAS OPENED FOR THIS WORKER (attach), and whether the "opened but
+        # nothing sent" row was written -- see relay/conversation_saving.py. 0.0 = none opened.
+        self._attached_ts = 0.0
+        self._unsent_noted = False
         # full-text transcript (each turn's send + Copilot reply, untruncated). The KEY
         # is run-unique (run_id includes the fleet start time) so reused worker names
         # (w0/w1) across rounds never share a file. Path is exposed via .transcript so
         # the snapshot can hand it to the UI. None when no dir was passed (back-compat).
+        # KEPT, NOT ONLY CONSUMED. This was folded straight into _tx_base_key and dropped,
+        # so the two mechanism records this class writes had no run to name and went into
+        # .fleet/mechanisms.jsonl blank -- 2981 of 4386 rows.
+        self.run_id = run_id or ""
+        # STEP TWO OF THE STAIRCASE, per worker. `configured` is written once per run at
+        # launch; this is the per-goal answer, and it is per worker because that is where the
+        # decision is made -- including for goals added mid-run, which run the same judge.
+        try:
+            _mt.record("fanout", run_id=self.run_id, goal_hash=getattr(self, "original_goal_hash", ""),
+                       configured=bool(fanout), config_source="per-goal judge",
+                       eligible=bool(self.fanout),
+                       ineligible_reason=("" if self.fanout else (self._split_reason or "")))
+        except Exception:
+            pass
         self._tx_base_key = ((run_id + "_") if run_id else "") + name
         self._tx_key = (self._tx_base_key + "_a0"
                         if self.resilience_profile != "off" else self._tx_base_key)
@@ -2241,6 +3771,62 @@ class RelayWorker:
         self.transcript = self._tx.path or ""
         if self.transcript:
             self.attempt_transcripts.append(self.transcript)
+
+    def _apply_diagnosis(self, *, fresh_was_refusal, fresh_succeeded,
+                         fresh_was_transient_error):
+        """Record WHY the refusal recovery ended the way it did.
+
+        One call site used to be `recovery_cause = "session_state"` and the other
+        `recovery_cause = "task_content"` -- the first and third answers of
+        review_resilience.diagnose_after_fresh_replay, written out. The other two were
+        unreachable, and they are the two where these fields stayed empty.
+
+        Never raises: this is a record, and a record must not be able to fail the settle it is
+        describing.
+        """
+        try:
+            d = diagnose_after_fresh_replay(
+                original_was_refusal=True,
+                fresh_was_refusal=bool(fresh_was_refusal),
+                fresh_succeeded=bool(fresh_succeeded),
+                fresh_was_transient_error=bool(fresh_was_transient_error),
+            )
+            self.recovery_cause = str(d.cause.value)
+            self.recovery_result = _RECOVERY_RESULT.get(d.action, str(d.action.value))
+            # THE SENTENCE, WHICH LIVED ONLY INSIDE THE FUNCTION. `reason` is what a person
+            # reads first, and "identical task refused in two independent conversations" was
+            # already the third branch's text typed out by hand.
+            self.reason = d.reason
+            # THE TRIP-WIRE FOR A MOMENT NOBODY IS WATCHING FOR. The standing note about
+            # these fields says, correctly, not to build a reader yet -- measured 2026-09-20,
+            # every recovery_cause/result/state across 549 files and 1,574 worker records is
+            # empty and every fresh_replay_count is 0, because the mechanism is off by default
+            # and only bench/review_run.py turns it on. It then says the first non-empty value
+            # is when to build one.
+            #
+            # And nothing was going to say when that arrived. The fields travel three layers
+            # into a final snapshot that no UI, script or analysis reads, so the first real
+            # recovery would have landed in a file nobody opens, and the note would have gone
+            # on saying "not yet" indefinitely. That is the shape of a watcher that only
+            # reports changes and therefore cannot see a death -- here, cannot see a birth.
+            #
+            # One row in the ledger that IS read, written only when a cause is actually
+            # produced. Not a reader for the fields: a signal that the day to build one has
+            # come.
+            if self.recovery_cause:
+                try:
+                    _mt.record("refusal_recovery", run_id=getattr(self, "run_id", ""),
+                               instance=self.name, turn=getattr(self, "turn", None),
+                               configured=True, config_source="resilience_profile",
+                               config_value={"max_fresh_replays":
+                                             getattr(self, "max_fresh_replays", None)},
+                               eligible=True, triggered=True, executed=True,
+                               extra={"cause": self.recovery_cause,
+                                      "result": self.recovery_result})
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
     def _start_fresh_replay(self):
         """Move this worker to a brand-new conversation and resend the identical envelope."""
@@ -2287,6 +3873,15 @@ class RelayWorker:
         self._turn_sent_at = 0.0
         self.no_progress = 0
         self.last_norm = None
+        # A fresh conversation has no memory of the old one's STUCK streak either.
+        self._last_stuck_reason = None
+        # Nor of a standing gate -- a fresh replay only ever starts from a status that isn't
+        # 'awaiting_gate' (raising a gate holds the worker, so no new turn -- and therefore no
+        # policy-refusal replay -- can begin while one stands), but reset defensively rather
+        # than leave a stale token pointing at a question this new conversation never asked.
+        self._gate_token = None
+        self._gate_question = ""
+        self._gate_deadline = 0.0
         self.last_response = ""
         self._continue_count = 0
         self.transient = 0
@@ -2296,6 +3891,8 @@ class RelayWorker:
         self._stable_since = None
         self._count_before = 0
         self._t_send = 0.0
+        self._attached_ts = 0.0
+        self._unsent_noted = False
         self._cooldown_until = 0.0
         self.closed = False
 
@@ -2308,13 +3905,20 @@ class RelayWorker:
         try:
             self.page = _open_fresh(self._context, self._agent_url)
             self.drv = CopilotWebDriver(self.page)
+            self._attached_ts = time.time()
         except Exception as e:
             self.status, self.outcome = "error", "ERROR"
             self.reason = "fresh replay open failed: %s: %s" % (type(e).__name__, e)
             return False
 
         # This is the same initial payload as the original non-plan review task.
-        self.job = self._replay_job()
+        try:
+            self.job = self._replay_job()
+        except EmptyGoalError as e:
+            # A fresh conversation with no goal in it would answer some other question.
+            self.status, self.outcome = "error", "ERROR"
+            self.reason = "fresh replay refused: %s" % (e,)
+            return False
         self.status = "ready"
         return True
 
@@ -2377,6 +3981,7 @@ class RelayWorker:
             if drv is not None:
                 self.page, self.drv, self.socket = None, drv, True
                 self.status = "ready"
+                self._attached_ts = time.time()
                 return True
 
         # A CONVERSATION ID IS NOT A URL, and everything below opens one. `open_url` is
@@ -2399,6 +4004,7 @@ class RelayWorker:
             self.page = _open_fresh(context, open_url)
             self.drv = CopilotWebDriver(self.page)
             self.status = "ready"
+            self._attached_ts = time.time()
             # BUG 4d fix: proactively run the EXISTING auto-consent click-through once, right
             # after the composer has rendered (_open_fresh only returns once it has), instead
             # of ONLY reactively from _decide after a real reply already contained consent
@@ -2419,11 +4025,44 @@ class RelayWorker:
             self.reason = "open failed: " + type(e).__name__ + ": " + str(e)
             return False
 
+    def _note_conversation_unsent(self, where):
+        """Write the `conversation_created_unsent` row, once, when a conversation was opened for
+        this worker and no message went out within conv_saving_mod.UNSENT_AFTER_S. Observes only:
+        it never sends, closes or creates anything (the id is peeked, not minted). Never raises."""
+        try:
+            if self._unsent_noted:
+                return
+            if not conv_saving_mod.unsent_overdue(self._attached_ts, self._t_send, self.turn):
+                return
+            self._unsent_noted = True
+            has_id = False
+            try:
+                if getattr(self, "socket", False) and self.drv is not None:
+                    has_id = bool((self.drv.conversation_ids() or {}).get("client"))
+                elif self.page is not None:
+                    has_id = bool(_CONV_GUID_RE.search(str(self.page.url).split("?", 1)[0]))
+            except Exception:
+                has_id = False
+            conv_saving_mod.record_unsent(
+                run_id=getattr(self, "run_id", ""), instance=getattr(self, "name", ""),
+                route=("socket" if getattr(self, "socket", False) else "tab"),
+                age_s=time.time() - self._attached_ts, where=where, has_id=has_id)
+        except Exception:
+            pass
+
     def close(self):
-        """Release the tab (frees ~0.3-0.6 GB). Idempotent; never raises."""
+        """Release this worker and every resource it owns. Idempotent; never raises."""
+        try:
+            if self._active_check is not None:
+                self._active_check.cancel()
+        except Exception:
+            pass
+        self._active_check = None
+        self._pending_checks = []
         if self.closed:
             return
         self.closed = True
+        self._note_conversation_unsent("close")
         try:
             # THE POSITIVE EXAMPLES TOO. A record of only the failures teaches a classifier
             # that everything fails; the goals that went the whole way over a socket are half
@@ -2455,9 +4094,36 @@ class RelayWorker:
                 turns=self.turn, outcome=self.outcome, status=self.status,
                 conv_client=ids.get("client", ""), conv_server=ids.get("server", ""),
                 conv_session=ids.get("session", ""),
-                reason=(self.reason or "")[:200])
+                reason=(self.reason or "")[:200],
+                # THE JOIN KEY task_router.py NEEDS AND NEVER GOT. `self.jid` is the
+                # admission-time id task_router.py mints per goal (see the comment at its
+                # assignment above) -- already carried into history.json and the final
+                # sweep snapshot, but never into this per-worker completion ledger, which is
+                # the one record written unconditionally (regardless of whether the cockpit
+                # is open to archive history.json) and appended rather than overwritten. Its
+                # absence here is why a fleet-bound job's true outcome could never be read
+                # back by anything joining on the id task_router.py itself uses -- see
+                # relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py. Empty for
+                # goals that never passed through admission, same as `self.jid` itself.
+                jid=(self.jid or ""))
         except Exception:
             pass
+        # THE VALIDITY AUDIT LEDGER, written when the conversation is complete. Only does work for
+        # a conversation that touched a validity_* tool or names one in its goal; idempotent, so
+        # the backfill script and this hook can both cover the same worker. A failure is reported
+        # on stderr by the helper, never raised into the close.
+        try:
+            from bridge.validity_audit import sync_worker_logged
+            from tools.tool_ledger import _repo_path
+            sync_worker_logged(
+                getattr(self, "_tx_key", ""), ledger_path=_repo_path(),
+                run_id=getattr(self, "run_id", ""), name=self.name, jid=(self.jid or ""),
+                outcome={"outcome": self.outcome, "status": self.status,
+                         "reason": (self.reason or "")[:300]},
+                reviewed=bool(getattr(self, "refute_count", 0)),
+                tail_bytes=16 * 1024 * 1024)
+        except Exception as exc:
+            _report_store_failure("validity audit sync", exc)
         try:
             if getattr(self, "socket", False) and self.drv is not None:
                 self.drv.close()          # a socket is cheap, but it is not free
@@ -2493,7 +4159,71 @@ class RelayWorker:
         self.reason = "手動で停止・タブ解放しました"
         self.close()
 
+    def _note_timeout(self, origin, elapsed_s, treatment, budget_s=None):
+        """Record one timeout WE measured, with the clock that fired and what we then did.
+
+        CAUSE AND TREATMENT ARE SEPARATE. `timeout` is the fact; retrying, salvaging or giving
+        up is the choice that followed. Collapsing them loses that a retry which worked and a
+        retry which gave up began identically -- and encourages "timeout therefore retry",
+        which is a reflex rather than a policy.
+
+        `origin` names the clock: `per_turn` is the tab-era budget (`per_turn_timeout_s`,
+        240s by default); `socket_turn` is the driver's much longer bound
+        (SOCKET_TURN_TIMEOUT_S, 1200s). Without it an inner overrun reads as an outer one,
+        which is the distinction deepseek-harness's timeout-policy scopes its inner timer for.
+
+        THIS PARAGRAPH DESCRIBED AN INTENT THE CODE DID NOT HAVE. The caller compared every
+        worker against per_turn_timeout_s and picked the label from the worker's TRANSPORT, so
+        a socket row said `origin=socket_turn budget_s=240` -- the 1200s clock reported as
+        having expired at 240, which is the one reading the field exists to prevent. The
+        caller applies the matching bound now and passes it in, so `budget_s` is the budget
+        that actually expired.
+
+        Never raises: this is telemetry beside a failure path, and a failure path that can
+        fail again is worse than no record.
+        """
+        try:
+            # THE BUDGET THAT EXPIRED, not the one this class happens to hold. It recorded
+            # per_turn_timeout_s whatever clock fired, so every socket row read
+            # `origin=socket_turn budget_s=240` -- the two numbers the origin field exists to
+            # keep apart, printed as one.
+            self._tx.metric(self.turn, "timeout", elapsed_s, origin=origin,
+                            budget_s=(self.per_turn_timeout_s if budget_s is None
+                                      else budget_s),
+                            treatment=treatment,
+                            transient=getattr(self, "transient", 0), observed=True)
+        except Exception:
+            pass
+
     def _capture_url(self):
+        # A SOCKET WORKER HAS NO PAGE, AND USED TO LEAVE NO WAY BACK.
+        #
+        # Everything below is page-only, so for the socket path -- which is the ordinary path
+        # now -- conv_url stayed "" for the worker's whole life and the transcript never got
+        # its `guid` line. Measured 2026-09-12: status.json conv_url "", all 267 fleet rows in
+        # conversations.json url "", and the transcript carrying only goal/key/meta/name/turn.
+        # Meanwhile socket_route.jsonl had the id the whole time.
+        #
+        # The consequence was not cosmetic. conv_url is the single field the chat window keys
+        # its send target, its steer mode and its live snapshot refresh on, so an empty one
+        # made a fleet conversation unaddressable: typing a follow-up into it answered "この会
+        # 話の送信先を特定できません。会話を開き直してください", advice that cannot work because
+        # reopening supplies nothing.
+        #
+        # Stored as "sess:<guid>" -- the shape the bridge already defines (SESSREF_PREFIX) and
+        # already knows how to resume -- NOT as a URL, because a socket conversation has no
+        # navigable one and calling it a url is how a resume silently becomes a fresh chat.
+        try:
+            if self.page is None and self.drv is not None and getattr(self, "socket", False):
+                ids = self.drv.conversation_ids() or {}
+                # CLIENT FIRST: it is the id that appears in the page URL, so it is the one a
+                # resume can actually open, and it is what conversation_for_goal matches on.
+                cid = str(ids.get("client") or ids.get("server") or "").strip()
+                if cid and not self.conv_url:
+                    self.conv_url = SESSREF_PREFIX + cid
+                    self._tx.note_guid(cid)
+        except Exception:
+            pass
         try:
             if self.page is not None:
                 u = self.page.url
@@ -2534,9 +4264,100 @@ class RelayWorker:
         from needs a live page to reach, so what it built was only ever checkable by reading
         it -- and its comment, "the same initial payload as the original", had quietly stopped
         being true when the original grew memory and a procedure.
+
+        CHANGED 2026-09-25 (same fix, same day, as _initial_job_with_unlock): this used to
+        carry UNLOCK_PREFIX / the literal password into turn 1 of the replayed conversation,
+        reasoning that a brand-new conversation is a brand-new MCP session so whatever token
+        the agent held is gone. That reasoning about the session is still correct -- but the
+        production transcripts that forced _initial_job_with_unlock's fix apply here with equal
+        force: Microsoft 365 Copilot's safety/DLP filter blanket-refuses "turn 1 contains a
+        password argument" regardless of which conversation that turn 1 belongs to. Injecting
+        proactively into this reopened turn 1 would just relocate the same deterministic refusal
+        one conversation later instead of removing it. The reactive path (_looks_locked() ->
+        _inject_unlock(), from _decide_impl) still re-locks and re-unlocks this fresh
+        conversation exactly as it does the original one, the first time a write/exec tool is
+        actually refused -- that shape is not blanket-refused. Do not reintroduce the proactive
+        injection here without rereading that incident.
+
+        _unlock_attempts is RESET to 0, not left at whatever the prior conversation spent: this
+        is a fresh MCP session with its own reactive re-unlock budget (MAX_UNLOCK_ATTEMPTS bounds
+        looping WITHIN one conversation), and there is no longer a proactive attempt to count
+        against it. Same reasoning as _recycle_job's reset, below.
         """
+        self._unlock_attempts = 0
+        goal = effective_goal(self.goal)
+        if not goal.strip():
+            raise EmptyGoalError("replay prompt would carry no goal")
+        # If the worker's goal is a recovery payload, its composition ends with that payload,
+        # not the goal: rebuild from the context prefix + the real goal.
+        body = (self._composed_prefix + goal if is_recovery_payload(self.goal)
+                else self._composed_goal)
         return (conversation_start_label(self.name + "-replay%d" % self.fresh_replay_count)
-                + PROTOCOL + self._composed_goal)
+                + PROTOCOL + body)
+
+    #: How much of the previous conversation may travel. The recycle exists BECAUSE the last
+    #: conversation ran out of context, so an expensive handover would recreate the condition
+    #: it is recovering from. Measured 2026-09-16: concatenating every assistant turn of the
+    #: longest run on record (74 turns) is 17,888 characters, and a typical run is 14,000 --
+    #: so a cap in the low thousands keeps the note to a fraction of one turn's text while
+    #: still carrying several attempts.
+    COMPACT_MAX_CHARS = 1400
+    COMPACT_MAX_TURNS = 4
+
+    def _compaction_note(self):
+        """What the previous conversation SAID it did, marked as claims rather than facts.
+
+        WHY THIS IS NOT A SUMMARY OF PROGRESS. RECYCLE_PREFIX tells the fresh agent to read
+        its output files and continue, which is correct and is the only part that is
+        verifiable -- disk is ground truth. What is lost is cheaper and still valuable: which
+        approaches were already tried, so the new conversation does not spend its first turns
+        rediscovering a dead end.
+
+        AND IT IS LABELLED, BECAUSE NOTHING IN THE STORE DISTINGUISHES A VERIFIED FINDING FROM
+        AN UNCHECKED CLAIM. The transcript holds opaque prose: a worker that reported success
+        it never achieved is recorded exactly like one that did the work. A summary that
+        presented these as facts would faithfully carry a false claim into a fresh context and
+        give it a second life -- which is worse than dropping it, because the new conversation
+        cannot tell it came from a guess. So the note says what it is, and says to check.
+
+        Reads this worker's own transcript, which needs no attribution: the relay writes one
+        file per worker and no join to an MCP session is involved. Never raises -- a recycle
+        must proceed even if nothing can be read.
+        """
+        try:
+            path = getattr(self, "transcript", "") or ""
+            if not path or not os.path.isfile(path):
+                return ""
+            said = []
+            with io.open(path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    try:
+                        rec = json.loads(line)
+                    except ValueError:
+                        continue
+                    if rec.get("role") == "assistant":
+                        text = str(rec.get("text") or "").strip()
+                        if text:
+                            said.append(text)
+            if not said:
+                return ""
+            # The most recent attempts are the ones worth not repeating.
+            picked, total = [], 0
+            for text in reversed(said[-self.COMPACT_MAX_TURNS:]):
+                room = self.COMPACT_MAX_CHARS - total
+                if room <= 120:
+                    break
+                piece = text if len(text) <= room else text[:room - 1] + "…"
+                picked.append(piece)
+                total += len(piece)
+            picked.reverse()
+            body = "\n---\n".join(picked)
+            return ("\n【前会話が『やった』と述べたこと（未検証）】以下は前の会話の発言そのままで、"
+                    "正しい保証はありません。同じ手を繰り返さないための材料として読み、"
+                    "事実として扱う前に必ずディスク上の実物で確かめてください。\n"
+                    + body + "\n")
+        except Exception:
+            return ""
 
     def _recycle_job(self):
         """The opening turn after a token-limit recycle, which is a BRAND NEW chat.
@@ -2544,9 +4365,65 @@ class RelayWorker:
         The agent has no memory of anything, including the procedure it was given at turn 1,
         so it travels again. It goes ABOVE the reset notice because RECYCLE_PREFIX ends with a
         "--- 元のゴール ---" heading, and what follows that heading should be the goal.
+
+        THE UNLOCK NO LONGER TRAVELS PROACTIVELY. This function used to carry UNLOCK_PREFIX /
+        the literal password into turn 1 of the recycled conversation, on the reasoning
+        recorded above (a fresh conversation is a fresh MCP session, so the token the agent was
+        holding died with the old chat and the new one starts locked). That reasoning about the
+        session boundary is still correct. CHANGED 2026-09-25: it no longer follows that the
+        password belongs in turn 1. The same production transcripts that forced
+        _initial_job_with_unlock's fix (see that function's docstring -- Microsoft 365
+        Copilot's safety/DLP filter blanket-refuses "turn 1 contains a password argument",
+        deterministically, regardless of which conversation that turn 1 opens) apply here
+        unchanged: proactively injecting into this reopened turn 1 does not avoid the refusal,
+        it just relocates it to the recycled conversation's first message instead of the
+        original's. The reactive path (_looks_locked() -> _inject_unlock(), from _decide_impl)
+        still re-locks and re-unlocks this fresh conversation the same as any other, the first
+        time a write/exec tool is actually refused -- that shape is not blanket-refused. Do not
+        reintroduce the proactive injection here without rereading that incident.
+
+        The reactive budget is RESET rather than spent. MAX_UNLOCK_ATTEMPTS bounds a re-unlock
+        loop WITHIN one conversation, where repeated failure means the password or the identity
+        is wrong; this is a different conversation, and the outer loop is already bounded by
+        _max_recycles. Charging recycles to that budget would make a long, healthy job go STUCK
+        for "unlock attempts exhausted" when nothing about the unlock had failed. There is also
+        no longer a proactive attempt to count against it in the first place.
         """
+        self._unlock_attempts = 0
+        goal = effective_goal(self.goal)
+        if not goal.strip():
+            raise EmptyGoalError("recycle prompt would carry no goal")
+        head = PROTOCOL
+        # The compaction note goes AFTER the goal, not before it: RECYCLE_PREFIX ends with a
+        # heading that introduces the goal, and the invariant that the composition ends with
+        # the goal is what _composed_prefix's suffix slice depends on. Appending after it
+        # keeps the goal intact and contiguous; the note is an addendum, which is also what
+        # it is epistemically.
         return (conversation_start_label(self.name + "-recycle%d" % self._recycles)
-                + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + self.goal)
+                + head + self._composed_prefix + RECYCLE_PREFIX + goal
+                + self._compaction_note())
+
+    def goal_as_amended(self):
+        """The goal a judge should hold: the original, plus every steer a person has sent.
+
+        self.goal stays exactly as it was -- it is the transcript key and this worker's
+        identity, and rewriting it would rename a running conversation. This is the reading
+        used when asking whether the work is done, because that question is about the task as
+        it stands NOW, and a person has changed it.
+
+        Returns self.goal unchanged when nobody has steered, so every existing caller that
+        wants the identity keeps getting exactly what it got before.
+        """
+        try:
+            if not getattr(self, "steers_applied", None):
+                return self.goal
+            parts = ["".join(self.goal or "")]
+            parts.append("\n\n--- 以降は走行中に人が追加した指示です（元のゴールと併せて評価してください） ---")
+            for i, t in enumerate(self.steers_applied, 1):
+                parts.append("%d. %s" % (i, str(t or "").strip()))
+            return "\n".join(parts)
+        except Exception:
+            return self.goal
 
     def _task_anchor(self, nudge):
         """Prepend the worker's task identity to a GENERIC retry/continue/fix nudge so a
@@ -2555,23 +4432,148 @@ class RelayWorker:
         forget WHICH task it is on. We re-state cwd + a one-line goal summary every time.
         Uses only fields already on the worker (self.cwd, self.goal); never raises."""
         try:
-            anchor = ""
-            one = ""
-            for ln in (self.goal or "").splitlines():
-                ln = ln.strip()
-                if ln:
-                    one = ln[:160]
-                    break
+            # UNTIL THE FIRST MESSAGE IS KNOWN TO HAVE LANDED THERE IS NO LEDGER TO POINT AT.
+            # The ledger says "full text: the first message of this conversation"; while the
+            # agent has shown nothing that acts on that message, the pointer names a message it
+            # may never have received.
+            _redo = self._first_message_redelivery("nudge")
+            if _redo:
+                return _redo
+            # A COMPACT LEDGER, NEITHER THE FIRST LINE NOR THE WHOLE GOAL. A 160-character head
+            # slice dropped a hard constraint that sat after character 200 and the worker
+            # answered another question from turn 3 on (docs/private/20260930_goal_fidelity_design.md);
+            # restating the whole goal every turn (PR #80) fixed that but spends the small
+            # context on repetition, and the owner rejected it. The first message keeps the
+            # full goal; this carries the task line, the goal's fixed-constraint sentences and a
+            # fan-out child's scope block, within LEDGER_MAX_CHARS in total. Wording follows the
+            # worker's own signal that it is a coding task: a verification card (self.checks).
             where = (self.cwd or "").strip()
-            if where and one:
-                anchor = "あなたは %s で「%s」を修正中です。その作業を続けてください。\n" % (where, one)
-            elif one:
-                anchor = "あなたは「%s」を修正中です。その作業を続けてください。\n" % one
-            elif where:
-                anchor = "あなたは %s での作業を続けてください。\n" % where
+            job_id = self._ledger_job_id()
+            if not effective_goal(self.goal).strip():
+                anchor = ("あなたは %s での作業を続けてください。\n" % where) if where else ""
+            else:
+                if self.checks:
+                    lead = ("あなたは %s で次のタスクを修正中です。その作業を続けてください。\n"
+                            % _clip(where or "この作業フォルダ", 200))
+                else:
+                    lead = "作業中のタスクの台帳です。固定条件をすべて満たして続けてください。\n"
+                ledger = goal_ledger(effective_goal(self.goal), job_id,
+                                     cap=LEDGER_MAX_CHARS - len(lead))
+                anchor = lead + ledger if ledger else lead
             return anchor + nudge if anchor else nudge
         except Exception:
             return nudge
+
+    #: How many times the first message may be delivered again, in total, per worker.
+    FIRST_MESSAGE_MAX_REDELIVERIES = 2
+    FIRST_MESSAGE_LEAD_IN = "先ほどのメッセージが届いていなかったようです。もう一度送ります。\n\n"
+
+    def _first_message_redelivery(self, via, reason=""):
+        """The text that delivers the first message again, or "" when it should not be.
+
+        A conversation whose agent has not yet acted on the first message has no goal, and the
+        compact-ledger nudges assume it does. Delivering the ORIGINAL message again is not a
+        restatement of the goal in an ordinary nudge -- it is the first delivery, made again
+        because the first one demonstrably did not land. Bounded, counted, and recorded
+        (mechanism `first_message_not_absorbed`). Never raises."""
+        try:
+            first = getattr(self, "_first_message", None)
+            if not first or getattr(self, "_first_absorbed", True):
+                return ""
+            if via == "nudge" and getattr(self, "turn", 0) < 1:
+                return ""       # the first message has not even been sent yet
+            if getattr(self, "_first_redeliveries", 0) >= self.FIRST_MESSAGE_MAX_REDELIVERIES:
+                return ""
+            self._first_redeliveries = getattr(self, "_first_redeliveries", 0) + 1
+            try:
+                _mt.record("first_message_not_absorbed", run_id=getattr(self, "run_id", ""),
+                           instance=getattr(self, "name", ""), turn=getattr(self, "turn", None),
+                           configured=True, config_source="run",
+                           config_value={"max_redeliveries": self.FIRST_MESSAGE_MAX_REDELIVERIES},
+                           eligible=True, triggered=True, executed=True,
+                           extra={"via": via, "reason": reason or "no_reply_yet",
+                                  "redelivery": self._first_redeliveries})
+            except Exception:
+                pass
+            try:
+                self._tx.metric(getattr(self, "turn", 0), "first_message_redelivery",
+                                self._first_redeliveries, via=via, reason=reason or "no_reply_yet")
+            except Exception:
+                pass
+            return self.FIRST_MESSAGE_LEAD_IN + first
+        except Exception:
+            return ""
+
+    def _note_first_reply(self, resp):
+        """Judge the reply once, on arrival, and stop watching as soon as it PROVES the goal
+        landed. The verdict is acted on later, past the infrastructure handlers
+        (_first_reply_gate), so a sign-in wall or a throttle is never read as a greeting.
+        Never raises."""
+        try:
+            if not getattr(self, "_first_message", None) or getattr(self, "_first_absorbed", True):
+                return
+            ok, why = first_reply_check.first_reply_absorbed(resp, self.goal)
+            self._first_verdict = (ok, why)
+            if ok and why in first_reply_check.STRONG_ABSORBED_REASONS:
+                self._first_absorbed = True
+        except Exception:
+            pass
+
+    def _first_reply_gate(self, resp):
+        """True when this reply was the answer of an agent that has no goal and the worker was
+        re-armed (first message delivered again) or ended. False for everything else.
+
+        Reached only for a reply that no infrastructure handler took. Never silently continues
+        on a goal-less conversation: past the bound the worker ends with an explicit,
+        re-queueable outcome."""
+        try:
+            verdict = getattr(self, "_first_verdict", None)
+            self._first_verdict = None
+            if verdict is None or getattr(self, "_first_absorbed", True):
+                return False
+            ok, why = verdict
+            if ok:
+                if why not in ("platform_error", "empty_reply_not_judged"):
+                    self._first_absorbed = True
+                return False
+            redo = self._first_message_redelivery("reply", why)
+            if redo:
+                self.job = redo
+                self.status = "ready"
+                self.reason = ("最初のメッセージが受理されていない(%s) -> 同じ会話で再送 %d/%d"
+                               % (why, self._first_redeliveries,
+                                  self.FIRST_MESSAGE_MAX_REDELIVERIES))
+                return True
+            self.status, self.outcome = "stuck", "INFRA_STUCK"
+            self.reason = ("⚠ 最初のメッセージを%d回再送してもエージェントがゴールに着手しない(%s)。"
+                           "会話にゴールが届いていない=**タスク失敗でなく配送の失敗(INFRA)**。"
+                           "再投入対象。" % (self._first_redeliveries, why))
+            return True
+        except Exception:
+            return False
+
+    def _ledger_job_id(self):
+        """The id the ledger's pointer may name: the record's task id, else the transcript file."""
+        try:
+            rec = getattr(self, "goal_record", None) or {}
+            jid = str(rec.get("task_id") or "").strip()
+            if jid:
+                return jid
+            return os.path.basename(getattr(self, "transcript", "") or "")
+        except Exception:
+            return ""
+
+    def _steer_job(self, steer_text):
+        """The turn that delivers one queued steer. A recovery payload is system text, not a
+        person's; and because it ends at the goal heading it is sent with the goal put back,
+        so the recovery turn never replaces the task with nothing."""
+        if is_recovery_payload(steer_text):
+            return (SYSTEM_RECOVERY_PREFIX + fill_recovery_goal(steer_text, self.goal, self._ledger_job_id())
+                    + "\n上記の運用上の指示に従って作業を続行してください。"
+                    + CLOSING_INSTRUCTION)
+        return ("【ユーザーからの追加指示】" + steer_text
+                + "\n上記を最優先で踏まえて作業を続行してください。"
+                + CLOSING_INSTRUCTION)
 
     def _begin_send(self):
         # max_turns=0 (or falsy) means unlimited -- no turn-cap check at all.
@@ -2587,12 +4589,57 @@ class RelayWorker:
             else:
                 self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
             return
+        # SOCKET WORKERS DO NOT SPEND A TAB SLOT, but their generative turns still spend the
+        # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
+        # actually consumes it, rather than leaving socket workers PENDING behind a tab/worker
+        # admission cap. Keep the worker READY and leave steer/job state untouched while waiting.
+        if getattr(self, "socket", False) and not admission_is_due():
+            ok_rate, why_rate = rate_headroom_ok()
+            self.reason = why_rate or "socket send pacing -- waiting for next send slot"
+            self._note_conversation_unsent("send_pacing")
+            return
+
         # a queued steering message preempts the normal CONTINUE/FIX job for this turn
         if self.steer_msgs:
-            self.job = ("【ユーザーからの追加指示】" + self.steer_msgs.pop(0)
-                        + "\n上記を最優先で踏まえて作業を続行してください。"
-                        "完了なら DONE、無理なら FAIL と理由を書いてください。")
+            _steer_text = self.steer_msgs.pop(0)
+            self.steers_applied.append(_steer_text)
+            # A REDELIVERED UNLOCK-RECOVERY PAYLOAD IS NOT A HUMAN INSTRUCTION -- SAY SO.
+            # "【ユーザーからの追加指示】" (an instruction FROM THE USER) is honest for a real
+            # cockpit steer, but when this queue is instead carrying _inject_unlock's own
+            # UNLOCK_PREFIX text back to the worker (see fleet_runner._follow_up / dispatch
+            # re-delivering a stuck worker's pending job through this same channel), that label
+            # is FALSE: nothing arrived from the user, and mid-conversation text that falsely
+            # claims to be a user instruction while directing a tool call with a password is
+            # exactly the shape a safety-aligned model is right to refuse as an injection.
+            # Confirmed against .fleet/transcripts/*.jsonl (2026-09-25 owner report): dozens of
+            # recent worker transcripts carry this exact wrapped string verbatim, immediately
+            # followed by a reply in which the worker declines to call unlock() because the
+            # password arrived as what reads like an injected instruction. The fix
+            # is not to make the payload MORE persuasive -- it is to stop mislabeling it: use
+            # is_recovery_payload's honest, system-authored framing instead whenever the queued
+            # text is recognizably _inject_unlock's own marker, and reserve the "user
+            # instruction" wording for text that did not originate here.
+            self.job = self._steer_job(_steer_text)
             self._last_was_steer = True
+            # A PERSON INTERVENED, SO THE CHAIN BEFORE THEM IS NOT EVIDENCE ABOUT WHAT COMES
+            # AFTER. `_continue_count` has had this rule in three places since it was written
+            # ("a steer is real progress"); `no_progress` -- the counter that actually
+            # TERMINATES a worker -- had it nowhere, so a worker sitting at max-1 could be
+            # steered and still be declared stuck on the very next reply, compared against a
+            # key from before the intervention. The person's message is in the transcript and
+            # the worker is recorded as having made no progress through it.
+            #
+            # BOTH, because either alone is not enough: zeroing the count while keeping the
+            # key means the next reply matches that stale key and the count is back to 1
+            # immediately.
+            #
+            # Reset HERE, where the steer is actually delivered, not where it was queued -- a
+            # message sitting in the queue has not reached anyone yet. Same logic applies to
+            # the STUCK-convergence streak: a person's message in between two STUCK replies
+            # means the second is not evidence the first was a dead end.
+            self.no_progress = 0
+            self.last_norm = None
+            self._last_stuck_reason = None
         else:
             self._last_was_steer = False
         # A DEFERRED SEND LEAVES self.job INTACT, SO THE NEXT SWEEP RE-SENDS IT VERBATIM.
@@ -2605,7 +4652,8 @@ class RelayWorker:
                 and self.job == self._last_sent_job
                 and not self._last_was_steer):
             self._refute_attempt += 1
-            self.job = _refute_fix_job(self._refute_reason, self._refute_attempt)
+            self.job = self._task_anchor(
+                _refute_fix_job(self._refute_reason, self._refute_attempt))
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
@@ -2618,7 +4666,24 @@ class RelayWorker:
             # generous total patience is realized across deferrals as a WALL-CLOCK budget
             # (max_gen_wait_s), not one blocking call. (run_relay's single-conversation path
             # keeps the full 240s.)
+            self._install_wire_sink()
             self.drv.send(self.job, gen_wait_s=2.0)
+            if getattr(self, "socket", False):
+                note_admitted()
+        except FreshSubmitAmbiguous as e:
+            # NEVER transient-retry an ambiguous fresh delivery. The M365 user turn may already
+            # exist even though the DOM receipt was missing/mismatched; resending self.job can
+            # duplicate work. Salvage only from independently checkable workspace evidence, else
+            # stop this worker and surface the ambiguity to the operator.
+            if self._salvage_via_checks():
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = "fresh submit delivery ambiguous; not retried: %s" % (str(e),)
+            # "not retried" WAS PROSE ONLY. STUCK is in outcomes.RETRYABLE, so without this the
+            # runner's own retry and the cockpit's auto-retry both re-queued the goal (2026-10-01:
+            # one job ran as three concurrent copies). The row exports it as `retryable: false`.
+            self.retryable_override = False
+            return
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can never succeed -- terminal, skip the transient budget entirely
@@ -2696,6 +4761,32 @@ class RelayWorker:
                             ts=self._turn_sent_at)
         except Exception:
             pass
+        # AND WHO ELSE WAS IN FLIGHT. Placed AFTER the quota meter on purpose: a test asserts
+        # the meter sits within 900 characters of `self.turn += 1` -- "the turn is metered
+        # where it is spent" -- and this block was first inserted between them, pushing the
+        # meter out of that window. Widening the test would have removed a real property to
+        # make room for a new one.
+        #
+        # A refusal is written by the server carrying an MCP session the relay cannot map to
+        # a worker, so "was that refusal mine" has been answered by reading the worker's own
+        # prose. When this worker is the only one with a turn open, the question has an exact
+        # answer instead. relay/turn_windows.py carries the measurement of how often that
+        # holds -- often when the fleet is small, rarely when it is large.
+        try:
+            from relay import turn_windows as _tw
+            _tw.open_turn(self.name, self._turn_sent_at)
+        except Exception:
+            pass
+        # THE SAME FACT, WRITTEN WHERE THE MCP SERVER CAN READ IT. turn_windows above lives in
+        # this process; the server that writes the tool ledger is another one, and workers never
+        # declare which job they are on, so every ledger row was unattributed. The server labels
+        # a call from these windows (tools/turn_context.py). Never allowed to break a turn.
+        try:
+            from tools import turn_context as _tc
+            _tc.record_open(self.name, self.jid, self.run_id, self.turn, self._turn_sent_at,
+                            ident=_tc.fanout_identity(getattr(self, "task_envelope", None)))
+        except Exception:
+            pass
         # a send actually went through -> reset BOTH the generation-wait count and the
         # wall-clock streak stamp so the next slow turn gets a fresh full patience budget.
         self.gen_waits = 0
@@ -2705,6 +4796,12 @@ class RelayWorker:
         self._send_fail_streak = 0
         self._redirect_renavs = 0
         self._tx.user(self.turn, self.job)     # persist the full sent prompt for this turn
+        if not getattr(self, "socket", False):
+            # TAB ROUTE: send() collapses all whitespace to one line (a newline would submit the
+            # composer), so that single line is what the agent received. The socket route
+            # reports its own payload through the sink installed above.
+            self._tx.wire(self.turn, " ".join(str(self.job).split()), route="tab",
+                          run_id=getattr(self, "run_id", ""))
         self._last_sent_job = self.job         # so the next turn can recognise a verbatim re-send
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self._settle_state = _settle.SettleState()
@@ -2851,6 +4948,71 @@ class RelayWorker:
         except Exception:
             return False
 
+    def _record_socket_idle_probe(self, idle_s):
+        """Record first meaningful-idle threshold crossings for this socket turn.
+
+        This is measurement only. It must never change status, cooldowns, retry counts or the
+        driver's failure state. `SocketRoute.record` itself is best-effort/non-blocking.
+        """
+        try:
+            turn = int(getattr(self, "turn", 0) or 0)
+            if getattr(self, "_socket_idle_probe_turn", -1) != turn:
+                self._socket_idle_probe_turn = turn
+                self._socket_idle_probe_seen = set()
+            seen = getattr(self, "_socket_idle_probe_seen", set())
+            route = _socket_route()
+            for bucket in SOCKET_IDLE_PROBE_BUCKETS:
+                bucket = float(bucket)
+                if idle_s < bucket or bucket in seen:
+                    continue
+                seen.add(bucket)
+                if route is not None:
+                    route.record(
+                        "socket_idle_probe", worker=self.name, turn=turn,
+                        run_id=getattr(self, "run_id", "") or "",
+                        jid=getattr(self, "jid", None), status=self.status,
+                        bucket_s=bucket, idle_s=round(float(idle_s), 3),
+                        limit_s=float(SOCKET_MEANINGFUL_IDLE_S))
+            self._socket_idle_probe_seen = seen
+        except Exception:
+            pass
+
+    def _socket_meaningful_idle_stalled(self, now=None):
+        """Fail one live socket turn after meaningful-progress silence.
+
+        This guard used to exist only in ``_defer_generation`` (the *next-send* path). A socket
+        already in ``status == waiting`` therefore sat behind the outer 240s turn timeout even
+        when the transport itself had reported >90s without meaningful progress. Keep the
+        transport decision in one place and call it from BOTH wait states. It is deliberately
+        socket-only; tab workers retain their existing generation/timeout rules.
+        """
+        if not getattr(self, "socket", False):
+            return False
+        is_generating = getattr(self.drv, "_is_generating", None)
+        if not callable(is_generating):
+            return False
+        try:
+            if not is_generating():
+                return False
+            idle_fn = getattr(self.drv, "generation_idle_s", None)
+            idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
+            self._record_socket_idle_probe(idle_s)
+            if idle_s < SOCKET_MEANINGFUL_IDLE_S:
+                return False
+            reason = ("socket turn made no meaningful progress for %.0fs "
+                      "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
+            fail_fn = getattr(self.drv, "fail_stalled_turn", None)
+            if callable(fail_fn):
+                fail_fn(reason)
+            else:
+                self.drv.failed = reason
+            self.reason = reason + " -> reconnect/fallback"
+            self._cooldown_until = (time.time() if now is None else float(now)) + 0.5
+            self.status = "ready"
+            return True
+        except Exception:
+            return False
+
     def _defer_generation(self):
         """Schedule a non-failure RESCHEDULE because the previous turn is still generating.
         Unlike _retry_transient this does NOT touch self.transient (the transient/STUCK
@@ -2879,6 +5041,8 @@ class RelayWorker:
         # snapshot at the end, so `_gen_progress_sig` is flat for a turn that is streaming
         # perfectly well underneath.
         if getattr(self, "socket", False) and getattr(self.drv, "_is_generating", None):
+            if RelayWorker._socket_meaningful_idle_stalled(self, now):
+                return True
             try:
                 if self.drv._is_generating():
                     self.gen_waits += 1          # still counted, so the wait is observable
@@ -2966,6 +5130,43 @@ class RelayWorker:
             except Exception:
                 pass
 
+    def _declare_blocking(self, seconds):
+        """Tell the watchdog this worker is about to block the sweep on purpose, for `seconds`.
+
+        SEPARATE FROM _mark_eval_busy, on purpose. That one also sets status to "verifying" and
+        declares the ACCEPTANCE ceiling (>= 1500s). Both are wrong for a tab open: the card
+        would claim a verification that is not running, and the window would be five times the
+        operation's own bound, which is exactly the blindness the failsafe exists to avoid.
+
+        THE FLUSH IS THE POINT, not the field. The watchdog reads status.json, and the sweep is
+        about to stop writing it -- so the marker has to reach the file BEFORE the freeze, which
+        is the same reason _mark_eval_busy flushes.
+        """
+        try:
+            self.eval_busy_until = time.time() + float(seconds or 0)
+        except Exception:
+            return
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+
+    def _end_blocking(self):
+        """Close the window, and publish that it closed.
+
+        _clear_eval_busy does not flush, which is right where the sweep resumes ticking
+        immediately. Here it matters: a snapshot still claiming a blocking call that already
+        finished is a worker vouching for a browser it is no longer watching, and that blinds
+        the watchdog to a genuine wedge for the rest of the declared window.
+        """
+        self.eval_busy_until = 0.0
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+
     def _clear_eval_busy(self):
         """Leave a blocking acceptance eval (always, even on failure/exception)."""
         self.eval_busy_until = 0.0
@@ -2980,16 +5181,122 @@ class RelayWorker:
             return False                     # still researching; the sweep keeps moving
         self._research_session = None
         if report:
-            self.job = ("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
+            self.job = self._task_anchor("依頼された調査が完了しました。以下が結果です。これを踏まえて作業を続けて"
                         "ください。\n--- 調査結果 ---\n" + report + "\n--- 調査結果ここまで ---\n"
                         + CONTINUE_JOB)
             self.reason = "research %d/%d 反映して続行" % (self.research_count, self.max_research)
         else:
-            self.job = ("調査結果を取得できませんでした。調査なしで可能な範囲で進めるか、無理なら"
+            self.job = self._task_anchor("調査結果を取得できませんでした。調査なしで可能な範囲で進めるか、無理なら"
                         "最後の行に STUCK: 理由 と書いてください。")
             self.reason = "research %d/%d 結果なし" % (self.research_count, self.max_research)
         self.status = "ready"
         return False
+
+    def _raise_stuck_gate(self, question, trigger):
+        """Ask a human instead of continuing to nudge/settle, carrying the WORKER'S OWN words
+        (`question`) rather than a template -- see GATE_AFTER_STUCK_RETRIES above for the
+        incident this closes. Sets status='awaiting_gate' and returns True on success; returns
+        False (does nothing) if a gate already stands for this worker -- ONE GATE PER WORKER AT
+        A TIME, a worker that has already asked must not ask again while its question stands --
+        or if raising one failed outright (e.g. the gate directory is unwritable), in which
+        case the caller must fall back to its OLD behaviour (settle STUCK / keep retrying)
+        rather than silently losing the worker on a plain Exception.
+
+        NON-BLOCKING, LIKE _poll_research/_poll_refute, NOT LIKE _declare_blocking. An open
+        question is not a synchronous call the sweep thread is inside of -- the round-robin
+        keeps stepping every OTHER worker while this one waits, and on_tick's status.json write
+        (which stamps `updated` on every sweep tick regardless of any one worker's progress)
+        never freezes just because this worker is idle. _declare_blocking's eval_busy_until
+        exists for the OTHER shape (the sweep itself blocked inside one worker's synchronous
+        call) and would be the wrong tool here -- there is nothing to tell the watchdog to wait
+        THROUGH, since the watchdog was never going to stall on this in the first place. What a
+        human looking at the run needs instead is the existing pending_gates surfacing
+        (fleet_runner._pending_gates -> status.json -> FleetCockpit's Bucket C banner), which
+        this reaches for free the moment the gate file lands on disk -- so 'awaiting_gate' is
+        this mechanism's answer to the same question _declare_blocking answers for its own
+        shape: let the observer tell deliberate-and-waiting apart from stuck-in-a-loop.
+        """
+        if self._gate_token:
+            return False
+        try:
+            from tools.gate_ops import gate_ask_local
+        except Exception:
+            return False
+        context = "worker=%s trigger=%s goal=%s" % (
+            self.name, trigger, (self.goal or "")[:200])
+        # DEDUPE ON THE QUESTION TEXT. Measured 2026-09-24: 8 workers hit "unlock
+        # exhausted after 4 attempts" within 12 minutes and each raised its OWN gate
+        # with the byte-identical question -- 8 toasts, 8 files, one real question.
+        # `question` is the worker's own diagnosis (see this method's docstring), so
+        # two workers converging on the identical text really is the identical cause;
+        # gate_ask_local's dedupe_key collapses them into one open gate that every
+        # attached worker polls (see _poll_gate below), and the owner answers once.
+        try:
+            token = gate_ask_local(question, context=context, dedupe_key=question,
+                                   worker_label=self.name)
+        except Exception:
+            token = None
+        if not token:
+            return False
+        self._gate_token = token
+        self._gate_question = question
+        self._gate_deadline = time.time() + GATE_ANSWER_TIMEOUT_S
+        self.status = "awaiting_gate"
+        self.reason = "🧑 human input requested (%s): %s" % (trigger, question[:160])
+        try:
+            self._tx.metric(self.turn, "gate_raised", token, trigger=trigger)
+        except Exception:
+            pass
+        # FLUSH NOW, not on the next natural tick -- the same reason _declare_blocking flushes
+        # before a blocking call: whoever is watching (the desktop toast already fired inside
+        # gate_ask_local, but the cockpit's own banner reads status.json) should see this the
+        # moment it is true, not whenever the sweep next happens to write it anyway.
+        if self._busy_writer is not None:
+            try:
+                self._busy_writer()
+            except Exception:
+                pass
+        return True
+
+    def _poll_gate(self):
+        """Drive a standing HITL gate (status=='awaiting_gate'). Mirrors _poll_research:
+        non-blocking (None/unanswered -> the round-robin keeps stepping every OTHER worker),
+        and an answer is injected as this worker's NEXT TURN in the SAME conversation
+        (self.job + status='ready') -- it does not restart the goal or lose what came before.
+
+        An unanswered gate cannot hold a worker forever: past GATE_ANSWER_TIMEOUT_S it settles
+        STUCK with the question itself preserved in the reason, so the record says what was
+        asked and that nobody answered -- not a generic timeout with the question already gone.
+        """
+        from tools.gate_ops import gate_get
+        data = gate_get(self._gate_token)
+        if data is not None and data.get("answered"):
+            answer = data.get("answer")
+            question = self._gate_question
+            self._gate_token = None
+            self._gate_question = ""
+            self._gate_deadline = 0.0
+            self.job = self._task_anchor(
+                "人間から次の回答がありました。\n質問: %s\n回答: %s\n"
+                "これを踏まえて作業を続けてください。"
+                % (question, answer if answer not in (None, "") else "(空の回答)"))
+            self.reason = "human answered the standing gate -> resuming"
+            self.status = "ready"
+            return False
+        if time.time() >= self._gate_deadline:
+            question = self._gate_question
+            self._gate_token = None
+            self._gate_question = ""
+            self._gate_deadline = 0.0
+            # No answer from the human is a terminal dependency, not transient infrastructure.
+            # Re-queuing into a fresh conversation only asks the same unanswered question again.
+            self.retryable_override = False
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = (
+                "human input requested but unanswered after %ds; the question was: %s"
+                % (int(GATE_ANSWER_TIMEOUT_S), question))
+            return True
+        return False               # still waiting; the sweep keeps moving
 
     def _salvage_via_checks(self):
         """Last-chance acceptance salvage for the EXHAUSTION paths (spec 3-3 verify gate,
@@ -3236,9 +5543,243 @@ class RelayWorker:
         self._last_heap_mb = heap
         return heap >= FLEET_HEAP_RECYCLE_MB
 
-    def _decide(self, resp):
+    def _note_unattributed_refusal(self, n_candidates):
+        """Record that a refusal in this turn's window was not attributable to this worker."""
+        try:
+            _mt.record("unlock_refusal_unattributed", run_id=getattr(self, "run_id", ""),
+                       instance=getattr(self, "name", ""), turn=getattr(self, "turn", None),
+                       configured=True, config_source="turn_windows",
+                       eligible=True, triggered=True, executed=False,
+                       extra={"candidates": int(n_candidates or 0), "injected": False})
+        except Exception:
+            pass
+
+    def _inject_unlock(self):
+        """UNLOCK-REQUIRED recovery: auto-inject unlock(password) with the LOCAL .env password
+        (NOT the agent's persistent instructions), then resume the goal. Bounded by
+        MAX_UNLOCK_ATTEMPTS -- the M365 backend IP can rotate and re-lock, so a few auto-unlocks
+        are normal; past the cap STUCK with an actionable reason.
+
+        Extracted so BOTH callers that have already decided a reply is a genuine lock refusal
+        run identical recovery: _decide's _looks_locked() branch (unchanged behaviour -- this
+        is the same code that used to live inline there), and the lock-ambiguity probe's
+        affirmative-answer branch. Never raises out of caller expectations; sets
+        self.job/self.status/self.reason, or self.status/self.outcome/self.reason on STUCK.
+        """
+        pw = _unlock_password()
+        if not pw:
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = ("⚠ 書込/実行に unlock が必要だが MCP_UNLOCK_PASSWORD が未設定。"
+                           ".env に設定して再投入してください。")
+            return
+        # CHECK THE SERVER LEDGER BEFORE SENDING ANOTHER PASSWORD TURN. A Copilot turn can
+        # call unlock successfully near the end of the same response that still contains an
+        # earlier lock refusal. Until now we only checked this AFTER exhausting all attempts,
+        # so a grant that already happened could still be followed by another unlock prompt.
+        # False means "not established" under concurrency; True is safe to act on.
+        if _worker_recently_granted(self.name, since=getattr(self, "_turn_sent_at", 0.0)):
+            self._unlock_attempts = 0
+            self.job = self._task_anchor(RETRY_JOB)
+            self.reason = "unlock grant confirmed by server ledger -> retry blocked operation"
+            self.status = "ready"
+            return
+        if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
+            self._unlock_attempts += 1
+            self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
+            self.reason = "コネクタ未解錠 → unlock 自動投入 (%d/%d)" % (
+                self._unlock_attempts, MAX_UNLOCK_ATTEMPTS)
+            # WITHOUT THIS THE UNLOCK IS NEVER SENT. 'ready' is the state that sends
+            # self.job; the branch composed the job and left the worker in 'waiting', so
+            # the next sweep re-read the SAME reply, re-classified it as locked, and spent
+            # another attempt -- four gone in about eight seconds, and the message blamed
+            # a rotating IP and a wrong password for a turn that was never sent. Every
+            # sibling branch that sets self.job sets this too; this one did not.
+            self.status = "ready"
+            return
+        # BEFORE DECLARING EXHAUSTION, ASK THE SERVER WHETHER IT ALREADY RECOVERED. The
+        # budget above counts ATTEMPTS, not elapsed time -- see _worker_recently_granted's
+        # docstring for the measured incident (2026-09-24): a worker can still be mid-flight
+        # on a slow Copilot turn that is ABOUT to call unlock() successfully when the 4th
+        # attempt is counted. If the server's own ledger shows this worker's identity was
+        # granted since, the run is not stuck at all; resume it instead of spending a human
+        # gate on a question recovery already answered.
+        if _worker_recently_granted(self.name, since=getattr(self, "_turn_sent_at", 0.0)):
+            self._unlock_attempts = 0
+            self.job = self._task_anchor(CONTINUE_JOB)
+            self.reason = "unlock 済みをサーバ記録で確認 -> 再開(人への確認は不要と判断)"
+            self.status = "ready"
+            return
+        # DIAGNOSE THE STATE MACHINE WE ACTUALLY RUN NOW. Session authorization has been the
+        # normal path since 2026-09-09, so "the model forgot to re-attach unlock_token" is no
+        # longer the first explanation for a normal fleet worker. Exhaustion means we never
+        # established a usable grant for THIS conversation, or the transport identity changed.
+        reason = ("⚠ unlock を %d 回投入したが、この会話の解錠成功を確認できません。"
+                  "確認順序: (1) agent がこの会話で unlock() を実行していない/遅延している、"
+                  "(2) Mcp-Session-Id が途中で変わったか失効した、"
+                  "(3) MCP_UNLOCK_PASSWORD が一致していない。"
+                  "MCP_UNLOCK_SESSION_AUTH=0 を明示している場合に限り、返却 unlock_token の"
+                  "再添付も確認してください。" % self._unlock_attempts)
+
+        # HITL GATE, NOT AN IMMEDIATE STUCK. Every one of the three causes named above is a
+        # question only a person can answer (did this conversation ever execute unlock, did its
+        # MCP session identity change/expire, or is the configured password wrong) -- exactly
+        # operator E's case, and the trap the module-level
+        # comment above GATE_AFTER_STUCK_RETRIES documents: a worker cannot call gate_ask on
+        # its own behalf here, being the one case that most needs it. Falls back to the old
+        # immediate-STUCK behaviour if a gate already stands for this worker or raising one
+        # fails outright, so this can never silently lose a worker to an Exception.
+        if self._raise_stuck_gate(reason, "unlock exhausted after %d attempts"
+                                  % self._unlock_attempts):
+            return
+        # A fresh conversation cannot repair a missing/invalid unlock grant or a broken HITL
+        # surface. Without this override coarse STUCK autoretry re-queued the same goal into a
+        # new locked conversation and restarted the exact loop this exhaustion path just bounded.
+        self.retryable_override = False
+        self.status, self.outcome = "stuck", "STUCK"
+        self.reason = reason
+
+    #: Terminal outcomes that mean "the infrastructure, not the task". Named rather than
+    #: matched on the word STUCK because `STUCK` alone covers both a worker the agent gave up
+    #: on and a worker the network gave up on, and those are different diagnoses.
+    _INFRA_OUTCOMES = ("INFRA_STUCK",)
+
+    def _decide(self, resp, _resume=False):
+        """Decide, then record WHY if this turn ended the worker after a fresh replay.
+
+        A WRAPPER RATHER THAN A LINE AT EACH GIVE-UP, and that is the whole point. The
+        diagnosis used to be applied at three call sites, all of them passing
+        `fresh_was_transient_error=False` as a literal -- so two of
+        `review_resilience.diagnose_after_fresh_replay`'s four answers could not occur at all:
+        TRANSIENT (the fresh conversation died on infrastructure) and UNKNOWN (it died on
+        something this cannot name). `looks_like_transient_error`, the function written to
+        compute that argument, had no caller anywhere in the repository.
+
+        The file has EIGHTEEN places that settle a worker as INFRA_STUCK and more that settle
+        it as STUCK. Adding the call to each is the defect restated: the next one added would
+        be missed exactly as these were, and nothing would say so. `_decide` is the one
+        funnel they all sit inside, so the transition is observed here instead.
+
+        IT DOES NOT RE-READ THE TEXT. Matching the strings again here would be a THIRD copy of
+        a judgement this file already makes -- relay_fleet has five marker families
+        (transient/agent-dead, tool-unreachable, canned-nonanswer, admin-block, throttle), and
+        TRANSIENT_ERROR_MARKERS among them was already a superset of the six strings
+        review_resilience kept for the same purpose. The path that settled the worker already
+        decided, and what it decided is in `outcome`. That is better evidence than matching the
+        same strings a third time.
+
+        (`review_resilience.looks_like_transient_error` and its markers were deleted on
+        2026-09-22 for that reason -- this paragraph is why, written before the deletion.)
+        """
+        before = self.status
+        try:
+            return self._decide_impl(resp, _resume=_resume)
+        finally:
+            # A RECORD MUST NOT BE ABLE TO FAIL THE THING IT DESCRIBES -- same contract as
+            # _apply_diagnosis, which this calls into.
+            try:
+                self._diagnose_terminal_give_up(before)
+            except Exception:
+                pass
+            # Shadow effort policy (phase 1): records only; never raises; no-op when off.
+            effort_policy_mod.shadow_tick(self)
+            # Campaign evidence (phase 2): a finished subtask feeds its siblings' streak.
+            effort_policy_mod.observe_child(self)
+
+    def _diagnose_terminal_give_up(self, status_before):
+        """Apply the diagnosis when THIS turn ended a worker that had already replayed fresh.
+
+        Three guards, each excluding something that would make the record wrong rather than
+        merely noisy:
+
+        * `fresh_replay_count` -- with no fresh replay there is no "the identical task in a
+          second conversation", and every answer the diagnosis gives is about that comparison.
+        * `recovery_cause` already set -- the refusal and success paths diagnose themselves
+          with what they know; this must never overwrite a better-informed answer with a
+          weaker one.
+        * the worker was not already terminal -- `_decide` can be re-entered (`_resume`), and
+          a settle that happened on an earlier turn was not caused by this one.
+        """
+        if not getattr(self, "fresh_replay_count", 0):
+            return
+        if getattr(self, "recovery_cause", ""):
+            return
+        if status_before in TERMINAL or self.status not in TERMINAL:
+            return
+        if self.status in ("done", "content_refused"):
+            return          # those paths own their own diagnosis
+        # `transient > 0` is the session's own count of retries it spent believing the failure
+        # would pass. A plain STUCK with none spent was never treated as transient by the code
+        # that settled it, and saying TRANSIENT here would contradict that.
+        transient = (self.outcome in self._INFRA_OUTCOMES
+                     or (self.outcome == "STUCK" and getattr(self, "transient", 0) > 0))
+        self._apply_diagnosis(fresh_was_refusal=False, fresh_succeeded=False,
+                              fresh_was_transient_error=transient)
+
+    def _decide_impl(self, resp, _resume=False):
+        # THE TURN CAME BACK, SO THE WINDOW CLOSES. Without this the window stays open and the
+        # worker goes on being a candidate for every later event -- and while it is the only
+        # worker running, exclusivity would then hold spuriously for as long as the open-window
+        # bound allows. Closed here rather than at the send site because this is the moment the
+        # reply exists. _exclusively_refused runs further down and needs the window to still
+        # cover the refusal that arrived just before the reply, which GRACE_S provides.
+        try:
+            from relay import turn_windows as _tw
+            _tw.close_turn(self.name)
+        except Exception:
+            pass
+        try:
+            if not _resume and getattr(self, "_turn_sent_at", 0.0):
+                from tools import turn_context as _tc
+                _tc.record_close(self.name, self.jid, self.run_id, self.turn,
+                                 self._turn_sent_at, time.time(),
+                                 ident=_tc.fanout_identity(getattr(self, "task_envelope", None)))
+        except Exception:
+            pass
+        # LOCK-AMBIGUITY PROBE ANSWER. A LOCK_PROBE_QUESTION was sent as this worker's previous
+        # turn (see _looks_locked_ambiguous's handling further down); THIS reply answers it, not
+        # the goal. Consumed here, before anything below can treat it as progress: self.last_
+        # response in particular is what the cockpit displays and what DONE-detection/adaptive-
+        # feature extraction read as "the result", and a bare "はい"/"いいえ" must never become
+        # either. Never loops: _lock_probe_used is already set (spent) by the time this fires,
+        # so the resumed call below cannot re-enter this branch or re-offer a probe.
+        if self._lock_probe_pending:
+            self._lock_probe_pending = False
+            orig_resp, orig_since = self._lock_probe_resp, self._lock_probe_since
+            self._lock_probe_resp, self._lock_probe_since = None, 0.0
+            try:
+                self._tx.assistant(self.turn, resp)   # the probe's own answer, on its own turn
+            except Exception:
+                pass
+            # A PROBE THAT FAILS MEANS "NOT LOCKED" -- THE SAFE DIRECTION. Whatever raised
+            # (a malformed/None reply, a parsing defect) or came back empty is read exactly
+            # like an explicit "いいえ": the worker STUCKs visibly downstream if it really is
+            # stuck, which is what happens today with no probe at all.
+            try:
+                answered_yes = _probe_answer_is_yes(resp)
+            except Exception:
+                answered_yes = False
+            if answered_yes:
+                _note_locked("probe", orig_resp, orig_since, None)
+                self._inject_unlock()
+                return
+            # "いいえ", a hedge, silence, or anything else short of a clear affirmative -> not
+            # locked -- the safe direction, same as today's behaviour with no probe at all.
+            # Resume the ORIGINAL (ambiguous) reply through the ordinary decision pipeline so
+            # whatever real progress/DONE/CONTINUE/STUCK it carried is still acted on. _resume
+            # skips the recording below (transcript/heap-metric/turn_outcome) -- it already ran
+            # once for this exact reply, on the turn it actually arrived on; re-running it here
+            # would duplicate those rows under the LATER (probe) turn number instead.
+            self._decide(orig_resp, _resume=True)
+            return
+        if self._refute_fix_pending and not _resume:
+            # The special preservation rule is ONLY for a correction turn that produced no
+            # assistant reply at all. Once the worker answers, ordinary execution owns the
+            # subsequent outcome again (CONTINUE, DONE, STUCK, etc.).
+            self._refute_fix_pending = False
         self.last_response = resp
-        self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+        if not _resume:
+            self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+            self._note_first_reply(resp)           # did the agent act on the first message?
         # HEAP PER TURN, RECORDED. The recycle threshold above is provisional and the only way
         # to replace it with a measured one is to know MB-per-turn on real work -- a worker's
         # turns carry OCR text and spreadsheet rows and are nothing like the bridge probe's
@@ -3246,9 +5787,49 @@ class RelayWorker:
         # turn, beside the transcript that already exists.
         try:
             _h = self._heap_mb()
-            if _h is not None:
+            if _h is not None and not _resume:
                 self._tx.metric(self.turn, "heap_mb", round(_h, 1),
                                 recycles=self._recycles)
+        except Exception:
+            pass
+        # HOW LONG THE TURN TOOK FROM SEND TO REPLY, RECORDED. This is the whole wait a worker
+        # experienced: generation plus any tool calls it made in between. The tool-call share of
+        # it is in .fleet/tool_events.jsonl (scripts/tool_event_report.py), so generation time
+        # is the difference, and the two are compared there rather than estimated here. Derived
+        # from the existing send stamp; nothing on the socket route is touched.
+        try:
+            if not _resume and self._t_send:
+                _now = time.time()
+                self._tx.metric(self.turn, "turn_wait_s", round(max(0.0, _now - self._t_send), 3),
+                                t_send=round(self._t_send, 3), t_done=round(_now, 3))
+        except Exception:
+            pass
+        # WHAT CLASS OF TURN THIS WAS, RECORDED BESIDE THE HEAP NUMBER ABOVE.
+        #
+        # relay/turn_outcome.py partitions one assistant reply by the STRUCTURED error code
+        # Copilot prints, and until now had zero callers -- so the taxonomy it was built from
+        # (8,205 turns) could only ever be recomputed offline, never watched.
+        #
+        # MEASUREMENT, NOT CONTROL, AND THE EVIDENCE SAYS SO. Re-measured over 1741 stored
+        # transcripts / 4468 assistant turns: rate 227 (THROTTLE_MARKERS handles it), context
+        # 165 (conversation_exhausted recycles it), system 29 (TRANSIENT handles it), and only
+        # SIX turns reach no handler at all -- AsyncResponsePayloadTooLarge x5 and
+        # RequestBodyTooLarge x1. Following those six workers: FIVE recovered on their own and
+        # finished real work; one ended on the error. A terminal branch for this would have
+        # killed five workers that recovered in order to rescue one, so none is added here.
+        # Recording the class is what turns "six, probably harmless" into something a later
+        # decision can be made from.
+        #
+        # ROLE IS PASSED EXPLICITLY: classify() treats anything that is not the assistant's own
+        # reply as ok by definition, which is what keeps our own prompt text out of the
+        # taxonomy -- the contamination that once turned a task ABOUT HTTP 429 into fifteen
+        # phantom rate limits.
+        try:
+            if not _resume:
+                from relay import turn_outcome as _to
+                _klass, _code = _to.classify(resp, "assistant")
+                if _klass != _to.OK:
+                    self._tx.metric(self.turn, "turn_class", _klass, code=_code)
         except Exception:
             pass
         # Parse optional NEXT/CONFIDENCE turn markers (informational only, no gating).
@@ -3266,6 +5847,14 @@ class RelayWorker:
         if conversation_exhausted(resp) or heavy:
             self._recycles += 1
             self._heap_recycle_turn = self.turn
+            if _recycle_is_futile(self, conversation_exhausted(resp)):
+                self.status, self.outcome = "stuck", "STUCK"
+                self.retryable_override = False
+                self.reason = ("conversation recycle cannot make progress: the fresh conversation "
+                               "hit the token limit on its very first turn %d times in a row "
+                               "(the same oversized tool result, not tried again); stopped "
+                               "after %d recycles" % (_FUTILE_RECYCLES, self._recycles - 1))
+                return
             if self._recycles > self._max_recycles:
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = (f"conversation recycled too often; exceeded "
@@ -3317,7 +5906,12 @@ class RelayWorker:
                                "conversation" if getattr(self, "socket", False) else
                                "token-limit recycle: fresh conversation did not render")
                 return
-            self.job = self._recycle_job()   # re-anchor in the fresh chat
+            try:
+                self.job = self._recycle_job()   # re-anchor in the fresh chat
+            except EmptyGoalError as e:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = "token-limit recycle refused: %s" % (e,)
+                return
             self.reason = (
                 f"ヒープ {getattr(self, '_last_heap_mb', 0):.0f}MB → 新会話で続行 "
                 f"({self._recycles}/{self._max_recycles})" if heavy else
@@ -3494,39 +6088,32 @@ class RelayWorker:
         # normal; past the cap STUCK with an actionable reason. Uses _looks_locked() (distinctive
         # marker + dominance) rather than a bare substring match so a long security-review
         # response that merely discusses unlock() is never mistaken for the real lock error.
-        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0)):
-            pw = _unlock_password()
-            if not pw:
-                self.status, self.outcome = "stuck", "STUCK"
-                self.reason = ("⚠ 書込/実行に unlock が必要だが MCP_UNLOCK_PASSWORD が未設定。"
-                               ".env に設定して再投入してください。")
+        if _looks_locked(resp, getattr(self, "_turn_sent_at", 0.0), self.name,
+                         on_unattributed=self._note_unattributed_refusal):
+            # A reply that already ended DONE/CONTINUE and quotes no refusal is never sent an
+            # unlock steer: the classification came from a sibling's refusal, and every steer
+            # costs that worker a turn and a slice of its budget.
+            if not _reply_completed_without_claiming_lock(
+                    resp, getattr(self, "_turn_sent_at", 0.0), self.name):
+                self._inject_unlock()
                 return
-            if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
-                self._unlock_attempts += 1
-                self.job = PROTOCOL + (UNLOCK_PREFIX % pw) + self.goal
-                self.reason = "コネクタ未解錠 → unlock 自動投入 (%d/%d)" % (
-                    self._unlock_attempts, MAX_UNLOCK_ATTEMPTS)
-                # WITHOUT THIS THE UNLOCK IS NEVER SENT. 'ready' is the state that sends
-                # self.job; the branch composed the job and left the worker in 'waiting', so
-                # the next sweep re-read the SAME reply, re-classified it as locked, and spent
-                # another attempt -- four gone in about eight seconds, and the message blamed
-                # a rotating IP and a wrong password for a turn that was never sent. Every
-                # sibling branch that sets self.job sets this too; this one did not.
-                self.status = "ready"
-                return
-            self.status, self.outcome = "stuck", "STUCK"
-            # NAME THE CAUSE THAT ACTUALLY HAPPENS. This listed a rotating backend IP and a wrong
-            # password, and on 2026-09-07 it was neither: MCP_REQUIRE_UNLOCK_TOKEN was on, the
-            # unlock succeeded, and every following call was refused for arriving without the
-            # token. Whoever reads this line is trying to find out why, so the possibility that
-            # was true must be in it -- and it is the cheapest one to check.
-            self.reason = ("⚠ unlock を %d 回投入したが解錠が続かない。"
-                           "(1) MCP_REQUIRE_UNLOCK_TOKEN が有効で、unlock_token を後続の "
-                           "call_tool に渡せていない (lock_refusals.jsonl の site が "
-                           "security.py:324 ならこれ)、"
-                           "(2) M365バックエンドの送信元IPが毎回変わる(unlockはIP単位)、"
-                           "(3) MCP_UNLOCK_PASSWORD 不一致。のいずれか。"
-                           % self._unlock_attempts)
+        # LOCK-AMBIGUITY PROBE (widens the above, does not replace it -- _looks_locked's two
+        # branches are untouched and still fire exactly as before). _looks_locked_ambiguous()
+        # only matches the leftover case: a distinctive marker present, but the reply is too
+        # long for the dominance rule to trust (>= LOCKED_DOMINANCE_MAX_CHARS) -- today that
+        # case falls through as "not locked" with no evidence either way. Rather than keep
+        # guessing from length, ask the worker directly: it saw the actual tool-call result.
+        # Bounded to ONE probe per worker, EVER -- past the budget this falls through to
+        # today's behaviour (not locked) instead of probing again.
+        if (not self._lock_probe_pending and not self._lock_probe_used
+                and _looks_locked_ambiguous(resp)):
+            self._lock_probe_used = True
+            self._lock_probe_pending = True
+            self._lock_probe_resp = resp
+            self._lock_probe_since = getattr(self, "_turn_sent_at", 0.0)
+            self.job = LOCK_PROBE_QUESTION
+            self.reason = "ロック疑い(長文中の marker) → 本人に確認中"
+            self.status = "ready"
             return
         # TOOL-BACKEND-UNREACHABLE: the agent's tool calls failed (devtunnel/network blip) and it
         # self-locked claiming its tools don't exist. INFRA-FALSE, not a miss. Re-send the GOAL (the
@@ -3685,17 +6272,37 @@ class RelayWorker:
                 # canned reply is about this prompt, so telling the operator to relaunch Edge
                 # sends them after a fault that is not there.
                 self.status = "stuck"
-                if connector_proven():
+                _proof = connector_proof_source()
+                if _proof == "run":
+                    self.retryable_override = False
                     self.outcome = "REFUSED"
                     self.reason = ("⚠ 定型の無回答が継続。ただし本走行の別ワーカーにはカスタム"
                                    "エージェントが応答しており、MCPコネクタは生きている。"
                                    "→ 接続の問題ではなく**この指示に対する拒否**。"
                                    "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
+                elif _proof in ("probe", "call"):
+                    self.retryable_override = False
+                    # SAME VERDICT, DIFFERENT EVIDENCE. Saying "a sibling answered" here would
+                    # be false -- this run may have had no sibling at all.
+                    self.outcome = "REFUSED"
+                    self.reason = ("⚠ 定型の無回答が継続。ただし直近%.0f分以内に本機のMCP"
+                                   "サーバへ実際のツール呼び出しが着弾しており(%s)、"
+                                   "コネクタ自体は生きている。→ 接続の問題ではなく"
+                                   "**この指示に対する拒否**の可能性が高い。指示の言い換えから試せ。"
+                                   % (CONNECTOR_PROOF_WINDOW_S / 60.0,
+                                      "死活プローブ" if _proof == "probe" else "別の実ツール呼び出し"))
                 else:
                     self.outcome = "INFRA_STUCK"
-                    self.reason = ("⚠ 定型の無回答が継続。headless の ?titleId= 解決失敗で既定Copilot"
-                                   "(MCPコネクタ無し)にフォールバックしている疑い。再ナビ/ヘッドフル復旧でも"
-                                   "解消せず。**タスク失敗でなくインフラ(接続/エージェント未確立)**=再投入対象。")
+                    # WHAT IS MEASURED, THEN WHAT IS GUESSED, LABELLED AS SUCH. The old wording
+                    # asserted the headless/?titleId= fallback as the cause. Nothing here
+                    # measures that -- this branch only knows no tool call has arrived. A reader
+                    # took the old sentence for a finding and reported it as the root cause.
+                    self.reason = ("⚠ 定型の無回答が継続し、再ナビ/ヘッドフル復旧でも解消せず。"
+                                   "**測定されたのは「直近%.0f分、本機のMCPサーバにツール呼び出しが1件も"
+                                   "着弾していない」ことだけ**。原因は未特定。headless の ?titleId= 解決失敗で"
+                                   "既定Copilot(コネクタ無し)に落ちているのが有力な**仮説**だが、確認済みの"
+                                   "事実ではない。=再投入対象。"
+                                   % (CONNECTOR_PROOF_WINDOW_S / 60.0))
                 return
             except Exception:
                 # NEVER raise out of _decide: on any unexpected error, fall through to the normal
@@ -3791,13 +6398,35 @@ class RelayWorker:
                 })
                 self.status, self.outcome = "content_refused", "CONTENT_REFUSED"
                 self.recovery_state = "content_refused"
-                self.recovery_cause = "task_content"
-                self.recovery_result = "needs_decomposition"
-                self.reason = "identical task refused in two independent conversations"
+                # THE DIAGNOSIS, NOT A TRANSCRIPTION OF ONE OF ITS ANSWERS. These three lines
+                # used to be literals equal to the function's third branch, which left its
+                # second and fourth unreachable -- so a fresh replay that died on a transient
+                # error recorded no cause at all.
+                self._apply_diagnosis(fresh_was_refusal=True, fresh_succeeded=False,
+                                      fresh_was_transient_error=False)
                 return
+        # FIRST MESSAGE NOT ABSORBED. Past every infrastructure handler and the content-refusal
+        # recovery, a short greeting / ask-for-the-goal / empty-message reply on a conversation
+        # that never acted on its first message means that message did not land.
+        if not _resume and self._first_reply_gate(resp):
+            return
         norm = _norm_for_progress(resp)
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
+        # A CONTROL INPUT THAT LEFT NO RECORD. This counter ends a dead endpoint early
+        # (NET_RETRY_NOPROGRESS_MAX, below) and nothing in .fleet ever said how often it rose
+        # or how far -- so "does this signal see the stalls that happen" could only be answered
+        # by reprocessing transcripts, and not at all once retention has pruned them.
+        #
+        # Recorded only on a repeat, not every turn: a row per turn saying "no repeat" is the
+        # denominator of a question nobody asked, and the turn count is already in the
+        # transcript.
+        if self.no_progress:
+            try:
+                self._tx.metric(self.turn, "reply_repeat", self.no_progress,
+                                chars=len(resp or ""), observed=True)
+            except Exception:
+                pass
         up = resp.upper()
         last_line = (resp.strip().splitlines() or [""])[-1].upper()
         # GOAL-DELIVERY recovery (additive, exception-safe): if the agent says it never
@@ -3834,6 +6463,51 @@ class RelayWorker:
                     ("identical STUCK reply repeated %d times (no progress) -> dead endpoint, "
                      "not waiting out the full %ds retry window" % (self.no_progress, NET_RETRY_WINDOW_S))
                 return
+            # STUCK-CONVERGENCE (see _stuck_converged above the TOOL-BACKEND-UNREACHABLE
+            # detector for the incident this closes): the no-progress check just above only
+            # catches a STUCK reply that repeats near-VERBATIM. A worker that reaches the same
+            # conclusion but restates it in fresh wording every turn slips past that check
+            # entirely -- which is exactly what burned 9 turns in the mined transcript, each
+            # answered with another retry nudge as if the reply were new information. Judge
+            # CONTENT, not text: if this STUCK's reason and the immediately preceding STUCK's
+            # reason are substantially the same finding, no further nudge is going to change
+            # it -- settle now, on the worker's OWN words, rather than spend the rest of the
+            # retry budget re-asking a question it already answered. The very first STUCK of a
+            # streak (self._last_stuck_reason is still None) can never trigger this -- it has
+            # nothing yet to have converged WITH, so it always gets its one retry, same as
+            # before this detector existed.
+            reason_text = stuck_reason_text(resp)
+            if self._last_stuck_reason is not None \
+                    and _stuck_converged(self._last_stuck_reason, reason_text):
+                if self._salvage_via_checks():
+                    return
+                # ASK, DON'T JUST SETTLE (operator E, wired in -- see GATE_AFTER_STUCK_RETRIES
+                # above). Two consecutive STUCK replies reaching the same conclusion is exactly
+                # the situation a person, not another nudge, can resolve -- the worker's own
+                # words (reason_text) ARE the question. Falls back to the old immediate-STUCK
+                # settlement if a gate already stands or raising one fails outright.
+                if self._raise_stuck_gate(reason_text, "converged on consecutive STUCK replies"):
+                    return
+                self.retryable_override = False
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = ("worker reached the same conclusion on consecutive turns -> "
+                               "settling on its own stated reason instead of nudging again: %s"
+                               % reason_text)
+                return
+            self._last_stuck_reason = reason_text
+            # RETRY-COUNT BACKSTOP (GATE_AFTER_STUCK_RETRIES, see its definition above): the
+            # convergence check just above is the SMARTER catch and normally fires first (the
+            # mined incident's wording only clears STUCK_CONVERGENCE_SIMILARITY at turns 5-6),
+            # but a STUCK streak whose wording keeps drifting just enough to dodge that
+            # threshold must still stop short of burning the whole max_transient budget on a
+            # question only a person can answer. self.transient here is the count of retries
+            # ALREADY SPENT (pre this one) -- >= GATE_AFTER_STUCK_RETRIES - 1 means the NEXT
+            # nudge would be the (GATE_AFTER_STUCK_RETRIES)-th, so ask instead of sending it.
+            if self.transient >= GATE_AFTER_STUCK_RETRIES - 1 \
+                    and self._raise_stuck_gate(
+                        reason_text, "retry budget reached %d/%d un-converged STUCK replies"
+                        % (self.transient, GATE_AFTER_STUCK_RETRIES)):
+                return
             # Under load, an agent STUCK is usually a downstream symptom of a transient
             # tool/network failure (the agent couldn't write a file etc.). Retry the turn
             # (re-prompt to try the tools again) before giving up, up to the budget.
@@ -3852,16 +6526,29 @@ class RelayWorker:
             # worker" -- so the self-improvement loop could tune a parameter with no effect
             # and measure the noise. Transport retries keep the window; this one keeps the
             # count, which is what both the name and the manifest already claimed.
+            #
+            # THE NUDGE TEXT ITSELF ESCALATES TOO (2026-09-15 fix): this call site used to send
+            # the byte-identical RETRY_JOB constant on every one of these retries -- the OTHER
+            # half of the same mined incident, and the reason all 9 wasted turns saw the exact
+            # same Japanese text asking the worker to try again as though its earlier failure
+            # had been transient. _stuck_retry_nudge (see EXHAUSTIVE-COVERAGE-CLAIM OVERRIDE
+            # above) keeps back-compat for the first two retries (unchanged RETRY_JOB) and
+            # from the third rotates through _next_retry_job's escalation -- UNLESS this reply
+            # claims exhaustive coverage, in which case it asks for an enumeration instead, at
+            # any count, because no phrasing in that ladder helps a worker convinced there is
+            # nothing left to check.
             if self.transient < self.max_transient and self._retry_transient():
-                self.job = self._task_anchor(RETRY_JOB)
+                self.job = self._task_anchor(_stuck_retry_nudge(resp, self.transient))
                 self.reason = "STUCK -> transient retry %d/%d" % (self.transient, self.max_transient)
                 return
             if self._salvage_via_checks():
                 return
+            self.retryable_override = False
             self.status, self.outcome, self.reason = "stuck", "STUCK", \
-                "agent reported STUCK (after %d retries)" % self.transient
+                "agent reported STUCK (after %d retries): %s" % (self.transient, reason_text)
             return
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
+        self._last_stuck_reason = None  # a real reply breaks the STUCK-convergence streak too
         self.first_transient_ts = 0.0   # reset the outage window on a healthy reply
         self._toolerr_ts = 0.0          # tool path is back -> clear the tool-unreachable window
         self._throttle_ts = 0.0         # the quota refilled -> clear the throttle window
@@ -3871,8 +6558,9 @@ class RelayWorker:
         # turn, and continue. Capped per worker (max_research); past the cap, tell it to proceed.
         rq = extract_research(resp)
         if rq and self._context is not None and self.max_research > 0:
+            self._record_effort_budget("research")
             if self.research_count >= self.max_research:
-                self.job = ("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
+                self.job = self._task_anchor("これ以上は調査を依頼できません（上限到達）。今ある情報で進めるか、"
                             "無理なら最後の行に STUCK: 理由 と書いてください。")
                 self.status = "ready"
                 return
@@ -3901,15 +6589,16 @@ class RelayWorker:
         az = extract_analyze(resp)
         if az and self._context is not None and self.max_research > 0:
             apath, ainstr = az
+            self._record_effort_budget("analyze")
             if self.research_count >= self.max_research:
-                self.job = ("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
+                self.job = self._task_anchor("これ以上は分析を依頼できません（上限到達）。自前ツールで分析するか、"
                             "無理なら最後の行に STUCK: 理由 と書いてください。")
                 self.status = "ready"
                 return
             if not os.path.isfile(apath):
                 # NAMED, NOT SILENT. A missing file used to be indistinguishable from the
                 # feature not existing, which is exactly how this stayed unnoticed.
-                self.job = ("指定されたファイルが見つかりません: %s。パスを確認するか、"
+                self.job = self._task_anchor("指定されたファイルが見つかりません: %s。パスを確認するか、"
                             "自前ツールで分析してください。" % apath[:200])
                 self.status = "ready"
                 return
@@ -3932,16 +6621,74 @@ class RelayWorker:
         # ends in SUBTASKS_READY and describes work rather than reporting it, and letting the
         # DONE branch see it first would accept a list of intentions as a finished task.
         if self.fanout and not self._fanout_done:
+            if fanout_mod.declined_split(resp):
+                # THE AGENT IS THE JUDGE FOR THIS BAND AND IT SAID NO. Read as a malformed
+                # split (which is what happened before the marker existed -- a decline has no
+                # numbered list, so `subtasks_from` returns []) this would be recorded as
+                # 「分割案が使えなかった」: the same work, the opposite meaning, and a
+                # deliberate refusal counted as a parse failure in the telemetry.
+                self._fanout_done = True
+                self.fanout = False
+                self.job = self._task_anchor(
+                    "分割しない判断を受け取りました。上記の目標をこの会話で直接実行してください。"
+                    + CLOSING_INSTRUCTION)
+                self.status = "ready"
+                self.reason = "エージェントが分割不要と判断（単独実行）"
+                try:
+                    self._tx.metric(self.turn, "fanout_declined", 1,
+                                    triage=self._split_reason, observed=True)
+                except Exception:
+                    pass
+                return
             if fanout_mod.fanout_ready(resp):
                 self._fanout_done = True
                 steps = fanout_mod.subtasks_from(resp)
+                # PER-TREE BUDGET: how many children this root may add. A refused grant empties
+                # `steps`, which takes the existing "run it here" branch below; a partial grant
+                # folds the tail into the last kept step. Unchanged at default limits.
+                self._budget_refusal = ""
+                # A NESTED SPLIT (depth > 0) names its place in the tree: its own depth, the
+                # campaign and slice it belongs to, and the tree's root, which is what the
+                # budget is charged against. Nothing is added for a top-level split.
+                _env = self.task_envelope
+                _tree = {}
+                if int(getattr(_env, "depth", 0) or 0) > 0:
+                    _tree = {"depth": int(_env.depth),
+                             "parent_campaign_id": _env.campaign_id or "",
+                             "parent_subtask_index": self.subtask_index,
+                             "root_id": ((_env.metadata or {}).get("root_id")
+                                         or _env.campaign_id or "")}
+                _grant_fn = getattr(self._spawn_fn, "grant", None)
+                if steps and _grant_fn is not None:
+                    steps, self._budget_refusal = _grant_fn(
+                        self.goal, steps, getattr(self.task_envelope, "task_id", "") or "",
+                        **({"root_id": _tree["root_id"]} if _tree else {}))
                 kids = (fanout_mod.child_goals(
                     self.goal, steps,
                     parent_task_id=getattr(self.task_envelope, "task_id", "") or "",
-                    checks=getattr(self, "checks", None) or None,
-                    cwd=getattr(self, "cwd", None)) if steps else [])
+                    cwd=getattr(self, "cwd", None), **_tree,
+                    parent_level=(effort_policy_mod.worker_level(self)
+                                  if effort_policy_mod.mode() != "off" else None),
+                    run_id=getattr(self, "run_id", "") or "") if steps else [])
                 if kids and self._spawn_fn:
-                    self._spawn_fn(self.goal, kids)
+                    # THE PARENT'S CHECK GOES TO THE MERGE, NOT ONTO EVERY CHILD. It used to
+                    # ride in child_goals(checks=...) and land identically on all of them, so
+                    # each slice was gated on the whole goal while being told not to touch the
+                    # other slices. The merge is the parent goal finishing, in the parent's
+                    # cwd; that is the worker the question belongs to.
+                    # A MID-RUN SPLIT HAS A PARENT THAT ALREADY DID WORK, and ending it
+                    # FANOUT drops everything it produced: the merge reads child records
+                    # only. Carried so the mechanism meant to rescue a long-running goal does
+                    # not destroy the part of it that was finished. Empty for a turn-1 split,
+                    # where there is nothing yet.
+                    _partial = ""
+                    if self._midrun_split_asked:
+                        _partial = (getattr(self, "display_result", "")
+                                    or self.last_response or "")[:4000]
+                    self._spawn_fn(self.goal, kids,
+                                   parent_checks=getattr(self, "checks", None) or None,
+                                   parent_partial=_partial,
+                                   **conv_saving_mod.parent_merge_kwargs(self))
                     # SPLITTING ENDS THIS WORKER. A parent parked until its children finish
                     # holds an admission slot the whole time, and with a concurrency cap
                     # below the number of children that is a deadlock -- the parent waits
@@ -3958,9 +6705,11 @@ class RelayWorker:
                 self.fanout = False
                 self.job = self._task_anchor(
                     "分割は行いません。上記の目標をこの会話で直接実行してください。"
-                    "完了したら DONE、無理なら FAIL と理由を書いてください。")
+                    + CLOSING_INSTRUCTION)
                 self.status = "ready"
-                self.reason = "分割案が使えなかったため単独実行に切り替え"
+                self.reason = ("分割予算の上限のため単独実行に切り替え (%s)" % self._budget_refusal
+                               if getattr(self, "_budget_refusal", "") and not steps
+                               else "分割案が使えなかったため単独実行に切り替え")
                 return
             # Still writing the split. Ask for the marker rather than for the work: without
             # it there is nothing to tell a finished list from a half-written one.
@@ -3978,7 +6727,7 @@ class RelayWorker:
             self.status = "ready"
             return
         if "DONE" in up and "FAIL" not in last_line:
-            self._on_done_claimed()
+            self._on_done_claimed(resp)
             return
         if self.no_progress >= self.max_no_progress:
             if self._salvage_via_checks():
@@ -4009,13 +6758,22 @@ class RelayWorker:
             self.status, self.outcome = "stuck", "STUCK"
             self.reason = "no progress for %d turns" % (self.no_progress + 1)
             return
+        # THE COUNTER BELOW SAYS "連続" AND NOTHING USED TO MAKE THAT TRUE. _unlanded_calls
+        # was only ever incremented, so a worker that wrote a stray invocation once, recovered,
+        # and wrote another one thirty turns later was filed INFRA_STUCK reading
+        # "2 ターン連続" -- a number that never described anything that happened. A streak
+        # counter needs the turn that breaks the streak to clear it, and the turn that breaks
+        # it is any turn whose reply carries no unlanded invocation, whichever branch it then
+        # takes. Reset here, above the branch, so no path can forget.
+        if not _tried_to_call_a_tool(resp):
+            self._unlanded_calls = 0
         if "FAIL" in last_line:
             self.job = self._task_anchor(FIX_JOB)
             self._continue_count = 0   # real progress signal -> the continue streak resets
         elif self._last_was_steer:
             # bridge off the steer instead of a raw CONTINUE so the redirection sticks
-            self.job = ("先ほどの追加指示を踏まえて作業を続行してください。"
-                        "完了なら DONE、無理なら FAIL と理由を書いてください。")
+            self.job = self._task_anchor("先ほどの追加指示を踏まえて作業を続行してください。"
+                        + CLOSING_INSTRUCTION)
             self._continue_count = 0   # a steer is real progress -> the continue streak resets
         else:
             # HARD CAP, independent of no_progress (which only trips on a VERBATIM-identical
@@ -4023,9 +6781,79 @@ class RelayWorker:
             # would otherwise ride the plain CONTINUE branch all the way to max_turns while
             # WE re-send byte-identical nudge text every turn -- the confirmed degradation
             # mechanism. Cap consecutive continues and terminate gracefully instead.
+            # AN ATTEMPTED CALL THAT NEVER ARRIVED IS NOT "DID NOT FINISH".
+            #
+            # Observed live 2026-09-16: 14 of 18 assistant turns contained `<invoke name=`
+            # written out as prose, none of it reaching the gateway, and the worker was filed
+            # STUCK as "no DONE after 6 continue nudges (stopped to avoid degrading the
+            # model)". That reason names the wrong thing entirely. The worker was not failing
+            # to finish; every tool call it made was landing nowhere, and a nudge to continue
+            # is advice for a different problem -- it spent six turns re-emitting the same
+            # broken invocation because nothing ever told it the invocation was the fault.
+            #
+            # The test is conservative on purpose: the reply shows an invocation was
+            # ATTEMPTED, and the ledger shows NOTHING from anybody arrived since this turn
+            # was sent. The negative form needs no attribution, which is just as well,
+            # because attribution is not generally available here.
+            # THE FIRST VERSION OF THIS ALSO REQUIRED THAT NOTHING AT ALL REACHED THE
+            # GATEWAY, AND THAT MADE IT USELESS FOR THE CASE IT WAS WRITTEN FOR. Measured on
+            # the run that prompted it: 19 calls DID land in the window and 18 succeeded --
+            # catalogue, signature, unlock, screen_windows, two shell_exec that actually
+            # answered the git question. Only the malformed blocks landed nowhere. So "zero
+            # calls from anybody" was never true, the branch never fired, and 8 of the last
+            # 10 turns went on re-emitting the same non-executing invocation.
+            #
+            # The markup in the reply IS the evidence. A model that writes <invoke name=...>
+            # with a <parameter name=...> into its prose meant to call something and did not.
+            # A reply merely DISCUSSING the syntax could trip this; the cost of that is one
+            # corrective nudge, against 8 wasted turns for a miss, and the reply is quoted
+            # back so a false positive is visible rather than silent.
+            if _tried_to_call_a_tool(resp):
+                self._unlanded_calls = getattr(self, "_unlanded_calls", 0) + 1
+                if self._unlanded_calls >= 2:
+                    self.status, self.outcome = "stuck", "INFRA_STUCK"
+                    self.reason = (
+                        "⚠ ツール呼び出しが%d ターン連続でゲートウェイに到達していない。"
+                        "返信には呼び出しの記述があるが、台帳には1件も届いていない。"
+                        "**タスクの失敗ではなくツール経路の問題**（ツール名の綴り、"
+                        "コネクタ、または経路）。継続を促しても直らない。"
+                        % self._unlanded_calls)
+                    # NEVER OBSERVED, AND THAT IS WHY IT IS RECORDED. Scanned 2026-09-22: 78
+                    # durable worker records and 470 status rows on this machine, zero
+                    # INFRA_STUCK and zero occurrences of this reason. The branch declares an
+                    # INFRASTRUCTURE fault -- the tool path is broken, not the task -- so the
+                    # first time it is right about that is worth knowing, and a status field
+                    # that a live snapshot overwrites each sweep is not where anybody would
+                    # find out. Same reason as refusal_recovery beside it: not a reader, a
+                    # signal.
+                    try:
+                        _mt.record("unlanded_calls", run_id=getattr(self, "run_id", ""),
+                                   instance=self.name, turn=getattr(self, "turn", None),
+                                   configured=True, config_source="always on",
+                                   eligible=True, triggered=True, executed=True,
+                                   extra={"consecutive": self._unlanded_calls})
+                    except Exception:
+                        pass
+                    return
+                self.job = self._task_anchor(
+                    "直前の返信にツール呼び出しの記述がありましたが、その呼び出しはサーバに"
+                    "一件も届いていません。同じ書き方を繰り返さないでください。"
+                    "call_tool(name='') でツール名を確かめ、gateway 経由で呼び直してください。"
+                    + CLOSING_INSTRUCTION)
+                self.status = "ready"
+                return
             self._continue_count += 1
             if self._continue_count >= self.max_continue:
                 if self._salvage_via_checks():
+                    return
+                # SIX REPLIES THAT KEPT GOING AND NEVER FINISHED. That is not a stalled
+                # worker -- `no_progress` is the counter for repetition, and it is separate --
+                # it is a goal that does not fit in one conversation, which is the condition
+                # fan-out exists for, arriving as evidence instead of as a guess about the
+                # goal's text. The split decision was previously fixed in __init__ from an
+                # offline reading of that text and could never be revised by the one party
+                # doing the work.
+                if self._ask_for_a_midrun_split():
                     return
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = ("no DONE after %d continue nudges (stopped to avoid degrading "
@@ -4034,13 +6862,70 @@ class RelayWorker:
             self.job = self._task_anchor(_continue_nudge(self._continue_count))
         self.status = "ready"
 
-    def _on_done_claimed(self):
+    def _ask_for_a_midrun_split(self) -> bool:
+        """Offer a split to a worker that has run long without finishing. True if asked.
+
+        Returns False -- leaving the caller's STUCK path exactly as it was -- whenever any
+        precondition is missing, so this can only ever add a rescue, never remove the
+        existing ending.
+
+        WHY THIS AND NOT `no_progress`: no_progress trips on a VERBATIM-identical reply,
+        which is a stuck conversation and a split will not help it. `max_continue` trips on
+        replies that are each different and each still going. Only the second is the shape
+        fan-out addresses.
+        """
+        if self._midrun_split_asked or self._fanout_done:
+            return False
+        if not getattr(self, "_fanout_capable", False) or not fanout_mod.may_split_at(
+                getattr(self.task_envelope, "depth", 0)):
+            # Either the run is not fan-out-capable, or this worker is already as deep as the
+            # tree may go (the depth setting is read now, not when the worker was built).
+            return False
+        self._midrun_split_asked = True
+        # The __init__ verdict is deliberately overridden: it was made before the work began,
+        # and six unfinished turns is better evidence than the goal's length. The agent can
+        # still decline -- `declined_split` is checked on the way back -- and a decline lands
+        # in the normal "carry on in this conversation" path.
+        self.fanout = True
+        self._fanout_done = False
+        self._continue_count = 0
+        self.job = self._task_anchor(fanout_mod.midrun_split_job(self.max_continue))
+        self.status = "ready"
+        self.reason = "%d ターン完了せず -> 残作業の分割を打診" % self.max_continue
+        try:
+            self._tx.metric(self.turn, "fanout_midrun_offer", 1,
+                            continues=self.max_continue,
+                            initial_verdict=self._split_reason, observed=True)
+        except Exception:
+            pass
+        return True
+
+    def _on_done_claimed(self, resp=None):
         """Copilot reported DONE. With no acceptance checks, go straight to the candidate-
         done step (back-compat trust, unless a refuter is on). With checks, run the
-        verification gate first."""
+        verification gate first.
+
+        `resp` IS THE CLAIM ITSELF, and a reply_contains check is a question about it -- "does
+        this report name the slices it could not get". It was a local variable in the caller
+        and went out of scope here, so the gate had nothing to read. Default None keeps every
+        other caller working and means "no reply captured", which _eval_reply fails on rather
+        than passing: not asking is not the same as being answered.
+        """
         self._continue_count = 0   # a DONE claim is real progress -> the continue streak resets
+        self._done_reply = resp or ""
+        self._candidate_done_reply = self._done_reply or self.last_response or ""
+        self._candidate_done_turn = self.turn
         if not self.checks:
-            self.verified = False
+            # NOT self.verified = False. __init__'s own comment declares the contract:
+            # "None=not checked, True/False after a gate ran" -- and no gate ran here, only
+            # DONE was trusted (back-compat). Setting False made "nothing was configured to
+            # verify" indistinguishable from "a check ran and failed", which is exactly the
+            # distinction the codex-plan item-1 evidence bar calls for ("未検証と検証失敗を
+            # 区別する"). Measured 2026-09-09: 67 of 68 verified=False rows in history.json
+            # had verify_attempts=0 -- this branch, not a failed gate, produced almost all of
+            # them, and every self-improvement rate computed over "verified" was reading
+            # unconfigured workers as failures.
+            self.verified = None
             self._candidate_done()
             return
         self._pending_checks = list(self.checks)
@@ -4053,9 +6938,18 @@ class RelayWorker:
         if not self._pending_checks:
             self.verified = True
             self.reason = "acceptance verified (%d check(s))" % len(self.checks)
+            # WHICH TREE THE GREEN DESCRIBES. supervisor_verify's step 4 -- the step the live
+            # path never had -- is to notice when the tree moves after the checks passed, and
+            # that needs the "before" taken HERE, at the moment they did.
+            #
+            # NOT HYPOTHETICAL HERE: fanout children inherit the parent's cwd (fanout.py:140),
+            # so siblings edit one tree concurrently and a sibling's write can invalidate this
+            # worker's green while this worker does nothing at all.
+            self._verified_tree = self._tree_hash_now()
             self._candidate_done()
             return
-        self._active_check = Check(self._pending_checks[0], cwd=self.cwd).start()
+        self._active_check = Check(self._pending_checks[0], cwd=self.cwd,
+                                   reply=getattr(self, "_done_reply", None)).start()
 
     #: Skip the refuter when the machine checks already settled it. OFF by default: while the
     #: shadow numbers are being collected, "we stopped asking" and "there was nothing to ask
@@ -4104,8 +6998,8 @@ class RelayWorker:
             _sk = "deterministic checks passed; no refuter turn spent"
             self.reason = (self.reason or "") + (" | " if self.reason else "") + _sk
             try:
-                from relay import mechanism_telemetry as _mt
-                _mt.record("refuter", configured=True, config_source="skip-when-settled",
+                _mt.record("refuter", run_id=self.run_id,
+                           configured=True, config_source="skip-when-settled",
                            eligible=True, triggered=False,
                            not_triggered_reason=_sk, executed=False, changed_decision=False)
             except Exception:
@@ -4153,15 +7047,16 @@ class RelayWorker:
             else:
                 from .refuter import RefuterSession
                 self._refuter_session = RefuterSession(
-                    self._context, self._agent_url or "", self.goal,
+                    self._context, self._agent_url or "", self.goal_as_amended(),
                     self.last_response,
-                    unverifiable=not self.checks).start()
+                    unverifiable=not self.checks,
+                    recorder=self._refuter_recorder("")).start()
             self.status = "refuting"
             return
         if self.fresh_replay_count:
-            self.recovery_cause = "session_state"
-            self.recovery_result = "recovered"
             self.recovery_state = "recovered"
+            self._apply_diagnosis(fresh_was_refusal=False, fresh_succeeded=True,
+                                  fresh_was_transient_error=False)
         self._settle_done()
 
     #: Check a DONE claim against the recorded tool calls before reporting it.
@@ -4173,7 +7068,53 @@ class RelayWorker:
     VERIFY_CLAIM_AGAINST_LEDGER = (os.environ.get("MCP_VERIFY_CLAIM", "1").strip().lower()
                                    not in ("", "0", "no", "off", "false"))
 
-    def _settle_done(self):
+    def _record_effort_budget(self, kind):
+        """The `effort` mechanism, recorded at the one moment it decides anything.
+
+        WHAT IT WAS BEFORE. `effort` was written to mechanisms.jsonl exactly once per run, at
+        start, as configured=True with the two budgets as its config_value -- and nothing ever
+        wrote the eligibility step. Measured 2026-09-22: 416 records, configured 416, and the
+        funnel reported eligible=0, whose own comment glosses that as "solving a problem that
+        does not occur here". It is not. All 416 carried eligible=None, which is "never
+        assessed", and reading a gap in the record as a fact about the world is what the
+        summary was corrected for in the same pass as this.
+
+        AND THE BUDGET HAS ACTUALLY BITTEN. Counted over 34,594 recorded fleet turns: 5 turns
+        asked RESEARCH and 13 asked ANALYZE, across 10 workers -- and one of those workers
+        asked five times against a cap of three, with another landing exactly on it. So this
+        is not a mechanism waiting for its situation; it is one that has fired in production
+        and left nothing in the ledger, which is why answering "did the budget ever bite"
+        needed the archaeology above rather than a query.
+
+        ONE HELPER, TWO CALL SITES, rather than a line at each outcome. The research and
+        analyze branches share a budget and each has its own cap check, so a line per outcome
+        would be four -- and the fifth, added later, would be the one that is missed. That is
+        the argument `_decide` makes about its eighteen give-ups, applied at the size where it
+        is still small.
+
+        Never raises: a mechanism record must not be able to fail the mechanism.
+        """
+        try:
+            blocked = self.research_count >= self.max_research
+            _mt.record("effort", run_id=getattr(self, "run_id", ""), instance=self.name,
+                       turn=getattr(self, "turn", None),
+                       configured=True, config_source="run",
+                       config_value={"max_research": self.max_research,
+                                     "max_refute": self.max_refute},
+                       # The request arrived and a budget governs it: that is the opportunity.
+                       eligible=True,
+                       # TRIGGERED MEANS THE BUDGET REFUSED, not that a delegation happened.
+                       # This mechanism is the cap, so its firing is the refusal; the
+                       # delegation going ahead is the budget NOT being reached.
+                       triggered=bool(blocked),
+                       not_triggered_reason=("" if blocked else
+                                             "within budget (%d of %d used)"
+                                             % (self.research_count, self.max_research)),
+                       extra={"kind": kind, "used": self.research_count})
+        except Exception:
+            pass
+
+    def _settle_done(self, outcome_override=None):
         """THE ONLY PLACE THIS WORKER BECOMES DONE.
 
         There were four separate sites assigning ("done", "DONE"). Adding the check at one of
@@ -4182,7 +7123,106 @@ class RelayWorker:
         on one branch while every other path walked past.
         """
         self.status = "done"
-        self.outcome = self._claim_verdict()
+        # BEFORE THE VERDICT, because it is about the tree the verdict is about. It cannot
+        # change the verdict yet, by design.
+        try:
+            self._record_tree_stability()
+        except Exception:
+            pass
+        self.outcome = outcome_override or self._claim_verdict()
+        # THE CHILD'S ANSWER IS MADE DURABLE HERE, not on a later sweep: a coordinator killed
+        # between the outcome and that sweep left the done-map saying DONE with no
+        # `child_result` line, and the family could then never merge. Never raises.
+        _cb = getattr(self, "on_settled_done", None)
+        if _cb is not None and self.outcome == "DONE":
+            try:
+                _cb(self)
+            except Exception:
+                pass
+
+    def _tree_hash_now(self) -> str:
+        """supervisor_verify.tree_hash over this worker's cwd, or "" when there is nothing to
+        hash. Never raises: a measurement must not be able to fail the work it measures.
+
+        WHAT THIS COSTS, MEASURED RATHER THAN ASSUMED. On a staged astropy worktree (1,896
+        files) it took 7.3s and 3.1s on two samples -- it reads file CONTENT, which is the
+        whole reason it can detect a change at all.
+
+        THAT COST FALLS ONLY WHERE IT IS PROPORTIONATE. It runs at most twice per worker, and
+        only for a worker that has both `checks` and a `cwd` -- a bench or code task, whose
+        single acceptance command is itself capped near 1300s, so this is well under a percent
+        of what that worker already spends. An ordinary Copilot fleet goal carries no cwd
+        (task_router hands the fleet a bare string), returns on the line above, and pays
+        nothing.
+
+        THE SWEEP IS TOLD, because it is single-threaded and this blocks it. Seven seconds is
+        far inside the watchdog's tolerance, but a frozen status.json with no marker is exactly
+        what a wedge looks like from outside, and this file already has the vocabulary for
+        "about to block on purpose".
+        """
+        root = (getattr(self, "cwd", "") or "").strip()
+        if not root:
+            return ""
+        busy = False
+        try:
+            from relay import supervisor_verify as _sv
+            try:
+                self._declare_blocking(TREE_HASH_CEILING_S)
+                busy = True
+            except Exception:
+                busy = False
+            return _sv.tree_hash(root)
+        except Exception:
+            return ""
+        finally:
+            if busy:
+                try:
+                    self._end_blocking()
+                except Exception:
+                    pass
+
+    def _record_tree_stability(self):
+        """Did the tree move between the checks going green and the worker settling?
+
+        RECORDED, NOT ACTED ON -- see this file's item-1 note and evidence_manifest's own
+        "SHADOW FIRST" rule. The number this produces is what a later decision to gate on it
+        would have to be made from; there are currently zero measurements of how often a live
+        tree moves under a finished worker.
+        """
+        before = getattr(self, "_verified_tree", "") or ""
+        if not before:
+            return
+        after = self._tree_hash_now()
+        self.tree_stable = (after == before) if after else None
+        # RECORDED EVERY TIME, NOT ONLY WHEN IT MOVED. The question this instrument exists to
+        # answer is "how OFTEN does a live tree move under a finished worker", and a log that
+        # holds only the positive cases has no denominator -- it can say a thing happened and
+        # never what share of the time. That is the same distinction the staircase fields are
+        # for: `eligible` is how often the question could be asked, `triggered` how often the
+        # answer was yes, and this repository already paid for collapsing them once, when "the
+        # panel ran 155 times" could not be turned into a rate.
+        try:
+            _mt.record("tree_moved_after_verify", run_id=getattr(self, "run_id", ""),
+                       goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
+                       turn=getattr(self, "turn", None),
+                       configured=True, config_source="supervisor_verify.tree_hash",
+                       # None, not False, when the tree could not be re-read: the question was
+                       # asked and could not be answered, which is neither yes nor no.
+                       eligible=(self.tree_stable is not None),
+                       ineligible_reason=("" if self.tree_stable is not None
+                                          else "the tree could not be re-hashed at settle"),
+                       triggered=(self.tree_stable is False),
+                       not_triggered_reason=("" if self.tree_stable is not True
+                                             else "unchanged since the checks passed"),
+                       # NOTHING WAS DONE ABOUT IT, and the record says so rather than leaving
+                       # a reader to assume the finding was acted on. See this file's item-1
+                       # note: shadow first.
+                       executed=False,
+                       self_report_outcome="DONE",
+                       extra={"tree_before": before, "tree_after": after,
+                              "cwd": (getattr(self, "cwd", "") or "")[-60:]})
+        except Exception:
+            pass
 
     def _claim_verdict(self):
         """"DONE", or a weaker outcome when the RECORD contradicts the claim. Never raises.
@@ -4192,6 +7232,36 @@ class RelayWorker:
         before. An absence of evidence is not evidence, and a worker must not be demoted
         because nothing happened to be recording.
         """
+        # RUNNING OUT OF REVIEW BUDGET IS NOT PASSING REVIEW.
+        #
+        # The refuter only runs while `refute_count < max_refute`. A worker that is REFUTED on
+        # its last allowed round is sent back to fix the work, and the fix it returns arrives
+        # with the budget spent -- so the gate is not entered, execution falls through to
+        # _settle_done, and the run is recorded DONE while the last thing any checker said
+        # about it was that it was wrong.
+        #
+        # MEASURED 2026-09-15, and it is not a theoretical hole. A worker could not read a
+        # file because the execution tools were locked, wrote into the deliverable that it had
+        # verified the content against that file, and the refuter caught the fabrication in
+        # as many words. The ledger row reads `outcome=DONE  reason=refuter#3: REFUTED: ...`.
+        # The operator's phrase for the whole class was 「無視して回すだけ回す」, and this is
+        # the exact mechanism they were describing.
+        #
+        # EVIDENCE_CONTRADICTED RATHER THAN A NEW OUTCOME, and rather than STUCK. Its entry in
+        # relay/outcomes.py already says what this is -- the claim is contradicted by the
+        # record of what was done -- and says why it reports "done" rather than "stuck": the
+        # work FINISHED, and telling an operator to re-run something that ran to completion is
+        # the wrong instruction. What is in doubt is the claim, which is precisely the doubt
+        # here. self.reason already carries the refuter's own words, so the operator reads why
+        # rather than a label.
+        #
+        # Before the ledger logic below because it is unconditional: that path returns DONE
+        # early for any goal without acceptance checks or a cwd, which is every ordinary
+        # Copilot fleet goal -- including the one this was found in.
+        if (getattr(self, "_last_refute_verdict", "") == "REFUTED"
+                and getattr(self, "refuter", False)
+                and self.refute_count >= self.max_refute):
+            return "EVIDENCE_CONTRADICTED"
         if not self.VERIFY_CLAIM_AGAINST_LEDGER:
             return "DONE"
         try:
@@ -4229,9 +7299,57 @@ class RelayWorker:
         # still holding the coding criteria would refute on grounds the others were told do
         # not apply, and a single REFUTED is enough to send the worker back.
         self._refuter_session = RefuterSession(
-            self._context, self._agent_url or "", self.goal,
+            self._context, self._agent_url or "", self.goal_as_amended(),
             self.last_response, lens=lens,
-            unverifiable=not self.checks).start()
+            unverifiable=not self.checks,
+            recorder=self._refuter_recorder(lens)).start()
+
+    def _install_wire_sink(self):
+        """Have the socket driver report each real payload (preamble + tools + request, and
+        every tool-result follow-up) into fleet_turns as role "user_wire". Tab drivers have no
+        such hook and are recorded after send(); a failure here is logged, never raised."""
+        try:
+            if not getattr(self, "socket", False) or self.drv is None:
+                return
+            turn_no = self.turn + 1          # self.turn counts only after a send succeeds
+            tx = self._tx
+            run_id = getattr(self, "run_id", "")
+
+            def sink(payload, round_no):
+                tx.wire(turn_no, payload, route="socket", round=round_no, run_id=run_id)
+            self.drv.payload_sink = sink
+        except Exception as exc:
+            _report_store_failure("wire sink install", exc)
+
+    def _refuter_recorder(self, lens=""):
+        """A callable the RefuterSession invokes once per text it sends or receives, which
+        writes that text in full to fleet_turns under key `<parent key>__refuter_<lens>`
+        (roles refuter_user / refuter_wire / refuter_assistant / refuter_verdict). Written
+        AS IT HAPPENS, so a review that never finishes still leaves what it was asked."""
+        parent = getattr(self, "_tx_key", "") or ""
+        run_id = getattr(self, "run_id", "")
+        worker = getattr(self, "name", "")
+        refute_count = getattr(self, "refute_count", 0)
+        turn = getattr(self, "turn", None)
+        role_of = {"sent": "refuter_user", "sent_wire": "refuter_wire",
+                   "received": "refuter_assistant", "verdict": "refuter_verdict"}
+
+        def record(ex):
+            try:
+                from bridge.session_store import record_refuter_turn
+                extra = {"route": ex.get("route", ""), "gpt_id": ex.get("gpt_id", ""),
+                         "preamble_id": ex.get("preamble_id", ""),
+                         "refute_count": refute_count, "worker_turn": turn,
+                         "direction": ex["direction"]}
+                ok = record_refuter_turn(
+                    parent, role_of.get(ex["direction"], "refuter_" + str(ex["direction"])),
+                    ex["seq"], ex["text"], lens=lens or ex.get("lens", ""), name=worker,
+                    goal=getattr(self, "goal", ""), run_id=run_id, extra=extra, ts=ex.get("ts"))
+                if not ok:
+                    _report_store_failure("refuter exchange", RuntimeError("store returned False"))
+            except Exception as exc:
+                _report_store_failure("refuter exchange", exc)
+        return record
 
     def _append_panel_ledger(self, record):
         """One line per completed panel, beside the run state.
@@ -4252,12 +7370,12 @@ class RelayWorker:
         # that separates "the refuter ran 155 times" from "the refuter improved 155 outcomes",
         # and it is the distinction the whole accuracy stack was accepted without.
         try:
-            from relay import mechanism_telemetry as _mt
             _lenses = [e.get("lens") for e in (record.get("lenses") or [])
                        if isinstance(e, dict)]
             _agg = record.get("aggregate")
             _veto = record.get("veto_shadow")
             _mt.record("panel" if len(_lenses) > 1 else "refuter",
+                       run_id=getattr(self, "run_id", ""),
                        instance=str(getattr(self, "cwd", "") or "")[-8:],
                        goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
                        turn=getattr(self, "turn", None),
@@ -4268,6 +7386,7 @@ class RelayWorker:
                        extra={"lenses": _lenses})
             if len(_lenses) > 1:
                 _mt.record("veto",
+                           run_id=getattr(self, "run_id", ""),
                            goal_hash=str(getattr(self, "goal_hash", "") or "")[:24],
                            turn=getattr(self, "turn", None),
                            configured=("security" in _lenses), eligible=("security" in _lenses),
@@ -4302,6 +7421,18 @@ class RelayWorker:
         if r is None:
             return False
         kind, reason = r
+        # THE VERDICT AS THE FLEET TOOK IT, beside the texts that produced it (the session
+        # records those as they happen). Not truncated to the 300-character status reason.
+        _sess = self._refuter_session
+        try:
+            _rec = getattr(_sess, "recorder", None)
+            if callable(_rec):
+                _rec({"direction": "verdict", "seq": 10_000,
+                      "text": "%s: %s" % (kind, reason or ""), "ts": time.time(),
+                      "route": getattr(_sess, "last_route", ""),
+                      "lens": getattr(_sess, "lens", "")})
+        except Exception as exc:
+            _report_store_failure("refuter verdict", exc)
         if self.review_lenses:
             lens = self._refuter_session.lens
             self._panel_results.append((lens, kind, reason))
@@ -4333,18 +7464,29 @@ class RelayWorker:
         self.reason = ("refuter#%d: %s%s"
                        % (self.refute_count, kind,
                           (": " + reason) if reason else ""))[:300]
+        # THE LAST WORD ANY CHECKER SAID, REMEMBERED, BECAUSE THE BUDGET CAN RUN OUT BEFORE
+        # ONE IS SAID AGAIN. A REFUTED verdict sends the worker back to fix the work; if its
+        # next candidate arrives with refute_count already at max_refute, the gate above is
+        # not entered and NOTHING examines the fix. _claim_verdict reads this, so that the
+        # run does not report DONE when the last thing said about it was that it was wrong.
+        #
+        # Assigned for every verdict and not only REFUTED, so that a later UPHELD clears it.
+        # Setting it inside the REFUTED branch alone would leave the flag standing after the
+        # work was subsequently approved, and mark a verdict that was actually satisfied.
+        self._last_refute_verdict = kind
         if kind == "REFUTED":
             # A NEW refute round: reset the resend counter, so its first send is byte-identical
             # to what this branch has always produced.
             self._refute_reason = reason or "(no reason)"
             self._refute_attempt = 1
-            self.job = _refute_fix_job(self._refute_reason, 1)
+            self._refute_fix_pending = True
+            self.job = self._task_anchor(_refute_fix_job(self._refute_reason, 1))
             self.status = "ready"
             return False
         if self.fresh_replay_count:
-            self.recovery_cause = "session_state"
-            self.recovery_result = "recovered"
             self.recovery_state = "recovered"
+            self._apply_diagnosis(fresh_was_refusal=False, fresh_succeeded=True,
+                                  fresh_was_transient_error=False)
         self._settle_done()
         return True
 
@@ -4372,7 +7514,7 @@ class RelayWorker:
             self.reason = ("acceptance check failed %d time(s): %s"
                            % (self.verify_attempts, (detail or "")[:200]))
             return True
-        self.job = VERIFY_FIX_JOB % (detail or "(no detail)")
+        self.job = self._task_anchor(VERIFY_FIX_JOB % (detail or "(no detail)"))
         self._pending_checks = []
         self._active_check = None
         self.status = "ready"
@@ -4417,6 +7559,37 @@ class RelayWorker:
                 cached = self._acting_goal = True      # unknown goes to the careful side
         return cached
 
+    def _timeout_resend_decision(self):
+        """Whether a timed-out turn may be sent again without risking a duplicate effect.
+
+        A turn that reached ``waiting`` was submitted successfully. If no answer comes back we
+        know nothing about whether the agent already performed its side effect. Use the exact
+        same action/effect policy as socket reconnect: reads are safe to repeat; an acting goal
+        is repeated only when an observable effect checker can establish that the effect is absent.
+        Unknown goes to the careful side.
+        """
+        if not self._goal_may_act():
+            return "resend"
+        try:
+            from relay.transport_policy import resend_decision_for_landed_act
+            return resend_decision_for_landed_act(
+                self.goal or "", checker=self._effect_checker())
+        except Exception as exc:
+            # Fail closed, but do not fail silently. A policy import/runtime failure and a
+            # deliberate policy refusal both return "refuse"; without telemetry operators
+            # cannot tell whether the safety policy itself is unavailable. Record only the
+            # exception TYPE (never its message, which can contain paths/tokens/provider text).
+            error_type = type(exc).__name__
+            try:
+                _socket_route().record(
+                    "resend_policy_error", worker=getattr(self, "name", ""),
+                    turn=getattr(self, "turn", 0), error_type=error_type, decision="refuse")
+            except Exception:
+                pass
+            print("[relay_fleet] %s: resend policy unavailable (%s); refusing re-send" %
+                  (getattr(self, "name", "worker"), error_type), flush=True)
+            return "refuse"
+
     def _refuse_resend(self, reason, delivery):
         """End the worker rather than repeat an act it cannot verify. Never silent."""
         self.status, self.outcome = "stuck", "STUCK"
@@ -4429,6 +7602,138 @@ class RelayWorker:
         except Exception:
             pass
         print("[relay_fleet] %s: %s" % (self.name, self.reason), flush=True)
+
+    def _effect_checker(self):
+        """A callable that says whether this goal's effect is already in the world, or None.
+
+        Returns None whenever the effect cannot be observed from here -- which is the common
+        case and is why nothing changes for it: `resend_decision_for_landed_act` refuses when
+        the checker is None, exactly as the code did before this method existed. A checker is
+        returned only for an effect `effect_is_checkable` recognises AND for which a
+        repository to look in is known, so the SAFE default survives a missing repo.
+
+        The repository is the goal's own working directory -- `self.cwd`, the tree the goal
+        was told to run in and the one its commit would land in -- with `self._effect_repo` as
+        an explicit override when the fleet set one. It is READ, never guessed: this process is
+        not the one that ran the turn, so inventing a path would check the wrong tree and
+        mis-report `absent`. When neither is set there is nowhere to look, so this returns None
+        and the caller keeps the safe refuse.
+        """
+        try:
+            from relay.transport_policy import (
+                effect_is_checkable, CHECK_PRESENT, CHECK_ABSENT, CHECK_UNKNOWN)
+        except Exception:
+            return None
+        if not effect_is_checkable(self.goal or ""):
+            return None
+
+        # A GOAL THAT PUTS A FILE SOMEWHERE IS CHECKED ON DISK, NOT IN `git log`. This is
+        # tried before the commit checker because a goal can match both vocabularies ("build
+        # the deck and commit it"), and of the two the filesystem question is the one that can
+        # be answered without a repository -- `_file_effect_checker` returns None when it
+        # cannot find a folder to look in, and the commit path below then gets its turn
+        # exactly as before.
+        file_check = self._file_effect_checker()
+        if file_check is not None:
+            return file_check
+
+        repo = getattr(self, "_effect_repo", None) or (getattr(self, "cwd", None) or None)
+        if not repo:
+            return None
+
+        def _check(goal):
+            # THE COMMIT'S OWN TRACE. `git log` is read-only and cannot itself change the
+            # tree, so asking the question has no effect of its own -- the property that lets
+            # a check stand in for a guess. The commit subject the goal named is looked for
+            # among recent commits; found means the act landed, not-found means it did not.
+            subject = _commit_subject_from_goal(goal)
+            if not subject:
+                return CHECK_UNKNOWN
+            try:
+                import subprocess
+                # UTF-8 FIRST, NOT THE CODE PAGE. `text=True` decodes with cp932 here.
+                # Measured over this repository's own history: 48 of 1582 commit subjects
+                # carry non-ASCII, and decoding the whole log with cp932 raises (byte 0x84 at
+                # position 9037). This call reads a 40-subject window over that population, so
+                # it fails when one of the 48 lands in the window -- INTERMITTENTLY, which is
+                # the worse shape: the `except` below swallows it and the check degrades to
+                # CHECK_UNKNOWN without saying anything, so it looks like a quiet repo rather
+                # than a broken read. Same class as the two bench incidents (4ef0d31, 1c83939).
+                from tools.childproc import run as _run_child
+                out = _run_child(
+                    ["git", "-C", repo, "log", "-n", "40", "--format=%s"], timeout=20)
+            except Exception:
+                return CHECK_UNKNOWN
+            if out.returncode != 0:
+                return CHECK_UNKNOWN
+            subjects = [ln.strip() for ln in out.stdout.splitlines() if ln.strip()]
+            return CHECK_PRESENT if subject in subjects else CHECK_ABSENT
+
+        return _check
+
+    #: Folders named in a goal are looked at no deeper than this. A deep tree can hold tens of
+    #: thousands of entries and this runs on the fault path, where the connection is already
+    #: broken and a slow answer is one nobody waits for.
+    EFFECT_SCAN_DEPTH = 2
+
+    def _file_effect_checker(self):
+        """A checker for "the goal was supposed to put a file somewhere". None if it cannot look.
+
+        WHAT IT ASKS. Not "does the named file exist" -- an ordinary instruction does not name
+        its output ("8月までのpptxと同じようなものを、同じフォルダに出してください"). It asks the
+        question that actually decides the re-send: **did anything appear in that folder after
+        this turn was sent.** Something appeared, so the act ran, so refuse. Nothing appeared,
+        so it did not, so re-sending repeats nothing.
+
+        IT NEVER ANSWERS `present`, AND THAT IS NOT AN OVERSIGHT. `resend_decision_for_landed_act`
+        reads `present` as "the effect is already in the world, so re-sending is a harmless
+        no-op" -- true of a commit, whose subject cannot land twice, and false of a file, which
+        a second run would write again. What this checker can actually establish is the ABSENCE
+        of any write; seeing *a* new file does not establish that THIS goal's effect completed.
+        So the honest answers are `absent` (nothing was written, re-sending repeats nothing) and
+        `unknown` (something changed, or the folder could not be read) -- and `unknown` refuses,
+        which is the behaviour that existed before this method did.
+
+        WHY IT NEEDS THE SEND TIME. Without it the question degrades to "are there files here",
+        which is yes for every real folder, so every act would read as landed and nothing would
+        ever be recovered. `_turn_sent_at` is set by `_begin_send`; with no send time there is
+        nothing to compare against and this returns None rather than inventing one.
+        """
+        try:
+            from relay.transport_policy import CHECK_ABSENT, CHECK_UNKNOWN
+        except Exception:
+            return None
+
+        sent_at = float(getattr(self, "_turn_sent_at", 0.0) or 0.0)
+        if sent_at <= 0.0:
+            return None
+
+        folders = _folders_named_in(self.goal or "")
+        if not folders:
+            cwd = getattr(self, "cwd", None)
+            if cwd and os.path.isdir(cwd):
+                folders = [cwd]
+        folders = [f for f in folders if os.path.isdir(f)]
+        if not folders:
+            return None
+
+        def _check(_goal):
+            looked = False
+            for folder in folders:
+                for root, dirs, files in os.walk(folder):
+                    depth = root[len(folder):].count(os.sep)
+                    if depth >= self.EFFECT_SCAN_DEPTH:
+                        dirs[:] = []
+                    for name in files:
+                        try:
+                            if os.path.getmtime(os.path.join(root, name)) > sent_at:
+                                return CHECK_UNKNOWN   # something ran; not provably THIS goal
+                        except OSError:
+                            continue
+                    looked = True
+            return CHECK_ABSENT if looked else CHECK_UNKNOWN
+
+        return _check
 
     def _socket_route_fault(self, reason):
         """See socket_fault_is_transport. A method so the worker reads as one object."""
@@ -4504,9 +7809,25 @@ class RelayWorker:
         # So an acting goal whose turn may already have landed is not re-sent at all, on
         # either transport. The worker ends and says why. A person who can check whether the
         # mail went can re-queue it; nothing here can check, and guessing repeats the act.
+        #
+        # UNLESS THE EFFECT ITSELF CAN BE CHECKED. "Nothing here can check" is true for mail
+        # and false for a git commit: `git log` shows whether the commit the goal named is
+        # already there. `resend_decision_for_landed_act` refuses exactly as before for every
+        # effect with no checker (the default, and the mail case), and only for a checkable
+        # effect with a working checker does it replace the guess with a look -- re-sending an
+        # already-present commit as a safe no-op, or re-sending a genuinely-absent one as the
+        # recovery the reconnect budget was for.
         if landed and self._goal_may_act():
-            self._refuse_resend(reason, delivery)
-            return False
+            decision = "refuse"
+            try:
+                from relay.transport_policy import resend_decision_for_landed_act
+                decision = resend_decision_for_landed_act(
+                    self.goal or "", checker=self._effect_checker())
+            except Exception:
+                decision = "refuse"
+            if decision != "resend":
+                self._refuse_resend(reason, delivery)
+                return False
 
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
@@ -4592,13 +7913,22 @@ class RelayWorker:
         except Exception:
             _delivery = "unknown"
         if (_delivery == "delivered" or getattr(self, "_landed_pending", False))                 and self._goal_may_act():
-            self._refuse_resend(reason, _delivery)
-            return False
+            decision = "refuse"
+            try:
+                from relay.transport_policy import resend_decision_for_landed_act
+                decision = resend_decision_for_landed_act(
+                    self.goal or "", checker=self._effect_checker())
+            except Exception:
+                decision = "refuse"
+            if decision != "resend":
+                self._refuse_resend(reason, _delivery)
+                return False
         # RECORDED IMMEDIATELY, not at the end: a run that dies mid-goal still leaves the
         # evidence behind, and this line is the only place the pairing of a goal with the
         # reason it needed a tab exists at all.
         try:
-            from relay.transport_policy import classify_fallback, delivery_status
+            from relay.transport_policy import (
+                classify_fallback, delivery_status, duplicate_risk as _duplicate_risk)
             cause, delivery = classify_fallback(reason), delivery_status(reason)
         except Exception:
             cause, delivery = "unknown", "unknown"
@@ -4608,7 +7938,12 @@ class RelayWorker:
                      # derivable from `reason` and neither was written down, so every question
                      # about them had to be answered by re-reading prose after the fact.
                      cause=cause, delivery=delivery,
-                     duplicate_risk=delivery in ("delivered", "unknown"),
+                     # THROUGH THE SHARED PREDICATE. This inlined its body, and a test in
+                     # relay/test_socket_route.py records what that cost: duplicate_risk()
+                     # went into the tab-fallback path the night it was written and this
+                     # socket-retry path "neither referenced nor recorded it". One rule, two
+                     # copies, and only one of them was ever updated.
+                     duplicate_risk=_duplicate_risk(reason),
                      # HOW MANY RECONNECTS THIS COST, and how much token was left when the
                      # last one failed. Without the second field the 2026-08-25 drops could
                      # not be attributed to token expiry or cleared of it.
@@ -4620,6 +7955,11 @@ class RelayWorker:
         except Exception:
             pass
         self.socket, self.drv = False, None
+        # DECLARED BEFORE THE BLOCKING CALL, because after it there is no sweep left to declare
+        # anything with. _open_fresh can hold this thread for 210s (three 45s navigations with a
+        # 25s composer wait each) and up to ~300s behind a sign-in page, all of it with
+        # status.json frozen -- which the watchdog read as a wedged Edge four times in one run.
+        self._declare_blocking(FALLBACK_OPEN_CEILING_S)
         try:
             self.page = _open_fresh(self._context, self._agent_url)
             self.drv = CopilotWebDriver(self.page)
@@ -4628,6 +7968,10 @@ class RelayWorker:
             self.reason = "socket fell back but the tab would not open: %s: %s" % (
                 type(e).__name__, e)
             return False
+        finally:
+            # ALWAYS, including the failure path above: a window left open on a worker that has
+            # already given up would vouch for the browser for another five minutes.
+            self._end_blocking()
         try:
             # The commonest reason a socket turn carries no text is a card only a tab can
             # show. Now there is a tab, so click it before re-sending into the same wall.
@@ -4707,6 +8051,8 @@ class RelayWorker:
             return self._poll_research()
         if self.status == "refuting":
             return self._poll_refute()
+        if self.status == "awaiting_gate":
+            return self._poll_gate()
         if self.status == "ready":
             if time.time() < self._cooldown_until:
                 return False             # waiting out a transient-retry backoff
@@ -4715,22 +8061,91 @@ class RelayWorker:
             return self.status in TERMINAL
         if self.status == "waiting":
             self._capture_url()
-            if time.time() - self._t_send > self.per_turn_timeout_s:
-                # a turn that never finished is a transient stall -- retry before STUCK
+            # The transport knows sooner than the generic 240s turn clock when a socket has
+            # stopped making meaningful progress. Consult that signal while the turn is actually
+            # waiting, not only later when a subsequent send discovers the previous generation.
+            if RelayWorker._socket_meaningful_idle_stalled(self, time.time()):
+                return False
+            # THE LABEL NAMES THE CLOCK THAT FIRED, AND THE BUDGET IS THE ONE COMPARED. This
+            # branch compares against per_turn_timeout_s for every worker, and then chose
+            # `origin` from the worker's TRANSPORT -- so a socket worker's row said
+            # `origin=socket_turn budget_s=240` while SOCKET_TURN_TIMEOUT_S is 1200: a 1200s
+            # clock reported as having expired at 240, which is the single reading the origin
+            # field was added to prevent ("without it an inner overrun reads as an outer one").
+            #
+            # THE BUDGET ITSELF IS LEFT ALONE, DELIBERATELY, and this is the second version of
+            # this comment. Raising it to SOCKET_TURN_TIMEOUT_S looked right -- _defer_generation
+            # says a socket turn is bounded by its own clock -- until the per-turn timings of
+            # run r6aa597a8_a0 were read: every reply that arrived came in 22-164s, well inside
+            # 240, and turn 3 replied at +70s and was declared timed out at +240s ANYWAY. A
+            # longer budget does not save that turn; it makes it wait 1200s for an answer it
+            # already had. The defect in turn 3 is that the poll did not see a reply it had,
+            # and why is NOT DETERMINED. Widening a clock to cover for that would hide it.
+            _bound = self.per_turn_timeout_s
+            # A REPLY THAT ALREADY EXISTS BEATS OUR OUTER CLOCK. This check must happen BEFORE
+            # timeout/retry. Measured twice now: r6aa597a8 turn 3 replied at +70s but was retried
+            # at +240s; r6ab7a384 w4 turn 12 replied at +16s but was retried at +240.6s. In both
+            # cases the transcript proves that retry duplicated work after an answer already existed.
+            # We do NOT accept the reply here: we only suppress the timeout and let the ordinary
+            # generating/stale/settle gates below decide when it is safe to consume.
+            try:
+                _has_new_answer = self.drv._answers().count() > self._count_before
+            except Exception:
+                _has_new_answer = False
+            if not _has_new_answer and time.time() - self._t_send > _bound:
+                # A MEASUREMENT, NOT A GUESS -- and recorded apart from the guesses.
+                # turn_outcome classifies THROTTLE/RECYCLE/TRANSIENT from what the upstream
+                # SAID; this is our own clock passing our own budget. A rate computed over
+                # both cannot say whether the upstream is degrading or our budget is wrong.
+                _elapsed = round(time.time() - self._t_send, 1)
+                # `per_turn` because per_turn_timeout_s is what was compared. The
+                # `socket_turn` origin belongs to the driver's own bound, which is enforced
+                # where SOCKET_TURN_TIMEOUT_S is passed to it -- not here.
+                _origin = "per_turn"
+                if (getattr(self, "_refute_fix_pending", False)
+                        and getattr(self, "_candidate_done_reply", "")):
+                    # MEASURED r6ab7d72e_a0: useful candidate DONE at turn 5, reviewer requested
+                    # a correction, then 8 x ~240s no-reply retries replaced the useful result
+                    # with STUCK. The reviewer has already contradicted the candidate, so keep
+                    # that evidence and stop: finished-but-contradicted is exactly what the
+                    # existing EVIDENCE_CONTRADICTED outcome means. Do not score it as a pass,
+                    # and do not resurrect it automatically on resume.
+                    self._note_timeout(_origin, _elapsed, "candidate-preserved", budget_s=_bound)
+                    self.last_response = self._candidate_done_reply
+                    self.retryable_override = False
+                    self._refute_fix_pending = False
+                    _rr = (self._refute_reason or "reviewer requested a correction").strip()
+                    self.reason = (
+                        "candidate DONE preserved; refuter correction produced no reply before "
+                        "the %.0fs turn timeout: %s" % (_bound, _rr)
+                    )[:500]
+                    self._settle_done(outcome_override="EVIDENCE_CONTRADICTED")
+                    return True
+                # A turn with no reply MAY already have executed. Reads are safe to repeat,
+                # but an acting goal (mail/send/write/etc.) must use the same duplicate-effect
+                # rule as socket reconnect. Measured r6abb8657_a0/w17: an audit allowed one md
+                # write, timed out seven times, and was blindly re-sent every ~240s.
+                _timeout_policy = getattr(self, "_timeout_resend_decision", None)
+                _timeout_resend = _timeout_policy() if callable(_timeout_policy) else "resend"
+                if _timeout_resend != "resend":
+                    self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
+                    self._refuse_resend("turn timeout without a reply", "unknown")
+                    return True
+                # Read-only / checkably-absent work keeps the existing transient retry path.
                 if self._retry_transient():
+                    self._note_timeout(_origin, _elapsed, "retry", budget_s=_bound)
                     self.reason = "turn timeout -> retry %d/%d" % (self.transient, self.max_transient)
                     return False
                 # retries exhausted: don't give up on an already-correct artifact -- if the
                 # workspace already passes the acceptance checks, salvage it as DONE+verified.
                 if self._salvage_via_checks():
+                    self._note_timeout(_origin, _elapsed, "salvaged", budget_s=_bound)
                     return True
+                self._note_timeout(_origin, _elapsed, "stuck", budget_s=_bound)
                 self.status, self.outcome, self.reason = "stuck", "STUCK", \
                     "turn timeout (after %d retries)" % self.transient
                 return True
-            try:
-                if self.drv._answers().count() <= self._count_before:
-                    return False
-            except Exception:
+            if not _has_new_answer:
                 return False
             # PRIMARY completion gate: never read/commit a turn while the agent is STILL
             # GENERATING (the live Stop/square button is showing). Reading mid-stream was
@@ -4762,7 +8177,10 @@ class RelayWorker:
                         return False
                 except Exception:
                     pass
-            t = self.drv.read_last_response()
+            _read_last = getattr(self.drv, "read_last_response", None)
+            if not callable(_read_last):
+                return False
+            t = _read_last()
             if _settle.unified():
                 # THE ONE RULE, and for this site it is a real change rather than a move.
                 # This loop has no sample requirement at all -- only a dwell -- so the guard
@@ -4927,7 +8345,7 @@ def _ask_to_approve_the_near_miss(store, text):
         pass
 
 
-def _with_matched_skill(goal_text):
+def _with_matched_skill(goal_text, want_body=True):
     """Prepend the approved procedure for this goal, when one matches. Never raises.
 
     WHY THE FRAME DOES THIS. The server orders every worker, as RULE 2, to call skill_match
@@ -4946,6 +8364,23 @@ def _with_matched_skill(goal_text):
     for pulling them when needed. This is that, performed by the party that reliably performs
     things. Bodies run 1.4 to 7.8 KB and are added only on a confident, trusted match.
 
+    WHY THE BODY, NOT A POINTER TO IT, EVEN THOUGH A WRONG MATCH CARRIES THE WHOLE BODY.
+    Handing over only the name and description, with an instruction to skill_load the name
+    if it applies, was tried and measured against relay/test_fanout_carries_the_procedure.py.
+    It fails there: turn 1 of a fan-out IS the split decision, made against the procedure's
+    own content (mail-lookup's slicing table, "1ヶ月なら上旬・中旬・下旬の3つ") with no second
+    turn free to call skill_load first -- deferring the body recreates exactly the failure
+    this frame exists to route around, just at skill_load instead of skill_match. SkillStore.
+    match's MIN_MATCH_WORDS and MIN_DISTINCTIVE_WORDS (skills.py) already remove the wrong
+    matches measured so far -- one word's overlapping bigrams counted as several pieces of
+    evidence, and a word every candidate could plausibly use counted as evidence for whichever
+    one happened to be in the store -- so by the time a hit arrives here it has already
+    cleared both bars. The residual those two cannot see (a wrong match built entirely of
+    real, mutually-distinctive-in-this-store content words the right match would also use) is
+    indistinguishable from a correct match on every signal available at this call site, so
+    withholding the body for it would also withhold it for the fixtures above, for no measured
+    gain. See MIN_DISTINCTIVE_WORDS's docstring for that analysis and its own measurement.
+
     Placed AFTER the theme notes and immediately BEFORE the goal: the procedure is how to do
     the thing, so it should be the last thing read before the thing. That position is a
     judgement, not a measurement, and is worth an A/B once anything is being measured.
@@ -4963,9 +8398,57 @@ def _with_matched_skill(goal_text):
         if not hit:
             _ask_to_approve_the_near_miss(store, text)
             return goal_text
+        # A POINTER WHEN THE BODY IS NOT THE DECISION.
+        #
+        # The docstring below argues for sending the whole body, and its measurement is
+        # sound but narrow: turn 1 of a FAN-OUT is the split decision, made against the
+        # procedure's own content, with no second turn free to call skill_load first. That
+        # case needs the body. Nothing measured the other case, and the other case is almost
+        # every worker.
+        #
+        # What it cost, observed 2026-09-16: a goal whose whole task was "press the Windows
+        # key, then Win+R" carried 2,251 characters of keyboard manual, in a 7,850-character
+        # turn that was then sent FOUR TIMES byte-identically while one reply came back. The
+        # operator named it as the same failure as the tool catalogue, which was fixed by
+        # exactly this move -- an index that is cheap to read, with the depth one call away.
+        #
+        # So: fan-out gets the body, everyone else gets the name, the one-line description
+        # and how to open it. skill_load is a single call through a gateway the worker is
+        # already required to use.
+        if not want_body:
+            desc = str(hit.get("description") or "").strip()
+            return ("%s【承認済み手順あり】この作業には承認済みの手順 `%s` が一致しました"
+                    "（score %s）。%s\n必要なら call_tool(name='skill_load', "
+                    "arguments={'name': '%s'}) で全文を読み、その手順どおりに進めてください。"
+                    # APPLICABILITY CHECK, ADDED 2026-09-24. Measured on a held-out set: 2 of
+                    # 30 requests that should have matched nothing instead got a confident hit
+                    # with the right topic and the wrong task (job-posting text vs. onboarding
+                    # a new hire; a legal question about carry-over vs. applying for leave). A
+                    # lexical matcher cannot see "same topic, different task" -- the model that
+                    # reads the description can, so it is told to check before following it.
+                    "ただし、話題が同じでも依頼の作業内容がこの手順と異なる場合は使わず、"
+                    "そのまま進めてください。"
+                    # THE FOOTER WAS ALWAYS EMPTY. This read
+                    # `_SKILL_FOOTER if "_SKILL_FOOTER" in globals() else ""`, and nothing
+                    # anywhere defines _SKILL_FOOTER -- so the guard's true branch was
+                    # unreachable, and the guard was the only thing keeping an undefined name
+                    # from being noticed. Written as the empty line it has always produced,
+                    # so the rendered text is byte-identical.
+                    "\n\n\n%s"
+                    % (_SKILL_HEADER, hit["name"], hit.get("score"), desc, hit["name"],
+                       goal_text))
         body = store.render(hit["name"], "")
         if not body:
             return goal_text
+        # APPLICABILITY CHECK, ADDED 2026-09-24, same measurement as the pointer form above:
+        # a confident lexical match can still be the wrong TASK on the right topic. The body
+        # is the procedure's own text, not a place that names itself, so the one-line
+        # description and the check are prepended here rather than folded into _skill_v1 --
+        # keeping impl(text, body) unchanged for the "off" arm and for direct callers.
+        desc = str(hit.get("description") or "").strip()
+        if desc:
+            body = ("%s\nただし、話題が同じでも依頼の作業内容がこの手順と異なる場合は使わず、"
+                    "そのまま進めること。\n\n%s" % (desc, body))
         # THERE WAS A GUARD HERE AGAINST CONTROL WORDS IN A PROCEDURE'S BODY, AND IT WAS
         # PROTECTING AGAINST A HAZARD THAT DOES NOT EXIST.
         #
@@ -5041,9 +8524,40 @@ def _with_theme_memory(goal_text, theme_text=None):
         notes = load_notes(theme_from_goal(keyed_on), goal=keyed_on)
         if not notes:
             return goal_text
-        return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, notes, text)
+        return "%s\n%s\n--- メモここまで ---\n\n%s" % (_MEMORY_HEADER, _where(notes), text)
     except Exception:
         return goal_text
+
+
+#: What goes into a worker's prompt in place of the store's contents.
+#:
+#: MEASURED ON A REAL GOAL, 2026-09-14. Priming "9月分のGC付着異物の報告資料を作ってください"
+#: produced 999 characters, ten index lines, of which NINE were arithmetic smoke tests --
+#: "5 と 6 を足した数だけを1行で返してください" and its siblings -- and the tenth was an earlier
+#: failed run of the same work. Against a protocol of about 1,401 characters. Not one line of it
+#: could have helped, and it is in the prompt of every goal.
+#:
+#: RANKING AND PRUNING WERE ALREADY THERE and did not save it: `prune_index_lines` drops the
+#: unrelated entries only when NONE of them shares a token with the goal, so one line matching
+#: on "ogf" carried the other nine in with it. That is the shape of every fix applied here so
+#: far -- machinery to make an enumeration survive growth, when enumeration is the thing that
+#: cannot survive it. The store holds 216 themes today, 36% of them one-shot questions; at ten
+#: thousand the question is not which forty to send, it is why any are being sent.
+#:
+#: SO: THE LOCATION, NOT THE CONTENTS. A worker that judges the past relevant can read it, the
+#: same way it reaches a Skill -- by asking, not by being handed a catalogue. One line, and it
+#: stays one line however large the store grows.
+_MEMORY_POINTER = ("過去の作業記録は .fleet/memory/ にある（テーマごとの .md と INDEX.md）。"
+                   "必要だと判断したときだけ read_file / list_directory で読むこと。")
+
+
+def _where(_notes):
+    """The pointer, whatever the store contains.
+
+    Takes the notes it replaces so the call site still shows what was being substituted, and so
+    a reader who wants the old behaviour can see exactly where it was.
+    """
+    return _MEMORY_POINTER
 
 
 def _with_repo_contract(goal_text):
@@ -5119,6 +8633,76 @@ def _resolve_review_lenses(review_lenses):
     return list(PANEL_LENSES[:n])
 
 
+def _campaigns_from_disk(transcript_dir):
+    """Families split by an earlier run, so a restart can still assemble them.
+
+    THE CASE THE LEDGER WAS WRITTEN FOR, AND THE ONE IT DID NOT COVER. On FleetContextLost the
+    fleet re-enters run_relay_fleet in a fresh process; `_unfinished()` rebuilds individual
+    goals, never families. A campaign split before the crash therefore lost its parent goal,
+    its child count, its cwd -- and now its acceptance checks and the parent's pre-split work,
+    which exist nowhere else once the process is gone. Its children could all finish and the
+    answer they were collected for would never be assembled, silently.
+
+    `fanout.campaigns_from_ledger` was written for exactly this and nothing called it: the
+    repository's unreached inventory has listed it as tested-but-unreached since 2026-08-28.
+
+    Families already merged are dropped here rather than in the merge loop, so a rehydrated run
+    does not re-deliver an answer the operator already has. A family whose children are not in
+    this run is harmless either way -- `_recs` comes out empty and `ready_to_aggregate` answers
+    False for empty on purpose -- but it is carried, because those children may be re-queued by
+    `_unfinished()` in this very run and then it IS the family they belong to.
+
+    Never raises. A ledger that cannot be read leaves the fleet exactly as it was before this
+    function existed, which is a bad state to be in but not a worse one.
+    """
+    if not transcript_dir:
+        return {}
+    path = os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
+    if not os.path.isfile(path):
+        return {}
+    try:
+        with open(path, encoding="utf-8") as fh:
+            fams = fanout_mod.campaigns_from_ledger(fh)
+    except OSError:
+        return {}
+    out = {}
+    done_map = resume_mod.read_done_map(os.path.dirname(transcript_dir))
+    # A merge lost twice is written off in the open (ledger + mechanism row; a nested one marks
+    # its parent slot MISSING) before the carry/drop decision below drops it.
+    resume_mod.abandon_exhausted_merges(os.path.dirname(transcript_dir), fams, done_map,
+                                        log=lambda m: print(m, flush=True))
+    # NOT SCOPED TO THE INTERRUPTED RUN, ON PURPOSE (swept with the resume-scope fix): this only
+    # CARRIES families in memory; a family with no children in this run queues nothing. The one
+    # thing it can queue is a re-issued merge, and that needs `merged` WITH an agg_key (written
+    # only by the exactly-once resume code, so none of a legacy ledger), no DONE aggregator and merge_requeued
+    # < 1: at most one merge per campaign, only for a family whose merge was already queued.
+    # Scoping it would break the no-snapshot FleetContextLost path G3 exists for.
+    for cid, fam in (fams or {}).items():
+        # merge_done -> drop; merged (queued) without merge_done and no aggregator DONE ->
+        # re-issue exactly once; otherwise carry. See fleet_resume.rehydrate_decision.
+        verdict = resume_mod.rehydrate_decision(fam, done_map)
+        if verdict == "drop":
+            continue
+        out[cid] = {"goal": fam.get("goal") or "", "n": int(fam.get("n") or 0),
+                    "merged": False, "cwd": fam.get("cwd"),
+                    "checks": list(fam.get("checks") or []),
+                    "partial": fam.get("partial") or "",
+                    "child_results": list(fam.get("child_results") or []),
+                    "requeue_merge": verdict == "reissue"}
+        if fam.get("depth"):
+            out[cid]["depth"] = fam["depth"]
+        # a nested family keeps the parent slot it fills, so its merge still reaches that slot
+        if fam.get("parent_campaign_id"):
+            out[cid]["parent_campaign_id"] = fam["parent_campaign_id"]
+            out[cid]["parent_subtask_index"] = fam.get("parent_subtask_index")
+        if fam.get("nested_missing"):
+            out[cid]["missing"] = list(fam["nested_missing"])
+    if out:
+        print("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out),
+              flush=True)
+    return out
+
+
 def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     notify=default_notify, on_tick=None, max_concurrent=None,
                     mc_box=None, add_box=None, refuter=False, max_refute=None,
@@ -5130,7 +8714,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     ram_box=None,
                     transcript_dir=None, run_id="", busy_writer=None,
                      pause_box=None, stop_box=None, resilience_profile="off",
-                     max_fresh_replays=0, fanout=False):
+                     max_fresh_replays=0, fanout=True):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -5234,8 +8818,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # A read of the resolved config, so it cannot change behaviour, and wrapped so telemetry
     # can never fail a run.
     try:
-        from relay import mechanism_telemetry as _mt
-        _run_id = "%s" % int(time.time())
+        # THE RUN'S OWN ID, NOT A FRESH EPOCH. This read `"%s" % int(time.time())` while
+        # `run_id` -- the parameter of this very function, resolved above and used to key every
+        # transcript file -- sat in scope. The result was a field shaped like an id that joined
+        # to nothing: of 4386 rows in .fleet/mechanisms.jsonl, 1405 carried an epoch and not one
+        # carried a value any other ledger could be matched on.
+        _run_id = run_id
         # A PANEL IS MORE THAN ONE LENS. Recording `configured` as "any lenses at all" made a
         # single-reviewer run look like a configured panel -- caught by reading this
         # instrument's own first output, where review_lenses came back as ["rootcause"]
@@ -5264,17 +8852,302 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
 
     # FAN-OUT bookkeeping. campaigns[cid] remembers the parent goal a family was split from,
     # which is the one thing the merge needs that the children do not carry themselves.
-    campaigns = {}
+    campaigns = _campaigns_from_disk(transcript_dir)
 
-    def _spawn_children(parent_goal, kids):
-        """Queue a split parent's children and remember the family."""
+    def _note_marker(row):
+        """Append one marker line to campaigns.jsonl. Best-effort by design: failing to write
+        it costs a duplicate merge (or a re-run child) after a crash, while refusing to
+        proceed because the note could not be written costs the answer itself."""
+        if not transcript_dir:
+            return
+        try:
+            with open(os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl"),
+                      "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(row, ensure_ascii=False, default=str) + "\n")
+        except OSError:
+            pass
+
+    def _note_merged(cid, agg_key=None, missing=None):
+        """Record on disk that this family's merge was QUEUED (`merged`; compat), and with
+        `agg_key` the resume key of the aggregator goal so a later run can find it DONE in
+        last_run_done.json. That the merge FINISHED is the separate `merge_done` line.
+        `missing` (a NESTED family only) lists the slices the merge was queued without, so the
+        parent slot is marked MISSING even if this run dies before the merge finishes."""
+        row = {"kind": "merged", "campaign_id": cid}
+        if agg_key:
+            row["agg_key"] = agg_key
+        if missing:
+            row["missing"] = list(missing)
+        _note_marker(row)
+
+    _noted_done = set()
+
+    def _note_nested_result(_cid, _w, merge_ok):
+        """A NESTED family's merge has ended: fill the parent slot it belongs to, once.
+
+        Writes a `child_result` addressed to the PARENT campaign and slot (the nested header's
+        parent_campaign_id / parent_subtask_index), carrying the merge's answer when it finished
+        DONE with every slice, and the explicit MISSING marker otherwise (a merge that ended
+        STUCK, or one queued with missing slices). The child's own split proposal is never the
+        slot's answer. A top-level family has no parent slot and nothing is written."""
+        _camp = campaigns.get(_cid) or {}
+        _pc, _pi = _camp.get("parent_campaign_id"), _camp.get("parent_subtask_index")
+        if not _pc or _pi is None:
+            return
+        # The slot row is written once per OUTCOME CLASS: one MISSING marker, and -- when a merge
+        # that first failed is retried and finishes DONE -- one DONE row that supersedes it (the
+        # readers take the last `nested` row of a slot). A DONE row is never superseded.
+        _mark = (_pc, "nested", _pi, "DONE" if merge_ok else "MISSING")
+        if _mark in _noted_done:
+            return
+        _noted_done.add(_mark)
+        _parent = campaigns.get(_pc)
+        if _parent is not None:
+            _have = list(_parent.get("child_results") or [])
+        else:
+            # the parent family left memory (its own merge is done): the ledger is the record
+            _have = []
+            try:
+                _pfam = resume_mod.read_campaigns(os.path.dirname(transcript_dir)).get(_pc) \
+                    if transcript_dir else None
+                _have = list((_pfam or {}).get("child_results") or [])
+            except Exception:
+                _have = []
+        _have = [_r for _r in _have if _r.get("nested") and _r.get("subtask_index") == _pi]
+        if _have:
+            if str(_have[-1].get("outcome") or "").upper() == "DONE" or not merge_ok:
+                return                      # already on the ledger (rehydrated / earlier pass)
+            # MISSING on the ledger and the merge now finished DONE: supersede it, once
+        _row = fanout_mod.nested_result_row(
+            _pc, _pi, _cid,
+            (getattr(_w, "display_result", "") or getattr(_w, "last_response", "") or ""),
+            merge_ok=merge_ok, missing=_camp.get("missing") or (),
+            task_id="%s-%s" % (_pc, _pi))
+        _note_marker(_row)
+        if _parent is not None:
+            _parent.setdefault("child_results", []).append(_row)
+
+    def _note_one_finished(_w):
+        """Write the `merge_done` / `child_result` line for ONE worker that ended DONE, once.
+
+        Called synchronously from the worker's _settle_done (so the line exists the moment the
+        outcome does -- a coordinator killed a second later still leaves the answer on disk)
+        and again from the sweep below as an idempotent safety net."""
+        if getattr(_w, "outcome", None) != "DONE":
+            return
+        _env = getattr(_w, "task_envelope", None)
+        _cid = getattr(_env, "campaign_id", "") or ""
+        _role = getattr(_env, "role", "") or ""
+        if not _cid or _role not in ("aggregator", "subtask"):
+            return
+        if _role == "aggregator":
+            _mark = (_cid, "merge_done")
+            if _mark in _noted_done:
+                return
+            _noted_done.add(_mark)
+            _note_marker({"kind": "merge_done", "campaign_id": _cid})
+            _note_nested_result(_cid, _w, True)
+        else:
+            _idx = getattr(_w, "subtask_index", None)
+            _mark = (_cid, "child", _idx)
+            if _mark in _noted_done:
+                return
+            # A line for this slice already on disk (rehydrated, or written by resume
+            # recovery) is not written a second time.
+            if any(_r.get("subtask_index") == _idx and
+                   str(_r.get("outcome") or "").upper() == "DONE"
+                   for _r in (campaigns.get(_cid, {}).get("child_results") or [])):
+                _noted_done.add(_mark)
+                return
+            _noted_done.add(_mark)
+            _note_marker({"kind": "child_result", "campaign_id": _cid,
+                          "subtask_index": _idx, "outcome": "DONE",
+                          "task_id": getattr(_env, "task_id", None),
+                          "result": ((getattr(_w, "display_result", "")
+                                      or getattr(_w, "last_response", "") or "")[:1200])})
+
+    def _note_finished_workers():
+        """G3 + G2 evidence: write `merge_done` when an aggregator worker ends DONE, and a
+        `child_result` line when a subtask ends DONE (its answer, capped like the merge
+        prompt caps it), once each. Read at resume so a merge can be rebuilt and a DONE child
+        is never run twice. The worker writes its own line at settle time; this sweep is the
+        safety net for any path that did not."""
+        for _w in workers:
+            _note_one_finished(_w)
+            _note_nested_merge_failed(_w)
+
+    def _note_nested_merge_failed(_w):
+        """A NESTED family's merge ended without DONE (STUCK, cancelled ...): the parent slot is
+        marked MISSING, so the parent's merge names the gap instead of waiting forever or
+        counting an empty success. Anything that is not a finished-and-not-DONE aggregator of a
+        nested family is ignored (so a flat family writes nothing)."""
+        _env = getattr(_w, "task_envelope", None)
+        if getattr(_env, "role", "") != "aggregator" or getattr(_w, "status", "") not in TERMINAL:
+            return
+        from relay.outcomes import FINISHED as _FIN
+        _oc = getattr(_w, "outcome", None)
+        if _oc in (None, "DONE") or _oc not in _FIN or _oc == "FANOUT":
+            return
+        _note_nested_result(getattr(_env, "campaign_id", "") or "", _w, False)
+
+    def _campaign_already_on_disk(cid):
+        """Whether this campaign was split by an EARLIER run.
+
+        `campaigns` above is per-process and starts empty, so it cannot answer this -- and a
+        resumed goal hashes to the same id, reaches _spawn_children, finds nothing in the dict
+        and splits again. The ledger is the only thing that outlives the run.
+
+        Reads the header lines only: a child row proves children were queued, while the header
+        proves a FAMILY was declared, which is what "already split" means here.
+
+        A MERGED FAMILY DOES NOT COUNT, and that is not a detail. `campaign_id_for` hashes the
+        goal TEXT, which is an input and not an execution identity -- yesterday's "update the
+        dependencies and run the tests" and today's are the same id. Without this, the guard
+        written to stop a duplicate split would instead adopt the FINISHED family and queue
+        nothing, so a deliberate re-run of a completed goal would silently do nothing at all.
+        A campaign that has been merged is over; only an unfinished one can be resumed.
+
+        STILL OPEN, RECORDED RATHER THAN PAPERED OVER: an UNMERGED abandoned campaign does
+        suppress a fresh run of the same text. Telling "resume this execution" from "run this
+        goal again" needs a persisted execution id, which a content hash is not.
+
+        Never raises. A ledger that cannot be read is not permission to duplicate, so an
+        unreadable one answers True -- refusing to split twice is recoverable (a person
+        re-queues), splitting twice is what this exists to stop.
+        """
+        if not transcript_dir:
+            return False
+        path = os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
+        if not os.path.isfile(path):
+            return False
+        seen = False
+        try:
+            with open(path, encoding="utf-8") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line or '"kind"' not in line or cid not in line:
+                        continue
+                    try:
+                        row = json.loads(line)
+                    except Exception:
+                        continue
+                    if not isinstance(row, dict) or row.get("campaign_id") != cid:
+                        continue
+                    if row.get("kind") == "campaign":
+                        seen = True
+                    elif row.get("kind") == "merged":
+                        # Finished, so this id describes a past execution and not one to join.
+                        # Scanned to the end rather than returned from early: the note can be
+                        # written before the header when two runs append concurrently.
+                        return False
+        except OSError:
+            return True
+        return seen
+
+    def _link_parent_slot(cid, kids):
+        """A NESTED family remembers the parent campaign and slot it fills, so its merge can
+        answer that slot (nothing is added for a top-level family)."""
+        _pc = (kids[0] or {}).get("parent_campaign_id") or ""
+        if _pc and campaigns.get(cid) is not None:
+            campaigns[cid]["parent_campaign_id"] = _pc
+            campaigns[cid]["parent_subtask_index"] = (kids[0] or {}).get("parent_subtask_index")
+
+    def _nested_family_for_slot(kids):
+        """The id of a nested family already filling the parent slot these `kids` would fill
+        (same parent_campaign_id + parent_subtask_index), in memory or on the ledger; None for
+        a top-level split or a free slot. Never raises."""
+        _pc = (kids[0] or {}).get("parent_campaign_id") or ""
+        _pi = (kids[0] or {}).get("parent_subtask_index")
+        if not _pc or _pi is None:
+            return None
+        for _c, _cm in campaigns.items():
+            if _cm.get("parent_campaign_id") == _pc and _cm.get("parent_subtask_index") == _pi:
+                return _c
+        if not transcript_dir:
+            return None
+        try:
+            return resume_mod.nested_slot_map(
+                resume_mod.read_campaigns(os.path.dirname(transcript_dir))).get((_pc, _pi))
+        except Exception:
+            return None
+
+    def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial="",
+                        parent_conv=""):
+        """Queue a split parent's children and remember the family. Idempotent per campaign.
+
+        THE ID WAS ALREADY STABLE AND NOTHING USED THAT. `campaign_id_for` hashes the parent
+        goal precisely so a resumed goal lands in the same family -- and this function then
+        overwrote `campaigns[cid]` and re-queued every child, so landing in the same family
+        meant re-creating it rather than joining it.
+
+        Measured 2026-09-13 in `.fleet/campaigns.jsonl`: ten campaigns had their header written
+        more than once, fifteen carry a repeated `subtask_index`, and c7e01b58b1956 holds 22
+        headers and 128 children for a seven-way split.
+
+        `self._fanout_done` does not cover this. It stops ONE WORKER splitting twice; it says
+        nothing about a second worker, a resumed run, or a retried goal, because `campaigns` is
+        local to this call of run_relay_fleet and starts empty each time.
+        """
         cid = kids[0].get("campaign_id") or fanout_mod.campaign_id_for(parent_goal)
+        if cid in campaigns:
+            # ALREADY SPLIT IN THIS RUN. Re-queueing would duplicate the children and move the
+            # merge's denominator, so the merge would wait for a family larger than the one
+            # that exists.
+            print("[fanout] %s: already split in this run (%d children); not re-queueing"
+                  % (cid, campaigns[cid].get("n", 0)), flush=True)
+            return
+        _twin = _nested_family_for_slot(kids)
+        if _twin and _twin != cid:
+            # A RETRY OF A CHILD THAT ALREADY SPLIT. The nested id hashes the splitting task's id,
+            # so a retry (new task id) would mint a SECOND nested family for the same parent slot
+            # and orphan the first. A parent slot is filled by one nested family: the first.
+            print("[fanout] %s: slot %s of %s already split into %s; not splitting again"
+                  % (cid, kids[0].get("parent_subtask_index"),
+                     kids[0].get("parent_campaign_id"), _twin), flush=True)
+            return
+        if _campaign_already_on_disk(cid):
+            # ALREADY SPLIT IN AN EARLIER RUN. The ledger outlives the process, and a resumed
+            # or retried goal reaches here with an empty `campaigns` dict -- which is how the
+            # same split came to be recorded twenty-two times. Adopt the family instead of
+            # minting it again: the children are already queued or already done, and the merge
+            # reads the ledger, not this dict.
+            campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
+                              "cwd": (kids[0] or {}).get("cwd"),
+                              "checks": list(parent_checks or []),
+                              "partial": parent_partial or ""}
+            if int((kids[0] or {}).get("depth") or 1) > 1:
+                campaigns[cid]["depth"] = int(kids[0]["depth"])
+            _link_parent_slot(cid, kids)
+            print("[fanout] %s: already split in an earlier run; adopting, not re-queueing"
+                  % cid, flush=True)
+            return
         # THE CHILDREN ALREADY CARRY THE PARENT'S cwd (child_goals puts it there), so the
         # merge takes it from them rather than from a second field that could drift. Without
         # it the merge starts wherever the fleet happens to be, while being asked to write a
         # combined file and report its path.
         campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
-                          "cwd": (kids[0] or {}).get("cwd")}
+                          "cwd": (kids[0] or {}).get("cwd"),
+                          # the parent's effort level (only present when the effort policy
+                          # is on); the merge keeps it. Not persisted: a family adopted from
+                          # disk merges at the run's level, exactly as before.
+                          "parent_level": ((kids[0] or {}).get("metadata") or {}).get(
+                              "parent_effort"),
+                          # THE WHOLE GOAL'S ACCEPTANCE CHECK, PARKED UNTIL THE MERGE. The
+                          # children are each responsible for one slice and cannot answer it;
+                          # the merge can, and runs in the same tree.
+                          "checks": list(parent_checks or []),
+                          # WHAT THE PARENT HAD ALREADY FINISHED, when the split was decided
+                          # mid-run. Empty for a turn-1 split. Without it the rescue throws
+                          # away the work it was rescuing.
+                          "partial": parent_partial or ""}
+        if parent_conv:
+            # THE PARENT'S CONVERSATION, for the `merge_conversation=parent` setting only (the
+            # spawn call passes it only then). Memory only, never written to the ledger: a
+            # family rebuilt in another process has no such id and merges in a fresh one.
+            campaigns[cid]["parent_conv"] = str(parent_conv)
+        if int((kids[0] or {}).get("depth") or 1) > 1:
+            campaigns[cid]["depth"] = int(kids[0]["depth"])   # the merge's depth (nested only)
+        _link_parent_slot(cid, kids)
         add_box.extend(kids)
         # WRITTEN DOWN, NOT ONLY QUEUED. add_box lives in memory: if the run dies here the
         # children vanish while the parent is already recorded finished, so the work would
@@ -5289,17 +9162,147 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     # cannot rebuild the thing it exists to preserve.
                     fh.write(json.dumps(
                         {"kind": "campaign", "campaign_id": cid, "goal": parent_goal,
-                         "n": len(kids), "cwd": (kids[0] or {}).get("cwd")},
+                         "n": len(kids), "cwd": (kids[0] or {}).get("cwd"),
+                         # ON DISK FOR THE SAME REASON THE GOAL IS. This file exists for the
+                         # run that dies after splitting; a family rebuilt from it without the
+                         # parent's check merges with nothing verifying it, and nothing says so.
+                         # The partial is here for the harder version of that: rebuilt without
+                         # it, work the parent actually finished is gone permanently.
+                         "checks": list(parent_checks or []),
+                         "partial": parent_partial or "",
+                         # WHICH RUN SPLIT IT, so a resume takes only the interrupted run's
+                         # families instead of every unmerged one in a ledger that never
+                         # shrinks. Additive: readers ignore unknown header keys.
+                         "run_id": run_id, "ts": round(time.time(), 1),
+                         "parent_task_id": (kids[0] or {}).get("parent_task_id"),
+                         "parent_campaign_id": (kids[0] or {}).get("parent_campaign_id", ""),
+                         "root_id": (kids[0] or {}).get("root_id", ""),
+                         # the parent slot a NESTED family fills (absent on a top-level one)
+                         **({"parent_subtask_index": kids[0]["parent_subtask_index"]}
+                            if (kids[0] or {}).get("parent_subtask_index") is not None else {}),
+                         # the children's depth, written only for a nested split
+                         **({"depth": kids[0]["depth"]} if int(
+                             (kids[0] or {}).get("depth") or 1) > 1 else {})},
                         ensure_ascii=False) + "\n")
                     for k in kids:
                         fh.write(json.dumps(
                             {"campaign_id": cid, "task_id": k.get("task_id"),
                              "subtask_index": k.get("subtask_index"),
-                             "text": (k.get("text") or "")[:4000]},
-                            ensure_ascii=False) + "\n")
+                             "text": (k.get("text") or "")[:4000],
+                             # THE WHOLE GOAL (cwd, metadata, jid, effort ...), so a resume
+                             # can re-queue an unfinished child without depending on the
+                             # 4000-char `text`. Old lines lack it and resume degrades.
+                             "goal": k},
+                            ensure_ascii=False, default=str) + "\n")
+        except Exception:
+            pass
+        # STEP THREE. Written HERE, where the split actually happens, because everything
+        # else in this function is a record of the family rather than of the mechanism: the
+        # campaigns ledger held 105 of these while the telemetry reported `triggered` zero
+        # times, and a reader trusting the telemetry would have concluded fan-out had never
+        # run in production.
+        try:
+            _mt.record("fanout", run_id=run_id, configured=True, config_source="split", eligible=True, triggered=True,
+                       extra={"campaign_id": cid, "children": len(kids)})
         except Exception:
             pass
         print("[fanout] %s -> %d subtask(s)" % (cid, len(kids)), flush=True)
+
+    def _grant_children(parent_goal, steps, parent_task_id="", root_id=""):
+        """The per-tree budget for a split about to happen: (steps_to_use, refusal_reason).
+
+        Called by the worker before it builds the children. A family that already exists
+        (this run or an earlier one) is adopted by _spawn_children and queues nothing, so it
+        is not charged. Anything else asks relay/fanout_budget.py; usage that cannot be read
+        refuses the split (the worker then runs the goal itself) and says so.
+        """
+        cid = fanout_mod.campaign_id_for(parent_goal, parent_task_id=parent_task_id)
+        if cid in campaigns or _campaign_already_on_disk(cid):
+            return steps, ""
+        try:
+            # A top-level split is its own, brand-new root: no worker carries its id and no
+            # header of it exists (a family already on disk returned above), so its usage is
+            # zero by construction and the ledger is not read at all. Only a NESTED split
+            # needs the tree's recorded rows, and only those of its own root.
+            rows = fanout_budget_mod.ledger_rows_for_split(
+                os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
+                if transcript_dir else "", root_id)
+            # A nested split is charged to the tree's root (and is itself one of its active
+            # workers); a top-level split is its own root.
+            use, why = fanout_budget_mod.apply_budget(
+                steps, root_id or cid, fanout_budget_mod.rows_from_workers(workers), rows,
+                fanout_budget_mod.limits_from_settings(), min_children=fanout_mod.MIN_CHILDREN,
+                **({"self_active": 1} if root_id else {}))
+        except Exception as exc:
+            use, why = [], "budget check failed: %s" % exc
+        if len(use) != len(steps) or why:
+            print("[fanout] %s: budget %s (%d -> %d subtask(s))"
+                  % (cid, why or "trimmed", len(steps), len(use)), flush=True)
+        if root_id and "usage unknown" in (why or ""):
+            # Fail closed on a nested split is the one refusal that is not a limit being
+            # reached, so it is the one that must be visible as its own row.
+            try:
+                _mt.record("fanout_budget_usage_unknown", run_id=run_id, configured=True,
+                           config_source="split", eligible=True, triggered=False,
+                           not_triggered_reason=why,
+                           extra={"campaign_id": cid, "root_id": root_id,
+                                  "requested": len(steps)})
+            except Exception:
+                pass
+        return use, why
+
+    _spawn_children.grant = _grant_children
+
+    _stall_sweeps = {}
+    _stall_fired = set()
+
+    def _stall_check(_cid, _camp, _have_idx):
+        """Merge-queue stall detector. A family with fewer records than children, nothing still
+        running for it, where the done-map says every missing child is DONE, is waiting on
+        `child_result` lines that will never be written. After MERGE_STALL_SWEEPS such sweeps:
+        write the mechanism row, recover the answers from durable sources and re-queue (once)
+        those that cannot be recovered. Returns how many children were re-queued. Never raises;
+        never queues a merge (the normal path does, exactly once, when the records are whole).
+        A non-zero return means "work remains" to the sweep loop's condition."""
+        try:
+            if _cid in _stall_fired or not transcript_dir:
+                return 0
+            _sd = os.path.dirname(transcript_dir)
+            _fam = resume_mod.read_campaigns(_sd).get(_cid)
+            if not _fam:
+                return 0
+            _dm = resume_mod.read_done_map(_sd)
+            _missing = [c for c in (_fam.get("children") or [])
+                        if c.get("subtask_index") not in _have_idx]
+            if not _missing or not all(resume_mod._child_in_done_map(c, _dm) for c in _missing):
+                _stall_sweeps.pop(_cid, None)
+                return 0
+            _stall_sweeps[_cid] = _stall_sweeps.get(_cid, 0) + 1
+            if _stall_sweeps[_cid] < resume_mod.MERGE_STALL_SWEEPS:
+                return 1          # still counting: keeps the sweep loop alive for K passes
+            _stall_fired.add(_cid)
+            try:
+                _mt.record("merge_stalled_missing_child_result", run_id=run_id, triggered=True,
+                           executed=True,
+                           extra={"campaign_id": _cid, "n": _camp.get("n", 0),
+                                  "missing": [c.get("subtask_index") for c in _missing]})
+            except Exception:
+                pass
+            _fam["child_results"] = list(_camp.get("child_results") or [])
+            _rec, _req = resume_mod.recover_family_results(_sd, _cid, _fam, _dm,
+                                                           log=lambda m: print(m, flush=True),
+                                                           run_id=run_id)
+            _camp["child_results"] = list(_fam.get("child_results") or [])
+            _n = 0
+            for _c in _req:
+                _g, _ = resume_mod.child_requeue_goal(_cid, _fam, _c)
+                if _g:
+                    add_box.append(_g)
+                    _n += 1
+            # recovered answers make the family whole: the next pass merges it
+            return _n + len(_rec)
+        except Exception:
+            return 0
 
     def _queue_ready_merges():
         """Queue the merge for every family whose children have all finished. Count queued.
@@ -5312,35 +9315,100 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         nine, and ended without ever writing the answer they were collected for.
         """
         queued = 0
+        _note_finished_workers()
         for _cid, _camp in campaigns.items():
             if _camp.get("merged"):
                 continue
             _kids = [w for w in workers
                      if getattr(getattr(w, "task_envelope", None), "campaign_id", "") == _cid
                      and getattr(getattr(w, "task_envelope", None), "role", "") == "subtask"]
-            _recs = [{"finished": w.status in TERMINAL,
-                      "outcome": w.outcome,
-                      "subtask_index": getattr(w, "subtask_index", "?"),
-                      "result": (getattr(w, "display_result", "") or w.last_response or "")}
-                     for w in _kids]
+            # A SLOT WHOSE CHILD SPLIT AGAIN (outcome FANOUT) IS NOT FINISHED BY THAT OUTCOME.
+            # The child's own text is a split proposal and is never the slot's answer; the slot
+            # waits for its nested family's merge, whose answer (or an explicit MISSING marker)
+            # arrives as a `nested` child_result row addressed to this slot.
+            _nested_rows = {}
+            for _cr in (_camp.get("child_results") or []):
+                if _cr.get("nested"):
+                    _nested_rows[_cr.get("subtask_index")] = _cr
+            _recs = []
+            for w in _kids:
+                if str(w.outcome or "").upper() == "FANOUT":
+                    _ix = getattr(w, "subtask_index", "?")
+                    _kin = next((c for c, cm in campaigns.items()
+                                 if cm.get("parent_campaign_id") == _cid
+                                 and cm.get("parent_subtask_index") == _ix), None)
+                    _recs.append(fanout_mod.slot_record(_ix, _nested_rows.get(_ix),
+                                                        nested_cid=_kin))
+                    continue
+                _recs.append({"finished": w.status in TERMINAL,
+                              "outcome": w.outcome,
+                              "subtask_index": getattr(w, "subtask_index", "?"),
+                              "result": (getattr(w, "display_result", "")
+                                         or w.last_response or "")})
+            # ANSWERS OF CHILDREN THAT FINISHED IN AN EARLIER PROCESS come from the ledger
+            # (`child_result` lines), so a resumed family is not stuck waiting for workers
+            # that will never exist again. A live worker for the same slice wins.
+            _live_idx = {r["subtask_index"] for r in _recs}
+            for _cr in (_camp.get("child_results") or []):
+                _ci = _cr.get("subtask_index")
+                if _ci in _live_idx:
+                    continue
+                _live_idx.add(_ci)
+                if _cr.get("nested"):
+                    _recs.append(fanout_mod.slot_record(_ci, _cr))
+                    continue
+                # the ROW'S outcome, not a presumed DONE: a MISSING / non-DONE row from the
+                # ledger is a named gap for the merge, never a counted success
+                _recs.append({"finished": True,
+                              "outcome": str(_cr.get("outcome") or "DONE").upper(),
+                              "subtask_index": _ci,
+                              "result": _cr.get("result") or ""})
             # Every child ADMITTED must be finished, and all of them must have been admitted:
             # a family half of which is still queued is not a finished campaign, and merging
             # it would report a sweep that never ran as though it had.
+            _stalled = (len(_live_idx) < _camp.get("n", 0)
+                        and all(w.status in TERMINAL for w in _kids))
             if not fanout_mod.ready_to_aggregate(_recs):
+                if _stalled and not _kids:
+                    queued += _stall_check(_cid, _camp, _live_idx)
                 continue
             # Collapse a slice's failed attempt into the retry that finished it, THEN check
             # the family is complete -- a retry adds a record without adding a slice, so
             # counting raw records would let a family of eight look like nine.
             _recs = fanout_mod.collapse_retries(_recs)
             if len(_recs) < _camp.get("n", 0):
+                if _stalled:
+                    queued += _stall_check(_cid, _camp, _live_idx)
                 continue
-            _camp["merged"] = True
+            _stall_sweeps.pop(_cid, None)
             # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
             # child_goals; the merge was starting wherever the fleet happened to be, while
             # being asked to write a combined file and report its path.
-            add_box.append(fanout_mod.aggregation_goal(_camp["goal"], _recs,
-                                                       campaign_id=_cid,
-                                                       cwd=_camp.get("cwd")))
+            _agg = fanout_mod.aggregation_goal(_camp["goal"], _recs,
+                                               campaign_id=_cid,
+                                               cwd=_camp.get("cwd"),
+                                               parent_checks=_camp.get("checks"),
+                                               parent_partial=_camp.get("partial"),
+                                               parent_level=_camp.get("parent_level"),
+                                               run_id=run_id,
+                                               **({"depth": _camp["depth"]}
+                                                  if _camp.get("depth") else {}))
+            # WHICH CONVERSATION THE MERGE RUNS IN (setting merge_conversation): fresh, as ever,
+            # or the parent's. Only the goal's transport changes; `merged` just below is what
+            # keeps the merge to once.
+            _agg = conv_saving_mod.apply_merge_conversation(_agg, _camp, _recs, run_id=run_id)
+            if _camp.get("parent_campaign_id"):
+                # a NESTED family: remember which slices this merge goes without, so the parent
+                # slot it fills is marked MISSING rather than complete
+                _camp["missing"] = fanout_mod.missing_slices(_recs)
+            _camp["merged"] = True
+            _note_merged(_cid, resume_mod.goal_resume_key(_agg), missing=_camp.get("missing"))
+            if _camp.get("requeue_merge"):
+                # A merge queued before a death that never finished is re-issued once; the
+                # cap (fleet_resume.rehydrate_decision) reads this line.
+                _camp["requeue_merge"] = False
+                _note_marker({"kind": "merge_requeued", "campaign_id": _cid, "attempt": 1})
+            add_box.append(_agg)
             queued += 1
             print("[fanout] %s: %d/%d subtask(s) done -> merging"
                   % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
@@ -5369,6 +9437,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                    "max_research": max_research, "review_lenses": review_lenses}
 
     def _worker_for(index, goal_item):
+        # Sibling de-escalation (effort policy): a later sibling may start one step lower.
+        # Returns the goal untouched unless MCP_EFFORT_POLICY=on and the streak is met.
+        goal_item = effort_policy_mod.sibling_adjust(goal_item, run_id=run_id,
+                                                     instance="w%d" % index)
         knobs = effort_mod.resolve(goal_item, _run_effort,
                                    log=lambda m: print(m, flush=True))
         if knobs != _run_effort:
@@ -5378,7 +9450,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _cap = (effective_max_turns if _checks
                 else (min(effective_max_turns, UNVERIFIABLE_MAX_TURNS)
                       if effective_max_turns else UNVERIFIABLE_MAX_TURNS))
-        return RelayWorker(goal_item, "w%d" % index, max_turns=_cap,
+        effort_policy_mod.shadow_assign(goal_item, knobs, run_id=run_id, instance="w%d" % index)
+        _nw = RelayWorker(goal_item, "w%d" % index, max_turns=_cap,
                            refuter=knobs["refuter"], max_refute=knobs["max_refute"],
                            plan_mode=plan_mode,
                            review_lenses=knobs["review_lenses"],
@@ -5390,6 +9463,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                            resilience_profile=resilience_profile,
                            max_fresh_replays=max_fresh_replays,
                            fanout=fanout, spawn_fn=_spawn_children)
+        # Durable at the moment of settling: see RelayWorker._settle_done.
+        _nw.on_settled_done = _note_one_finished
+        return _nw
 
     workers = [_worker_for(i, g) for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
@@ -5410,7 +9486,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     def _socket_open_now():
         """Whether a worker admitted right now would take a socket rather than a tab."""
         try:
-            return bool(_socket_route().open())
+            return bool(_socket_route().ready(agent_url))
         except Exception:
             return False
 
@@ -5454,12 +9530,82 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # terminal, so without it one failure would re-queue on every pass and never stop.
     try:
         from relay.fleet_runner import RETRYABLE_OUTCOMES, settings_autoretry
+        from relay.outcomes import UnknownOutcome as _UnknownOutcome, is_retryable as _retryable
         _retry_on, _retry_cap = settings_autoretry()
     except Exception:
         _retry_on, _retry_cap, RETRYABLE_OUTCOMES = False, 0, frozenset()
+        _UnknownOutcome, _retryable = Exception, None
     _retry_seen, _retry_used = set(), {}
     if add_box is None:
         _retry_on = False        # nowhere to put a re-queued goal
+        # A SPLIT HAS NOWHERE TO PUT ITS CHILDREN EITHER -- and unlike a retry, that is not a
+        # reason to decline. A retry re-queues the CALLER'S goal, so an absent box means the
+        # caller does not want more goals back. A split is internal: the caller asked for one
+        # goal and still wants one answer, and the merge IS that answer.
+        #
+        # Unreachable until 2026-09-13, when `fanout` began defaulting True: before that a
+        # caller enabling it was also wiring a box. Measured the same day by the first test to
+        # enter here with fan-out live and no box --
+        #   AttributeError: 'NoneType' object has no attribute 'extend'   (_spawn_children)
+        #   AttributeError: 'NoneType' object has no attribute 'append'   (_queue_ready_merges)
+        #
+        # The loop below drains this list itself, so children and the merge run here just as
+        # they do for the fleet runner; the caller is simply not handed a list it never asked
+        # for, and gets the merge back among its results.
+        #
+        # NOT GATED ON `fanout`, and the first attempt at this was. A family SPLIT BY AN
+        # EARLIER RUN is rehydrated from the ledger and merged by this one whether or not this
+        # run is itself fan-out-capable -- which is right, the answer is owed either way, and
+        # means the box is needed either way. Gating it on the flag left the crash in place
+        # for exactly the recovery path the ledger exists for.
+        add_box = []
+
+    def _retry_allowed(outcome, worker):
+        """Whether this outcome may be re-queued, saying so out loud when it is not KNOWN.
+
+        A worker may carry `retryable_override` when it has stronger evidence than the coarse
+        outcome name: e.g. a converged STUCK or a prompt-specific refusal is deterministic and
+        a fresh conversation only repeats it. None preserves the outcome-wide historical rule.
+
+        `outcomes.is_retryable` refuses an outcome outside the closed set instead of answering
+        "no" -- because "not retryable" and "not considered" were the same answer once, and the
+        outcome that actually occurred (STUCK) was the one left out. The raw membership test
+        this replaces gave the silent answer, and the telemetry beside it then wrote "outcome X
+        is not retryable" as though someone had decided.
+
+        THE REFUSAL IS NOT RAISED INTO THE RUN. This is inside the main loop; an uncaught
+        UnknownOutcome would end a live fleet over one worker's typo'd outcome string, which is
+        a worse answer than declining to retry one goal. So an unknown outcome is treated as
+        not retryable -- exactly as before -- and PRINTED and RECORDED, which is the half that
+        was missing.
+        """
+        _override = getattr(worker, "retryable_override", None)
+        if _override is not None:
+            return bool(_override)
+        if _retryable is None:                      # outcomes module unavailable: prior rule
+            return outcome in RETRYABLE_OUTCOMES
+        try:
+            return _retryable(outcome)
+        except _UnknownOutcome:
+            print("[retry] %r is not in the outcome vocabulary; not retrying, and this is an "
+                  "omission rather than a decision (relay/outcomes.py::OUTCOMES)"
+                  % (outcome,), flush=True)
+            try:
+                # IMPORTED HERE, like every other telemetry call in this file: `_mt` is not a
+                # module-level name. Without this the NameError would be swallowed by the
+                # except below and the record would silently never be written -- the same
+                # silence this function exists to end, reintroduced inside it.
+                _mt.record("retry", run_id=run_id,
+                           goal_hash=str(getattr(worker, "goal_hash", "") or "")[:24],
+                           turn=getattr(worker, "turn", None),
+                           configured=True, config_source="run",
+                           eligible=False, triggered=False,
+                           ineligible_reason="outcome %r is outside the closed set; nobody "
+                                             "considered it" % (outcome,),
+                           self_report_outcome=str(outcome or ""))
+            except Exception:
+                pass
+            return False
 
     _reap_counter = 0
     while (any(w.status not in TERMINAL for w in workers)
@@ -5524,17 +9670,18 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # skips. Recorded rather than argued: the funnel now shows retry stopping at
                 # "did not trigger" with the reason attached, on every goal it declines.
                 try:
-                    from relay import mechanism_telemetry as _mt
-                    _mt.record("retry",
+                    _mt.record("retry", run_id=run_id,
                                goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                turn=getattr(_w, "turn", None),
                                configured=True, config_source="run",
                                eligible=True,
-                               triggered=(_oc in RETRYABLE_OUTCOMES),
+                               triggered=_retry_allowed(_oc, _w),
                                not_triggered_reason=(
-                                   "" if _oc in RETRYABLE_OUTCOMES else
-                                   "outcome %s is not retryable; the trigger reads the "
-                                   "worker's own report" % _oc),
+                                   "" if _retry_allowed(_oc, _w) else
+                                   ("worker marked this terminal result deterministic; fresh retry disabled"
+                                    if getattr(_w, "retryable_override", None) is False else
+                                    "outcome %s is not retryable; the trigger reads the "
+                                    "worker's own report" % _oc)),
                                self_report_outcome=str(_oc or ""))
                 except Exception:
                     pass
@@ -5557,8 +9704,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     in ("1", "on", "true", "yes"))
                 if _unverified_done:
                     try:
-                        from relay import mechanism_telemetry as _mt
-                        _mt.record("retry",
+                        _mt.record("retry", run_id=run_id,
                                    goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                    turn=getattr(_w, "turn", None),
                                    configured=True, config_source="MCP_RETRY_UNVERIFIED_DONE",
@@ -5567,7 +9713,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                    extra={"reason": "DONE with no verification gate"})
                     except Exception:
                         pass
-                elif _oc not in RETRYABLE_OUTCOMES:
+                elif not _retry_allowed(_oc, _w):
                     continue
                 # A CAMPAIGN THAT HAS ALREADY BEEN MERGED NEEDS NO MORE MERGES. A merge that
                 # goes STUCK is retryable like anything else, so a family could end up
@@ -5603,16 +9749,19 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 # what a retry actually changes.
                 _retry_item = dict(getattr(_w, "goal_record", None) or {})
                 _retry_item.update({"text": _g, "checks": getattr(_w, "checks", None),
-                                    "cwd": getattr(_w, "cwd", None), "priority": True})
+                                    "cwd": getattr(_w, "cwd", None), "priority": True,
+                                    "retry": True})
                 add_box.append(_retry_item)
+                # Exported on the row (`retry_queued`) so the cockpit does not re-queue a worker
+                # the runner already re-queued.
+                _w.retry_queued = True
                 # THE STEP THAT WAS MISSING. `triggered` was recorded above and nothing ever
                 # recorded `executed`, so the funnel read "retry: 23 triggered, 0 executed --
                 # did not execute" while the log beside it said "-> re-queued (1/2)" twenty
                 # three times. An instrument built to tell "never fired" from "fired and
                 # changed nothing" had a rung of its own ladder unset.
                 try:
-                    from relay import mechanism_telemetry as _mt
-                    _mt.record("retry",
+                    _mt.record("retry", run_id=run_id,
                                goal_hash=str(getattr(_w, "goal_hash", "") or "")[:24],
                                turn=getattr(_w, "turn", None),
                                configured=True, config_source="run",
@@ -5656,8 +9805,44 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if add_box:
             while add_box:
                 item = add_box.pop(0)
+                # A RETRY OF A GOAL THAT IS ALREADY QUEUED OR RUNNING IS A DUPLICATE, not a
+                # retry. The runner's own re-queue and the cockpit's auto-retry each re-queued the
+                # same STUCK worker (2026-10-01: three concurrent copies of one job). Only items
+                # tagged retry=True are refused; a user's plain resubmit is never blocked.
+                if item.get("retry") and _goal_is_live(workers, item.get("text")):
+                    print("[fleet] refusing a duplicate retry: this goal is already live",
+                          flush=True)
+                    try:
+                        _mt.record("retry", run_id=run_id,
+                                   goal_hash=__import__("hashlib").sha256(
+                                       str(item.get("text") or "").encode("utf-8")
+                                   ).hexdigest()[:24],
+                                   configured=True, config_source="run",
+                                   eligible=False, triggered=False,
+                                   ineligible_reason="duplicate retry refused: the same goal is "
+                                                     "already queued or running in this run")
+                    except Exception:
+                        pass
+                    continue
                 # item may carry checks/cwd too; goal_fields reads them (priority ignored)
-                nw = _worker_for(len(workers), item)
+                #
+                # A REJECTED INJECTION COSTS THE INJECTED GOAL AND NOTHING ELSE. `goal_fields`
+                # raises MalformedCheck on a bad acceptance spec (since 2026-09-13, and
+                # deliberately -- a dropped check is indistinguishable from no check). Raising
+                # HERE, though, escapes run_relay_fleet into fleet_runner's generic handler,
+                # which diagnoses it as a connection failure, burns the recovery budget and can
+                # hard-reset the browser out from under every worker that was running fine. One
+                # typo in a goal the cockpit added mid-run would take the whole fleet with it.
+                try:
+                    nw = _worker_for(len(workers), item)
+                except AcceptanceError as _exc:
+                    print("[fleet] refusing an injected goal: %s" % _exc, flush=True)
+                    try:
+                        notify("追加されたゴールを受け付けませんでした（受入検査の指定が不正）: %s"
+                               % str(_exc)[:300])
+                    except Exception:
+                        pass
+                    continue
                 workers.append(nw)
                 if item.get("priority"):
                     pending.insert(0, nw)
@@ -5724,22 +9909,30 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         #
         # Tabs are different -- a tab is a real allocation -- and they are already governed:
         # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
-        # side-page at the moment it opens, and the autoscale sets mc_box from free RAM. Adding a
-        # count-based gate on top of those charges sockets for something they do not use.
-        while pending and (_active_open() == 0
-                           or _projected_peak()
-                              + pending[0].tab_weight(assume_socket=_socket_open_now())
-                              <= max(1, mc_box[0])):
-            # SPACING, AND IT SITS HERE BECAUSE THERE ARE TWO WAYS OUT OF THIS LOOP.
-            # The first version of this guard was placed next to `pending.pop(0)` in the flat
-            # branch, and the per-repo branch a few lines above pops with `pending.pop(pick)`
-            # -- so the spacing would have covered every kind of run EXCEPT the benchmark runs
-            # that produced the measurement. Guarding one caller of a failure class and calling
-            # it fixed is a mistake this repository has already paid for.
-            #
-            # Costs at most one interval of delay before a disk/RAM deferral is logged, which
-            # is the right trade for covering both paths with one line.
-            if not admission_is_due():
+        # side-page at the moment it opens, and the autoscale sets mc_box from free RAM.
+        #
+        # SOCKET ATTACHMENT IS NOT THE QUOTA-SPENDING OPERATION. A socket worker reserves zero
+        # tabs (tab_weight==0), so it may become READY without sitting behind the browser/RAM
+        # cap. The shared request ceiling is enforced in RelayWorker._begin_send immediately
+        # before each generative socket send. Tabs keep the historical attach pacing below.
+        # This separates three different resources instead of pretending one integer is all of
+        # them: browser tabs/RAM at admission, disk at eval admission, request rate at send.
+        while pending:
+            # A refresh may take 5-60s of sync Playwright browser work. It runs in an independent
+            # helper PROCESS with its own CDP connection; this sweep only launches it and returns.
+            # If no usable token exists yet, admission honestly budgets this candidate as a tab.
+            try:
+                route = _socket_route()
+                if route.open() and route.needs_refresh(agent_url):
+                    _consider_socket_refresh(route, agent_url)
+            except Exception:
+                pass
+            _candidate_socket = _socket_open_now()
+            if not admits_another_tab(
+                    _active_open(), _projected_peak(),
+                    pending[0].tab_weight(assume_socket=_candidate_socket), mc_box[0]):
+                break
+            if not _candidate_socket and not admission_is_due():
                 break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
@@ -5778,19 +9971,16 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     # does not become the log.
                     _note_disk_defer(disk_box[0], len(pending))
                     break              # disk floor would be breached -> defer admission
+                # ADMITTED, so the block (if there was one) is over. Cleared here rather than
+                # inside the predicate because the predicate is pure and tested as such; without
+                # this the next block would be timed from the first one's start and would alert
+                # immediately, which is the fastest way to teach someone to ignore the alert.
+                disk_defer_clear()
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            # BEFORE ADMITTING, make sure there is a live token to hand out -- a capture opens
-            # a tab, captures and CLOSES it, so nothing is held open between refreshes. When
-            # the route is off or the capture fails this is a no-op and the worker opens a tab.
-            try:
-                route = _socket_route()
-                if route.open() and route.needs_refresh():
-                    route.refresh(context, agent_url)
-            except Exception:
-                pass
-            note_admitted()
+            if not _candidate_socket:
+                note_admitted()
             ok = w.attach(context, agent_url)
             if not ok:
                 # attach failed. If the WHOLE Edge/context died mid-open (e.g. the
@@ -6044,6 +10234,28 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     return [{"name": w.name, "goal": w.goal, "outcome": w.outcome,
              "turns": w.turn, "reason": w.reason,
              "verified": w.verified, "verify_attempts": w.verify_attempts,
+             # THE ADMISSION-TIME ID, carried into the final snapshot for the same reason
+             # run_id is just below: this dict is built once, after the sweep exits, and a
+             # worker archived from THIS snapshot (not the live one) needs the field too.
+             "jid": getattr(w, "jid", None) or "",
+             # THE RUN IDENTITY, CARRIED INTO THE FINAL SNAPSHOT TOO.
+             #
+             # `run_id` is a parameter of this call (fleet_runner.py passes
+             # "r<hex started>_a<attempt>"), the same string baked into every worker's
+             # transcript filename here (`<run_id>_<name>.jsonl`). The LIVE snapshot
+             # (fleet_runner._snapshot) derives it by re-reading that filename via
+             # _run_id_of() on every tick while the run is active. This FINAL return
+             # value -- built once, after the sweep exits -- had never carried the field
+             # at all, so a worker that only ever appeared in status.json AFTER the run
+             # finished (which is exactly when the cockpit archives it: running flips to
+             # False and every worker is terminal at once) got an empty run_id. Measured:
+             # mid-run status.json workers carried run_id "r6a9fd978_a0"; the SAME workers'
+             # entries in the final status.json (written once run_relay_fleet returns) had
+             # no "run_id" key at all -- so ArchiveTerminal's S(w, "run_id") read "" and the
+             # archived row joined to nothing, same defect this file's own comments already
+             # describe for `verified` ("BOTH ARCHIVE SITES GET THIS" applies here to both
+             # SNAPSHOT SITES instead).
+             "run_id": run_id,
              # carry the captured conversation identity into the FINAL snapshot so the
              # cockpit keeps the Copilot title/URL (and /history link) on finished cards
              # instead of reverting to the bare goal text.
@@ -6071,7 +10283,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
              "role": getattr(getattr(w, "task_envelope", None), "role", ""),
              "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+             "root_id": (getattr(getattr(w, "task_envelope", None), "metadata", None) or {}).get("root_id", ""),
              "goal_hash": getattr(w, "original_goal_hash", ""),
+             "retryable": getattr(w, "retryable_override", None),
+             "retry_queued": bool(getattr(w, "retry_queued", False)),
              "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
              "refusal_count": getattr(w, "refusal_count", 0),
              "refusal_history": list(getattr(w, "refusal_history", [])),

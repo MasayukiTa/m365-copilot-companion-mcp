@@ -262,8 +262,9 @@ def _fleet_runner_fn(probe_suite, discipline_override):
         try:
             # The relay's exact single-shot flag set is environment-specific; we pass the probe as the
             # goal and capture stdout. Wired here as the integration seam, kept thin on purpose.
-            r = subprocess.run([VENVPY, RELAY, "--goal", prompt, "--max-turns", "1"],
-                               cwd=REPO, env=env, capture_output=True, text=True, timeout=600)
+            from tools.childproc import run as _run_child
+            r = _run_child([VENVPY, RELAY, "--goal", prompt, "--max-turns", "1"],
+                           cwd=REPO, env=env, timeout=600)
             out[pid] = (r.stdout or "").strip()
         except Exception:
             out[pid] = ""

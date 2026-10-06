@@ -57,6 +57,31 @@ FLEET_TOOLS = {
     # -- see its own work ----------------------------------------------------------------
     "git_status":       "what have I changed",
     "git_diff":         "the answer it is being asked for IS this diff",
+
+    # -- drive the desktop ---------------------------------------------------------------
+    #
+    # THESE DO NOT BELONG TO A SWE-BENCH WORKER AND ARE HERE ANYWAY, WHICH IS WORTH SAYING
+    # PLAINLY. Everything above serves the five things a bench worker does; nothing below
+    # does. They are here because this list is consulted for EVERY fleet run, not only a
+    # bench one, and a fleet worker is the only caller that can exercise computer use at
+    # all -- the operator's own calls do not go through an unattended run, and the library
+    # can be driven directly from a script, which proves the executor and proves nothing
+    # about the agent. Listing them elsewhere and refusing them here made the capability
+    # untestable rather than making a bench run safer.
+    #
+    # The distinction that is actually wanted is by RUN KIND, which this file cannot
+    # express today: a bench run should not reach these and an office-work run should.
+    # Recorded here rather than solved here, because inventing a second list is how the
+    # first one stopped being a decision.
+    #
+    # What still gates them is the unlock: all six call require_unlocked(), so a worker
+    # that has not been given the password moves no mouse.
+    "screen_look":      "see the screen, with the coordinate frame needed to act on what it sees",
+    "screen_click":     "click what it saw, in that frame",
+    "screen_scroll":    "reach what is below the fold",
+    "screen_type":      "type into the focused field, as characters rather than keystrokes",
+    "screen_press":     "the named keys ordinary office work needs, refusing the destructive combinations",
+    "screen_windows":   "what is open, which is often enough to decide without a picture",
 }
 
 # Named so a reader can see what was considered and refused, rather than guessing that it was
@@ -76,6 +101,12 @@ DELIBERATELY_EXCLUDED = {
     "clipboard_get":     "reads whatever the operator last copied, which may be anything",
     "clipboard_set":     "writes the operator's clipboard, which nothing here needs",
     "screenshot":        "captures the operator's screen, including work unrelated to the run",
+    # NOTE: the six screen_* computer-use tools were listed here for a day and that was
+    # wrong -- see the block above FLEET_TOOLS. The reason ("a benchmark worker has no
+    # business driving the operator's desktop") is correct and this list cannot express it,
+    # because it is consulted for EVERY fleet run and not only for a benchmark one. Refusing
+    # them here did not protect a bench run; it made computer use unreachable by the only
+    # caller that can exercise it, which is a fleet worker.
     "web_fetch":         "dependency downloads belong to the package manager inside the container, not to the worker",
     "web_search":        "the task ships with its own issue text; searching is how a worker finds someone else's answer",
     "web_search_news":   "the task ships with its own issue text; searching finds someone else's answer",
@@ -97,6 +128,34 @@ DELIBERATELY_EXCLUDED = {
     "notify_desktop":    "the operator's attention is not a resource the worker allocates",
     "verify_python":     "executes Python under a name that reads like a check",
     "python_check":      "executes Python under a name that reads like a static check",
+
+    # FOUND 2026-09-14, by running the undecided-tools guard against the real registry for the
+    # first time. The guard had been reading a gitignored dump, so it skipped in CI and, here,
+    # compared against a snapshot taken by hand on 2026-08-30. Eleven tools had appeared since
+    # and were neither allowed nor refused. Recording them as excluded does not change what the
+    # gate does -- unlisted was already refused -- it changes whether anybody looked.
+    "restore_point":     "establishes a way back before editing; the capture step reads `git diff HEAD`, so a worker able to roll the tree back can erase the artefact the run exists to produce -- same reason as git_checkout",
+    "roll_back":         "returns the tree to a restore_point, which is exactly the diff the run is being graded on",
+    # REGISTERED 2026-09-24 (C-1 burndown: git_checkout's refusal told agents to shell out to a
+    # raw `git worktree add` while these safety-checked versions sat unregistered). Right for an
+    # interactive agent; wrong for a fleet worker, for the same reason as git_checkout.
+    "worktree_add":      "the capture step reads ONE working tree; a worker that opens another does its work where the capture never looks -- same reason as git_checkout",
+    "worktree_remove":   "removes a working tree, which may be the operator's; a worker's own tree is the run's, not the worker's, to dispose of",
+    "survey_worktrees":  "reads what other trees the operator has checked out, which is not part of fixing the instance -- same reason as fleet_queue",
+    "fleet_submit":      "queues work for this machine's fleet: a worker that can enqueue runs is not bounded by the run it is in -- same family as stop_request and schedule_create",
+    "fleet_queue":       "reads what else the operator has running, which is not part of fixing the instance",
+    "validity_audit_ledger": "reads the audit ledger of the validity tools, which is the operator's record of other conversations and not part of fixing the instance",
+    "loop_until_verified": "drives an edit/verify loop of its own inside one turn; a worker that can start an unbounded agent loop is not bounded by a list of tools -- same reason as forge_tool",
+    "recurrent_begin":   "opens a self-generating loop, for the same reason",
+    "recurrent_step":    "advances that loop",
+    "recurrent_state":   "reads that loop",
+    "loop_trajectory":   "reports on those iterations; nothing to report when the loop is not available",
+    "render_page":       "fetches a page after its JavaScript has run -- web_fetch's reason applies unchanged, and the container's package manager is where downloads belong",
+    # NOT WEIGHED, RECORDED. This is the one of the eleven a worker could plausibly want: it is
+    # replace_in_file with a verification and an automatic undo, which is strictly safer than
+    # the multi_edit already allowed. It is listed here because that is what the gate already
+    # did with it, NOT because a case against it was made. Promoting it is an operator's call.
+    "edit_and_verify":   "not weighed -- recorded as excluded because unlisted already meant refused; the one of the eleven with a real case for promotion",
 }
 
 # ---------------------------------------------------------------------------------------
@@ -176,9 +235,22 @@ def unknown_tools(catalogue):
 # switched from permissive to closed without measuring first, the review that caught it said
 # to shadow for an hour and confirm zero. Same discipline here.
 #
+# THE GATEWAY CONSULTS `check` AGAIN, from 2026-09-14. It had not since 2026-08-31: main.py
+# removed the call site deliberately ("the benchmark's tool-population policy ... is a fact
+# about that benchmark, not about this server") and left the list here "for the runner that owns
+# it" -- and the runner never consulted it either, so for two weeks the modes below described a
+# gate wired to nothing while a heading claimed "the gateway actually consults it".
+#
+# THE REMOVAL'S ARGUMENT IS STILL RIGHT AND THE REMOVAL WAS STILL WRONG. The policy does not
+# live in dispatch; it lives here, and main.py asks it one question. What went out with the call
+# site was `_fleet_run_active()` -- the mechanism built for the gateway's one real problem, that
+# it cannot tell a worker from the operator. That is what makes a check in general dispatch
+# harmless to the operator: outside an unattended run it allows everything. Operator decision,
+# recorded in docs/unreached_burndown.md.
+#
 #   off      the policy is not consulted at all
-#   shadow   every call that WOULD be refused is recorded; nothing is blocked   <- default
-#   enforce  calls outside the allowed set are refused while a run is active
+#   shadow   every call that WOULD be refused is recorded; nothing is blocked
+#   enforce  calls outside the allowed set are refused while a run is active   <- default
 #
 # Promote to enforce only after a shadow window shows the refusals are the ones intended --
 # a shadow log full of read_file means the set is wrong, not that the workers are hostile.
@@ -191,9 +263,28 @@ def unknown_tools(catalogue):
 # that needs to end something it started can do so through shell_exec, inside its own
 # process tree.
 #
-# That is the evidence for enforce. It is deliberately NOT switched here: flipping a gate
-# under a measurement in flight changes the thing being measured. Set FLEET_TOOLSET_MODE=
-# enforce when no run is in progress.
+# AND THE LOG THAT SENTENCE CITES WAS BEING WRITTEN BY THE TESTS ABOUT IT. Found 2026-09-14:
+# SHADOW_LOG was a RELATIVE path and was not in conftest's redirect table, so every local run of
+# relay/test_fleet_toolset.py appended a row to the operator's file -- measured 219 -> 220 on
+# one run. The file held 220 rows spanning 2026-08-30 to 2026-09-14, not the four the paragraph
+# above describes, and every row said `process_kill`, which is precisely the tool those tests
+# pass. So the log could not distinguish a refusal that happened from one a test simulated.
+#
+# THE FOUR ARE STILL THE FIRST FOUR ROWS and still fall inside the stated window, so the window
+# itself is not withdrawn -- but it is the only part of that file anyone may read as evidence,
+# and even it cannot be proven free of a test write. The default stays `enforce` because the
+# argument for it does not rest on the count: `process_kill` reaches any process on this
+# machine, including the server hosting the gate, and shell_exec covers a worker's own tree.
+# The log is isolated from 2026-09-14, so the NEXT window will measure what it claims to.
+#
+# That was the evidence for enforce, AND IT HAS SINCE BEEN SWITCHED -- `mode()` defaults to
+# enforce and test_the_default_is_enforce_now_that_the_shadow_window_has_run pins it. This
+# paragraph said "deliberately NOT switched here ... set FLEET_TOOLSET_MODE=enforce when no run
+# is in progress" for as long as the opposite was true. Corrected 2026-09-14, in the same batch
+# that found the test section below claiming the gateway consults a gate nothing consults:
+# prose contradicting a passing test is the failure this module keeps producing.
+#
+# Set FLEET_TOOLSET_MODE=shadow to measure again; shadow remains reachable and is tested.
 import json as _json
 import os as _os
 import time as _time

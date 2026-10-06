@@ -9,6 +9,8 @@ from ctypes import wintypes
 
 _log = logging.getLogger(__name__)
 
+API_KEY_VAR = "MCP_API_KEY"
+API_KEY_PROTECTED_VAR = "MCP_API_KEY_PROTECTED"
 UNLOCK_PASSWORD_VAR = "MCP_UNLOCK_PASSWORD"
 UNLOCK_PASSWORD_PROTECTED_VAR = "MCP_UNLOCK_PASSWORD_PROTECTED"
 _DPAPI_PREFIX = "dpapi:"
@@ -107,6 +109,33 @@ PROBLEM_UNSET = "unset"
 PROBLEM_UNDECRYPTABLE = "undecryptable"
 
 
+
+
+def api_key_from_env(environ=None) -> str:
+    """Read legacy plaintext or preferred DPAPI-protected bearer token."""
+    env = environ if environ is not None else os.environ
+    plain = (env.get(API_KEY_VAR) or "").strip()
+    if plain:
+        return plain
+    protected = (env.get(API_KEY_PROTECTED_VAR) or "").strip()
+    if not protected:
+        return ""
+    try:
+        return unprotect_secret(protected).strip()
+    except Exception as exc:
+        _log.warning("MCP_API_KEY_PROTECTED is set but cannot be decrypted by this Windows account (%s)", type(exc).__name__)
+        return ""
+
+
+def materialize_api_key(environ=None) -> str:
+    """Decrypt the bearer token into process memory only; never persist plaintext."""
+    env = environ if environ is not None else os.environ
+    value = api_key_from_env(env)
+    if value:
+        env[API_KEY_VAR] = value
+    return value
+
+
 def unlock_password_problem() -> str:
     """The reason the last read failed: "", PROBLEM_UNSET or PROBLEM_UNDECRYPTABLE."""
     return _LAST_PROBLEM[0]
@@ -197,17 +226,31 @@ _MIN_SECRET_LEN = 8
 
 
 def secret_values(environ=None) -> list[str]:
-    """伏せるべき値を集める。環境変数と .env の両方から、名前で選ぶ。"""
-    env = dict(os.environ if environ is None else environ)
-    try:
-        from dotenv import dotenv_values
+    """伏せるべき値を集める。環境変数と .env の両方から、名前で選ぶ。
 
-        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-        for k, v in (dotenv_values(os.path.join(repo, ".env")) or {}).items():
+    RAISES WHEN IT CANNOT READ AN .env THAT EXISTS. This used to swallow that failure and
+    return whatever the process environment alone held -- a list that looks complete and is
+    not, so a secret that lives only in .env went into the record in clear text. A partial
+    list is not a smaller answer, it is a wrong one; redact_secrets turns the raise into a
+    withheld record. No .env at all is not a failure: there is nothing there to miss.
+
+    THE DECRYPTED UNLOCK PASSWORD IS INCLUDED BY VALUE. Selection by NAME picks the value of
+    MCP_UNLOCK_PASSWORD_PROTECTED, which is the DPAPI ciphertext -- while the turn the relay
+    and the bridge inject carries the PLAINTEXT (unlock_password_local decrypts it). So on
+    exactly the install the setup recommends, the one value this redaction exists for was
+    the one it never matched. The plaintext is decrypted here the same way the injector
+    decrypts it; a value this account cannot decrypt is one no process of this account can
+    have injected, so that failure is skipped rather than treated as a redaction failure.
+    """
+    env = dict(os.environ if environ is None else environ)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dotenv_path = os.path.join(repo, ".env")
+    if os.path.isfile(dotenv_path):
+        from dotenv import dotenv_values   # ImportError propagates: see the docstring
+
+        for k, v in (dotenv_values(dotenv_path) or {}).items():
             if v and k not in env:
                 env[k] = v
-    except Exception:
-        pass
 
     out: list[str] = []
     for name, value in env.items():
@@ -216,6 +259,14 @@ def secret_values(environ=None) -> list[str]:
         upper = name.upper()
         if any(hint in upper for hint in SECRET_NAME_HINTS):
             out.append(value.strip())
+    protected = (env.get(UNLOCK_PASSWORD_PROTECTED_VAR) or "").strip()
+    if protected:
+        try:
+            plain = unprotect_secret(protected).strip()
+        except Exception:
+            plain = ""
+        if len(plain) >= _MIN_SECRET_LEN:
+            out.append(plain)
     # 長いものから消す。短い値が長い値の一部だったとき、先に短い方を消すと
     # 長い方が部分的に残る。
     return sorted(set(out), key=len, reverse=True)
@@ -232,17 +283,39 @@ def secret_values(environ=None) -> list[str]:
 REDACTION_MARKER = "<redacted>"
 
 
+#: What is written INSTEAD of the text when redaction itself failed. The caller persists this
+#: and nothing else, because the only other choices are the unredacted text -- the leak this
+#: module exists to stop -- or raising into a write path that must not fail a live turn.
+REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
+
+
 def redact_secrets(text: str, environ=None) -> str:
     """本文から秘密を伏せる。書き出す直前にだけ使う。
 
     送る文には掛けないこと。解錠は本物のパスワードが相手に届いて初めて通る。
     掛けてよいのは「ファイルに書く瞬間」だけ。
+
+    FAILS CLOSED, AND NEVER RAISES. This used to `except: pass` and return `value` -- the text
+    as far as the loop had got, which on a failure before the first replacement is the
+    original, secret and all. That went straight into transcripts and session ledgers. Now a
+    failure returns REDACTION_FAILED_MARKER in place of the whole text and says so on the
+    log; the record loses one entry, the secret stays out of it. The log line carries the
+    exception TYPE only: the message of an exception raised while handling a secret can hold
+    a fragment of it.
     """
-    value = text or ""
     try:
+        value = "" if text is None else text
         for secret in secret_values(environ):
             if secret in value:
                 value = value.replace(secret, REDACTION_MARKER)
-    except Exception:
-        pass
-    return value
+        if not isinstance(value, str):
+            raise TypeError("redaction produced %s, not text" % type(value).__name__)
+        return value
+    except Exception as exc:
+        try:
+            _log.warning("redact_secrets failed (%s); the text was withheld from the record "
+                         "and %r written in its place", type(exc).__name__,
+                         REDACTION_FAILED_MARKER)
+        except Exception:
+            pass
+        return REDACTION_FAILED_MARKER

@@ -48,6 +48,7 @@ from __future__ import annotations
 
 import argparse
 from datetime import datetime
+import io
 import os
 import random
 import re
@@ -89,16 +90,25 @@ from tools.gate_ops import stop_check                     # operator E: kill-swi
 # cannot answer anything about a caller with no remote identity.
 from tools.memory_ops import memory_load
 from tools.memory_ops import memory_save_local as memory_save   # cross-session history
+from tools.memory_ops import MAX_VALUE_CHARS as _MEMORY_MAX_CHARS
+
+#: How much of a turn response is kept for cross-session recall. Derived from the
+#: store's own limit, less room for the marker that announces a cut, so the value can
+#: never be refused for length AND a reader can always tell a whole turn from a
+#: shortened one.
+_MEMORY_TURN_CHARS = _MEMORY_MAX_CHARS - 200
 # THE LOCAL VARIANT for the same reason as memory_save above: sixteen call sites in this
 # file, every return value discarded, and the gate denying all of them because this process
 # has no HTTP request. The audit runlog has never been written.
 from tools.runlog_ops import runlog_append_local as runlog_append  # operator D: audit
 from tools.runlog_ops import runlog_summarize
+from relay.send_errors import FreshSubmitAmbiguous
 
 class ConversationClosed(RuntimeError):
     """Raised by send() when the target tab/composer is already gone (the
     conversation ended) BEFORE we even try to submit. This is the TargetClosedError
-    race seen in 28/72 send_failures records: the agent turn finished, the page was
+    race seen in 28 of the first 72 send_failures records (0.19% over the whole log --
+    see _page_alive): the agent turn finished, the page was
     torn down, and the relay then tried to send into a dead target -- burning the full
     3-attempt retry budget every time. run_relay treats this as TERMINAL (no transient
     retry), since retrying a closed target can never succeed. Subclasses RuntimeError
@@ -164,6 +174,11 @@ COPILOT_SELECTORS = {
     # inner_text is the answer. NOTE: data-testid="chatOutput" was NOT reliable --
     # it can read back the user's own message, which broke STUCK detection.
     "assistant_msg": ".fai-CopilotMessage",
+    # User turn container. Captured live 2026-10-01 while closing R5-NOTE-1. Unlike
+    # chatOutput, chatQuestion is one container per visible USER turn and exposes an empty
+    # first-message defect directly ("You said:" with no body). Fresh sends use it as the
+    # response-independent delivery receipt.
+    "user_msg": '[data-testid="chatQuestion"]',
     "assistant_msg_fallback": '[data-testid="copilot-message-reply-div"]',
     # Within one .fai-CopilotMessage the block splits into a HEADER and a BODY:
     #   <div>                                            <- header, all chrome
@@ -181,8 +196,9 @@ COPILOT_SELECTORS = {
     # The Send button. Pressing Enter in this rich editor does NOT reliably submit
     # (the text just sits in the composer) -- clicking this button does.
     #
-    # LIVE DOM (companion Edge, 2026-06-13, read-only CDP scrape + 72 send_failures
-    # records): when the composer holds text, the button renders as
+    # LIVE DOM (companion Edge, 2026-06-13, read-only CDP scrape + the 72 send_failures
+    # records that existed THAT DAY; the log holds 15,606 now): when the composer holds
+    # text, the button renders as
     #   <button aria-label="送信" ...>           (JP locale, visible, enabled)
     # in the same 40x40 toolbar slot that holds the dictation / voice buttons when
     # the composer is EMPTY (so the button simply does not exist until text is typed
@@ -306,18 +322,33 @@ OUTPUT_DISCIPLINE = _load_discipline()
 #: the same answer and the true answer was reachable without consulting any skill, so it
 #: measured nothing about whether the sentence works. A probe has to be a task whose CORRECT
 #: procedure is non-obvious and whose following is visible in the answer.
+# 実測 2026-09-24: 「社内で使えるパワーポイントのskillsを探してほしい」で skill_match が
+# 空だったところ、ワーカーは「このskillは存在しません」で打ち切り、外部検索を一度も試さない
+# まま DONE にした（refuter#1 は UPHELD）。「一致が無ければ通常どおり進めてよい」だけでは、
+# その「通常どおり」が具体的に何を指すか(web検索等の他の手段を使い切って依頼を最後まで
+# やる、であって、依頼そのものを『できない』と答えることではない)が書かれておらず、
+# 「一致が無い=この依頼の対象が存在しない」と読めてしまった。以下の一文で明示する。
 SKILL_SENTENCE = ("" if os.environ.get("MCP_NO_SKILL_SENTENCE") else
                   "承認済みの手順(スキル)がある作業は、それに従うこと。作業に入る前に call_tool で "
                   "skill_match を呼び、確度の高い一致があれば skill_load して**その手順どおりに**進める"
-                  "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい。")
+                  "(自分で別の手順を作らない)。一致が無ければ通常どおり進めてよい"
+                  "(=それ以外の手持ちの手段、web検索等も使って依頼を最後まで遂行すること。"
+                  "『一致するスキルが無い』を『依頼された対象が存在しない』と読み替えて"
+                  "打ち切らないこと)。")
 
 PROTOCOL = (
     # ゲートウェイの説明を先頭に置く。規律文が先だと、ツールを探す前に
     # 「無いので不可」と切り上げる側に効いてしまう（実測でその挙動が出た）。
-    "【最重要】使えるツールは約160個あり、すべて call_tool ゲートウェイの先にある。"
-    "read_file / list_directory / run_python といった名前は、あなた自身のツール一覧には"
-    "出てこない。一覧に無いことを理由に「この環境には存在しない」と結論してはならない。"
-    "必ず call_tool(name='') で実際の一覧を確認してから可否を述べること。 "
+    #
+    # TRIMMED 2026-09-15 (first-turn budget push, ContextTokenLimitExceeded incident).
+    # Dropped "約160個" (a count that goes stale -- call_tool('') answers this itself)
+    # and two of the three example names (read_file/list_directory/run_python -> read_file
+    # 等). Kept: gateway framing, "not in your own list", "don't conclude absent", and the
+    # call_tool(name='') instruction itself -- those are the load-bearing parts the POSITION
+    # comment above and test_the_gateway_sentence_comes_before_the_discipline exist for.
+    "【最重要】ツールは全て call_tool ゲートウェイの先にあり、read_file 等の名前は"
+    "あなた自身の一覧には出てこない。無いことを理由に「存在しない」と結論せず、"
+    "必ず call_tool(name='') で確認してから述べること。 "
     # POSITION, MEASURED. The same sentence sat after the output discipline and the worker
     # ignored it: arm A prompt 1,665 chars without it, arm B 1,801 chars WITH it, and
     # neither called skill_match on a goal that exactly matches a skill. The server rule it
@@ -339,16 +370,43 @@ PROTOCOL = (
     + SKILL_SENTENCE
     + OUTPUT_DISCIPLINE + " "
     "ツールを使い自律的に進める。重い作業は小さく分割し1ターンに1〜数ステップ。"
-    "ツールは call_tool ゲートウェイ経由: まず call_tool(name='') で一覧(名前+要約)を見て"
-    "このタスクに必要なツールを見極め、call_tool(name='X') で使い方を確認、"
-    "call_tool(name='X', arguments={...}) で実行する。"
-    "初手はこの一覧確認＋対象フォルダ/ファイルの存在確認(call_tool で list_directory)から始め、"
-    "いきなり絶対パス直行しない。パスは必ず「/」区切り(例 C:/dir/file)、バックスラッシュ禁止(\\t等に化ける)。"
+    # TRIMMED 2026-09-15: was "ツールは call_tool ゲートウェイ経由: まず call_tool(name='')
+    # で一覧(名前+要約)を見てこのタスクに必要なツールを見極め、call_tool(name='X') で使い方を
+    # 確認、call_tool(name='X', arguments={...}) で実行する。" -- same three-call sequence,
+    # connective filler removed. The 3-verb chain (list/describe/call) is the load-bearing part.
+    "call_tool(name='') で一覧、call_tool(name='X') で使い方確認、"
+    "call_tool(name='X', arguments={...}) で実行。"
+    "初手は一覧確認+対象の存在確認(list_directory)から。絶対パス直行しない。"
+    "パスは必ず「/」区切り(例 C:/dir/file)、バックスラッシュ禁止(\\t等に化ける)。"
     "ファイル/画像/データの大量処理は1ターンに1件だけ処理し、都度ディスク(Excel等)に保存して次へ"
     "(まとめて読むと OpenAIModelTokenLimit で失敗)。各ターン冒頭で保存済み状態を見て未処理の続きから。"
-    "深い調査は行頭 `RESEARCH: 内容`、データ分析は `ANALYZE: 絶対パス | 指示`。"
-    "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。""STUCK を出す前に必ず call_tool(name='') で一覧を見直し、未確認の経路が無いことを""確かめること。ツールを一度も叩かずに STUCK と書いてはならない。"
-    "任意: 最終マーカーの直前に `NEXT: <次アクション1行>` と `CONFIDENCE: low|medium|high` を書いてよい。"
+    # ANALYZE IS THE ONLY WAY A MODEL SEES A FILE. It attaches the real file to the page, so
+    # it is what you use when the answer is IN a picture or a spreadsheet rather than about
+    # one. Called "データ分析" until 2026-09-17, when a worker told in its own goal to open a
+    # PNG with ANALYZE never emitted one: reading characters off an image is not what that
+    # phrase describes, and read_image was sitting there claiming to do it.
+    # WHICH ROUTE FOR WHICH PICTURE, measured 2026-09-17. A SCREENSHOT needs the Analyst:
+    # ocr_image on a desktop capture came back as unreadable noise, and read_image returns
+    # base64 text nothing sees. CLEAN TEXT on a plain background is the opposite -- ocr_image
+    # read it exactly, for a fraction of the cost of opening a page. Budgeted with RESEARCH at
+    # max_research (3 per worker, relay_fleet.py:5411).
+    #
+    # This line was narrowed to "only when no local tool can get it" and reverted within the
+    # hour: the run that prompted it was examining a folder it had been handed, images and all,
+    # and reading them was the task. The sentence was producing good behaviour and the reason
+    # to change it had been withdrawn.
+    "深い調査は行頭 `RESEARCH: 内容`、画像や表を実際に見るには `ANALYZE: 絶対パス | 指示`(実添付)。"
+    "各ターン最終行に必ず: 続行=CONTINUE、完了(検証も通過)=DONE、行き詰まり=STUCK: 理由。"
+    # TRIMMED 2026-09-15: dropped the standalone "STUCK を出す前に必ず call_tool(name='') で
+    # 一覧を見直し...確かめること。ツールを一度も叩かずに STUCK と書いてはならない。" sentence.
+    # It had no incident comment of its own and duplicated, inside this SAME first turn,
+    # OUTPUT_DISCIPLINE's own guarded clause ("ツールの有無・実行可否は、実際に call_tool を
+    # 叩いて確かめてから述べる。確かめずに「無い」「できない」と書くことは、この規律違反である。"
+    # -- see _DEFAULT_DISCIPLINE above, NOT touched here), which already covers STUCK: a STUCK
+    # is a declaration of "できない" and OUTPUT_DISCIPLINE is embedded a few dozen characters
+    # earlier in this very string. Do not re-add without a comment recording a DISTINCT
+    # incident this shorter form fails to prevent -- see relay/test_instruction_budget.py.
+    "任意: 最後に `NEXT: <次アクション1行>` `CONFIDENCE: low|medium|high` を書いてよい。"
     "まず最初のステップを実行。\nGoal: "
 )
 
@@ -411,7 +469,19 @@ RETRY_JOB = (
 # delayed/retried probe tick without flapping between healthy/stale, while still catching a
 # probe subsystem that has gone quiet for a sustained stretch -- which is exactly the mined
 # incident this closes (tools were unreachable for the WHOLE run, not for a single missed tick).
-STUCK_TOOL_HEALTH_MAX_AGE_S = float(os.environ.get("MCP_STUCK_TOOL_HEALTH_MAX_AGE_S", "1800"))
+#: Three times the CONFIGURED probe interval (tools.tool_probe.configured_interval_s -- 30 min by
+#: default now, 10 min before), never below the old 1800 s: a record is up to one interval old
+#: between probes even when the probe subsystem is healthy.
+def _stuck_health_default_s():
+    try:
+        from tools import tool_probe as _tp
+        return max(1800.0, 3.0 * float(_tp.configured_interval_s()))
+    except Exception:
+        return 1800.0
+
+
+STUCK_TOOL_HEALTH_MAX_AGE_S = float(os.environ.get("MCP_STUCK_TOOL_HEALTH_MAX_AGE_S",
+                                                   str(_stuck_health_default_s())))
 
 
 def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
@@ -490,7 +560,16 @@ def _tool_health_for_stuck(max_age_s: float = STUCK_TOOL_HEALTH_MAX_AGE_S,
 # requires that two invocations of the SAME call site see strictly increasing counts, which a
 # monotonic per-site counter already guarantees regardless of what other branches ran between
 # them.
-
+#
+# THE FIRST THREE PHRASES ALL ASSUME A MECHANICAL FAILURE (bad argument, wrong path, missing
+# permission) -- and a mined incident (.fleet/transcripts, worker r6aa8fc73_a0_w0) shows that
+# assumption is sometimes just wrong. That worker exhaustively searched every place its one
+# data source could hold the fact it needed, said so precisely, and reported STUCK naming the
+# exact unresolved question. Every phrase above still tells it to double-check arguments and
+# paths and try the SAME call again -- of no use when the call was fine and the fact was never
+# in that source at all. The fourth phrase below is the missing case: it does not name what the
+# other source might be (this repository never puts the answer in the nudge -- that is the
+# worker's job to find), only that the place already searched may not be the right place.
 _RETRY_ESCALATION_PHRASES = (
     "同じ手順を単純に繰り返すのではなく、直前に失敗した呼び出しの引数・パス指定・権限を"
     "見直してから再試行してください。",
@@ -498,6 +577,8 @@ _RETRY_ESCALATION_PHRASES = (
     "もう一度実行してください。",
     "エラーの内容を踏まえて手順を調整し、同じ失敗を繰り返さないようにしてから"
     "再試行してください。",
+    "今探している場所に目的の情報が無い可能性があります。同じ場所を探し直すのではなく、"
+    "他に手がかりになりそうな資料や経路がないか考えてから再試行してください。",
 )
 
 
@@ -639,6 +720,26 @@ def reported_stuck(resp: str) -> bool:
     return "STUCK:" in up or "STUCK：" in up
 
 
+#: How long a reply may be and still BE the token-limit error rather than prose about one.
+#: The same two-part rule, and the same 400, as tools/tool_ledger.py::looks_refused and
+#: relay/relay_fleet.py::_looks_locked. Measured: every genuine error in 2,318 transcripts
+#: is 126 characters.
+EXHAUSTED_DOMINANCE_MAX_CHARS = 400
+
+#: Japanese forms of the same platform error. Never observed on this machine -- every
+#: genuine error here carries the ASCII code -- so these are kept as a hypothesis about
+#: other locales and builds, which is exactly what they always were. The difference is that
+#: a hypothesis now has to be stated as a phrase somebody would only write if it happened.
+EXHAUSTED_JP_MARKERS = (
+    "トークンの上限に達",
+    "トークン上限に達",
+    "トークンの上限を超え",
+    "トークン上限を超え",
+    "コンテキストの上限に達",
+    "コンテキスト長の上限",
+)
+
+
 def conversation_exhausted(resp: str) -> bool:
     """True when Copilot itself reports the conversation can no longer continue
     because it ran out of model token budget. The hands-off relay otherwise
@@ -646,17 +747,50 @@ def conversation_exhausted(resp: str) -> bool:
     eventually trips this and EVERY later turn returns the same error. Detecting
     it lets run_relay recycle to a fresh conversation instead of dying.
 
-    Anchored on Copilot's own error code/text (JP + EN) -- kept conservative so a
-    normal answer that merely discusses tokens does not false-fire.
+    TWO PARTS, LIKE EVERY OTHER "IS THIS THE THING OR PROSE ABOUT IT" TEST HERE: a
+    distinctive marker AND dominance. The reply IS the error, it does not mention one.
+    See looks_refused in tools/tool_ledger.py and _looks_locked in relay/relay_fleet.py,
+    which reached the same shape from the same kind of incident.
+
+    THE JAPANESE VOCABULARY RULE IS GONE, and the measurement is why. Over all 2,318
+    transcripts on this machine (5,783 assistant rows) it produced 103 matches and NOT ONE
+    genuine platform error. 100 of them were recycled into a brand-new conversation and 81
+    of those discarded replies ended in DONE -- finished work, thrown away mid-report. An
+    entire fan-out investigating this repo's own unlock-token expiry was destroyed for
+    writing the words トークン and 上限, the 上限 being the 8-token cap in
+    .unlock_state.json. Three of the false positives were SHORTER than the genuine error,
+    so no length bound could have saved this rule: it had no distinctive marker at all,
+    only ordinary vocabulary, and dominance needs a marker to gate.
+
+    What the genuine error actually looks like, 262 of 263 occurrences identical modulo the
+    UUID and timestamp, and every one of them 126 characters:
+
+        エラーが発生しました。
+        エラー コード: ContextTokenLimitExceeded
+        会話 ID: <uuid>
+        時間 (UTC): <iso8601>。
+
+    openaimodeltokenlimit and the English phrasings have never fired here, so their length
+    is unknown; they keep the same bound rather than a guess of their own.
     """
     t = (resp or "")
     low = t.lower()
+    # Dominance, at the constant this repo already uses for the same judgement: 3.2x the
+    # only genuine error ever measured. It is not decoration -- a worker READING a
+    # transcript and quoting ContextTokenLimitExceeded in 2,652 characters of analysis was
+    # recycled for it (r6a9eaee5_a0_w16, turn 11).
+    if len(t.strip()) >= EXHAUSTED_DOMINANCE_MAX_CHARS:
+        return False
     if "openaimodeltokenlimit" in low:
         return True
-    # Defensive variants Copilot has shown for the same condition.
-    if ("トークン" in t and ("上限" in t or "制限" in t or "超え" in t)):
-        return True
     if "maximum context length" in low or "context length exceeded" in low:
+        return True
+    # A PHRASE, NOT TWO NOUNS. Each of these says the limit was REACHED or EXCEEDED, which
+    # is a thing only the platform says about itself. Checked against the false positives
+    # that were actually measured: "unlockトークンの保持場所と失効条件 ... 上限は8個" and
+    # "トークン制限を避け、1枚ずつ処理します" match none of them, and under the old rule
+    # both were recycled.
+    if any(marker in t for marker in EXHAUSTED_JP_MARKERS):
         return True
     # ContextTokenLimitExceeded -- the SAME condition under a different error code, and the
     # one this function did not know. A worker that hit it on 2026-08-26 was not recycled:
@@ -922,19 +1056,42 @@ _SEND_STAGE_AFTER_S = float(os.environ.get("MCP_SEND_STAGE_AFTER_S", "5"))
 _SEND_STAGE_PATH = os.path.join(".fleet", "send_stage.jsonl")
 
 
+#: Whether the "this log has stopped" line has already been written. Module state, because
+#: the alternative is one such line per slow send for the rest of the machine's life.
+_SEND_STAGE_CAPPED_SAID = False
+
+
 def _send_stage(t0, name, **extra):
     """One line per send() milestone once the send is already slow. Never raises."""
+    global _SEND_STAGE_CAPPED_SAID
     try:
         import json as _json
-        age = time.time() - t0
+        now = time.time()
+        age = now - t0
         if age < _SEND_STAGE_AFTER_S:
             return
         try:
             if os.path.getsize(_SEND_STAGE_PATH) > 2_000_000:
+                # SILENCE AND HEALTH USED TO LOOK THE SAME. Past the cap this returned, and a
+                # log that stops recording slow sends is indistinguishable from a machine that
+                # stopped having them -- which is the reading anyone would take, because it is
+                # the good news. One line, once, so the file says why it ends.
+                if not _SEND_STAGE_CAPPED_SAID:
+                    _SEND_STAGE_CAPPED_SAID = True
+                    with open(_SEND_STAGE_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(_json.dumps(
+                            {"ts": now, "stage": "log_capped",
+                             "note": "past 2 MB; nothing after this line was recorded, so the "
+                                     "absence of later entries is this cap and not a quiet "
+                                     "machine"}, ensure_ascii=False) + chr(10))
                 return
         except OSError:
             pass
-        rec = {"age_s": round(age, 1), "stage": name}
+        # ts, NOT ONLY age_s. The absolute time was in hand -- `now` is what age_s is computed
+        # FROM -- and throwing it away left 519 rows that cannot be placed beside
+        # send_failures.jsonl, an incident, or each other. A duration answers "how slow"; only
+        # a timestamp answers "when", and "when" is the question every correlation starts with.
+        rec = {"ts": now, "age_s": round(age, 1), "stage": name}
         rec.update(extra)
         os.makedirs(os.path.dirname(_SEND_STAGE_PATH), exist_ok=True)
         with open(_SEND_STAGE_PATH, "a", encoding="utf-8") as fh:
@@ -1102,22 +1259,82 @@ def _adjust_backoff(ok, turn_elapsed, backoff_s, base_elapsed,
     return max(0.0, backoff_s - backoff_step_s * 0.5), base_elapsed, "healthy"
 
 
-def default_notify(title: str, body: str) -> None:
-    """Best-effort Windows toast; never raises into the control loop."""
-    # DIAGNOSTIC (2026-07 notification-source hunt): record who fired every toast --
-    # timestamp, pid, process argv, and the caller stack -- so a freshly-spawned fleet
-    # self-identifies as the emitter instead of us guessing from process trees.
+#: Toast emitters already seen in THIS process, so the watchdog below writes each one once.
+_NOTIFY_SEEN = set()
+_NOTIFY_LOG_MAX_BYTES = 256 * 1024
+
+#: WHERE THE WATCHDOG WRITES, AS A NAME RATHER THAN AN EXPRESSION INSIDE THE FUNCTION.
+#: It was built from __file__ at each call, which put the path out of reach of anything that
+#: wanted to move it -- a test could only redirect it by reassigning the module's __file__,
+#: and the repository's own isolation registry (relay/test_live_record_isolation.py) cannot
+#: see a path that does not exist as a constant. Every other operator record here is a
+#: module-level name for exactly that reason. MCP_NOTIFY_SOURCE_LOG overrides it.
+NOTIFY_SOURCE_LOG = os.environ.get("MCP_NOTIFY_SOURCE_LOG") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "_notify_source.log")
+
+
+def _record_notify_source(title: str) -> None:
+    """Write down WHO fired a toast, the first time each emitter is seen in this process.
+
+    WHY IT EXISTS. Commit e658a43 (2026-07-04), "catches any future false toast": a
+    freshly-spawned fleet names itself as the emitter instead of anyone guessing from process
+    trees. Timestamp, pid, argv and the caller stack.
+
+    ONCE PER EMITTER, NOT ONCE PER TOAST. It wrote an eight-frame stack every time, unbounded.
+    Measured 2026-09-18: 20,622 lines and 1.5 MB describing FOUR distinct titles and SIXTEEN
+    distinct stack frames, with "default_notify <- run_relay_fleet <- main" recorded 1,340
+    times. A small answer space, fully enumerated, re-derived on every single toast.
+
+    Not merely wasteful here. tools/tool_ledger bounds itself and says why -- "a ledger cannot
+    become the thing that fills the disk, which on this machine is the binding constraint, and
+    has already stopped a benchmark run once" -- and this had no bound at all. A disk reaching
+    zero on this machine has truncated source files mid-write.
+
+    The watch itself is unchanged in the way that matters: a NEW emitter, a title or a call
+    path never seen before, is still written in full the moment it appears. Only the repetition
+    stops. The seen-set is per process on purpose -- a fresh process is a fresh context, and
+    re-stating its emitters once is cheap and occasionally the thing you want to see.
+
+    SEPARATE FROM default_notify SO IT CAN BE TESTED. conftest replaces default_notify with an
+    inert stub for every test, and rightly: a test must never fire a real desktop toast. That
+    also made the recording unreachable from a test, so it was verified by reading the source
+    and by watching the live file -- neither of which catches a regression. This writes a file
+    and fires nothing, so it is safe to call directly.
+
+    Never raises: it runs on the path that tells a person what happened.
+    """
     try:
-        import os as _os, sys as _sys, time as _t, traceback as _tb
-        _line = "%s pid=%s argv=%r title=%r\n%s" % (
-            _t.strftime("%H:%M:%S"), _os.getpid(), _sys.argv[:4], title,
-            "".join(_tb.format_stack(limit=8)))
-        _p = _os.path.join(_os.path.dirname(_os.path.dirname(_os.path.abspath(__file__))),
-                           ".fleet", "_notify_source.log")
+        import hashlib as _h, os as _os, sys as _sys, time as _t, traceback as _tb
+        _stack = "".join(_tb.format_stack(limit=8))
+        _sig = _h.sha256(("%s|%s" % (title, _stack)).encode("utf-8", "replace")).hexdigest()[:16]
+        if _sig in _NOTIFY_SEEN:
+            return
+        _NOTIFY_SEEN.add(_sig)
+        _line = "%s pid=%s argv=%r title=%r sig=%s\n%s" % (
+            _t.strftime("%H:%M:%S"), _os.getpid(), _sys.argv[:4], title, _sig, _stack)
+        _p = NOTIFY_SOURCE_LOG
+        _d = _os.path.dirname(_p)
+        if _d:
+            _os.makedirs(_d, exist_ok=True)
+        try:
+            if _os.path.getsize(_p) > _NOTIFY_LOG_MAX_BYTES:
+                # Keep the RECENT half: a watchdog is asked about what just appeared.
+                _keep = io.open(_p, encoding="utf-8", errors="replace").read()
+                _keep = _keep[len(_keep) // 2:]
+                _keep = _keep[_keep.find("\n") + 1:]
+                io.open(_p, "w", encoding="utf-8").write(_keep)
+        except OSError:
+            pass
         with open(_p, "a", encoding="utf-8") as _f:
             _f.write(_line + "-" * 60 + "\n")
     except Exception:
         pass
+
+
+def default_notify(title: str, body: str) -> None:
+    """Best-effort Windows toast; never raises into the control loop."""
+    _record_notify_source(title)
     try:
         from tools.notify_ops import notify_desktop
         notify_desktop(title, body[:240])
@@ -1301,11 +1518,26 @@ class CopilotWebDriver:
         """Cheap liveness probe: is the tab still open AND the composer still present?
 
         Used as an early dead-check before a send so a conversation that ended (the
-        page/composer was torn down -- the TargetClosedError race seen in
-        send_failures.jsonl, 28/72) is treated as terminal IMMEDIATELY instead of
-        burning the full 3-attempt x 12s retry budget against a dead target. Any
-        exception (incl. TargetClosedError from page.is_closed/evaluate) -> not alive.
-        Never raises."""
+        page/composer was torn down -- the TargetClosedError race) is treated as terminal
+        IMMEDIATELY instead of burning the full 3-attempt x 12s retry budget against a dead
+        target. Any exception (incl. TargetClosedError from page.is_closed/evaluate) ->
+        not alive. Never raises.
+
+        THE RATE THIS WAS JUSTIFIED WITH, AND THE RATE THE WHOLE RECORD SHOWS. This said
+        "28/72" -- 39%, hand-counted on 2026-06-13, the day of the incident that prompted it
+        and repeated in four other places in this file. Measured 2026-09-20 over the entire
+        log (`python -m tools.send_failure_report`): 29 of 15,606, or 0.19%.
+
+        THE RULE STANDS AND THE SENTENCE DID NOT. Fast-failing a genuinely closed page is
+        right whenever it happens, and the cost avoided is real, so nothing here changes. What
+        was wrong was the shape of the claim: a bare "28/72" with no window reads as a
+        standing property of send failures, and across three months it is not one. A rate
+        quoted without its window is a baseline quoted without its date.
+
+        AND THIS RULE MOVES ITS OWN NUMBER, which is why the two are not a before/after: once
+        a dead page is caught before the send, fewer sends reach the point that writes one of
+        those rows at all. tools/send_failure_report states that limit rather than implying a
+        clean comparison it cannot make."""
         try:
             if self.page.is_closed():
                 return False
@@ -1324,6 +1556,90 @@ class CopilotWebDriver:
         except Exception:
             t = ""
         return t.replace("​", "").replace("‌", "").strip()
+
+    @staticmethod
+    def _normalise_visible_text(text: str) -> str:
+        """Normalize only representation noise, never semantic content."""
+        return " ".join(str(text or "").replace("\u200b", "").replace("\u200c", "").split())
+
+    def _stabilize_fresh_composer(self, composer, intended: str, *,
+                                  stable_s: float = 2.0, timeout_s: float = 10.0) -> bool:
+        """Require a fresh-chat draft to survive SPA hydration before Send.
+
+        Live proof 2026-10-01: a fresh M365 editor can display the full intended text and expose
+        it through Lexical, then ~100ms later reset to empty.  Send clicked inside that transient
+        window creates a real EMPTY user turn.  Waiting for *non-empty* is therefore insufficient.
+
+        We require the exact normalized text to remain continuously unchanged for ``stable_s``.
+        If hydration wipes it, re-focus, clear and atomically insert the same text again.  This
+        only runs for fresh conversations; continuation turns keep the old fast path.
+        """
+        wanted = self._normalise_visible_text(intended)
+        deadline = time.time() + max(0.1, float(timeout_s))
+        stable_since = None
+        while time.time() < deadline:
+            current = self._normalise_visible_text(self._composer_text())
+            if current == wanted:
+                if stable_since is None:
+                    stable_since = time.time()
+                if time.time() - stable_since >= max(0.0, float(stable_s)):
+                    return True
+                self.page.wait_for_timeout(100)
+                continue
+
+            # The fresh-page hydration reset won.  Re-enter the exact same draft, then start the
+            # continuous-stability clock again.  No Send/Enter occurs in this branch.
+            try:
+                composer.click(force=True, timeout=5000)
+            except Exception:
+                pass
+            self.page.keyboard.press("Control+a")
+            self.page.keyboard.press("Delete")
+            self.page.wait_for_timeout(100)
+            self.page.keyboard.insert_text(intended)
+            stable_since = None
+            self.page.wait_for_timeout(100)
+        return False
+
+    def _visible_user_questions(self) -> list[str]:
+        """Visible user-turn DOM, one entry per chatQuestion. Best-effort and read-only."""
+        try:
+            loc = self.page.locator(COPILOT_SELECTORS["user_msg"])
+            return [loc.nth(i).inner_text() or "" for i in range(loc.count())]
+        except Exception:
+            return []
+
+    def _wait_fresh_user_receipt(self, intended: str, before_count: int, *,
+                                 timeout_s: float | None = None,
+                                 mismatch_settle_s: float = 1.0) -> bool:
+        """Prove a fresh submit created exactly one intended, non-empty USER turn.
+
+        URL transition and a Stop/generating control prove *some* turn began, not that our draft
+        was the turn.  The R5 live audit observed a real ``You said:`` empty bubble followed by a
+        semantic resend.  This receipt refuses that as success, even if a later resend matches.
+        """
+        wanted = self._normalise_visible_text(intended)
+        deadline = time.time() + (self.SUBMIT_ACK_WAIT_S if timeout_s is None else timeout_s)
+        mismatch_since = None
+        while time.time() < deadline:
+            rows = self._visible_user_questions()
+            new_rows = rows[max(0, int(before_count)):]
+            if new_rows:
+                normalized = [self._normalise_visible_text(t) for t in new_rows]
+                matches = [wanted in t for t in normalized]
+                # Exactly one new turn, and that one contains the complete intended one-line
+                # payload.  Two new user turns means duplicate/recovery traffic happened before
+                # send() returned and cannot be accepted as a clean first delivery.
+                if len(new_rows) == 1 and matches[0] and normalized[0]:
+                    return True
+                if mismatch_since is None:
+                    mismatch_since = time.time()
+                elif time.time() - mismatch_since >= max(0.0, mismatch_settle_s):
+                    return False
+            else:
+                mismatch_since = None
+            self.page.wait_for_timeout(100)
+        return False
 
     def _wait_send_armed(self, timeout_s: float = 12.0) -> bool:
         """Wait until the Send button is present AND enabled.
@@ -1496,7 +1812,8 @@ class CopilotWebDriver:
         # EARLY DEAD-CHECK: if the tab/composer is already gone (conversation ended),
         # do NOT enter the type/arm/click retry loop -- it would just throw
         # TargetClosedError on every probe and waste the full 3x12s budget (the
-        # TargetClosedError race, 28/72 of send_failures). Fail fast and terminally so
+        # TargetClosedError race, 28 of the first 72 send_failures -- see _page_alive for
+        # what that rate is and is not). Fail fast and terminally so
         # run_relay records a STUCK instead of spinning. This is a pure read; never
         # types or clicks.
         if not self._page_alive():
@@ -1538,6 +1855,7 @@ class CopilotWebDriver:
         # genuinely NEW one (rather than re-reading the previous turn's answer).
         start_url = str(getattr(self.page, "url", "") or "")
         fresh_conversation = "/conversation/" not in start_url.lower()
+        user_count_before = len(self._visible_user_questions()) if fresh_conversation else 0
         if track_answer:
             try:
                 self._count_before = self._answers().count()
@@ -1584,10 +1902,16 @@ class CopilotWebDriver:
             # DOES arm, so nothing downstream notices. Comparing the composer against what
             # we meant to type is the only check that sees it.
             for _settle in range(8):
-                if self._composer_text():
+                if self._normalise_visible_text(self._composer_text()) == one_line:
                     break
                 self.page.wait_for_timeout(250)
                 self.page.keyboard.insert_text(one_line)
+            if fresh_conversation and not self._stabilize_fresh_composer(composer, one_line):
+                self._snapshot_send_failure(
+                    attempt=attempt, phase="fresh_composer_never_stabilized",
+                    allow_answer_content=track_answer,
+                )
+                continue
             _send_stage(_send_t0, "typed", attempt=attempt,
                         composer_len=len(self._composer_text() or ""))
             if self._wait_send_armed(timeout_s=12.0):
@@ -1618,33 +1942,31 @@ class CopilotWebDriver:
             # right after a fresh page). POLL for the composer to empty instead of one
             # fixed 800ms check -- the short check was the real cause of the false
             # "Send button never submitted" failures (and the retry then double-typed).
-            # Window is generous (12s) because under memory pressure the M365 SPA can take
-            # many seconds to clear the composer; a too-short window both falsely fails AND
-            # causes the retry to double-send. Re-click the Send button each second in case
-            # it re-armed without submitting (a load-induced no-op click).
+            # For continuation turns the legacy 12s composer/answer settle window remains below.
+            # Fresh turns deliberately bypass its re-click behavior and wait only for a visible
+            # user-turn receipt, because an ambiguous first submit must never be retried blindly.
             _send_stage(_send_t0, "clicked", attempt=attempt)
-            for i in range(48):                  # up to ~12s
+            if fresh_conversation:
+                # ONE SUBMIT ACTION PER fresh send(). After a click/Enter there is no safe basis
+                # for a second click merely because the composer is slow to clear: attempt 1 may
+                # already have landed. Wait only for the response-independent USER-turn receipt.
+                # This closes the duplicate window where attempt 2 could resend an already-landed
+                # first turn. A missing/mismatched receipt is ambiguous and therefore fail-closed.
+                if self._wait_fresh_user_receipt(one_line, user_count_before):
+                    return
+                self._snapshot_send_failure(
+                    attempt=attempt, phase="fresh_user_turn_receipt_mismatch",
+                    allow_answer_content=track_answer,
+                )
+                raise FreshSubmitAmbiguous(
+                    "fresh submit has no single matching user-turn receipt; "
+                    "the user turn may already have landed, so automatic resend is forbidden"
+                )
+
+            for i in range(48):                  # continuation turn, up to ~12s
                 self.page.wait_for_timeout(250)
                 if not self._composer_text():
-                    # On a fresh agent page the composer can be cleared by an SPA reset even
-                    # though no message was submitted.  Require a response-independent receipt:
-                    # a conversation URL, a live generation control, or a new response block.
-                    if not fresh_conversation:
-                        return
-                    ack_deadline = time.time() + self.SUBMIT_ACK_WAIT_S
-                    while time.time() < ack_deadline:
-                        current_url = str(getattr(self.page, "url", "") or "")
-                        if "/conversation/" in current_url.lower() or self._is_generating():
-                            return
-                        self.page.wait_for_timeout(250)
-                    self._snapshot_send_failure(
-                        attempt=attempt, phase="composer_cleared_without_turn_ack",
-                        allow_answer_content=track_answer,
-                    )
-                    raise RuntimeError(
-                        "send failed: composer cleared without a conversation or "
-                        "generation acknowledgement"
-                    )
+                    return
                 # STRONGER success signal: if a new answer block has appeared, the agent
                 # is already replying, so the send DID go through -- even if the composer
                 # is slow to visually clear under memory pressure. Without this, a laggy
@@ -2092,6 +2414,36 @@ def run_relay(
         t_send = time.time()
         try:
             driver.send(job)
+        except FreshSubmitAmbiguous as e:
+            # A fresh submit may already have landed even though its USER-turn receipt could
+            # not be proven. Treating that ambiguity like a transient transport failure and
+            # re-sending the same logical job can duplicate real work. This single-conversation
+            # loop used to do exactly that through the generic Exception branch below.
+            #
+            # The ONLY safe salvage is independent acceptance evidence from the target
+            # workspace. If those checks already pass, no resend is needed; otherwise stop and
+            # make the ambiguous delivery visible to the operator. Never rotate/retry here.
+            _amb_passed = False
+            _amb_detail = ""
+            if checks_norm:
+                try:
+                    _amb_passed, _amb_detail = run_all_blocking(checks_norm, cwd=cwd)
+                except Exception as _amb_exc:
+                    _amb_passed = False
+                    _amb_detail = "acceptance check error: %s" % type(_amb_exc).__name__
+            runlog_append(run_id, {
+                "turn": turn, "event": "fresh_submit_ambiguous",
+                "acceptance_checked": bool(checks_norm),
+                "acceptance_passed": bool(_amb_passed),
+                "detail": (_amb_detail or "")[:400],
+            })
+            if _amb_passed:
+                outcome = "DONE"
+                reason = "fresh submit delivery ambiguous; independent acceptance checks already pass"
+            else:
+                outcome = "STUCK"
+                reason = "fresh submit delivery ambiguous; automatic resend forbidden: %s" % str(e)
+            break
         except ConversationClosed as e:
             # The target tab/composer is gone (conversation ended). Retrying a dead
             # target can NEVER succeed, so this is terminal -- skip the transient-retry
@@ -2177,7 +2529,25 @@ def run_relay(
 
         runlog_append(run_id, {"turn": turn, "job_excerpt": job[:160],
                                "response_excerpt": resp[:500]})
-        memory_save(f"relay.{run_id}.turn{turn}", resp[:4000], scope="relay",
+        # THE CUT SAYS IT IS A CUT, AND THE BOUND IS THE STORE'S OWN.
+        #
+        # This was `resp[:4000]`, silently, into a store whose purpose is cross-session
+        # recall -- so a later session pulling relay.<id>.turnN would read a response cut
+        # mid-thought as the whole thing. Worse, memory_save ALREADY REFUSES a value over
+        # MAX_VALUE_CHARS (16,000) with an explicit error, which is the right behaviour;
+        # pre-cutting to 4,000 meant that guard could never fire. A caller that shortens
+        # data to stay under a limit it will never reach has replaced a loud refusal with
+        # a quiet loss.
+        #
+        # Found 2026-09-18 by sweeping the failure class after tripping it three times in
+        # one day: a 4,000-char cap destroyed a ChatHub frame, a 400-char cap produced a
+        # three-field transcription of a six-field request, and a 60-char cap ended a
+        # job's provenance mid-sentence. The rule is evidence_trace's own.
+        _kept = resp
+        if len(resp) > _MEMORY_TURN_CHARS:
+            _kept = resp[:_MEMORY_TURN_CHARS] + (
+                "\n[cut: kept %d of %d characters]" % (_MEMORY_TURN_CHARS, len(resp)))
+        memory_save(f"relay.{run_id}.turn{turn}", _kept, scope="relay",
                     tags=["relay", run_id])
         print(f"[relay turn {turn}] {resp[:160].replace(chr(10), ' ')}")
 

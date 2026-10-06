@@ -16,6 +16,9 @@ param(
     [switch]$CoreOnly,
     [switch]$NoSplash
 )
+# THE SCRIPT'S FIRST LINE: "ts" in start_all_runs.jsonl (New-StartAllRunRecord). What the process
+# spent before it (PowerShell starting) is "proc_ts", read from the process, not from here.
+$script:runStartedAt = Get-Date
 
 $ErrorActionPreference = "Continue"
 # This script lives in <repo>\scripts. $root is the REPO ROOT (.env, .git, ui\ live there);
@@ -23,18 +26,18 @@ $ErrorActionPreference = "Continue"
 # start_companion_edge.ps1, start_bridge.ps1) now live.
 $scriptDir = $PSScriptRoot
 $root = Split-Path -Parent $scriptDir
-
-# Shared PURE helpers (Get-SupervisorArgTunnel / Get-BareTunnelName /
-# Test-SupervisorTunnelDrift) for detecting a supervisor that drifted onto a
-# stale/borrowed tunnel -- see tunnel_name_util.ps1's header comment. No
-# top-level side effects, so dot-sourcing it here is safe.
-. (Join-Path $scriptDir "tunnel_name_util.ps1")
-. (Join-Path $scriptDir "update_recovery.ps1")
-
-# The .env backfill lives in one testable place; see scripts/win/env_defaults.ps1 for why
-# deciding "is this value ours or the user's" needs a record of what we wrote.
-. (Join-Path $PSScriptRoot "win\env_defaults.ps1")
-Ensure-EnvDefaults
+# The interpreter the helper calls below ask, and the bridge endpoint the server-swap rule
+# reads. Named once so the tests can point them at a throwaway clone and a stub server
+# instead of this machine's live bridge.
+$script:venvPy = Join-Path $root ".venv\Scripts\python.exe"
+$script:bootstrapPy = Join-Path $scriptDir "bootstrap.py"
+$script:bridgeStatusUrl = "http://127.0.0.1:8765/status"
+# Japanese-capable WinForms font helper (Get-JapaneseUiFont), dot-sourced once here so every
+# Form-building function below (Show-AlreadyRunningNotice, Start-Splash) can use it. See
+# scripts/win/ui_font.ps1 for why: a control with no explicit .Font falls back to Microsoft
+# Sans Serif (no Japanese glyphs), and Windows font-links to a CHINESE fallback font on a
+# non-Japanese system locale.
+. (Join-Path $scriptDir "win/ui_font.ps1")
 
 function Proc-Running([string]$pattern) {
     try {
@@ -49,44 +52,1015 @@ function Port-Up([int]$p) {
 function Http-Up([string]$url) {
     try { Invoke-WebRequest -UseBasicParsing -TimeoutSec 3 $url | Out-Null; return $true } catch { return $false }
 }
-function Proc-Is-Outdated([string]$repo, [string]$match, [string[]]$dirs, [string[]]$files) {
-    # True when a process matching $match is running that started BEFORE the newest source
-    # it loads. Only the modules that process imports at startup are considered, so editing
-    # docs or an unrelated tool never forces a restart. Any failure answers $false: an
-    # unreadable timestamp must never be the reason a healthy process gets torn down.
+# ---------------------------------------------------------------------------
+# WHO STARTED THIS RUN (.setup\logs\start_all_runs.jsonl, one line per invocation).
+#
+# On 2026-09-24 full start_alls kept appearing (the splash) and could not be attributed: the
+# launchers (wscript running a .vbs) had already exited, and nothing recorded who had started
+# which run. So the lineage is read HERE, as the first thing the script does -- before the
+# launcher is gone -- and written with the lock wait and the outcome at the end
+# (New-StartAllRunRecord / Write-StartAllRunRecord). A parent that has already exited still
+# leaves its pid (ParentProcessId outlives it); a live pid whose process started AFTER this one
+# is a reused pid, not the parent, and is not reported as one.
+# ---------------------------------------------------------------------------
+function Get-Win32ProcessByPid([int]$Id) {
+    # One Win32_Process by its key, or $null. A [wmi] key lookup, NOT Get-CimInstance: this runs
+    # at the top of EVERY start_all, including the ones that only find a startup running and
+    # leave, and ten clicks at once measured Get-CimInstance (CimCmdlets autoload + a CIM
+    # session + a query) at ~1 s per process against ~0.35 s for this; under further load the
+    # lineage alone took 2.7 s of a leaver's life.
+    try { return [wmi]("Win32_Process.Handle='" + $Id + "'") } catch { return $null }
+}
+function ConvertFrom-WmiDate($Value) {
+    try { return [System.Management.ManagementDateTimeConverter]::ToDateTime([string]$Value) } catch { return $null }
+}
+function Get-LaunchLineage([switch]$ParentOnly) {
+    # -ParentOnly: this process and its parent, not the grandparent -- for a copy that leaves
+    # because a startup is running (who clicked is the parent; one lookup fewer on its way out).
+    $l = [ordered]@{ parent_pid = 0; parent_name = ""; parent_cmd = ""; grandparent_pid = 0; grandparent_name = "" }
+    if ($ParentOnly) {
+        # THE LAUNCHER ALREADY KNOWS ITS OWN PID -- ASK IT, DON'T QUERY THE OS (2026-09-25,
+        # CI leaver_max_s still crossing 3.0 s after the spool-file fix). Measured: the ONE WMI
+        # moniker lookup this function makes ([wmi]"Win32_Process.Handle=...", already the
+        # cheapest of everything tried -- Add-Type/P-Invoke to NtQueryInformationProcess,
+        # Get-Counter's PDH counters, a Reflection.Emit P-Invoke with no Add-Type/compiler at
+        # all, a budgeted async Runspace -- was EQUAL OR WORSE under the same contention, because
+        # every one of them does its own CPU-bound setup (a compiler process, a new runspace, a
+        # JIT) that competes for the same starved cores; there is no cheaper way to ask the OS
+        # "who is my parent" once the machine is genuinely CPU-saturated) still cost 0.25-2.3 s
+        # of a leaver's life as CPU contention rose in local repro (a 12-core box loaded to
+        # 91-100% with 20-46 competing processes), the same shape as CI's small (0.09-0.23 s)
+        # overshoot on its 2 vCPU runner. So skip the query entirely when the launcher told us
+        # who it is: start_all_hidden.vbs and start_all.bat's WSH-disabled fallback branch both
+        # set MCP_STARTALL_LAUNCH_PARENT_NAME (and _PID, when the launcher's own pid is free to
+        # read, e.g. $PID in a PowerShell launcher) on the child's environment before starting it
+        # -- inherited environment reads cost nothing. Only a launch this script does not
+        # control (a bare `powershell start_all.ps1`, the re-exec handoff) falls through to WMI
+        # below, same as before.
+        $envName = "$env:MCP_STARTALL_LAUNCH_PARENT_NAME"
+        $env:MCP_STARTALL_LAUNCH_PARENT_NAME = $null   # read once; never handed to what this run starts
+        $envPidRaw = "$env:MCP_STARTALL_LAUNCH_PARENT_PID"
+        $env:MCP_STARTALL_LAUNCH_PARENT_PID = $null
+        if ($envName) {
+            $l.parent_name = $envName
+            $l.parent_cmd = "(not read)"
+            $l.grandparent_name = "(not read)"
+            $envPid = 0
+            if ([int]::TryParse($envPidRaw, [ref]$envPid) -and $envPid -gt 0) { $l.parent_pid = $envPid }
+            return $l
+        }
+    }
     try {
-        $procs = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                   Where-Object { $_.CommandLine -and ($_.CommandLine -match $match) })
-        if ($procs.Count -eq 0) { return $false }   # nothing running -> normal start path
-        $started = ($procs | Measure-Object -Property CreationDate -Minimum).Minimum
-        if (-not $started) { return $false }
-        $newest = $null
-        foreach ($sub in $dirs) {
-            $d = Join-Path $repo $sub
-            if (-not (Test-Path $d)) { continue }
-            $m = (Get-ChildItem $d -Filter *.py -File -ErrorAction SilentlyContinue |
-                  Where-Object { $_.Name -notlike 'test_*' } |
-                  Measure-Object -Property LastWriteTime -Maximum).Maximum
-            if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
+        $me = Get-Win32ProcessByPid $PID
+        if (-not $me) { return $l }
+        $l.parent_pid = [int]$me.ParentProcessId
+        $meAt = ConvertFrom-WmiDate $me.CreationDate
+        if ($ParentOnly) {
+            # The parent's NAME from [Diagnostics.Process] (~10 ms), not a second WMI lookup
+            # (~0.2-0.5 s under load); its command line is not read.
+            $l.parent_cmd = "(not read)"
+            $l.grandparent_name = "(not read)"
+            try {
+                $pp = [System.Diagnostics.Process]::GetProcessById([int]$me.ParentProcessId)
+                if ($meAt -and ($pp.StartTime -le $meAt)) { $l.parent_name = $pp.ProcessName + ".exe" } else { $l.parent_name = "(exited)" }
+            } catch { $l.parent_name = "(exited)" }
+            return $l
         }
-        foreach ($f in $files) {
-            $p = Join-Path $repo $f
-            if (-not (Test-Path $p)) { continue }
-            $m = (Get-Item $p -ErrorAction SilentlyContinue).LastWriteTime
-            if ($m -and (-not $newest -or $m -gt $newest)) { $newest = $m }
+        $p = Get-Win32ProcessByPid ([int]$me.ParentProcessId)
+        $pAt = $null
+        if ($p) { $pAt = ConvertFrom-WmiDate $p.CreationDate }
+        if ($p -and $pAt -and $meAt -and ($pAt -le $meAt)) {
+            $l.parent_name = [string]$p.Name
+            $l.parent_cmd = [string]$p.CommandLine
+            $l.grandparent_pid = [int]$p.ParentProcessId
+            $g = Get-Win32ProcessByPid ([int]$p.ParentProcessId)
+            $gAt = $null
+            if ($g) { $gAt = ConvertFrom-WmiDate $g.CreationDate }
+            $l.grandparent_name = $(if ($g -and $gAt -and ($gAt -le $pAt)) { [string]$g.Name } else { "(exited)" })
+        } else {
+            $l.parent_name = "(exited)"
         }
-        if (-not $newest) { return $false }
-        return ($newest -gt $started)
+    } catch { }
+    return $l
+}
+# READ RIGHT AFTER THE ENTRY DECISION, not here (since 2026-09-24, see Invoke-StartAllEntry's call
+# site): the lookup costs ~0.65 s under load, and every copy that only finds a startup running
+# and leaves used to pay it before it could even ask. Between here and there the script only
+# defines functions (tens of ms), so it is still read before the splash and Invoke-Startup --
+# long before the launcher exits.
+$script:launch = $null
+$script:lockState = "not reached"
+$script:lockWaitSec = 0.0
+
+# =============================================================================================
+# THE ENTRY DECISION, AS EARLY AS THE SCRIPT CAN MAKE IT (2026-09-24). Everything a copy needs to
+# decide "a startup is already running -- leave" and to leave (the lock, the role records, the
+# run log, redaction) is defined here, ABOVE the rest of the script and its dot-sourced helpers:
+# measured with ten concurrent clicks under load, defining the ~2,000 lines below and dot-sourcing
+# four files cost a leaving copy 0.3-0.6 s before it could even probe the lock, and the running
+# startup the same before it wrote the holder record the others wait for.
+# =============================================================================================
+$script:startupFailures = @()
+# Problems that could not be confirmed either way (a bounded external check -- devtunnel CLI --
+# timed out or answered unreadably) go here, NOT into $script:startupFailures: they are not a
+# known-bad state, so they must not flip the run to "failures" or the exit code non-zero. But
+# they must not be silently "ok" either (2026-09-24 sandbox: a devtunnel CLI answer that could
+# not be read within 10 s meant the tunnel was never actually confirmed hosted, yet the run's
+# own record said outcome=ok) -- see the "unclear" outcome near the bottom of this file.
+$script:startupUnclear = @()
+
+# PHASE TIMING (profiling review, 2026-09-24). A Windows Sandbox run took 6-7 minutes and
+# nothing recorded WHERE the time went -- start_all_runs.jsonl had lock_wait_s and a total
+# (ts/end) but nothing in between, so every theory about the cause was a guess. Record-PhaseTiming
+# is called around each major stage of Invoke-Startup below; New-StartAllRunRecord adds the
+# whole map as "phases" on the run record next to the existing lock/outcome fields. PURE
+# arithmetic plus one hashtable write -- never throws, so a phase that itself fails still gets
+# its time recorded by the caller's own try/finally or by running to its next statement.
+$script:phaseTimings = [ordered]@{}
+function Record-PhaseTiming([string]$Name, [datetime]$Since) {
+    if (-not $script:phaseTimings) { $script:phaseTimings = [ordered]@{} }
+    $script:phaseTimings[$Name] = [math]::Round(((Get-Date) - $Since).TotalSeconds, 2)
+}
+
+
+# ---------------------------------------------------------------------------
+# ONE start_all AT A TIME (new-PC analysis D14).
+#
+# The logon autostart launches this script TWICE: register-supervisor.ps1 installs a Startup-
+# folder shortcut AND a scheduled task (15 s delay), both running start_background_hidden.vbs.
+# Only the supervisor had a single-instance guard; two copies of this script ran every step
+# side by side -- two .env backfills, two orphan sweeps, two fleet-resume checks that could
+# both see the same interrupted run and relaunch it twice onto one state directory.
+#
+# GLOBAL, FOR THE SUPERVISOR'S REASON. supervisor.ps1 takes Global\m365-copilot-companion-
+# supervisor so that an instance started by Task Scheduler and one started by hand cannot race,
+# whatever session each runs in; this script is launched by exactly those two paths. And what
+# it starts is machine-wide anyway (ports 8000/8765/9222, the supervisor's own Global mutex), so
+# a second copy on the same machine has nothing of its own to start.
+#
+# A SECOND COPY WAITS, IT DOES NOT QUIT. Every step here is idempotent, so running after the
+# first copy finishes is correct and cheap -- and quitting would lose what the second launch
+# was for: a double-click during a background logon start still has to open the windows.
+# (Since 2026-09-24 only the copies that NEED to wait do; the rest leave at entry -- see the block
+# above Get-RankOfStartAllMode.)
+# ---------------------------------------------------------------------------
+$script:startAllLock = $null
+function Enter-StartAllLock {
+    # Returns $true once this process holds the lock (or when a lock cannot be created at all:
+    # Constrained Language Mode refuses New-Object on a Mutex, and a missing lock must never be
+    # the reason nothing starts). $false only after waiting $TimeoutSec for another copy.
+    # -KeepWaitingWhile: past $TimeoutSec, keep waiting (up to $MaxExtraSec more) while this
+    # returns true. Used for "the holder is installing Python dependencies" (Invoke-
+    # DependencySync), which on a slow proxied network can outlast ten minutes -- and giving up
+    # then would count a failure telling the operator to close a start_all that is working.
+    param([string]$Name = "Global\m365-copilot-companion-start-all",
+          [int]$TimeoutSec = 600,
+          [scriptblock]$OnWait = $null,
+          [scriptblock]$KeepWaitingWhile = $null,
+          [int]$MaxExtraSec = 3600)
+    try {
+        $m = New-Object System.Threading.Mutex($false, $Name)
+    } catch {
+        Write-Host "[lock] single-instance lock unavailable ($($_.Exception.Message)) -- continuing without it"
+        return $true
+    }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    $hardDeadline = $deadline.AddSeconds($MaxExtraSec)
+    $extended = $false
+    $announced = $false
+    while ($true) {
+        $got = $false
+        try {
+            $got = $m.WaitOne(250)
+        } catch {
+            # A copy that died holding it (killed, or the Environment.Exit of a self-update)
+            # leaves it ABANDONED. MEASURED on Windows PowerShell 5.1: after the holder exits
+            # or is killed, WaitOne simply returns True (scripts/test_start_all_install_path.py
+            # covers that). A runtime that raises AbandonedMutexException instead has still
+            # handed over ownership, so that is taken the same way rather than treated as a
+            # failure to start.
+            $inner = $_.Exception
+            while ($inner -and -not ($inner -is [System.Threading.AbandonedMutexException])) { $inner = $inner.InnerException }
+            if ($inner) { $got = $true } else { throw }
+        }
+        if ($got) { $script:startAllLock = $m; return $true }
+        if (-not $announced) {
+            Write-Host "[lock] another start_all is already running on this machine -- waiting for it to finish (up to $TimeoutSec s)"
+            $announced = $true
+        }
+        if ($OnWait) { & $OnWait }
+        if ((Get-Date) -ge $deadline) {
+            $keep = $false
+            if ($KeepWaitingWhile -and ((Get-Date) -lt $hardDeadline)) {
+                try { $keep = [bool](& $KeepWaitingWhile) } catch { $keep = $false }
+            }
+            if ($keep) {
+                if (-not $extended) {
+                    Write-Host "[lock] the other start_all is still installing Python dependencies -- waiting for it (up to $MaxExtraSec s more)"
+                    $extended = $true
+                }
+                $deadline = (Get-Date).AddSeconds(15)
+                continue
+            }
+            try { $m.Dispose() } catch { }
+            return $false
+        }
+    }
+}
+function Exit-StartAllLock {
+    Exit-StartAllWaiterSlot
+    if (-not $script:startAllLock) { return }
+    # The record goes BEFORE the lock: a copy that then takes the lock must not find ours.
+    Remove-StartAllRoleRecord "holder"
+    try { $script:startAllLock.ReleaseMutex() } catch { }
+    try { $script:startAllLock.Dispose() } catch { }
+    $script:startAllLock = $null
+}
+
+# ---------------------------------------------------------------------------
+# A COPY THAT FINDS A STARTUP ALREADY RUNNING DOES NOT QUEUE ANOTHER ONE (2026-09-24).
+#
+# "A second copy waits" (above) was written for the two logon launches, and it covered every
+# other way a second copy arrives too: a person double-clicking the desktop icon, or clicking it
+# ten times because nothing seemed to happen, and the cockpit's auto-repair (repair.ps1 -Auto runs
+# start_all.ps1 -NoUi -NoSplash). Each showed its own banner ("Another startup is already
+# running -- waiting..."), waited on the lock, and then ran the WHOLE bring-up again after the
+# first had finished: a stack of full start_alls, one banner each, queued for ~20 minutes that
+# day. Measured with scripts/test_start_all_ten_clicks.py: ten clicks = ten banners, ten
+# bring-ups one after the other.
+#
+# So the lock is probed at ENTRY (Invoke-StartAllEntry, before any banner exists), and a copy
+# that finds it held asks one question: does the running startup already do what this launch
+# was for? Coverage is by mode -- full (windows) > background -NoUi (services) > -CoreOnly
+# (supervisor only); a holder whose record cannot be read within ~1.5 s (not written yet, or an
+# older copy of this script that writes none) counts as background.
+#   * covered -> LEAVE within ~2 s: bring the running startup's banner to the front (or, when it
+#     shows none, a short notice that closes itself; a -NoUi / -NoSplash copy shows nothing),
+#     write "already running" to start_all_runs.jsonl, exit 0. Nothing is queued.
+#   * not covered -> WAIT, exactly as before. Who still waits, and why:
+#       - the post-update re-exec (MCP_STARTALL_HANDOFF_PID naming OUR parent, set by
+#         Invoke-PostUpdateTail): it IS the startup in progress, continued on the new code;
+#       - -CoreOnly: quickstart's synchronous step between STEP 4 and STEP 5, which reads this
+#         run's exit code and needs the supervisor up before it asks for a connection test;
+#       - a launch that needs MORE than the running one: a double-click (full) during a
+#         background logon start still has to open the windows -- the reason this lock was
+#         written to wait. Only ONE such copy waits (the "-waiter" mutex); every later one
+#         leaves and brings that waiter's banner forward.
+#     A waiting copy still keeps waiting past its 10 minutes while the holder installs Python
+#     dependencies (Test-DepsInstallInProgress, 7034f0b) -- unchanged.
+# Who holds the lock, and whether it shows a banner, is in .setup\start_all_holder.json (and
+# start_all_waiter.json for the one waiter), trusted only while that pid is alive with the same
+# start time.
+# ---------------------------------------------------------------------------
+$script:startAllLockName = "Global\m365-copilot-companion-start-all"
+$script:waiterSlot = $null
+$script:busyHolderPid = 0
+
+function Get-RankOfStartAllMode([string]$Mode) {
+    # PURE. How much of the stack a run of this mode (Get-StartAllMode) brings up.
+    switch ($Mode) {
+        "full" { return 3 }
+        "background (-NoUi)" { return 2 }
+        "core (-CoreOnly)" { return 1 }
+    }
+    return 0
+}
+function Get-StartAllBusyAction {
+    # PURE. What a copy that found the start_all lock held does: "leave", "wait", or "wait-one"
+    # (wait only if it can take the single waiter slot, else leave). See the block above.
+    param([string]$Mode, [string]$HolderMode, [bool]$Handoff)
+    if ($Handoff) { return "wait" }
+    if ($Mode -eq "core (-CoreOnly)") { return "wait" }
+    $h = Get-RankOfStartAllMode $HolderMode
+    if ($h -eq 0) { $h = 2 }
+    if ($h -ge (Get-RankOfStartAllMode $Mode)) { return "leave" }
+    return "wait-one"
+}
+function Test-TakeMutex($Mutex, [int]$Ms) {
+    # WaitOne, with an abandoned mutex taken as owned (see Enter-StartAllLock).
+    try { return [bool]$Mutex.WaitOne($Ms) } catch {
+        $inner = $_.Exception
+        while ($inner -and -not ($inner -is [System.Threading.AbandonedMutexException])) { $inner = $inner.InnerException }
+        return [bool]$inner
+    }
+}
+function Get-StartAllRolePath([string]$Role) {
+    return (Join-Path $root (".setup\start_all_" + $Role + ".json"))
+}
+function ConvertTo-StartAllRoleJson($Pid_, [long]$Started, [string]$Mode, [bool]$Banner, [long]$Hwnd) {
+    # PURE. The role record, written and read by this file alone, in a fixed shape.
+    # NOT ConvertTo-Json / ConvertFrom-Json: the FIRST ConvertFrom-Json in a Windows PowerShell
+    # 5.1 process costs ~0.33 s (measured with ten processes at once), and a copy that leaves
+    # reads this file on its way out -- ConvertFrom-StartAllRoleJson below reads this shape.
+    $m = ("" + $Mode).Replace('\', '').Replace('"', '')
+    return ('{{"pid":{0},"started":{1},"mode":"{2}","banner":{3},"hwnd":{4}}}' -f [int]$Pid_, $Started, $m, $(if ($Banner) { "true" } else { "false" }), $Hwnd)
+}
+function ConvertFrom-StartAllRoleJson([string]$Text) {
+    # PURE. The record ConvertTo-StartAllRoleJson writes, or $null for anything else.
+    $m = [regex]::Match(("" + $Text), '^\s*\{"pid":(\d+),"started":(\d+),"mode":"([^"]*)","banner":(true|false),"hwnd":(-?\d+)\}\s*$')
+    if (-not $m.Success) { return $null }
+    return [PSCustomObject]@{ pid = [int]$m.Groups[1].Value; started = [long]$m.Groups[2].Value; mode = $m.Groups[3].Value
+                              banner = ($m.Groups[4].Value -eq "true"); hwnd = [long]$m.Groups[5].Value }
+}
+function Get-ProcessStartTicks([int]$Id) {
+    # UTC start ticks of a live process, or 0. [Diagnostics.Process], not Get-Process: ~10 ms
+    # against ~110 ms with ten processes starting at once.
+    try { return [System.Diagnostics.Process]::GetProcessById($Id).StartTime.ToUniversalTime().Ticks } catch { return 0 }
+}
+function Write-StartAllRoleRecord([string]$Role, [bool]$Banner = $false, [long]$Hwnd = 0) {
+    try {
+        $p = Get-StartAllRolePath $Role
+        $dir = [System.IO.Path]::GetDirectoryName($p)
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $text = ConvertTo-StartAllRoleJson $PID (Get-ProcessStartTicks $PID) (Get-StartAllMode) $Banner $Hwnd
+        $tmp = $p + "." + $PID + ".tmp"
+        [System.IO.File]::WriteAllText($tmp, $text, (New-Object System.Text.UTF8Encoding($false)))
+        # Retried: the copies that leave READ this file while it is replaced (see Save-StartAllRunLines).
+        for ($i = 0; $i -lt 20; $i++) {
+            try {
+                if ([System.IO.File]::Exists($p)) { [System.IO.File]::Replace($tmp, $p, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $p) }
+                return $true
+            } catch { Start-Sleep -Milliseconds 25 }
+        }
+        try { [System.IO.File]::Delete($tmp) } catch { }
+        return $false
     } catch { return $false }
 }
-function Bridge-Is-Outdated([string]$repo) {
-    return (Proc-Is-Outdated $repo 'copilot_bridge\.py' @('bridge', 'tools', 'relay') @())
+function Read-StartAllRoleRecord([string]$Role) {
+    # The record, only while the process that wrote it is alive: same pid AND same start time,
+    # so a record left by a killed copy (or a reused pid) is not believed.
+    # READ AGAIN WHILE IT IS BEING REPLACED. The holder rewrites its record when its banner
+    # appears (Update-StartAllBannerRecord); a copy reading at that moment got a sharing
+    # violation or no file, took it as "no banner" and showed the notice instead of bringing the
+    # banner forward (measured: 1-2 of 9 clicks, once the entry decision moved to the top).
+    try {
+        $p = Get-StartAllRolePath $Role
+        $text = $null
+        for ($i = 0; $i -lt 5 -and $null -eq $text; $i++) {
+            try { if ([System.IO.File]::Exists($p)) { $text = [System.IO.File]::ReadAllText($p) } } catch { }
+            if ($null -eq $text) { Start-Sleep -Milliseconds 20 }
+        }
+        if ($null -eq $text) { return $null }
+        $r = ConvertFrom-StartAllRoleJson $text
+        if (-not $r -or -not $r.pid) { return $null }
+        $ticks = Get-ProcessStartTicks $r.pid
+        if (-not $ticks) { return $null }
+        if ($r.started -and ([math]::Abs($ticks - $r.started) -gt 20000000)) { return $null }
+        return $r
+    } catch { return $null }
 }
-function Server-Is-Outdated([string]$repo) {
-    # main.py そのものと、それが起動時に取り込む tools/relay を見る。ブリッジだけを
-    # 見ていた頃、main.py の説明文を書き換えても再起動されず、古い文言が配られ続けた。
-    # 直したのに直っていない、という一番たちの悪い状態になる。
-    return (Proc-Is-Outdated $repo 'main\.py' @('tools', 'relay') @('main.py'))
+function Remove-StartAllRoleRecord([string]$Role) {
+    try {
+        $p = Get-StartAllRolePath $Role
+        if (-not [System.IO.File]::Exists($p)) { return }
+        $r = ConvertFrom-StartAllRoleJson ([System.IO.File]::ReadAllText($p))
+        if ($r -and ([int]$r.pid -eq $PID)) { [System.IO.File]::Delete($p) }
+    } catch { }
+}
+function Exit-StartAllWaiterSlot {
+    if (-not $script:waiterSlot) { return }
+    Remove-StartAllRoleRecord "waiter"
+    try { $script:waiterSlot.ReleaseMutex() } catch { }
+    try { $script:waiterSlot.Dispose() } catch { }
+    $script:waiterSlot = $null
+}
+function Update-StartAllBannerRecord {
+    # Called when this copy's banner appears or goes: the copies that leave bring it forward.
+    $hwnd = 0
+    $shown = [bool]($script:splash)
+    if ($shown) { try { $hwnd = $script:splash.Form.Handle.ToInt64() } catch { $hwnd = 0 } }
+    if ($script:startAllLock) { $null = Write-StartAllRoleRecord "holder" $shown $hwnd }
+    elseif ($script:waiterSlot) { $null = Write-StartAllRoleRecord "waiter" $shown $hwnd }
+}
+function Test-StartAllHandoff {
+    # The post-update re-exec: Invoke-PostUpdateTail sets MCP_STARTALL_HANDOFF_PID to its own pid
+    # and starts this copy. Compared with OUR parent, so a process that merely inherited the
+    # variable (a window the re-exec'd run started, a repair that window launched) is not one.
+    # Runs BEFORE the lineage is read (see $script:launch), so it asks for our parent itself --
+    # and only when the variable is set at all, which is only the re-exec case.
+    $h = 0
+    try { $h = [int]$env:MCP_STARTALL_HANDOFF_PID } catch { $h = 0 }
+    if ($h -le 0) { return $false }
+    $parent = 0
+    if ($script:launch) { $parent = [int]$script:launch.parent_pid }
+    else { $me = Get-Win32ProcessByPid $PID; if ($me) { $parent = [int]$me.ParentProcessId } }
+    return [bool]($parent -eq $h)
+}
+function Invoke-StartAllEntry {
+    # "run": this copy holds the lock. "wait": Invoke-Startup waits for it (Enter-StartAllLock).
+    # "leave": a startup that covers this launch is running (see the block above).
+    $t0 = Get-Date
+    $handoff = Test-StartAllHandoff
+    $env:MCP_STARTALL_HANDOFF_PID = $null        # read once; not handed down to what this run starts
+    try {
+        $m = New-Object System.Threading.Mutex($false, $script:startAllLockName)
+    } catch {
+        return "wait"      # no lock possible (Constrained Language Mode): Enter-StartAllLock says so and runs
+    }
+    if (Test-TakeMutex $m 0) {
+        $script:startAllLock = $m
+        $null = Write-StartAllRoleRecord "holder" (-not $NoSplash) 0
+        return "run"
+    }
+    try { $m.Dispose() } catch { }
+    $holder = $null
+    $deadline = $t0.AddMilliseconds(1500)
+    while ($true) {
+        $holder = Read-StartAllRoleRecord "holder"
+        if ($holder -or ((Get-Date) -ge $deadline)) { break }
+        # 25ms, not 100ms: a leaver's whole budget is LEAVE_BOUND_SEC (3s, see
+        # test_start_all_ten_clicks.py), and the holder record is normally written within a
+        # few ms of the holder taking the lock -- polling at 100ms granularity could add up
+        # to 75ms of pure rounding to a step that is supposed to be near-instant, on top of
+        # the same rounding in the waiter-record loop below. Tightened 2026-09-24 (CI:
+        # leaver_max_s 3.08s > the 3.0s bound) rather than raising the bound.
+        Start-Sleep -Milliseconds 25
+    }
+    $holderMode = ""
+    if ($holder) { $holderMode = [string]$holder.mode; $script:busyHolderPid = [int]$holder.pid }
+    $act = Get-StartAllBusyAction -Mode (Get-StartAllMode) -HolderMode $holderMode -Handoff $handoff
+    if ($act -eq "wait-one") {
+        $act = "leave"
+        try {
+            $w = New-Object System.Threading.Mutex($false, ($script:startAllLockName + "-waiter"))
+            if (Test-TakeMutex $w 0) {
+                $script:waiterSlot = $w
+                $null = Write-StartAllRoleRecord "waiter" (-not $NoSplash) 0
+                $act = "wait"
+            } else {
+                try { $w.Dispose() } catch { }
+                # The waiter took its slot a moment ago and may not have written its record yet;
+                # without it there is no banner to bring forward (measured: 1 in 8 got the notice).
+                while (-not (Read-StartAllRoleRecord "waiter") -and ((Get-Date) -lt $deadline)) {
+                    Start-Sleep -Milliseconds 25
+                }
+            }
+        } catch { $act = "wait" }
+    }
+    return $act
+}
+function Add-BannerWinType {
+    if ("M365.BannerWin" -as [type]) { return $true }
+    try {
+        Add-Type -Namespace M365 -Name BannerWin -MemberDefinition @"
+[DllImport("user32.dll")] public static extern bool IsWindow(IntPtr h);
+[DllImport("user32.dll")] public static extern bool IsIconic(IntPtr h);
+[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int n);
+[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+"@ -ErrorAction Stop
+        return $true
+    } catch { return $false }
+}
+function Show-RunningBanner([int]$BudgetMs = 1200) {
+    # Brings the banner of the running startup (or of the one copy waiting behind it) to the
+    # front. Returns that process's pid, or 0 when neither shows one within $BudgetMs.
+    $deadline = (Get-Date).AddMilliseconds($BudgetMs)
+    $typeOk = $false
+    while ($true) {
+        $expected = $false
+        foreach ($role in @("holder", "waiter")) {
+            $r = Read-StartAllRoleRecord $role
+            if (-not $r -or -not $r.banner) { continue }
+            $expected = $true
+            $h = [IntPtr]([long]$r.hwnd)
+            if ($h -eq [IntPtr]::Zero) { continue }       # created, handle not recorded yet
+            if (-not $typeOk) { $typeOk = Add-BannerWinType; if (-not $typeOk) { return 0 } }
+            if (-not [M365.BannerWin]::IsWindow($h)) { continue }
+            if ([M365.BannerWin]::IsIconic($h)) { [void][M365.BannerWin]::ShowWindow($h, 9) }   # SW_RESTORE
+            [void][M365.BannerWin]::SetForegroundWindow($h)
+            return [int]$r.pid
+        }
+        if ((-not $expected) -or ((Get-Date) -ge $deadline)) { return 0 }
+        Start-Sleep -Milliseconds 100
+    }
+}
+function Get-StartAllUiLanguage {
+    # "ja" or "en": MCP_NOTIFY_LANG, else the operator's UI culture -- the rule
+    # relay/selfimprove/authority_ledger.py ui_language() uses for the desktop notices.
+    $o = ("" + $env:MCP_NOTIFY_LANG).Trim().ToLowerInvariant()
+    if ($o -in @("ja", "en")) { return $o }
+    try { if ([System.Globalization.CultureInfo]::CurrentUICulture.TwoLetterISOLanguageName -eq "ja") { return "ja" } } catch { }
+    return "en"
+}
+function Get-AlreadyRunningText([string]$Lang) {
+    # PURE. Japanese is built from code points: this file has no BOM, so Windows PowerShell 5.1
+    # reads it in the ANSI code page and a literal would arrive mangled.
+    if ($Lang -eq "ja") {
+        return (-join (@(0x8D77, 0x52D5, 0x51E6, 0x7406, 0x306F, 0x3059, 0x3067, 0x306B, 0x9032, 0x884C, 0x4E2D, 0x3067, 0x3059) | ForEach-Object { [char]$_ }))
+    }
+    return "Startup is already in progress."
+}
+function Show-AlreadyRunningNotice([int]$Ms = 1500) {
+    # Shown only when the running startup has no banner to bring forward. Closes itself.
+    try {
+        Add-Type -AssemblyName System.Windows.Forms | Out-Null
+        Add-Type -AssemblyName System.Drawing | Out-Null
+        $null = Add-BannerWinType
+        $f = New-Object System.Windows.Forms.Form
+        $f.Text = "M365 Companion"
+        $f.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedToolWindow
+        $f.StartPosition = [System.Windows.Forms.FormStartPosition]::CenterScreen
+        $f.ClientSize = New-Object System.Drawing.Size(360, 70)
+        $f.TopMost = $true
+        $f.ShowInTaskbar = $false
+        $l = New-Object System.Windows.Forms.Label
+        $l.Text = Get-AlreadyRunningText (Get-StartAllUiLanguage)
+        # Get-AlreadyRunningText returns real Japanese text when the UI language is "ja" -- a
+        # bare "Segoe UI" font does not cover Japanese and mis-renders it via Chinese font
+        # linking on a non-Japanese system locale (see scripts/win/ui_font.ps1).
+        $l.Font = Get-JapaneseUiFont -SizePoints 11
+        $l.AutoSize = $false
+        $l.Size = New-Object System.Drawing.Size(336, 46)
+        $l.Location = New-Object System.Drawing.Point(12, 12)
+        $l.TextAlign = [System.Drawing.ContentAlignment]::MiddleCenter
+        $f.Controls.Add($l)
+        $script:noticeForm = $f
+        $t = New-Object System.Windows.Forms.Timer
+        $t.Interval = [math]::Max(200, $Ms)
+        $t.Add_Tick({ try { $args[0].Stop() } catch { }; try { $script:noticeForm.Close() } catch { } })
+        # A form in a hidden (window 0) launch inherits SW_HIDE; show it explicitly (see Start-Splash).
+        $f.Add_Shown({ try { [void][M365.BannerWin]::ShowWindow($this.Handle, 5) } catch { } })
+        $t.Start()
+        [void]$f.ShowDialog()
+        try { $t.Dispose(); $f.Dispose() } catch { }
+    } catch { }
+}
+function Invoke-StartAllLeave {
+    Write-Host "[lock] a startup is already running (pid $script:busyHolderPid) and covers this launch -- not starting a second one"
+    if ((-not $NoUi) -and (-not $NoSplash)) {
+        $shown = 0
+        try { $shown = Show-RunningBanner } catch { $shown = 0 }
+        if (-not $shown) { Show-AlreadyRunningNotice }
+    }
+    $script:lockState = "busy"
+    $script:lockWaitSec = [math]::Round(((Get-Date) - $script:runStartedAt).TotalSeconds, 1)
+    # SPOOLED, not Write-StartAllRunRecord (2026-09-25, scripts/test_start_all_ten_clicks.py):
+    # a leaving copy never shares a lock with another leaving copy -- see
+    # Write-StartAllRunRecordSpooled's own comment for why a shared mutex here does not scale
+    # to ten-at-once on the CI runner even after every earlier optimisation of that path.
+    $null = Write-StartAllRunRecordSpooled (Join-Path $script:diagDir "start_all_runs.d") (New-StartAllRunRecord "already running")
+}
+
+function Get-StartAllMode {
+    if ($CoreOnly) { return "core (-CoreOnly)" }
+    if ($NoUi) { return "background (-NoUi)" }
+    return "full"
+}
+function New-StartAllRunRecord([string]$Outcome) {
+    # One line of start_all_runs.jsonl -- see Get-LaunchLineage's header.
+    $sw = @()
+    if ($NoUi) { $sw += "-NoUi" }
+    if ($NoSplash) { $sw += "-NoSplash" }
+    if ($CoreOnly) { $sw += "-CoreOnly" }
+    $l = $script:launch
+    if (-not $l) { $l = @{} }
+    return [ordered]@{
+        proc_ts          = $(try { [System.Diagnostics.Process]::GetCurrentProcess().StartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz") } catch { "" })
+        ts               = $script:runStartedAt.ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
+        end              = (Get-Date).ToString("yyyy-MM-ddTHH:mm:ss.fffzzz")
+        pid              = $PID
+        mode             = (Get-StartAllMode)
+        switches         = $sw
+        reexec           = ($env:MCP_STARTALL_REEXEC -eq "1")
+        parent_pid       = $l.parent_pid
+        parent_name      = $l.parent_name
+        parent_cmd       = (Hide-Secrets ([string]$l.parent_cmd))
+        grandparent_pid  = $l.grandparent_pid
+        grandparent_name = $l.grandparent_name
+        lock             = $script:lockState
+        lock_wait_s      = $script:lockWaitSec
+        failures         = @($script:startupFailures).Count
+        outcome          = $Outcome
+        holder_pid       = [int]$script:busyHolderPid
+        phases           = $(if ($script:phaseTimings) { $script:phaseTimings } else { [ordered]@{} })
+    }
+}
+function Enter-StartAllRunLogLock([string]$Path) {
+    # The mutex Write-StartAllRunRecord and Merge-StartAllRunSpool both serialise on, named
+    # after the FILE (not a fixed name), so a different diagDir per test-tree cannot collide
+    # with another. Pulled out of Write-StartAllRunRecord (2026-09-25) so the merge path can
+    # take the IDENTICAL lock rather than a second, independently-named one. Caller releases
+    # with $lk.ReleaseMutex()/.Dispose() in a finally, same as before.
+    try {
+        $md5 = [System.Security.Cryptography.MD5]::Create()
+        $hash = [BitConverter]::ToString($md5.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($Path.ToLowerInvariant()))).Replace("-", "")
+        $md5.Dispose()
+        $lk = New-Object System.Threading.Mutex($false, ("Global\m365-start-all-runlog-" + $hash))
+        try { [void]$lk.WaitOne(10000) } catch { }      # abandoned = ours; a timeout still writes
+        return $lk
+    } catch { return $null }
+}
+function Write-StartAllRunRecord([string]$Path, $Record, [int]$Keep = 500) {
+    # Append one JSON line, keeping the last $Keep (up to 50 more between trims, see
+    # Save-StartAllRunLines). Never throws.
+    # SERIALISED BY ITS OWN MUTEX (Enter-StartAllRunLogLock). It used to rely on the start_all
+    # lock being held; a copy that leaves because a startup is already running used to write
+    # here directly too, and nine of those at once rewrote the file over each other -- that
+    # copy now uses Write-StartAllRunRecordSpooled instead (2026-09-25), which needs no lock at
+    # all; THIS function is for the one caller per run that is never in a ten-at-once race: the
+    # holder's own final record, and the (also singular) self-update re-exec handoff.
+    # The line is built BEFORE the lock: ConvertTo-Json is the slow part, and nine copies leaving
+    # at once used to each hold the lock through it (measured: up to 2.5 s of a leaver spent
+    # here) -- moot for THIS caller now, kept because it was free and correct either way.
+    $line = $null
+    try { $line = ($Record | ConvertTo-Json -Compress -Depth 3) } catch { return $false }
+    $lk = Enter-StartAllRunLogLock $Path
+    try {
+        return (Save-StartAllRunLines $Path $line $Keep)
+    } finally {
+        if ($lk) { try { $lk.ReleaseMutex() } catch { }; try { $lk.Dispose() } catch { } }
+    }
+}
+function Write-StartAllRunRecordSpooled([string]$SpoolDir, $Record) {
+    # WHAT A LEAVING COPY CALLS INSTEAD OF Write-StartAllRunRecord (2026-09-25,
+    # scripts/test_start_all_ten_clicks.py). Nine leaving copies used to serialise through ONE
+    # shared-file mutex (Write-StartAllRunRecord) -- already tuned once before (moving
+    # ConvertTo-Json outside the lock, cutting a measured 2.5 s), and STILL measured costing up
+    # to 3.87 s of queueing for the last-in-line copy on the CI runner (windows-latest, 2 vCPU,
+    # slower disk/Defender than this was ever tuned against) even after that fix. A leaving copy
+    # never needs to be seen by another leaving copy, only eventually folded into the one
+    # canonical file -- so it does not need a SHARED lock with them at all. Each gets its own
+    # file, named by a tick count and this process's pid (two leavers cannot share both), written
+    # temp-then-rename so nothing ever reads a half-written file. Read back and folded into
+    # start_all_runs.jsonl by Merge-StartAllRunSpool, called by the HOLDER once it is done, never
+    # on a leaving copy's own path -- see that function and its call site.
+    try {
+        if (-not (Test-Path -LiteralPath $SpoolDir)) { [void](New-Item -ItemType Directory -Force -Path $SpoolDir) }
+        $line = $null
+        try { $line = ($Record | ConvertTo-Json -Compress -Depth 3) } catch { return $false }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $name = ("{0}-{1}.json" -f [DateTime]::UtcNow.Ticks, $PID)
+        $final = Join-Path $SpoolDir $name
+        $tmp = $final + ".tmp"
+        [System.IO.File]::WriteAllText($tmp, $line, $utf8)
+        [System.IO.File]::Move($tmp, $final)
+        return $true
+    } catch { return $false }
+}
+function Merge-StartAllRunSpool([string]$SpoolDir, [string]$Path, [int]$Keep = 500) {
+    # Folds every file Write-StartAllRunRecordSpooled left behind into start_all_runs.jsonl,
+    # under the SAME mutex Write-StartAllRunRecord uses for that file (Enter-StartAllRunLogLock),
+    # so a direct write (the holder's own final record) and a merge can never race each other
+    # either. Called by the HOLDER, once, right before it writes its own final record (see the
+    # call site) -- NEVER on a leaving copy's path, which is the entire point: nothing about
+    # this function's cost is paid by any of the nine copies LEAVE_BOUND_SEC bounds.
+    #
+    # A reader wanting "every run so far" (ensure_m365_signin.py's freshness check,
+    # scripts/test_start_all_ten_clicks.py's read_runs, doctor if it ever reads this file) must
+    # ALSO read $SpoolDir directly for the window between a leave and the next merge -- a spooled
+    # record is real and already happened, not "not yet true" just because nobody has folded it
+    # into the jsonl file yet.
+    if (-not (Test-Path -LiteralPath $SpoolDir)) { return 0 }
+    $files = @(Get-ChildItem -LiteralPath $SpoolDir -Filter "*.json" -File -ErrorAction SilentlyContinue | Sort-Object Name)
+    if ($files.Count -eq 0) { return 0 }
+    $lines = New-Object System.Collections.Generic.List[string]
+    $toRemove = New-Object System.Collections.Generic.List[System.IO.FileInfo]
+    foreach ($f in $files) {
+        try {
+            $text = ([System.IO.File]::ReadAllText($f.FullName)).Trim()
+            if ($text) {
+                $null = $text | ConvertFrom-Json       # a torn write from a killed process must
+                $lines.Add($text)                       # never poison the merged file -- skip it,
+            }                                            # left for the NEXT merge to retry.
+            $toRemove.Add($f)
+        } catch { }
+    }
+    if ($lines.Count -eq 0) { return 0 }
+    $lk = Enter-StartAllRunLogLock $Path
+    try {
+        $null = Save-StartAllRunLinesMany $Path $lines.ToArray() $Keep
+    } finally {
+        if ($lk) { try { $lk.ReleaseMutex() } catch { }; try { $lk.Dispose() } catch { } }
+    }
+    foreach ($f in $toRemove) { try { [System.IO.File]::Delete($f.FullName) } catch { } }
+    return $lines.Count
+}
+function Save-StartAllRunLines([string]$Path, [string]$Line, [int]$Keep = 500, [int]$Slack = 50) {
+    # Called under Write-StartAllRunRecord's lock with the line already built. .NET calls only,
+    # no cmdlet pipeline. Historically this was also what nine leaving copies queued for at
+    # once (measured: up to 0.5 s each, then measured far worse on the CI runner) -- that path
+    # now goes through Write-StartAllRunRecordSpooled/Merge-StartAllRunSpool instead
+    # (2026-09-25), so this function's only callers today are Write-StartAllRunRecord's single
+    # holder/re-exec writes; Save-StartAllRunLinesMany (below) is Merge-StartAllRunSpool's.
+    # APPENDED, and trimmed back to the last $Keep only once $Keep + $Slack lines have built up:
+    # a full read-write-replace on every line held the lock ~0.1 s each under load.
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $lines = New-Object System.Collections.Generic.List[string]
+        if ([System.IO.File]::Exists($Path)) {
+            foreach ($l in [System.IO.File]::ReadAllLines($Path)) { if ($l -and $l.Trim()) { $lines.Add($l) } }
+        }
+        if (($lines.Count + 1) -lt ($Keep + $Slack)) {
+            for ($i = 0; $i -lt 40; $i++) {
+                try { [System.IO.File]::AppendAllText($Path, $Line + "`r`n", $utf8); return $true }
+                catch { Start-Sleep -Milliseconds 50 }
+            }
+            return $false
+        }
+        $lines.Add($Line)
+        if ($lines.Count -gt $Keep) { $lines.RemoveRange(0, $lines.Count - $Keep) }
+        $tmp = $Path + "." + $PID + ".tmp"
+        [System.IO.File]::WriteAllLines($tmp, $lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+        # THE REPLACE IS RETRIED. A reader holding the file open (doctor, a tail, a test polling
+        # it) makes the rename fail with "access denied" for a moment; measured with ten clicks
+        # 200 ms apart, one "already running" line was lost that way and its .tmp left behind.
+        for ($i = 0; $i -lt 40; $i++) {
+            try {
+                # [NullString]::Value, not $null: PowerShell passes $null to a string parameter
+                # as "", which File.Replace rejects -- measured: every replace failed, lines lost.
+                if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $Path) }
+                return $true
+            } catch { Start-Sleep -Milliseconds 50 }
+        }
+        try { [System.IO.File]::Delete($tmp) } catch { }
+        return $false
+    } catch { return $false }
+}
+function Save-StartAllRunLinesMany([string]$Path, [string[]]$NewLines, [int]$Keep = 500, [int]$Slack = 50) {
+    # Save-StartAllRunLines, generalised to append SEVERAL lines in one pass -- Merge-
+    # StartAllRunSpool folding N spooled leave-records into the file under one lock acquisition,
+    # rather than acquiring the lock once per record (which would just reintroduce the same
+    # per-record serialisation cost Write-StartAllRunRecordSpooled exists to avoid, one level
+    # up). Same shape and the same two paths (append-only under Keep+Slack, temp+replace once
+    # over it) as Save-StartAllRunLines; kept as a separate function rather than an overload so
+    # the well-tested single-line function is untouched.
+    if (-not $NewLines -or $NewLines.Count -eq 0) { return $true }
+    try {
+        $dir = [System.IO.Path]::GetDirectoryName($Path)
+        if (-not [System.IO.Directory]::Exists($dir)) { [void][System.IO.Directory]::CreateDirectory($dir) }
+        $utf8 = New-Object System.Text.UTF8Encoding($false)
+        $lines = New-Object System.Collections.Generic.List[string]
+        if ([System.IO.File]::Exists($Path)) {
+            foreach ($l in [System.IO.File]::ReadAllLines($Path)) { if ($l -and $l.Trim()) { $lines.Add($l) } }
+        }
+        foreach ($nl in $NewLines) { $lines.Add($nl) }
+        if ($lines.Count -lt ($Keep + $Slack)) {
+            $blob = (($NewLines) -join "`r`n") + "`r`n"
+            for ($i = 0; $i -lt 40; $i++) {
+                try { [System.IO.File]::AppendAllText($Path, $blob, $utf8); return $true }
+                catch { Start-Sleep -Milliseconds 50 }
+            }
+            return $false
+        }
+        if ($lines.Count -gt $Keep) { $lines.RemoveRange(0, $lines.Count - $Keep) }
+        $tmp = $Path + "." + $PID + ".tmp"
+        [System.IO.File]::WriteAllLines($tmp, $lines.ToArray(), (New-Object System.Text.UTF8Encoding($false)))
+        for ($i = 0; $i -lt 40; $i++) {
+            try {
+                if ([System.IO.File]::Exists($Path)) { [System.IO.File]::Replace($tmp, $Path, [NullString]::Value) }
+                else { [System.IO.File]::Move($tmp, $Path) }
+                return $true
+            } catch { Start-Sleep -Milliseconds 50 }
+        }
+        try { [System.IO.File]::Delete($tmp) } catch { }
+        return $false
+    } catch { return $false }
+}
+
+# ONE PLACE, INSIDE THE REPO. Diagnostics were scattered across %TEMP% and hidden windows, so
+# the answer existed and could not be found. Everything that a hidden process would otherwise
+# swallow is written here, next to the thing it is about.
+$script:diagDir = Join-Path $root ".setup\logs"
+try { if (-not (Test-Path $script:diagDir)) { New-Item -ItemType Directory -Force $script:diagDir | Out-Null } } catch { }
+
+function Hide-Secrets([string]$text) {
+    # CENTRAL REDACTION. A log that is finally visible is also a log that can be pasted into a
+    # chat window, and this stack handles a Bearer token, an unlock password and a tunnel URL
+    # that is effectively a capability. Redacted once, here, rather than remembered at each
+    # site that writes.
+    if (-not $text) { return $text }
+    $t = $text
+    $t = [regex]::Replace($t, '(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(MCP_API_KEY\s*=\s*)\S+', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(MCP_API_KEY_PROTECTED\s*=\s*)\S+', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(MCP_UNLOCK_PASSWORD[A-Z_]*\s*=\s*)\S+', '$1<redacted>')
+    $t = [regex]::Replace($t, '(?i)(password|passwd|secret|token)(["'':\s=]+)\S+', '$1$2<redacted>')
+    $t = [regex]::Replace($t, 'https://[A-Za-z0-9\-]+\.devtunnels\.ms\S*', 'https://<tunnel>.devtunnels.ms/...')
+    return $t
+}
+
+# ONE STARTUP AT A TIME, DECIDED BEFORE ANY BANNER EXISTS: a copy that finds a startup already
+# running which covers it leaves here, in ~2 s, instead of queueing a second bring-up (see the
+# block above Get-RankOfStartAllMode for who still waits, and why).
+# The lock is probed FIRST, before the lineage lookup: the running startup takes the lock and
+# writes its holder record at once, so the copies arriving with it do not wait on its lookup,
+# and a copy that leaves reads only itself and its parent (see Get-LaunchLineage).
+$script:entryAction = Invoke-StartAllEntry
+if ($script:entryAction -eq "leave") {
+    $script:launch = Get-LaunchLineage -ParentOnly
+    Invoke-StartAllLeave
+    exit 0
+}
+
+# Shared PURE helpers (Get-SupervisorArgTunnel / Get-BareTunnelName /
+# Test-SupervisorTunnelDrift) for detecting a supervisor that drifted onto a
+# stale/borrowed tunnel -- see tunnel_name_util.ps1's header comment. No
+# top-level side effects, so dot-sourcing it here is safe.
+. (Join-Path $scriptDir "tunnel_name_util.ps1")
+. (Join-Path $scriptDir "update_recovery.ps1")
+
+# The .env backfill lives in one testable place; see scripts/win/env_defaults.ps1 for why
+# deciding "is this value ours or the user's" needs a record of what we wrote.
+# CALLED FROM Invoke-Startup, AFTER THE SINGLE-INSTANCE LOCK, not here: it rewrites .env (not
+# atomically), and the logon autostart launches this script twice at once (Startup shortcut +
+# scheduled task), so two unserialised copies were two writers on one file.
+. (Join-Path $PSScriptRoot "win\env_defaults.ps1")
+# Where the Desktop / Startup launchers live and how the person's answer about them is recorded.
+. (Join-Path $PSScriptRoot "win\convenience_marker.ps1")
+
+# ---------------------------------------------------------------------------
+# THE RUNNING SERVER: ONE RULE FOR "MAY IT BE STOPPED?", ASKED FROM BOTH PLACES THAT STOP IT.
+#
+# There were two. Invoke-PostUpdateTail (after this script's own pull) asked
+# stale_server_check.py --pyside / --runlive and re-implemented decide_post_update_action by
+# hand; the daily check further down (Server-Is-Outdated) asked nothing at all -- it killed
+# the server whenever a TOP-LEVEL tools/relay .py was newer than the process, so a manual
+# `git pull` plus a double-click dropped a live fleet or review run, and a change inside a
+# subpackage (tools/auto/, relay/selfimprove/) was never noticed (new-PC analysis D12/D30).
+# Both now call stale_server_check.py --server-action, which walks every file the server
+# imports (tools/deploy_freshness.newer_than: tools/ and relay/ recursively, plus main.py) and
+# refuses the swap while a fleet run, a review run or a bridge turn is live. Before this was
+# wired the hand-written branch and decide_post_update_action were compared over all 36
+# output combinations of the two old calls: identical.
+# ---------------------------------------------------------------------------
+function Get-ThisCheckoutServerProcesses {
+    # SCOPED TO THIS CHECKOUT: another clone's main.py, or an unrelated project's, is not ours
+    # to judge or to stop.
+    try {
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -and ($_.CommandLine -match 'main\.py') -and ($_.CommandLine -like "*$root*") })
+    } catch { return @() }
+}
+function Get-ServerStartEpoch {
+    # Unix seconds at which the oldest of this checkout's main.py processes started, or 0 when
+    # none is running or its start cannot be read (0 = nothing to judge, never "stale").
+    try {
+        $started = (Get-ThisCheckoutServerProcesses | Measure-Object -Property CreationDate -Minimum).Minimum
+        if (-not $started) { return 0 }
+        return ([DateTimeOffset]$started).ToUnixTimeMilliseconds() / 1000.0
+    } catch { return 0 }
+}
+function ConvertTo-ServerActionResult([object[]]$Lines, [int]$ExitCode) {
+    # PURE. The CLI prints "why: ..." lines and ONE verdict word last. Anything else --
+    # a non-zero exit, no output, a word it does not print -- is "unknown", which every caller
+    # reads as "leave the server alone": an unreadable answer must never authorise a kill.
+    $text = @($Lines | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() })
+    $why = @($text | Where-Object { $_ -like "why: *" } | ForEach-Object { $_.Substring(5) })
+    $verdict = "unknown"
+    if ($ExitCode -eq 0 -and $text.Count -gt 0) {
+        $last = $text[$text.Count - 1].Trim()
+        if ($last -in @("noop", "report-only", "swap-needed")) { $verdict = $last }
+    }
+    return @{ Verdict = $verdict; Why = $why }
+}
+function Get-ServerAction {
+    # -ChangedPaths: the post-update form (git diff --name-only). -StartedEpoch: the daily form.
+    param([string[]]$ChangedPaths = @(), [double]$StartedEpoch = 0)
+    $pyExe = $script:venvPy
+    $chk = Join-Path $scriptDir "stale_server_check.py"
+    if (-not (Test-Path $pyExe) -or -not (Test-Path $chk)) {
+        return @{ Verdict = "unknown"; Why = @("no .venv python to ask stale_server_check.py") }
+    }
+    $cliArgs = @($chk, "--server-action", "--fleet-dir", (Join-Path $root ".fleet"),
+                 "--bridge-status", $script:bridgeStatusUrl)
+    try {
+        if ($StartedEpoch -gt 0) {
+            $cliArgs += @("--started-epoch", $StartedEpoch.ToString("R", [Globalization.CultureInfo]::InvariantCulture))
+            $out = @(& $pyExe @cliArgs 2>$null)
+        } else {
+            # THE PATH LIST GOES IN AS BYTES THIS FUNCTION WROTE, NOT THROUGH POWERSHELL'S PIPE.
+            # `$ChangedPaths | & $pyExe ...` had PowerShell encode stdin with whatever
+            # $OutputEncoding the host has: a UTF-8 one is written with a BOM, so the first path
+            # reads "﻿tools/x.py", is not server code, and a changed server comes back
+            # "noop" -- the verdict CI got in test_post_update_form_and_unreadable_answers
+            # (reproduced here by setting $OutputEncoding = [Text.Encoding]::UTF8; an empty
+            # pipe gives the same "noop"). A file of UTF-8 WITHOUT a BOM, handed over as the
+            # child's stdin, and Python told to read it as UTF-8 (-X utf8), removes the host
+            # setting from the question -- and a non-ASCII path from `git diff` survives too.
+            $tmpIn = [System.IO.Path]::GetTempFileName()
+            $tmpOut = [System.IO.Path]::GetTempFileName()
+            $tmpErr = [System.IO.Path]::GetTempFileName()
+            # CI (windows-install-smoke, 2026-09-24) still got "tools/??.py" for a non-ASCII
+            # path with -X utf8 alone: that flag sets Python's default TEXT encoding, but a
+            # runner whose OS codepage cannot represent the character (not this machine's, so
+            # unreproducible here) can still have something in Python's own stdio setup fall
+            # back to it for the REDIRECTED-TO-A-FILE stdout stream. PYTHONIOENCODING pins the
+            # child's stdout/stderr encoding directly and explicitly, independent of the host's
+            # OS codepage or console state -- belt-and-suspenders with -X utf8, not a
+            # replacement for the stdin fix above (which is what makes the non-ASCII path
+            # readable in the first place).
+            $savedPyIoEnc = [Environment]::GetEnvironmentVariable("PYTHONIOENCODING", "Process")
+            [Environment]::SetEnvironmentVariable("PYTHONIOENCODING", "utf-8", "Process")
+            try {
+                $text = ((@($ChangedPaths) | ForEach-Object { [string]$_ }) -join "`n") + "`n"
+                [System.IO.File]::WriteAllText($tmpIn, $text, (New-Object System.Text.UTF8Encoding($false)))
+                $argLine = @(@("-X", "utf8") + $cliArgs | ForEach-Object { '"' + ([string]$_).Replace('"', '\"') + '"' })
+                $p = Start-Process -FilePath $pyExe -ArgumentList $argLine -NoNewWindow -PassThru `
+                                   -RedirectStandardInput $tmpIn -RedirectStandardOutput $tmpOut -RedirectStandardError $tmpErr
+                $null = $p.Handle           # keeps ExitCode readable after exit (PS 5.1)
+                $p.WaitForExit()
+                $out = @(Get-Content -LiteralPath $tmpOut -Encoding UTF8 -ErrorAction SilentlyContinue)
+                return (ConvertTo-ServerActionResult $out ([int]$p.ExitCode))
+            } finally {
+                [Environment]::SetEnvironmentVariable("PYTHONIOENCODING", $savedPyIoEnc, "Process")
+                Remove-Item -LiteralPath $tmpIn, $tmpOut, $tmpErr -Force -ErrorAction SilentlyContinue
+            }
+        }
+        return (ConvertTo-ServerActionResult $out $LASTEXITCODE)
+    } catch {
+        return @{ Verdict = "unknown"; Why = @($_.Exception.Message) }
+    }
+}
+function Invoke-ServerAction($Action, [string]$Tag) {
+    # Acts on a Get-ServerAction result. Returns the note for the update dialog ("" if none).
+    $why = ""
+    if ($Action.Why -and @($Action.Why).Count -gt 0) { $why = " (" + (@($Action.Why) -join "; ") + ")" }
+    switch ($Action.Verdict) {
+        "swap-needed" {
+            # Stop it; the supervisor (or the start path below) brings it back on the new code.
+            $stopped = 0
+            foreach ($p in (Get-ThisCheckoutServerProcesses)) {
+                try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop; $stopped++ } catch { }
+            }
+            if ($stopped -gt 0) {
+                Write-Host "$Tag server code is newer than the running server and no run is live$why -- stopped it so it restarts on the new code"
+                Start-Sleep -Seconds 2
+                return "`n`nServer updated (restarting on new code)."
+            }
+            Write-Host "$Tag server code changed but no process of this checkout's server is running; nothing to restart"
+            return "`n`nServer code updated, but the running server could not be identified; restart it manually."
+        }
+        "report-only" {
+            Write-Host "$Tag server code is newer than the running server, but a run is live$why -- left running. The supervisor restarts it once nothing is running."
+            return "`n`nServer code updated. It will take effect after the current run finishes and the server is restarted."
+        }
+        "unknown" {
+            Write-Host "$Tag could not decide whether the running server is stale$why -- left running."
+            return ""
+        }
+        default { return "" }
+    }
+}
+# ---------------------------------------------------------------------------
+# THE RUNNING BRIDGE: the same one-question shape as the server above, asked from the one
+# place that can stop it (the daily "bridge is older than its code" check further down).
+#
+# Bridge-Is-Outdated (removed) called Get-ChildItem WITHOUT -Recurse over the top level of
+# bridge/, tools/ and relay/ only -- a change inside a subpackage (relay/selfimprove/,
+# tools/auto/) was invisible to it, exactly the D12/D30 top-level-only bug the server's own
+# daily check had -- and it asked nothing about whether a chat turn was in progress, so a
+# manual `git pull` plus a double-click of start_all could kill the bridge mid-turn.
+# Get-BridgeAction asks stale_server_check.py --bridge-action, which scans the SAME
+# directories RECURSIVELY (stale_server_check.BRIDGE_WATCHED: bridge/, relay/, tools/ -- what
+# copilot_bridge.py actually imports from) and refuses the swap while the bridge's own
+# /status reports a turn live (turn_running or busy) -- the identical GET-only, no-proxy
+# probe --server-action already uses for its "bridge turn" input. NEVER call /stream, /goal,
+# /new, /switch, /history or /upload from here: only /status, which holds no page lock.
+# ---------------------------------------------------------------------------
+function Get-ThisCheckoutBridgeProcesses {
+    # SCOPED TO THIS CHECKOUT, exactly like Get-ThisCheckoutServerProcesses above: another
+    # clone's bridge, or an unrelated project's, is not ours to judge or to stop.
+    try {
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -and ($_.CommandLine -match 'copilot_bridge\.py') -and ($_.CommandLine -like "*$root*") })
+    } catch { return @() }
+}
+function Get-BridgeStartEpoch {
+    # Unix seconds at which the oldest of this checkout's bridge processes started, or 0 when
+    # none is running or its start cannot be read (0 = nothing to judge, never "stale") --
+    # the same rule Get-ServerStartEpoch uses.
+    try {
+        $started = (Get-ThisCheckoutBridgeProcesses | Measure-Object -Property CreationDate -Minimum).Minimum
+        if (-not $started) { return 0 }
+        return ([DateTimeOffset]$started).ToUnixTimeMilliseconds() / 1000.0
+    } catch { return 0 }
+}
+function Get-BridgeAction {
+    # Same shape as Get-ServerAction on purpose: ConvertTo-ServerActionResult parses the
+    # output unchanged, and the caller reads the same three verdict words (noop /
+    # report-only / swap-needed).
+    $pyExe = $script:venvPy
+    $chk = Join-Path $scriptDir "stale_server_check.py"
+    if (-not (Test-Path $pyExe) -or -not (Test-Path $chk)) {
+        return @{ Verdict = "unknown"; Why = @("no .venv python to ask stale_server_check.py") }
+    }
+    $epoch = Get-BridgeStartEpoch
+    if ($epoch -le 0) {
+        return @{ Verdict = "noop"; Why = @("no bridge process of this checkout is running") }
+    }
+    $cliArgs = @($chk, "--bridge-action",
+                 "--started-epoch", $epoch.ToString("R", [Globalization.CultureInfo]::InvariantCulture),
+                 "--bridge-status", $script:bridgeStatusUrl)
+    try {
+        $out = @(& $pyExe @cliArgs 2>$null)
+        return (ConvertTo-ServerActionResult $out $LASTEXITCODE)
+    } catch {
+        return @{ Verdict = "unknown"; Why = @($_.Exception.Message) }
+    }
 }
 function Stop-Bridge-Processes() {
     # Take the keepalive supervisor down first, otherwise it just respawns the python we are
@@ -117,7 +1091,24 @@ function Env-Value([string]$key) {
     return ""
 }
 
+function Get-BridgePollAttempts([string]$ImplAgentUrl, [int]$MaxAttempts = 8) {
+    # PURE. How many times the new-bridge branch below should poll :8765/conv before giving
+    # up. start_bridge.ps1's own child exits at once with "No agent page. Set
+    # MCP_IMPL_AGENT_URL..." whenever that key is empty (see the -Keepalive wrapper comment
+    # at the call site) -- the wrapper then just keeps relaunching the same dead child forever,
+    # so /conv can NEVER come up. Polling the full $MaxAttempts * 2s in that state (measured:
+    # ~16s, every start_all run, on any machine that has not yet finished Copilot Studio setup
+    # -- e.g. a fresh install that stopped after the Dev Tunnel step) waits out a precondition
+    # already known false at the top of this function, not a fluke that a retry could catch.
+    # A machine WITH the URL set still gets the full budget: a slow first-run Edge bring-up
+    # plus a Python import is a real, sometimes-slow startup this must not shortcut.
+    if (-not $ImplAgentUrl) { return 0 }
+    return $MaxAttempts
+}
+
 function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [string]$icon) {
+    # Checked for the Japanese-font-rendering fix (scripts/win/ui_font.ps1): every call site
+    # passes English-only text, so this MessageBox is not exposed to that bug -- left as-is.
     # Show a MessageBox that is guaranteed to appear in front, even when this script
     # runs hidden (window=0 from the vbs launcher). We parent the box on a TopMost owner
     # form so it is not lost behind other windows. Returns the DialogResult.
@@ -146,7 +1137,7 @@ function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [stri
 # .Show() + DoEvents -- the SAME path as the update dialog (which is known to display), so it
 # reliably appears (an earlier runspace version created the window but it never became
 # visible). Best-effort: any failure leaves $splash = $null and every helper no-ops, so
-# startup is NEVER blocked. No X (can't be closed onto a half-started stack), and a minimum
+# startup is NEVER blocked. It can be closed and minimised (see Start-Splash), and has a minimum
 # on-screen time so a fast (already-running) startup does not just flash by unseen.
 # ---------------------------------------------------------------------------
 function Start-Splash {
@@ -176,15 +1167,28 @@ function Start-Splash {
         # window, not to remove its close button.
         $f.ControlBox = $true
         $f.MaximizeBox = $false
-        $f.MinimizeBox = $false
+        # MINIMIZABLE, because it is TopMost. A startup that waits (another start_all holding the
+        # lock, a slow tunnel, a dependency update) kept this window above every other window for
+        # the whole wait, and the only way out was the close button, which reads as "cancel the
+        # startup". Minimising keeps the startup running and puts the window on the taskbar
+        # (ShowInTaskbar), where the person can bring it back to see the status.
+        $f.MinimizeBox = $true
+        $f.ShowInTaskbar = $true
         $title = New-Object System.Windows.Forms.Label
         $title.Text = "M365 Companion"
-        $title.Font = New-Object System.Drawing.Font("Segoe UI", 13, [System.Drawing.FontStyle]::Bold)
+        # Both the title and status labels are English today, but Set-SplashStatus is called
+        # with arbitrary text (see call sites throughout this file) -- using the Japanese-capable
+        # font here for free consistency/future-proofing costs nothing (see scripts/win/ui_font.ps1).
+        $title.Font = Get-JapaneseUiFont -SizePoints 13 -Style ([System.Drawing.FontStyle]::Bold)
         $title.AutoSize = $true
         $title.Location = New-Object System.Drawing.Point(22, 20)
         $f.Controls.Add($title)
         $status = New-Object System.Windows.Forms.Label
         $status.Text = "Starting M365 Companion..."
+        # $status never set an explicit .Font before (WinForms default = Microsoft Sans Serif,
+        # 8.25pt) -- give it the same Japanese-capable font explicitly rather than leaving it on
+        # the buggy default.
+        $status.Font = Get-JapaneseUiFont -SizePoints 8.25
         $status.AutoSize = $false
         $status.Size = New-Object System.Drawing.Size(396, 22)
         $status.Location = New-Object System.Drawing.Point(24, 58)
@@ -269,6 +1273,47 @@ function Test-ShouldReExecAfterUpdate {
     return $true
 }
 
+function Get-UpdateCheckSkipReason {
+    # PURE. "" when the update dialog may be shown, else the reason it is not (for the log).
+    #
+    # -NoUi: a background logon start has nobody to ask (unchanged).
+    #
+    # -CoreOnly, AND ANY cmd.exe PARENT: A PULL HERE CAN REWRITE THE BATCH FILE THAT IS RUNNING
+    # US. quickstart.bat calls this script twice while it is itself executing -- -CoreOnly
+    # between STEP 4 and STEP 5, and a full start at STEP 7 -- and a Yes in the dialog ran
+    # `git pull` or `git reset --hard @{u}` underneath it. cmd resumes a batch file by BYTE
+    # OFFSET after every line, so a quickstart.bat replaced mid-run continues at whatever now
+    # sits at that offset (quickstart.bat's own STEP 3 comment describes exactly this and stops
+    # after its own pull for that reason). It also asked the update question twice more after
+    # the person had answered N at STEP 3 (new-PC analysis D3). -CoreOnly alone would leave
+    # STEP 7 open, and quickstart.bat is not this file's to change, so the gate is the
+    # mechanism itself: a cmd.exe parent means a batch file may be waiting on this process.
+    # The daily launchers never have one (start_all.bat, the Desktop icon and the logon task
+    # all go through wscript), so they still get the update check; a developer typing
+    # `powershell -File scripts\start_all.ps1` at a cmd prompt loses it and can `git pull`.
+    param([bool]$NoUi, [bool]$CoreOnly, [string]$ParentName, [string]$ParentCommandLine)
+    if ($NoUi) { return "-NoUi" }
+    if ($CoreOnly) { return "-CoreOnly: quickstart.bat is running and already asked about updates at STEP 3" }
+    if ($ParentName -and ($ParentName -match '^(?i)cmd(\.exe)?$')) {
+        $what = "a batch file"
+        if ($ParentCommandLine -match '(?i)([^\\/"]+\.(bat|cmd))') { $what = $matches[1] }
+        return ("started from cmd (" + $what + "): a pull now could rewrite that batch file while it runs; update with start_all.bat or git pull --ff-only")
+    }
+    return ""
+}
+
+function Get-ParentProcessInfo {
+    # @{ Name; CommandLine } of the process that launched this one ("" when it cannot be read,
+    # which Get-UpdateCheckSkipReason reads as "not a batch file").
+    $info = @{ Name = ""; CommandLine = "" }
+    try {
+        $me = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $PID) -ErrorAction Stop
+        $parent = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $me.ParentProcessId) -ErrorAction Stop
+        if ($parent) { $info.Name = [string]$parent.Name; $info.CommandLine = [string]$parent.CommandLine }
+    } catch { }
+    return $info
+}
+
 function Invoke-PostUpdateTail {
     # Shared tail run once the checkout has ACTUALLY landed the new commits --
     # by either `git pull --ff-only` (plain fast-forward) or `git reset --hard
@@ -308,66 +1353,14 @@ function Invoke-PostUpdateTail {
     # guarded and treats "already running" as a no-op, and the re-exec below only restarts
     # THIS start_all -- so a server that was already up keeps executing the PRE-update code
     # it imported at startup, indefinitely. /health still answers 200, so nothing surfaces
-    # it. The decision (did server code change? is a run live?) is delegated to the pure,
-    # pytest-covered scripts\stale_server_check.py so this stays in step with its tests.
-    # SAFETY: we NEVER swap the server while a fleet/review run is live -- that would drop
-    # the run. If we cannot tell whether a run is live, we assume it IS (report-only), the
-    # conservative side. When it is safe to swap, we only STOP the stale server and let
-    # supervisor.ps1 bring it back on fresh code via its normal health-probe restart -- we
-    # do not hand-roll the replacement here.
+    # it. SAFETY: we NEVER swap the server while a fleet/review run or a bridge turn is live
+    # -- that would drop the run -- and if that cannot be told, it counts as live. The
+    # decision is Get-ServerAction's (stale_server_check.py --server-action), the SAME one the
+    # daily start asks; see the block above Get-ThisCheckoutServerProcesses for why there is
+    # only one. We only STOP the stale server; the supervisor brings it back on fresh code.
     try {
-        $pyExe = Join-Path $root ".venv\Scripts\python.exe"
-        $staleChk = Join-Path $scriptDir "stale_server_check.py"
-        if ((Test-Path $pyExe) -and (Test-Path $staleChk) -and $changed) {
-            $pyVerdict = ($changed | & $pyExe $staleChk "--pyside") 2>$null
-            if ($LASTEXITCODE -eq 0 -and ($pyVerdict | Select-Object -Last 1) -eq "yes") {
-                # Is a fleet/review run LIVE? Ask the same module, which reads the
-                # authoritative signal defined by relay/fleet_reaper.py: the active-run
-                # marker .fleet\fleet_run_active.json (pid still alive), else status.json
-                # running==True. It only READS -- it never reaps -- and on any ambiguity
-                # it prints "yes" so we withhold the swap rather than risk a live run.
-                $fleetDir = Join-Path $root ".fleet"
-                $liveVerdict = (& $pyExe $staleChk "--runlive" $fleetDir) 2>$null
-                $runLive = -not ($LASTEXITCODE -eq 0 -and ($liveVerdict | Select-Object -Last 1) -eq "no")
-                if (-not $runLive) {
-                    # swap-needed: stop the stale server; supervisor restarts it on fresh code.
-                    try {
-                        # LOOK AT WHAT IS THERE BEFORE KILLING IT. Owning :8000 is not proof
-                        # of being our server: on this machine a system-Python main.py held
-                        # :8000 while the venv one ran portless, and a stray bridge held :8765
-                        # answering / but not /conv. A port is a claim, not an identity. Kill
-                        # only a process whose command line is this checkout's main.py; if the
-                        # holder is something else, say so and leave it -- a wrong kill here
-                        # takes down whatever unrelated program happened to bind the port.
-                        $stopped = 0
-                        Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop |
-                            Select-Object -ExpandProperty OwningProcess -Unique |
-                            ForEach-Object {
-                                $owner = Get-CimInstance Win32_Process -Filter "ProcessId = $_" -ErrorAction SilentlyContinue
-                                $cl = if ($owner) { [string]$owner.CommandLine } else { "" }
-                                if ($cl -match 'main\.py') {
-                                    Stop-Process -Id $_ -Force -ErrorAction SilentlyContinue
-                                    $stopped++
-                                } else {
-                                    Write-Host "[update] :8000 is held by pid $_ which is not this server ($cl); leaving it alone"
-                                }
-                            }
-                        if ($stopped -gt 0) {
-                            Write-Host "[update] server code changed and no run is live: stopped the stale server so supervisor restarts it on the new code"
-                            $rebuildNote += "`n`nServer updated (restarting on new code)."
-                        } else {
-                            Write-Host "[update] server code changed but nothing recognisable as this server holds :8000; not restarting anything"
-                            $rebuildNote += "`n`nServer code updated, but the running server could not be identified; restart it manually."
-                        }
-                    } catch {
-                        Write-Host "[update] wanted to swap the stale server but stopping it failed: $($_.Exception.Message)"
-                    }
-                } else {
-                    # report-only: a run is (or may be) live; do not disturb it.
-                    Write-Host "[update] server code changed but a run appears live: leaving the running server in place; a restart is needed once the run finishes"
-                    $rebuildNote += "`n`nServer code updated. It will take effect after the current run finishes and the server is restarted."
-                }
-            }
+        if ($changed) {
+            $rebuildNote += (Invoke-ServerAction (Get-ServerAction -ChangedPaths @($changed)) "[update]")
         }
     } catch {
         Write-Host "[update] stale-server check skipped (error): $($_.Exception.Message)"
@@ -399,7 +1392,17 @@ function Invoke-PostUpdateTail {
                 if ($NoUi) { $reArgs += "-NoUi" }
                 if ($NoSplash) { $reArgs += "-NoSplash" }
                 if ($CoreOnly) { $reArgs += "-CoreOnly" }
+                # This run ends here without reaching the end of the script: record it now.
+                $null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord "re-exec after update")
                 $env:MCP_STARTALL_REEXEC = "1"
+                # WHO THE FRESH COPY CONTINUES: a click that takes the lock in the moment between
+                # the release below and the fresh copy's start makes that copy wait for it rather
+                # than leave (Test-StartAllHandoff compares this with the fresh copy's parent).
+                $env:MCP_STARTALL_HANDOFF_PID = [string]$PID
+                # HAND THE LOCK OVER FIRST. The fresh copy waits on the single-instance lock;
+                # held until Environment.Exit below it would come back abandoned, which works,
+                # but a release is the clean hand-over rather than the recovery path.
+                Exit-StartAllLock
                 Start-Process powershell -WindowStyle Hidden -ArgumentList $reArgs | Out-Null
                 # Terminate THIS (old) process hard. A bare `exit` here throws a
                 # System.Management.Automation.ExitException; when Invoke-Startup runs
@@ -417,6 +1420,253 @@ function Invoke-PostUpdateTail {
             # running.
         }
     }
+}
+
+# ---------------------------------------------------------------------------
+# DEPENDENCY DRIFT (D5): START_ALL BRINGS THE VENV UP TO DATE ITSELF.
+#
+# `git pull` (or a manual pull/merge) can change requirements.txt, and nothing on the daily path
+# used to install the difference: this function's predecessor only REPORTED it, telling the
+# operator to run setup.bat -- and because it asked "is the stamp for this requirements.txt?"
+# rather than "does the venv satisfy it?", every PC installed before the stamp existed got that
+# line on every start, forever. The owner's rule since: the only remedy start_all may give for
+# its own environment is running start_all.bat again, and preferably not even that.
+#
+# The old reasons for not installing here are each solved, not waived:
+#   * hidden window, nobody reads the console -- pip's output goes to .setup\logs\deps_install_*.log
+#     and a failure is COUNTED into the startup summary with pip's own last error line and that
+#     path (bootstrap.py sync_deps / _last_pip_error);
+#   * two starts at once (Startup .lnk + Task, 15 s apart) racing pip into one .venv -- the two
+#     copies are already serialised by Enter-StartAllLock, and bootstrap.py takes an OS
+#     byte-range lock (.setup\install_deps.lock) around check + install + stamp, which also
+#     covers setup/quickstart running their own install_deps at the same time; a waiting
+#     start_all keeps waiting while that lock is held (Test-DepsInstallInProgress);
+#   * proxy / TLS interception -- Set-PipNetworkEnvironment gives pip the same environment
+#     setup.bat does (ca_bundle.ps1 roots, detect_proxy.ps1 proxy), and restores it afterwards;
+#   * processes running from the venv while pip rewrites it -- the install runs only when none of
+#     this checkout's supervisor / server / bridge / fleet coordinator is running, or when the
+#     SAME rule every server swap here uses (Get-ServerAction / stale_server_check.py
+#     --server-action, requirements.txt as the changed path) says nothing is live; they are then
+#     stopped first and started again by the rest of this start_all. Otherwise the install is
+#     put off to the next start_all, and the summary says so in plain words;
+#   * an upgrade that pip reports as successful but leaves a package missing its own files (the
+#     fastmcp 2 -> 3 / fastmcp-slim case, 2026-09-24) -- bootstrap's install step checks every
+#     RECORD against the disk, reinstalls what it broke, and proves the result by importing
+#     main.py, for setup.bat and start_all alike.
+# Runs BEFORE the supervisor is started, so a normal logon start installs first and the server
+# then starts on the new packages with nothing to restart.
+# ---------------------------------------------------------------------------
+function Get-ThisCheckoutSupervisorProcesses {
+    # All Win32_Process entries whose command line launches THIS checkout's supervisor.ps1.
+    # SCOPED -- this list is what gets STOPPED. A bare name match finds anything that mentions
+    # the file: measured, four matches here and three of them were shell commands that merely
+    # contained the string. Stopping those would kill another checkout's supervisor, or
+    # somebody's shell.
+    try {
+        $supPath = Join-Path $scriptDir "supervisor.ps1"
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                  Where-Object {
+                      $_.CommandLine -and
+                      ($_.Name -match '^(powershell|pwsh)') -and
+                      ($_.CommandLine -like ("*" + $supPath + "*")) -and
+                      ($_.CommandLine -notlike "*register-supervisor*")
+                  })
+    } catch { return @() }
+}
+function ConvertFrom-DepsSyncOutput([object[]]$Lines) {
+    # PURE. bootstrap.py --sync-deps prints one verdict line last: "deps: ok", "deps: recorded
+    # ...", "deps: installed ...", "deps: failed: <what>". Anything else -- a crash, no output --
+    # is "unknown", which the caller counts as a failure (it did not bring the venv up to date).
+    $v = @($Lines | ForEach-Object { [string]$_ } | Where-Object { $_ -like "deps: *" } | Select-Object -Last 1)
+    if ($v.Count -eq 0) {
+        $tail = @($Lines | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() } | Select-Object -Last 1)
+        return @{ Verdict = "unknown"; Detail = ($(if ($tail.Count) { $tail[0].Trim() } else { "no output" })) }
+    }
+    $body = $v[0].Substring(6).Trim()
+    foreach ($word in @("failed", "installed", "recorded", "ok")) {
+        if ($body -eq $word -or $body.StartsWith($word + " ") -or $body.StartsWith($word + ":")) {
+            return @{ Verdict = $word; Detail = $body.Substring($word.Length).TrimStart(":").Trim() }
+        }
+    }
+    return @{ Verdict = "unknown"; Detail = $body }
+}
+function Get-DepsProblemSummary([object[]]$CheckLines) {
+    # PURE. The first few "what is missing" items from --check-deps's own line, for a summary line.
+    $l = @($CheckLines | ForEach-Object { [string]$_ } | Where-Object { $_ -like "The .venv does not satisfy requirements.txt:*" } | Select-Object -Last 1)
+    if ($l.Count -eq 0) { return "requirements.txt is not satisfied by .venv" }
+    $items = @($l[0].Substring($l[0].IndexOf(":") + 1).Split(";") | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+    $s = ($items | Select-Object -First 3) -join "; "
+    if ($items.Count -gt 3) { $s += "; and $($items.Count - 3) more" }
+    return $s
+}
+function Test-DepsInstallInProgress {
+    # Is some process holding bootstrap.py's install lock right now? Probed with the same Win32
+    # byte-range lock msvcrt.locking takes (FileStream.Lock -> LockFile), released at once.
+    param([string]$LockPath = (Join-Path $root ".setup\install_deps.lock"))
+    if (-not (Test-Path -LiteralPath $LockPath)) { return $false }
+    $fs = $null
+    try {
+        $fs = [System.IO.File]::Open($LockPath, [System.IO.FileMode]::Open,
+                                     [System.IO.FileAccess]::ReadWrite, [System.IO.FileShare]::ReadWrite)
+        try { $fs.Lock(0, 1) } catch { return $true }
+        try { $fs.Unlock(0, 1) } catch { }
+        return $false
+    } catch {
+        return $false
+    } finally {
+        if ($fs) { $fs.Dispose() }
+    }
+}
+function Set-PipNetworkEnvironment {
+    # The environment setup.bat gives pip, for THIS process only (so for the bootstrap.py child
+    # started next): the machine's trusted roots exported by ca_bundle.ps1 (TLS interception),
+    # and the proxy detect_proxy.ps1 derives from Windows' own settings. Like setup.bat, a value
+    # that is already set wins. Returns what was there before, for Restore-ProcessEnvironment --
+    # the supervisor, server and bridge started later must not inherit a proxy meant for pip.
+    $names = @("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY")
+    $saved = @{}
+    foreach ($n in $names) { $saved[$n] = [Environment]::GetEnvironmentVariable($n, "Process") }
+    try {
+        $caScript = Join-Path $scriptDir "ca_bundle.ps1"
+        if (Test-Path -LiteralPath $caScript) {
+            $bundle = @(& $caScript -OutFile (Join-Path $root ".setup\ca-bundle.pem") -ExtraPem (Join-Path $root ".setup\ca-extra.pem") 2>$null |
+                        ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() }) | Select-Object -Last 1
+            if ($bundle -and (Test-Path -LiteralPath $bundle)) {
+                foreach ($n in @("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE")) {
+                    if (-not [Environment]::GetEnvironmentVariable($n, "Process")) {
+                        [Environment]::SetEnvironmentVariable($n, [string]$bundle, "Process")
+                    }
+                }
+            }
+        }
+    } catch {
+        Write-Host "[deps] could not export this machine's root certificates ($($_.Exception.Message)); pip uses its own"
+    }
+    try {
+        if (-not $env:HTTPS_PROXY) {
+            $proxyScript = Join-Path $scriptDir "detect_proxy.ps1"
+            $proxy = $null
+            if (Test-Path -LiteralPath $proxyScript) {
+                $proxy = @(& $proxyScript 2>$null | ForEach-Object { [string]$_ } | Where-Object { $_ -and $_.Trim() }) | Select-Object -Last 1
+            }
+            if ($proxy) {
+                $env:HTTPS_PROXY = $proxy
+                if (-not $env:HTTP_PROXY) { $env:HTTP_PROXY = $proxy }
+                if (-not $env:NO_PROXY) { $env:NO_PROXY = "localhost,127.0.0.1,::1" }
+                Write-Host "[deps] using this PC's proxy for the download: $proxy"
+            }
+        }
+    } catch {
+        Write-Host "[deps] proxy detection skipped ($($_.Exception.Message))"
+    }
+    return $saved
+}
+function Restore-ProcessEnvironment([hashtable]$Saved) {
+    if (-not $Saved) { return }
+    foreach ($n in @($Saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $Saved[$n], "Process") }
+}
+function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
+    # Returns the outcome word (ok / recorded / installed / deferred / failed / unknown / skipped)
+    # and COUNTS every outcome that leaves the venv behind requirements.txt into
+    # $script:startupFailures -- with what failed and "re-run start_all.bat", never setup.bat.
+    #
+    # No venv or no bootstrap.py: nothing to bring up to date; the first-time setup gate and the
+    # supervisor's own "no usable Python" refusal cover "nothing is installed yet".
+    if ((-not $VenvPy) -or (-not (Test-Path -LiteralPath $VenvPy)) -or
+        (-not $BootstrapPy) -or (-not (Test-Path -LiteralPath $BootstrapPy))) {
+        return "skipped"
+    }
+    # 1. The cheap question. A matching stamp answers from one hash; a missing or different stamp
+    #    reads the installed metadata and, when everything is satisfied, RECORDS the stamp -- so a
+    #    PC set up before the stamp existed is clean from this start on, with no install.
+    try {
+        $checkOut = @(& $VenvPy $BootstrapPy --check-deps 2>&1 | ForEach-Object { [string]$_ })
+        $rc = $LASTEXITCODE
+    } catch {
+        Write-Host "[deps] dependency check could not run ($($_.Exception.Message)) -- left as-is"
+        return "unknown"
+    }
+    if ($rc -eq 0) { return "ok" }
+    if ($rc -ne 3) {
+        # The venv's python itself failed; the supervisor's own Python check reports that.
+        Write-Host ("[deps] dependency check exited $rc -- left as-is: " + (($checkOut | Select-Object -Last 2) -join " / "))
+        return "unknown"
+    }
+    $need = Get-DepsProblemSummary $checkOut
+    Write-Host "[deps] .venv does not satisfy requirements.txt: $need"
+
+    # 2. NOTHING THAT RUNS FROM .venv MAY BE RUNNING WHILE PIP REWRITES IT. Measured 2026-09-24:
+    #    an install under a running server and bridge left both unable to import fastmcp until the
+    #    venv was repaired by hand. So: a fleet coordinator of this checkout -> not now. Anything
+    #    else of ours up (the supervisor, which restarts the server on its own; the server; the
+    #    bridge and its keepalive) -> ask the ONE server rule (stale_server_check.py
+    #    --server-action, requirements.txt as the changed path; it reads the fleet/review run
+    #    markers and the bridge's turn state). Only "swap-needed" -- nothing live -- lets this
+    #    stop them; anything else, including "cannot tell", puts the install off. What is stopped
+    #    here is started again by the rest of this start_all, on the new packages.
+    $coords = @(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ })
+    $sups = @(Get-ThisCheckoutSupervisorProcesses)
+    $servers = @(Get-ThisCheckoutServerProcesses)
+    $bridges = @(Get-ThisCheckoutBridgeProcesses)
+    $why = ""
+    $live = $false
+    if ($coords.Count -gt 0) {
+        $live = $true
+        $why = "a fleet run is in progress"
+    } elseif ($CoreOnly -and $bridges.Count -gt 0) {
+        # -CoreOnly starts the supervisor only, so a bridge stopped here would stay down.
+        $live = $true
+        $why = "the chat bridge is running and this core-only start would not start it again"
+    } elseif (($sups.Count + $servers.Count + $bridges.Count) -gt 0) {
+        $pre = Get-ServerAction -ChangedPaths @("requirements.txt")
+        if ($pre.Verdict -ne "swap-needed") {
+            $live = $true
+            $w = @($pre.Why | Where-Object { $_ -and ($_ -notlike "the update changed *") })
+            $why = $(if ($w.Count) { $w -join "; " } else { "it could not be confirmed that nothing is running" })
+        } else {
+            Write-Host "[deps] nothing is in use -- stopping this checkout's supervisor, MCP server and bridge for the install; they are started again below"
+            foreach ($p in $sups) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch { } }
+            $null = Invoke-ServerAction $pre "[deps]"
+            if ($bridges.Count -gt 0) { Stop-Bridge-Processes }
+            Start-Sleep -Seconds 1
+        }
+    }
+    if ($live) {
+        Write-Host "[deps] not updating now: $why"
+        $script:startupFailures += "Python dependencies need updating ($need), but $why -- they will be updated automatically the next time start_all.bat runs while nothing is running"
+        return "deferred"
+    }
+
+    # 3. Install, through bootstrap.py's own install_deps step (lock, re-check, pip, repair,
+    #    verify by importing main.py, stamp).
+    Set-SplashStatus $script:splash "Updating Python dependencies..."
+    Write-Host "[deps] bringing .venv up to date with requirements.txt"
+    $saved = Set-PipNetworkEnvironment
+    try {
+        $syncOut = @(& $VenvPy $BootstrapPy --sync-deps 2>&1 | ForEach-Object { [string]$_ })
+    } catch {
+        $syncOut = @("deps: failed: bootstrap.py --sync-deps could not run ($($_.Exception.Message)) -- re-run start_all.bat")
+    } finally {
+        Restore-ProcessEnvironment $saved
+    }
+    $res = ConvertFrom-DepsSyncOutput $syncOut
+    switch ($res.Verdict) {
+        "installed" {
+            Write-Host "[deps] installed $($res.Detail)"
+        }
+        { $_ -eq "recorded" -or $_ -eq "ok" } {
+            Write-Host "[deps] .venv satisfies requirements.txt ($($res.Verdict))"
+        }
+        "failed" {
+            Write-Host "[deps] FAILED: $($res.Detail)" -ForegroundColor Yellow
+            $script:startupFailures += "Python dependencies could not be brought up to date ($need): $($res.Detail)"
+        }
+        default {
+            Write-Host "[deps] no verdict from bootstrap.py --sync-deps: $($res.Detail)" -ForegroundColor Yellow
+            $script:startupFailures += "Python dependencies could not be brought up to date ($need): bootstrap.py --sync-deps ended without a verdict (last output: $($res.Detail)); its record is .setup\bootstrap.log -- re-run start_all.bat"
+        }
+    }
+    return $res.Verdict
 }
 
 function Check-ForUpdates {
@@ -645,91 +1895,118 @@ function Invoke-FirstTimeSetupGate {
 }
 
 # ---------------------------------------------------------------------------
-# One-time convenience provisioning: a person who downloads the repo, manually finishes
-# devtunnel + agent-URL setup, then runs start_all expects it to also finish the two other
-# one-time setup steps -- the Desktop icon (make_desktop_shortcut.ps1) and the logon autostart
-# registration (register-supervisor.ps1). Neither happens today via this path (the shortcut
-# script is only invoked from quickstart.bat behind a Y/N prompt; autostart registration is a
-# purely manual step), so provision both here, but ONLY ONCE EVER: gated on a marker file so
-# that if the user later deletes the icon or unregisters autostart, start_all does not fight
-# them by silently recreating it on the next run. Runs AFTER the services/UIs are brought up so
-# a failure here can never block or delay the actual startup.
+# Convenience provisioning: the Desktop icon (make_desktop_shortcut.ps1) and the logon autostart
+# (register-supervisor.ps1), created from the person's recorded answer in
+# .setup\convenience_provisioned (see scripts\win\convenience_marker.ps1). Runs AFTER the
+# services/UIs are brought up so a failure here can never block or delay the actual startup.
+#
+# ONLY WHAT WAS ASKED FOR, AND ONLY WHAT IS MISSING (new-PC analysis D11). This re-ran both
+# scripts on EVERY start while the record said yes -- and nothing but quickstart ever wrote the
+# record, so unregister-supervisor.ps1 removed the autostart and the next start put it back.
+# Now: a "yes" re-creates the thing only when it is gone, and the scripts that remove or add
+# one (unregister-supervisor.ps1, make_desktop_shortcut.ps1 -Remove, and their opposites)
+# record the new answer, so the file always says what the person last asked for.
 # ---------------------------------------------------------------------------
+# A LAUNCHER THAT EXISTS CAN STILL BE DEAD. make_desktop_shortcut.ps1 / register-supervisor.ps1
+# (f27826d) point a shortcut at powershell.exe instead of wscript.exe when Windows Script Host is
+# disabled -- but only when they RUN, and provisioning below ran them only for a MISSING
+# shortcut. One made while WSH worked stayed on wscript.exe after a policy disabled WSH, and
+# wscript then does nothing at all: no window, no error, no start. So a shortcut that targets
+# wscript.exe is re-made when preflight_policy.ps1 -CheckWshOnly (the check both scripts and
+# start_all.bat use) says WSH is disabled. The .lnk is read as bytes, the way
+# scripts/test_shortcuts_without_wsh.py reads it -- WScript.Shell is the thing that may be gone.
+function Test-ShortcutTargetsWscript([string]$LnkPath) {
+    if (-not $LnkPath -or -not (Test-Path -LiteralPath $LnkPath)) { return $false }
+    try {
+        $b = [System.IO.File]::ReadAllBytes($LnkPath)
+        # UTF-16LE at both byte parities (StringData fields land on either) plus a latin-1 pass
+        # for LinkInfo's narrow LocalBasePath, where the target path is.
+        $u0 = [System.Text.Encoding]::Unicode.GetString($b)
+        $u1 = $(if ($b.Length -gt 1) { [System.Text.Encoding]::Unicode.GetString($b, 1, $b.Length - 1) } else { "" })
+        $a = [System.Text.Encoding]::GetEncoding(28591).GetString($b)
+        return (($u0 + "`n" + $u1 + "`n" + $a).ToLowerInvariant().Contains("wscript.exe"))
+    } catch { return $false }
+}
+function Test-WshDisabled {
+    # $true only when preflight_policy.ps1 -CheckWshOnly answers WSH-ENABLED=0. A check that
+    # cannot run is "not known to be disabled": nothing is re-made on a guess.
+    $preflight = Join-Path $scriptDir "preflight_policy.ps1"
+    if (-not (Test-Path -LiteralPath $preflight)) { return $false }
+    try {
+        $lines = @(& powershell -NoProfile -ExecutionPolicy Bypass -File $preflight -CheckWshOnly 2>$null |
+                   ForEach-Object { ([string]$_).Trim() })
+        return ($lines -contains "WSH-ENABLED=0")
+    } catch { return $false }
+}
 function Ensure-ConvenienceProvisioning {
     try {
-        $setupDir = Join-Path $root ".setup"
-        $markerPath = Join-Path $setupDir "convenience_provisioned"
+        $markerPath = Get-ConvenienceMarkerPath $root
         # THE MARKER RECORDS A DECISION, NOT AN ACT -- and its ABSENCE is not consent.
-        #
-        # This used to provision both whenever the marker was missing, so a machine that had
-        # never been asked got a Desktop shortcut and a logon autostart entry anyway. Worse,
-        # quickstart.bat asked "Create a launcher? [Y/n]" AFTERWARDS, so the question was put
-        # to someone whose answer could no longer matter: saying no changed nothing, and the
-        # autostart registration was never mentioned at all. Both are changes OUTSIDE this
-        # folder, and both persist after the repo is deleted.
-        #
-        # quickstart.bat now asks first and writes the answers here as
-        #   shortcut=yes|no
-        #   autostart=yes|no
         # With no file there is no decision, and with no decision nothing is created.
         if (-not (Test-Path $markerPath)) {
             Write-Host "[provision] no consent on record -- creating nothing."
             Write-Host "[provision] run quickstart.bat to be asked, or scripts\make_desktop_shortcut.ps1"
-            Write-Host "[provision] and scripts
-egister-supervisor.ps1 to do either by hand."
+            Write-Host "[provision] and scripts\register-supervisor.ps1 to do either by hand."
             return
         }
-
-        $decision = @{}
-        foreach ($line in (Get-Content $markerPath -ErrorAction SilentlyContinue)) {
-            if ($line -match '^\s*([A-Za-z_]+)\s*=\s*(\S+)\s*$') { $decision[$matches[1]] = $matches[2] }
-        }
         # An older marker holds the single word "provisioned": that machine was already
-        # provisioned under the previous behaviour, so re-doing it would fight the user. Treat
-        # it as "both already handled, touch nothing" rather than re-asking or re-creating.
-        if ($decision.Count -eq 0) { return }
+        # provisioned under the previous behaviour, so re-doing it would fight the user.
+        $decision = Read-ConvenienceDecision $root
+        if (-not $decision -or $decision.Count -eq 0) { return }
 
         $wantShortcut  = ($decision['shortcut']  -eq 'yes')
         $wantAutostart = ($decision['autostart'] -eq 'yes')
-        if (-not $wantShortcut -and -not $wantAutostart) { return }
+        $plan = Get-ConvenienceProvisioningPlan -Decision $decision `
+                    -ShortcutPresent (Test-Path (Get-DesktopLauncherPath)) `
+                    -AutostartPresent (Test-Path (Get-StartupLauncherPath))
 
-        if (-not (Test-Path $setupDir)) {
-            New-Item -ItemType Directory -Path $setupDir -Force | Out-Null
+        # A present launcher that targets wscript.exe while WSH is disabled is dead: re-made like
+        # a missing one (see Test-ShortcutTargetsWscript). WSH is asked only when a shortcut
+        # actually targets wscript.exe, so an ordinary start pays nothing for this.
+        $deadShortcut = $wantShortcut -and -not $plan.Shortcut -and (Test-ShortcutTargetsWscript (Get-DesktopLauncherPath))
+        $deadAutostart = $wantAutostart -and -not $plan.Autostart -and (Test-ShortcutTargetsWscript (Get-StartupLauncherPath))
+        if (($deadShortcut -or $deadAutostart) -and -not (Test-WshDisabled)) {
+            $deadShortcut = $false
+            $deadAutostart = $false
         }
 
-        # a) Desktop shortcut. make_desktop_shortcut.ps1 is idempotent (overwrites), so running
-        #    it here is harmless even on a machine where it was already created by hand/quickstart.
+        # a) Desktop shortcut -- only when the record says yes AND it is not there (or is dead).
         $shortcutScript = Join-Path $scriptDir "make_desktop_shortcut.ps1"
-        if ($wantShortcut -and (Test-Path $shortcutScript)) {
+        if ($wantShortcut -and (Test-Path $shortcutScript) -and ($plan.Shortcut -or $deadShortcut)) {
             try {
                 Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
-                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $shortcutScript
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $shortcutScript)
                 ) -WorkingDirectory $root
-                Write-Host "[provision] desktop shortcut created"
+                if ($deadShortcut) {
+                    Write-Host "[provision] Desktop launcher pointed at wscript.exe, and Windows Script Host is disabled on this PC -- re-created to start through PowerShell."
+                } else {
+                    Write-Host "[provision] Desktop launcher was missing and your recorded answer is shortcut=yes -- re-created."
+                }
+                Write-Host "[provision] To remove it for good: scripts\make_desktop_shortcut.ps1 -Remove"
             } catch {
                 Write-Host "[provision] desktop shortcut skipped: $_"
             }
         }
 
-        # b) Logon autostart. register-supervisor.ps1 is idempotent (re-creates the same Startup-
-        #    folder shortcut), so running it here is harmless even on an already-registered machine.
+        # b) Logon autostart -- only when the record says yes AND the Startup shortcut (the
+        #    primary mechanism; the scheduled task is an optional extra) is not there.
         $autostartScript = Join-Path $scriptDir "register-supervisor.ps1"
-        if ($wantAutostart -and (Test-Path $autostartScript)) {
+        if ($wantAutostart -and (Test-Path $autostartScript) -and ($plan.Autostart -or $deadAutostart)) {
             try {
                 Start-Process powershell -WindowStyle Hidden -Wait -ArgumentList @(
-                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", $autostartScript
+                    "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ('"{0}"' -f $autostartScript)
                 ) -WorkingDirectory $root
-                Write-Host "[provision] logon autostart registered"
+                if ($deadAutostart) {
+                    Write-Host "[provision] logon autostart pointed at wscript.exe, and Windows Script Host is disabled on this PC -- re-registered to start through PowerShell."
+                } else {
+                    Write-Host "[provision] logon autostart was missing and your recorded answer is autostart=yes -- registered."
+                }
+                Write-Host "[provision] To turn it off for good: scripts\unregister-supervisor.ps1"
             } catch {
                 Write-Host "[provision] autostart registration skipped: $_"
             }
         }
-
-        # Write the marker AFTER attempting both, regardless of whether either one succeeded --
-        # this is a single best-effort attempt, not a retry-every-startup nag. No personal path or
-        # username is recorded, just a generic tag.
-        # NOT overwritten here any more: this file is the record of what the person chose,
-        # and stamping it with "provisioned" would erase that answer.
+        # The file is the record of what the person chose; nothing here overwrites it.
     } catch {
         # Convenience provisioning is best-effort only; it must never affect startup.
     }
@@ -801,10 +2078,344 @@ while ((Get-Date) -lt $deadline) {
     }
 }
 
+function Get-FleetResumeSkipReason {
+    # PURE. "" when start_all should run resume_interrupted_fleet.py --resume, else why not.
+    #
+    # THERE WERE TWO RESUMERS OF ONE MARKER. supervisor.ps1 resumes an interrupted fleet run at
+    # its own startup (Invoke-FleetAutoResume), and this script ran resume_interrupted_fleet.py
+    # --resume three seconds after starting that same supervisor. A resumed coordinator writes
+    # its fresh marker only once Python has imported it, so for seconds both saw the old DEAD
+    # pid and each could relaunch -- two coordinators on one .fleet directory, each overwriting
+    # the other's status. The second concurrent start_all (see the lock above) was a third.
+    #   * this run just started a supervisor that survived: that supervisor resumes at startup;
+    #     this one stays out of its way.
+    #   * a coordinator of this checkout is already running (either resumer's, or a live run):
+    #     there is nothing to resume, whatever the marker says yet.
+    #   * MCP_FLEET_AUTORESUME=0/false/no/off: the supervisor's opt-out, honoured here too.
+    param([bool]$SupervisorJustStarted, [object[]]$RunningCoordinatorPids, [string]$AutoResumeSetting)
+    if ($AutoResumeSetting -and ($AutoResumeSetting.Trim() -in @("0", "false", "no", "off"))) {
+        return "MCP_FLEET_AUTORESUME=$AutoResumeSetting"
+    }
+    if ($SupervisorJustStarted) {
+        return "the supervisor started by this run resumes an interrupted run itself, at its startup"
+    }
+    $pids = @($RunningCoordinatorPids | Where-Object { $_ })
+    if ($pids.Count -gt 0) {
+        return ("a fleet coordinator of this checkout is already running (pid " + ($pids -join ", ") + ")")
+    }
+    return ""
+}
+function Get-ThisCheckoutFleetCoordinatorPids {
+    try {
+        return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
+                 Where-Object { $_.CommandLine -and ($_.CommandLine -match 'relay[\\/.]fleet_runner') -and
+                                ($_.CommandLine -like "*$root*") } |
+                 ForEach-Object { $_.ProcessId })
+    } catch { return @() }
+}
+
+# ---------------------------------------------------------------------------
+# THE TUNNEL IS PART OF "STARTED" (new-PC analysis D24).
+#
+# A signed-out devtunnel CLI (token lifetime, the tenant's sign-in frequency) or a tunnel that
+# expired leaves the supervisor running and NOT hosting: it pauses tunnel management and writes
+# one line to %TEMP%\m365-companion-supervisor.log. start_all never looked, so the daily start
+# ended with zero problems while Copilot Studio could not reach this PC at all, and only
+# doctor.bat's tunnel_login row said why. Checked here with the same resolution and the same
+# `user show` / `show` reading as supervisor.ps1 and doctor.ps1, and COUNTED, with the command
+# that fixes it.
+# ---------------------------------------------------------------------------
+function Resolve-DevTunnelExe {
+    # Same order as supervisor.ps1 and doctor.ps1: winget link, the direct download that
+    # setup_devtunnel.ps1 falls back to, then PATH. "" when there is none.
+    $wingetDt = Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\devtunnel.exe"
+    if (Test-Path $wingetDt) { return $wingetDt }
+    $directDt = Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"
+    if (Test-Path $directDt) { return $directDt }
+    $cmd = Get-Command devtunnel -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($cmd) { return $cmd.Source }
+    return ""
+}
+function Invoke-DevTunnelBounded([string]$Exe, [string[]]$DtArgs, [int]$TimeoutSec) {
+    # Start-Job + deadline, as doctor.ps1 does: an offline CLI can hang, and this must not.
+    try {
+        $job = Start-Job -ScriptBlock {
+            param($exe, $a)
+            try { & $exe @a 2>&1 | Out-String } catch { "" }
+        } -ArgumentList $Exe, $DtArgs
+    } catch { return $null }
+    $deadline = (Get-Date).AddSeconds($TimeoutSec)
+    while ($job.State -eq 'Running' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 150 }
+    if ($job.State -eq 'Running') {
+        try { Stop-Job $job -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+        return $null
+    }
+    $out = Receive-Job $job
+    try { Remove-Job $job -Force -ErrorAction SilentlyContinue } catch { }
+    return [string]$out
+}
+function Get-TunnelLoginState([string]$UserShowOutput) {
+    # PURE. supervisor.ps1's Test-DevtunnelLoggedIn reading, three-valued: an answer that is
+    # neither (a timeout, an error) is "unknown", which is reported but not counted.
+    if (-not $UserShowOutput) { return "unknown" }
+    if ($UserShowOutput -match 'Not logged in' -or $UserShowOutput -match 'Login required') { return "signed-out" }
+    if ($UserShowOutput -match 'Logged in') { return "signed-in" }
+    return "unknown"
+}
+function Get-TunnelHostCount([string]$ShowOutput) {
+    # PURE. -1: the tunnel does not exist on this account. -2: could not tell. Else N >= 0.
+    if (-not $ShowOutput) { return -2 }
+    if ($ShowOutput -match 'Tunnel not found') { return -1 }   # doctor.ps1's tunnel_exists reading
+    if ($ShowOutput -match 'Host connections\s*:\s*(\d+)') { return [int]$Matches[1] }
+    return -2
+}
+function Test-TunnelServing {
+    # Appends to $script:startupFailures. Waits (bounded) for a host connection only when the
+    # CLI is signed in and the tunnel exists, because the supervisor may have been started a
+    # few seconds ago and hosting takes up to ~50 s.
+    param([int]$HostWaitSec = 60, [int]$PollSec = 5)
+    $dt = Resolve-DevTunnelExe
+    if (-not $dt) {
+        Write-Host "[tunnel] devtunnel CLI not found -- Copilot Studio cannot reach this PC." -ForegroundColor Yellow
+        $script:startupFailures += "devtunnel CLI not found: install it with quickstart.bat (STEP 4) or 'winget install Microsoft.devtunnel', then start again"
+        return
+    }
+    $login = Get-TunnelLoginState (Invoke-DevTunnelBounded $dt @('user', 'show') 10)
+    if ($login -eq "signed-out") {
+        Write-Host "[tunnel] devtunnel is SIGNED OUT: the tunnel is not hosted and Copilot Studio cannot reach this PC." -ForegroundColor Yellow
+        Write-Host "         Run:  devtunnel user login   (opens a browser). The supervisor resumes hosting on its own within a minute." -ForegroundColor Yellow
+        $script:startupFailures += "devtunnel is signed out, so the tunnel is not hosted: run 'devtunnel user login', then start again"
+        return
+    }
+    if ($login -eq "unknown") {
+        Write-Host "[tunnel] could not tell whether devtunnel is signed in (no clear answer within 10 s) -- not counted as a failure, but cannot confirm the tunnel is served; doctor.bat checks it again." -ForegroundColor DarkGray
+        $script:startupUnclear += "could not tell whether devtunnel is signed in (no answer within 10 s): cannot confirm the tunnel is served -- run doctor.bat"
+        return
+    }
+    $tn = Env-Value "MCP_TUNNEL_NAME"
+    if (-not $tn) {
+        Write-Host "[tunnel] MCP_TUNNEL_NAME is empty in .env: no tunnel is configured." -ForegroundColor Yellow
+        $script:startupFailures += "no Dev Tunnel configured (MCP_TUNNEL_NAME is empty): run quickstart.bat (STEP 4) or powershell -File scripts\setup_devtunnel.ps1"
+        return
+    }
+    $deadline = (Get-Date).AddSeconds($HostWaitSec)
+    while ($true) {
+        $n = Get-TunnelHostCount (Invoke-DevTunnelBounded $dt @('show', $tn) 10)
+        if ($n -ge 1) { Write-Host "[tunnel] '$tn' is hosted ($n host connection(s))"; return }
+        if ($n -eq -1) {
+            Write-Host "[tunnel] Dev Tunnel '$tn' does not exist on this account (expired or deleted)." -ForegroundColor Yellow
+            $script:startupFailures += ("Dev Tunnel '" + $tn + "' does not exist on this account (expired or deleted): recreate it with powershell -File scripts\setup_devtunnel.ps1 and re-paste the URL it prints into Copilot Studio")
+            return
+        }
+        if ((Get-Date) -ge $deadline) { break }
+        Start-Sleep -Seconds $PollSec
+    }
+    if ($n -eq -2) {
+        Write-Host "[tunnel] could not read the state of '$tn' -- not counted as a failure, but cannot confirm the tunnel is served; doctor.bat checks it again." -ForegroundColor DarkGray
+        $script:startupUnclear += ("could not read the hosting state of Dev Tunnel '" + $tn + "': cannot confirm the tunnel is served -- run doctor.bat")
+        return
+    }
+    Write-Host "[tunnel] Dev Tunnel '$tn' has no host connection after $HostWaitSec s -- Copilot Studio cannot reach this PC." -ForegroundColor Yellow
+    $script:startupFailures += ("Dev Tunnel '" + $tn + "' is not hosted after " + $HostWaitSec + " s: the supervisor hosts it -- see " + (Join-Path $env:TEMP 'm365-companion-supervisor.log') + ", or run doctor.bat")
+}
+
+# ---------------------------------------------------------------------------
+# THE UI EXES ARE CHECKED AGAINST THEIR SOURCES, NOT BY EXISTENCE (new-PC analysis D27).
+# stale_server_check.py --ui-stale reads rebuild_ui.ps1's Build lines through
+# bench/ui_build_check.py -- the one parser of that list -- and names every exe that is
+# missing, zero-length, or older than a source it is built from. Without .venv it cannot be
+# asked, and the check falls back to the old existence test plus a zero-length test.
+# ---------------------------------------------------------------------------
+function ConvertFrom-UiStaleLines([object[]]$Lines) {
+    # PURE. "<name> ok" / "<name> rebuild <reason>" -> @{ Names = all; Stale = @{name=reason} }
+    $names = @(); $stale = @{}
+    foreach ($l in @($Lines | ForEach-Object { [string]$_ })) {
+        if ($l -match '^\s*([A-Za-z0-9_]+)\s+ok\s*$') { $names += $matches[1] }
+        elseif ($l -match '^\s*([A-Za-z0-9_]+)\s+rebuild\s+(\S+)\s*$') { $names += $matches[1]; $stale[$matches[1]] = $matches[2] }
+    }
+    return @{ Names = $names; Stale = $stale }
+}
+function Get-UiBuildState {
+    # @{ Names; Stale; Source } -- Source says whether the answer came from the sources or only
+    # from the files existing.
+    $pyExe = $script:venvPy
+    $chk = Join-Path $scriptDir "stale_server_check.py"
+    if ((Test-Path $pyExe) -and (Test-Path $chk)) {
+        try {
+            $out = @(& $pyExe $chk "--ui-stale" 2>$null)
+            if ($LASTEXITCODE -eq 0) {
+                $st = ConvertFrom-UiStaleLines $out
+                if ($st.Names.Count -gt 0) { $st.Source = "sources"; return $st }
+            }
+        } catch { }
+    }
+    $st = @{ Names = @("CopilotChat", "FleetCockpit"); Stale = @{}; Source = "existence only (no .venv to read the build list)" }
+    foreach ($n in $st.Names) {
+        $exe = Join-Path $root ("ui\" + $n + ".exe")
+        if (-not (Test-Path $exe)) { $st.Stale[$n] = "missing" }
+        elseif ((Get-Item $exe).Length -eq 0) { $st.Stale[$n] = "empty" }
+    }
+    return $st
+}
+function Invoke-UiStep {
+    # Build once if ANY exe needs it (rebuild_ui.ps1 always builds both), then launch whatever
+    # is not running. -NoLaunch, so there is one launch path: the loop below. rebuild_ui.ps1
+    # stops both apps before compiling -- the same thing the update path's rebuild does -- so a
+    # window running a stale build is closed and reopened on the new one.
+    Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
+    $ui = Get-UiBuildState
+    $counted = @{}
+    if ($ui.Stale.Count -gt 0) {
+        $what = (@($ui.Stale.Keys | Sort-Object | ForEach-Object { $_ + " (" + $ui.Stale[$_] + ")" }) -join ", ")
+        $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
+        if (Test-Path $rebuildScript) {
+            Write-Host "[4/4] UI needs building: $what [checked by $($ui.Source)] -- building both apps (~30s; open chat/cockpit windows close and reopen)..."
+            Set-SplashStatus $script:splash "Building the chat and cockpit apps (~30s)..."
+            $rbOut = ""
+            $global:LASTEXITCODE = 0
+            try {
+                $rbOut = (& $rebuildScript -NoLaunch 2>&1 | Out-String)
+                $rbCode = $LASTEXITCODE
+            } catch {
+                $rbOut = $_.Exception.Message
+                $rbCode = 1
+            }
+            if ($rbCode -ne 0) {
+                $tail = (@($rbOut -split "`r?`n" | Where-Object { $_.Trim() }) | Select-Object -Last 3) -join " / "
+                Write-Host "[4/4] UI rebuild FAILED: $tail -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)" -ForegroundColor Yellow
+                foreach ($app in @($ui.Stale.Keys)) {
+                    # COUNTED. A UI that did not build is a startup problem, and the exit
+                    # code exists to carry exactly that.
+                    $script:startupFailures += "${app}: rebuild failed"
+                    $counted[$app] = $true
+                }
+            } else {
+                Write-Host "[4/4] UI rebuilt"
+            }
+        } else {
+            Write-Host "[4/4] UI needs building ($what), and ui\rebuild_ui.ps1 is missing -- see docs\TROUBLESHOOTING.md" -ForegroundColor Yellow
+        }
+    }
+    foreach ($app in @($ui.Names)) {
+        $exe = Join-Path $root ("ui\" + $app + ".exe")
+        if (Get-Process $app -ErrorAction SilentlyContinue) {
+            Write-Host "[4/4] ${app}: already running"
+        } elseif ((Test-Path $exe) -and ((Get-Item $exe).Length -gt 0)) {
+            Write-Host "[4/4] ${app}: launching"
+            # THE WINDOW MAY ASK "WHO OPENED ME?": M365_LAUNCHED_BY_START_ALL=1 in ITS environment
+            # only. Start-Process copies this process's environment, so it is set for the call
+            # and put back at once -- nothing else start_all launches inherits it.
+            $prevLaunched = [Environment]::GetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL", "Process")
+            [Environment]::SetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL", "1", "Process")
+            try {
+                Start-Process $exe
+            } finally {
+                [Environment]::SetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL", $prevLaunched, "Process")
+            }
+        } else {
+            Write-Host "[4/4] ${app}: no usable ui\$app.exe -- the chat/cockpit window cannot open" -ForegroundColor Yellow
+            if (-not $counted[$app]) {
+                $script:startupFailures += ("${app}: ui\" + $app + ".exe is missing or empty and was not rebuilt -- run powershell -File ui\rebuild_ui.ps1")
+            }
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# A BACKGROUND START THAT FAILED HAS TO LEAVE SOMETHING SOMEBODY SEES.
+#
+# The daily launchers run this hidden (start_all_hidden.vbs, start_background_hidden.vbs: window
+# 0, exit code unread), so the failure list printed at the end went to a window nobody has. Two
+# things now carry it out: .setup\logs\start_all_summary.txt, rewritten on EVERY run (so a clean
+# start clears yesterday's list), next to doctor_summary.txt; and, when there are failures and
+# no visible console, a desktop notification through tools/notify_ops.notify_desktop -- the
+# helper the supervisor and heal_tunnel.ps1 already use -- listing them and pointing at
+# doctor.bat. A visible console (quickstart, a manual run) already shows the list, so it is not
+# repeated there.
+# ---------------------------------------------------------------------------
+function Write-StartupSummary([string]$Path, [string[]]$Failures, [string]$Mode, [string[]]$Unclear = @()) {
+    try {
+        $lines = @(("failures=" + @($Failures).Count),
+                   ("when=" + (Get-Date).ToString("yyyy-MM-dd HH:mm:ss")),
+                   ("mode=" + $Mode),
+                   ("unclear=" + @($Unclear).Count))
+        foreach ($f in @($Failures)) { $lines += ("- " + (Hide-Secrets ([string]$f))) }
+        foreach ($u in @($Unclear)) { $lines += ("? " + (Hide-Secrets ([string]$u))) }
+        if (@($Failures).Count -gt 0) { $lines += "fix: run doctor.bat for the specific fix for each line" }
+        if (@($Unclear).Count -gt 0) { $lines += "unclear ('?') lines were never confirmed either way -- run doctor.bat to check them" }
+        $dir = Split-Path -Parent $Path
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory -Force -Path $dir | Out-Null }
+        $tmp = $Path + ".tmp"
+        [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        return $true
+    } catch { return $false }
+}
+function Test-ShouldNotifyStartupFailures([int]$Count, [bool]$NoUi, [bool]$ConsoleVisible) {
+    # PURE.
+    if ($Count -le 0) { return $false }
+    return ($NoUi -or -not $ConsoleVisible)
+}
+function Test-ConsoleVisible {
+    # Is there a console window a person can see? $false for the hidden VBS launches (window 0)
+    # and when this cannot be told -- the notification is the safer error.
+    try {
+        if (-not ("M365.ConsoleVis" -as [type])) {
+            Add-Type -Namespace M365 -Name ConsoleVis -MemberDefinition @"
+[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+[DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
+"@ -ErrorAction Stop
+        }
+        $h = [M365.ConsoleVis]::GetConsoleWindow()
+        return (($h -ne [IntPtr]::Zero) -and [M365.ConsoleVis]::IsWindowVisible($h))
+    } catch { return $false }
+}
+function Send-StartupFailureNotice([string]$SummaryPath) {
+    # Best effort. The script reads the "- " lines itself from the summary file and gets every
+    # value through argv, so no failure text is ever spliced into code.
+    try {
+        $py = $script:venvPy
+        if (-not (Test-Path $py)) { return $false }
+        $code = "import sys; sys.path.insert(0, sys.argv[1]); from tools.notify_ops import notify_desktop; " +
+                "ls = [l[2:].strip() for l in open(sys.argv[2], encoding='utf-8') if l.startswith('- ') or l.startswith('? ')]; " +
+                "notify_desktop('M365 Companion: %d startup problem(s)' % len(ls), chr(10).join(ls[:4] + ['Run doctor.bat for the fix for each.']), launch=sys.argv[3])"
+        $uri = ([Uri]$SummaryPath).AbsoluteUri
+        & $py -c $code $root $SummaryPath $uri 2>$null | Out-Null
+        return ($LASTEXITCODE -eq 0)
+    } catch { return $false }
+}
+
 # Everything that brings the stack up, as ONE function so it can run either INSIDE the splash's
 # message loop (a one-shot timer, so the modal splash stays visible while this runs) OR directly
 # as a fallback if the splash cannot be shown. Status updates target $script:splash (no-op if null).
 function Invoke-Startup {
+    # FIRST, BEFORE ANYTHING IS WRITTEN OR STARTED: one copy of this script at a time (see
+    # Enter-StartAllLock). The splash keeps painting while a second copy waits.
+    $lockT0 = Get-Date
+    $heldAtEntry = [bool]$script:startAllLock
+    if ($heldAtEntry) {
+        # Taken at entry (Invoke-StartAllEntry), before the banner existed; its record is written.
+        $gotLock = $true
+    } else {
+        # Only a copy that must wait gets here (Invoke-StartAllEntry: the re-exec hand-over,
+        # -CoreOnly, or the ONE launch that needs more than the running startup does).
+        $gotLock = Enter-StartAllLock -Name $script:startAllLockName -OnWait {
+            Set-SplashStatus $script:splash "Another startup is already running -- waiting for it to finish..."
+        } -KeepWaitingWhile { Test-DepsInstallInProgress }
+    }
+    $script:lockWaitSec = [math]::Round(((Get-Date) - $lockT0).TotalSeconds, 1)
+    $script:lockState = $(if (-not $gotLock) { "timed out" } elseif ($script:lockWaitSec -ge 1) { "got after waiting" } else { "got" })
+    # The waiter slot is given up either way; a copy that now holds the lock records that it does.
+    Exit-StartAllWaiterSlot
+    if ($gotLock -and -not $heldAtEntry) { Update-StartAllBannerRecord }
+    if (-not $gotLock) {
+        $script:lockTimedOut = $true
+        $script:startupFailures += "another start_all.ps1 held the startup lock for 10 minutes; this one did not start anything alongside it -- close it (Task Manager) and start again"
+        return
+    }
+    Ensure-EnvDefaults
+
     Start-BackgroundSecurityUiCloser
 
     # First-time setup gate (BUG 3a): must run before anything is started, and before the
@@ -818,7 +2429,9 @@ function Invoke-Startup {
         # opening Copilot Studio to do. Asking here would be a deadlock.
         Write-Host "[setup] first-time interactive setup skipped (-CoreOnly)"
     } else {
+        $t0_setupGate = Get-Date
         Invoke-FirstTimeSetupGate
+        Record-PhaseTiming "setup_gate" $t0_setupGate
     }
 
     # A .ENV CARRIED FROM ANOTHER PC IS PRESENT AND UNUSABLE, WHICH NOTHING WAS LOOKING FOR.
@@ -853,20 +2466,19 @@ function Invoke-Startup {
                 } | Select-Object -Last 1)
             }
             if ($repair -like "repaired:*") {
-                # THE OPERATOR HAS TO BE TOLD. The repair generates a NEW password, so the one
-                # they wrote down on the machine that produced this .env no longer works here --
-                # and nothing used to say so. Printed to the console only, in the same place
-                # quickstart prints the other secrets; not written to any log.
-                $newPw = $repair.Substring("repaired:".Length)
+                # THE OPERATOR HAS TO BE TOLD, BUT NOT THE VALUE. The repair generates a NEW
+                # password and writes it to .env itself; repair_unlock.py deliberately no longer
+                # returns the cleartext, because this stdout is captured here and can reach logs,
+                # and the repo is public. So we announce that it changed and point at how to read
+                # it, rather than echoing a secret. $repair now carries only a non-secret note.
                 Write-Host ""
                 Write-Host "  ============================================================"
                 Write-Host "  The unlock password could not be decrypted by this Windows"
-                Write-Host "  account, so a NEW one was established for this machine:"
+                Write-Host "  account, so a NEW one was established and written to .env."
                 Write-Host ""
-                Write-Host ("      " + $newPw)
-                Write-Host ""
-                Write-Host "  Write this down. Any password you brought from another PC no"
-                Write-Host "  longer works here. (The fleet and bridge unlock themselves.)"
+                Write-Host "  Any password you brought from another PC no longer works here."
+                Write-Host "  Read the new value with: scripts\copilot_studio_values.ps1"
+                Write-Host "  (The fleet and bridge unlock themselves.)"
                 Write-Host "  ============================================================"
                 Write-Host ""
             } elseif ($repair -like "failed:*") {
@@ -883,19 +2495,41 @@ function Invoke-Startup {
     }
 
     # Pre-flight update check (best-effort, non-blocking). Runs once before any service starts.
-    # In background logon startup this is skipped because update prompts are visible dialogs.
-    if ($NoUi) {
-        Write-Host "[update] update check skipped (-NoUi)"
+    # Skipped when nobody should be asked, or when a pull could rewrite a batch file that is
+    # running this script -- see Get-UpdateCheckSkipReason for the exact gate and why.
+    $parentInfo = Get-ParentProcessInfo
+    $updateSkip = Get-UpdateCheckSkipReason -NoUi ([bool]$NoUi) -CoreOnly ([bool]$CoreOnly) `
+                                            -ParentName $parentInfo.Name -ParentCommandLine $parentInfo.CommandLine
+    if ($updateSkip) {
+        Write-Host "[update] update check skipped ($updateSkip)"
     } else {
         Set-SplashStatus $script:splash "Checking for updates..."
+        $t0_updateCheck = Get-Date
         Check-ForUpdates
+        Record-PhaseTiming "update_check" $t0_updateCheck
     }
+
+    # Dependency drift (D5): the venv is brought up to date with requirements.txt HERE -- after
+    # the update check, so a requirements.txt that pull just changed is installed on this start,
+    # and before the supervisor (and so the server) is started below. See the block above
+    # ConvertFrom-DepsSyncOutput. Whatever it cannot fix is counted into
+    # $script:startupFailures with what failed and "re-run start_all.bat"; never setup.bat.
+    $t0_depsSync = Get-Date
+    try {
+        $null = Invoke-DependencySync $script:venvPy $script:bootstrapPy
+    } catch {
+        Write-Host "[deps] dependency update skipped ($($_.Exception.Message))"
+        $script:startupFailures += "Python dependencies could not be checked: $($_.Exception.Message) -- re-run start_all.bat"
+    }
+    Record-PhaseTiming "deps_sync" $t0_depsSync
 
     # Dev Tunnel self-heal (best-effort, non-blocking, runs even under -NoUi):
     # repoints MCP_TUNNEL_NAME/MCP_TUNNEL_URL to a tunnel this account actually
     # owns, BEFORE the supervisor (below) hosts it.
     Set-SplashStatus $script:splash "Checking the Dev Tunnel..."
+    $t0_tunnelHeal = Get-Date
     Invoke-TunnelHealPreflight
+    Record-PhaseTiming "tunnel_heal" $t0_tunnelHeal
 
     Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
 
@@ -909,6 +2543,7 @@ function Invoke-Startup {
     #    forever. Detect that with Test-SupervisorTunnelDrift and restart on the correct
     #    tunnel; otherwise behave exactly as before.
     Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
+    $t0_supervisor = Get-Date
     function Start-FreshSupervisor([string]$tn) {
         # QUOTED. -ArgumentList elements are joined with spaces and not quoted, so an
         # install path containing one becomes two arguments and the launch fails.
@@ -945,6 +2580,11 @@ function Invoke-Startup {
                     } catch { }
                     Write-Host ("[1/4] " + $why) -ForegroundColor Yellow
                     $script:startupFailures += $why
+                    $script:supervisorDied = $true
+                } else {
+                    # It survived its first statements, so it will reach its own startup-time
+                    # fleet resume; the resume step below leaves that to it.
+                    $script:supervisorStartedHere = $true
                 }
             }
         } catch {
@@ -954,40 +2594,20 @@ function Invoke-Startup {
         }
     }
     function Get-RunningSupervisorProcesses {
-        # All Win32_Process entries whose command line launches supervisor.ps1. Normally
-        # zero or one; returned as an array so a drift-restart can stop every match.
-        try {
-            # SCOPED -- this list is what a drift restart STOPS. A bare name match finds
-            # anything that mentions the file: measured, four matches here and three of them
-            # were shell commands that merely contained the string. Stopping those would kill
-            # another checkout's supervisor, or somebody's shell.
-            $supPath = Join-Path $scriptDir "supervisor.ps1"
-            return @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                      Where-Object {
-                          $_.CommandLine -and
-                          ($_.Name -match '^(powershell|pwsh)') -and
-                          ($_.CommandLine -like ("*" + $supPath + "*")) -and
-                          ($_.CommandLine -notlike "*register-supervisor*")
-                      })
-        } catch { return @() }
+        # Normally zero or one; an array so a drift-restart can stop every match. One scoped
+        # definition, shared with Invoke-DependencySync (see Get-ThisCheckoutSupervisorProcesses).
+        return @(Get-ThisCheckoutSupervisorProcesses)
     }
     # main.py が自分のソースより古ければ落とす。supervisor が居れば数十秒で拾い直し、
     # 居なければ下の起動経路が立ち上げる。トンネルには触らない。
     # ここが無かった頃、main.py を直しても古いプロセスが残り、直したはずの説明文が
     # 配られ続けた（直っていないのか反映されていないのかが切り分けられない）。
-    if (Server-Is-Outdated $root) {
-        Write-Host "[1/4] MCP server: code is newer than the running process -- restarting"
-        try {
-            # SCOPED TO THIS CHECKOUT. Matching 'main.py' alone kills ANY process whose
-            # command line contains it -- another clone of this repo on the same machine, an
-            # unrelated project's main.py, an editor running one under a debugger. supervisor.ps1
-            # already gets this right with the same idiom; this copy did not, so one file in the
-            # repository was correct and the other was not.
-            Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -and ($_.CommandLine -match 'main\.py') -and ($_.CommandLine -like "*$root*") } |
-                ForEach-Object { Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue }
-        } catch { }
-        Start-Sleep -Seconds 2
+    # NOT WHILE A RUN IS LIVE, AND NOT ONLY THE TOP LEVEL: the same decision the post-update
+    # tail uses (Get-ServerAction). A server with nothing newer is a no-op; a live fleet/review
+    # run or bridge turn leaves it running and says so.
+    $srvStarted = Get-ServerStartEpoch
+    if ($srvStarted -gt 0) {
+        Invoke-ServerAction (Get-ServerAction -StartedEpoch $srvStarted) "[1/4] MCP server:" | Out-Null
     }
     $envTn = Env-Value "MCP_TUNNEL_NAME"
     $runningSupervisors = Get-RunningSupervisorProcesses
@@ -1020,6 +2640,7 @@ function Invoke-Startup {
             Write-Host "[1/4] supervisor (MCP server + tunnel): already running -- left as-is"
         }
     }
+    Record-PhaseTiming "supervisor_start" $t0_supervisor
 
     # 1b) Collect browsers left behind by a previous session, BEFORE starting anything.
     #
@@ -1034,6 +2655,8 @@ function Invoke-Startup {
     # it is not running, so a fleet run or bridge that is already up is left strictly alone.
     # Report-and-stop rather than silence, because reclaiming a browser somebody is watching
     # in Task Manager should be explainable afterwards.
+    $t0_fleetResume = Get-Date
+    try {
     $reaper = Join-Path $root "scripts\win\reap_orphan_edge.py"
     $py = Join-Path $root ".venv\Scripts\python.exe"
     if ((Test-Path $reaper) -and (Test-Path $py)) {
@@ -1050,12 +2673,28 @@ function Invoke-Startup {
     # Everything this needs already existed -- the marker carries a precomputed resume argv,
     # should_auto_resume() states the rule -- and nothing called it, so an interrupted run
     # simply stayed interrupted and the way anyone found out was that the answer never came.
+    #
+    # ONCE, NOT TWICE: see Get-FleetResumeSkipReason for the two other resumers this used to
+    # race (the supervisor it had just started, and a second copy of this script).
     if (Test-Path $py) {
         $resumer = Join-Path $root "scripts\win\resume_interrupted_fleet.py"
         if (Test-Path $resumer) {
-            try {
-                & $py $resumer --resume 2>&1 | ForEach-Object { Write-Host "      $_" }
-            } catch { Write-Host "      (resume check skipped: $($_.Exception.Message))" }
+            $resumeSkip = Get-FleetResumeSkipReason -SupervisorJustStarted ([bool]$script:supervisorStartedHere) `
+                              -RunningCoordinatorPids (Get-ThisCheckoutFleetCoordinatorPids) `
+                              -AutoResumeSetting ([string]$env:MCP_FLEET_AUTORESUME)
+            if ($resumeSkip) {
+                Write-Host "      fleet resume check skipped: $resumeSkip"
+                # AND THE REAP BELOW WITH IT, unless auto-resume is switched off. The reaper
+                # deletes a dead run's marker -- the very file a resume reads -- and the
+                # supervisor that is about to resume (or a coordinator that has not written
+                # its fresh marker yet) would find it gone. The supervisor reaps phantoms on
+                # its own loop (Invoke-FleetReap), after its resume, in the right order.
+                if ($resumeSkip -notlike "MCP_FLEET_AUTORESUME=*") { $script:fleetLeftToSupervisor = $true }
+            } else {
+                try {
+                    & $py $resumer --resume 2>&1 | ForEach-Object { Write-Host "      $_" }
+                } catch { Write-Host "      (resume check skipped: $($_.Exception.Message))" }
+            }
         }
     }
 
@@ -1067,7 +2706,9 @@ function Invoke-Startup {
     # It refuses to touch a run whose pid is alive, never relaunches anything and never
     # raises, so it is safe here -- including when the user clicks start_all while a real
     # run is going.
-    if (Test-Path $py) {
+    if ($script:fleetLeftToSupervisor) {
+        Write-Host "      phantom-run sweep left to the supervisor (it resumes first, then reaps)"
+    } elseif (Test-Path $py) {
         try {
             & $py -m relay.fleet_reaper --reap 2>&1 | ForEach-Object { Write-Host "      $_" }
         } catch { Write-Host "      (phantom-run sweep skipped: $($_.Exception.Message))" }
@@ -1079,7 +2720,9 @@ function Invoke-Startup {
         Write-Host "[core] server and tunnel are up; browser, bridge and UI left for STEP 7"
         return
     }
+    } finally { Record-PhaseTiming "fleet_resume_and_reaper" $t0_fleetResume }
 
+    $t0_browserBridgeUi = Get-Date
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
     Set-SplashStatus $script:splash "Starting the agent browser..."
     if (Port-Up 9222) {
@@ -1098,11 +2741,25 @@ function Invoke-Startup {
     # shipped that day was inert and the bug they fixed looked unfixed. Restarting only when
     # the source is actually newer keeps the idempotent behaviour for the ordinary case and
     # makes "pull, then click this" enough on its own.
+    #
+    # BUT NOT MID-TURN. Get-BridgeAction (see its block above) withholds the restart while
+    # the bridge's own /status reports a turn live, exactly like the server-swap rule
+    # withholds a kill during a live fleet/review run -- a manual `git pull` plus a
+    # double-click must not be able to drop what the operator is doing right now.
     Set-SplashStatus $script:splash "Starting the chat bridge..."
-    if (Bridge-Is-Outdated $root) {
-        Write-Host "[3/4] bridge: code is newer than the running process -- restarting"
-        Stop-Bridge-Processes
-        Start-Sleep -Seconds 2
+    $bridgeAction = Get-BridgeAction
+    switch ($bridgeAction.Verdict) {
+        "swap-needed" {
+            $why = ""
+            if ($bridgeAction.Why -and @($bridgeAction.Why).Count -gt 0) { $why = " (" + (@($bridgeAction.Why) -join "; ") + ")" }
+            Write-Host "[3/4] bridge: code is newer than the running process and no turn is live$why -- restarting"
+            Stop-Bridge-Processes
+            Start-Sleep -Seconds 2
+        }
+        "report-only" {
+            Write-Host "[3/4] bridge is running old code and will be refreshed on the next start when idle"
+        }
+        default { }
     }
     # A KEEPALIVE PROCESS IS NOT A SERVING BRIDGE. This branch asked only whether the wrapper
     # existed, so a wedged python holding :8765 behind a live keepalive reported "already
@@ -1158,14 +2815,21 @@ function Invoke-Startup {
         # 3s, so the process is "still running" while nothing serves. /conv is the same
         # liveness signal this whole block already keys on, so that is what is checked. The
         # first-start Edge bring-up plus a Python import needs a few seconds before /conv can
-        # answer, so this polls rather than probing once.
+        # answer, so this polls rather than probing once -- UNLESS MCP_IMPL_AGENT_URL is empty,
+        # in which case the child cannot ever serve /conv (see Get-BridgePollAttempts) and the
+        # poll is skipped outright rather than waiting out the full ~16s on every single start.
+        $bridgePollAttempts = Get-BridgePollAttempts (Env-Value "MCP_IMPL_AGENT_URL")
         $bridgeUp = $false
-        for ($bi = 0; $bi -lt 8; $bi++) {
+        for ($bi = 0; $bi -lt $bridgePollAttempts; $bi++) {
             Start-Sleep -Seconds 2
             if (Http-Up "http://127.0.0.1:8765/conv") { $bridgeUp = $true; break }
         }
         if (-not $bridgeUp) {
-            $why = "bridge: started but :8765/conv did not answer within ~16s"
+            if ($bridgePollAttempts -eq 0) {
+                $why = "bridge: not polled -- MCP_IMPL_AGENT_URL is empty, so start_bridge.ps1 exits at once and :8765/conv can never answer"
+            } else {
+                $why = "bridge: started but :8765/conv did not answer within ~16s"
+            }
             try {
                 if (Test-Path "$bridgeLog.err") {
                     $brLines = @(Get-Content "$bridgeLog.err" -Tail 5 -ErrorAction Stop |
@@ -1180,72 +2844,32 @@ function Invoke-Startup {
         }
     }
 
-    # 4) WPF apps. Launch only if not already running; build them first if the exe is missing.
-    #    In -NoUi mode (used by logon autostart), keep the backend stack alive but leave the
-    #    desktop untouched. Manual launchers still use the default behavior and open the apps.
+    # 4) WPF apps. Launch only if not already running; build them first if an exe is missing,
+    #    empty, or older than its sources (Invoke-UiStep). In -NoUi mode (used by logon
+    #    autostart), keep the backend stack alive but leave the desktop untouched. Manual
+    #    launchers still use the default behavior and open the apps.
     if ($NoUi) {
         Set-SplashStatus $script:splash "UI launch skipped for background startup..."
         Write-Host "[4/4] UI windows: skipped (-NoUi)"
     } else {
-        # rebuild_ui.ps1 builds AND relaunches BOTH apps itself, so if either exe is missing we
-        # invoke it exactly once for the whole loop ($rebuilt flag) rather than once per app.
-        Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
-        $rebuilt = $false
-        foreach ($app in @("CopilotChat","FleetCockpit")) {
-            if (Get-Process $app -ErrorAction SilentlyContinue) {
-                Write-Host "[4/4] ${app}: already running"
-            } elseif (Test-Path "$root\ui\$app.exe") {
-                Write-Host "[4/4] ${app}: launching"
-                Start-Process "$root\ui\$app.exe"
-            } elseif ($rebuilt) {
-                # Already tried a rebuild this loop (below) -- re-check post-rebuild state without
-                # rebuilding again.
-                if (Get-Process $app -ErrorAction SilentlyContinue) {
-                    Write-Host "[4/4] ${app}: launched by rebuild"
-                } else {
-                    Write-Host "[4/4] ${app}: still not running after rebuild -- see docs\TROUBLESHOOTING.md"
-                }
-            } else {
-                $rebuildScript = Join-Path $root "ui\rebuild_ui.ps1"
-                if (Test-Path $rebuildScript) {
-                    Write-Host "[4/4] $app.exe not built yet -- building both UI apps (first run, ~30s)..."
-                    Set-SplashStatus $script:splash "Building the chat and cockpit apps (first run, ~30s)..."
-                    $rebuilt = $true
-                    try {
-                        & $rebuildScript | Out-Null
-                        if (Get-Process $app -ErrorAction SilentlyContinue) {
-                            Write-Host "[4/4] ${app}: built and launched"
-                        } elseif (Test-Path "$root\ui\$app.exe") {
-                            Write-Host "[4/4] ${app}: built -- launching"
-                            Start-Process "$root\ui\$app.exe"
-                        } else {
-                            Write-Host "[4/4] ${app}: rebuild ran but exe still missing -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
-                        }
-                    } catch {
-                        Write-Host "[4/4] ${app}: rebuild failed ($_) -- see docs\TROUBLESHOOTING.md ('csc.exe not found' row)"
-                        # COUNTED. A UI that did not build is a startup problem, and the exit
-                        # code exists to carry exactly that.
-                        $script:startupFailures += "${app}: rebuild failed"
-                    }
-                } else {
-                    Write-Host "[4/4] $app.exe not built yet, and ui\rebuild_ui.ps1 is missing -- see docs\TROUBLESHOOTING.md"
-                }
-            }
-        }
+        Invoke-UiStep
     }
+    Record-PhaseTiming "browser_bridge_ui" $t0_browserBridgeUi
 
     Write-Host ""
     if ($NoUi) {
-        Write-Host "Done. Background stack is up. Chat bridge: http://127.0.0.1:8765"
+        Write-Host "Done. Background stack is up (bridge status: http://127.0.0.1:8765/status)."
         Write-Host "Open the full UI manually with: wscript.exe `"$root\scripts\start_all_hidden.vbs`""
     } else {
-        Write-Host "Done. Chat UI: http://127.0.0.1:8765 (or the CopilotChat window). Fleet cockpit window is up."
+        Write-Host "Done. Chat: use the CopilotChat window. Fleet cockpit window is up."
         Write-Host "If a one-time M365 sign-in is needed, a visible Edge window will appear -- sign in there."
     }
 
     # 5) One-time convenience provisioning (Desktop icon + logon autostart). Runs last, after every
     #    service/UI above is already launched, so any failure here can never block real startup.
+    $t0_provisioning = Get-Date
     Ensure-ConvenienceProvisioning
+    Record-PhaseTiming "provisioning" $t0_provisioning
 
     if (-not $NoUi) {
         # Keep the splash up (BOUNDED ~20s) until a chat/cockpit window actually appears, then enforce
@@ -1271,30 +2895,20 @@ function Invoke-Startup {
 # directly so it is NEVER blocked.
 $script:splash = $null
 $script:startupFailures = @()
+$script:startupUnclear = @()
+$script:phaseTimings = [ordered]@{}
+$script:lockTimedOut = $false           # Enter-StartAllLock gave up: nothing was started
+$script:supervisorStartedHere = $false  # this run started a supervisor that survived
+$script:supervisorDied = $false         # this run started one and it exited at once
+$script:fleetLeftToSupervisor = $false  # resume and reap left to that supervisor
 
-# ONE PLACE, INSIDE THE REPO. Diagnostics were scattered across %TEMP% and hidden windows, so
-# the answer existed and could not be found. Everything that a hidden process would otherwise
-# swallow is written here, next to the thing it is about.
-$script:diagDir = Join-Path $root ".setup\logs"
-try { if (-not (Test-Path $script:diagDir)) { New-Item -ItemType Directory -Force $script:diagDir | Out-Null } } catch { }
-
-function Hide-Secrets([string]$text) {
-    # CENTRAL REDACTION. A log that is finally visible is also a log that can be pasted into a
-    # chat window, and this stack handles a Bearer token, an unlock password and a tunnel URL
-    # that is effectively a capability. Redacted once, here, rather than remembered at each
-    # site that writes.
-    if (-not $text) { return $text }
-    $t = $text
-    $t = [regex]::Replace($t, '(?i)(bearer\s+)[A-Za-z0-9._\-]{8,}', '$1<redacted>')
-    $t = [regex]::Replace($t, '(?i)(MCP_API_KEY\s*=\s*)\S+', '$1<redacted>')
-    $t = [regex]::Replace($t, '(?i)(MCP_UNLOCK_PASSWORD[A-Z_]*\s*=\s*)\S+', '$1<redacted>')
-    $t = [regex]::Replace($t, '(?i)(password|passwd|secret|token)(["'':\s=]+)\S+', '$1$2<redacted>')
-    $t = [regex]::Replace($t, 'https://[A-Za-z0-9\-]+\.devtunnels\.ms\S*', 'https://<tunnel>.devtunnels.ms/...')
-    return $t
-}
+# WHO STARTED THIS RUN, read before the splash and Invoke-Startup (the launcher exits within a
+# second) -- see the block above Get-LaunchLineage.
+$script:launch = Get-LaunchLineage
 $ranViaSplash = $false
 try {
     if (-not $NoSplash) { $script:splash = Start-Splash }
+    Update-StartAllBannerRecord
     if ((-not $NoSplash) -and $script:splash -and $script:splash.Form) {
         $script:splash.Start = (Get-Date)
         $timer = New-Object System.Windows.Forms.Timer
@@ -1310,6 +2924,8 @@ try {
         $timer.Start()
         [void]$script:splash.Form.ShowDialog()
         try { $script:splash.Form.Dispose() } catch { }
+        # The banner is gone; a click from now on gets the short notice instead.
+        if ($script:startAllLock) { $null = Write-StartAllRoleRecord "holder" $false 0 }
         $ranViaSplash = $true
     }
 } catch { $ranViaSplash = $false }
@@ -1318,18 +2934,22 @@ if (-not $ranViaSplash) {
     try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)" }
 }
 
-# WHAT WENT WRONG, SAID OUT LOUD AT THE END. This script returns 0 whatever happens, so a
-# caller checking its exit code learns nothing -- the missing thing was never the code, it was
-# any statement of the failure. Printed last so it is the final thing on screen rather than
-# something that scrolled past during a two-minute startup.
-if ($script:startupFailures.Count -gt 0) {
-    Write-Host ""
-    Write-Host "=========================================================" -ForegroundColor Yellow
-    Write-Host " Startup finished with $($script:startupFailures.Count) problem(s)" -ForegroundColor Yellow
-    Write-Host "=========================================================" -ForegroundColor Yellow
-    foreach ($f in $script:startupFailures) { Write-Host ("  - " + (Hide-Secrets $f)) -ForegroundColor Yellow }
-    Write-Host "  Run doctor.bat for the specific fix for each line." -ForegroundColor Yellow
-    Write-Host ""
+# THE TUNNEL, CHECKED AND COUNTED (Test-TunnelServing; new-PC analysis D24). After the splash
+# has closed, because it may wait up to a minute for a supervisor started seconds ago to host;
+# and under -CoreOnly too, which is the start whose exit code quickstart reads before STEP 5
+# asks for a Copilot Studio connection test. Not after a lock timeout: nothing was started.
+if (-not $script:lockTimedOut) {
+    $t0_tunnelConfirm = Get-Date
+    try {
+        if ($script:supervisorDied) {
+            Write-Host "[tunnel] not checked: the supervisor, which hosts it, did not start (see above)" -ForegroundColor DarkGray
+        } else {
+            Test-TunnelServing
+        }
+    } catch {
+        Write-Host ("[tunnel] check skipped (" + $_.Exception.Message + ")") -ForegroundColor DarkGray
+    }
+    Record-PhaseTiming "tunnel_confirm" $t0_tunnelConfirm
 }
 
 # THE SESSION EXPIRES AND NOTHING LOOKED. ensure_m365_signin is called from quickstart once, at
@@ -1345,9 +2965,66 @@ if ($script:startupFailures.Count -gt 0) {
 # "could not tell" stays silent in both: the fleet is websocket-driven and opens no tabs, so a
 # signed-in machine looks identical to one with no tab, and reporting that would send somebody to
 # fix what is not broken.
+function Report-OtherProfileSignIns {
+    <#
+      EVERY MANAGED EDGE, NOT JUST :9222 -- and SAY SO, do not fix it here.
+
+      Each managed browser runs on its own --user-data-dir (Edge locks a profile to one
+      process, so running them at once REQUIRES distinct profiles), and a distinct profile is a
+      distinct cookie jar. Signing in on the companion signs in the companion. The owner asked
+      whether a sign-in could have landed in one of the two browsers and not the other, on
+      2026-09-23: structurally, yes, and until now nothing looked.
+
+      REPORTED, NOT ESCALATED. Surfacing a second browser to sign it in is exactly what the
+      comment above spent 751 MB learning not to do at startup. A line the operator can act on
+      is the whole job here; doctor carries the same rows with the command.
+
+      "cannot_tell" stays silent, for the reason this file already gives: a healthy machine has
+      no M365 tab, so that is the normal answer and not evidence of anything.
+    #>
+    param([string] $Report)
+    if (-not $Report) { return }
+    foreach ($line in ($Report -split "`r?`n")) {
+        $m = [regex]::Match($line, '^\s*PROFILE:\s+(\d+)\s+(\S+)\s+(\w+)(\s+\[primary\])?\s*\((.*)\)\s*$')
+        if (-not $m.Success) { continue }
+        if ($m.Groups[4].Success -and $m.Groups[4].Value) { continue }
+        if ($m.Groups[3].Value -ne "sign_in_needed") { continue }
+        # THE CHAT BRIDGE'S EDGE IS THE ONE THAT COUNTS (e66af67). The chat window needs it; any
+        # other managed profile (the eval browser) is optional, so it is printed, not counted.
+        $bp = $(if ($env:MCP_BRIDGE_CDP_PORT) { $env:MCP_BRIDGE_CDP_PORT } else { "9223" })
+        if ($m.Groups[1].Value -ne $bp) {
+            Write-Host ("[m365] {0} (:{1}) is on a sign-in page -- it is a SEPARATE browser profile, so the companion's sign-in does not cover it (optional). {2}" `
+                -f $m.Groups[2].Value, $m.Groups[1].Value, $m.Groups[5].Value) -ForegroundColor Yellow
+            continue
+        }
+        # The same sentence doctor.ps1 shows ($bridgeSigninFixJa -- keep the two arrays equal),
+        # built from code points: this file has no BOM, so Windows PowerShell 5.1 reads it in
+        # the ANSI code page and a Japanese literal would arrive mangled.
+        $fixJa = -join (@(
+            0x30C1,0x30E3,0x30C3,0x30C8,0x753B,0x9762,0x304C,0x4F7F,0x3046,0x0020,0x0045,0x0064,
+            0x0067,0x0065,0x0020,0x304C,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x753B,0x9762,0x3067,
+            0x6B62,0x307E,0x3063,0x3066,0x3044,0x307E,0x3059,0x3002,0x30B5,0x30A4,0x30F3,0x30A4,
+            0x30F3,0x304C,0x5FC5,0x8981,0x306B,0x306A,0x308B,0x3068,0x3001,0x305D,0x306E,0x0020,
+            0x0045,0x0064,0x0067,0x0065,0x0020,0x304C,0x81EA,0x52D5,0x3067,0x524D,0x9762,0x306B,
+            0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002,0x8868,0x793A,0x3055,0x308C,0x305F,
+            0x0020,0x0045,0x0064,0x0067,0x0065,0x0020,0x3067,0x3001,0x4F1A,0x793E,0x306E,0x30A2,
+            0x30AB,0x30A6,0x30F3,0x30C8,0x3067,0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x3057,0x3066,
+            0x304F,0x3060,0x3055,0x3044,0x3002,0x8868,0x793A,0x3055,0x308C,0x3066,0x3044,0x306A,
+            0x3044,0x5834,0x5408,0x306F,0x3001,0x30C7,0x30B9,0x30AF,0x30C8,0x30C3,0x30D7,0x306E,
+            0x300C,0x004D,0x0033,0x0036,0x0035,0x0020,0x0043,0x006F,0x006D,0x0070,0x0061,0x006E,
+            0x0069,0x006F,0x006E,0x300D,0x3092,0x3082,0x3046,0x4E00,0x5EA6,0x8D77,0x52D5,0x3059,
+            0x308B,0x3068,0x8868,0x793A,0x3055,0x308C,0x307E,0x3059,0x3002
+        ) | ForEach-Object { [char]$_ })
+        Write-Host ("[m365] " + $fixJa + " (" + $m.Groups[2].Value + " :" + $m.Groups[1].Value + ", " + $m.Groups[5].Value + ")") -ForegroundColor Yellow
+        # English and exact: doctor.ps1 maps this line (for the bridge port) to the same sentence.
+        $script:startupFailures += ("M365 sign-in needed on " + $m.Groups[2].Value + " (:" + $m.Groups[1].Value + ")")
+    }
+}
+
+$t0_m365Signin = Get-Date
 try {
     $signinPs = Join-Path $scriptDir "ensure_m365_signin.ps1"
-    if ((Test-Path $signinPs) -and (-not $CoreOnly)) {
+    if ((Test-Path $signinPs) -and (-not $CoreOnly) -and (-not $script:lockTimedOut)) {
         if ($NoUi) {
             # THE PYTHON DIRECTLY, not the wrapper. ensure_m365_signin.ps1 ends with an
             # unconditional `exit 0` -- deliberately, so a missing sign-in never fails the
@@ -1355,8 +3032,9 @@ try {
             # codes are 0 signed in / 1 a sign-in wall is open / 2 could not tell.
             $signinPy = Join-Path $scriptDir "ensure_m365_signin.py"
             $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+            $signinReport = ""
             if ((Test-Path $signinPy) -and (Test-Path $pyExe)) {
-                & $pyExe $signinPy --port 9222 --check-only | Out-Null
+                $signinReport = (& $pyExe $signinPy --port 9222 --check-only --all 2>&1 | Out-String)
             } else {
                 $global:LASTEXITCODE = 2
             }
@@ -1364,6 +3042,7 @@ try {
                 Write-Host "[m365] a sign-in is needed, and a background start cannot show it." -ForegroundColor Yellow
                 $script:startupFailures += "M365 sign-in needed (background start could not prompt)"
             }
+            Report-OtherProfileSignIns $signinReport
         } else {
             # ASK FIRST; SURFACE ONLY ON A REAL WALL. Running the full helper here opened a
             # HEADED companion Edge on m365.cloud.microsoft/chat and left it running: measured
@@ -1380,25 +3059,79 @@ try {
             # it already does on the -NoUi path above.
             $signinPy = Join-Path $scriptDir "ensure_m365_signin.py"
             $pyExe = Join-Path $root ".venv\Scripts\python.exe"
+            $signinReport = ""
             if ((Test-Path $signinPy) -and (Test-Path $pyExe)) {
-                & $pyExe $signinPy --port 9222 --check-only | Out-Null
+                $signinReport = (& $pyExe $signinPy --port 9222 --check-only --all 2>&1 | Out-String)
             } else {
                 $global:LASTEXITCODE = 2
             }
             if ($LASTEXITCODE -eq 1) {
                 & powershell -NoProfile -ExecutionPolicy Bypass -File ('"{0}"' -f $signinPs) -TimeoutSeconds 180 | Out-Null
             }
+            Report-OtherProfileSignIns $signinReport
         }
     }
 } catch {
     Write-Host ("[m365] sign-in check skipped (" + $_.Exception.Message + ")") -ForegroundColor DarkGray
+} finally {
+    Record-PhaseTiming "m365_signin" $t0_m365Signin
 }
+
+# WHAT WENT WRONG, SAID OUT LOUD AT THE END. This script returns 0 whatever happens, so a
+# caller checking its exit code learns nothing -- the missing thing was never the code, it was
+# any statement of the failure. Printed last so it is the final thing on screen rather than
+# something that scrolled past during a two-minute startup. AFTER the tunnel and sign-in
+# checks: it used to be printed before the sign-in check, so a failure that check recorded
+# was in the exit code and missing from the list.
+if ($script:startupFailures.Count -gt 0) {
+    Write-Host ""
+    Write-Host "=========================================================" -ForegroundColor Yellow
+    Write-Host " Startup finished with $($script:startupFailures.Count) problem(s)" -ForegroundColor Yellow
+    Write-Host "=========================================================" -ForegroundColor Yellow
+    foreach ($f in $script:startupFailures) { Write-Host ("  - " + (Hide-Secrets $f)) -ForegroundColor Yellow }
+    Write-Host "  Run doctor.bat for the specific fix for each line." -ForegroundColor Yellow
+    Write-Host ""
+}
+if (@($script:startupUnclear).Count -gt 0) {
+    Write-Host ""
+    Write-Host " $(@($script:startupUnclear).Count) thing(s) could not be confirmed either way:" -ForegroundColor DarkYellow
+    foreach ($u in $script:startupUnclear) { Write-Host ("  ? " + (Hide-Secrets $u)) -ForegroundColor DarkYellow }
+    Write-Host ""
+}
+
+# AND WHERE SOMEBODY WILL SEE IT when this ran hidden -- see Write-StartupSummary's header.
+$startMode = Get-StartAllMode
+$summaryPath = Join-Path $script:diagDir "start_all_summary.txt"
+$summaryWritten = Write-StartupSummary $summaryPath @($script:startupFailures) $startMode @($script:startupUnclear)
+# WHO STARTED IT AND HOW IT ENDED (see Get-LaunchLineage), while the lock is still held.
+# "unclear" (2026-09-24 sandbox finding): a check that could not be confirmed either way (the
+# devtunnel CLI did not answer within its 10 s bound) must not read as "ok" here -- a run whose
+# own jsonl record says outcome=ok is exactly what earlier hid a tunnel that was never actually
+# hosted. It is kept apart from "failures" (a KNOWN-bad state) so a transient CLI hiccup does
+# not flip the exit code or doctor's failure count; the jsonl and summary still say plainly that
+# something was never confirmed.
+$runOutcome = $(if ($script:lockTimedOut) { "lock timed out" }
+    elseif ($script:startupFailures.Count -gt 0) { "failures" }
+    elseif (@($script:startupUnclear).Count -gt 0) { "unclear" }
+    else { "ok" })
+# FOLD EVERY LEAVING COPY'S SPOOLED RECORD IN NOW, before this run's own line -- the one place
+# on the WHOLE machine that is guaranteed to run once per bring-up and never on a leaving
+# copy's path (see Write-StartAllRunRecordSpooled / Merge-StartAllRunSpool for why leaving
+# copies stopped writing start_all_runs.jsonl directly). Still under the single-instance lock
+# (the comment above), so no other copy can be mid-merge or mid-bring-up at the same time.
+$null = Merge-StartAllRunSpool (Join-Path $script:diagDir "start_all_runs.d") (Join-Path $script:diagDir "start_all_runs.jsonl")
+$null = Write-StartAllRunRecord (Join-Path $script:diagDir "start_all_runs.jsonl") (New-StartAllRunRecord $runOutcome)
+if ($summaryWritten -and (Test-ShouldNotifyStartupFailures (@($script:startupFailures).Count + @($script:startupUnclear).Count) ([bool]$NoUi) (Test-ConsoleVisible))) {
+    Send-StartupFailureNotice $summaryPath | Out-Null
+}
+Exit-StartAllLock
 
 # WHERE TO LOOK, PRINTED EVERY TIME. Named whether or not anything failed, because the case
 # that needs it most -- "the chat window does not respond" -- produces no error here at all:
 # the bridge failed silently in a hidden process, and until now its message went nowhere.
 Write-Host ("  Logs: " + $script:diagDir) -ForegroundColor DarkGray
 Write-Host ("        supervisor: " + (Join-Path $env:TEMP 'm365-companion-supervisor.log')) -ForegroundColor DarkGray
+Write-Host ("        this start: " + $summaryPath) -ForegroundColor DarkGray
 
 # THE COUNT IS THE EXIT CODE, the same convention doctor uses. Until now this script reported
 # its problems in prose and exited 0 regardless, so a caller could not tell a startup that

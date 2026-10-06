@@ -42,7 +42,13 @@ import io
 import json
 import os
 import re
+import shutil
+import stat
+import subprocess
+import sys
 import time
+
+from tools import childproc
 
 #: Diagnostics for finished runs. Generous because they cost little and are the first thing
 #: wanted when a run is being reconstructed; only the newest is ever read by code.
@@ -187,33 +193,557 @@ STORE_KEEP_DAYS = float(os.environ.get("MCP_FLEET_STORE_DAYS", "30"))
 #: store added later is untouched until someone decides otherwise, which is the safe default.
 STORE_DIRS = ("transcripts", "swe")
 
+#: Subtrees of a named store that are WORKSPACES, not per-run output, and are never entered.
+#:
+#: swe/work holds the benchmark clones, their worktrees and pip target directories
+#: (`_np123/numpy`, `<repo>-main/.git/objects/pack/...`) that runs reuse. Two things are wrong
+#: with walking it under a per-file age rule, measured 2026-09-24:
+#:
+#:   * It is 101,170 files in 46,069 directories, and this rule stat()ed every one of them on
+#:     every fleet start. That walk was the whole of the ~60 s between "fleet_runner started"
+#:     and the run's `started` stamp (277 s on a cold copy; 24 s warm), with nothing deleted.
+#:   * Were anything in it older than the window, the rule would delete it FILE BY FILE -- a
+#:     pack file a clone has not rewritten in thirty days is still the repository, and the
+#:     clone would be left corrupt rather than removed.
+#:
+#: Named, relative to the .fleet root, for the same fail-safe reason STORE_DIRS is.
+STORE_SKIP = (os.path.join("swe", "work"),)
+
+#: FILE_ATTRIBUTE_REPARSE_POINT. A junction is not a symlink to Python 3.10's is_symlink(), so
+#: os.walk descended through one -- and an age rule following a junction deletes files that
+#: are not in the store at all.
+_REPARSE_POINT = 0x400
+
+
+def _store_files(root, skip):
+    """Every regular file under `root` as a DirEntry, without following links or junctions.
+
+    NO stat() PER FILE. On Windows a DirEntry carries the size and times the directory listing
+    already returned, so the age test below costs nothing extra; os.walk + getmtime cost one
+    stat per file plus one lstat per directory, which is where the startup minute went.
+
+    A directory that holds `.git` is a checkout and is one unit: it is never entered, because
+    the only thing a per-file rule can do inside one is corrupt it.
+    """
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        if any(e.name == ".git" for e in entries):
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    if os.path.normcase(os.path.abspath(e.path)) not in skip:
+                        stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    yield e, st
+            except OSError:
+                continue
+
 
 def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
     """Age out per-run files inside the named stores.
 
     `sessions` is deliberately absent from STORE_DIRS: that directory holds the conversation
     database, which has its own retention with its own settings, and two policies on one store
-    is how they come to disagree about what is still live.
+    is how they come to disagree about what is still live. STORE_SKIP and any checkout are not
+    entered either -- see there.
     """
     now = time.time() if now is None else now
     keep_days = _setting("fleet_store_days", STORE_KEEP_DAYS) if keep_days is None else keep_days
+    skip = {os.path.normcase(os.path.abspath(os.path.join(fleet_dir, s))) for s in STORE_SKIP}
     freed, removed = 0, []
     for name in (names or STORE_DIRS):
         root = os.path.join(fleet_dir, name)
         if not os.path.isdir(root):
             continue
-        for parent, _dirs, files in os.walk(root):
-            for f in files:
-                p = os.path.join(parent, f)
-                # Never a database, wherever it turns up. The extension check is cheap and it
-                # is the last line between an age rule and someone's history.
-                if os.path.splitext(f)[1].lower() in (".sqlite3", ".db", ".sqlite"):
-                    continue
-                if _age_days(p, now) <= keep_days:
-                    continue
-                freed += _rm(p, dry_run)
-                removed.append(os.path.relpath(p, fleet_dir))
+        for entry, st in _store_files(root, skip):
+            # Never a database, wherever it turns up. The extension check is cheap and it
+            # is the last line between an age rule and someone's history.
+            if os.path.splitext(entry.name)[1].lower() in (".sqlite3", ".db", ".sqlite"):
+                continue
+            if (now - st.st_mtime) / 86400.0 <= keep_days:
+                continue
+            # CONFIRMED BEFORE IT IS DELETED. The listing's time is the directory's copy, which
+            # NTFS may update late for a file another process holds open; a real stat on the
+            # handful of candidates costs nothing and makes the deletion rest on the file.
+            p = entry.path
+            if _age_days(p, now) <= keep_days:
+                continue
+            freed += _rm(p, dry_run)
+            removed.append(os.path.relpath(p, fleet_dir))
     return freed, removed
+
+
+#: swe/work never shrinks. STORE_SKIP (above) stops the per-file age rule from entering it, and
+#: that fix was correct as far as it went -- but "correct" there meant "does nothing", and
+#: nothing else in this file touches that directory either. Measured 2026-09-24: 1.27 GB across
+#: roughly a hundred thousand files, all of it benchmark clones, worktrees and pip targets that
+#: fleet_runner leaves behind once a run finishes with them, and none of it has ever been freed.
+#:
+#: The unit of deletion here is DIFFERENT IN KIND from every rule above. Every other rule in
+#: this file deletes individual files: a log, a rotation, a scratch file, one aged-out entry in
+#: a per-run store. Deleting individual files out of the MIDDLE of a git checkout is exactly
+#: the failure STORE_SKIP's docstring describes -- a pack file untouched for thirty days is
+#: still the repository, and removing it file-by-file does not clean the clone, it corrupts it.
+#: So this rule never deletes a file. It deletes a whole clone directory, as one atomic
+#: `shutil.rmtree`, once the WHOLE of it -- not its own directory entry, but everything nested
+#: inside it -- has gone untouched for the keep window, and only once nothing still running
+#: references its path.
+CLONE_KEEP_DAYS = float(os.environ.get("MCP_FLEET_CLONE_DAYS", "14"))
+
+#: How often the clone sweep is actually allowed to RUN, regardless of how often apply() itself
+#: is called. See the measurement note on workspace_clones() for why a walk over swe/work still
+#: needs a floor under how often it happens at all, even off the critical path.
+CLONE_SWEEP_HOURS = float(os.environ.get("MCP_FLEET_CLONE_SWEEP_HOURS", "24"))
+
+#: Sidecar recording when the clone sweep last actually completed a walk over swe/work, so the
+#: cost is amortized to at most once per CLONE_SWEEP_HOURS no matter how many times apply() runs
+#: in between -- fleet_runner.py calls apply() at the start of EVERY fleet run.
+_CLONE_SWEEP_STATE_NAME = "clone_sweep_state.json"
+
+#: A clone mid-removal is renamed to this prefix BEFORE shutil.rmtree runs on it -- see
+#: _clone_sweep_run_once()'s own comment for why. Dotted so it never collides with a real clone
+#: name (benchmark harnesses do not check out repositories starting with a dot) and so a listing
+#: of swe/work makes an in-flight deletion obvious at a glance.
+_DELETING_PREFIX = ".deleting-"
+
+#: The sweep holds this lock file for as long as it runs -- measured worst case on the synthetic
+#: tree was under six minutes, so anything still holding the lock two hours later did not
+#: release it because it is running, it did not release it because it crashed. Stolen rather
+#: than honoured past this age, or a crash permanently wedges the sweep off.
+_CLONE_SWEEP_LOCK_NAME = "clone_sweep.lock"
+_CLONE_SWEEP_LOCK_STALE_HOURS = 2.0
+
+
+def _clone_sweep_due(fleet_dir, now, sweep_hours):
+    """Whether enough time has passed since the last COMPLETED walk to justify another one.
+
+    Unreadable or missing state means "never swept" -- due, not skipped. A state file that
+    cannot be parsed must not silently disable the sweep forever.
+    """
+    path = os.path.join(fleet_dir, _CLONE_SWEEP_STATE_NAME)
+    try:
+        data = json.load(io.open(path, encoding="utf-8-sig"))
+        last = float(data.get("last_swept_ts") or 0)
+    except Exception:
+        return True
+    return (now - last) / 3600.0 >= sweep_hours
+
+
+def _record_clone_sweep(fleet_dir, now):
+    """Stamp that the walk just ran. TMP-THEN-REPLACE, the same atomic idiom conversations()
+    uses above: a crash mid-write must leave either the old stamp or the new one, never a
+    truncated file that makes every future call see a corrupt state and re-walk needlessly (or,
+    worse, a parse exception that some future caller mistakes for permission to skip a real
+    sweep -- which is why _clone_sweep_due treats unreadable as due, not as skip)."""
+    path = os.path.join(fleet_dir, _CLONE_SWEEP_STATE_NAME)
+    tmp = path + ".tmp"
+    try:
+        with io.open(tmp, "w", encoding="utf-8") as fh:
+            json.dump({"last_swept_ts": now}, fh)
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def _clone_sweep_lock_acquire(fleet_dir, now):
+    """Atomically claim the right to run the sweep, or return None if someone already has it.
+
+    O_CREAT|O_EXCL is the whole mechanism: the OS refuses the second create, so two sweeps
+    racing to start -- two fleets starting within the same throttle window, each deciding the
+    sweep is due before either has recorded completion -- can never both believe they hold it.
+    This is the ONLY thing that makes "two concurrent triggers run one sweep" true; the due-check
+    in workspace_clones() is not atomic across processes and cannot be the safety rail by itself.
+    """
+    path = os.path.join(fleet_dir, _CLONE_SWEEP_LOCK_NAME)
+    try:
+        fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        try:
+            age_h = (now - os.path.getmtime(path)) / 3600.0
+        except OSError:
+            age_h = 0.0
+        if age_h < _CLONE_SWEEP_LOCK_STALE_HOURS:
+            return None
+        # STALE, NOT HELD. A prior sweep process died holding this; refusing to ever steal it
+        # would mean one crash disables clone cleanup forever, which is worse than the small
+        # chance of overlapping a genuinely-still-running sweep past its measured worst case.
+        try:
+            os.remove(path)
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except OSError:
+            return None
+    except OSError:
+        # fleet_dir itself missing or unwritable -- nothing to lock. apply() already checks
+        # fleet_dir exists before any rule runs, so in production this branch is defensive;
+        # a direct caller (a test, or a manual CLI invocation) gets a clean "did not sweep"
+        # rather than a raised exception.
+        return None
+    try:
+        os.write(fd, str(os.getpid()).encode("ascii"))
+    except OSError:
+        pass
+    os.close(fd)
+    return path
+
+
+def _clone_sweep_lock_release(lock_path):
+    try:
+        os.remove(lock_path)
+    except OSError:
+        pass
+
+
+def _newest_mtime_and_size(root):
+    """The newest mtime and total byte size found anywhere under `root`, recursively, never
+    following a symlink or a junction.
+
+    REUSES _store_files()'s NO-STAT-PER-FILE TECHNIQUE RATHER THAN A SECOND PASS. On Windows a
+    DirEntry's stat(follow_symlinks=False) is populated from the directory listing NtQuery
+    already returned; os.walk() + os.path.getmtime() costs a real stat() syscall per file and
+    per directory, which is the exact cost STORE_SKIP exists to keep out of swe/work. This
+    function is the one place this rule is allowed to look at every file in a clone -- finding
+    the true recursive newest mtime has no cheaper definition -- so it must not also be the
+    place that reintroduces a stat-per-file walk.
+
+    A clone touched two days ago by a `pip install` in a venv six directories down is NOT stale
+    even though the clone's own top-level directory entry has not changed in months; that is
+    why the caller cannot use the top-level entry's own mtime and must call this.
+
+    FILE MTIMES ONLY, NOT DIRECTORY MTIMES. A directory's own mtime is bumped by adding or
+    removing an entry inside it -- which is exactly what writing a new file already does, at
+    the same instant -- so a real write is never missed by looking at files alone. Counting
+    directory mtimes too would add nothing a file mtime does not already cover, while making
+    the result depend on directory-entry churn (a rename, a delete) that leaves no file behind
+    to justify calling the clone anything but stale.
+    """
+    newest = 0.0
+    total = 0
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            with os.scandir(d) as it:
+                entries = list(it)
+        except OSError:
+            continue
+        for e in entries:
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    continue
+                if e.is_dir(follow_symlinks=False):
+                    stack.append(e.path)
+                elif e.is_file(follow_symlinks=False):
+                    if st.st_mtime > newest:
+                        newest = st.st_mtime
+                    total += st.st_size
+            except OSError:
+                continue
+    return newest, total
+
+
+def _default_path_in_use(path):
+    """True/False/None: whether any LIVE process's command line names `path` -- None when the
+    question could not be answered at all.
+
+    Mirrors orphan_reaper.candidates()'s own technique (Win32_Process via CimInstance, matched
+    case-insensitively against the command line) because that module already established it as
+    the only real signal on Windows: fleet_runner's ACTIVE_MARKER records pid/argv/start_ts but
+    never a workspace path, so there is no marker to read here, only the process table itself.
+
+    None on ANY failure -- PowerShell not found, WMI refusing the query, a timeout, malformed
+    JSON -- so the caller can fail closed exactly as _linked_sessions() does above: an
+    unanswerable question about what is running must never be treated as "nothing is running".
+    """
+    norm = os.path.normcase(os.path.abspath(path))
+    ps = "Get-CimInstance Win32_Process | Select-Object CommandLine | ConvertTo-Json -Compress"
+    try:
+        r = subprocess.run(["powershell", "-NoProfile", "-Command", ps],
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120,
+                           creationflags=childproc.headless_creationflags())
+        if r.returncode != 0:
+            return None
+        rows = json.loads(r.stdout or "[]")
+    except Exception:
+        return None
+    if isinstance(rows, dict):
+        rows = [rows]
+    if not isinstance(rows, list):
+        return None
+    for row in rows:
+        try:
+            cmd = row.get("CommandLine") or ""
+        except AttributeError:
+            return None
+        if norm in os.path.normcase(cmd):
+            return True
+    return False
+
+
+def _rmtree_onerror(func, path, exc_info):
+    """Retry a Windows read-only unlink after clearing the read-only bit.
+
+    Git object pack/index files are commonly mode 0444 on Windows. ``shutil.rmtree`` raises
+    WinError 5 on the first such file, which previously left every renamed `.deleting-*`
+    workspace permanently stranded. Only PermissionError gets retried; unrelated filesystem
+    failures still propagate to the caller and remain fail-safe.
+    """
+    exc = exc_info[1]
+    if not isinstance(exc, PermissionError):
+        raise exc
+    try:
+        os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+    except OSError:
+        raise exc
+    func(path)
+
+
+def _rmtree_workspace(path):
+    """Remove one already-approved workspace, tolerating Windows Git read-only files."""
+    return shutil.rmtree(path, onerror=_rmtree_onerror)
+
+
+def _finish_leftover_deletes(work_root, dry_run):
+    """Finish any `.deleting-*` directory a prior sweep renamed but never got to rmtree.
+
+    Nothing checks age or in-use here: something already decided, in a PREVIOUS sweep, that
+    this directory should go, and the rename already took it out from under whatever path any
+    live process could still be watching. Re-deciding would only re-run a check that already
+    passed once and cannot un-happen.
+    """
+    removed = []
+    try:
+        with os.scandir(work_root) as it:
+            entries = list(it)
+    except OSError:
+        return removed
+    for e in entries:
+        if not e.name.startswith(_DELETING_PREFIX):
+            continue
+        try:
+            # A .deleting- entry is always something THIS module renamed from a real
+            # directory it had already verified was not a junction; the checks below are
+            # defensive, not load-bearing, in case anything else ever lands a file matching
+            # the prefix.
+            if e.is_symlink():
+                continue
+            st = e.stat(follow_symlinks=False)
+            if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                continue
+        except OSError:
+            continue
+        if dry_run:
+            removed.append(e.name)
+            continue
+        try:
+            _rmtree_workspace(e.path)
+            removed.append(e.name)
+        except OSError:
+            continue
+    return removed
+
+
+def _clone_sweep_run_once(fleet_dir, keep_days, in_use, now, dry_run=False):
+    """Do the actual walk-and-delete over swe/work, synchronously, in whatever process calls
+    it. This is the function a background process (or a test) runs; workspace_clones() itself
+    never calls the parts of this that cost real time -- see its own docstring for why.
+
+    LOCKED FOR THE WHOLE CALL, not dry_run. O_CREAT|O_EXCL on a lock file is the only thing
+    that makes "two concurrent triggers run one sweep" true: two fleet starts landing in the
+    same throttle window can both decide a sweep is due and both launch one, and the decision
+    that only one of them actually runs has to be made by whichever of them gets here first,
+    atomically, not by whichever of them decided to launch first (that race is not atomic
+    across processes). The loser returns immediately, having touched nothing.
+
+    RENAME BEFORE RMTREE, on every deletion. shutil.rmtree() is not atomic -- it is thousands of
+    individual unlink() calls on a big clone -- and this function is meant to run detached,
+    where nothing guarantees it finishes: the process can be killed, the machine can sleep, a
+    disk fault can interrupt it partway through. A directory caught mid-rmtree under its ORIGINAL
+    name is ambiguous: is it a live clone that happens to be missing files, or a deletion that
+    stopped short? Renamed to `.deleting-<name>-<ts>` FIRST, the ambiguity is gone -- nothing
+    still watching the original path can find it there any more (the in-use check already
+    passed before the rename), and nothing mistakes a `.deleting-*` name for a live clone,
+    including this function on its own next call, which instead finishes it unconditionally via
+    _finish_leftover_deletes() before it looks for anything new to remove.
+    """
+    now = time.time() if now is None else now
+    freed, removed = 0, []
+    lock_path = None
+    if not dry_run:
+        lock_path = _clone_sweep_lock_acquire(fleet_dir, now)
+        if lock_path is None:
+            return 0, []
+    try:
+        work_root = os.path.join(fleet_dir, "swe", "work")
+        if not os.path.isdir(work_root):
+            return freed, removed
+
+        removed.extend(_finish_leftover_deletes(work_root, dry_run))
+
+        try:
+            with os.scandir(work_root) as it:
+                children = list(it)
+        except OSError:
+            return freed, removed
+
+        for e in children:
+            if e.name.startswith(_DELETING_PREFIX):
+                continue    # already handled above
+            try:
+                if e.is_symlink():
+                    continue
+                st = e.stat(follow_symlinks=False)
+                if getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+                    continue
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+
+            # The top-level directory's OWN mtime is deliberately not consulted here, for the
+            # same reason _newest_mtime_and_size() does not track directory mtimes below it: it
+            # is a listing entry, not a file, and every real write inside the clone is already
+            # visible as a file mtime.
+            newest, size = _newest_mtime_and_size(e.path)
+            if (now - newest) / 86400.0 <= keep_days:
+                continue
+
+            used = in_use(e.path)
+            if used or used is None:
+                # FAIL CLOSED -- see _default_path_in_use()'s own docstring. `used is None`
+                # means the question could not be answered at all, and that is not a reason
+                # to guess.
+                continue
+
+            if dry_run:
+                freed += size
+                removed.append(e.name)
+                continue
+
+            deleting_path = os.path.join(
+                work_root, "%s%s-%d" % (_DELETING_PREFIX, e.name, int(now)))
+            try:
+                os.rename(e.path, deleting_path)
+            except OSError:
+                continue
+            try:
+                _rmtree_workspace(deleting_path)
+            except OSError:
+                # Renamed but not fully removed -- exactly the state _finish_leftover_deletes()
+                # exists to clean up on the NEXT sweep. Still counted as freed/removed here:
+                # the clone's original name is already gone, which is the part that matters to
+                # a caller asking "is this still a live clone".
+                pass
+            freed += size
+            removed.append(e.name)
+
+        if not dry_run:
+            _record_clone_sweep(fleet_dir, now)
+        return freed, removed
+    finally:
+        if lock_path is not None:
+            _clone_sweep_lock_release(lock_path)
+
+
+def _spawn_clone_sweep_subprocess(fleet_dir, keep_days, now):
+    """The production launcher: a detached, low-priority child process that runs the sweep and
+    exits on its own. Never waited on -- Popen() returns as soon as the child is created, which
+    is the whole point: workspace_clones() must return before the sweep has done anything.
+
+    A SEPARATE PROCESS, not a thread. A thread dies with its parent -- if fleet_runner's own
+    process is what apply() runs inside and that process later exits or is killed (a fleet run
+    ending, a supervisor restart), a thread doing the sweep dies with it, silently, and the next
+    apply() sees `not due` was never true so does nothing until the throttle window closes on
+    its own. A separate process, once launched, survives the launcher exiting.
+    """
+    try:
+        creationflags = 0
+        if sys.platform == "win32":
+            # CREATE_NO_WINDOW WITHOUT DETACHED_PROCESS -- the pair put a console window on the
+            # owner's desktop. Measured 2026-09-24 by scripts/win/console_flash_watch.py: a
+            # sweep launched here showed a Windows Terminal window (CASCADIA_HOSTING_WINDOW_CLASS
+            # + PseudoConsoleWindow) owned by the BASE python.exe. DETACHED_PROCESS wins over
+            # CREATE_NO_WINDOW and leaves the child with no console at all; sys.executable is
+            # the venv's python.exe, a launcher that starts the base interpreter as ITS child
+            # with no flags, and a console program started by a console-less parent gets a new,
+            # visible console. CREATE_NO_WINDOW alone gives the child a console with no window,
+            # which the grandchild inherits. The child still outlives this process either way:
+            # on Windows a child is never tied to its parent's lifetime. Same finding as
+            # relay/task_router.py's autostart launch and relay/selfimprove/guards.py.
+            creationflags = (getattr(subprocess, "CREATE_NO_WINDOW", 0) |
+                             getattr(subprocess, "IDLE_PRIORITY_CLASS", 0))
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        subprocess.Popen(
+            [sys.executable, "-m", "relay.fleet_retention", "--clone-sweep-worker",
+             "--dir", fleet_dir, "--keep-days", str(keep_days), "--now", str(now)],
+            cwd=repo_root, creationflags=creationflags, close_fds=True,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        # Launching is best-effort. A failed launch leaves the throttle state untouched, so
+        # the NEXT due apply() call tries again rather than this one raising into fleet_runner.
+        pass
+
+
+def workspace_clones(fleet_dir, now=None, dry_run=False, keep_days=None, sweep_hours=None,
+                     in_use=None, launcher=None):
+    """Remove whole benchmark clones/workspaces under swe/work, once each is both old and
+    unused -- but never do the removing (or even the walk that finds candidates) IN this call.
+
+    OFF THE CRITICAL PATH. Measured on a synthetic tree of the same shape as the real swe/work
+    (~100k files, ~60k dirs, 40 clones): the discovery walk alone is ~52 s and a walk that also
+    deletes is ~340 s. apply() runs at the start of EVERY fleet start, so doing either of those
+    inline is exactly the cost f7571a1 removed, reintroduced. This function instead only ever
+    does two cheap things before returning: read the small throttle state file to decide
+    whether a sweep is due, and, if so, hand off to `launcher` (real work happens in
+    _clone_sweep_run_once(), run by the launcher, never by this function). Both cost
+    microseconds; neither touches swe/work.
+
+    `launcher(fleet_dir, keep_days, now)` defaults to _spawn_clone_sweep_subprocess(), a
+    detached child process with its own lock file (_clone_sweep_lock_acquire(), inside
+    _clone_sweep_run_once()) so two callers deciding a sweep is due at the same moment still
+    only run one sweep between them. Tests inject a launcher that runs the same worker
+    function in-thread instead, so they can wait on it deterministically without spawning a
+    real process or invoking PowerShell.
+
+    dry_run BYPASSES THE LAUNCHER ENTIRELY and runs synchronously in this process. A dry run
+    exists to be read back immediately by its own caller (the --apply CLI printout, or a test
+    inspecting the report) and must never mutate anything, so there is no background process
+    for it to race with and no reason to defer it; see _clone_sweep_run_once(dry_run=True).
+
+    Returns (freed_bytes, [clone names]): for dry_run, what a real sweep would do right now;
+    otherwise (0, []) whether or not a sweep was actually launched -- the caller gets the
+    result later, from the sidecar state file's `last_swept_ts`, not from this call.
+    """
+    now = time.time() if now is None else now
+    keep_days = _setting("fleet_clone_days", CLONE_KEEP_DAYS) if keep_days is None else keep_days
+    sweep_hours = (_setting("fleet_clone_sweep_hours", CLONE_SWEEP_HOURS)
+                  if sweep_hours is None else sweep_hours)
+
+    if dry_run:
+        use = _default_path_in_use if in_use is None else in_use
+        return _clone_sweep_run_once(fleet_dir, keep_days, use, now, dry_run=True)
+
+    if not _clone_sweep_due(fleet_dir, now, sweep_hours):
+        return 0, []
+
+    launch = launcher if launcher is not None else _spawn_clone_sweep_subprocess
+    launch(fleet_dir, keep_days, now)
+    return 0, []
 
 
 #: Finished logs are gzipped rather than deleted. THIS IS THE RULE THAT MATTERS, and the
@@ -329,24 +859,72 @@ def cap_jsonl(fleet_dir, dry_run=False, max_mb=None):
         before = _size(p)
         if before <= limit:
             continue
+        keep = int(limit * JSONL_TRIM_FRACTION)
         if dry_run:
-            freed += before - limit
+            freed += before - keep
             trimmed.append(n)
             continue
-        try:
-            with io.open(p, "rb") as fh:
-                fh.seek(before - limit)
-                # Land on a line boundary: half a JSON object at the head of the file is a
-                # parse error for every reader, which is worse than the bytes it saved.
-                fh.readline()
-                tail = fh.read()
-            with io.open(p, "wb") as fh:
-                fh.write(tail)
+        if _keep_tail(p, before, keep):
             freed += before - _size(p)
             trimmed.append(n)
-        except OSError:
-            continue
     return freed, trimmed
+
+
+#: A capped ledger is cut to this fraction of the ceiling, not to the ceiling itself.
+#:
+#: Cut to exactly the ceiling, a ledger that is written every day sits a few hundred KB over it
+#: at every start, and was rewritten whole at every start: measured 2026-09-24, tool_events.jsonl
+#: at 64.0 MB, "freed 0.1 MB" -- 64 MB read and 64 MB written to free 0.1. With headroom the
+#: rewrite happens once per tenth of the ceiling written, and the tail kept is still 57 MB.
+JSONL_TRIM_FRACTION = float(os.environ.get("MCP_FLEET_JSONL_TRIM_FRACTION", "0.9"))
+
+#: Bytes held in memory at once while a tail is moved.
+_COPY_CHUNK = 1024 * 1024
+
+
+def _keep_tail(path, size, keep):
+    """Rewrite `path` as its last `keep` bytes, starting on a line boundary. True if it did.
+
+    STREAMED, NOT READ WHOLE. The first version read the tail into one bytes object -- the full
+    64 MB ceiling, resident in the fleet process at every start, for the length of a disk write.
+    This moves it a megabyte at a time into a sibling file and swaps it in, so the peak is one
+    chunk. If the swap is refused (another process holds the ledger open without delete
+    sharing), the tail is streamed back over the original instead, which is what the in-memory
+    version did too, just without holding it.
+    """
+    tmp = path + ".captmp"
+    try:
+        with io.open(path, "rb") as src:
+            src.seek(size - keep)
+            # Land on a line boundary: half a JSON object at the head of the file is a
+            # parse error for every reader, which is worse than the bytes it saved.
+            src.readline()
+            with io.open(tmp, "wb") as dst:
+                while True:
+                    chunk = src.read(_COPY_CHUNK)
+                    if not chunk:
+                        break
+                    dst.write(chunk)
+        try:
+            os.replace(tmp, path)
+            return True
+        except OSError:
+            pass
+        with io.open(tmp, "rb") as src, io.open(path, "wb") as dst:
+            while True:
+                chunk = src.read(_COPY_CHUNK)
+                if not chunk:
+                    break
+                dst.write(chunk)
+        return True
+    except OSError:
+        return False
+    finally:
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
 
 
 #: Registry entries younger than this are kept even when nothing links them: a fleet run
@@ -402,6 +980,16 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
     ("r6a8cfa11_w0"), and NONE of the 409 conversation GUIDs appear as a key. There is no join
     from a registry row to the data, so a row with no session behind it cannot reach anything
     locally. (The M365 URL may still open server-side; what is gone is any local record.)
+
+    A ROW IS NOT DROPPED WHILE ITS TRANSCRIPT STILL EXISTS ON DISK (2026-10-05). The main chat
+    window lists conversations from the registry AND from the transcript directory, and an old
+    conversation whose registry row was pruned after 24 h could only be reached through that
+    directory scan. Rows are now dropped only when nothing links them AND the transcript is gone
+    AND they are older than the keep window. The registry is kept small the other way: the
+    full goal text of a row whose transcript has been idle for COMPACT_IDLE_HOURS (it is the bulk of the file: 1.9 of 2.4 million
+    characters on the live registry) is cut to GOAL_COMPACT_CHARS and flagged `goal_cut`; the
+    full text is the first line of the transcript, which the chat reads when the row is opened.
+    A file that is rewritten for the first time is backed up once as conversations.json.bak.
     """
     now = time.time() if now is None else now
     keep_hours = CONV_KEEP_HOURS if keep_hours is None else keep_hours
@@ -409,11 +997,11 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
     if not os.path.isfile(path):
         return 0, []
     got = _linked_sessions(fleet_dir)
-    if got is None:
-        # FAIL CLOSED. Every row looks unlinked when the table cannot be read, and acting on
-        # that would empty the registry on exactly the failure it should be cautious about.
-        return 0, []
-    sids, linked = got
+    # FAIL CLOSED. Every row looks unlinked when the table cannot be read, and acting on that
+    # would empty the registry on exactly the failure it should be cautious about. Compaction
+    # needs no session table, so it still runs.
+    can_drop = got is not None
+    sids, linked = got if can_drop else (set(), set())
     guids = {_guid(u) for u in linked if _guid(u)}
     try:
         rows = json.load(io.open(path, encoding="utf-8-sig"))
@@ -423,8 +1011,14 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
         return 0, []
     before = _size(path)
     kept, dropped = [], []
+    compacted = 0
     for r in rows:
         if not isinstance(r, dict):
+            kept.append(r)
+            continue
+        if _compact_row(r, now, fleet_dir):
+            compacted += 1
+        if not can_drop:
             kept.append(r)
             continue
         url = (r.get("url") or "").strip()
@@ -446,13 +1040,297 @@ def conversations(fleet_dir, now=None, dry_run=False, keep_hours=None):
         if age_h <= keep_hours:
             kept.append(r)
             continue
+        if transcript_on_disk(fleet_dir, r):
+            kept.append(r)       # still openable from disk: the chat must keep listing it
+            continue
         dropped.append(r.get("title") or url[:60])
-    if dropped and not dry_run:
-        tmp = path + ".tmp"
-        with io.open(tmp, "w", encoding="utf-8") as fh:
-            json.dump(kept, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
+    if (dropped or compacted) and not dry_run:
+        _write_registry(path, kept)
     return max(0, before - (_size(path) if not dry_run else 0)), dropped
+
+
+#: Goal text kept on a registry row past the keep window. The sidebar shows the title; the full
+#: goal is the first line of the transcript and is read from there when the row is opened.
+GOAL_COMPACT_CHARS = int(os.environ.get("MCP_FLEET_REGISTRY_GOAL_CHARS", "240"))
+
+
+#: A row whose transcript has not been written for this long is finished for the purpose of
+#: shrinking it. NOT the 24 h keep window: the registry only ever holds the last day or so of
+#: rows (the live file held 1,122 rows from one day, 1.9 of its 2.4 million characters being
+#: goal text), so waiting a day would leave an oversized file oversized. Safe because the full
+#: goal is recovered from the transcript when the row is opened and from a live worker.
+COMPACT_IDLE_HOURS = float(os.environ.get("MCP_FLEET_REGISTRY_IDLE_HOURS", "1"))
+
+
+def _compact_row(r, now, fleet_dir=None):
+    """Shrink one idle registry row in place; True when it changed. A row whose transcript is
+    still being written, or that is inside the keep window, is live and is never touched (a
+    running worker's goal addresses its follow-ups).
+
+    IDLE IS READ FROM THE TRANSCRIPT, NOT FROM `ts`: on the live registry 1,122 of 1,143 rows
+    carried a ts from the same day because something restamped them together, so `ts` alone
+    would have made the migration a no-op on exactly the oversized file it exists for."""
+    g = r.get("goal")
+    if not isinstance(g, str) or len(g) <= GOAL_COMPACT_CHARS:
+        return False
+    idle_h = None
+    if fleet_dir is not None:
+        idle_h = _transcript_idle_hours(fleet_dir, r, now)
+    if idle_h is None:
+        try:
+            idle_h = (now - float(r.get("ts") or 0)) / 3600.0
+        except (TypeError, ValueError):
+            idle_h = 1e9
+    if idle_h <= COMPACT_IDLE_HOURS:
+        return False
+    r["goal"] = g[:GOAL_COMPACT_CHARS]
+    r["goal_cut"] = True
+    return True
+
+
+def _transcript_paths_on_disk(fleet_dir, r):
+    """Every existing file (plain or .gz) a registry row's transcript pointers resolve to."""
+    found = []
+    for p in _row_transcripts(r):
+        norm = p.replace("\\", "/")
+        base = os.path.basename(norm)
+        for c in (p, norm, os.path.join(fleet_dir, norm),
+                  os.path.join(fleet_dir, "transcripts", base)):
+            plain = c[:-3] if c.endswith(".gz") else c
+            for f in (plain, plain + ".gz"):
+                if os.path.isfile(f):
+                    found.append(f)
+    return found
+
+
+def _transcript_idle_hours(fleet_dir, r, now):
+    """Hours since the NEWEST of a row's existing transcripts was written, None when none exist."""
+    best = None
+    for f in _transcript_paths_on_disk(fleet_dir, r):
+        try:
+            age = (now - os.path.getmtime(f)) / 3600.0
+        except OSError:
+            continue
+        best = age if best is None else min(best, age)
+    return best
+
+
+def _row_transcripts(r):
+    out = []
+    one = r.get("transcript")
+    if isinstance(one, str) and one.strip():
+        out.append(one.strip())
+    many = r.get("transcripts")
+    if isinstance(many, list):
+        out.extend(x.strip() for x in many if isinstance(x, str) and x.strip())
+    return out
+
+
+def transcript_on_disk(fleet_dir, r):
+    """True when any transcript a registry row points at still exists, as plain or gzipped, at
+    the stored path, under the fleet directory, or by file name in .fleet/transcripts (rows
+    written on another checkout carry that checkout's absolute path)."""
+    return bool(_transcript_paths_on_disk(fleet_dir, r))
+
+
+def _write_registry(path, rows):
+    """Atomic write of the registry, backing the previous file up ONCE as .bak (the first time
+    a compaction or prune rewrites it). No BOM: the C# reader and Python both tolerate one but
+    the writers never add it."""
+    bak = path + ".bak"
+    if not os.path.exists(bak):
+        try:
+            shutil.copy2(path, bak)
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with io.open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(rows, fh, ensure_ascii=False, separators=(",", ":"))
+    os.replace(tmp, path)
+
+#: campaigns.jsonl is NOT compacted here. Resume (relay/fleet_resume.py) and campaigns_from_ledger
+#: (relay/fanout.py) read it for unfinished families, and cap_jsonl's tail cut at 64 MB is the only
+#: bound. Moving finished families to campaigns.jsonl.1 is specified in
+#: tests/test_campaigns_ledger_retention.py and not built: it must prove a family is finished
+#: (merge_done) and referenced by no interrupted-run snapshot or live worker, and that proof is
+#: its own slice. Until then the ledger is READ in a way that does not depend on its size
+#: (relay/fanout_budget.py) and this warning makes the growth visible.
+CAMPAIGNS_WARN_MB = float(os.environ.get("MCP_FLEET_CAMPAIGNS_WARN_MB", "8"))
+
+
+def campaigns_ledger_warning(fleet_dir, dry_run=False, warn_mb=None):
+    """Write one `campaigns_ledger_large` mechanism row when campaigns.jsonl is past the warning
+    size. Returns the size in bytes when it warned, else 0. Never raises, never modifies the file."""
+    warn_mb = CAMPAIGNS_WARN_MB if warn_mb is None else warn_mb
+    size = _size(os.path.join(fleet_dir, "campaigns.jsonl"))
+    if size <= int(warn_mb * 1048576):
+        return 0
+    if not dry_run:
+        try:
+            from relay import mechanism_telemetry as _mt
+            _mt.record("campaigns_ledger_large", configured=True, eligible=True, triggered=True,
+                       extra={"bytes": size, "warn_mb": warn_mb})
+        except Exception:
+            pass
+    return size
+
+
+#: Age after which an entry under %TEMP%\m365-companion\ is swept (hours; newest file inside).
+TEMP_HOME_MAX_AGE_H = float(os.environ.get("MCP_TEMP_HOME_MAX_AGE_H", "24"))
+#: An EMPTY top-level playwright-artifacts-* directory (left when a CDP-attached browser is
+#: killed) is swept after this many hours.
+PLAYWRIGHT_EMPTY_MAX_AGE_H = 6.0
+#: Exactly the name PasteImage() in ui/CopilotChat.cs gives a pasted picture.
+_PASTE_PNG = re.compile(r"^copilot_paste_[0-9a-f]{8}\.png$")
+_PLAYWRIGHT_DIR = re.compile(r"^playwright-artifacts-[A-Za-z0-9_\-]+$")
+
+
+def _is_link(path):
+    """True for a symlink or a Windows junction / any reparse point. lstat only, never follows."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return False
+    if stat.S_ISLNK(st.st_mode):
+        return True
+    return bool(getattr(st, "st_file_attributes", 0) & 0x400)  # FILE_ATTRIBUTE_REPARSE_POINT
+
+
+def _unlink_quiet(path):
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            os.remove(path)
+            return True
+        except OSError:
+            return False
+
+
+def _remove_link(path):
+    """Remove a link/junction ITSELF, never what it points at."""
+    try:
+        os.unlink(path)
+        return True
+    except OSError:
+        try:
+            os.rmdir(path)  # a directory symlink or junction on Windows
+            return True
+        except OSError:
+            return False
+
+
+def _rm_tree_safe(path):
+    """Delete `path` and everything under it, never following a link out of it, skipping what
+    is locked. Returns bytes removed. Never raises."""
+    freed = 0
+    if _is_link(path):
+        _remove_link(path)
+        return 0
+    try:
+        entries = list(os.scandir(path))
+    except OSError:
+        return 0
+    for e in entries:
+        try:
+            if _is_link(e.path):
+                _remove_link(e.path)
+            elif e.is_dir(follow_symlinks=False):
+                freed += _rm_tree_safe(e.path)
+            else:
+                n = _size(e.path)
+                if _unlink_quiet(e.path):
+                    freed += n
+        except OSError:
+            continue
+    try:
+        os.rmdir(path)
+    except OSError:
+        pass  # something locked or new inside: leave it for the next pass
+    return freed
+
+
+def sweep_temp_home(fleet_dir=None, now=None, dry_run=False, max_age_h=None, temp_root=None):
+    """Sweep what this product left in %TEMP%. Returns (bytes_freed, [paths]); never raises.
+
+    ONLY three things are ever touched:
+      1. entries directly under %TEMP%\\m365-companion\\ whose newest file is older than
+         `max_age_h` (default 24) -- including agents' venvs under agents\\<name>\\;
+      2. top-level %TEMP%\\playwright-artifacts-* directories that are EMPTY and older than 6 h;
+      3. top-level %TEMP%\\copilot_paste_<8 hex>.png files older than `max_age_h`.
+    Anything else in %TEMP% is somebody else's and is not looked at. Links and junctions are
+    removed as links, never followed; a locked file is skipped, not an error. `fleet_dir` is
+    accepted only so apply() can call every rule the same way."""
+    freed, items = 0, []
+    try:
+        now = time.time() if now is None else now
+        max_age_h = TEMP_HOME_MAX_AGE_H if max_age_h is None else max_age_h
+        if temp_root is None:
+            from relay import temp_home as _th
+            temp_root = _th.system_temp()
+            home = _th.home_path()
+        else:
+            home = os.path.join(temp_root, "m365-companion")
+        cutoff = now - max_age_h * 3600.0
+
+        # 1. the home directory
+        if os.path.isdir(home) and not _is_link(home):
+            for e in list(os.scandir(home)):
+                try:
+                    if _is_link(e.path):
+                        # A planted link is removed as a link once old enough; never followed.
+                        if os.lstat(e.path).st_mtime < cutoff:
+                            items.append(e.path)
+                            if not dry_run:
+                                _remove_link(e.path)
+                        continue
+                    if e.is_dir(follow_symlinks=False):
+                        newest, size = _newest_mtime_and_size(e.path)
+                        newest = newest or os.lstat(e.path).st_mtime
+                        if newest < cutoff:
+                            items.append(e.path)
+                            freed += size
+                            if not dry_run:
+                                _rm_tree_safe(e.path)
+                    elif e.stat(follow_symlinks=False).st_mtime < cutoff:
+                        n = _size(e.path)
+                        items.append(e.path)
+                        freed += n
+                        if not dry_run:
+                            _unlink_quiet(e.path)
+                except OSError:
+                    continue
+
+        # 2 + 3. the two known strays directly in the system temp dir
+        if os.path.isdir(temp_root):
+            for e in list(os.scandir(temp_root)):
+                try:
+                    if _PLAYWRIGHT_DIR.match(e.name):
+                        if (e.is_dir(follow_symlinks=False) and not _is_link(e.path)
+                                and not os.listdir(e.path)
+                                and now - os.lstat(e.path).st_mtime > PLAYWRIGHT_EMPTY_MAX_AGE_H * 3600.0):
+                            items.append(e.path)
+                            if not dry_run:
+                                try:
+                                    os.rmdir(e.path)  # refuses a non-empty dir, by construction
+                                except OSError:
+                                    pass
+                    elif _PASTE_PNG.match(e.name):
+                        if (e.is_file(follow_symlinks=False) and not _is_link(e.path)
+                                and os.lstat(e.path).st_mtime < cutoff):
+                            n = _size(e.path)
+                            items.append(e.path)
+                            freed += n
+                            if not dry_run:
+                                _unlink_quiet(e.path)
+                except OSError:
+                    continue
+    except Exception:
+        pass
+    return freed, items
+
 
 def apply(fleet_dir=None, now=None, dry_run=False):
     """Run every rule. Returns a report; never raises."""
@@ -474,10 +1352,13 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("rotations", rotations),
                      ("scratch", scratch),
                      ("stores", stores),
+                     ("workspace_clones", workspace_clones),
                      ("conversations", conversations),
-                     ("cap_jsonl", cap_jsonl)):
+                     ("cap_jsonl", cap_jsonl),
+                     ("temp_home", sweep_temp_home)):
         try:
-            if fn in (coordinator_logs, scratch, stores, compress, conversations):
+            if fn in (coordinator_logs, scratch, stores, compress, conversations,
+                     workspace_clones, sweep_temp_home):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)
@@ -488,6 +1369,11 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                               "freed_bytes": freed, "count": len(items)}
         rep["freed_bytes"] += freed
     rep["freed_mb"] = round(rep["freed_bytes"] / 1048576.0, 1)
+    try:
+        rep["campaigns_ledger_bytes_over_warning"] = campaigns_ledger_warning(
+            fleet_dir, dry_run=dry_run)
+    except Exception:
+        pass
     return rep
 
 
@@ -498,7 +1384,25 @@ if __name__ == "__main__":
     ap.add_argument("--apply", action="store_true",
                     help="actually delete (default is a dry run that only reports)")
     ap.add_argument("--dir", default=None)
+    # INTERNAL. This is the entry point _spawn_clone_sweep_subprocess() launches as a detached
+    # child process -- not meant to be typed by a person, though nothing stops it. Kept as a
+    # plain CLI flag rather than a separate script because a separate script is one more file
+    # whose relative import path could drift out of sync with this one.
+    ap.add_argument("--clone-sweep-worker", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--keep-days", type=float, default=None, help=argparse.SUPPRESS)
+    ap.add_argument("--now", type=float, default=None, help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.clone_sweep_worker:
+        fleet_dir = args.dir or os.path.join(
+            os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet")
+        keep_days = (args.keep_days if args.keep_days is not None
+                    else _setting("fleet_clone_days", CLONE_KEEP_DAYS))
+        now = args.now if args.now is not None else time.time()
+        freed, removed = _clone_sweep_run_once(fleet_dir, keep_days, _default_path_in_use, now)
+        print("clone sweep: %.1f MB freed, %d removed" % (freed / 1048576.0, len(removed)))
+        raise SystemExit(0)
+
     rep = apply(fleet_dir=args.dir, dry_run=not args.apply)
     print("%s  %s" % (rep["dir"], "(dry run)" if rep["dry_run"] else ""))
     for name, r in rep["rules"].items():

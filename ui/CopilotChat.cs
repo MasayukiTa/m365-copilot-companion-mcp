@@ -12,6 +12,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.IO.Compression;
 using System.Net;
 using System.Text;
 using System.Threading;
@@ -26,24 +27,21 @@ using System.Windows.Media.Imaging;
 using System.Windows.Threading;
 using System.Web.Script.Serialization;
 
-class Program { [STAThread] static void Main() { new Application().Run(new ChatWindow()); } }
-
-class Msg { public string Role; public string Text; public Msg(string r, string t) { Role = r; Text = t; } }
-
-class Conversation
+class Program
 {
-    public string Id = Guid.NewGuid().ToString("N").Substring(0, 12);
-    public string Title = "";        // empty = untitled (shows the localized default)
-    public string ConvUrl = "";
-    public string Source = "";
-    public double Ts = 0;
-    public string Transcript = "";   // disk jsonl path (fleet convs) -> open from disk, no scrape
-    public string Name = "";         // worker name (fallback to resolve the transcript by name)
-    public List<Msg> Messages = new List<Msg>();
-    public bool Untitled() { return string.IsNullOrEmpty(Title); }
+    [STAThread]
+    static void Main(string[] args)
+    {
+        // --selftest: construct the window the ordinary way, pump once, exit. See WindowSelfTest.cs.
+        if (args.Length >= 1 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase))
+            Environment.Exit(WindowSelfTest.Run(delegate { return new ChatWindow(); }));
+        new Application().Run(new ChatWindow());
+    }
 }
 
-class ChatWindow : Window
+// Msg and Conversation live in ChatSend.cs, with the send path that is compiled without WPF.
+
+class ChatWindow : Window, IChatSendEffects
 {
     readonly string _bridge = Environment.GetEnvironmentVariable("MCP_BRIDGE_URL") ?? "http://127.0.0.1:8765";
     static readonly string StoreDir = Path.Combine(
@@ -114,8 +112,72 @@ class ChatWindow : Window
         { "archived", true  },   // default collapsed to hide old eval/bench clutter
     };
     string _sidebarStatePath;   // set after _convsPath is known (ctor / timer init)
-    static readonly string SettingsFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "copilot-bridge", "settings.txt");
+    //: WHERE THE SETTINGS LIVE, in both places, new first.
+    //:
+    //: %APPDATA% is redirected for a process running inside an MSIX package, so the same
+    //: absolute path resolved to the operator's file from one context and to a private copy
+    //: from another. On 2026-09-16 the panel showed 1 GB while every fleet coordinator
+    //: reserved 4 GB, for a month, and neither side could see the other's file. The
+    //: repository is the one directory every context agrees about.
+    //:
+    //: READS take the new location when it exists and the old one otherwise, so a machine
+    //: mid-migration keeps working and one that never migrates behaves exactly as before.
+    //: WRITES always go to the new location. Kept in step with tools/settings_path.py --
+    //: test_the_settings_path_is_the_same_in_every_language pins the two together.
+    static string SettingsFileNew
+    {
+        get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); }
+    }
+
+    static string SettingsFileOld
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    //: The repository root as seen from the running executable: ui\ sits directly under it.
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            string dir = Path.GetDirectoryName(exe);
+            DirectoryInfo d = new DirectoryInfo(dir);
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
+
 
     string T(string k)
     {
@@ -189,8 +251,17 @@ class ChatWindow : Window
         // ── send-target pinning / reachability fallback errors (nothing was sent) ────
         if (k == "send_wrong_page")  return ja ? "送信先の会話に接続できませんでした — 送信は行われていません" : "Could not connect to the target conversation — nothing was sent.";
         if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
+        // ── fleet conversations: the message goes to the fleet, not to the bridge page ──
+        if (k == "fleet_steer_sent")  return ja ? "実行中のワーカーに追加指示を渡しました。次のターンから反映されます。" : "Handed to the running worker -- it takes effect on its next turn.";
+        if (k == "fleet_goal_empty") return ja ? "/goal のあとに内容がありません。新しいゴールの本文を書いてください。" : "/goal was given with no text. Write the new goal after it.";
+        if (k == "fleet_follow_sent") return ja ? "この会話の続きとして、新しいワーカーに引き継ぎました（同じ会話を継続します）。" : "Queued as a follow-up: a new worker will continue this same conversation.";
+        if (k == "fleet_follow_idle") return ja ? "フリートが起動していないため、次の走行で拾われます（同じ会話の続きとして投入済み）。" : "No fleet is running, so this waits for the next one -- queued as a continuation of this conversation.";
+        if (k == "fleet_no_goal")     return ja ? "この会話を識別するゴール本文が記録されていないため、続きを投入できません。" : "This conversation has no recorded goal text to identify it, so it can't be continued.";
+        if (k == "fleet_send_failed") return ja ? "フリートへの受け渡しに失敗しました。送信は行われていません。" : "Could not hand this to the fleet -- nothing was sent.";
+        if (k == "not_saved") return ja ? "この会話は保存されていません: " : "This conversation was not saved: ";
         if (k == "send_offline") return ja ? "ブリッジに接続できません。送信していません。" : "Can't reach the bridge. Nothing was sent.";
         if (k == "retry_start_stack") return ja ? "スタックを起動して再試行" : "Start the stack and retry";
+        if (k == "bridge_auth_problem") return ja ? "ブリッジが要求を受け付けませんでした（認証またはバージョンの不一致）。" : "The bridge refused the request (authentication or version mismatch).";
         if (k == "reload_transcript") return ja ? "再読み込み" : "Reload";
         // ── sidebar section / action labels ──────────────────────────────────────
         if (k == "sec_pinned")   return ja ? "ピン留め"   : "Pinned";
@@ -208,6 +279,7 @@ class ChatWindow : Window
         if (k == "tip_theme")     return _dark ? (ja ? "ライトテーマへ" : "Switch to light theme") : (ja ? "ダークテーマへ" : "Switch to dark theme");
         if (k == "rename_link")   return ja ? "名前変更" : "Rename";
         if (k == "show_more")     return ja ? ("+" + "{0}" + " 件を表示") : ("+{0} more");
+        if (k == "older_more")    return ja ? "さらに古い会話を読み込む（残り {0} 件）…" : "Load older conversations ({0} left)…";
         return k;
     }
 
@@ -372,7 +444,37 @@ class ChatWindow : Window
 
         _messages = new StackPanel { Margin = new Thickness(0, 8, 0, 8), MaxWidth = 760, HorizontalAlignment = HorizontalAlignment.Center };
         _scroll = new ScrollViewer { Content = _messages, VerticalScrollBarVisibility = ScrollBarVisibility.Auto, Padding = new Thickness(24, 16, 24, 16) };
-        Grid.SetRow(_scroll, 1); main.Children.Add(_scroll);
+
+        // ── THE STATE OF THE WORK, OUT OF THE CONVERSATION ──────────────────────────────
+        //
+        // A status line was being appended to the transcript as an assistant TURN: "状態: running
+        // ターン 3/1000" arrived as though the agent had said it. Status is a value that is true
+        // NOW; a message is a record of a moment. Mixing them forces the whole transcript to be
+        // rebuilt whenever the status moves, which is what destroyed the reader's text selection
+        // once a second, and it puts the least durable thing in the most permanent place.
+        //
+        // So it lives here: one band, above the transcript, updated in place. Nothing about it
+        // touches _messages, so a status change cannot disturb what the reader is looking at.
+        _statusBand = new Border
+        {
+            // 4-MULTIPLE SPACING, from the set already in use. The first draft used 14/7 and the
+            // repository's own design test refused it: "new spacing values appeared: [14.0] --
+            // pick one already in use". A band that introduces its own rhythm is exactly the
+            // "全く違うものになっている" this restructure is meant to stop.
+            Padding = new Thickness(16, 8, 16, 8),
+            BorderThickness = new Thickness(0, 0, 0, 1),
+            Visibility = Visibility.Collapsed,
+        };
+        SetRef(_statusBand, Border.BorderBrushProperty, "Border");
+        _statusText = new TextBlock { TextWrapping = TextWrapping.Wrap, FontSize = 12.5 };
+        SetRef(_statusText, TextBlock.ForegroundProperty, "Muted");
+        _statusBand.Child = _statusText;
+        var chatCol = new Grid();
+        chatCol.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        chatCol.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+        Grid.SetRow(_statusBand, 0); chatCol.Children.Add(_statusBand);
+        Grid.SetRow(_scroll, 1); chatCol.Children.Add(_scroll);
+        Grid.SetRow(chatCol, 1); main.Children.Add(chatCol);
         // Auto-scroll, but yield to the user. ScrollChanged fires for BOTH user scrolls and content
         // growth: when the extent didn't change it was the USER moving -> stick only if they're at
         // the bottom; when content grew -> pin to the bottom ONLY if still sticking. So while a reply
@@ -546,7 +648,9 @@ class ChatWindow : Window
         Content = root;
 
         // Set _convsPath BEFORE LoadConversations so DiscoverTranscripts and LoadSidebarState work.
-        string fleetDir = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
+        // --selftest reads and writes an empty scratch directory instead of the real .fleet.
+        string fleetDir = WindowSelfTest.Active ? WindowSelfTest.ScratchDir("chat-fleet")
+            : Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
         _openPath = Path.Combine(fleetDir, "open.json");
         _convsPath = Path.Combine(fleetDir, "conversations.json");
         _sidebarStatePath = Path.Combine(fleetDir, "sidebar_state.json");
@@ -633,6 +737,9 @@ class ChatWindow : Window
         openTimer.Start();
         SetDot("idle");   // optimistic idle at launch; the first ProbeBridge tick confirms/corrects
         SyncRegistry();
+        // Dispose the transcript watcher on exit -- a FileSystemWatcher left running past window
+        // close is a leaked OS handle, not just a leaked object.
+        Closed += delegate { StopFollowingTranscript(); };
     }
 
     string _openPath; long _openMtime;
@@ -650,10 +757,12 @@ class ChatWindow : Window
             if (m == _settingsMtime) return;
             _settingsMtime = m;
             int l0 = _lang;
+            int cap0 = _sectionCap;
             double s0 = _uiScale;
             bool a0 = _uiAuto; double t0 = _scaleTarget;
             LoadSettings();                              // re-reads lang/dark/ui_scale/target (+ApplyTheme)
             if (_lang != l0) { UpdateChrome(); RefreshConvList(); RerenderActiveConversation(); }
+            else if (_sectionCap != cap0) RefreshConvList();   // the cockpit changed the sidebar cap
             // Cockpit changed the shared zoom -> mirror it silently. In AUTO recompute for THIS monitor
             // (the per-monitor effective scale, not the other window's); in MANUAL push the shared number.
             if (_uiAuto)
@@ -676,9 +785,278 @@ class ChatWindow : Window
     }
     string _activeFleetUrl;              // conv URL of the fleet snapshot currently shown (null = none)
     long _statusMtime;                   // last-seen mtime of status.json (for live re-render)
+    //: What the fleet view last PUT ON SCREEN, one entry per rendered turn. The mtime above says
+    //: the file moved; this says whether the reader would see anything different, and WHERE it
+    //: differs -- a per-turn list is what lets new turns be appended instead of the panel being
+    //: rebuilt around the reader. A single joined string could only answer "same or not".
+    List<string> _fleetTurnSigs = new List<string>();
+    //: The band above the transcript that carries the CURRENT state of a fleet run. Separate
+    //: from the messages on purpose: a status is a value now, a message is a record of a moment,
+    //: and giving them one place made every status tick rewrite the conversation.
+    Border _statusBand;
+    TextBlock _statusText;
 
-    static string SS(Dictionary<string, object> d, string k)
-    { return (d.ContainsKey(k) && d[k] != null) ? d[k].ToString() : ""; }
+    // ── live-follow of the OPEN fleet transcript ─────────────────────────────────────────
+    //
+    // "別のを開いて開きなおさないと現行のが見えない" -- the operator should never have to
+    // leave and come back to see a running conversation's new turns. status.json's mtime-poll
+    // (CheckFleetSnapshot, above) already re-renders a live snapshot, but it is keyed to the
+    // WHOLE fleet's status file and a 20s "is this fresh" heuristic that can go stale while a
+    // worker is genuinely still writing. This instead watches the ONE open transcript file
+    // directly with a FileSystemWatcher and appends bytes as they land -- no tick, no re-read
+    // of anything but the new tail, and it can never fight over what is "new" with the status
+    // poll because every line it renders is folded into _fleetTurnSigs, which the status poll
+    // treats as "already on screen".
+    FileSystemWatcher _txWatcher;          // non-null while a transcript is being followed
+    string _txWatchPath;                   // full path of the plain .jsonl being followed
+    string _txWatchConvKey;                // Conversation.ConvUrl this follow belongs to -- a
+                                            // stale callback for a conversation the user has
+                                            // since left is dropped rather than misapplied
+    long _txReadOffset;                    // bytes of _txWatchPath already consumed
+    byte[] _txPartialLine = new byte[0];   // trailing bytes not yet terminated by '\n'
+    readonly object _txFollowLock = new object();  // serializes catch-up passes
+    volatile bool _txRecheckQueued;                // another change arrived while one was running
+
+    // Begin following 'path' for appends, starting from byte offset 'fromOffset' (the length
+    // already rendered on screen, so nothing already shown is re-emitted). 'convKey' is the
+    // Conversation.ConvUrl this follow belongs to; a callback only applies its result while
+    // _conv still matches it. Any previous follow is torn down first -- exactly one transcript
+    // is ever watched at a time. A '.gz' path (fleet_retention already archived it) or a
+    // missing directory is a no-op: there is nothing left that could still grow.
+    void StartFollowingTranscript(string path, long fromOffset, string convKey)
+    {
+        StopFollowingTranscript();
+        try
+        {
+            if (string.IsNullOrEmpty(path)) return;
+            if (path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)) return;
+            string dir = Path.GetDirectoryName(path);
+            string file = Path.GetFileName(path);
+            if (string.IsNullOrEmpty(dir) || string.IsNullOrEmpty(file) || !Directory.Exists(dir)) return;
+            _txWatchPath = path;
+            _txWatchConvKey = convKey ?? "";
+            _txReadOffset = fromOffset > 0 ? fromOffset : 0;
+            _txPartialLine = new byte[0];
+            var w = new FileSystemWatcher(dir, file);
+            w.NotifyFilter = NotifyFilters.LastWrite | NotifyFilters.Size | NotifyFilters.FileName;
+            w.Changed += OnTranscriptFileEvent;
+            w.Created += OnTranscriptFileEvent;
+            w.Renamed += OnTranscriptFileEvent;
+            // fleet_retention deletes the plain file once it has gzipped it -- that is the normal,
+            // quiet end of a follow, handled inside ConsumeFollowedTranscriptOnce (File.Exists check),
+            // not treated as an error here.
+            w.Deleted += OnTranscriptFileEvent;
+            w.Error += delegate { Dispatcher.BeginInvoke(new Action(delegate { if (_txWatchPath == path) StopFollowingTranscript(); })); };
+            w.EnableRaisingEvents = true;
+            _txWatcher = w;
+        }
+        catch { StopFollowingTranscript(); }
+    }
+
+    // Tear down the current follow, if any. Safe to call when nothing is being followed.
+    void StopFollowingTranscript()
+    {
+        var w = _txWatcher;
+        _txWatcher = null; _txWatchPath = null; _txWatchConvKey = null;
+        _txReadOffset = 0; _txPartialLine = new byte[0];
+        if (w == null) return;
+        try { w.EnableRaisingEvents = false; } catch { }
+        try
+        {
+            w.Changed -= OnTranscriptFileEvent; w.Created -= OnTranscriptFileEvent;
+            w.Renamed -= OnTranscriptFileEvent; w.Deleted -= OnTranscriptFileEvent;
+        }
+        catch { }
+        try { w.Dispose(); } catch { }
+    }
+
+    // FileSystemWatcher fires on a threadpool thread, in bursts, and can fire before the
+    // writer's flush lands -- so this never assumes the event means "a whole new line is ready".
+    // It just means "go look again"; ConsumeFollowedTranscriptOnce does the actual, safe read.
+    void OnTranscriptFileEvent(object sender, FileSystemEventArgs e)
+    {
+        // Serialize catch-up passes instead of running them concurrently: if one is already in
+        // flight, mark that another look is needed and let IT pick up the new bytes when done,
+        // rather than piling up threadpool threads racing the same file/offset.
+        if (!Monitor.TryEnter(_txFollowLock)) { _txRecheckQueued = true; return; }
+        try
+        {
+            do { _txRecheckQueued = false; ConsumeFollowedTranscriptOnce(); }
+            while (_txRecheckQueued);
+        }
+        finally { Monitor.Exit(_txFollowLock); }
+    }
+
+    static byte[] Combine(byte[] a, byte[] b)
+    {
+        if (a == null || a.Length == 0) return b ?? new byte[0];
+        if (b == null || b.Length == 0) return a;
+        byte[] r = new byte[a.Length + b.Length];
+        Buffer.BlockCopy(a, 0, r, 0, a.Length);
+        Buffer.BlockCopy(b, 0, r, a.Length, b.Length);
+        return r;
+    }
+
+    // Read exactly the bytes appended since the last pass, parse whatever complete JSONL lines
+    // they contain, and append those as messages -- never re-reads or re-renders anything
+    // already on screen. Runs on the watcher's threadpool thread; only the UI application at
+    // the end is marshaled onto the dispatcher.
+    void ConsumeFollowedTranscriptOnce()
+    {
+        string path = _txWatchPath;
+        string convKey = _txWatchConvKey;
+        if (string.IsNullOrEmpty(path)) return;
+        var newMsgs = new List<Msg>();
+        try
+        {
+            if (!File.Exists(path))
+            {
+                // The run finished and fleet_retention gzipped (and deleted) the plain file, or it
+                // otherwise vanished. That is not an error -- just the quiet end of this follow.
+                Dispatcher.BeginInvoke(new Action(delegate { if (_txWatchPath == path) StopFollowingTranscript(); }));
+                return;
+            }
+            byte[] chunk;
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                long len = fs.Length;
+                if (len < _txReadOffset) { _txReadOffset = 0; _txPartialLine = new byte[0]; }  // truncated/replaced -- resync
+                long toRead = len - _txReadOffset;
+                if (toRead <= 0) return;   // nothing new since last pass
+                fs.Seek(_txReadOffset, SeekOrigin.Begin);
+                chunk = new byte[toRead];
+                int off = 0;
+                while (off < chunk.Length)
+                {
+                    int n = fs.Read(chunk, off, chunk.Length - off);
+                    if (n <= 0) break;   // read landed mid-flush -- whatever we got becomes the new partial tail
+                    off += n;
+                }
+                if (off < chunk.Length) Array.Resize(ref chunk, off);
+                _txReadOffset += off;
+            }
+
+            // Split at the BYTE level, not after decoding the whole chunk as UTF8: 0x0A never
+            // appears as a continuation byte of a multi-byte UTF-8 sequence, so a segment between
+            // two 0x0A bytes is always a complete, independently-decodable run of characters --
+            // decoding a still-partial multi-byte tail is exactly the corruption this avoids.
+            byte[] all = Combine(_txPartialLine, chunk);
+            int start = 0;
+            for (int i = 0; i < all.Length; i++)
+            {
+                if (all[i] != (byte)'\n') continue;
+                int lineLen = i - start;
+                if (lineLen > 0 && all[start + lineLen - 1] == (byte)'\r') lineLen--;   // CRLF -> LF
+                string ln = Encoding.UTF8.GetString(all, start, lineLen);
+                Msg m;
+                if (TryParseTranscriptLine(ln, out m)) newMsgs.Add(m);
+                start = i + 1;
+            }
+            // Whatever follows the last '\n' (possibly nothing) is an incomplete line -- buffered
+            // verbatim and left UNPARSED until the rest of it arrives on a later pass.
+            int remain = all.Length - start;
+            var partial = new byte[remain];
+            if (remain > 0) Array.Copy(all, start, partial, 0, remain);
+            _txPartialLine = partial;
+        }
+        catch (IOException) { return; }   // writer holds the range mid-flush; the next event retries
+        catch { return; }
+
+        if (newMsgs.Count == 0) return;
+        Dispatcher.BeginInvoke(new Action(delegate
+        {
+            // The open conversation may have changed since this pass started; apply the result
+            // only to the SAME one this follow was started for.
+            if (_txWatchPath != path || _conv == null || _conv.ConvUrl != convKey) return;
+            foreach (var m in newMsgs)
+            {
+                if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text);
+                _conv.Messages.Add(m);
+                // Keep the status-poll's own diff baseline in sync so its next tick sees these
+                // lines as already-rendered, instead of re-appending or rebuilding over them.
+                _fleetTurnSigs.Add(m.Role + "" + m.Text);
+            }
+        }));
+    }
+
+    // Resume/stop following the ONE fleet transcript that matches the just-opened conversation.
+    // Called every time a conversation is put on screen (from OpenFromFleet, from re-opening an
+    // already-cached fleet conversation, and from the startup restore) so a watcher never lingers
+    // on a conversation the user has left, and one is (re)armed whenever the newly-opened one is
+    // still a live-tracked fleet worker with an on-disk, not-yet-archived transcript.
+    void MaybeFollowConversation(Conversation c, string transcriptHint)
+    {
+        try
+        {
+            string key = c != null ? (c.ConvUrl ?? "") : "";
+            var wkr = ReadFleetWorker(key);
+            if (wkr == null) { StopFollowingTranscript(); return; }
+            string tp = SS(wkr, "transcript");
+            if (string.IsNullOrEmpty(tp)) tp = transcriptHint;
+            if (string.IsNullOrEmpty(tp) && c != null && !string.IsNullOrEmpty(c.Name))
+                tp = NewestTranscriptForWorker(c.Name);
+            if (string.IsNullOrEmpty(tp) || tp.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+            { StopFollowingTranscript(); return; }
+            long startOff = 0;
+            try { if (File.Exists(tp)) startOff = new FileInfo(tp).Length; } catch { }
+            // Sync the status-poll's diff baseline to exactly what is already on screen, so its
+            // next tick does not treat this fresh follow's starting point as something to append.
+            _fleetTurnSigs = new List<string>();
+            if (c != null) foreach (var m in c.Messages) _fleetTurnSigs.Add(m.Role + "" + m.Text);
+            StartFollowingTranscript(tp, startOff, key);
+        }
+        catch { StopFollowingTranscript(); }
+    }
+
+    static string SS(Dictionary<string, object> d, string k) { return ChatSend.SS(d, k); }
+
+    static List<string> TranscriptListField(Dictionary<string, object> d, string key)
+    {
+        var outp = new List<string>();
+        if (d == null || !d.ContainsKey(key) || d[key] == null) return outp;
+        var arr = d[key] as object[];
+        if (arr == null) return outp;
+        foreach (object o in arr)
+        {
+            string text = o == null ? "" : o.ToString().Trim();
+            if (text.Length > 0) outp.Add(text);
+        }
+        return outp;
+    }
+
+    List<string> RegistryTranscriptLineage(Dictionary<string, object> d)
+    {
+        return FleetConvIdentity.MergeTranscriptLineage(
+            null, TranscriptListField(d, "transcripts"), SS(d, "transcript"));
+    }
+
+    // Resolve one shared-conversation lineage from the registry. Real/sess URLs are the primary
+    // identity. For legacy rows without a URL, mirror the registry writer's (source,name) key.
+    // A latest hint is appended only when the registry has not seen it yet.
+    List<string> RegistryTranscriptLineageFor(string url, string worker, string latestHint)
+    {
+        try
+        {
+            foreach (object o in ReadConvsRegistry())
+            {
+                var d = o as Dictionary<string, object>;
+                if (d == null) continue;
+                string du = SS(d, "url");
+                string dn = SS(d, "name");
+                string ds = SS(d, "source");
+                string dt = SS(d, "transcript");
+                bool hit = false;
+                if (!string.IsNullOrEmpty(url)) hit = (du == url);
+                else if (!string.IsNullOrEmpty(worker)) hit = (du.Length == 0 && ds == "fleet" && dn == worker);
+                if (!hit && !string.IsNullOrEmpty(latestHint)) hit = (dt == latestHint);
+                if (!hit) continue;
+                return FleetConvIdentity.MergeTranscriptLineage(
+                    RegistryTranscriptLineage(d), null, latestHint);
+            }
+        }
+        catch (Exception ex) { NoteTranscriptLineFailure(url, ex); }
+        return FleetConvIdentity.MergeTranscriptLineage(null, null, latestHint);
+    }
 
     // status.json lives next to conversations.json (.fleet/). Read the worker dict whose
     // "conv_url" matches 'url' (the cockpit cards render exactly this live per-worker state).
@@ -711,10 +1089,55 @@ class ChatWindow : Window
         return null;
     }
 
+    // relay/fleet_retention.py::compress() gzips any transcript older than COMPRESS_AFTER_HOURS
+    // (default 6h) to "<name>.jsonl.gz" and DELETES the plain file -- introduced 2026-09-01. This
+    // reader was never updated, so every one of the three lookups below used to see only the last
+    // few hours of transcripts and silently drop the rest (no error, just an empty-looking history).
+    // These three helpers are the single place that knows about both name shapes; every call site
+    // routes through them so the bug class can't reappear one glob at a time.
+    //
+    // Strip a trailing ".gz" to get the logical (uncompressed) transcript identity, so a plain file
+    // and its compressed successor are recognised as the SAME transcript.
+    static string StripGz(string path) { return ConvListing.StripGz(path); }
+
+    // True if the transcript exists on disk in EITHER form (plain or gzipped), regardless of
+    // which spelling the caller has.
+    static bool TranscriptFileExists(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return false;
+        if (File.Exists(path)) return true;
+        return path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+            ? File.Exists(StripGz(path)) : File.Exists(path + ".gz");
+    }
+
+    // Enumerate every transcript in tdir, merging "*.jsonl" and "*.jsonl.gz" into one list
+    // deduped by logical name (StripGz) -- when both spellings exist for the same transcript
+    // (a race with fleet_retention mid-compress), the plain file wins the slot.
+    static List<string> ListTranscriptFiles(string tdir) { return ConvListing.ListTranscriptFiles(tdir); }
+
+    // Open a transcript for reading regardless of compression: resolves to whichever of
+    // path/path+".gz" actually exists on disk (a caller may hand either spelling), then wraps the
+    // stream in GZipStream when needed. Every read of a transcript's bytes must go through this --
+    // see relay/fleet_retention.py::open_maybe_gz(), whose docstring says readers must not have to
+    // know about compression. This is that contract kept on the C# side.
+    static StreamReader OpenTranscriptReader(string path)
+    {
+        string actual = path;
+        if (!File.Exists(actual))
+        {
+            actual = actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase) ? StripGz(actual) : actual + ".gz";
+        }
+        var fsr = new FileStream(actual, FileMode.Open, FileAccess.Read, FileShare.ReadWrite);
+        if (actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
+            return new StreamReader(new GZipStream(fsr, CompressionMode.Decompress), Encoding.UTF8);
+        return new StreamReader(fsr, Encoding.UTF8);
+    }
+
     // Locate a worker's on-disk transcript by NAME, independent of the live status.json worker
-    // entry. Transcripts are named "<runid>_a<agent>_w<N>.jsonl" and OUTLIVE the live worker dict,
-    // so this lets click-to-open load the full conversation for a finished/restarted/history worker
-    // (when ReadFleetWorker returns null) instead of falling back to the "not available" placeholder.
+    // entry. Transcripts are named "<runid>_a<agent>_w<N>.jsonl" (or "...jsonl.gz" once
+    // fleet_retention compresses it) and OUTLIVE the live worker dict, so this lets click-to-open
+    // load the full conversation for a finished/restarted/history worker (when ReadFleetWorker
+    // returns null) instead of falling back to the "not available" placeholder.
     // Returns the NEWEST matching file (the latest run for that worker), or "" if none.
     string NewestTranscriptForWorker(string worker)
     {
@@ -724,10 +1147,14 @@ class ChatWindow : Window
             string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
             if (!Directory.Exists(tdir)) return "";
             string suffix = "_" + worker + ".jsonl";   // exact suffix: "w1" must not match "w10"
+            string gzSuffix = suffix + ".gz";
             string newest = null; DateTime best = DateTime.MinValue;
-            foreach (string f in Directory.GetFiles(tdir, "*" + suffix))
+            var candidates = new List<string>(Directory.GetFiles(tdir, "*" + suffix));
+            candidates.AddRange(Directory.GetFiles(tdir, "*" + gzSuffix));
+            foreach (string f in candidates)
             {
-                if (!Path.GetFileName(f).EndsWith(suffix, StringComparison.Ordinal)) continue;
+                string name = Path.GetFileName(f);
+                if (!(name.EndsWith(suffix, StringComparison.Ordinal) || name.EndsWith(gzSuffix, StringComparison.Ordinal))) continue;
                 DateTime t = File.GetLastWriteTimeUtc(f);
                 if (t > best) { best = t; newest = f; }
             }
@@ -775,28 +1202,106 @@ class ChatWindow : Window
     List<Msg> ReadTranscript(string path)
     {
         var msgs = new List<Msg>();
-        if (string.IsNullOrEmpty(path) || !File.Exists(path)) return msgs;
+        if (string.IsNullOrEmpty(path) || !TranscriptFileExists(path)) return msgs;
         try
         {
             string[] lines;
-            using (var fsr = new FileStream(path, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8))
+            using (var sr = OpenTranscriptReader(path))
                 lines = sr.ReadToEnd().Replace("\r", "").Split('\n');
             foreach (string ln in lines)
             {
-                if (string.IsNullOrEmpty(ln)) continue;
-                Dictionary<string, object> o;
-                try { o = _cjs.DeserializeObject(ln) as Dictionary<string, object>; }
-                catch { continue; }
-                if (o == null) continue;
-                if (!o.ContainsKey("role")) continue;   // skip meta / guid marker lines
-                string role = o["role"] != null ? o["role"].ToString() : "assistant";
-                string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
-                msgs.Add(new Msg(role.StartsWith("user") ? "U" : "A", text));
+                Msg m;
+                if (TryParseTranscriptLine(ln, out m)) msgs.Add(m);
             }
         }
         catch { }
         return msgs;
+    }
+
+    List<Msg> ReadTranscriptLineage(IEnumerable<string> paths)
+    {
+        var msgs = new List<Msg>();
+        var seen = new List<string>();
+        if (paths == null) return msgs;
+        foreach (string raw in paths)
+        {
+            string path = (raw ?? "").Trim();
+            if (path.Length == 0 || seen.Contains(path)) continue;
+            seen.Add(path);
+            var part = ReadTranscript(path);
+            if (part.Count > 0) msgs.AddRange(part);
+            AppendSubAgentTranscripts(msgs, path);
+        }
+        return msgs;
+    }
+
+    // The goal text off a transcript's own first ("meta") line -- relay/relay_fleet.py's
+    // _Transcript writes it once, at file creation, and it never changes afterward (a retry
+    // opens a new attempt file with the SAME goal; see relay_fleet.py's fresh_replay). Used as
+    // the last-resort source of identity for a fleet conversation opened by click: the live
+    // status.json worker dict is the first choice (see OpenFromFleet) because it survives a
+    // finished worker's slot being reused, but a restarted fleet or an old run has no worker
+    // dict at all, only this file. Returns "" on any read/parse failure -- never throws.
+    string TranscriptMetaGoal(string path)
+    {
+        if (string.IsNullOrEmpty(path) || !TranscriptFileExists(path)) return "";
+        try
+        {
+            using (var sr = OpenTranscriptReader(path))
+            {
+                string first = sr.ReadLine();
+                if (string.IsNullOrEmpty(first)) return "";
+                var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
+                return meta != null ? SS(meta, "goal") : "";
+            }
+        }
+        catch (Exception ex) { NoteTranscriptLineFailure(path, ex); return ""; }
+    }
+
+    // One JSONL transcript line -> a turn, or nothing. Shared by the full read above and the
+    // incremental live-follow below so the two can never disagree about what counts as a turn.
+    //
+    // NOT EVERY RECORDED ROLE IS A TURN. The test used to be `role.StartsWith("user") ? "U" :
+    // "A"`, so EVERYTHING that was not a user line became an assistant line -- including
+    // `metric`, which the fleet writes with an empty text. Those rendered as a "Copilot" label
+    // with nothing under it, and a reader looking for what the agent said mid-run found a blank
+    // where the answer should be. Reported as "copilotの分が途中のが表示されないケースが".
+    //
+    // Asked as "is this a turn with something in it", because that is the question: a role
+    // nobody has seen before should be shown if it carries text, and an empty record of any
+    // role is bookkeeping, not speech.
+    bool TryParseTranscriptLine(string ln, out Msg msg)
+    {
+        msg = null;
+        if (string.IsNullOrEmpty(ln)) return false;
+        Dictionary<string, object> o;
+        try { o = _cjs.DeserializeObject(ln) as Dictionary<string, object>; }
+        catch (Exception ex)
+        {
+            // A line that does not parse is a turn the reader could not show. The writer appends
+            // while this runs, so a half-written LAST line is expected and harmless; anything
+            // else is not, and used to vanish without a trace (a line over the serializer's
+            // 2 MB default was dropped here, which is how a long answer went missing).
+            NoteTranscriptLineFailure(ln, ex);
+            return false;
+        }
+        if (o == null) return false;
+        if (!o.ContainsKey("role")) return false;   // skip meta / guid marker lines
+        string role = o["role"] != null ? o["role"].ToString() : "assistant";
+        string text = (o.ContainsKey("text") && o["text"] != null) ? o["text"].ToString() : "";
+        if (role == "metric" || role == "meta" || role == "guid" || role == "note") return false;
+        if (text.Trim().Length == 0) return false;
+        msg = new Msg(role.StartsWith("user") ? "U" : "A", text);
+        return true;
+    }
+
+    int _lineFailures;
+    void NoteTranscriptLineFailure(string ln, Exception ex)
+    {
+        if (++_lineFailures > 20) return;      // a damaged file must not fill the log
+        ConvListing.Diag(Path.GetDirectoryName(_convsPath),
+            "transcript line (" + (ln == null ? 0 : ln.Length) + " chars) not readable: "
+            + ex.GetType().Name + ": " + ex.Message);
     }
 
     // Append any captured sub-agent (research) conversations for this worker. Each deep-dive is
@@ -899,19 +1404,31 @@ class ChatWindow : Window
         return sb.ToString().TrimEnd('\n');
     }
 
+    // THE REGISTRY, READ WITHOUT SWALLOWING. This used to be a bare `catch { }` returning an empty
+    // list, and the file crossed the serializer's 2,097,152-character default: every read threw,
+    // nothing was logged, and the sidebar showed no registry rows at all with no sign why. A
+    // failure is now logged (.fleet/chat_listing.log) and shown as a one-line notice in the
+    // sidebar; a later successful read clears it.
     List<object> ReadConvsRegistry()
     {
-        try
+        string err;
+        var rows = ConvListing.ReadRegistry(_convsPath, out err);
+        if (err.Length > 0)
         {
-            if (File.Exists(_convsPath))
-            {
-                var a = _cjs.DeserializeObject(File.ReadAllText(_convsPath, Encoding.UTF8)) as object[];
-                if (a != null) return new List<object>(a);
-            }
+            if (err != _lastRegistryError)
+                ConvListing.Diag(Path.GetDirectoryName(_convsPath), "registry read failed: " + err);
+            _lastRegistryError = err;
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, err);
         }
-        catch { }
-        return new List<object>();
+        else if (_lastRegistryError.Length > 0)
+        {
+            _lastRegistryError = "";
+            _historyNotice = "";
+        }
+        return rows;
     }
+    string _lastRegistryError = "";
+    string _historyNotice = "";
     // Add this conversation to the shared registry so the cockpit/other side lists it.
     void RegisterConv(string url, string title, string source)
     {
@@ -919,6 +1436,7 @@ class ChatWindow : Window
         try
         {
             var list = ReadConvsRegistry();
+            if (_lastRegistryError.Length > 0) return;   // never write back what could not be read: that replaces the file with this one row
             foreach (var o in list) { var d = o as Dictionary<string, object>; if (d != null && SS(d, "url") == url) return; }
             var e = new Dictionary<string, object>(); e["url"] = url; e["title"] = title ?? ""; e["source"] = source; e["ts"] = 0;
             list.Add(e);
@@ -935,6 +1453,7 @@ class ChatWindow : Window
         try
         {
             var list = ReadConvsRegistry();
+            if (_lastRegistryError.Length > 0) return;   // same: an unreadable registry must not be overwritten with the remainder
             var keep = new List<object>();
             foreach (var o in list)
             {
@@ -958,33 +1477,94 @@ class ChatWindow : Window
             if (m == _convsMtime) return;
             _convsMtime = m;
             bool added = false;
+            string noticeBefore = _historyNotice;
             foreach (var o in ReadConvsRegistry())
             {
                 var d = o as Dictionary<string, object>;
                 if (d == null) continue;
                 string url = SS(d, "url");
-                if (string.IsNullOrEmpty(url)) continue;
-                bool exists = false;
-                foreach (var c in _all) if (c.ConvUrl == url) { exists = true; break; }
-                if (!exists)
+                string transcript = SS(d, "transcript");
+                string regSource = SS(d, "source");
+                string regName = SS(d, "name");
+                var regLineage = RegistryTranscriptLineage(d);
+                // A socket-driven fleet worker never gets a conv_url: relay_fleet.py's
+                // _capture_url only ever fires when the worker holds a browser `page`, and a
+                // socket worker's page is None by construction (MCP_FLEET_SOCKET has defaulted
+                // on since 2026-08-21). Requiring url here silently dropped every such worker
+                // from the ONLY live-update path -- DiscoverTranscripts only runs once, at
+                // startup, capped at 80 -- so the fleet section froze at whatever that one scan
+                // found and never grew again. transcript alone is already a valid identity for
+                // opening a conversation: the click handler tries c.Transcript's on-disk read
+                // BEFORE it ever needs ConvUrl (see the "a registry/fleet conversation we
+                // haven't loaded yet" branch below), so a transcript-only row is not degraded,
+                // just openable a different way. A row with neither is still skipped -- there
+                // is nothing to show or open for it either way.
+                if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(transcript) && regLineage.Count == 0) continue;
+                // THE FULL GOAL TEXT (relay/fleet_runner.py::_register_convs, added alongside
+                // this read). NOT "title": make_title() truncates that for display, and
+                // DecideFleetSend (ChatSend.cs) addresses a fleet conversation by the goal, not
+                // the title -- a follow-up or a mid-run interrupt sent through a row with no
+                // goal was refused (fleet_no_goal) even while the worker was live, because this
+                // registry poll is the ONLY feed that updates while the window is already open
+                // (DiscoverTranscripts only scans once, at startup).
+                string regGoal = SS(d, "goal");
+                Conversation existingC = null;
+                foreach (var c in _all)
+                {
+                    if (!string.IsNullOrEmpty(url) && c.ConvUrl == url) { existingC = c; break; }
+                    if (string.IsNullOrEmpty(url) && regSource == c.Source && regName == c.Name
+                        && !string.IsNullOrEmpty(regName)) { existingC = c; break; }
+                    if (string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(transcript)
+                        && c.Transcript == transcript) { existingC = c; break; }
+                }
+                if (existingC != null)
+                {
+                    // BACKFILL ONLY: a row discovered before the registry carried "goal", or one
+                    // whose identity was never set by OpenFromFleet (see there), must not stay
+                    // permanently unaddressable just because it already exists. Never overwrite
+                    // a goal/transcript this row already has -- the decision itself lives in
+                    // FleetConvIdentity.MergeBackfillOnly (see ui/FleetConvIdentity.cs) so a
+                    // test can run it directly instead of only reading this call site as text.
+                    existingC.Goal = FleetConvIdentity.MergeBackfillOnly(existingC.Goal, regGoal);
+                    existingC.Source = FleetConvIdentity.MergeBackfillOnly(existingC.Source, regSource);
+                    existingC.Name = FleetConvIdentity.MergeBackfillOnly(existingC.Name, regName);
+                    // Seed a legacy row's single latest pointer into the lineage BEFORE applying
+                    // the fresh registry chain, so a stale poll can never rewind a newer pointer.
+                    var priorLineage = FleetConvIdentity.MergeTranscriptLineage(
+                        existingC.Transcripts, null, existingC.Transcript);
+                    existingC.Transcripts = FleetConvIdentity.MergeTranscriptLineage(
+                        priorLineage, regLineage, transcript);
+                    existingC.Transcript = FleetConvIdentity.LatestTranscript(
+                        existingC.Transcripts, FleetConvIdentity.MergeBackfillOnly(existingC.Transcript, transcript));
+                    continue;
+                }
                 {
                     var c = new Conversation();
                     c.ConvUrl = url;
                     c.Title = SS(d, "title");
-                    c.Source = SS(d, "source");
-                    c.Transcript = SS(d, "transcript");   // disk jsonl -> open from disk, no scrape
-                    c.Name = SS(d, "name");
-                    try { c.Ts = (d.ContainsKey("ts") && d["ts"] != null) ? Convert.ToDouble(d["ts"]) : 0; }
-                    catch { c.Ts = 0; }
+                    c.Source = regSource;
+                    c.Transcripts = regLineage;
+                    c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, transcript);
+                    c.Name = regName;
+                    c.Goal = regGoal;
+                    double tsv;
+                    c.Ts = (d.ContainsKey("ts") && d["ts"] != null
+                            && double.TryParse(Convert.ToString(d["ts"], System.Globalization.CultureInfo.InvariantCulture),
+                                               System.Globalization.NumberStyles.Float,
+                                               System.Globalization.CultureInfo.InvariantCulture, out tsv)) ? tsv : 0;
                     _all.Insert(0, c);   // newest on top (registry/fleet convs were appended below)
                     added = true;
                 }
             }
-            if (added) RefreshConvList();
+            if (added || _historyNotice != noticeBefore) RefreshConvList();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "SyncRegistry failed: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
     }
-    readonly JavaScriptSerializer _cjs = new JavaScriptSerializer();
+    readonly JavaScriptSerializer _cjs = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     // ── sidebar state persistence (pinned / archived / collapsed) ────────────────
     // Schema: {"pinned":["id",...], "archived":["id",...], "forced_today":["id",...],
@@ -1092,6 +1672,13 @@ class ChatWindow : Window
             string url = (d.ContainsKey("url") && d["url"] != null) ? d["url"].ToString() : "";
             string worker = (d.ContainsKey("worker") && d["worker"] != null) ? d["worker"].ToString() : "";
             string transcript = (d.ContainsKey("transcript") && d["transcript"] != null) ? d["transcript"].ToString() : "";
+            // WHICH ENTRY WAS CHOSEN, when one was. The cockpit card lists what happened and
+            // holds no body; clicking an entry has to land the reader ON it, not at the end of a
+            // conversation they then have to search. Absent means "just open it", which is what
+            // the card header and the history list still ask for.
+            int turnIndex = -1;
+            if (d.ContainsKey("turn_index") && d["turn_index"] != null)
+                int.TryParse(d["turn_index"].ToString(), out turnIndex);
             if (string.IsNullOrEmpty(url) && string.IsNullOrEmpty(worker) && string.IsNullOrEmpty(transcript)) return;
             // Bring this chat window to the front so a cockpit "▶ 開く" click lands you here without
             // an alt-tab -- the two-window round-trip was the biggest gap vs Claude Code's one pane.
@@ -1101,9 +1688,74 @@ class ChatWindow : Window
                 Activate(); Topmost = true; Topmost = false; Focus();
             }
             catch { }
-            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcript); }) { IsBackground = true }.Start();
+            int wantIdx = turnIndex;
+            new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcript); ScrollToTurn(wantIdx); })
+            { IsBackground = true }.Start();
         }
         catch { }
+    }
+
+    // Put the chosen entry at the top of the view and mark it, so a click on a card lands on the
+    // thing that was clicked.
+    //
+    // AND STOP FOLLOWING THE TAIL. Arriving at turn 4 of 40 and then being dragged to the bottom
+    // by the next status write is the same defect as opening at the end, with an extra step. The
+    // scroll handler re-arms following on its own the moment the reader returns to the bottom,
+    // so this suppresses it exactly until they do.
+    //
+    // Index is over the whole transcript, counting the same entries the card counted: the
+    // conversation panel holds one child per turn plus a note at the top for a fleet view, so
+    // the mapping is stated here rather than assumed, and a value that does not land inside the
+    // panel is ignored rather than clamped -- a silent jump to the wrong entry is worse than no
+    // jump, because it reads as the right one.
+    void ScrollToTurn(int index)
+    {
+        if (index < 0) return;
+        try
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                try
+                {
+                    int offset = 0;
+                    if (_messages.Children.Count > 0 && _messages.Children[0] is TextBlock) offset = 1;
+                    int at = index + offset;
+                    if (at < 0 || at >= _messages.Children.Count) return;
+                    var target = _messages.Children[at] as FrameworkElement;
+                    if (target == null) return;
+                    _stickBottom = false;
+                    target.BringIntoView();
+                    HighlightBriefly(target);
+                }
+                catch { }
+            }), System.Windows.Threading.DispatcherPriority.Loaded);
+        }
+        catch { }
+    }
+
+    // A short, self-clearing mark on the entry that was opened. Without it the reader has to
+    // work out which of several similar blocks they were sent to.
+    void HighlightBriefly(FrameworkElement target)
+    {
+        var border = target as Border;
+        if (border == null)
+        {
+            // Assistant turns are a StackPanel, not a Border; wrap nothing and mark the panel's
+            // own background instead of restructuring the tree under the reader.
+            var panel = target as Panel;
+            if (panel == null) return;
+            var was = panel.Background;
+            panel.SetResourceReference(Panel.BackgroundProperty, "PanelAlt");
+            var t = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1600) };
+            t.Tick += delegate { t.Stop(); panel.Background = was; };
+            t.Start();
+            return;
+        }
+        var prev = border.Background;
+        border.SetResourceReference(Border.BackgroundProperty, "PanelAlt");
+        var timer = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(1600) };
+        timer.Tick += delegate { timer.Stop(); border.Background = prev; };
+        timer.Start();
     }
 
     void OpenFromFleet(string url, string worker) { OpenFromFleet(url, worker, null); }
@@ -1120,17 +1772,34 @@ class ChatWindow : Window
         // Resolve the live worker dict (by conv_url when we have a real URL, else by name).
         var wkr = ReadFleetWorker(key);
         bool running = FleetRunningFresh();
-        string transcriptPath = wkr != null ? SS(wkr, "transcript") : "";
-        // A history click carries the EXACT transcript path -- prefer it (correct even when several
-        // runs share a worker name, which the name-newest fallback below could otherwise confuse).
-        if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(transcriptHint))
-            transcriptPath = transcriptHint;
-        // FALLBACK by worker name: if no live worker dict resolved (finished/restarted run, a
-        // history click, or a transient status.json read) the transcript field is unavailable even
-        // though the .jsonl is on disk -- so locate it by name. This is what was dropping users to
-        // the "transcript not available" placeholder so often; the full conversation was right there.
-        if (string.IsNullOrEmpty(transcriptPath) && !string.IsNullOrEmpty(worker))
-            transcriptPath = NewestTranscriptForWorker(worker);
+        string liveTranscriptPath = wkr != null ? SS(wkr, "transcript") : "";
+        if (string.IsNullOrEmpty(liveTranscriptPath) && !string.IsNullOrEmpty(worker))
+            liveTranscriptPath = NewestTranscriptForWorker(worker);
+
+        // Registry lineage is the conversation identity (old -> new). A cockpit history click's
+        // transcriptHint is DISPLAY LOCATION only: it must never rewind the Conversation.Transcript
+        // pointer that ChatSend later uses for live-worker/follow-up routing.
+        var transcriptLineage = RegistryTranscriptLineageFor(url, worker, liveTranscriptPath);
+        string identityTranscriptPath = FleetConvIdentity.LatestTranscript(transcriptLineage, liveTranscriptPath);
+        bool exactTranscriptView = !string.IsNullOrEmpty(transcriptHint);
+        string displayTranscriptPath = exactTranscriptView ? transcriptHint : identityTranscriptPath;
+        if (transcriptLineage.Count == 0 && !string.IsNullOrEmpty(identityTranscriptPath))
+            transcriptLineage = FleetConvIdentity.MergeTranscriptLineage(null, null, identityTranscriptPath);
+
+        // THE GOAL TEXT THAT IDENTIFIES THIS CONVERSATION TO THE FLEET (ChatSend.cs's
+        // DecideFleetSend addresses a follow-up / a live steer by c.Goal and c.Transcript, not
+        // by c.Title). Neither field was ever copied onto the Conversation object below -- the
+        // live worker dict and the transcript file both had the answer right here, and it was
+        // simply never read. That is what made an interrupt sent while the worker was still
+        // running, and a follow-up sent after it finished, both refuse identically: this
+        // method built the conversation the chat window actually sends through, and it always
+        // carried an empty Goal and an empty Transcript regardless of the worker's real state.
+        string liveGoal = wkr != null ? SS(wkr, "goal") : "";
+        // Decision itself (which source wins) lives in FleetConvIdentity.ResolveGoal so a test
+        // can run it without WPF; see ui/FleetConvIdentity.cs.
+        string goalTranscriptPath = !string.IsNullOrEmpty(identityTranscriptPath)
+            ? identityTranscriptPath : displayTranscriptPath;
+        string bestGoal = FleetConvIdentity.ResolveGoal(liveGoal, TranscriptMetaGoal(goalTranscriptPath));
 
         // SOURCE PRIORITY:
         //  1. Persisted full-text transcript (jsonl) -- ALWAYS preferred when present. It is the
@@ -1140,8 +1809,9 @@ class ChatWindow : Window
         //     fully separate from the fleet's :9222, so it is safe even mid-run (it no longer
         //     PAGE.goto's the shared companion Edge). Only used when there is no disk transcript.
         //  3. status.json snapshot fragment -- fallback for older workers with no transcript.
-        var msgs = ReadTranscript(transcriptPath);
-        AppendSubAgentTranscripts(msgs, transcriptPath);   // show captured research sub-conversations
+        var msgs = exactTranscriptView
+            ? ReadTranscriptLineage(FleetConvIdentity.MergeTranscriptLineage(null, null, displayTranscriptPath))
+            : ReadTranscriptLineage(transcriptLineage);
         bool fromTranscript = msgs.Count > 0;
         bool historyScraped = false;   // true only when the /history call below actually ran and succeeded
         if (!fromTranscript && !string.IsNullOrEmpty(url))   // scrape via the separate bridge Edge, mid-run safe
@@ -1152,7 +1822,7 @@ class ChatWindow : Window
             // is what made clicking a past chat "load forever, then error").
             try
             {
-                string hist = HttpGet("/history?url=" + Uri.EscapeDataString(url), 25000);
+                string hist = BridgeCall("/history?url=" + Uri.EscapeDataString(url), 25000);
                 var root = _cjs.DeserializeObject(hist) as Dictionary<string, object>;
                 if (root != null && root.ContainsKey("messages") && root["messages"] is object[])
                     foreach (object o in (object[])root["messages"])
@@ -1181,6 +1851,26 @@ class ChatWindow : Window
             Conversation c = null;
             foreach (var x in _all) { if (x.ConvUrl == key) { c = x; break; } }
             if (c == null) { c = new Conversation(); c.ConvUrl = key; c.Title = T("fleetview"); _all.Insert(0, c); }
+            // A FLEET CONVERSATION BY CONSTRUCTION -- UNLESS THIS ROW IS SOMETHING ELSE. This
+            // method is reached only for a fleet worker (cockpit "open") or a registry row with
+            // no cached messages yet (OpenConversation's "haven't loaded yet" branch, which also
+            // covers a plain Copilot-side orphan row when one shares this exact ConvUrl). DO NOT
+            // stamp Source over a row that already carries a real, different one -- only a stub
+            // with no source yet (the default "") is claimed here. DecideDoor (ChatSend.cs)
+            // routes a send by c.Source == "fleet"; a stub left at "" would fall through to the
+            // page-pinning doors instead, which have no key for it either (send_unknown_conv).
+            // The merge decisions (claim Source only for an unclaimed row; never blank the
+            // Transcript/Goal the row already had) live in FleetConvIdentity.MergeBackfillOnly
+            // and .MergeForward -- see ui/FleetConvIdentity.cs -- so a test can run them
+            // directly instead of only reading this call site as text.
+            c.Source = FleetConvIdentity.MergeBackfillOnly(c.Source, "fleet");
+            c.Name = FleetConvIdentity.MergeBackfillOnly(c.Name, worker);
+            var priorLineage = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, c.Transcript);
+            c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(
+                priorLineage, transcriptLineage, identityTranscriptPath);
+            c.Transcript = FleetConvIdentity.LatestTranscript(
+                c.Transcripts, FleetConvIdentity.MergeForward(c.Transcript, identityTranscriptPath));
+            c.Goal = FleetConvIdentity.MergeForward(c.Goal, bestGoal);
             c.Messages.Clear();
             foreach (var m in loaded) c.Messages.Add(m);
             _conv = c;
@@ -1231,6 +1921,10 @@ class ChatWindow : Window
                 reload.Click += delegate { new Thread((ThreadStart)delegate { OpenFromFleet(url, worker, transcriptHint); }) { IsBackground = true }.Start(); };
                 noTxContent.Children.Add(reload);
             }
+            // Follow this transcript's tail live from here on -- appends land as they are
+            // written, no re-open needed to see them. No-ops (and stops any previous follow)
+            // when this worker is no longer live-tracked or its transcript is already archived.
+            MaybeFollowConversation(c, identityTranscriptPath);
             RefreshConvList();
             RefreshSteerVisual();   // tint the input border if this is a live steerable worker
             StickToEnd();
@@ -1273,6 +1967,69 @@ class ChatWindow : Window
         if (_conv == null || _conv.ConvUrl != _activeFleetUrl) return;   // user navigated away
         var w = ReadFleetWorker(_activeFleetUrl);
         if (w == null) return;
+
+        // REBUILD ONLY WHEN WHAT IS ON SCREEN WOULD DIFFER.
+        //
+        // The trigger for this method is status.json's MTIME, and a live fleet rewrites that
+        // file about once a second whether or not anything a reader can see has changed. So the
+        // whole message panel was cleared and re-created every second: `_messages.Children
+        // .Clear()` destroys the TextBox the user is selecting in, and a selection cannot
+        // survive the control it lives in. Select a few words, and they were gone before Ctrl+C
+        // -- "選択してctrl cしてもなにもコピーできていない", and nothing was wrong with the
+        // controls, which are read-only and selectable and always were.
+        //
+        // The signature is the RENDERED CONTENT -- the transcript lines and the status tail --
+        // and not the worker dict, which carries per-second fields that would defeat the point.
+        string latestTranscript = SS(w, "transcript");
+        _conv.Transcripts = FleetConvIdentity.MergeTranscriptLineage(_conv.Transcripts, null, latestTranscript);
+        _conv.Transcript = FleetConvIdentity.LatestTranscript(_conv.Transcripts, latestTranscript);
+        var txPre = ReadTranscriptLineage(_conv.Transcripts);
+        string tailPre = BuildFleetStatusTail(w, includeLast: txPre.Count == 0);
+
+        // THE BAND IS UPDATED FIRST AND UNCONDITIONALLY, because it is the part that moves. It
+        // is not in _messages, so writing it cannot disturb a selection or a scroll position --
+        // which is the whole reason the status was taken out of the transcript.
+        ShowRunState(tailPre);
+
+        // AND THE TRANSCRIPT IS SIGNED WITHOUT IT -- per turn, not as one string. Including the
+        // status would put the conversation back on the status's clock: every tick would differ,
+        // the guard would never hold, and the rebuild would return exactly as often as before.
+        var sigs = new List<string>();
+        foreach (var m in txPre) sigs.Add(m.Role + "" + m.Text);
+
+        // APPEND WHAT IS NEW; REBUILD ONLY WHEN THE PAST CHANGED.
+        //
+        // The signature guard above stops the rebuild on a tick where nothing moved, which is
+        // most of them -- but a live worker DOES produce turns, and on each of those the whole
+        // panel was still being cleared and re-created. The review that asked for this said so
+        // in as many words: 「表示署名の判定だけでは、本文が増えた際の全再構築が残る。既存部分
+        // を保持し、追記と対象箇所の更新で済むことを設計要件にします」. A reader mid-selection
+        // when the agent answers loses the selection for the same reason as before, just less
+        // often -- and "less often" is not a property anybody can rely on.
+        //
+        // The past does not normally change: a transcript is append-only. So compare turn by
+        // turn, and when everything already rendered is still identical, add only the tail. A
+        // rebuild stays the answer for the case that is NOT an append -- a different worker, a
+        // recycled conversation, a transcript rewritten underneath us -- because then what is on
+        // screen is about something else.
+        int common = 0;
+        while (common < sigs.Count && common < _fleetTurnSigs.Count
+               && sigs[common] == _fleetTurnSigs[common]) common++;
+        bool append = common == _fleetTurnSigs.Count && common > 0 && sigs.Count > common
+                      && _messages.Children.Count > 0;
+        if (append)
+        {
+            for (int i = common; i < sigs.Count; i++)
+            {
+                var m = txPre[i];
+                if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text);
+            }
+            _fleetTurnSigs = sigs;
+            return;
+        }
+        if (sigs.Count == _fleetTurnSigs.Count && common == sigs.Count) return;
+        _fleetTurnSigs = sigs;
+
         _messages.Children.Clear();
         var note = new TextBlock { Text = T("fleetview_note"), TextWrapping = TextWrapping.Wrap, FontSize = 12.5, Margin = new Thickness(2, 2, 2, 12) };
         SetRef(note, TextBlock.ForegroundProperty, "Muted");
@@ -1280,17 +2037,30 @@ class ChatWindow : Window
         // If this worker has a persisted transcript, re-render the WHOLE conversation from disk
         // (untruncated) and append the live status tail -- otherwise fall back to the snapshot
         // fragment. Reading the jsonl touches only disk, never the live companion Edge.
-        var tx = ReadTranscript(SS(w, "transcript"));
+        // The same read the signature was taken from -- reading the transcript twice would put
+        // a second disk hit on a path that runs whenever the fleet writes.
+        var tx = txPre;
         if (tx.Count > 0)
         {
+            // NO STATUS TURN AT THE END. It used to be appended here as an assistant message;
+            // it is in the band above now.
             foreach (var m in tx) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
-            AddAssistant(BuildFleetStatusTail(w, includeLast: false));
         }
         else
         {
             RenderFleetSnapshot(w);
         }
         StickToEnd();
+    }
+
+    // Put the run's current state in the band, or hide it. Touches nothing in the transcript.
+    void ShowRunState(string text)
+    {
+        if (_statusBand == null || _statusText == null) return;
+        string t = (text ?? "").Trim();
+        if (t.Length == 0) { _statusBand.Visibility = Visibility.Collapsed; return; }
+        if (!string.Equals(_statusText.Text, t, StringComparison.Ordinal)) _statusText.Text = t;
+        _statusBand.Visibility = Visibility.Visible;
     }
 
     // If a fleet snapshot is the active view, re-render it when status.json's mtime changes
@@ -1300,7 +2070,7 @@ class ChatWindow : Window
         try
         {
             if (string.IsNullOrEmpty(_activeFleetUrl)) return;
-            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; RefreshSteerVisual(); return; }
+            if (_conv == null || _conv.ConvUrl != _activeFleetUrl) { _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual(); return; }
             string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
             if (!File.Exists(sp)) return;
             long m = File.GetLastWriteTimeUtc(sp).Ticks;
@@ -1311,33 +2081,12 @@ class ChatWindow : Window
         catch { }
     }
 
-    // Read status.json and count ACTIVE fleet workers (status not terminal / not "pending").
-    // Terminal statuses: "done", "resolved", "failed", "error", "cancelled", "stopped".
-    // "pending" means queued but not yet started. Anything else (e.g. "running", "verifying",
-    // "planning") is considered actively working. Returns 0 when status.json is absent.
+    // Read status.json and count ACTIVE fleet workers -- status neither terminal nor "pending",
+    // by ChatSend.IsTerminalWorkerStatus, the one list the steer lookup uses too. Anything else
+    // (e.g. "running", "verifying", "planning") is actively working. 0 when status.json is absent.
     int ReadActiveFleetWorkerCount()
     {
-        try
-        {
-            string sp = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
-            if (!File.Exists(sp)) return 0;
-            string txt;
-            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
-            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
-            if (d == null || !d.ContainsKey("workers") || !(d["workers"] is object[])) return 0;
-            int count = 0;
-            foreach (object o in (object[])d["workers"])
-            {
-                var w = o as Dictionary<string, object>;
-                if (w == null) continue;
-                string st = SS(w, "status").ToLowerInvariant();
-                if (st == "pending" || st == "done" || st == "resolved" || st == "failed"
-                    || st == "error" || st == "cancelled" || st == "stopped") continue;
-                count++;
-            }
-            return count;
-        }
+        try { return ChatSend.ActiveWorkerCount(Path.Combine(Path.GetDirectoryName(_convsPath), "status.json")); }
         catch { return 0; }
     }
 
@@ -1762,17 +2511,8 @@ class ChatWindow : Window
         return b;
     }
 
-    // First line only, ellipsis-trimmed to `max` chars. Shared by SendText (stored title) and the
-    // sidebar/header DISPLAY of long saved titles so a whole first message never fills a row.
-    static string TrimTitle(string s, int max)
-    {
-        if (string.IsNullOrEmpty(s)) return s;
-        int nl = s.IndexOfAny(new[] { '\r', '\n' });
-        if (nl >= 0) s = s.Substring(0, nl);
-        s = s.Trim();
-        if (s.Length > max) s = s.Substring(0, max) + "…";
-        return s;
-    }
+    // First line only, ellipsis-trimmed to `max` chars; the one definition is in ChatSend.cs.
+    static string TrimTitle(string s, int max) { return ChatSend.TrimTitle(s, max); }
 
     // Header title tracks the active conversation (Wave 2). Untitled -> localized "New chat".
     void RefreshHeadTitle()
@@ -1828,6 +2568,7 @@ class ChatWindow : Window
     // corporate proxy (which would make a local bridge look unreachable).
     void ProbeBridge()
     {
+        if (WindowSelfTest.Active) return;   // --selftest touches no network
         if (_reachProbing) return;
         _reachProbing = true;
         new Thread((ThreadStart)delegate
@@ -2139,7 +2880,7 @@ class ChatWindow : Window
     }
 
     // Repo root: this exe runs from <repo>\ui, so one level up is <repo> -- same convention
-    // already used for .fleet\status.json / .fleet\commands.json below.
+    // already used for .fleet\status.json / .fleet\commands.d below.
     string RepoRoot() { return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..")); }
 
     [System.Runtime.InteropServices.DllImport("user32.dll")] static extern bool SetForegroundWindow(IntPtr h);
@@ -2452,6 +3193,7 @@ class ChatWindow : Window
         }
 
         _convList.Children.Clear();
+        if (_historyNotice.Length > 0) _convList.Children.Add(MakeHistoryNotice(_historyNotice));
 
         // Render sections in order: Pinned, Recent, Fleet, Archived.
         // Header always shows when the section is non-empty (so a collapsed section can be expanded).
@@ -2461,6 +3203,7 @@ class ChatWindow : Window
         RenderSection(todayList,    "sec_today",    "today",    false, false, false);
         RenderSection(fleetList,    "sec_fleet",    "fleet",    true,  false, false);
         RenderSection(archivedList, "sec_archived", "archived", false, true,  false);
+        if (TranscriptsPending() > 0) _convList.Children.Add(MakeOlderRow(TranscriptsPending()));
 
         RefreshHeadTitle();   // keep the header title in sync with the active conversation (Wave 2)
     }
@@ -2470,7 +3213,10 @@ class ChatWindow : Window
     // so the full list renders. COLLAPSING the section (chevron) resets the override — MakeSectionHeader
     // clears the entry so re-expanding starts capped again.
     HashSet<string> _sectionExpanded = new HashSet<string>();
-    const int SectionCap = 8;
+    // How many rows a sidebar section shows before "+N more". Chosen in the cockpit settings popup
+    // (settings.txt sidebar_section_cap, default 8; 0 = no cap) and re-read when that file changes.
+    int _sectionCap = 8;
+    int SectionCap { get { return _sectionCap <= 0 ? int.MaxValue : _sectionCap; } }
 
     // Emits one section: header (if non-empty) + its rows. When collapsed, rows are skipped
     // EXCEPT the active conversation (cc.Id == _conv.Id), which always renders so the open
@@ -2506,6 +3252,38 @@ class ChatWindow : Window
             foreach (var c in list)
                 if (c.Id == _conv.Id) AddConvRow(c, isFleet, archived, isPinned);   // keep the open conv reachable
         }
+    }
+
+    // One line at the top of the sidebar when part of the history could not be read.
+    UIElement MakeHistoryNotice(string text)
+    {
+        var tb = new TextBlock
+        {
+            Text = text, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(12, 6, 8, 6)
+        };
+        SetRef(tb, TextBlock.ForegroundProperty, "Warning");
+        return tb;
+    }
+
+    // "Older..." row under the last section: loads the next page (one day) of the transcripts
+    // that are on disk but not yet listed. See LoadTranscriptPage.
+    UIElement MakeOlderRow(int pending)
+    {
+        var tb = new TextBlock
+        {
+            Text = T("older_more").Replace("{0}", pending.ToString()),
+            FontSize = 11.5, VerticalAlignment = VerticalAlignment.Center
+        };
+        SetRef(tb, TextBlock.ForegroundProperty, "Accent");
+        var btn = new Button
+        {
+            Content = tb, HorizontalContentAlignment = HorizontalAlignment.Left,
+            Padding = new Thickness(16, 6, 6, 8), Margin = new Thickness(0, 4, 0, 4),
+            BorderThickness = new Thickness(0), Background = Brushes.Transparent, Cursor = Cursors.Hand
+        };
+        btn.Click += delegate { LoadOlderPage(); };
+        return btn;
     }
 
     // Muted "+N more" row (ITEM 3c). Clicking expands the section for the session (RefreshConvList).
@@ -3070,7 +3848,7 @@ class ChatWindow : Window
         var newConv = new Conversation();
         new Thread((ThreadStart)delegate
         {
-            try { HttpGet("/new"); _pageConv = newConv; } catch { }
+            try { BridgeCall("/new"); _pageConv = newConv; } catch { }
         }) { IsBackground = true }.Start();
         _conv = newConv;
         _conv.Ts = (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
@@ -3078,13 +3856,15 @@ class ChatWindow : Window
         _messages.Children.Clear();
         _emptyState = null;             // cleared with the children above; rebuild fresh below
         ShowEmptyState();               // fresh chat -> show the empty state again
-        _activeFleetUrl = null; RefreshSteerVisual();
+        _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual();
+        StopFollowingTranscript();      // a brand-new chat has nothing to live-follow
         RefreshConvList();
         _input.Focus();
     }
 
     void OpenConversation(Conversation c)
     {
+        StopFollowingTranscript();      // leaving whatever was open -- its watcher must not linger
         _conv = c;
         // Persist which conversation is open NOW. SaveSettings only ran on theme / language /
         // zoom / sidebar changes, so nothing recorded the active conversation and the restore
@@ -3102,8 +3882,13 @@ class ChatWindow : Window
                         : (!string.IsNullOrEmpty(c.Name) ? NewestTranscriptForWorker(c.Name) : "");
             if (!string.IsNullOrEmpty(tp))
             {
-                var tm = ReadTranscript(tp);
-                AppendSubAgentTranscripts(tm, tp);
+                c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, tp);
+                c.Transcript = FleetConvIdentity.LatestTranscript(c.Transcripts, tp);
+                // The registry keeps only the head of an old row's goal (relay/fleet_retention.py
+                // compaction); the whole text is the transcript's first line, and a follow-up is
+                // addressed by it (ChatSend.DecideFleetSend), so restore it as the row is opened.
+                c.Goal = FleetConvIdentity.MergeForward(c.Goal, TranscriptMetaGoal(c.Transcript));
+                var tm = ReadTranscriptLineage(c.Transcripts);
                 foreach (var mm in tm) c.Messages.Add(mm);
             }
         }
@@ -3135,13 +3920,18 @@ class ChatWindow : Window
             RefreshConvList();
             return;
         }
-        _activeFleetUrl = null; RefreshSteerVisual();   // a normal local conversation is NOT steer mode
+        _activeFleetUrl = null; ShowRunState(null); RefreshSteerVisual();   // a normal local conversation is NOT steer mode
         foreach (var m in c.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+        // Re-arm live-follow for a re-opened fleet conversation whose messages were already
+        // cached in 'c' -- without this, switching away and back would need a poll tick to
+        // resume showing new turns, which is the exact defect this feature exists to remove.
+        // A no-op (and stays stopped) for a plain local chat or a worker no longer live-tracked.
+        MaybeFollowConversation(c, c.Transcript);
         RefreshConvList();
         if (!string.IsNullOrEmpty(c.ConvUrl))
             new Thread((ThreadStart)delegate
             {
-                try { HttpGet("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); _pageConv = c; } catch { }
+                try { BridgeCall("/switch?url=" + Uri.EscapeDataString(c.ConvUrl)); _pageConv = c; } catch { }
             }) { IsBackground = true }.Start();
     }
 
@@ -3179,7 +3969,7 @@ class ChatWindow : Window
             {
                 try
                 {
-                    HttpGet("/forget?url=" + Uri.EscapeDataString(url)
+                    BridgeCall("/forget?url=" + Uri.EscapeDataString(url)
                             + "&sid=" + Uri.EscapeDataString(cid));
                 }
                 catch { }
@@ -3228,7 +4018,7 @@ class ChatWindow : Window
                 if (next < 0) next = 0;
                 OpenConversation(_all[next]);
             }
-            else { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
+            else { StopFollowingTranscript(); _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
         }
         RefreshConvList();
     }
@@ -3421,7 +4211,7 @@ class ChatWindow : Window
             new Thread((ThreadStart)delegate
             {
                 string j = null; string err = null;
-                try { j = HttpGet("/agent_conversations", 120000); }
+                try { j = BridgeCall("/agent_conversations", 120000); }
                 catch (Exception ex) { err = ex.GetType().Name; }
                 var orphans = new List<Conversation>();
                 int n = 0;
@@ -3496,7 +4286,7 @@ class ChatWindow : Window
                         if (_renamingId == c.Id) _renamingId = null;
                         _all.Remove(c);
                         if (!string.IsNullOrEmpty(c.ConvUrl)) deletedUrls.Add(c.ConvUrl);
-                        if (_conv.Id == c.Id) { _conv = new Conversation(); _messages.Children.Clear(); }
+                        if (_conv.Id == c.Id) { StopFollowingTranscript(); _conv = new Conversation(); _messages.Children.Clear(); }
                     }));
                     deleted++;
                     if (!localOnly && !string.IsNullOrEmpty(c.ConvUrl))
@@ -3506,7 +4296,7 @@ class ChatWindow : Window
                         {
                             // a Copilot-side delete (goto + menu ops + GUID-disappearance verify) can take
                             // ~40s; give it 120s so the HTTP call doesn't time out mid-delete.
-                            var j = HttpGet("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""), 120000);
+                            var j = BridgeCall("/delete?url=" + Uri.EscapeDataString(c.ConvUrl) + "&title=" + Uri.EscapeDataString(c.Title ?? ""), 120000);
                             ok = j != null && j.Contains("\"ok\": true");
                             if (!ok) reason = ExtractField(j, "reason") ?? ExtractField(j, "error");
                         }
@@ -3525,7 +4315,7 @@ class ChatWindow : Window
                 {
                     UnregisterConvs(deletedUrls);
                     if (sidebarChanged[0]) SaveSidebarState();   // persist pinned/archived/forcedToday purge once
-                    if (_all.Count == 0) { _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
+                    if (_all.Count == 0) { StopFollowingTranscript(); _conv = new Conversation(); _all.Add(_conv); _messages.Children.Clear(); }
                     RefreshConvList();
                     rebuild[0]();
                     string summary = (_lang == 0)
@@ -3556,6 +4346,8 @@ class ChatWindow : Window
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
                 else if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
                 else if (ln.StartsWith("sidebar_collapsed=")) _sidebarCollapsed = ln.Substring(18).Trim() == "1";
+                else if (ln.StartsWith("sidebar_section_cap=") && int.TryParse(ln.Substring(20).Trim(), out v))
+                    _sectionCap = System.Math.Max(0, System.Math.Min(500, v));
                 else if (ln.StartsWith("last_open_conv=")) _lastOpenId = ln.Substring(15).Trim();
                 else if (ln.StartsWith("ui_scale="))
                 {
@@ -3612,8 +4404,8 @@ class ChatWindow : Window
                     else lines.Add(ln);
                 }
             foreach (var kv in want) if (!seen.Contains(kv.Key)) lines.Add(kv.Key + "=" + kv.Value);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
         }
         catch { }
     }
@@ -3683,7 +4475,7 @@ class ChatWindow : Window
         if (mode == 1) { Toast(T("t_local")); return; }
         if (mode == 2)
         {
-            if (!string.IsNullOrEmpty(url)) new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
+            if (!string.IsNullOrEmpty(url)) new Thread((ThreadStart)delegate { try { BridgeCall("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
             Toast(T("t_open"));
             return;
         }
@@ -3692,14 +4484,14 @@ class ChatWindow : Window
         new Thread((ThreadStart)delegate
         {
             bool ok = false;
-            try { var j = HttpGet("/delete?url=" + Uri.EscapeDataString(url) + "&title=" + Uri.EscapeDataString(title)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
+            try { var j = BridgeCall("/delete?url=" + Uri.EscapeDataString(url) + "&title=" + Uri.EscapeDataString(title)); ok = j != null && j.Contains("\"ok\": true"); } catch { }
             Dispatcher.BeginInvoke(new Action(delegate
             {
                 if (ok) Toast(T("t_auto_ok"));
                 else
                 {
                     Toast(T("t_auto_fail"));
-                    new Thread((ThreadStart)delegate { try { HttpGet("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
+                    new Thread((ThreadStart)delegate { try { BridgeCall("/switch?url=" + Uri.EscapeDataString(url)); } catch { } }) { IsBackground = true }.Start();
                 }
             }));
         }) { IsBackground = true }.Start();
@@ -3753,7 +4545,7 @@ class ChatWindow : Window
         var tb = new TextBox
         {
             Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI Variable, Segoe UI"), FontSize = 14
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily(Theme.UiFont), FontSize = 14
         };
         SetRef(tb, ForegroundProperty, "Fg");
         var bubble = new Border { Child = tb, CornerRadius = new CornerRadius(Theme.RadBubble), Padding = new Thickness(16, 12, 16, 12), Margin = new Thickness(40, 6, 0, 24), HorizontalAlignment = HorizontalAlignment.Right, MaxWidth = 560 };
@@ -3829,11 +4621,11 @@ class ChatWindow : Window
         rtb.IsDocumentEnabled = false;
         rtb.BorderThickness = new Thickness(0);
         rtb.Background = Brushes.Transparent;
-        rtb.Padding = new Thickness(0);
+        rtb.Padding = BODY_PAD;
         rtb.Focusable = true;   // required for text selection to work
         rtb.HorizontalAlignment = HorizontalAlignment.Stretch;
-        rtb.FontFamily = new FontFamily("Segoe UI Variable, Segoe UI");
-        rtb.FontSize = 14;
+        rtb.FontFamily = BODY_FACE;
+        rtb.FontSize = BODY_SIZE;
         // Disable scrollbars so the RichTextBox auto-sizes to its content height
         // instead of clipping to a fixed viewport.
         ScrollViewer.SetVerticalScrollBarVisibility(rtb, ScrollBarVisibility.Disabled);
@@ -3849,7 +4641,7 @@ class ChatWindow : Window
         var doc = new FlowDocument();
         doc.PagePadding = new Thickness(0);
         doc.FontFamily = rtb.FontFamily;
-        doc.FontSize = 14;
+        doc.FontSize = BODY_SIZE;
         // Ensure the document foreground picks up the theme color.
         // FlowDocument is DependencyObject but not FrameworkElement, so call
         // SetResourceReference directly rather than through the SetRef helper.
@@ -3857,6 +4649,97 @@ class ChatWindow : Window
 
         string plain = PlainText(text);
 
+        // A LONG ANSWER OPENS SHORT, ONCE.
+        //
+        // MEASURED BEFORE BUILDING ANYTHING, because the obvious design was the wrong one. An
+        // external review recommended folding long TOOL OUTPUT; on this machine's transcripts
+        // that is not where the length is. 138 assistant turns with text: median 280 characters,
+        // p90 1,130, max 2,282, and only 8% mention a tool call at all. Folding tool output would
+        // have been machinery aimed at a case that barely occurs, while the 14% of turns over a
+        // thousand characters -- ordinary prose -- kept pushing everything else off the screen.
+        //
+        // So the threshold is the measurement: above ASSISTANT_FOLD_CHARS the body opens clipped
+        // with a line saying how much is hidden, and one click shows all of it.
+        //
+        // THREE RULES FROM THE REVIEW, each of which is a way this goes wrong:
+        //   * the summary is an ENTRANCE to the original, never a replacement -- so the fold is
+        //     the same text, clipped, and never a paraphrase;
+        //   * nothing the reader has opened is ever folded again -- a panel that re-folds while
+        //     being read is worse than one that never folded;
+        //   * folding happens on first render only, which is why it is here and not in the
+        //     refresh path.
+        bool folds = plain.Length > ASSISTANT_FOLD_CHARS;
+        string full = plain;
+        if (folds) plain = plain.Substring(0, ASSISTANT_FOLD_CHARS);
+
+        FillFlowDocument(doc, plain);
+
+        rtb.Document = doc;
+        content.Children.Add(rtb);
+
+        if (folds)
+        {
+            // SAYS HOW MUCH IS HIDDEN, not just that something is. "続きを表示" alone leaves the
+            // reader guessing whether it is a line or a page -- which is the question they are
+            // trying to answer before clicking.
+            int hidden = full.Length - ASSISTANT_FOLD_CHARS;
+            var more = new TextBlock
+            {
+                Text = _lang == 0 ? ("続きを表示（あと " + hidden + " 字）")
+                                  : ("Show the rest (" + hidden + " more characters)"),
+                FontSize = 12,
+                Cursor = Cursors.Hand,
+                Margin = new Thickness(2, 6, 0, 0),
+            };
+            SetRef(more, TextBlock.ForegroundProperty, "Accent");
+            var rtbRef = rtb;
+            var moreRef = more;
+            string fullRef = full;
+            more.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                // ONE WAY ONLY. There is no "fold again": the reader asked for the text, and a
+                // control that takes it back is the panel changing under them, which is the
+                // whole family of defect this file has been working through.
+                rtbRef.Document = BuildFlowDocument(fullRef, rtbRef.FontFamily);
+                moreRef.Visibility = Visibility.Collapsed;
+            };
+            content.Children.Add(more);
+        }
+    }
+
+    //: Above this many characters an assistant answer opens clipped, with a line saying how
+    //: much is hidden and one click to show all of it.
+    //:
+    //: FROM THE MEASUREMENT, not from a guess. 138 assistant turns on this machine: median 280
+    //: characters, p90 1,130, max 2,282. A threshold at the p90 leaves the 86 percent that were
+    //: already short untouched and catches the 14 percent that were burying everything under
+    //: them. Set it much lower and every answer grows a control nobody needs.
+    const int ASSISTANT_FOLD_CHARS = 1100;
+
+    static string PlainText(string md)
+    {
+        if (md == null) return "";
+        var sb = new StringBuilder();
+        string[] lines = md.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
+        foreach (var raw in lines)
+        {
+            string ln = raw;
+            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
+            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1);   // heading -> plain
+            ln = ln.Replace("**", "").Replace("`", "");                              // drop bold/code markers
+            sb.Append(ln).Append('\n');
+        }
+        return sb.ToString().TrimEnd('\n');
+    }
+
+
+    // The paragraph layout for an assistant answer, as a function so the folded body and the
+    // full body are built the same way. It was inline, which is why unfolding had no way to
+    // re-render without duplicating it -- and a second copy of a layout is a second place for it
+    // to drift.
+    static void FillFlowDocument(FlowDocument doc, string plain)
+    {
         // Split on runs of 2+ newlines to identify paragraph boundaries.
         // We do this manually without Regex (C# 5 compatible, no extra imports).
         var paragraphBlocks = new List<string>();
@@ -3910,32 +4793,42 @@ class ChatWindow : Window
             }
         }
 
-        rtb.Document = doc;
-        content.Children.Add(rtb);
     }
 
-    static string PlainText(string md)
+    // A document for `plain` with the same layout, used when a folded answer is opened.
+    static FlowDocument BuildFlowDocument(string plain, FontFamily family)
     {
-        if (md == null) return "";
-        var sb = new StringBuilder();
-        string[] lines = md.Replace("\r\n", "\n").Replace("\r", "\n").Split('\n');
-        foreach (var raw in lines)
-        {
-            string ln = raw;
-            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
-            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1);   // heading -> plain
-            ln = ln.Replace("**", "").Replace("`", "");                              // drop bold/code markers
-            sb.Append(ln).Append('\n');
-        }
-        return sb.ToString().TrimEnd('\n');
+        var d = new FlowDocument { PagePadding = new Thickness(0), FontFamily = family, FontSize = BODY_SIZE };
+        d.SetResourceReference(FlowDocument.ForegroundProperty, "Fg");
+        FillFlowDocument(d, plain);
+        return d;
     }
+
+    //: THE TWO RENDERINGS OF ONE ANSWER MUST MEASURE THE SAME.
+    //
+    // A streaming answer is a plain TextBox (MakeText); the settled one is a RichTextBox over a
+    // FlowDocument (RenderAssistantBody), because TextBlock cannot be selected and TextBox has
+    // no line height. That swap is fine as long as the two agree on everything that decides
+    // where a line breaks -- and they did not. The streaming box asked for "Segoe UI" and the
+    // settled one for "Segoe UI Variable, Segoe UI", which are different faces with different
+    // advance widths, and the streaming box carried 2px of left padding the settled one did
+    // not. So at the moment an answer finished, every line re-wrapped.
+    //
+    // An external review of this window named exactly this and said to treat it as a READING
+    // POSITION problem rather than a cosmetic one: the reader is mid-sentence when the text
+    // moves under them. These constants exist so the two paths cannot drift apart again, and
+    // `test_an_answer_does_not_rewrap_when_it_settles` asserts both use them.
+    static readonly FontFamily BODY_FACE = new FontFamily(Theme.UiFont);
+    const double BODY_SIZE = 14;
+    static readonly Thickness BODY_PAD = new Thickness(0);
 
     TextBox MakeText(string text)
     {
         var tb = new TextBox
         {
             Text = text, IsReadOnly = true, BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-            TextWrapping = TextWrapping.Wrap, IsTabStop = false, FontFamily = new FontFamily("Segoe UI"), FontSize = 14, Padding = new Thickness(2, 0, 0, 0)
+            TextWrapping = TextWrapping.Wrap, IsTabStop = false,
+            FontFamily = BODY_FACE, FontSize = BODY_SIZE, Padding = BODY_PAD
         };
         SetRef(tb, ForegroundProperty, "Fg");
         return tb;
@@ -3967,130 +4860,91 @@ class ChatWindow : Window
     }
 
     // ── send / stream ───────────────────────────────────────────────────────────
-    void DoSend()
+    //
+    // THE DECISIONS AND THEIR ORDER LIVE IN ChatSend.cs, where a test runs them. What is left
+    // here is the window's half: the real effects behind IChatSendEffects (below). DoSend is
+    // what Enter and the Send button reach; SendText is also what the router bar's buttons call.
+    // Untested by execution: the WPF event reaching DoSend, and the effects' real bodies.
+    void DoSend() { ChatSend.DoSend(this); }
+
+    void SendText(string text) { ChatSend.SendText(this, text); }
+
+    // ── IChatSendEffects: the real effects of a send ─────────────────────────────
+    string IChatSendEffects.InputText() { return _input.Text; }
+    bool IChatSendEffects.SendEnabled() { return _send.IsEnabled; }
+    Conversation IChatSendEffects.CurrentConversation() { return _conv; }
+    Conversation IChatSendEffects.PageConversation() { return _pageConv; }
+    List<Conversation> IChatSendEffects.AllConversations() { return _all; }
+    bool IChatSendEffects.BridgeReachable() { return _bridgeReachable; }
+    bool IChatSendEffects.RouterShown() { return _routerShown; }
+    int IChatSendEffects.Lang() { return _lang; }
+    string IChatSendEffects.T(string key) { return T(key); }
+    string IChatSendEffects.CommandHelpText() { return CommandHelpText(); }
+
+    // .fleet/status.json beside the exe's parent -- the same path the fleet writes and the
+    // cockpit reads. Null when there is none; throws when it cannot be read.
+    string IChatSendEffects.ReadFleetStatus()
     {
-        var text = _input.Text.Trim();
-        if (text.Length == 0 || !_send.IsEnabled) return;
-        if (text.Equals("/help", StringComparison.OrdinalIgnoreCase))
-        {
-            _input.Clear();
-            AddUser(text);
-            AddAssistant(CommandHelpText());
-            return;
-        }
-
-        // #4: new-chat fallback -- nothing to send into yet, so start a fresh conversation first
-        // (also seeds _pageConv once /new succeeds).
-        if (_conv == null) NewChat();
-
-        // #4: bridge-reachability fallback -- re-probe once synchronously before refusing the send,
-        // since _bridgeReachable is only updated by the low-cadence background probe and may be stale.
-        if (!_bridgeReachable)
-        {
-            bool ok;
-            try { HttpGet("/conv", 5000); ok = true; } catch { ok = false; }
-            _bridgeReachable = ok;
-            if (!ok)
-            {
-                SetDot("offline");
-                AddAssistant(T("send_offline"));
-                _input.Text = text;   // put the trimmed text back so it isn't lost
-                _input.CaretIndex = _input.Text.Length;
-                // One-click recovery: bring the whole stack (bridge + relay) back up instead of
-                // leaving the user to go find a terminal. Idempotent -- safe even if some of the
-                // stack is already running.
-                ShowRecoveryBanner(T("send_offline"), T("retry_start_stack"), delegate
-                {
-                    HideBanner();
-                    try { System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo(Path.Combine(RepoRoot(), "start_all.bat")) { UseShellExecute = true }); }
-                    catch { }
-                });
-                return;
-            }
-            RefreshIdleDot();
-        }
-
-        // #3: while a fleet is at capacity, a native send would open a 4th heavy tab
-        // and blow the memory budget -> route it into the fleet queue instead. Prefix
-        // "!" forces priority (jumps the queue). Slash-commands are never rerouted.
-        int[] fs = FleetState();
-        if (fs[0] == 1 && fs[2] > 0 && fs[1] >= fs[2] && !text.StartsWith("/"))
-        {
-            bool force = text.StartsWith("!");
-            string body = force ? text.Substring(1).Trim() : text;
-            if (body.Length == 0) return;
-            _input.Clear(); HideRouter();
-            EnqueueToFleet(body, force);
-            AddUser(text);
-            AddAssistant(force ? T("fleet_forced") : T("fleet_queued"));
-            return;
-        }
-
-        // #2: research-intent auto-router -- propose the researcher (confirm, not auto,
-        // to avoid false positives), the way Claude Code surfaces a tool.
-        if (!text.StartsWith("/") && !_routerShown && DetectResearch(text))
-        {
-            ShowRouter(text);
-            return;
-        }
-        HideRouter();
-        _input.Clear();
-        SendText(text);
+        return ChatSend.ReadStatusFile(Path.Combine(FleetStateDir(), "status.json"));
     }
 
-    void SendText(string text)
+    void IChatSendEffects.ClearInput() { _input.Clear(); }
+    void IChatSendEffects.RestoreInput(string text)
     {
-        // Snapshot the conversation this send targets ONCE, up front. Everything below (and
-        // everything in Stream) must operate on `target`, never re-read the shared `_conv` field --
-        // a fleet-card open landing mid-send must not be able to redirect this reply elsewhere.
-        Conversation target = _conv;
+        _input.Text = text;
+        _input.CaretIndex = _input.Text.Length;
+    }
+    void IChatSendEffects.AddUser(string text) { AddUser(text); PersistSentTurn(); }
+    void IChatSendEffects.AddAssistant(string text) { AddAssistant(text); }
+    void IChatSendEffects.NewChat() { NewChat(); }
+    // The interface keeps its historical name (the send-path oracle records "HttpGet|..."); it is
+    // an authenticated POST now, like every other bridge call from this window.
+    string IChatSendEffects.HttpGet(string path, int timeoutMs) { return BridgeCall(path, timeoutMs); }
+    void IChatSendEffects.SetBridgeReachable(bool ok) { _bridgeReachable = ok; }
+    void IChatSendEffects.SetDot(string state) { SetDot(state); }
+    void IChatSendEffects.RefreshIdleDot() { RefreshIdleDot(); }
+    void IChatSendEffects.HideRouter() { HideRouter(); }
+    void IChatSendEffects.ShowRouter(string text) { ShowRouter(text); }
+    bool IChatSendEffects.AppendCommand(string key, object item) { return AppendCommand(key, item); }
+    void IChatSendEffects.SetPageConversation(Conversation c) { _pageConv = c; }
+    void IChatSendEffects.MarkSendInFlight() { _sendInFlight = true; }
+    void IChatSendEffects.RefreshConvList() { RefreshConvList(); }
+    void IChatSendEffects.StickToEnd() { StickToEnd(); }
 
-        // ── page pinning: make sure the bridge page actually shows `target` before we send ──
-        if (!ReferenceEquals(target, _pageConv))
+    // The send was refused because the bridge is down. One-click recovery: bring the whole
+    // stack (bridge + relay) back up instead of leaving the user to go find a terminal.
+    // Idempotent -- safe even if some of the stack is already running.
+    void IChatSendEffects.ShowStartStackBanner(string message, string buttonLabel)
+    {
+        ShowRecoveryBanner(message, buttonLabel, delegate
         {
-            if (!string.IsNullOrEmpty(target.ConvUrl))
+            HideBanner();
+            // wscript + the VBS, NOT start_all.bat, AND NOT UseShellExecute. This
+            // process is WPF and has no console of its own, so shell-executing a .bat
+            // makes Windows give cmd.exe a brand new one -- a black window on the
+            // operator's desktop, which is the single thing start_all.bat's own header
+            // says it was rewritten to stop ("No console lingers"). The bat's entire
+            // body is this same wscript line, so calling it directly loses nothing.
+            // FleetCockpit.RunStartAll already does exactly this; this site was the
+            // one copy that did not.
+            try
             {
-                try { HttpGet("/switch?url=" + Uri.EscapeDataString(target.ConvUrl), 15000); _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
+                var psi = new System.Diagnostics.ProcessStartInfo();
+                psi.FileName = "wscript.exe";
+                psi.Arguments = "\"" + Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs") + "\"";
+                psi.WorkingDirectory = RepoRoot();
+                psi.UseShellExecute = false;
+                psi.CreateNoWindow = true;
+                System.Diagnostics.Process.Start(psi);
             }
-            else if (target.Source == "chat" && !string.IsNullOrEmpty(target.Name))
-            {
-                // A CONVERSATION WITH NO URL IS NOT AUTOMATICALLY UNREACHABLE. One captured
-                // over the socket is stored as "sess:<guid>", which is not something you
-                // can navigate to, so it registers with url="" and /switch has nothing to
-                // take. It does carry its sid, right here in Name, and /resume takes a sid
-                // and knows both stored shapes -- clicking the sidebar row for a sessref,
-                // navigating for a real URL.
-                //
-                // Without this, every conversation the socket captured fell through to the
-                // refusal below: visible in the list, impossible to continue. And the socket
-                // is now the ordinary path, so that was most of them.
-                //
-                // Gated on Source, because Name means two different things: the sid for a
-                // chat row, and the worker name (w0, w1) for a fleet row. Resuming a fleet
-                // row by "w0" would ask the store for a session that does not exist.
-                try { HttpGet("/resume?sid=" + Uri.EscapeDataString(target.Name), 20000);
-                      _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
-            }
-            else if (target.Messages.Count == 0)
-            {
-                try { HttpGet("/new", 15000); _pageConv = target; }
-                catch { AddAssistant(T("send_wrong_page")); return; }
-            }
-            else
-            {
-                AddAssistant(T("send_unknown_conv"));
-                return;
-            }
-        }
+            catch { }
+        });
+    }
 
-        _sendInFlight = true;
-        target.Messages.Add(new Msg("U", text));
-        if (target.Untitled()) { target.Title = TrimTitle(text, 40); }   // ITEM 3a: first line, max 40 + ellipsis
-        if (!_all.Contains(target)) { _all.Insert(0, target); }
-        RefreshConvList();
-        AddUser(text);
+    // The window's half of a send that is going ahead: the assistant block with the typing
+    // dots, the Stop button, the busy dot, and the Stream thread for `target`.
+    void IChatSendEffects.BeginStream(string text, Conversation target)
+    {
         StackPanel outer;
         _pendingContent = AddAssistantContainer(out outer);
         _pendingOuter = outer;
@@ -4103,59 +4957,34 @@ class ChatWindow : Window
         ClearChips();   // the attached file(s) go with this message; reset the chip row
     }
 
-    // ── #3 fleet-aware routing ───────────────────────────────────────────────────
-    // returns [running(0/1), openTabs, maxConcurrent]
-    int[] FleetState()
+    // ── the fleet command channel ────────────────────────────────────────────────
+    // Send ONE command ({key: [item]}) to the running fleet, as a file of its own.
+    //
+    // This used to read all of .fleet/commands.json, append to `key` and write the file back --
+    // and so did EnqueueToFleet (now the capacity branch of ChatSend.DoSend), and so did
+    // FleetCockpit.cs's ReadCommands/WriteCommands.
+    // FleetCockpit.exe and CopilotChat.exe are SEPARATELY BUILT PROCESSES (ui/rebuild_ui.ps1),
+    // so no amount of care inside one of them could order the other: whichever wrote second
+    // deleted the other's queued command, and a lost add_goal/steer looks exactly like one that
+    // was never sent. FleetCommands.Write drops each command into .fleet/commands.d/ under a
+    // unique name instead, which removes the read-modify-write rather than trying to guard it.
+    // See ui/FleetCommands.cs.
+    bool AppendCommand(string key, object item)
     {
-        try
-        {
-            string sp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "status.json"));
-            if (!File.Exists(sp)) return new int[] { 0, 0, 0 };
-            string txt;
-            using (var fsr = new FileStream(sp, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fsr, Encoding.UTF8)) txt = sr.ReadToEnd();
-            var d = _cjs.DeserializeObject(txt) as Dictionary<string, object>;
-            if (d == null) return new int[] { 0, 0, 0 };
-            bool running = d.ContainsKey("running") && Convert.ToBoolean(d["running"]);
-            bool idle = d.ContainsKey("idle") && Convert.ToBoolean(d["idle"]);
-            int open = d.ContainsKey("open_tabs") && d["open_tabs"] != null ? Convert.ToInt32(d["open_tabs"]) : 0;
-            int maxc = d.ContainsKey("max_concurrent") && d["max_concurrent"] != null ? Convert.ToInt32(d["max_concurrent"]) : 0;
-            return new int[] { (running && !idle) ? 1 : 0, open, maxc };
-        }
-        catch { return new int[] { 0, 0, 0 }; }
+        var items = new List<object>();
+        items.Add(item);
+        var patch = new Dictionary<string, object>();
+        patch[key] = items;
+        return FleetCommands.Write(FleetStateDir(), patch);
     }
 
-    void EnqueueToFleet(string text, bool priority)
+    // The .fleet state dir, beside the exe's parent. The command channel lives under it.
+    static string FleetStateDir()
     {
-        try
-        {
-            string cp = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet", "commands.json"));
-            var cmd = new Dictionary<string, object>();
-            if (File.Exists(cp))
-            {
-                try { var ex = _cjs.DeserializeObject(File.ReadAllText(cp, Encoding.UTF8)) as Dictionary<string, object>; if (ex != null) cmd = ex; } catch { }
-            }
-            var adds = new List<object>();
-            if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[]) foreach (var o in (object[])cmd["add_goal"]) adds.Add(o);
-            var item = new Dictionary<string, object>(); item["text"] = text; item["priority"] = priority;
-            adds.Add(item);
-            cmd["add_goal"] = adds;
-            File.WriteAllText(cp, _cjs.Serialize(cmd), Encoding.UTF8);
-        }
-        catch { }
+        return Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "..", ".fleet"));
     }
 
-    // ── #2 research-intent detection + confirm bar ───────────────────────────────
-    static readonly string[] _researchHints = {
-        "調査", "調べて", "深掘り", "リサーチ", "最新情報", "出典", "比較して", "下調べ",
-        "research", "investigate", "look up", "deep dive", "find out", "compare "
-    };
-    bool DetectResearch(string msg)
-    {
-        string m = msg.ToLower();
-        foreach (var h in _researchHints) if (m.Contains(h.ToLower())) return true;
-        return false;
-    }
+    // ── #2 research-intent confirm bar (the detection is ChatSend.DetectResearch) ──
 
     Border _routerBar; bool _routerShown; string _routerText = "";
     Button _routerResearch, _routerNormal; TextBlock _routerLbl;
@@ -4219,7 +5048,7 @@ class ChatWindow : Window
         {
             var img = Clipboard.GetImage();
             if (img == null) return;
-            string path = Path.Combine(Path.GetTempPath(), "copilot_paste_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".png");
+            string path = Path.Combine(ChatTempHome.Dir(), "copilot_paste_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".png");
             using (var fs = new FileStream(path, FileMode.Create))
             {
                 var enc = new PngBitmapEncoder();
@@ -4237,7 +5066,7 @@ class ChatWindow : Window
         new Thread((ThreadStart)delegate
         {
             string r = null;
-            try { r = HttpGet("/upload?path=" + Uri.EscapeDataString(path)); } catch { }
+            try { r = BridgeCall("/upload?path=" + Uri.EscapeDataString(path)); } catch { }
             bool ok = r != null && r.Contains("\"ok\": true");
             Dispatcher.BeginInvoke(new Action(delegate
             {
@@ -4272,19 +5101,26 @@ class ChatWindow : Window
         var content = _pendingContent;
         var outer = _pendingOuter;
         string errMsg = null;
+        string persistErr = null;      // the bridge's `persist_error`: this turn is NOT in its session store
+        bool persistAcked = false;     // the bridge's `persist`: it is
         try
         {
-            var url = _bridge + "/stream?msg=" + Uri.EscapeDataString(msg);
-            var req = (HttpWebRequest)WebRequest.Create(url);
             // /review and /security-review run a full-repo fleet pass that can exceed the
             // default 10-minute cap -- give those two commands a 60-minute window instead.
             string msgTrim = (msg ?? "").TrimStart();
             bool isLongReview = msgTrim.StartsWith("/review", StringComparison.OrdinalIgnoreCase)
                 || msgTrim.StartsWith("/security-review", StringComparison.OrdinalIgnoreCase);
             int reqTimeoutMs = isLongReview ? 3600000 : 600000;
-            req.Timeout = reqTimeoutMs; req.ReadWriteTimeout = reqTimeoutMs;
-            _activeReq = req;
-            using (var resp = (HttpWebResponse)req.GetResponse())
+            // An authenticated POST (ui/BridgeClient.cs). Every request it makes is kept in
+            // _activeReq as it is made, so Stop can Abort() whichever one is in flight.
+            HttpWebResponse opened;
+            try
+            {
+                opened = BridgeClient.Open(_bridge, "/stream?msg=" + Uri.EscapeDataString(msg), reqTimeoutMs,
+                                           delegate(HttpWebRequest r) { _activeReq = r; });
+            }
+            catch (BridgeClientException bex) { NoteBridgeProblem(bex); throw; }
+            using (var resp = opened)
             using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
             {
                 string line; bool done = false;
@@ -4309,6 +5145,9 @@ class ChatWindow : Window
                                 _pendingText.AppendText(d); StickToEnd();
                             }));
                         }
+                        var pe = ExtractField(jsonData, "persist_error");
+                        if (!string.IsNullOrEmpty(pe)) persistErr = pe;
+                        else if (ExtractField(jsonData, "persist") == "ok") persistAcked = true;
                         var rep = ExtractField(jsonData, "replace");
                         if (!string.IsNullOrEmpty(rep))
                         {
@@ -4351,6 +5190,14 @@ class ChatWindow : Window
             // currently shown -- these run unconditionally, keyed on `target`, never on `_conv`.
             target.Messages.Add(new Msg("A", answer));
             SaveConversation(target);
+            // The bridge keeps its own copy of every chat turn; when it says it could not, the
+            // person is told here. An answer that arrives with neither word is logged, not shown:
+            // slash commands that never reach the session store look exactly like that.
+            if (persistErr != null) NoteNotSaved(target, "bridge: " + persistErr);
+            else if (answer.Length > 0 && !persistAcked)
+            {
+                try { File.AppendAllText(Path.Combine(StoreDir, "chat_save_errors.log"), DateTime.Now.ToString("s") + "\t" + target.Id + "\tbridge sent no persist word\n", new UTF8Encoding(false)); } catch (Exception) { }
+            }
             // ── status dot outcome (reflects the VISIBLE conversation only) ──────────────
             if (!visible) return;
             if (errFinal != null)
@@ -4378,7 +5225,7 @@ class ChatWindow : Window
         }));
         try
         {
-            var j = HttpGet("/conv");
+            var j = BridgeCall("/conv");
             var u = ExtractField(j, "url");
             if (!string.IsNullOrEmpty(u))
             {
@@ -4394,7 +5241,43 @@ class ChatWindow : Window
     static string B64(string s) { return Convert.ToBase64String(Encoding.UTF8.GetBytes(s == null ? "" : s)); }
     static string UnB64(string s) { try { return Encoding.UTF8.GetString(Convert.FromBase64String(s)); } catch { return ""; } }
 
-    void SaveConversation(Conversation c)
+    // THE SAVE THAT TELLS YOU WHEN IT DID NOT SAVE. This was `catch { }`: a full disk, a locked or
+    // read-only folder, or a path that could not be created lost the conversation and said
+    // nothing, so a chat could be on screen and nowhere else. A failure is now counted, written to
+    // chat_save_errors.log beside the chats, and shown once per reason as a line in the chat.
+    int _chatUserTurnsSent;      // user lines sent from this window in this process
+    int _chatSaveFailures;       // saves (file or bridge store) that did not land
+    string _lastNotSavedReason = "";
+
+    void NoteNotSaved(Conversation c, string reason)
+    {
+        _chatSaveFailures++;
+        try
+        {
+            Directory.CreateDirectory(StoreDir);
+            File.AppendAllText(Path.Combine(StoreDir, "chat_save_errors.log"),
+                DateTime.Now.ToString("s") + "\t" + (c == null ? "" : c.Id) + "\t" + (reason ?? "") + "\tsent=" + _chatUserTurnsSent + " failures=" + _chatSaveFailures + "\n",
+                new UTF8Encoding(false));
+        }
+        catch (Exception) { /* the log is the second place; the notice below is the first */ }
+        if (reason == _lastNotSavedReason) return;     // once per reason, not once per send
+        _lastNotSavedReason = reason;
+        Action show = delegate { if (c == null || ReferenceEquals(c, _conv)) AddAssistant(T("not_saved") + reason); };
+        if (Dispatcher.CheckAccess()) show(); else Dispatcher.BeginInvoke(show);
+    }
+
+    // The user's line is kept the moment it is sent, not when (if) the answer comes back. A fleet
+    // conversation has no .chat file of its own: its durable record is the command file the fleet
+    // consumes, whose write failure ChatSend already reports (fleet_send_failed).
+    void PersistSentTurn()
+    {
+        _chatUserTurnsSent++;
+        var c = _conv;
+        if (c == null || c.Source == "fleet" || c.Messages.Count == 0) return;
+        SaveConversation(c);
+    }
+
+    bool SaveConversation(Conversation c)
     {
         try
         {
@@ -4405,9 +5288,15 @@ class ChatWindow : Window
             sb.Append("CONV\t").Append(c.ConvUrl == null ? "" : c.ConvUrl).Append('\n');
             sb.Append("TITLE\t").Append(B64(c.Title)).Append('\n');
             foreach (var m in c.Messages) sb.Append(m.Role).Append('\t').Append(B64(m.Text)).Append('\n');
-            File.WriteAllText(Path_(c.Id), sb.ToString(), Encoding.UTF8);
+            File.WriteAllText(Path_(c.Id), sb.ToString(), new UTF8Encoding(false));
+            _lastNotSavedReason = "";      // a good save re-arms the notice for the next failure
+            return true;
         }
-        catch { }
+        catch (Exception ex)
+        {
+            NoteNotSaved(c, ex.GetType().Name + ": " + ex.Message);
+            return false;
+        }
     }
 
     void LoadConversations()
@@ -4425,7 +5314,7 @@ class ChatWindow : Window
                     // stamp last-activity from the file mtime so the sidebar can sort by RECENCY
                     // (newest first) rather than alphabetically. Fleet/registry convs already carry Ts.
                     try { c.Ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
-                    catch { c.Ts = 0; }
+                    catch (Exception ex) { c.Ts = 0; NoteTranscriptLineFailure(f, ex); }
                     foreach (var ln in File.ReadAllLines(f, Encoding.UTF8))
                     {
                         var tab = ln.IndexOf('\t'); if (tab < 0) continue;
@@ -4438,7 +5327,11 @@ class ChatWindow : Window
                 }
             }
         }
-        catch { }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "saved chats not readable: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
         DiscoverTranscripts();   // surface every fleet worker's disk transcript as a past chat
         // Restore what was open last time. _all[0] is just the first record read off disk --
         // neither the newest nor the one being worked on -- so startup used to reopen whatever
@@ -4455,6 +5348,10 @@ class ChatWindow : Window
             }
             _conv = want;
             foreach (var m in _conv.Messages) { if (m.Role == "U") AddUser(m.Text); else AddAssistant(m.Text); }
+            // Resume live-follow for whatever was open at last exit, if it is still a
+            // live-tracked fleet worker -- otherwise the operator would have to touch the
+            // sidebar once just to re-arm updates for the conversation already on screen.
+            MaybeFollowConversation(_conv, _conv.Transcript);
         }
         else { _conv = new Conversation(); _all.Add(_conv); }
         ShowEmptyState();        // no-op if the active conversation rendered any real message
@@ -4466,57 +5363,159 @@ class ChatWindow : Window
     // conversation whose agent the bridge is not on -> not one past chat was retrievable. Newest
     // first, capped so a huge dir doesn't flood the list; dedup by transcript path; sub-agent
     // (research) child transcripts are skipped (they nest under their parent on open).
+    //
+    // PAGED, NOT CAPPED (2026-10-05). The scan used to stop at the newest 80 and never run again,
+    // so 3,229 of 3,309 transcripts on disk were not in the sidebar at all. The directory is now
+    // indexed once (names and mtimes only: no file is opened) and the sidebar takes it a page at
+    // a time: the newest ConvListing.FirstPage at startup, then one local day per "older" click
+    // (LoadOlderPage). Opening a row still reads the local transcript first.
+    List<KeyValuePair<string, DateTime>> _transcriptIndex;
+    int _transcriptPos;
+
+    int TranscriptsPending()
+    {
+        return _transcriptIndex == null ? 0 : Math.Max(0, _transcriptIndex.Count - _transcriptPos);
+    }
+
     void DiscoverTranscripts()
     {
         try
         {
             string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
             if (!Directory.Exists(tdir)) return;
-            var files = new List<string>(Directory.GetFiles(tdir, "*.jsonl"));
-            files.Sort(delegate (string a, string b) { return File.GetLastWriteTimeUtc(b).CompareTo(File.GetLastWriteTimeUtc(a)); });
-            int budget = 80;
-            foreach (var f in files)
-            {
-                if (budget-- <= 0) break;
-                if (f.IndexOf("__sub_", StringComparison.Ordinal) >= 0) continue;   // research children
-                bool exists = false;
-                foreach (var c in _all) if (c.Transcript == f) { exists = true; break; }
-                if (exists) continue;
-                string goal = "", name = "";
-                try
-                {
-                    using (var sr = new StreamReader(f, Encoding.UTF8))
-                    {
-                        string first = sr.ReadLine();
-                        if (!string.IsNullOrEmpty(first))
-                        {
-                            var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
-                            if (meta != null) { goal = SS(meta, "goal"); name = SS(meta, "name"); }
-                        }
-                    }
-                }
-                catch { }
-                string title = goal.Length > 0 ? (goal.Length > 54 ? goal.Substring(0, 54) + "…" : goal)
-                                               : Path.GetFileNameWithoutExtension(f);
-                double ts = 0;
-                try { ts = (File.GetLastWriteTimeUtc(f) - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
-                catch { }
-                _all.Add(new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet", Ts = ts });
-            }
+            // Merged glob: relay/fleet_retention.py gzips anything older than
+            // COMPRESS_AFTER_HOURS and deletes the plain file, so "*.jsonl" alone only ever
+            // shows the last few hours. See ConvListing.ListTranscriptFiles for the dedupe rule.
+            _transcriptIndex = ConvListing.ListMainTranscripts(tdir);
+            _transcriptPos = 0;
+            LoadTranscriptPage();
         }
-        catch { }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "transcript scan failed: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
     }
 
-    string HttpGet(string path) { return HttpGet(path, 60000); }
-
-    string HttpGet(string path, int timeoutMs)
+    // The "older" row's action: add the next page (one day) of transcripts to the sidebar and
+    // open the Archived section so they are visible. A page whose rows were all already listed
+    // (through the registry) is skipped over rather than reported as empty.
+    void LoadOlderPage()
     {
-        var req = (HttpWebRequest)WebRequest.Create(_bridge + path);
-        req.Timeout = timeoutMs;
-        req.ReadWriteTimeout = timeoutMs;
-        using (var resp = (HttpWebResponse)req.GetResponse())
-        using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
-            return sr.ReadToEnd();
+        int added = 0;
+        try
+        {
+            while (added == 0 && TranscriptsPending() > 0) added = LoadTranscriptPage();
+        }
+        catch (Exception ex)
+        {
+            ConvListing.Diag(Path.GetDirectoryName(_convsPath), "older page failed: " + ex);
+            _historyNotice = ConvListing.UnreadableNotice(_lang == 0, ex.Message);
+        }
+        _sectionCollapsed["archived"] = false;
+        _sectionExpanded.Add("archived");
+        RefreshConvList();
+    }
+
+    // Adds the next page of the transcript index to _all; returns how many rows it added.
+    int LoadTranscriptPage()
+    {
+        if (_transcriptIndex == null) return 0;
+        int end = ConvListing.PageEnd(_transcriptIndex, _transcriptPos, ConvListing.MaxPage);
+        var known = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+        foreach (var c in _all)
+        {
+            if (!string.IsNullOrEmpty(c.Transcript)) known.Add(StripGz(c.Transcript));
+            foreach (string tx in c.Transcripts)
+                if (!string.IsNullOrEmpty(tx)) known.Add(StripGz(tx));
+        }
+        int added = 0;
+        for (int i = _transcriptPos; i < end; i++)
+        {
+            string f = _transcriptIndex[i].Key;
+            if (known.Contains(StripGz(f))) continue;
+            string goal = "", name = "", guid = "";
+            try
+            {
+                using (var sr = OpenTranscriptReader(f))
+                {
+                    string first = sr.ReadLine();
+                    if (!string.IsNullOrEmpty(first))
+                    {
+                        var meta = _cjs.DeserializeObject(first) as Dictionary<string, object>;
+                        if (meta != null) { goal = SS(meta, "goal"); name = SS(meta, "name"); }
+                    }
+                    // THE CONVERSATION'S OWN IDENTITY, written by _tx.note_guid on the
+                    // first poll after the worker's first turn. Without it ConvUrl stays
+                    // empty and _activeFleetUrl never arms, so neither steer mode nor the
+                    // live snapshot refresh can recognise the open conversation.
+                    // Bounded: the guid line lands within the first turn or not at all,
+                    // and this runs for up to a page of transcripts.
+                    for (int li = 0; li < 40 && guid.Length == 0; li++)
+                    {
+                        string ln2 = sr.ReadLine();
+                        if (ln2 == null) break;
+                        if (ln2.IndexOf("\"guid\"", StringComparison.Ordinal) < 0) continue;
+                        var gd = _cjs.DeserializeObject(ln2) as Dictionary<string, object>;
+                        if (gd != null) guid = SS(gd, "guid");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                // The row is still listed (by file name) and still opens; only its title and
+                // identity are missing. Logged, because a file that cannot be read here is
+                // usually one that cannot be opened either.
+                NoteTranscriptLineFailure(f, ex);
+            }
+            string title = goal.Length > 0 ? (goal.Length > 54 ? goal.Substring(0, 54) + "…" : goal)
+                                           : Path.GetFileNameWithoutExtension(StripGz(f));
+            double ts = (_transcriptIndex[i].Value - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds;
+            var discovered = new Conversation { Transcript = f, Name = name, Title = title, Source = "fleet",
+                                        Ts = ts, Goal = goal,
+                                        // "sess:<guid>" -- the bridge's own shape for a
+                                        // conversation with no navigable URL. NOT a url:
+                                        // calling it one is how a resume silently becomes
+                                        // a fresh chat.
+                                        ConvUrl = guid.Length > 0 ? "sess:" + guid : "" };
+            discovered.Transcripts.Add(f);
+            _all.Add(discovered);
+            known.Add(StripGz(f));
+            added++;
+        }
+        _transcriptPos = end;
+        return added;
+    }
+
+    string BridgeCall(string path) { return BridgeCall(path, 60000); }
+
+    // Every bridge endpoint except the reachability probe goes through here: an authenticated
+    // POST (ui/BridgeClient.cs). A refusal the person has to act on -- no token file, a bridge
+    // older than this window -- is ALSO put in the banner, because most call sites catch and
+    // swallow exceptions, and a door that fails in silence is how "nothing happened" looks.
+    string BridgeCall(string path, int timeoutMs)
+    {
+        if (WindowSelfTest.Active) throw new InvalidOperationException("--selftest touches no network: " + path);
+        try { return BridgeClient.Call(_bridge, path, timeoutMs); }
+        catch (BridgeClientException ex) { NoteBridgeProblem(ex); throw; }
+    }
+
+    DateTime _bridgeProblemShown = DateTime.MinValue;
+
+    void NoteBridgeProblem(Exception ex)
+    {
+        var msg = ex.Message;
+        try
+        {
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                // At most once every 30 s: a sidebar refresh can make several calls in a row.
+                if ((DateTime.UtcNow - _bridgeProblemShown).TotalSeconds < 30) return;
+                _bridgeProblemShown = DateTime.UtcNow;
+                ShowRecoveryBanner(T("bridge_auth_problem") + "\n" + msg, T("close"), delegate { HideBanner(); });
+            }));
+        }
+        catch { }
     }
 
     // Map a raw bridge delete reason to a short, stable bucket key for the summary.

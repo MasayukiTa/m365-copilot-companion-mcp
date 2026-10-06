@@ -63,10 +63,11 @@ def _matches(text, patterns):
 
 def _git_status(folder):
     try:
-        p = subprocess.run(
+        # Paths under this owner's Desktop are Japanese, and a listing lost to the code
+        # page reads as "clean" -- the gate would then approve a dirty tree.
+        from tools.childproc import run as _run_child
+        p = _run_child(
             ["git", "-C", folder, "status", "--porcelain"],
-            capture_output=True,
-            text=True,
             timeout=10,
         )
         if p.returncode == 0:

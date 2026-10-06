@@ -23,13 +23,17 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import shutil
 import subprocess
 import sys
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, REPO)
 
-from relay.fleet_runner import ACTIVE_MARKER, should_auto_resume   # noqa: E402
+from relay.fleet_runner import (  # noqa: E402
+    ACTIVE_MARKER, marker_owner_alive, should_auto_resume,
+)
 
 
 def read_marker(state_dir: str):
@@ -42,6 +46,65 @@ def read_marker(state_dir: str):
         return None
 
 
+def read_resume_source(state_dir: str):
+    """(marker, snapshot_path) -- the live marker if there is one, else the marker COPY the
+    reaper kept in the newest pending `.fleet/interrupted/<run_id>.json` (the reaper deletes
+    the live marker once it has marked the run interrupted). (None, None) when neither."""
+    marker = read_marker(state_dir)
+    if marker:
+        return marker, None
+    from relay.fleet_reaper import read_interrupted_snapshot
+    found = read_interrupted_snapshot(state_dir)
+    if found:
+        data, path = found
+        copy = data.get("marker")
+        if isinstance(copy, dict) and copy.get("pid"):
+            return copy, path
+    return None, None
+
+
+def fleet_resume_record(snapshot_path: str) -> dict:
+    """The snapshot as a dict ({} when unreadable -- the gate then sees a pending, fresh run)."""
+    try:
+        with open(snapshot_path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def free_bytes(path: str):
+    try:
+        return shutil.disk_usage(path).free
+    except OSError:
+        return None
+
+
+def read_floor_gb():
+    """The disk floor AS THE PRODUCT READS IT (settings.txt > env chain). Only read here; no
+    value is chosen. None when unreadable or not positive."""
+    try:
+        from relay.fleet_runner import settings_disk_floor
+        v = float(settings_disk_floor())
+        return v if v > 0 else None
+    except Exception:
+        return None
+
+
+def signature_for(state_dir: str, record: dict, marker: dict):
+    """(signature, enospc) of the death: coordinator log tail markers + snapshot evidence."""
+    from relay import fleet_resume
+    ev = record.get("interrupted") or {}
+    lines = []
+    log = fleet_resume.newest_coordinator_log(state_dir, marker.get("pid"))
+    if log:
+        lines = fleet_resume.tail_lines(log, 200)
+    for item in ev.get("exit_evidence") or []:
+        lines.append(json.dumps(item) if not isinstance(item, str) else item)
+    code = ev.get("exit_code")
+    return fleet_resume.crash_signature(lines, exception_code="" if code is None else str(code))
+
+
 def pid_alive(pid) -> bool:
     """Is that process still running?
 
@@ -52,8 +115,8 @@ def pid_alive(pid) -> bool:
     """
     script = "@(Get-CimInstance Win32_Process -Filter \"ProcessId=%s\").Count" % int(pid)
     try:
-        out = subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                             capture_output=True, text=True, timeout=25).stdout.strip()
+        from tools.childproc import run as _run_child
+        out = _run_child(["powershell", "-NoProfile", "-Command", script], timeout=25).stdout.strip()
         return not (out.isdigit() and int(out) == 0)
     except Exception:
         return True
@@ -79,13 +142,13 @@ def main(argv=None) -> int:
                     help="relaunch it (default: report what would happen)")
     args = ap.parse_args(sys.argv[1:] if argv is None else argv)
 
-    marker = read_marker(args.state_dir)
+    marker, snapshot_path = read_resume_source(args.state_dir)
     if not marker:
         print("no interrupted fleet run (no active-run marker).")
         return 0
 
     pid = marker.get("pid")
-    alive = pid_alive(pid)
+    alive = marker_owner_alive(marker, pid_alive)
     if not should_auto_resume(True, alive):
         print("a run is live (pid %s) -- nothing to resume." % pid)
         return 0
@@ -96,18 +159,44 @@ def main(argv=None) -> int:
               "automatically. Its goals are in the ledger (last_run_goals.json)." % pid)
         return 1
 
+    # THE LOOP GUARD. Applies to the snapshot path (an automatic resume of a reaped run); a
+    # live marker with a dead pid is the pre-reaper case and keeps its old behaviour.
+    record, free_now, signature = None, None, ""
+    if snapshot_path:
+        from relay import fleet_resume
+        record = fleet_resume_record(snapshot_path)
+        free_now = free_bytes(args.state_dir)
+        signature, enospc = signature_for(args.state_dir, record, marker)
+        ok, reason = fleet_resume.resume_gate(
+            record, time.time(), free_now, read_floor_gb(), signature,
+            coordinator_live=False, enospc=enospc)
+        if not ok:
+            print("not resuming pid %s: %s" % (pid, reason))
+            if args.resume:
+                fleet_resume.record_blocked(snapshot_path, time.time(), reason, free_now, signature)
+            return 0
+
     if not args.resume:
         print("pid %s is dead. Would resume with:\n  %s" % (pid, " ".join(command[1:])))
         print("run again with --resume to do it.")
         return 0
 
     print("resuming the run interrupted at pid %s ..." % pid)
+    env = dict(os.environ)
+    if record and record.get("run_id"):
+        env["MCP_FLEET_RESUME_LINEAGE"] = str(record["run_id"])
     try:
-        subprocess.Popen(command, cwd=REPO,
+        subprocess.Popen(command, cwd=REPO, env=env,
                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except Exception as exc:
         print("could not relaunch: %s: %s" % (type(exc).__name__, exc))
         return 1
+    if snapshot_path:
+        from relay import fleet_resume
+        # state=resumed, resume.count += 1, signature and free bytes for the next gate.
+        if not fleet_resume.record_resume(snapshot_path, time.time(), free_now, signature):
+            from relay.fleet_reaper import mark_snapshot_state
+            mark_snapshot_state(snapshot_path, "resumed")
     print("relaunched. It reconstructs the unfinished goals from the ledger.")
     return 0
 

@@ -10,8 +10,13 @@ The href also carries guids and is the wrong source: 24 of them, 5 unique, and t
 TitleIds rather than conversations. Reading those would have stored confident nonsense, which
 is worse than storing nothing.
 
-Source-level, like the sibling bridge suites: copilot_bridge.py imports Playwright at module
-scope and cannot be imported on a runner.
+Source-level -- AND THE REASON GIVEN FOR THAT WAS STALE. This said "copilot_bridge.py
+imports Playwright at module scope and cannot be imported on a runner", and every bridge
+suite copied it. Measured 2026-09-22: the module imports in 2.6 s, starts no server and
+leaves one thread; the only `from playwright.sync_api import ...` is inside a function.
+The claim outlived whatever made it true and took the whole suite's ability to EXECUTE
+with it. bridge/test_the_bridge_http_surface_runs.py now stands the real Handler up on
+a spare port. What stays here is what is genuinely easier to read than to run.
 
 Run: pytest -q bridge/test_conv_capture_selectors.py
 """

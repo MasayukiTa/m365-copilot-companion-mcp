@@ -64,7 +64,10 @@ def acquire_lock():
         except Exception:
             old = ""
         if old:
-            chk = subprocess.run(["tasklist", "/FI", "PID eq " + old], capture_output=True, text=True)
+            # errors="replace": tasklist prints localised headers, and a decode error here
+            # would abort the orchestrator before it started over a PID check.
+            chk = subprocess.run(["tasklist", "/FI", "PID eq " + old],
+                                 capture_output=True, text=True, errors="replace")
             if old in (chk.stdout or ""):
                 log("another solve orchestrator (pid %s) running; exiting" % old)
                 sys.exit(0)
@@ -118,16 +121,40 @@ def write_goals(insts, spec, goals_path):
     return n
 
 
+def _bench_disk_floor_args():
+    """["--disk-floor-gb", "0"] unless the operator has chosen a floor.
+
+    A bench run wants the disk gate out of the way: it is measuring a model, not admission,
+    and a run that defers on headroom produces an empty row rather than a result. On an eval
+    host there is no settings.txt, so this returns the flag and nothing changes.
+
+    On the owner's WORKSTATION it returns nothing, because passing the flag beats the file and
+    a run that ignores the panel while the panel keeps displaying its number is exactly the
+    defect class this repository spent a week removing -- and because the standing rule there
+    is to free disk rather than to lower the floor.
+    """
+    try:
+        from relay.fleet_runner import operator_set_a_disk_floor
+        if operator_set_a_disk_floor():
+            return []
+    except Exception:
+        pass
+    return ["--disk-floor-gb", "0"]
+
+
 def run_fleet(goals_path, max_concurrent, max_turns, max_transient, effort):
     cmd = [VENVPY, "-m", "relay.fleet_runner", "--goals-file", goals_path,
            "--max-concurrent", str(max_concurrent), "--max-turns", str(max_turns),
-           "--max-transient", str(max_transient), "--disk-floor-gb", "0",
+           "--max-transient", str(max_transient),
            # effort=min => each worker is ONE tab (no refuter/research side-pages), so a cap of N
            # runs N tasks in parallel. auto/ultra reserve ~3 tabs/task (tab_weight), which on a
            # RAM-tight box collapses to 1 task at a time. The strong-scaffold discipline lives in
            # the GOAL TEXT (set via env below), so min still self-tests -- it just drops the
            # external review operators, giving a clean single-shot pass@1.
            "--effort", effort]
+    # See bench/review_run.py: a hard-coded floor of 0 beat the operator's own setting on the
+    # workstation, and changes nothing on an eval host, which has no settings file.
+    cmd += _bench_disk_floor_args()
     log("fleet: %s" % " ".join(cmd[2:]))
     p = subprocess.Popen(cmd, cwd=REPO, env=dict(os.environ))
     p.wait()
@@ -137,21 +164,64 @@ def run_fleet(goals_path, max_concurrent, max_turns, max_transient, effort):
 def capture(insts):
     os.makedirs(PREDS, exist_ok=True)
     nonempty = 0
+    captured_n = 0
     for inst in insts:
         wt = os.path.join(WORK, "wt_" + inst)
+        # NO WORKTREE MEANS IT WAS NEVER ATTEMPTED, WHICH IS NOT AN EMPTY PATCH.
+        #
+        # This wrote a prediction for every instance in the chunk, using "" when the worktree
+        # was missing. The grader reads that as a patch that changed nothing and returns `not
+        # resolved`, so an instance the harness never staged enters McNemar as evidence about
+        # the change under test. Leaving it uncaptured keeps it out of the pair AND keeps it in
+        # `remaining`, which is what lets a later run actually solve it.
+        if not os.path.isdir(wt):
+            log("  skip capture (never staged, stays in remaining): %s" % inst)
+            continue
         diff = ""
         if os.path.isdir(wt):
             try:
-                diff = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True,
-                                      timeout=60).stdout
+                # BYTES, THEN tools.code_exec._decode. `text=True` with no encoding decodes
+                # with locale.getpreferredencoding() -- cp932 here -- and a patch is arbitrary
+                # bytes. On 2026-09-11 one byte (0x9c) killed subprocess's reader thread, left
+                # .stdout as None, and took an entire 100-instance arm with it after 60 had
+                # already been solved. _decode tries UTF-8 first, falls back to the local
+                # codepage with errors="replace", and cannot raise.
+                raw = subprocess.run(["git", "-C", wt, "diff"],
+                                     capture_output=True, timeout=60).stdout
+                diff = _decode_child(raw)
             except Exception as e:
                 log("  capture error %s: %s" % (inst, e))
         pred = [{"instance_id": inst, "model_patch": diff, "model_name_or_path": "companion"}]
         with open(os.path.join(PREDS, inst + ".json"), "w", encoding="utf-8", newline="\n") as f:
             json.dump(pred, f, ensure_ascii=False)
-        if diff.strip():
+        # `or ""` BECAUSE THE PARENT NEVER SEES THE READER THREAD'S EXCEPTION. subprocess.run
+        # returns normally with .stdout set to None, so the try/except above cannot catch it.
+        # Decoding correctly is the fix; this is the guard that keeps a None from any other
+        # path out of .strip().
+        if (diff or "").strip():
             nonempty += 1
-    return nonempty
+        captured_n += 1
+    return nonempty, captured_n
+
+
+def _decode_child(raw):
+    """Decode child output without ever raising. Delegates to tools.code_exec._decode, which
+    is where this repository already solved this, so there is one implementation and not two.
+
+    Falls back to a local equivalent only if that import is unavailable -- this file is run as
+    a script from several places and must not fail to start over a decoding helper.
+    """
+    if not raw:
+        return ""
+    try:
+        from tools.code_exec import _decode
+        return _decode(raw)
+    except Exception:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            import locale
+            return raw.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
 
 
 def release(insts):
@@ -166,8 +236,10 @@ def release(insts):
         clone = os.path.join(WORK, repo_key(inst) + "-main")
         try:
             if os.path.isdir(os.path.join(clone, ".git")):
+                # errors="replace": the output is not read, but a decode error would still
+                # raise out of the reader thread during cleanup.
                 subprocess.run(["git", "-C", clone, "worktree", "remove", wt, "--force"],
-                               capture_output=True, text=True)
+                               capture_output=True, text=True, errors="replace")
             if os.path.isdir(wt):
                 subprocess.run(["cmd", "/c", "rmdir", "/s", "/q", wt], capture_output=True)
             if not os.path.isdir(wt):
@@ -248,16 +320,29 @@ def main():
         log("--- chunk %d/%d: %d inst (repos: %s) | C: free %.1f GB ---"
             % (ci, len(chunks(remaining, a.chunk)), len(ch), ",".join(repos), fg))
         if not stage(ch, a.spec, a.floor_gb):
-            log("  stage failed for chunk %d; skipping (will retry on resume)" % ci)
-            continue
+            # NOT A REASON TO DISCARD THE CHUNK. Measured 2026-09-12: "19 prepared, 1 failed"
+            # threw away nineteen ready worktrees, left the arm at 80/100, and the gate then
+            # burned a hundred fresh instances for an `underpowered` verdict.
+            #
+            # write_goals already skips an instance with no worktree, and the `ng == 0` check
+            # below already covers a stage that produced nothing at all -- so the honest
+            # behaviour was one line away the whole time: carry on with what is ready, and
+            # leave the rest to be picked up as `remaining` on the next run.
+            log("  stage incomplete for chunk %d; continuing with whatever prepared "
+                "(the rest stay in `remaining`)" % ci)
         goals_path = os.path.join(SWEDIR, "goals_solve_chunk.jsonl")
         ng = write_goals(ch, spec, goals_path)
         if ng == 0:
             log("  no goals written for chunk %d; skipping" % ci)
             continue
+        if ng < len(ch):
+            log("  chunk %d: %d of %d instances staged; %d deferred to a later run"
+                % (ci, ng, len(ch), len(ch) - ng))
         run_fleet(goals_path, a.max_concurrent, a.max_turns, a.max_transient, a.effort)
-        ne = capture(ch)
-        log("  captured %d/%d (non-empty diffs: %d)" % (len(ch), len(ch), ne))
+        ne, nc = capture(ch)
+        # WHAT WAS ACTUALLY CAPTURED, not the chunk size twice. The old line printed
+        # "captured 20/20" whether or not every instance had a worktree.
+        log("  captured %d/%d (non-empty diffs: %d)" % (nc, len(ch), ne))
         if not a.keep_worktrees:
             release(ch)
 

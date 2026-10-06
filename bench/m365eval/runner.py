@@ -38,7 +38,7 @@ Safety rules (hard-coded, not configurable):
   * NEVER calls outlook_send_mail or asks the agent to send email or invitations.
   * NEVER touches any artifact whose title/subject differs from the exact marker.
   * All Work IQ prompts include "Do NOT delete/touch any other event/file."
-  * MCP_API_KEY is read from .env at runtime; never printed, logged, or committed.
+  * MCP_API_KEY is materialized in process memory from legacy/plain or DPAPI-protected .env storage; never persisted in clear text.
   * Cleanup is verified by an independent re-read before declaring success.
 """
 
@@ -80,6 +80,8 @@ def _load_dotenv(path: Path) -> None:
 
 
 _load_dotenv(REPO_ROOT / ".env")
+from tools.secret_store import materialize_api_key
+materialize_api_key()
 
 # ---------------------------------------------------------------------------
 # Shared HTTP helpers
@@ -677,7 +679,7 @@ def main() -> int:
 
     api_key = os.environ.get("MCP_API_KEY", "")
     if not api_key:
-        print("  BLOCKER: MCP_API_KEY not found in environment / .env")
+        print("  BLOCKER: MCP_API_KEY could not be materialized from environment / protected .env storage")
         return 3
 
     # ---- Step 1: Preflight -------------------------------------------------

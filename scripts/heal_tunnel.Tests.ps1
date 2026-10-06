@@ -12,6 +12,19 @@ $scriptPath = Join-Path $PSScriptRoot "heal_tunnel.ps1"
 . $scriptPath
 
 Describe "Get-TunnelHealAction" {
+# PESTER 5 RUNS FILE-SCOPE CODE DURING DISCOVERY, NOT DURING THE RUN. The dot-source above
+# is enough for Pester 3.4.0 (what this machine has) and useless on the CI runner (which picks
+# Pester 5): there, these functions are defined while tests are being FOUND and are gone by the
+# time any It executes -- "Discovery found 13 tests" and then 13 identical
+# CommandNotFoundException failures. Repeating the dot-source in a BeforeAll inside each
+# Describe puts them in the run phase as well; 3.4.0 honours BeforeAll too, so one file works
+# on both and neither version needs pinning.
+    # $scriptPath is a FILE-SCOPE variable, so under Pester 5 it belongs to the discovery
+    # phase and is null by the time this runs -- `. $null` fails with "the expression after
+    # '.' ... must result in a command name". Rebuild the path here, where $PSScriptRoot is
+    # available in both phases.
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
 
     It "owned name + matching URL -> noop" {
         $owned = @([PSCustomObject]@{ Id = "mytunnel.usw2"; Url = "https://mytunnel-abcd.usw2.devtunnels.ms/" })
@@ -49,17 +62,192 @@ Describe "Get-TunnelHealAction" {
         $result.TargetUrl | Should Be "https://shared-abcd.usw2.devtunnels.ms"
     }
 
-    It "not owned, no URL match, owns at least one -> rename_url" {
+    # 2026-09-24: this used to switch to the account's FIRST owned tunnel. With one account on
+    # two PCs that is as likely the other PC's tunnel as this one's -- the likeliest way a second
+    # PC with a copied .env hosted this PC's tunnel. Only this machine's own tunnel is adopted.
+    It "not owned, no URL match, owns only someone else's tunnel -> setup_needed (never the first one)" {
         $owned = @([PSCustomObject]@{ Id = "othertunnel.usw2"; Url = "https://shared-abcd.usw2.devtunnels.ms/" })
         $result = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://completely-different.usw2.devtunnels.ms" -Owned $owned
+        $result.Action | Should Be "setup_needed"
+        $result.TargetId | Should Be ""
+    }
+
+    It "not owned, no URL match, this machine's own tunnel is owned -> rename_url to it, not to the first" {
+        $owned = @([PSCustomObject]@{ Id = "othertunnel.usw2"; Url = "https://shared-abcd.usw2.devtunnels.ms/" },
+                   [PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/" })
+        $result = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://completely-different.usw2.devtunnels.ms" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
         $result.Action | Should Be "rename_url"
-        $result.TargetId | Should Be "othertunnel.usw2"
-        $result.TargetUrl | Should Be "https://shared-abcd.usw2.devtunnels.ms/"
+        $result.TargetId | Should Be "m365-copilot-companion-0a1b2c3d.usw2"
+        $result.TargetUrl | Should Be "https://mine-0a1b.usw2.devtunnels.ms/"
     }
 
     It "owns nothing -> setup_needed" {
         $owned = @()
         $result = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://whatever.usw2.devtunnels.ms" -Owned $owned
         $result.Action | Should Be "setup_needed"
+    }
+}
+
+Describe "Get-TunnelHealAction -- the rules setup_devtunnel.ps1 applies" {
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
+    It "owned name hosted by ANOTHER machine, own tunnel exists -> rename_url to own" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $false; Identifying = $false },
+                   [PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/" })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "rename_url"
+        $r.TargetId | Should Be "m365-copilot-companion-0a1b2c3d.usw2"
+    }
+
+    It "owned name hosted by another machine, no own tunnel -> refused (nothing changed)" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 2; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "refused"
+    }
+
+    It "owned name hosted by THIS machine -> kept (noop)" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $true; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "noop"
+    }
+
+    It "this machine's own name is kept even while another host is on it" {
+        $owned = @([PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "m365-copilot-companion-0a1b2c3d.usw2" -Url "https://mine-0a1b.usw2.devtunnels.ms/" -Owned $owned -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "noop"
+    }
+
+    It "an unknown host count is not evidence -> kept" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = $null; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned
+        $r.Action | Should Be "noop"
+    }
+
+    It "an identifying owned name is not kept" {
+        $owned = @([PSCustomObject]@{ Id = "leaky.usw2"; Url = "https://leaky-1.usw2.devtunnels.ms/"; HostConnections = 0; HostedHere = $false; Identifying = $true })
+        $r = Get-TunnelHealAction -Name "leaky.usw2" -Url "https://leaky-1.usw2.devtunnels.ms/" -Owned $owned
+        $r.Action | Should Be "refused"
+    }
+
+    It "URL match on a tunnel another machine hosts -> no repoint" {
+        $owned = @([PSCustomObject]@{ Id = "other.usw2"; Url = "https://shared-abcd.usw2.devtunnels.ms/"; HostConnections = 1; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "notmine.usw2" -Url "https://shared-abcd.usw2.devtunnels.ms" -Owned $owned
+        $r.Action | Should Be "setup_needed"
+    }
+
+    It ".env from another machine, own tunnel owned -> adopt_own" {
+        $owned = @([PSCustomObject]@{ Id = "m365-copilot-companion-0a1b2c3d.usw2"; Url = "https://mine-0a1b.usw2.devtunnels.ms/" })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -ForeignReason "recorded on 'otherpc'" -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "adopt_own"
+        $r.TargetId | Should Be "m365-copilot-companion-0a1b2c3d.usw2"
+    }
+
+    It ".env from another machine, its name owned and no own tunnel -> set_aside, never kept" {
+        $owned = @([PSCustomObject]@{ Id = "custom.usw2"; Url = "https://custom-1.usw2.devtunnels.ms/"; HostConnections = 0; HostedHere = $false; Identifying = $false })
+        $r = Get-TunnelHealAction -Name "custom.usw2" -Url "https://custom-1.usw2.devtunnels.ms/" -Owned $owned -ForeignReason "recorded on 'otherpc'" -OwnDefaults @("m365-copilot-companion-0a1b2c3d")
+        $r.Action | Should Be "set_aside"
+        $r.TargetId | Should Be "m365-copilot-companion-0a1b2c3d"
+    }
+}
+
+Describe "Get-OwnedTunnelIdsFromListOutput" {
+# PESTER 5 RUNS FILE-SCOPE CODE DURING DISCOVERY, NOT DURING THE RUN. The dot-source above
+# is enough for Pester 3.4.0 (what this machine has) and useless on the CI runner (which picks
+# Pester 5): there, these functions are defined while tests are being FOUND and are gone by the
+# time any It executes -- "Discovery found 13 tests" and then 13 identical
+# CommandNotFoundException failures. Repeating the dot-source in a BeforeAll inside each
+# Describe puts them in the run phase as well; 3.4.0 honours BeforeAll too, so one file works
+# on both and neither version needs pinning.
+    # $scriptPath is a FILE-SCOPE variable, so under Pester 5 it belongs to the discovery
+    # phase and is null by the time this runs -- `. $null` fails with "the expression after
+    # '.' ... must result in a command name". Rebuild the path here, where $PSScriptRoot is
+    # available in both phases.
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
+
+    # MEASURED 2026-09-09: heal_tunnel.ps1's Invoke-DevTunnelBounded runs the CLI as
+    # `& $exe @a 2>&1 | Out-String`, merging stderr into the text that gets parsed as
+    # data. When the CLI errors (this repo's evidence: invalid_token auth failures at
+    # 07:35-07:36 in .setup/logs/server.err.history.log), PowerShell renders the merged
+    # native-command stderr as a line starting with the executable name -- confirmed
+    # against the real regex: "devtunnel.exe : Error: ..." matches
+    # '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' the same way "mytunnel.jpe1 " does, and
+    # the old (pre-fix) extraction reduced it via Get-BareTunnelId to the bare id
+    # "devtunnel" -- an id nobody owns, believed anyway because parsing SUCCEEDED (Count
+    # -eq 1), so the "could not parse" guard never fired. This is the mechanism behind
+    # the 2026-09-09 07:36 corruption of MCP_TUNNEL_NAME from the configured name to
+    # 'devtunnel'.
+
+    It "parses a real tunnel row" {
+        $listOut = @(
+            "List of tunnels:"
+            ""
+            "ID                Description  Host Connections  Client Connections  Ports"
+            "----------------  -----------  ----------------  ------------------  -----"
+            "mytunnel.jpe1                          1                    0        8000"
+        ) -join "`r`n"
+        $ids = Get-OwnedTunnelIdsFromListOutput $listOut
+        $ids | Should Be @("mytunnel.jpe1")
+    }
+
+    It "does NOT parse a merged PowerShell native-command error line as a tunnel id (THE BUG)" {
+        # This is PowerShell's actual rendering of a merged native-command stderr line --
+        # not a paraphrase. Reproduced by running a failing native exe through
+        # `2>&1 | Out-String` (the exact pattern Invoke-DevTunnelBounded uses).
+        $listOut = @(
+            "devtunnel.exe : Error: unable to list tunnels: 401 invalid_token"
+            "    + CategoryInfo          : NotSpecified: (Error: unable ...:String) [], RemoteException"
+            "    + FullyQualifiedErrorId : NativeCommandError"
+        ) -join "`r`n"
+        $ids = Get-OwnedTunnelIdsFromListOutput $listOut
+        $ids.Count | Should Be 0
+        ($ids -contains "devtunnel") | Should Be $false
+    }
+
+    It "parses the real row and rejects the error line when both appear in the same merged output" {
+        # This is the exact shape a genuinely-owned account with a mid-listing auth
+        # hiccup would produce: a good row plus a merged stderr line in the same
+        # Invoke-DevTunnelBounded output.
+        $listOut = @(
+            "mytunnel.jpe1                          1                    0        8000"
+            "devtunnel.exe : Error: unable to refresh token: 401 invalid_token"
+        ) -join "`r`n"
+        $ids = Get-OwnedTunnelIdsFromListOutput $listOut
+        $ids | Should Be @("mytunnel.jpe1")
+        ($ids -contains "devtunnel") | Should Be $false
+    }
+
+    It "empty/null input -> no ids, no throw" {
+        (Get-OwnedTunnelIdsFromListOutput "").Count | Should Be 0
+        (Get-OwnedTunnelIdsFromListOutput $null).Count | Should Be 0
+    }
+}
+
+Describe "Test-LooksLikeExecutableSuffix" {
+# PESTER 5 RUNS FILE-SCOPE CODE DURING DISCOVERY, NOT DURING THE RUN. The dot-source above
+# is enough for Pester 3.4.0 (what this machine has) and useless on the CI runner (which picks
+# Pester 5): there, these functions are defined while tests are being FOUND and are gone by the
+# time any It executes -- "Discovery found 13 tests" and then 13 identical
+# CommandNotFoundException failures. Repeating the dot-source in a BeforeAll inside each
+# Describe puts them in the run phase as well; 3.4.0 honours BeforeAll too, so one file works
+# on both and neither version needs pinning.
+    # $scriptPath is a FILE-SCOPE variable, so under Pester 5 it belongs to the discovery
+    # phase and is null by the time this runs -- `. $null` fails with "the expression after
+    # '.' ... must result in a command name". Rebuild the path here, where $PSScriptRoot is
+    # available in both phases.
+    BeforeAll { . (Join-Path $PSScriptRoot "heal_tunnel.ps1") }
+
+
+    It "flags .exe and sibling executable/script suffixes" {
+        Test-LooksLikeExecutableSuffix "exe" | Should Be $true
+        Test-LooksLikeExecutableSuffix "EXE" | Should Be $true
+        Test-LooksLikeExecutableSuffix "ps1" | Should Be $true
+        Test-LooksLikeExecutableSuffix "bat" | Should Be $true
+    }
+
+    It "does not flag real devtunnel cluster codes" {
+        Test-LooksLikeExecutableSuffix "jpe1" | Should Be $false
+        Test-LooksLikeExecutableSuffix "usw2" | Should Be $false
+        Test-LooksLikeExecutableSuffix "use2" | Should Be $false
     }
 }

@@ -30,6 +30,8 @@ import os
 import sys
 import time
 
+from . import stdin_arg as _stdin_arg
+
 _REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 #: Runtime state, deliberately untracked: entries quote proposed diffs to the files the
@@ -132,7 +134,29 @@ def add(files, reason: str, *, diff: str = "", command: str = "", detail: str = 
             "action": (action or "").strip(),
         })
         if notify:
-            _notify(pid, files, reason)
+            # BYPASS SUPPRESSES THE TOAST, NOT THE QUEUE. This is a self-improvement
+            # proposal, not a local-job run -- the same distinction request_approval() in
+            # relay/skills.py draws for Skill trust: bypass turns off ASKING about routine
+            # job execution, it was never a grant of "apply code changes to yourself
+            # without a person looking". So under bypass the card is still queued (`--list`
+            # / the dashboard still show it, still OPEN, still needs `resolve`) -- only the
+            # desktop toast that would interrupt someone is skipped, and that skip itself is
+            # written to the audit trail so it isn't invisible.
+            is_bypass = False
+            try:
+                from tools.approval_policy import current_approval_mode, record_bypass_decision
+                is_bypass = current_approval_mode() == "bypass"
+                if is_bypass:
+                    record_bypass_decision(
+                        "relay.selfimprove.pending.add",
+                        "判断待ち: %s -- %s" % (
+                            ", ".join(sorted(str(f) for f in (files or []))), reason),
+                        "queued, not notified (bypass never auto-approves self-improvement "
+                        "proposals); still awaiting explicit resolve()")
+            except Exception:
+                is_bypass = False
+            if not is_bypass:
+                _notify(pid, files, reason)
         return pid
     except Exception:
         return ""
@@ -243,26 +267,16 @@ def _cli(argv=None) -> int:
     ap.add_argument("--drop", metavar="ID", default="",
                     help="mark a queued decision as not going to happen")
     ap.add_argument("--authorization", default="",
-                    help="the operator's decision, quoted verbatim. \"-\" reads it from "
-                         "stdin, which is how the dashboard passes it: a command line cannot "
-                         "carry every character a person might type")
+                    help="the operator's decision, quoted verbatim. "
+                         + _stdin_arg.help_suffix())
     ap.add_argument("--kind", default="",
                     help="how it was given: preset (a phrase they chose) or typed")
     args = ap.parse_args(argv)
 
-    # VERBATIM MEANS VERBATIM. The dashboard used to substitute an apostrophe for every double
-    # quote before putting the text on a command line, so a decision containing one was
-    # recorded as something the operator had not written -- while the dialog promised, in as
-    # many words, that nothing would be summarised or reworded. Reading it from stdin removes
-    # the quoting problem rather than escaping around it.
-    if str(args.authorization) == "-":
-        try:
-            # The raw buffer, decoded as UTF-8. sys.stdin.read() uses the locale encoding,
-            # which on this machine is cp932 -- so reading it that way would corrupt exactly
-            # the text this path exists to carry through unaltered.
-            args.authorization = sys.stdin.buffer.read().decode("utf-8", "replace")
-        except Exception:
-            args.authorization = ""
+    # MOVED, NOT DROPPED. The reasoning that was written here lives in
+    # relay/selfimprove/stdin_arg.py, next to the code -- because frozen.py took the same
+    # flag, was called the same way, and never implemented it.
+    args.authorization = _stdin_arg.resolve(args.authorization)
 
     if args.approve or args.resolve or args.drop:
         pid = args.approve or args.resolve or args.drop
@@ -282,9 +296,50 @@ def _cli(argv=None) -> int:
     for r in rows:
         print("%s  [%s]  %s" % (r.get("id"), r.get("status"), ", ".join(r.get("files") or [])))
         print("    %s" % (r.get("reason") or ""))
+        gone = _premise_gone(r)
+        if gone:
+            print("    NOTE: %s" % gone)
         if r.get("command"):
             print("    $ %s" % r["command"])
     return 0
+
+
+def _premise_gone(row) -> str:
+    """Why this card may no longer be asking anything, or "" if it still is.
+
+    A card is queued when named files drift from the frozen baseline, and the drift can end
+    without the card being answered -- somebody re-signs for another reason, or reverts the
+    code. The question then has no subject left, and the entry goes on demanding a decision
+    about a condition that is gone. Measured 2026-09-22: card 931997c4df88 asks about
+    relay/selfimprove/frozen.py, which has matched its baseline since the re-signing earlier
+    that day.
+
+    THIS DOES NOT CLOSE IT, AND THAT IS THE WHOLE CARE HERE. `resolve` still only touches
+    APPROVED cards, because closing an open one is this process answering on the operator's
+    behalf -- the rule frozen.py states beside its own resolver. "The thing you were asked
+    about is no longer true" is a fact, not an answer, so it is printed and the decision stays
+    theirs. Never raises: a listing must not fail because the baseline cannot be read.
+    """
+    if row.get("status") != OPEN:
+        return ""
+    files = [str(f) for f in (row.get("files") or [])]
+    if not files:
+        return ""
+    try:
+        from relay.selfimprove import frozen as _frozen
+
+        base = (_frozen.load_baseline() or {}).get("checksums") or {}
+        if not base:
+            return ""
+        now = _frozen.compute_checksums()
+        drifting = [f for f in files if f in base and now.get(f) != base.get(f)]
+        if drifting:
+            return ""
+        return ("none of the files this names differs from the baseline any more, so the "
+                "change it asks about has already been settled some other way. Left open "
+                "deliberately -- deciding it is yours, not this program's.")
+    except Exception:
+        return ""
 
 
 if __name__ == "__main__":

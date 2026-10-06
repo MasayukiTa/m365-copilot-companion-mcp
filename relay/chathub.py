@@ -170,8 +170,26 @@ class RequestTemplate:
                 return str(models[0])
         return ""
 
-    def frame_for(self, text, *, session_id, request_id, started):
-        """The captured frame with this turn's values written into it, and nothing else."""
+    def frame_for(self, text, *, session_id, request_id, started, annotations=None):
+        """The captured frame with this turn's values written into it, and nothing else.
+
+        `annotations` is the one addition, and it is NOT a composed field. The page puts
+        `messageAnnotations` inside `message`, beside `messageType`, and that is where this
+        writes it. The shape is transcribed from a CDP capture on 2026-09-17:
+
+            [{"id": "<docId returned by UploadFile>",
+              "messageAnnotationMetadata": {"@type": "File", "annotationType": "File",
+                                           "fileType": "png", "fileName": "..."},
+              "messageAnnotationType": "ImageFile"}]
+
+        The server echoed that frame back with messageAnnotationSource "UserAnnotated" and
+        turnCount 1, so the shape is observed rather than guessed -- which matters here more
+        than usual, because this module already records that a COMPOSED frame was measured
+        REJECTED while the captured shape was accepted.
+
+        Omitted entirely when there are none: a frame carrying an empty list is a different
+        frame from one carrying no key at all, and the accepted capture carried no key.
+        """
         f = json.loads(json.dumps(self.frame))
         f["sessionId"] = session_id
         f["clientCorrelationId"] = request_id
@@ -188,6 +206,8 @@ class RequestTemplate:
         msg["requestId"] = request_id
         if isinstance(msg.get("clientInfo"), dict):
             msg["clientInfo"]["clientSessionId"] = session_id
+        if annotations:
+            msg["messageAnnotations"] = annotations
         return f
 
 
@@ -247,7 +267,8 @@ def _local_time_zone():
 def chat_frames(text: str, *, session_id: str, conversation_id: str, request_id: str,
                 started: bool = True, tone: str = "magic", locale: str = "ja-JP",
                 gpt_id: str = "", gpt_source: str = "MOS3",
-                template: "RequestTemplate" = None, invocation_id: str = "0") -> str:
+                template: "RequestTemplate" = None, invocation_id: str = "0",
+                annotations=None) -> str:
     """The chat frame and the metrics frame, in one send, as the protocol expects.
 
     WITH A TEMPLATE the frame is the client's own, with this turn's ids and text written in and
@@ -271,7 +292,7 @@ def chat_frames(text: str, *, session_id: str, conversation_id: str, request_id:
     """
     if template is not None:
         args = template.frame_for(text, session_id=session_id, request_id=request_id,
-                                  started=started)
+                                  started=started, annotations=annotations)
         chat = {"type": 4, "target": "chat", "invocationId": str(invocation_id), "arguments": [args]}
         metrics = {"type": 1, "target": "Metrics", "arguments": [{"Timestamps": {}}]}
         return json.dumps(chat, ensure_ascii=False) + RS + json.dumps(metrics) + RS
@@ -451,8 +472,14 @@ def collect_final(frame) -> str:
 def collect_text(frame) -> str:
     """The visible text this frame carries -- its delta if it has one, else its snapshot.
 
-    Kept for callers that look at a single frame. A whole turn must NOT be assembled by
-    concatenating this: see `collect_final`.
+    NO PRODUCTION CALLER. Written for callers that look at a single frame and there are
+    none, checked across `git ls-files` on 2026-09-14; `relay/test_chathub.py` asserts through
+    it (a `Metrics` target contributes no text; a chain-of-thought frame yields none), which is
+    why it is still here. The previous wording -- "kept for callers that look at a single
+    frame" -- named a consumer that does not exist and so closed the question of who it should
+    be. Listed in docs/unreached_burndown.md instead.
+
+    A whole turn must NOT be assembled by concatenating this: see `collect_final`.
     """
     return collect_delta(frame) or collect_final(frame)
 
@@ -528,7 +555,11 @@ class Conversation:
         #: absence as "no socket route", not as "try anyway".
         self.template = template
         self.session_id = str(uuid.uuid4())
-        self.conversation_id = str(uuid.uuid4())
+        #: LAZY. The id is minted by the first read that needs it (the wire, in `ask`), not by
+        #: constructing the object: a conversation that is built and never spoken in must not
+        #: carry an id that a transcript, a ledger row or a resume could mistake for a real one
+        #: (467 such ids were counted in one burst on 2026-09-30). See `peek_conversation_id`.
+        self._conversation_id = ""
         #: One key per CONNECTION, not per conversation. The client sends a single value
         #: across chatsessionid, clientrequestid and XRoutingParameterSessionKey, and mints a
         #: fresh one every time it opens a socket -- captured over two consecutive messages in
@@ -551,6 +582,23 @@ class Conversation:
         #: Continuity lives in the conversation id, not in the wire.
         self._sock = None
 
+    @property
+    def conversation_id(self) -> str:
+        """The id the wire carries. Minted on first use, so the first message creates the
+        conversation in the same call that sends it."""
+        if not self._conversation_id:
+            self._conversation_id = str(uuid.uuid4())
+        return self._conversation_id
+
+    @conversation_id.setter
+    def conversation_id(self, value) -> None:
+        self._conversation_id = str(value or "")
+
+    def peek_conversation_id(self) -> str:
+        """The id if one exists, else "" -- WITHOUT creating it. What recorders ask, so that
+        looking at a conversation that never sent anything does not bring it into being."""
+        return self._conversation_id
+
     def headers(self) -> dict:
         h = {}
         if self.send_origin:
@@ -560,7 +608,8 @@ class Conversation:
         return h
 
     def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
-            started=None, on_text=None, on_progress=None):
+            started=None, on_text=None, on_progress=None, annotations=None,
+            on_payload=None):
         """One turn: connect, send, read frames until the turn completes, return the answer.
 
         `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
@@ -579,7 +628,19 @@ class Conversation:
         payload = ST.build_prompt(text, catalogue or [], protocol=protocol) if catalogue             else (protocol or "") + text
         answer, rounds = "", 0
         while True:
+            # THE EXACT STRING ABOUT TO GO ON THE WIRE (protocol preamble + tool catalogue +
+            # request on round 0; the tool-result payload on later rounds). Reported so the
+            # fleet can store what the agent actually received, not the job text it started
+            # from. A failing observer is logged, never allowed to cost the turn.
+            if on_payload is not None:
+                try:
+                    on_payload(payload, rounds)
+                except Exception as exc:
+                    import sys as _sys
+                    _sys.stderr.write("[chathub] on_payload failed: %s: %s\n"
+                                      % (type(exc).__name__, str(exc)[:160]))
             answer = self._one_exchange(payload, connect=connect, started=started,
+                                        annotations=annotations,
                                         on_text=on_text, on_progress=on_progress)
             started = False
             self.turns += 1
@@ -598,7 +659,7 @@ class Conversation:
         return ST.strip_calls(answer) if catalogue else answer
 
     def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None,
-                      on_progress=None) -> str:
+                      on_progress=None, annotations=None) -> str:
         """Send one payload and read until the turn completes. Returns the reply text.
 
         `on_text` sees the answer as it grows, so a caller that shows progress does not have
@@ -612,7 +673,8 @@ class Conversation:
                                   conversation_id=self.conversation_id,
                                   request_id=request_id, started=started,
                                   gpt_id=self.gpt_id, template=self.template,
-                                  invocation_id=str(self.turns)))
+                                  invocation_id=str(self.turns),
+                                  annotations=annotations))
             # DELTAS ACCUMULATE, SNAPSHOTS REPLACE. Keeping them apart is what stops the same
             # answer being counted once per channel it arrives on.
             deltas, final, result, seen = [], "", "", 0

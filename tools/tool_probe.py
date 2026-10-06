@@ -194,7 +194,152 @@ def next_probe_instruction(count: int, desktop_dir: str) -> str:
 # Where the cockpit / /health can read the same summary without driving the browser.
 _PROBE_FILE = Path(__file__).resolve().parent.parent / ".fleet" / "tool_probe.json"
 
+#: The bridge's own account of WHY the probe did or did not run, for the screen and /status.
+#: A separate file from tool_probe.json on purpose: record_probe() replaces that file whole, so
+#: anything stored beside the verdict would be erased by the next probe. One writer (the bridge).
+_STATE_PATH = Path(__file__).resolve().parent.parent / ".fleet" / "tool_probe_state.json"
+
 _LOCK = threading.Lock()
+
+
+# ---------------------------------------------------------------------------
+# How often the probe may cost a Copilot message.
+#
+# MEASURED 2026-09-28..10-05 from .fleet/tool_events.jsonl: the probe sent 118-158 real messages
+# a day on full days at its fixed 10-minute cadence, landing in 43-81 distinct MCP sessions a day,
+# and Copilot Studio counts sessions. Between a third and a half of them were sent within 30 minutes of a REAL tool call
+# from the fleet -- i.e. when the very thing the probe exists to prove had just been proved for
+# free. And a failed probe led to a quick re-probe (and, after a streak, a conversation recycle,
+# which is yet another session).
+#
+# So the probe is now the fallback, not the schedule: it runs only when nothing else has shown
+# the tool path working for a whole interval, and slows down further after a failure.
+IDLE_MIN_KEY = "tool_probe_idle_min"
+IDLE_MIN_DEFAULT = 30
+#: What the cockpit offers. 0 = never probe. A hand-edited value outside this set is honoured if
+#: it is 0 or a plausible number of minutes (5..1440), otherwise the default applies.
+IDLE_MIN_CHOICES = (0, 15, 30, 60)
+#: The longest the probe backs off to after consecutive failures, whatever the interval.
+BACKOFF_CAP_S = 7200.0
+
+
+def idle_min_setting(path: Optional[str] = None) -> int:
+    """The `tool_probe_idle_min` setting in minutes (0 = off). Read from settings.txt on every
+    call (the probe re-reads it each time it decides); absent, empty or unusable means
+    IDLE_MIN_DEFAULT. Never raises."""
+    try:
+        if path is None:
+            from tools.settings_path import settings_file
+            path = settings_file()
+        raw = None
+        if path and os.path.isfile(path):
+            with open(path, encoding="utf-8-sig") as fh:
+                for ln in fh.read().splitlines():
+                    if ln.startswith(IDLE_MIN_KEY + "="):
+                        raw = ln.split("=", 1)[1]
+        v = int(float((raw or "").strip()))
+        if v == 0 or 5 <= v <= 1440:
+            return v
+        return IDLE_MIN_DEFAULT
+    except Exception:
+        return IDLE_MIN_DEFAULT
+
+
+def probe_interval(env_sec: Optional[float], idle_min: int) -> Tuple[float, str]:
+    """(interval_s, source). `env_sec` is MCP_TOOL_PROBE_SEC when it was set, else None: the
+    environment variable stays the override of last resort (it beat every setting before the
+    setting existed, and a deployment that sets it keeps its behaviour). interval_s <= 0 means
+    the probe is disabled."""
+    if env_sec is not None:
+        return float(env_sec), "env"
+    return float(idle_min) * 60.0, "setting"
+
+
+def configured_interval_s(environ=None, path: Optional[str] = None) -> float:
+    """The probe interval other components derive their freshness windows from: the
+    MCP_TOOL_PROBE_SEC override when set (<= 0 stays <= 0: the operator turned the probe off by
+    environment), otherwise the setting in seconds -- and a setting of 0 (off) reports the default
+    interval instead, because 'no probe' must not shrink a window that real calls also feed.
+    Never raises."""
+    try:
+        env = os.environ if environ is None else environ
+        raw = (env.get("MCP_TOOL_PROBE_SEC") or "").strip()
+        sec, src = probe_interval(float(raw) if raw else None, idle_min_setting(path))
+        if src == "setting" and sec <= 0:
+            return IDLE_MIN_DEFAULT * 60.0
+        return sec
+    except Exception:
+        return IDLE_MIN_DEFAULT * 60.0
+
+
+def backoff_s(base_s: float, failures: int, cap_s: float = BACKOFF_CAP_S) -> float:
+    """How long to wait after `failures` consecutive failed probes: base doubled per failure,
+    never below base and never above max(base, cap). Pure."""
+    try:
+        n = max(0, int(failures))
+    except (TypeError, ValueError):
+        n = 0
+    base = max(0.0, float(base_s))
+    return min(max(base, cap_s), base * (2 ** min(n, 16)))
+
+
+def record_evidence(ts: float, tool: str, now: Optional[float] = None) -> bool:
+    """Record the tool-call check as passed BY A REAL CALL, at that call's own time. Returns
+    whether the file was written. Never raises.
+
+    Never moves the record backwards (a newer probe verdict stays), and never invents a time:
+    `ts` is the real call's timestamp from the ledger, so the age the cockpit shows is the age
+    of something that happened. Totals are carried forward untouched -- nothing was PROBED, so
+    neither `probes` nor `failures` moves.
+    """
+    try:
+        ts = float(ts)
+        if ts <= 0 or ts > (time.time() if now is None else now) + 60:
+            return False
+        with _LOCK:
+            prev = {}
+            try:
+                with open(str(_PROBE_FILE), encoding="utf-8") as fh:
+                    prev = json.load(fh)
+                if not isinstance(prev, dict):
+                    prev = {}
+            except Exception:
+                prev = {}
+            try:
+                if float(prev.get("ts") or 0.0) >= ts:
+                    return False
+            except Exception:
+                pass
+            payload = {"ts": ts, "ok": True, "kind": "answer",
+                       "detail": "real tool call reached the server: %s" % (str(tool)[:80],),
+                       "alive": True, "inbound": True, "evidence": "real_call", "tool": str(tool)[:80]}
+            if isinstance(prev.get("totals"), dict):
+                payload["totals"] = prev["totals"]
+            for k in ("probing_since", "probing_kind", "probing_detail"):
+                if k in prev:
+                    payload[k] = prev[k]
+            _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(_PROBE_FILE) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(payload, fh, ensure_ascii=False)
+            os.replace(tmp, str(_PROBE_FILE))
+        return True
+    except Exception:
+        return False
+
+
+def write_state(state: dict) -> bool:
+    """Persist the probe's decision state for the screen (atomic). Never raises."""
+    try:
+        with _LOCK:
+            _STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
+            tmp = str(_STATE_PATH) + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(state, fh, ensure_ascii=False)
+            os.replace(tmp, str(_STATE_PATH))
+        return True
+    except Exception:
+        return False
 
 
 def classify_probe_reply(reply_text: str, agent_loaded: bool) -> Tuple[bool, str]:
@@ -644,6 +789,28 @@ def record_probe(ok: bool, kind: str, detail: str = "", ts: Optional[float] = No
             payload["inbound"] = bool(inbound)
         with _LOCK:
             _PROBE_FILE.parent.mkdir(parents=True, exist_ok=True)
+            # A DENOMINATOR, BECAUSE THE FAILURES HAD NONE. probe_failures.jsonl records every
+            # failed probe and nothing anywhere counted the probes that ran, so its 500 rows
+            # were a numerator on its own: not a rate, not a trend, not even a total -- the
+            # journal is capped at 500 and reaped, so "500" is the cap rather than a count.
+            # send_failures.jsonl had the same gap, and supplying one is what turned a rule
+            # that fires on 28 of 72 into a rule that fires on 0.19% of everything.
+            #
+            # Three counters, not one. `probes` is what was attempted, `failures` is the
+            # subset, and `since_ts` says what window they cover -- without it a reader has a
+            # ratio and no idea whether it describes a day or a month. Carried forward from
+            # the previous file, because this write replaces it.
+            prev = {}
+            try:
+                with open(str(_PROBE_FILE), encoding="utf-8") as _f:
+                    prev = (json.load(_f) or {}).get("totals") or {}
+            except Exception:
+                prev = {}
+            payload["totals"] = {
+                "probes": int(prev.get("probes") or 0) + 1,
+                "failures": int(prev.get("failures") or 0) + (0 if ok else 1),
+                "since_ts": prev.get("since_ts") or now,
+            }
             tmp = str(_PROBE_FILE) + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(payload, f, ensure_ascii=False)
@@ -785,6 +952,53 @@ def journal_probe_failure(ok: bool, kind: str, reply: Optional[str],
         pass
 
 
+#: Last successfully-read probe payload, keyed by the (mtime, size) it was read at.
+#:
+#: NO TIME-BASED STALENESS. A first attempt cached for five seconds without re-checking, which
+#: made a freshly written probe invisible for up to five seconds -- and that is not a test
+#: artefact, it is the metric being wrong. The stat stays on every call: it is one syscall
+#: against a file whose parse is what actually cost, and it keeps the answer exact.
+_SUMMARY_CACHE = {"raw": None, "key": None}
+
+
+def _probe_key():
+    """(mtime, size) of the probe file, or None when it cannot be stat'ed."""
+    try:
+        st = _PROBE_FILE.stat()
+        return (st.st_mtime, st.st_size)
+    except Exception:
+        return None
+
+
+def _summary_from_cache():
+    """The cached payload when the file has not changed, else None. Never raises.
+
+    A file that cannot be stat'ed is a CACHE MISS, not a reason to serve the last payload. The
+    documented contract is that a missing or corrupt probe file reads as the all-None shape --
+    "no evidence" -- and two tests hold it. Returning a remembered `tool_ok: true` for a probe
+    file that is gone would report health that nothing measured, which is a worse failure than
+    the one this cache exists to prevent."""
+    c = _SUMMARY_CACHE
+    if c["raw"] is None:
+        return None
+    key = _probe_key()
+    if key is None:
+        return None
+    return c["raw"] if key == c["key"] else None
+
+
+def _store_summary_cache(raw) -> None:
+    _SUMMARY_CACHE["key"] = _probe_key()
+    _SUMMARY_CACHE["raw"] = raw
+
+
+def _reset_summary_cache() -> None:
+    """Tests write the probe file repeatedly within one mtime tick; this drops the cache so a
+    test measures the reader rather than the clock."""
+    _SUMMARY_CACHE["raw"] = None
+    _SUMMARY_CACHE["key"] = None
+
+
 def get_summary(now: Optional[float] = None) -> dict:
     """Read the last-recorded probe outcome from .fleet/tool_probe.json and return
     {"tool_ok": bool|None, "tool_kind": str|None, "tool_ts": float|None,
@@ -803,9 +1017,30 @@ def get_summary(now: Optional[float] = None) -> dict:
     time.time() -- deterministic for tests, real wallclock in production (e.g. /health)."""
     empty = {"tool_ok": None, "tool_kind": None, "tool_ts": None, "tool_age_s": None,
              "tool_alive": None, "tool_inbound": None}
+    # SERVED FROM A CACHE, BECAUSE /health CALLS THIS ON THE EVENT LOOP.
+    #
+    # main.py's /health says it "does no blocking I/O on purpose" and then calls this, which
+    # opened a file. Both docstrings were accurate about themselves and nobody read them
+    # together. On 2026-09-09 the disk filled to 0.51 GB, this read stalled, /health stopped
+    # answering while every other endpoint still worked, and the supervisor -- which judges the
+    # server on /health alone -- restarted a HEALTHY server every five minutes. Each restart cut
+    # the in-flight tool calls, which is what reached the operator as
+    # "tool did not respond with success" and starlette's ClientDisconnect in the log.
+    #
+    # The file is written once per probe, minutes apart, and /health is polled every ~15s, so
+    # re-reading it per request bought nothing. Cache on mtime: a stale-but-recent answer is
+    # exactly what a liveness probe wants, and the loop never waits on the disk.
+    cached = _summary_from_cache()
+    if cached is not None:
+        raw = cached
+    else:
+        try:
+            with open(_PROBE_FILE, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+            _store_summary_cache(raw)
+        except Exception:
+            return dict(empty)
     try:
-        with open(_PROBE_FILE, "r", encoding="utf-8") as f:
-            raw = json.load(f)
         ts = raw.get("ts")
         if not isinstance(ts, (int, float)):
             return dict(empty)

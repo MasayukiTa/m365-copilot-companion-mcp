@@ -6,7 +6,14 @@ def clipboard_get() -> str:
     """Return the current text content of the system clipboard.
 
     Useful for "I just copied something — analyse this" workflows.
+
+    GATED: the clipboard can hold anything the operator last copied -- a password,
+    a customer record, an internal document -- so reading it requires the same
+    per-IP unlock as a write. Call unlock(password=...) first if refused.
     """
+    locked = require_unlocked()
+    if locked:
+        return locked
     try:
         try:
             import pyperclip

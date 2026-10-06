@@ -10,7 +10,6 @@ Here the script runs against a directory and nothing else runs at all, so what s
 attributable to exactly one thing.
 """
 import os
-import subprocess
 
 import pytest
 
@@ -33,7 +32,8 @@ def _run(profile, cap=2, dry=False):
             "-ProfileDir", str(profile), "-CapMB", str(cap)]
     if dry:
         args.append("-DryRun")
-    r = subprocess.run(args, capture_output=True, text=True, timeout=120)
+    from tools.childproc import run as _run_child
+    r = _run_child(args, timeout=120)
     assert r.returncode == 0, r.stdout + r.stderr
     return r.stdout
 

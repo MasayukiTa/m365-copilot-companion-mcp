@@ -91,6 +91,38 @@ def test_should_autoresume_happy_path():
     assert "resumable" in reason
 
 
+def test_startup_candidate_never_searches_backward_for_an_attached_session():
+    newest = {"sid": "newest", "conv_url": ""}
+
+    class FakeStore:
+        def __init__(self):
+            self.latest_calls = 0
+
+        def latest_session(self):
+            self.latest_calls += 1
+            return newest
+
+        def latest_attached(self):
+            raise AssertionError("startup must not search backward for an attached session")
+
+    store = FakeStore()
+    got = B.startup_resume_candidate(store)
+    assert got is newest
+    assert store.latest_calls == 1
+    should, reason = B.should_autoresume(got)
+    assert should is False
+    assert "no conversation attached" in reason
+
+
+def test_startup_path_uses_the_tested_latest_session_candidate_helper():
+    from pathlib import Path
+    src = Path(B.__file__).read_text(encoding="utf-8")
+    i = src.index("# STARTUP AUTO-RESUME")
+    block = src[i:i + 1800]
+    assert "latest = startup_resume_candidate()" in block
+    assert "latest_attached()" not in block
+
+
 def test_should_autoresume_with_real_conv_url():
     sess = {"conv_url": "https://m365.cloud.microsoft/chat/agent/T_x/conversation/"
                           "9374821f-6bff-4050-b6fd-8a4338013664"}
@@ -714,7 +746,8 @@ def test_merge_into_empty_existing():
     entry = {"url": "https://x/conversation/abc", "title": "t", "source": "chat",
               "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 1.0}
     merged = B.merge_fleet_conversations([], [entry])
-    assert merged == [entry]
+    expected = dict(entry); expected["transcripts"] = [entry["transcript"]]
+    assert merged == [expected]
 
 
 def test_merge_dedup_by_url_updates_in_place():
@@ -723,7 +756,8 @@ def test_merge_dedup_by_url_updates_in_place():
     new = {"url": "https://x/conversation/abc", "title": "new", "source": "chat",
            "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 2.0}
     merged = B.merge_fleet_conversations([old], [new])
-    assert merged == [new]
+    expected = dict(new); expected["transcripts"] = [new["transcript"]]
+    assert merged == [expected]
     assert len(merged) == 1
 
 
@@ -734,7 +768,8 @@ def test_merge_preserves_untouched_existing_entries():
                   "transcript": "sessions/s1.jsonl", "name": "s1", "ts": 2.0}
     merged = B.merge_fleet_conversations([fleet_entry], [chat_entry])
     assert fleet_entry in merged
-    assert chat_entry in merged
+    expected_chat = dict(chat_entry); expected_chat["transcripts"] = [chat_entry["transcript"]]
+    assert expected_chat in merged
     assert len(merged) == 2
 
 
@@ -747,7 +782,8 @@ def test_merge_empty_url_entries_dedup_by_source_and_name_not_url():
     new = {"url": "", "title": "new title", "source": "chat", "transcript": "sessions/s1.jsonl",
            "name": "s1", "ts": 2.0}
     merged = B.merge_fleet_conversations([old], [new])
-    assert merged == [new]
+    expected = dict(new); expected["transcripts"] = [new["transcript"]]
+    assert merged == [expected]
     assert len(merged) == 1
 
 

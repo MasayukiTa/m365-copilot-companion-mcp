@@ -33,6 +33,10 @@ import re
 import subprocess
 import sys
 
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO not in sys.path:
+    sys.path.insert(0, _REPO)
+
 #: Where the unshaped names come from. A comma-separated list; never a default in this file.
 NAMES_ENV = "IDENTITY_NAMES"
 
@@ -124,6 +128,38 @@ NON_IDENTIFYING_USERS = {"public", "default", "defaultuser", "example", "test", 
                          "<user>", "<home>", "<you>", "<name>",
                          "...", "\\...", "x", "me"}
 
+#: A GitHub noreply commit author, which is the SAFE form this repository standardises on:
+#: every commit is authored as <N>+<name>@users.noreply.github.com, so this address is the
+#: absence of a leak, not an instance of one. The employee-id shape starts with a letter and
+#: the home-path shape needs a Users/ path, so neither fires on the numeric id or the address
+#: on its own; but a configured name that happens to be a substring of the account handle would.
+#: A metadata string is cleared of any noreply address before the shaped/name checks run, so the
+#: canonical form is never the thing that trips the guard the commit metadata was added to feed.
+_NOREPLY = re.compile(r"\b[0-9]*\+?[A-Za-z0-9._-]+@users\.noreply\.github\.com\b", re.I)
+
+
+def scan_text(text, name_re=None):
+    """The one place the three checks are applied to a string, so a file LINE and a commit's
+    author/committer/message are judged by the same rules and no fourth rule is invented.
+
+    Returns the label of the first check that fires, or None. HOME_SHAPE is exempted for the
+    placeholder segments exactly as the file loop does, because the two callers must agree.
+    """
+    text = text or ""
+    for what, pattern in (("employee-id shape", ID_SHAPE),
+                          ("home directory path", HOME_SHAPE),
+                          ("configured name", name_re)):
+        if pattern is None:
+            continue
+        m = pattern.search(text)
+        if not m:
+            continue
+        if pattern is HOME_SHAPE and m.group(1).lower() in NON_IDENTIFYING_USERS:
+            continue
+        return what
+    return None
+
+
 #: This file, which describes the check, and .gitignore, which has to name what it ignores.
 ALLOWED = {".gitignore", "scripts/check_no_identifying_names.py"}
 
@@ -165,14 +201,97 @@ class CheckFailed(RuntimeError):
     """The check could not be performed. Never the same thing as finding nothing."""
 
 
+def _split_nul(text):
+    """Split a NUL-separated `-z` git listing into paths, dropping the empty tail `split`
+    leaves after the final terminator.
+
+    `-z` IS THE FIX, NOT A DETAIL. Without it, git's default `core.quotePath` wraps any
+    non-ASCII filename in double quotes and rewrites every non-ASCII byte as a C-style octal
+    escape -- `"\\346\\227\\245...".txt` -- which is a literal string of backslash-digit
+    characters, not the bytes of the name. Splitting that on newlines and decoding as UTF-8
+    (measured: `git -C repo ls-files` on a repo holding one file named with Japanese
+    characters) yields exactly that escaped, quoted string as the "path", which does not exist
+    on disk. `open()` on it then raised, and the guard reported the file as "unreadable, so
+    unchecked" -- a FOUND offence that blocked the commit for a file whose actual content was
+    never read. Per git-ls-files(1) and git-diff(1), `-z` disables the quoting entirely and
+    NUL-terminates each entry instead of newline-terminating it, so a name is returned as
+    itself and a literal newline inside a name cannot be mistaken for an entry separator.
+    """
+    return [p for p in text.split("\0") if p]
+
+
+def _git_lines(repo, args):
+    """Lines from one git command, or [] when git has nothing to say. Never raises.
+
+    Used for the two ADVISORY reaches below. The tracked list keeps its own hard failure --
+    a guard that cannot enumerate what it guards must not report a pass.
+
+    `-z` is appended to every call -- see `_split_nul` -- so a non-ASCII filename comes back
+    as itself rather than as git's quoted, octal-escaped display form.
+    """
+    try:
+        from tools.childproc import run as _run_child
+        out = _run_child(["git", "-C", repo] + list(args) + ["-z"])
+    except OSError:
+        return []
+    if out.returncode != 0:
+        return []
+    return _split_nul(out.stdout)
+
+
+def staged_files(repo="."):
+    """Paths about to become tracked.
+
+    THE GUARD STOOD IN THE WRONG PLACE. It enumerated `git ls-files`, so the only moment it
+    could speak was after a commit had been pushed and CI ran -- which on 2026-09-13 meant an
+    employee id was already public and the fix was a history rewrite. A staged file is the last
+    moment before that, and in CI nothing is staged, so CI is unaffected.
+
+    DELETIONS ARE EXCLUDED, and leaving them in blocked the guard's own advice. `git rm
+    --cached <file>` is exactly what this check tells you to do with a generated file that
+    carries a home path -- and the plain name-only listing includes the removed path, while
+    the file is still sitting in the working tree untracked. The scan then read it and
+    refused the commit that was removing it. --diff-filter=ACMR keeps additions, copies,
+    modifications and renames: everything whose CONTENT is about to become tracked.
+    """
+    return _git_lines(repo, ["diff", "--cached", "--name-only", "--diff-filter=ACMR"])
+
+
+def untracked_files(repo="."):
+    """Paths that are neither tracked nor ignored -- one `git add` from being public."""
+    return _git_lines(repo, ["ls-files", "--others", "--exclude-standard"])
+
+
+def _run_git_or_fail(repo, args):
+    """A git invocation that turns "git could not even be launched" into CheckFailed instead
+    of an unhandled FileNotFoundError/OSError.
+
+    tools.childproc.run's own try/except only covers decoding the child's output; it does not
+    cover the launch itself failing (git missing from PATH entirely), which is a plain OSError
+    from CreateProcess with nothing between it and the caller. Used everywhere in this file
+    that a git failure is supposed to become "the check could not run" rather than a bare
+    traceback -- the guards this file backs must not look like they passed when they never ran.
+    """
+    from tools.childproc import run as _run_child
+    try:
+        return _run_child(["git", "-C", repo] + list(args))
+    except OSError as exc:
+        raise CheckFailed("could not run git in %s: %s" % (repo, exc)) from exc
+
+
 def tracked_files(repo="."):
     """Every tracked path, or raise. A failed git call used to yield an empty list, and an
-    empty list reads as "nothing identifying in 0 tracked files" -- a pass."""
-    out = subprocess.run(["git", "-C", repo, "ls-files"], capture_output=True, text=True)
+    empty list reads as "nothing identifying in 0 tracked files" -- a pass.
+
+    `-z` -- see `_split_nul` -- so a non-ASCII filename decodes to itself instead of to git's
+    quoted, octal-escaped display form, which is not a path that exists and used to make this
+    check report the file "unreadable, so unchecked" for content it had never actually opened.
+    """
+    out = _run_git_or_fail(repo, ["ls-files", "-z"])
     if out.returncode != 0:
         raise CheckFailed("git ls-files failed in %s: %s"
                           % (repo, (out.stderr or "").strip()[:200]))
-    files = [p for p in out.stdout.splitlines() if p.strip()]
+    files = _split_nul(out.stdout)
     if not files:
         raise CheckFailed("git reported no tracked files in %s, which is not a repository "
                           "this check can vouch for" % repo)
@@ -184,7 +303,7 @@ def tracked_files(repo="."):
 MAX_HITS_PER_FILE = 20
 
 
-def offences(repo=".", names=None):
+def offences(repo=".", names=None, files=None):
     """[(path, what, line_number, line)] for every tracked text file that identifies someone."""
     # THE REPO UNDER CHECK, not the current directory. The .env fallback read whichever
     # directory the process happened to start in, so checking a temp repository picked up
@@ -193,7 +312,11 @@ def offences(repo=".", names=None):
     names = configured_names(repo) if names is None else names
     name_re = (re.compile("|".join(re.escape(n) for n in names), re.I)) if names else None
     found = []
-    for rel in tracked_files(repo):
+    # WHICH FILES, PASSED IN. The scanner used to call tracked_files() itself, which made the
+    # question it answers ("is anything public?") the only question it could answer. The same
+    # scan is now reusable for files that are about to become public -- staged -- and for ones
+    # that are one `git add` away.
+    for rel in (files if files is not None else tracked_files(repo)):
         if rel in ALLOWED:
             continue
         # THE PATH ITSELF. A file called after a person or a project discloses it without any
@@ -226,20 +349,10 @@ def offences(repo=".", names=None):
                                       "stopped after %d hits in this file"
                                       % MAX_HITS_PER_FILE))
                         break
-                    for what, pattern in (("employee-id shape", ID_SHAPE),
-                                          ("home directory path", HOME_SHAPE),
-                                          ("configured name", name_re)):
-                        if pattern is None:
-                            continue
-                        m = pattern.search(line)
-                        if not m:
-                            continue
-                        if (pattern is HOME_SHAPE
-                                and m.group(1).lower() in NON_IDENTIFYING_USERS):
-                            continue
-                        found.append((rel, what, n, line.strip()[:120]))
+                    label = scan_text(line, name_re)
+                    if label is not None:
+                        found.append((rel, label, n, line.strip()[:120]))
                         hits_here += 1
-                        break          # one label per LINE; the next line is still checked
         except OSError as exc:
             # NOT SKIPPED SILENTLY. A file the check could not read is a file it cannot
             # vouch for, and the whole point of this script is that "we did not look" must
@@ -248,7 +361,82 @@ def offences(repo=".", names=None):
     return found
 
 
+#: How far back to look when no range is given. A checker wired into CI runs on a push, so the
+#: commits at risk are the ones this push introduces over main; when that base cannot be found
+#: (a fresh clone, a detached run) the tip commit is still worth checking rather than nothing.
+def _commit_range(repo):
+    for base in ("origin/main", "main"):
+        rev = _run_git_or_fail(repo, ["rev-parse", "--verify", "-q", base])
+        if rev.returncode == 0:
+            head = _run_git_or_fail(repo, ["rev-parse", "--verify", "-q", "HEAD"])
+            # HEAD may already BE the base (checked out main with nothing ahead). Comparing a
+            # ref to itself yields no commits, which is the honest answer, not an error.
+            if head.returncode == 0 and head.stdout.strip() == rev.stdout.strip():
+                return "HEAD~1..HEAD"
+            return "%s..HEAD" % base
+    return "HEAD"
+
+
+def commit_metadata_offences(repo=".", names=None, rev_range=None):
+    """[(rev, field, 0, value)] for every commit whose author/committer/message identifies
+    someone. A grep of tracked FILES cannot see this: the leak that prompted it rode in the
+    commit's author line, not in any file. The same three checks run here, via scan_text, with
+    no new rule -- the only addition is that the repository's own noreply address is stripped
+    first, so the safe canonical form is never the thing that fails.
+    """
+    names = configured_names(repo) if names is None else names
+    name_re = (re.compile("|".join(re.escape(n) for n in names), re.I)) if names else None
+    if rev_range is None:
+        # No commits yet (git init with nothing committed) means no metadata to leak. That is
+        # an empty result, not a failure -- HEAD does not resolve, and asking git to log it
+        # would raise, turning a benign state into CHECK COULD NOT RUN.
+        head = _run_git_or_fail(repo, ["rev-parse", "--verify", "-q", "HEAD"])
+        if head.returncode != 0:
+            return []
+        rng = _commit_range(repo)
+    else:
+        rng = rev_range
+    # A record separator no field can contain lets author name, email, committer name, email
+    # and subject be read back unambiguously even when a name legitimately contains spaces.
+    fmt = "%H%x1f%an%x1f%ae%x1f%cn%x1f%ce%x1f%s"
+    out = _run_git_or_fail(repo, ["log", "--no-color", "--format=" + fmt, rng])
+    if out.returncode != 0:
+        raise CheckFailed("git log failed for range %s in %s: %s"
+                          % (rng, repo, (out.stderr or "").strip()[:200]))
+    found = []
+    for row in out.stdout.splitlines():
+        if not row.strip():
+            continue
+        parts = row.split("\x1f")
+        if len(parts) != 6:
+            continue
+        rev, an, ae, cn, ce, subject = parts
+        for field, value in (("author name", an), ("author email", ae),
+                             ("committer name", cn), ("committer email", ce),
+                             ("commit message", subject)):
+            cleaned = _NOREPLY.sub(" ", value)
+            label = scan_text(cleaned, name_re)
+            if label is not None:
+                found.append((rev[:12], "%s: %s" % (field, label), 0, value[:120]))
+    return found
+
+
 def main(argv=None) -> int:
+    # THE GUARD DIED WHILE REPORTING, WHICH IS THE ONLY TIME IT MATTERS.
+    #
+    # It prints the offending LINE, and this repository is full of Japanese. On Windows a
+    # bare console is cp932, so a flagged line containing anything cp932 cannot encode --
+    # a replacement character from a binary read, an emoji, a non-JIS glyph -- raised
+    # UnicodeEncodeError part-way through the listing. The traceback still exits non-zero,
+    # so nothing got committed, but the operator saw a codec error instead of the filename,
+    # and the check that runs before every commit became a thing that "crashes sometimes".
+    # CI never saw it: Linux is UTF-8.
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     argv = argv if argv is not None else sys.argv[1:]
     args = [a for a in argv if not a.startswith("--")]
     strict = "--require-names" in argv
@@ -257,6 +445,16 @@ def main(argv=None) -> int:
 
     try:
         found = offences(repo)
+        meta = commit_metadata_offences(repo, names=names)
+        # ABOUT TO BE PUBLIC. Staged files are the last moment before a commit, which is where
+        # this check belongs: on 2026-09-13 it stood only on tracked files, so the earliest it
+        # could speak was CI -- after a push, when the fix is a history rewrite. Nothing is
+        # staged in CI, so CI behaviour is unchanged.
+        staged = [p for p in staged_files(repo) if os.path.isfile(os.path.join(repo, p))]
+        found_staged = offences(repo, names=names, files=staged) if staged else []
+        # ONE `git add` AWAY. Advisory only -- see below.
+        loose = [p for p in untracked_files(repo) if os.path.isfile(os.path.join(repo, p))]
+        found_loose = offences(repo, names=names, files=loose) if loose else []
     except CheckFailed as exc:
         print("CHECK COULD NOT RUN: %s" % exc)
         return 2
@@ -274,14 +472,40 @@ def main(argv=None) -> int:
                   "result.")
             return 2
 
-    if not found:
+    # ADVISORY, NOT A FAILURE. The rule this protects is about what becomes PUBLIC, and an
+    # untracked file is not public. Failing on scratch files would train people to silence the
+    # check, which is how a guard stops being read -- the same way an approval that is always
+    # there stops being read. Printed first so it is seen even on a pass.
+    if found_loose:
+        print("WARNING -- untracked files carry identifying content (%d). They are not public, "
+              "and they are one `git add` from being so:" % len(found_loose))
+        for rel, what, n, line in found_loose[:12]:
+            print("  %s:%d  [%s]" % (rel, n, what))
+        print("")
+
+    if found_staged:
+        print("IDENTIFYING CONTENT IN STAGED FILES (%d) -- this is about to be committed:"
+              % len(found_staged))
+        for rel, what, n, line in found_staged:
+            print("  %s:%d  [%s]  %s" % (rel, n, what, line))
+        print("")
+        print("Unstage or scrub these. Caught here, the fix is an edit; caught in CI, the fix "
+              "is a history rewrite.")
+        return 1
+
+    if not found and not meta:
         print("nothing identifying in %d tracked files (%d configured name(s))"
               % (len(tracked_files(repo)), len(names)))
         return 0
 
-    print("IDENTIFYING CONTENT IN TRACKED FILES (%d):" % len(found))
-    for rel, what, n, line in found:
-        print("  %s:%d  [%s]  %s" % (rel, n, what, line))
+    if found:
+        print("IDENTIFYING CONTENT IN TRACKED FILES (%d):" % len(found))
+        for rel, what, n, line in found:
+            print("  %s:%d  [%s]  %s" % (rel, n, what, line))
+    if meta:
+        print("IDENTIFYING CONTENT IN COMMIT METADATA (%d):" % len(meta))
+        for rev, what, _n, value in meta:
+            print("  %s  [%s]  %s" % (rev, what, value))
     print("")
     print("This repository is public and the rule has been broken twice. Remove these from the")
     print("working tree; if they were pushed, the history needs rewriting too, which is a")

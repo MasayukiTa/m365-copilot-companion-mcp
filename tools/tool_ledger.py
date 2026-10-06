@@ -31,12 +31,21 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import threading
 import time
 import uuid
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER_PATH = os.path.join(_REPO, ".fleet", "tool_events.jsonl")
+
+#: tools.secret_store.REDACTION_FAILED_MARKER, repeated for the case where that module could
+#: not be imported at all -- _append's redaction call below is best-effort and must fail closed
+#: even when the import itself is what failed, so it cannot rely on importing the marker from
+#: the same place. Mirrors bridge/copilot_bridge.py's and relay/relay_fleet.py's own copies; a
+#: test (tools/test_ledger_never_writes_a_secret.py) holds all three equal to
+#: tools.secret_store.REDACTION_FAILED_MARKER (SEC-18, e822fb6).
+_REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
 
 SCHEMA_VERSION = 1
 
@@ -49,6 +58,49 @@ MAX_INLINE = 2000
 #: on disk that outlives the session; a password written once is written forever.
 SECRET_ARGS = {"password", "passwd", "secret", "token", "unlock_token", "api_key", "apikey",
                "authorization", "auth", "credential", "credentials", "private_key"}
+
+#: Tools whose RESULT is the secret, so only its digest and length are kept.
+#:
+#: THE SYMMETRIC HALF OF SECRET_ARGS, AND IT WAS MISSING. The list above stops a secret the
+#: caller HANDED IN; test_ledger_never_writes_a_secret stops one the process HOLDS, by value, at
+#: the point bytes leave. A password this machine RECOVERS is neither: it arrives from inside an
+#: encrypted file, so no name matches it and no held value equals it, and it was written to
+#: .fleet/tool_events.jsonl in clear and kept there. Reported by CodeQL as
+#: py/clear-text-logging-sensitive-data (alert #33).
+#:
+#: Returning the password to whoever asked is the tool's entire purpose and is not the problem.
+#: The problem is the second, silent copy in a file that outlives the session -- and the digest
+#: still answers every question the ledger is actually asked of it: that the call happened, how
+#: long it took, whether it succeeded, and whether two calls returned the same thing.
+SECRET_RESULT_TOOLS = {"office_password_recovery"}
+
+#: call_id -> tool, so record_outcome can tell which tool it is closing. The pairing is always
+#: within one process (both writers call record_call and record_outcome in the same function),
+#: and the map is bounded because an unbounded one in a long-lived server is a leak of its own.
+_CALL_TOOLS = {}
+_CALL_TOOLS_MAX = 4096
+
+#: call_id -> (wall ts, monotonic) at the moment the call row was written, so the outcome row can
+#: state its own start and end without trusting the caller to pass them. Bounded like the map
+#: above for the same reason.
+_CALL_STARTS = {}
+
+#: Identifies THIS process for the lifetime of the ledger module. time.monotonic() is only
+#: comparable within one process, so every row carries it; a reader subtracts monotonic stamps
+#: only when `proc` matches and falls back to wall-clock `ts` otherwise.
+_PROC = uuid.uuid4().hex[:8]
+
+#: THE ONLY HONEST SOURCE OF TASK/WORKER FOR A CALL MADE INSIDE A WORKER'S TURN. The gateway
+#: has no idea which fleet run a call belongs to; nothing upstream passes `_task`. What a worker
+#: DOES state itself is the turn-loop protocol: claim_turn(job_id, worker_id), then heartbeat /
+#: read_job_context / commit_turn / abort_turn with the same job_id. Those arguments are the
+#: worker's own declaration, and the MCP session they arrived on is the only thing tying its
+#: other calls to that declaration. A call on a session that never declared itself stays EMPTY --
+#: a guess would be counted as coverage the data does not have.
+_LOOP_DECLARING = {"claim_turn", "heartbeat", "read_job_context"}
+_LOOP_ENDING = {"commit_turn", "abort_turn"}
+_SESSION_IDENTITY = {}      # session fingerprint -> (task, worker)
+_SESSION_IDENTITY_MAX = 1024
 
 _LOCK = threading.Lock()
 
@@ -86,6 +138,93 @@ def _bounded(value):
 _LOCK_REFUSAL_PREFIX = "[locked"
 _LOCK_REFUSAL_MAX_CHARS = 400
 
+#: THE SHAPE EVERY TOOL IN THIS REPO USES TO REPORT ITS OWN FAILURE. They do not raise -- an
+#: MCP tool returns text -- so `[read_file error: FileNotFoundError: ...]` reaches the ledger
+#: through the success path and was filed as a success for 37k rows. Two parts, the same rule
+#: looks_refused uses: a distinctive marker AND dominance, so a file whose contents happen to
+#: quote an error is not filed as one.
+#:
+#: The bound is 600 rather than 400 because it was measured, not chosen: over the whole ledger
+#: the longest genuine error report of this shape is 463 characters and only 5 of 1,650 pass
+#: 400. A bound under the real maximum would have left the largest failures reading green,
+#: which is the half of the range where being wrong matters most.
+#: Up to two name tokens, because the gateway writes "[call_tool git_status error: ...]" and
+#: web_fetch writes "[web_fetch HTTP error: ...]" -- 139 rows of the latter alone. A
+#: single-token rule would have left every gateway-level failure reading green, and the
+#: gateway is the one place every dispatched call passes through. Zero tokens is allowed too:
+#: code_exec writes a bare "[timeout: exceeded 30 seconds]".
+#:
+#: The keyword must be followed immediately by ":" or "]" so that a document beginning
+#: "[error on page 3: ..." is not a report about itself.
+_NAME = r"(?:[A-Za-z0-9_]+ ){0,2}"
+_FAILURE_SHAPE = re.compile(r"^\[" + _NAME + r"(?:error|failed|refused)[:\]]"
+                            # "[pwsh_exec timeout after 30s]" as well as "[timeout: ...]".
+                            # Zero rows in the ledger today, but four tools write the spaced
+                            # form and a shape that exists in the source will eventually be
+                            # produced by it.
+                            r"|^\[" + _NAME + r"timeout(?:[:\]]| after )")
+#: AND THE OTHER ORDER. The gateway writes "[call_tool: refused. ...]" and fleet_intake
+#: writes "[fleet_submit: refused -- ...]": the name, then the colon, THEN the word. Seen in
+#: production on 2026-09-16 in a run that was otherwise reading correctly. 36 rows in the
+#: whole ledger, 0.097%, and 34 of them are call_tool.* which the health reader already
+#: excludes as discovery chatter -- so this is completeness, not a fix for a live symptom,
+#: and it is recorded as such rather than as a save.
+#:
+#: Safe against the "[<name>: <prose>]" family that means a lookup found nothing, because
+#: that prose never starts with one of these four words: "[memory_read: no topic found]",
+#: "[which: rg not found on PATH]", "[sqlite_schema: no table named ...]".
+_FAILURE_AFTER_COLON = re.compile(r"^\[[A-Za-z0-9_.]+:\s*(?:error|failed|timeout|refused)\b",
+                                  re.I)
+_UNAVAILABLE_SHAPE = re.compile(r"^\[" + _NAME + r"(?:unavailable|skipped|aborted)[:\]]")
+_REPORT_MAX_CHARS = 600
+
+#: COUNTED, NOT GUESSED, over the whole ledger (37,018 successes carrying a string):
+#:   error 1,789 | timeout 213 | failed 37 | refused 2   -- all filed as successes
+#:   [stdout] / [stderr]  8,216                          -- successful runs, must stay green
+#:   skipped 20, aborted 3                               -- DELIBERATELY NOT HERE
+#: skipped and aborted are NEITHER, and the first draft of this rule called them successes.
+#: "[replace skipped: old text was not found]" is a correct answer to a caller's mistake --
+#: but the identical word comes out of an environment fault: a missing executable, an
+#: unavailable mount, an absent credential. The word cannot tell those apart, and the reason
+#: text is free-form, so nothing here can either. Counting them as successes meant every one
+#: of those refreshed green AND reset the consecutive-failure streak, so failure/failure/skip
+#: repeating forever would never have reached red.
+#:
+#: They join the unavailable case instead: not evidence. A path that only ever skips reports
+#: "no evidence", which is exactly what a run of skips supports -- nothing in it says whether
+#: the tool can do its job. Raised by gpt-6-astra against the first draft, and it is right.
+
+
+def _is_report(result, shape) -> bool:
+    try:
+        if not isinstance(result, str):
+            return False
+        text = result.strip()
+        return bool(shape.match(text)) and len(text) < _REPORT_MAX_CHARS
+    except Exception:
+        return False
+
+
+def looks_failed(result) -> bool:
+    """True iff `result` IS a tool reporting its own failure, rather than content quoting one."""
+    return _is_report(result, _FAILURE_SHAPE) or _is_report(result, _FAILURE_AFTER_COLON)
+
+
+def looks_unavailable(result) -> bool:
+    """True iff nothing happened that says anything about whether the tool path works.
+
+    Covers two cases that read alike to a health indicator: the machine was not in a state to
+    run the tool, and the tool declined because a precondition was not met.
+
+    A THIRD STATE, AND THE REASON THIS IS NOT JUST ANOTHER FAILURE. When the workstation is
+    locked, no screen can be captured and no click can be delivered -- and the tools are
+    fine. Filing that as a failure lights a health indicator red and tells a reader the
+    system is broken when what happened is that a person walked away. Filing it as a success
+    is worse. It is neither, and the only honest rendering is "no evidence", which
+    fleet_tool_health already knows how to show.
+    """
+    return _is_report(result, _UNAVAILABLE_SHAPE)
+
 
 def looks_refused(result) -> bool:
     """True iff `result` IS a lock refusal, rather than content that merely contains one.
@@ -100,6 +239,23 @@ def looks_refused(result) -> bool:
             return False
         text = result.strip()
         return text.startswith(_LOCK_REFUSAL_PREFIX) and len(text) < _LOCK_REFUSAL_MAX_CHARS
+    except Exception:
+        return False
+
+
+def row_unavailable(row) -> bool:
+    """True iff this outcome says the machine was not in a state to run the tool.
+
+    Separate from row_ok deliberately: row_ok answers "did this call do its job" and the
+    answer here is no, while this answers "does this call count as evidence about the tool"
+    and the answer there is also no. A reader that only has the first cannot tell an
+    unattended machine from a broken one -- which is the whole defect.
+    """
+    try:
+        result = row.get("result")
+        if isinstance(result, dict):
+            result = result.get("text")
+        return looks_unavailable(result) or bool(row.get("unavailable"))
     except Exception:
         return False
 
@@ -131,7 +287,11 @@ def row_ok(row) -> bool:
         result = row.get("result")
         if isinstance(result, dict):
             result = result.get("text")
-        return not looks_refused(result)
+        # All three corrections, not just the refusal one. The rows this now moves were
+        # written over months by tools that report failure by returning it, and the ledger is
+        # append-only, so history is corrected on read exactly as refusals already were.
+        return not (looks_refused(result) or looks_failed(result)
+                    or looks_unavailable(result))
     except Exception:
         # A reader that raises on one malformed row stops being used, same as read() above.
         try:
@@ -164,6 +324,31 @@ def redact_args(arguments, _depth=0) -> dict:
     return out
 
 
+#: When the ledger is moved aside. Its neighbour faulthandler.log has rotated at 8 MB since
+#: the day it was added; this file reached 64 MB without anyone choosing that. The cap is
+#: larger because the ledger is read back -- fleet_tool_health tails it, and measurements are
+#: taken over it -- so a generous single file is worth more here than a small one.
+LEDGER_MAX_BYTES = 128 * 1024 * 1024
+
+
+def _rotate_if_large(path: str) -> None:
+    """Move the ledger aside once, keeping one generation. Never raises.
+
+    ROTATION IS NOT EDITING. The rows are moved intact; none is rewritten, which is the
+    property this file's worth rests on. os.replace is atomic on Windows and POSIX alike, so
+    a reader holding the old path keeps reading a complete file rather than a truncated one.
+    """
+    try:
+        if os.path.getsize(path) < LEDGER_MAX_BYTES:
+            return
+    except OSError:
+        return          # no file yet, or unreadable: nothing to rotate
+    try:
+        os.replace(path, path + ".1")
+    except OSError:
+        pass            # a locked file is a reason to keep appending, not to lose the row
+
+
 def _append(row: dict) -> None:
     """Best effort, never raises. A ledger that can fail a tool call is worse than no ledger."""
     try:
@@ -179,10 +364,26 @@ def _append(row: dict) -> None:
         try:
             from tools.secret_store import redact_secrets
             line = redact_secrets(line)
-        except Exception:
-            pass
+        except Exception as exc:
+            # FAILS CLOSED (SEC-18 follow-up to e822fb6). This used to `except: pass`, which on
+            # an import failure -- or an exception escaping redact_secrets despite its own
+            # internal fail-closed handling -- left `line` exactly as built above: the row,
+            # UNREDACTED, about to be appended below. redact_secrets() already fails closed on
+            # its own (it returns tools.secret_store.REDACTION_FAILED_MARKER rather than raising
+            # or returning a partial value), so reaching this except at all means the IMPORT
+            # itself is what failed -- which is why the marker is a private copy here rather
+            # than something fetched from the module that could not be imported.
+            try:
+                import logging as _logging
+                _logging.getLogger(__name__).warning(
+                    "tool ledger redaction failed (%s); wrote %r instead of the row",
+                    type(exc).__name__, _REDACTION_FAILED_MARKER)
+            except Exception:
+                pass
+            line = _REDACTION_FAILED_MARKER
         with _LOCK:
             os.makedirs(os.path.dirname(path), exist_ok=True)
+            _rotate_if_large(path)
             with open(path, "a", encoding="utf-8") as fh:
                 fh.write(line + "\n")
     except Exception:
@@ -235,6 +436,111 @@ def session_fingerprint() -> str:
     return hashlib.sha256(sid.encode("utf-8", "replace")).hexdigest()[:16]
 
 
+def _remember_tool(call_id: str, tool: str) -> None:
+    """Note which tool a call id belongs to, so the outcome writer can ask."""
+    with _LOCK:
+        if len(_CALL_TOOLS) >= _CALL_TOOLS_MAX:
+            _CALL_TOOLS.clear()      # a bound, not a cache policy: nothing here must be kept
+        _CALL_TOOLS[str(call_id or "")] = str(tool or "")
+
+
+def result_is_secret(call_id: str, tool: str = "") -> bool:
+    """Is this call's result a secret in itself? Answered by tool name, either given or looked
+    up from the call record written moments earlier."""
+    name = str(tool or "") or _CALL_TOOLS.get(str(call_id or ""), "")
+    return name in SECRET_RESULT_TOOLS
+
+
+#: session fingerprint -> (task, worker, bound_at). Set ONLY by an unambiguous turn-window match
+#: (exactly one worker in flight), so a later call on that session that lands in an overlap of
+#: several windows can reuse it. Expires, and is only reused when its worker is among the
+#: overlapping candidates -- a session that moved to another worker must not carry the old label.
+_WINDOW_BINDING = {}
+_WINDOW_BINDING_MAX = 1024
+
+
+def _window_identity(session: str, ts: float):
+    """(task, worker, how) from the coordinator's turn windows (tools/turn_context.py).
+
+    how: "window" (one worker in flight), "session-window" (several, but this session was bound
+    earlier by an unambiguous match to one of them), "ambiguous" (several, no usable binding:
+    task and worker stay EMPTY), or "" (no window matched / no file). Never raises.
+    """
+    try:
+        from tools import turn_context
+        cands = turn_context.candidates(float(ts))
+        if not cands:
+            return "", "", ""
+        now = time.time()
+        if len(cands) == 1:
+            worker, task = cands[0]
+            if session:
+                with _LOCK:
+                    if len(_WINDOW_BINDING) >= _WINDOW_BINDING_MAX:
+                        _WINDOW_BINDING.clear()
+                    _WINDOW_BINDING[session] = (task, worker, now)
+            return task, worker, "window"
+        if session:
+            with _LOCK:
+                bound = _WINDOW_BINDING.get(session)
+            if bound and now - bound[2] <= turn_context.MAX_OPEN_S \
+                    and any(w == bound[1] for w, _t in cands):
+                return bound[0], bound[1], "session-window"
+        return "", "", "ambiguous"
+    except Exception:
+        return "", "", ""
+
+
+def _identity_for(tool: str, arguments, session: str, task: str, worker: str, ts: float = None):
+    """(task, worker, how) for a call. `how` is "explicit", "session", "window",
+    "session-window", "ambiguous" or "" (not attributable).
+
+    Explicit values win. Then the identity a worker declared through the turn-loop protocol on
+    the same MCP session. Then the coordinator's own record of whose turn was in flight at `ts`
+    (see tools/turn_context.py for the clock basis and the overlap rule). Never raises.
+    """
+    try:
+        if task or worker:
+            return task, worker, "explicit"
+        got = _declared_identity(tool, arguments, session)
+        if got:
+            return got
+        return _window_identity(session, ts if ts is not None else time.time())
+    except Exception:
+        return "", "", ""
+
+
+def _declared_identity(tool: str, arguments, session: str):
+    """The turn-loop declaration path: (task, worker, "session") or None. Never raises."""
+    try:
+        if not session:
+            return None
+        args = arguments if isinstance(arguments, dict) else {}
+        if tool in _LOOP_DECLARING and args.get("job_id"):
+            with _LOCK:
+                prev = _SESSION_IDENTITY.get(session, ("", ""))
+                job = str(args.get("job_id"))
+                who = str(args.get("worker_id") or (prev[1] if prev[0] == job else ""))
+                if len(_SESSION_IDENTITY) >= _SESSION_IDENTITY_MAX:
+                    _SESSION_IDENTITY.clear()
+                _SESSION_IDENTITY[session] = (job, who)
+                return job, who, "session"
+        if tool in _LOOP_ENDING:
+            with _LOCK:
+                got = _SESSION_IDENTITY.pop(session, None)
+            if got:
+                return got[0], got[1], "session"
+            job = str(args.get("job_id") or "")
+            return (job, "", "session") if job else None
+        with _LOCK:
+            got = _SESSION_IDENTITY.get(session)
+        if got:
+            return got[0], got[1], "session"
+    except Exception:
+        pass
+    return None
+
+
 def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
                 turn=None, call_id: str = "", ts: float = None) -> str:
     """Write the CALL record, BEFORE the tool runs. Returns the id to pass to record_outcome.
@@ -257,25 +563,51 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
         _sess = session_fingerprint()
     except Exception:
         _sess = ""
+    _ts = float(ts if ts is not None else time.time())
+    task, worker, _how = _identity_for(tool, arguments, _sess, task, worker, _ts)
+    _mono = time.monotonic()
     row = {
         "schema": SCHEMA_VERSION,
         "event": "call",
         "id": cid,
-        "ts": float(ts if ts is not None else time.time()),
+        "ts": _ts,
+        "mono": round(_mono, 4),
+        "proc": _PROC,
         "tool": str(tool or "")[:120],
         "task": str(task or "")[:120],
         "worker": str(worker or "")[:64],
         "turn": turn,
         "args": redact_args(arguments),
     }
+    if _how:
+        row["attr"] = _how
+    if _how in ("window", "session-window") and worker:
+        # Additive fan-out identity from the same window (campaign_id, subtask_id, parent_task_id,
+        # root_id, role) so a join with the campaign records needs no id translation. Never
+        # touches task/worker; absent for non-fan-out workers and for old window rows.
+        try:
+            from tools import turn_context
+            _id = turn_context.identity_of(worker, _ts)
+            for _k, _dst in (("campaign_id", "campaign_id"), ("task_id", "subtask_id"),
+                             ("parent_task_id", "parent_task_id"), ("root_id", "root_id"),
+                             ("role", "role")):
+                if _id.get(_k):
+                    row[_dst] = _id[_k]
+        except Exception:
+            pass
     if _sess:
         row["session"] = _sess
+    with _LOCK:
+        if len(_CALL_STARTS) >= _CALL_TOOLS_MAX:
+            _CALL_STARTS.clear()
+        _CALL_STARTS[cid] = (row["ts"], _mono)
+    _remember_tool(cid, tool)
     _append(row)
     return cid
 
 
 def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
-                   ts: float = None, duration_s: float = None) -> None:
+                   ts: float = None, duration_s: float = None, tool: str = "") -> None:
     """Write the OUTCOME record for a call. Linked by id, never merged into the call record."""
     # A REFUSAL IS NOT A SUCCESS. Every call site passes ok=True whenever the tool returned
     # without raising, and a lock refusal returns normally -- so `write_file` denied for a
@@ -291,19 +623,59 @@ def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
     # Only ever downgrades -- an explicit ok=False is never overridden -- and the reason stays
     # a fixed string, because the refusal text is already stored verbatim in `result` and the
     # error field is the one thing a reader scans in bulk.
+    unavailable = False
     if ok and looks_refused(result):
         ok = False
         error = error or "refused (locked)"
+    elif ok and looks_unavailable(result):
+        # Recorded as not-ok AND flagged, because those are two different facts and a reader
+        # that has only the first will call an unattended machine a broken one.
+        ok, unavailable = False, True
+        error = error or "unavailable (the machine was not in a state to run it)"
+    elif ok and looks_failed(result):
+        ok = False
+        error = error or "returned its own error report"
+    _end_ts = float(ts if ts is not None else time.time())
+    _end_mono = time.monotonic()
+    with _LOCK:
+        _start = _CALL_STARTS.pop(str(call_id or ""), None)
+    _timing = {"proc": _PROC, "mono": round(_end_mono, 4), "ts_end": _end_ts}
+    if _start:
+        _timing["ts_start"] = _start[0]
+        _timing["dur_mono_s"] = round(max(0.0, _end_mono - _start[1]), 4)
     _append({
         "schema": SCHEMA_VERSION,
         "event": "outcome",
         "id": str(call_id or ""),
-        "ts": float(ts if ts is not None else time.time()),
+        "ts": _end_ts,
+        **_timing,
         "ok": bool(ok),
         "duration_s": (round(float(duration_s), 3) if duration_s is not None else None),
         "error": str(error or "")[:MAX_INLINE],
-        "result": _bounded(result) if result is not None else None,
+        # Written as a field as well as being inferable from the text, because a reader
+        # scanning 39,000 rows in bulk reads fields, and row_unavailable accepts either.
+        "unavailable": True if unavailable else None,
+        "result": _outcome_result(call_id, tool, result),
     })
+
+
+def _outcome_result(call_id, tool, result):
+    """What goes in the `result` field: the bounded value, or a description of it.
+
+    THE REFUSAL SHAPES ARE STILL READ FIRST, above, because whether a call was refused or
+    unavailable is not secret and a reader that loses that loses the correction this ledger
+    exists to make. Only the text is withheld."""
+    if result is None:
+        return None
+    if not result_is_secret(call_id, tool):
+        return _bounded(result)
+    try:
+        text = result if isinstance(result, str) else json.dumps(result, ensure_ascii=False,
+                                                                 default=str)
+    except Exception:
+        text = str(result)
+    return {"withheld": "this tool's result is a secret in itself",
+            "digest": _digest(text), "len": len(text)}
 
 
 def read(path: str = None):

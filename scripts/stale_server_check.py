@@ -14,17 +14,42 @@ This module is the PURE decision core for both halves of the fix:
 * doctor calls :func:`classify_staleness` (via the CLI ``main`` below) to turn
   "server-start HEAD" vs "current HEAD" into one word doctor maps to green / red /
   indeterminate -- the same shape ``check_unlock_usable.py`` already uses.
-* ``Invoke-PostUpdateTail`` in ``start_all.ps1`` calls the same reasoning through
-  :func:`python_side_changed` + :func:`decide_post_update_action` to decide whether
-  the freshly-pulled Python needs the server swapped, and -- crucially -- whether a
-  fleet/review run is live, in which case it must only REPORT rather than disturb it.
+* ``start_all.ps1`` asks ONE question through ``--server-action`` (see ``_cli_server_action``)
+  from BOTH places that can stop a running server: ``Invoke-PostUpdateTail`` after its own
+  pull (changed paths from ``git diff``), and the daily "server is older than its code"
+  check (a start time, compared against every file the server imports). Both get
+  :func:`decide_post_update_action` over :func:`fleet_is_running`, so neither can swap the
+  server while a fleet run, a review run or a bridge turn is live.
 
-Every function here is pure (no I/O, no side effects) so the decisions can be
-exercised directly from pytest on any OS. The only I/O lives in the small CLI at the
-bottom, which reads two files and prints one verdict word; it is deliberately thin so
-that what is tested is what runs.
+  IT USED TO BE TWO RULES. The post-update tail called ``--pyside`` and ``--runlive`` and
+  re-implemented decide_post_update_action by hand in PowerShell (equivalent, measured over
+  all 36 output combinations of the two calls before this was wired); the daily check had no
+  live-run test at all and killed the server on a top-level mtime, so ``git pull`` plus a
+  double-click dropped a live run, and a change in a subpackage was never seen (new-PC
+  analysis D12/D30).
 
-Stdlib only. No Windows-specific calls: this runs in the Linux CI test job.
+* ``start_all.ps1`` asks the SAME SHAPE of question through ``--bridge-action`` (see
+  ``_cli_bridge_action``) for the chat bridge (``bridge/copilot_bridge.py``). Wiring the
+  server's daily check through ``--server-action`` left the bridge's own daily check
+  (``Bridge-Is-Outdated`` in start_all.ps1) exactly as it always was: ``Get-ChildItem``
+  without ``-Recurse`` over the top level of ``bridge/``, ``tools/`` and ``relay/`` only, and
+  no question at all about whether a chat turn was in progress -- a manual ``git pull`` plus
+  a double-click could kill the bridge mid-turn. ``--bridge-action`` scans the SAME watched
+  directories RECURSIVELY (:func:`_bridge_newer_than`, reusing
+  ``tools.deploy_freshness.newer_than``) and asks the SAME bridge ``/status`` probe
+  (:func:`_bridge_state`) the server's own "is a bridge turn live" input already uses, then
+  reuses :func:`decide_post_update_action` unchanged -- a stale-but-idle bridge is
+  ``swap-needed``, a stale-and-busy bridge is ``report-only``, and an unchanged bridge is
+  ``noop`` whatever ``/status`` says.
+
+The decision functions are pure (no I/O, no side effects) so they can be exercised
+directly from pytest on any OS. The I/O -- the run markers, the bridge's /status, file
+times -- lives in the underscore readers and the CLI at the bottom, which prints one
+verdict word; it is deliberately thin so that what is tested is what runs.
+
+Stdlib only (plus this repository's own tools/deploy_freshness and
+bench/ui_build_check, imported lazily by the sub-commands that need them). No
+Windows-specific calls: this runs in the Linux CI test job.
 """
 
 from __future__ import annotations
@@ -49,7 +74,22 @@ if _REPO_ROOT not in sys.path:
 #: the server process, so touching them must not trigger a server swap (that would
 #: break the "re-running is a no-op" contract for the common docs-only update).
 SERVER_CODE_PREFIXES: tuple[str, ...] = ("relay/", "tools/")
-SERVER_CODE_FILES: frozenset[str] = frozenset({"main.py"})
+#: requirements.txt names the PACKAGES the running server imported, so a change to it is a change
+#: the running server cannot see either. start_all.ps1 (Invoke-DependencySync) asks this rule with
+#: exactly that path after it has brought .venv up to date, so a server still holding the old
+#: packages is swapped by the same "never while a run or a bridge turn is live" decision as for a
+#: code change -- rather than by a second, separate restart path.
+SERVER_CODE_FILES: frozenset[str] = frozenset({"main.py", "requirements.txt"})
+
+#: Directories the BRIDGE itself imports from. copilot_bridge.py's own import lines name
+#: ``bridge.session_store``, ``bridge.review_command``, ``relay.copilot_autopilot_relay``,
+#: ``relay.relay_fleet``, ``relay.skills`` and ``tools.tool_probe`` -- so, like
+#: deploy_freshness.WATCHED for the server, the conservative and verifiable unit is the WHOLE
+#: directory each of those lives under, not the literal name list (a new import inside
+#: relay/ or tools/ must not have to be added here by hand to stay covered). ``bridge/`` is
+#: additionally watched because that is the bridge's own package -- the one directory the
+#: server's WATCHED never needed, since main.py does not import it.
+BRIDGE_WATCHED: tuple[str, ...] = ("bridge", "relay", "tools")
 
 
 def _normalize(path: str) -> str:
@@ -59,7 +99,12 @@ def _normalize(path: str) -> str:
     might hand us a backslash path or a leading ``./``; normalize both so the prefix
     test below cannot be fooled by cosmetics. Never touches the filesystem.
     """
-    p = path.strip().replace("\\\\", "/")
+    # ONE backslash, not two. This read replace("\\\\", "/") -- a DOUBLE backslash -- so a
+    # Windows path with single separators ("tools\x.py") was never normalised and was
+    # classified as not-server-code; only the doubled form a test happened to use passed
+    # (new-PC analysis D29). A doubled separator still classifies after this: "a//b" keeps
+    # its prefix.
+    p = path.strip().replace("\\", "/")
     if p.startswith("./"):
         p = p[2:]
     return PurePosixPath(p).as_posix() if p else p
@@ -90,7 +135,8 @@ def python_side_changed(changed_paths) -> bool:
     return any(is_server_code_path(p) for p in changed_paths if p and p.strip())
 
 
-def classify_staleness(started_head, current_head, server_running: bool) -> str:
+def classify_staleness(started_head, current_head, server_running: bool,
+                       watched_changed=None) -> str:
     """One word describing the running server vs the checkout.
 
     * ``"no_server"``  -- nothing is running, so there is nothing to be stale.
@@ -104,6 +150,24 @@ def classify_staleness(started_head, current_head, server_running: bool) -> str:
     Pure: the caller supplies both SHAs and the liveness flag. ``current_head`` being
     missing is itself ``unknown`` -- without a HEAD to compare to, nothing can be
     concluded.
+
+    ``watched_changed`` SEPARATES "THE COMMIT MOVED" FROM "THIS SERVER'S CODE MOVED".
+    A different SHA was the whole rule until 2026-09-17, so a commit touching only docs, only
+    the cockpit, or only tests turned the server dot amber and told the operator that fixes
+    were not live -- when nothing the server loads had changed at all. Measured that day: the
+    dot went amber three times in an afternoon, every time for a commit, and each time a person
+    had to notice and clear it. A dot that is amber for reasons the reader knows are irrelevant
+    is a dot that stops being read, which is the failure it exists to prevent.
+
+    The distinction was already in this repository and unused here: tools/deploy_freshness
+    knows which paths the server imports (WATCHED, pinned against main.py's real imports), and
+    decide_post_update_action twenty lines below already answers "noop -- no server code
+    changed" for docs-only updates.
+
+      * ``None``  -- the caller could not tell. The SHA rule stands, which is the conservative
+                     side: reporting stale when it might be is better than the reverse.
+      * ``False`` -- nothing the server imports changed. A different SHA is then not staleness.
+      * ``True``  -- something it imports changed. Stale, as before.
     """
     if not server_running:
         return "no_server"
@@ -111,7 +175,11 @@ def classify_staleness(started_head, current_head, server_running: bool) -> str:
     cur = (current_head or "").strip()
     if not sh or not cur:
         return "unknown"
-    return "current" if sh == cur else "stale"
+    if sh == cur:
+        return "current"
+    if watched_changed is False:
+        return "current"
+    return "stale"
 
 
 def decide_post_update_action(python_changed: bool, fleet_running: bool) -> str:
@@ -144,6 +212,11 @@ def fleet_is_running(marker_states) -> bool:
     Mirrors the supervisor's own rule: a marker with a DEAD pid is a crashed run, not
     a live one, so it does not count. Pure: the caller does the Test-Path / pid probe
     and hands in booleans.
+
+    THE CONSERVATIVE BRANCHES LIVE IN THE STATES, NOT HERE. A marker whose pid cannot be
+    read, a status.json that says running, a bridge that answers but not intelligibly --
+    each is handed in as (True, True) by :func:`_run_states`, so this stays a plain ``any``
+    and the "unreadable counts as live" rule cannot be lost by calling it directly.
     """
     return any(present and pid_alive for present, pid_alive in marker_states)
 
@@ -173,45 +246,156 @@ def _read_marker(marker_path: str):
     return raw.split()[0]
 
 
+def _load_json(path):
+    try:
+        with open(path, "r", encoding="utf-8-sig") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _marker_state(path):
+    """(present, pid_alive) for one active-run marker, conservative on a bad pid.
+
+    Not a dict (absent, empty, corrupt) -> (False, False): there is no marker to honour.
+    A dict whose pid cannot be read -> (True, True): a marker exists and nothing proves its
+    run is dead, so it counts as live -- the rule _run_appears_live always had.
+    """
+    marker = _load_json(path)
+    if not isinstance(marker, dict):
+        return (False, False)
+    try:
+        pid = int(marker.get("pid"))
+    except (TypeError, ValueError):
+        return (True, True)
+    return (True, _pid_alive(pid))
+
+
+def _run_states(fleet_dir: str):
+    """The (present, alive) pairs :func:`fleet_is_running` is asked about, for <fleet_dir>.
+
+    1. The fleet run: fleet_run_active.json when it is a usable marker (live iff its pid
+       is alive -- a dead pid is a crashed run and is NOT rescued by status.json, exactly
+       as before); only when there is no marker does status.json running==True count.
+    2. The review run: review_run_active.json, written by bench/review_run.py and resumed
+       by the supervisor. It was NOT READ HERE AT ALL, so a server swap could land in the
+       middle of a live review pipeline -- the one run the "never drop a live run" rule was
+       written for by name.
+    """
+    fleet = _marker_state(os.path.join(fleet_dir, "fleet_run_active.json"))
+    if not fleet[0]:
+        status = _load_json(os.path.join(fleet_dir, "status.json"))
+        running = isinstance(status, dict) and status.get("running") is True
+        fleet = (running, running)
+    review = _marker_state(os.path.join(fleet_dir, "review_run_active.json"))
+    return [fleet, review]
+
+
 def _run_appears_live(fleet_dir: str) -> bool:
     """Best-effort: does <fleet_dir> show a LIVE fleet/review run?
 
     Mirrors relay/fleet_reaper.py's authoritative signal WITHOUT its side effects
-    (we never finalize/reap here -- start_all only needs a read). Order:
-      1. fleet_run_active.json present with an int pid -> live iff that pid is alive.
-      2. No usable marker -> status.json with running==True is treated as live.
-      3. Anything unreadable/ambiguous -> True (conservative: withhold the swap).
+    (we never finalize/reap here -- start_all only needs a read). See :func:`_run_states`
+    for the order; anything unreadable or ambiguous counts as live (withhold the swap).
 
     The pid-liveness check reuses relay.fleet_reaper's own helper when importable, so
     this cannot drift from what the reaper considers alive; if that import fails we
     fall back to os.kill(pid, 0)/psutil and, failing even that, to the safe default.
     """
-    active_path = os.path.join(fleet_dir, "fleet_run_active.json")
-    status_path = os.path.join(fleet_dir, "status.json")
+    return fleet_is_running(_run_states(fleet_dir))
 
-    def _load(path):
+
+def _bridge_state(url):
+    """(present, busy) for the chat bridge's /status, the second half of the supervisor's
+    idle rule (Invoke-StaleServerCycle: a fleet run OR the bridge reporting turn_running /
+    busy). A bridge turn can be in the middle of a tool call through this server.
+
+    Nothing listening -> (False, False): no bridge, no turn -- the ordinary state right after
+    a reboot, so it must not block the restart the daily start exists to make. Answered with
+    JSON -> busy iff turn_running or busy is true. Anything else (timeout, an error page,
+    garbage) -> (True, True): unreadable is busy, as in the supervisor.
+
+    GET /status only. It holds no page lock and drives nothing; the bridge's page-touching
+    endpoints are never called from here.
+    """
+    if not url:
+        return (False, False)
+    import urllib.error
+    import urllib.request
+    # NO PROXY. A corporate HTTP_PROXY in the environment would otherwise send a request for
+    # 127.0.0.1 to the proxy, and its error page would read as "busy" for ever.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(url, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+    except urllib.error.URLError as exc:
+        if isinstance(getattr(exc, "reason", None), ConnectionRefusedError):
+            return (False, False)
+        return (True, True)
+    except ConnectionRefusedError:
+        return (False, False)
+    except Exception:
+        return (True, True)
+    if not isinstance(body, dict):
+        return (True, True)
+    return (True, body.get("turn_running") is True or body.get("busy") is True)
+
+
+def _bridge_newer_than(when, repo):
+    """[(relpath, mtime)] under BRIDGE_WATCHED modified after ``when``, newest first.
+
+    Reuses ``tools.deploy_freshness.newer_than`` -- the SAME recursive ``os.walk`` the
+    server's ``--server-action`` already trusts -- so a change inside a subpackage
+    (``relay/selfimprove/``, ``tools/auto/``) is seen here too, not just at the top level.
+    That top-level-only scan was exactly the bug in start_all.ps1's old ``Bridge-Is-Outdated``
+    (a plain ``Get-ChildItem`` with no ``-Recurse``).
+
+    ``main.py`` IS EXCLUDED. ``newer_than`` always appends it, since it is the server's own
+    entrypoint, but ``copilot_bridge.py`` never imports ``main`` -- counting it would restart
+    the bridge over a server-only change the bridge cannot even see.
+    """
+    from tools.deploy_freshness import newer_than
+    return [(rel, m) for rel, m in newer_than(when, repo, watched=BRIDGE_WATCHED)
+            if rel.replace("\\", "/") != "main.py"]
+
+
+def stale_ui_targets(ui_dir: str, targets, extra_inputs=("app.manifest",)):
+    """[(name, reason)] for each UI target whose exe has to be (re)built before it is run.
+
+    ``targets`` is [(name, [source.cs, ...])] -- the Build lines of ui/rebuild_ui.ps1 as
+    bench/ui_build_check.py parses them, never a list written out here. reason is one of
+    ``missing``, ``empty`` (a zero-length exe: an interrupted csc or copy) or
+    ``older-than:<file>`` (a source, or the manifest the build embeds, changed after the exe
+    was written -- a manual ``git pull`` that nothing rebuilt).
+
+    TRUSTED BY EXISTENCE, IT RAN YESTERDAY'S BINARY. start_all launched ui\\<name>.exe
+    whenever the file existed; only its own update path rebuilt, so a pull made by hand left
+    the windows on the old code with nothing saying so, and a 0-byte exe was "built"
+    (new-PC analysis D27).
+    """
+    out = []
+    for name, sources in targets:
+        exe = os.path.join(ui_dir, name + ".exe")
         try:
-            with open(path, "r", encoding="utf-8") as fh:
-                return json.load(fh)
-        except (OSError, ValueError):
-            return None
-
-    marker = _load(active_path)
-    if isinstance(marker, dict):
-        raw_pid = marker.get("pid")
-        try:
-            pid = int(raw_pid)
-        except (TypeError, ValueError):
-            pid = None
-        if pid is not None:
-            return _pid_alive(pid)
-        # marker present but no usable pid -> cannot confirm dead -> conservative live.
-        return True
-
-    status = _load(status_path)
-    if isinstance(status, dict) and status.get("running") is True:
-        return True
-    return False
+            st = os.stat(exe)
+        except OSError:
+            out.append((name, "missing"))
+            continue
+        if st.st_size == 0:
+            out.append((name, "empty"))
+            continue
+        newest = None
+        for rel in list(sources) + [p for p in extra_inputs
+                                    if os.path.isfile(os.path.join(ui_dir, p))]:
+            try:
+                m = os.path.getmtime(os.path.join(ui_dir, rel))
+            except OSError:
+                continue
+            if m > st.st_mtime and (newest is None or m > newest[1]):
+                newest = (rel, m)
+        if newest:
+            out.append((name, "older-than:" + newest[0]))
+    return out
 
 
 def _pid_alive(pid: int) -> bool:
@@ -239,14 +423,120 @@ def _pid_alive(pid: int) -> bool:
     return True
 
 
+def _cli_server_action(rest) -> int:
+    """start_all's single question: should the running server be stopped?
+
+        --server-action --fleet-dir D [--bridge-status URL] --started-epoch E [--repo R]
+            "did anything the server imports change after it started?" -- every file
+            tools/deploy_freshness.newer_than finds, which walks tools/ and relay/ RECURSIVELY
+            (the old PowerShell scan read their top level only) plus main.py.
+        --server-action --fleet-dir D [--bridge-status URL]
+            with the ``git diff --name-only`` list on stdin: the post-update form.
+
+    Prints ``why:`` evidence lines, then ONE verdict word as the last line: noop,
+    report-only or swap-needed. Anything that goes wrong raises, exits non-zero and prints
+    no verdict, which the caller must read as "leave the server alone".
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="stale_server_check.py --server-action")
+    ap.add_argument("--fleet-dir", required=True)
+    ap.add_argument("--bridge-status", default=None)
+    ap.add_argument("--started-epoch", type=float, default=None)
+    ap.add_argument("--repo", default=_REPO_ROOT)
+    a = ap.parse_args(rest)
+    if a.started_epoch is not None:
+        from tools.deploy_freshness import newer_than
+        newer = newer_than(a.started_epoch, a.repo)
+        changed = bool(newer)
+        for rel, _m in newer[:5]:
+            print("why: newer than the running server: %s" % rel.replace("\\", "/"))
+    else:
+        paths = sys.stdin.read().splitlines()
+        changed = python_side_changed(paths)
+        for p in [p for p in paths if is_server_code_path(p)][:5]:
+            print("why: the update changed %s" % _normalize(p))
+    # The markers and the bridge are read only when the code changed: an unchanged server is
+    # a no-op whatever is running, which is decide_post_update_action's own first rule.
+    states = []
+    if changed:
+        states = _run_states(a.fleet_dir) + [_bridge_state(a.bridge_status)]
+    verdict = decide_post_update_action(changed, fleet_is_running(states))
+    for label, (present, alive) in zip(("a fleet run", "a review run", "a bridge turn"), states):
+        if present and alive:
+            print("why: %s is live (or cannot be proven finished)" % label)
+    print(verdict)
+    return 0
+
+
+def _cli_bridge_action(rest) -> int:
+    """start_all's bridge question: should the running bridge be stopped and restarted?
+
+        --bridge-action --started-epoch E [--bridge-status URL] [--repo R]
+
+    The bridge half of the ``--server-action`` fix (see the module docstring). Only the
+    daily/started-epoch form exists -- the bridge is never restarted from a ``git diff``
+    change list the way the post-update tail restarts the server, because start_all only
+    ever restarts the bridge from its own daily "is the running process older than its code"
+    check.
+
+    Prints ``why:`` evidence lines, then ONE verdict word: ``noop``, ``report-only`` or
+    ``swap-needed`` -- the SAME vocabulary ``--server-action`` prints, read by the SAME
+    ``ConvertTo-ServerActionResult`` on the PowerShell side. Anything that goes wrong raises,
+    exits non-zero and prints no verdict, which the caller must read as "leave the bridge
+    alone".
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(prog="stale_server_check.py --bridge-action")
+    ap.add_argument("--bridge-status", default=None)
+    ap.add_argument("--started-epoch", type=float, required=True)
+    ap.add_argument("--repo", default=_REPO_ROOT)
+    a = ap.parse_args(rest)
+    newer = _bridge_newer_than(a.started_epoch, a.repo)
+    changed = bool(newer)
+    for rel, _m in newer[:5]:
+        print("why: newer than the running bridge: %s" % rel.replace("\\", "/"))
+    # As in --server-action: the bridge's own /status is asked only when the code actually
+    # changed. An unchanged bridge is a no-op whatever a turn is doing, and it must never be
+    # probed just to find that out.
+    busy = False
+    if changed:
+        _present, busy = _bridge_state(a.bridge_status)
+        if busy:
+            print("why: a bridge turn is live (or cannot be proven finished)")
+    verdict = decide_post_update_action(changed, busy)
+    print(verdict)
+    return 0
+
+
+def _cli_ui_stale() -> int:
+    """One line per UI target, ``<name> ok`` or ``<name> rebuild <reason>``, from the Build
+    lines bench/ui_build_check.py parses out of ui/rebuild_ui.ps1. That parser raises
+    SystemExit when it finds no Build line, which is a non-zero exit here too: a list that
+    cannot be read must not come back as "everything is current"."""
+    from bench.ui_build_check import UI, targets_from_rebuild_script
+
+    targets = targets_from_rebuild_script()
+    stale = dict(stale_ui_targets(UI, targets))
+    for name, _sources in targets:
+        print("%s rebuild %s" % (name, stale[name]) if name in stale else "%s ok" % name)
+    return 0
+
+
 def main(argv=None) -> int:
-    """CLI with two shapes.
+    """CLI.
 
     Default (doctor):
         stale_server_check.py <marker_path> <current_head> [<server_running>]
       prints one of no_server / unknown / current / stale.
 
-    Sub-command (start_all's Invoke-PostUpdateTail):
+    start_all.ps1:
+        stale_server_check.py --server-action ...   see _cli_server_action
+        stale_server_check.py --bridge-action ...    see _cli_bridge_action
+        stale_server_check.py --ui-stale            see _cli_ui_stale
+
+    Older sub-commands, kept for anything that still calls them (start_all no longer does):
         stale_server_check.py --pyside <changed_path> [<changed_path> ...]
       prints "yes" if any changed path is code the running server imports, else "no".
       The change list may also be supplied one-per-line on stdin when no paths follow
@@ -258,6 +548,12 @@ def main(argv=None) -> int:
     listening". The marker file may be absent -- that is ``unknown``, not an error.
     """
     args = list(sys.argv[1:] if argv is None else argv)
+    if args and args[0] == "--server-action":
+        return _cli_server_action(args[1:])
+    if args and args[0] == "--bridge-action":
+        return _cli_bridge_action(args[1:])
+    if args and args[0] == "--ui-stale":
+        return _cli_ui_stale()
     if args and args[0] == "--pyside":
         paths = args[1:]
         if not paths:

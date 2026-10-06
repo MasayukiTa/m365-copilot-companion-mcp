@@ -11,10 +11,14 @@
 #   .\setup_devtunnel.ps1                 # install+login+ensure tunnel, print the URL
 #   .\setup_devtunnel.ps1 -DeviceCode     # force device-code sign-in (no browser)
 #   .\setup_devtunnel.ps1 -TunnelName foo # use/create a specific tunnel name
+# Exit codes: 0 ready (URL recorded, an access grant in place); 1 failed; 3 set up and URL recorded
+# but NO access grant (none chosen); 4 the chosen grant (A/T) is not on the tunnel when read back.
 param(
     [string]$TunnelName = "",     # empty -> reuse the existing tunnel if there is one, else create a default
     # Entra/tenant-scoped access, applied instead of being printed as a command to type. Empty
-    # means "not chosen"; the anonymous switch is still MCP_TUNNEL_ALLOW_ANONYMOUS.
+    # means "not chosen"; the anonymous switch is still MCP_TUNNEL_ALLOW_ANONYMOUS. Non-empty
+    # SELECTS tenant mode only: devtunnel's --tenant is a flag meaning "the signed-in account's
+    # tenant" and takes no id (D16), so the value itself is displayed, never passed.
     [string]$TenantId = "",
     # THE ANSWER JUST GIVEN, which must beat both the file and the environment. Get-AllowAnonymous
     # reads $env: first and then takes the FIRST matching .env line, so a stale key or an
@@ -29,6 +33,26 @@ $ErrorActionPreference = "Continue"
 $root = Split-Path -Parent $PSScriptRoot
 $DEFAULT_NAME = "m365-copilot-companion"
 
+# Shared PURE helper Test-GeneratedTunnelName (see its header comment in tunnel_name_util.ps1
+# for why only this one function moved there and not the rest of this file's tunnel-name
+# logic). No top-level side effects, so dot-sourcing it here is safe.
+. (Join-Path $PSScriptRoot "tunnel_name_util.ps1")
+
+# PURE (given a file on disk): decides whether a freshly-downloaded devtunnel.exe is trustworthy
+# (INST-10, 2026-09-24). The MZ-magic check the direct-download branch already does only rules
+# out a proxy's HTML block page; it says nothing about who built the binary. Requires BOTH a
+# Valid Authenticode chain AND a Microsoft signer -- measured on this machine's own installed
+# copies (WinGet's and the System32/MSI one) with this exact cmdlet: both report
+# Status=Valid, Subject="CN=Microsoft Corporation, O=Microsoft Corporation, L=Redmond,
+# S=Washington, C=US" -- so this is what a real devtunnel.exe looks like today, not a guess.
+function Test-DevTunnelSignature {
+    param([Parameter(Mandatory)][string]$Path)
+    $sig = Get-AuthenticodeSignature -LiteralPath $Path
+    $subject = if ($sig.SignerCertificate) { $sig.SignerCertificate.Subject } else { "" }
+    $ok = ($sig.Status -eq 'Valid') -and ($subject -match 'O=Microsoft Corporation')
+    return [pscustomobject]@{ Ok = $ok; Status = [string]$sig.Status; Subject = $subject }
+}
+
 # Anonymous tunnel access is an EXPLICIT opt-in (MCP_TUNNEL_ALLOW_ANONYMOUS), default OFF.
 # Granting --allow-anonymous / --anonymous makes this server (file/shell tools on the tunnel's
 # port) reachable by ANYONE on the internet, gated only by the app-layer MCP_API_KEY -- that must
@@ -40,7 +64,7 @@ function Get-AllowAnonymous {
     if (-not $v) {
         $envPath0 = Join-Path $root ".env"
         if (Test-Path $envPath0) {
-            foreach ($ln in Get-Content $envPath0) {
+            foreach ($ln in Get-Content $envPath0 -Encoding UTF8) {
                 if ($ln -match '^MCP_TUNNEL_ALLOW_ANONYMOUS=(.*)$') { $v = $matches[1]; break }
             }
         }
@@ -48,14 +72,64 @@ function Get-AllowAnonymous {
     if (-not $v) { return $false }
     return ($v.Trim().ToLowerInvariant() -in @("1", "true", "yes"))
 }
-$AllowAnonymous = $ForceAnonymous.IsPresent -or (Get-AllowAnonymous)
+
+# ONE ACCESS MODE PER RUN, AND THE MOST RECENT ANSWER WINS: anonymous / tenant / none.
+# The old code computed "$AllowAnonymous = -ForceAnonymous OR .env/env says 1" and then ran
+# `if ($AllowAnonymous) {...} elseif ($TenantId) {...}` -- so a .env still carrying
+# MCP_TUNNEL_ALLOW_ANONYMOUS=1 from an earlier "A" beat a -TenantId given in THIS run, the
+# tenant branch never ran, and nothing anywhere ever REMOVED an anonymous grant. Choosing N or
+# T after A therefore left the file/shell tools reachable from the anonymous internet while
+# the operator was told "no grant yet" / "tenant-scoped" (D4 in the 2026-09-24 new-PC review,
+# rank 1; reproduced with a stub devtunnel: `access create ... --anonymous` twice, no --tenant).
+# Order: -ForceAnonymous (the A just pressed), then -TenantId (the T just answered), then the
+# standing MCP_TUNNEL_ALLOW_ANONYMOUS opt-in, else none. Anything but anonymous now also
+# revokes an existing anonymous grant (section 3b).
+#
+# THE RECORDED T, FOR A RUN WITH NO ARGUMENTS (2026-09-24). T is not written to .env, only to
+# .setup\tunnel_access_choice (quickstart), so this script run on its own -- which doctor,
+# heal_tunnel and start_all all tell people to do to recreate a tunnel -- resolved to "none" and
+# left a recreated tunnel with no grant. A recorded "tenant" is now the standing choice after the
+# anonymous opt-in; anonymous itself still needs MCP_TUNNEL_ALLOW_ANONYMOUS (the documented opt-in).
+function Get-RecordedAccessChoice {
+    $p = Join-Path $root ".setup\tunnel_access_choice"
+    if (-not (Test-Path -LiteralPath $p)) { return "" }
+    foreach ($ln in @(Get-Content -LiteralPath $p -ErrorAction SilentlyContinue)) {
+        if ($ln -match '^\s*access=(\w+)') { return $matches[1].ToLowerInvariant() }
+    }
+    return ""
+}
+function Resolve-AccessMode([bool]$forceAnonymous, [string]$tenantId, [bool]$allowAnonymousSetting, [string]$recordedChoice = "") {
+    if ($forceAnonymous) { return "anonymous" }
+    if (-not [string]::IsNullOrWhiteSpace($tenantId)) { return "tenant" }
+    if ($allowAnonymousSetting) { return "anonymous" }
+    if ($recordedChoice -eq "tenant") { return "tenant" }
+    return "none"
+}
+$anonSetting = Get-AllowAnonymous
+$recordedChoice = Get-RecordedAccessChoice
+$AccessMode = Resolve-AccessMode $ForceAnonymous.IsPresent $TenantId $anonSetting $recordedChoice
+if (-not $ForceAnonymous.IsPresent -and [string]::IsNullOrWhiteSpace($TenantId) -and -not $anonSetting -and $AccessMode -eq "tenant") {
+    Write-Host "      Tenant-only access, as recorded by quickstart in .setup\tunnel_access_choice."
+}
+$AllowAnonymous = ($AccessMode -eq "anonymous")
 if ($ForceAnonymous.IsPresent) {
     Write-Host "      Anonymous access was chosen for this run (-ForceAnonymous)."
+} elseif ($AccessMode -eq "tenant") {
+    Write-Host "      Tenant-only access was chosen for this run (-TenantId)."
+    if ($anonSetting) {
+        Write-Host "      MCP_TUNNEL_ALLOW_ANONYMOUS=1 (in .env or the environment) is IGNORED for this run:"
+        Write-Host "      the tenant choice just made wins, and any anonymous grant is removed below."
+    }
 }
 
 # Run devtunnel and return stdout lines with the welcome/banner/upgrade noise stripped.
+# THE RESOLVED PATH, NOT THE BARE NAME. `& devtunnel` searches PATH (with PATHEXT), while
+# Start-Process devtunnel (sign-in, host) goes through ShellExecute, which also looks in
+# System32 first -- on a machine with an IT-deployed System32 copy plus a winget/direct one,
+# the two could run DIFFERENT binaries. Section 1 sets this to the one binary it found.
+$script:DtExe = "devtunnel"
 function Dt {
-    $out = & devtunnel @args 2>&1 | Out-String
+    $out = & $script:DtExe @args 2>&1 | Out-String
     return ($out -split "`r?`n" | Where-Object {
         $_ -and ($_ -notmatch 'Welcome to dev tunnels|License Terms|Privacy Statement|Report issues on|devtunnel --help|older version|upgrade to the latest|using one of|Direct download:|Package manager|^\s*$') })
 }
@@ -65,72 +139,157 @@ function Dt {
 # create the same default name WILL collide) can be resolved with a name that is unique per
 # machine/user yet stable across re-runs on that same machine (the URL must not keep changing --
 # Copilot Studio is registered against it). Lowercase alnum only, valid for a devtunnel id.
-function Get-MachineSuffix {
-    $seed = "$env:COMPUTERNAME|$env:USERNAME"
-    $sha1 = [System.Security.Cryptography.SHA1]::Create()
-    try {
-        $bytes = $sha1.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($seed))
-    } finally {
-        $sha1.Dispose()
-    }
-    $hex = -join ($bytes | ForEach-Object { $_.ToString("x2") })
-    return $hex.Substring(0, 6)
-}
+#
+# ONE MACHINE IDENTITY, THE SAME ONE bootstrap.py USES (D22 in the 2026-09-24 new-PC review).
+# This file stamped and compared %COMPUTERNAME% (the NetBIOS name, cut at 15 characters) and
+# hashed SHA1(COMPUTERNAME|USERNAME)[:6]; bootstrap.py stamps platform.node() (the DNS host
+# name, not cut) and hashes sha256(lower(node|user))[:8]. On a host name longer than 15
+# characters the two stamps differ, so each tool read the other's stamp as "another machine"
+# and set the URL aside on every run, and a tunnel bootstrap created and could not record was
+# unknown to this script, which then created a second one. Both are now bootstrap's scheme:
+#   host   = platform.node()  == socket.gethostname() == [Net.Dns]::GetHostName(), lowercased
+#   user   = getpass.getuser() == first non-empty of LOGNAME, USER, LNAME, USERNAME
+#   suffix = sha256(lower(host + "|" + user)) hex, first 8
+# The OLD identity is still recognised (Get-LegacyHost / Get-LegacyMachineSuffix) so an install
+# made before this change keeps its URL: its stamp counts as this machine and is rewritten to
+# the new form on the next successful run, and its `<default>-<sha1 6>` tunnel is reused.
+# Get-ThisHost / Get-LegacyHost / Get-ThisUser / Get-MachineSuffix / Get-LegacyMachineSuffix
+# live in tunnel_name_util.ps1 (dot-sourced above) since 2026-09-24, so heal_tunnel.ps1 -- which
+# runs on every start_all -- uses the same identity.
+# Test-GeneratedTunnelName (a name THIS repository generates, default + optional hex machine
+# suffix) now lives in tunnel_name_util.ps1, dot-sourced above -- it used to be defined here,
+# byte-for-byte duplicated (except its name) as Test-GeneratedTunnelNameDoctor in doctor.ps1,
+# and hand-kept in sync with both that copy and bootstrap.py's _is_generated_tunnel_name.
+# Callers below pass only $name, relying on the shared function's $DefaultName default
+# ("m365-copilot-companion"), which has always equaled this file's own $DEFAULT_NAME.
 
 # Privacy guard: some tunnel names leak an identifying (organization/user) token to the
 # GLOBAL devtunnels.ms namespace, which is visible to Microsoft and to the tunnel owner.
-# These two SHA-256 values are a blocklist of the specific leaked token and the specific
-# leaked full tunnel name seen in the wild -- the plaintext is intentionally never written
-# here; only its hash is, so this file cannot itself leak it. Hashing is over the UTF-8
-# bytes of the lowercased input, hex-encoded lowercase.
-$script:TOKEN_SHA256 = "2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04"  # gitleaks:allow
-$script:FULLNAME_SHA256 = "5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261"  # gitleaks:allow
-
-function Get-Sha256Hex([string]$s) {
-    $sha256 = [System.Security.Cryptography.SHA256]::Create()
-    try {
-        $bytes = $sha256.ComputeHash([System.Text.Encoding]::UTF8.GetBytes($s))
-    } finally {
-        $sha256.Dispose()
-    }
-    return (-join ($bytes | ForEach-Object { $_.ToString("x2") }))
-}
-
-# Detects whether a candidate dev tunnel name leaks an identifying token. Returns $true if
-# the name (or one of its hyphen/underscore/dot/space-separated tokens) is identifying,
-# $false otherwise (including an empty/whitespace name -- nothing to leak, "no name set").
-function Test-IdentifyingTunnelName([string]$name) {
-    if ([string]::IsNullOrWhiteSpace($name)) { return $false }
-    $lower = $name.ToLowerInvariant()
-
-    # 1. Whole-name blocklist hash match.
-    if ((Get-Sha256Hex $lower) -eq $script:FULLNAME_SHA256) { return $true }
-
-    # 2. Per-token blocklist hash match.
-    $tokens = @($lower -split '[^a-z0-9]+' | Where-Object { $_ })
-    foreach ($t in $tokens) {
-        if ((Get-Sha256Hex $t) -eq $script:TOKEN_SHA256) { return $true }
-    }
-
-    # 3. Generic runtime checks (no hash needed) -- catches folder-derived / user-derived
-    #    names on any machine, beyond the specific blocklist above.
-    $repoLeaf = (Split-Path -Leaf $root).ToLowerInvariant()
-    $userName = ("$env:USERNAME").ToLowerInvariant()
-    foreach ($t in $tokens) {
-        if (($repoLeaf -and $t -eq $repoLeaf) -or ($userName -and $t -eq $userName)) { return $true }
-    }
-    if (($repoLeaf -and $lower.Contains($repoLeaf)) -or ($userName -and $lower.Contains($userName))) { return $true }
-
-    return $false
-}
+# Test-IdentifyingTunnelName (with its SHA-256 blocklist) lives in tunnel_name_util.ps1 since
+# 2026-09-24, shared with heal_tunnel.ps1; it reads this script's $root.
 
 # Non-fatal notes collected from tolerated (idempotent "already exists") non-zero devtunnel exits,
 # surfaced later only if the tunnel ultimately fails to come up -- so the real CLI text is visible
 # instead of silently swallowed.
 $script:DtWarnings = @()
 
+# --- 0. a URL this machine did not mint must not survive a failed run -------------------------
+# A devtunnel URL is reachable only while a machine HOSTS that tunnel, so it is a fact about a
+# machine -- and .env is carried to the new PC, which is how a new machine is normally set up.
+# Sixteen `exit 1` paths lie between here and the block that rewrites .env, and the first ones
+# are "CLI not installed" and "not signed in", which is precisely the state a fresh PC is in.
+# So on that machine the inherited URL survived the failed run intact, quickstart's
+# `findstr MCP_TUNNEL_URL=..*` gate saw a non-empty value and let the operator continue, and
+# copilot_studio_values.ps1 printed the old machine's address to paste into Copilot Studio.
+# Reported from a real new-PC setup, 2026-09-08.
+#
+# It is COMMENTED OUT, not deleted: an install predating MCP_TUNNEL_HOST has no stamp and is
+# indistinguishable from an inherited one, and blanking a URL that machine legitimately owns
+# would cost it a working connector if this run then fails. The commented line keeps the value
+# readable while making the readiness gate correctly report "not ready".
+#
+# AND THE NAME, WHEN THE .env PROVABLY CAME FROM ANOTHER MACHINE (D7 in the 2026-09-24 new-PC
+# review). Setting aside only the URL kept MCP_TUNNEL_NAME, section 3 then reused that name
+# whenever this account owned it -- which it does when the same Microsoft account is signed in
+# on both PCs -- and BOTH machines hosted one tunnel: the relay split Copilot Studio's calls
+# between them, each saw only some, and doctor was green on both. "Provably" = a host stamp
+# naming a different machine, or (no stamp) a generated default name whose hash suffix is not
+# this machine's. Which keys go is not decided here: tools/env_portability.py's
+# merge_for_new_machine classifies what cannot travel, and this section sets aside the tunnel
+# keys it names -- one copy of the rules, not two. A .env with NO stamp and a custom name is
+# still left its name: nothing proves it foreign, and dropping a name this machine really owns
+# would change a working URL. The rule (Get-EnvTunnelProvenance), the classifier call
+# (Get-MachineBoundTunnelKeys) and the set-aside (ConvertTo-EnvLinesWithKeysAside) live in
+# tunnel_name_util.ps1 since 2026-09-24, so heal_tunnel.ps1 applies the same ones every start.
+$foreignWhy = ""
+try {
+    $envPath1 = Join-Path $root ".env"
+    if (Test-Path $envPath1) {
+        $envLines1 = @(Get-Content $envPath1 -Encoding UTF8)
+        $urlLine   = $envLines1 | Where-Object { $_ -match '^MCP_TUNNEL_URL=..*' } | Select-Object -First 1
+        $hostLine  = $envLines1 | Where-Object { $_ -match '^MCP_TUNNEL_HOST=(.+)$' } | Select-Object -First 1
+        $nameLine  = $envLines1 | Where-Object { $_ -match '^MCP_TUNNEL_NAME=(.+)$' } | Select-Object -First 1
+        $recorded  = ""
+        if ($hostLine -match '^MCP_TUNNEL_HOST=(.+)$') { $recorded = $matches[1].Trim().ToLower() }
+        $recName   = ""
+        if ($nameLine -match '^MCP_TUNNEL_NAME=(.+)$') { $recName = $matches[1].Trim() }
+        $me        = Get-ThisHost
+        $prov      = Get-EnvTunnelProvenance -RecordedHost $recorded -RecordedName $recName -DefaultName $DEFAULT_NAME
+        $stampIsMine = [bool]$prov.StampIsMine
+        $foreignWhy = [string]$prov.ForeignReason
+        if ($stampIsMine -and ($recorded -ne $me)) {
+            Write-Host "[0/4] .env's host stamp '$recorded' is this machine under its old (NetBIOS) name;"
+            Write-Host "      it is rewritten as '$me' when this run records the URL."
+        }
+        if ($foreignWhy) {
+            $aside = Get-MachineBoundTunnelKeys $envPath1
+            if ($null -eq $aside) {
+                Write-Host "[0/4] ERROR: .env came from another machine ($foreignWhy),"
+                Write-Host "      and tools\env_portability.py -- which decides which values cannot move to a"
+                Write-Host "      new machine -- could not be run, because no Python was found or it failed."
+                Write-Host "      Nothing was changed. Run setup.bat (it installs Python into .venv), then run"
+                Write-Host "      quickstart.bat again."
+                exit 1
+            }
+            Write-Host "[0/4] .env came from another machine: $foreignWhy."
+            Write-Host "      That tunnel belongs to the other machine. Hosting it here too would make BOTH"
+            Write-Host "      machines serve one URL and split Copilot Studio's calls between them, so these"
+            Write-Host ("      are set aside (kept as comments): " + ($aside -join ", "))
+            Write-Host "      This run gives this machine its own tunnel; paste its NEW URL into Copilot Studio."
+            $rewritten = ConvertTo-EnvLinesWithKeysAside $envLines1 $aside "set aside by setup_devtunnel.ps1: made on another machine, not valid on this one"
+            [IO.File]::WriteAllLines($envPath1, [string[]]$rewritten, (New-Object System.Text.UTF8Encoding($false)))
+        } elseif ($urlLine -and -not $stampIsMine) {
+            Write-Host "[0/4] .env holds a tunnel URL with no record of which machine minted it."
+            Write-Host "      That address is not reachable unless this machine hosts that tunnel, so it is"
+            Write-Host "      set aside (kept as a comment) until this run records one for this machine."
+            $rewritten = @()
+            foreach ($ln in $envLines1) {
+                if ($ln -match '^MCP_TUNNEL_URL=..*') {
+                    $rewritten += "# set aside by setup_devtunnel.ps1: minted elsewhere, not valid on this machine"
+                    $rewritten += ("# " + $ln)
+                } else {
+                    $rewritten += $ln
+                }
+            }
+            # No-BOM UTF-8: ASCII would drop non-ASCII lines to '?', and PS 5.1's -Encoding UTF8
+            # emits a BOM that breaks the .env parser.
+            [IO.File]::WriteAllLines($envPath1, $rewritten, (New-Object System.Text.UTF8Encoding($false)))
+        }
+    }
+} catch {
+    # NOT A WARNING ONCE THE .env IS KNOWN TO BE FOREIGN. Carrying on would reuse the other
+    # machine's tunnel name, which is D7 itself -- measured: a classifier call that threw here
+    # printed this WARN and the run then hosted the carried tunnel.
+    if ($foreignWhy) {
+        Write-Host "[0/4] ERROR: .env came from another machine ($foreignWhy), and setting its tunnel"
+        Write-Host "      values aside failed: $($_.Exception.Message)"
+        Write-Host "      Nothing was hosted. Fix the error above (or delete the MCP_TUNNEL_* lines from .env"
+        Write-Host "      by hand), then run quickstart.bat again."
+        exit 1
+    }
+    Write-Host "[0/4] WARN: could not check whether .env's tunnel URL belongs to this machine: $($_.Exception.Message)"
+}
+
 # --- 1. ensure the CLI is installed ----------------------------------------------------------
-if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
+# WHERE AN INSTALL LANDS, NOT ONLY WHAT PATH SAYS (D9 in the 2026-09-24 new-PC review). winget
+# puts the CLI behind %LOCALAPPDATA%\Microsoft\WinGet\Links and the direct download below puts
+# it in %LOCALAPPDATA%\devtunnel; both reach PATH only for processes started AFTER the change.
+# This process was started before it, so `Get-Command` failed right after a successful winget
+# install, the 23 MB direct download ran anyway -- and where that download is blocked, STEP 4
+# failed on a machine that had devtunnel installed. supervisor.ps1:122-134, doctor.ps1 and
+# heal_tunnel.ps1 already look in both places; this is the same lookup.
+function Find-DevTunnelCli {
+    $c = Get-Command devtunnel -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($c) { return $c.Source }
+    if (-not $env:LOCALAPPDATA) { return $null }
+    foreach ($cand in @((Join-Path $env:LOCALAPPDATA "Microsoft\WinGet\Links\devtunnel.exe"),
+                        (Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"))) {
+        if (Test-Path -LiteralPath $cand) { return $cand }
+    }
+    return $null
+}
+$dtFound = Find-DevTunnelCli
+if (-not $dtFound) {
     Write-Host "[1/4] devtunnel CLI not found."
     $installed = $false
     if (Get-Command winget -ErrorAction SilentlyContinue) {
@@ -138,7 +297,9 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
         try {
             winget install --id Microsoft.devtunnel --accept-source-agreements --accept-package-agreements -e --silent | Out-Null
         } catch { }
-        $installed = [bool](Get-Command devtunnel -ErrorAction SilentlyContinue)
+        $dtFound = Find-DevTunnelCli
+        $installed = [bool]$dtFound
+        if ($installed) { Write-Host "      installed by winget: $dtFound" }
     }
     if (-not $installed) {
         Write-Host "      winget unavailable/failed -> DIRECT DOWNLOAD (no winget needed)..."
@@ -364,6 +525,25 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
             exit 1
         }
 
+        # Checked BEFORE the binary is ever executed (the --version probe below), not after: a
+        # rejected file must never be run, not even with a harmless-looking flag.
+        $dtSig = Test-DevTunnelSignature -Path $exe
+        if (-not $dtSig.Ok) {
+            # LEAVE NOTHING BEHIND, same as the "did not run" case below: a rejected file must not
+            # sit there to be mistaken for an installation on the next attempt.
+            Remove-Item -LiteralPath $exe -Force -ErrorAction SilentlyContinue
+            Write-Host "      ERROR: the downloaded devtunnel.exe did not pass signature verification."
+            $dtSubj = if ($dtSig.Subject) { $dtSig.Subject } else { "(no signer)" }
+            Write-Host "      Authenticode status: $($dtSig.Status); signer: $dtSubj"
+            Write-Host "      A genuine devtunnel.exe is Authenticode-signed by Microsoft Corporation; this is"
+            Write-Host "      not, so it was removed rather than trusted. This is almost always a proxy or DNS"
+            Write-Host "      substituting something else for the real download, not a corrupt file."
+            Write-Host "      Ask IT (or use another PC) to download devtunnel for Windows x64, save it as"
+            Write-Host "      %LOCALAPPDATA%\devtunnel\devtunnel.exe, then run quickstart.bat again."
+            exit 1
+        }
+        Write-Host "      signature: Valid ($($dtSig.Subject))"
+
         # PROVE IT RUNS, THEN PERSIST. The order was the other way round: PATH was extended
         # permanently and only afterwards was the binary tried. When the check failed the bogus
         # file stayed on disk and the PATH entry stayed with it, so the next run saw
@@ -395,26 +575,51 @@ if (-not (Get-Command devtunnel -ErrorAction SilentlyContinue)) {
         }
         if (-not $already) { [Environment]::SetEnvironmentVariable("Path", "$dir;$userPath", "User") }
         Write-Host "      installed devtunnel.exe -> $dir  (added to your PATH; new terminals pick it up)"
+        $dtFound = $exe
     }
 } else {
-    Write-Host "[1/4] devtunnel CLI: already installed"
+    Write-Host "[1/4] devtunnel CLI: already installed ($dtFound)"
+}
+$script:DtExe = $dtFound
+# Children of this run (the hidden sign-in and host below, anything they start) find the same
+# binary by name too.
+$dtDir = Split-Path -Parent $dtFound
+if ($dtDir -and -not (@($env:Path -split ';') | Where-Object { $_.TrimEnd('\') -ieq $dtDir.TrimEnd('\') })) {
+    $env:Path = "$dtDir;$env:Path"
 }
 Write-Host ("      version: " + ((Dt --version) -join " "))
 
 # --- 2. ensure signed in ---------------------------------------------------------------------
+# N (no remote access chosen) MUST NOT reach the interactive sign-in below (Windows Sandbox
+# report, standard user, unattended, 2026-09-24): choosing N still ran the 120s browser poll,
+# then a device-code flow that blocked ~15 minutes and failed with "Verification code
+# expired". N means nothing remote is wanted THIS run -- local chat/fleet keep working without
+# a Dev Tunnel -- so nothing here needs a Microsoft sign-in yet. Checked BEFORE the browser/
+# device-code branches, not after: `devtunnel user login` itself is what blocks, and must never
+# be invoked here. This only matters when the account is not ALREADY signed in (an earlier A/T
+# run's sign-in is reused exactly as before, tunnel and all) -- `user show` is a fast local
+# credential read, not the interactive flow, so checking it first costs nothing.
 $who = (Dt user show) -join " "
 if ($who -match 'Logged in as') {
     Write-Host ("[2/4] sign-in: already signed in -- " + $who)
+} elseif ($AccessMode -eq "none") {
+    Write-Host "[2/4] sign-in: not signed in, and no remote access was chosen for this run (N)."
+    Write-Host "      Skipping the Microsoft sign-in -- it is not needed until Copilot Studio (or"
+    Write-Host "      any other remote caller) actually has to reach this machine. Local chat and"
+    Write-Host "      the fleet keep working without it. Re-run quickstart.bat and press A"
+    Write-Host "      (anonymous) or T (tenant) when you want that; the Dev Tunnel is created and"
+    Write-Host "      the sign-in happens then, not before."
+    exit 3
 } else {
     Write-Host "[2/4] sign-in required. A browser (or a device code) will appear -- complete the Entra ID / Microsoft sign-in."
     if ($DeviceCode) {
         # User forced device-code directly: this prints the URL + code and blocks until done.
-        devtunnel user login -d
+        & $script:DtExe user login -d
     } else {
         # Launch the browser login WITHOUT blocking, then poll for up to 120s so a legitimate MFA
         # browser sign-in has time to complete. We never start the device-code flow while this one
         # may still be running -- only after this window closes without success.
-        Start-Process devtunnel -ArgumentList @("user", "login") -WindowStyle Hidden | Out-Null
+        Start-Process $script:DtExe -ArgumentList @("user", "login") -WindowStyle Hidden | Out-Null
         $signedIn = $false
         for ($i = 0; $i -lt 24; $i++) {
             if (((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true; break }
@@ -426,7 +631,7 @@ if ($who -match 'Logged in as') {
         if (-not $signedIn) {
             Write-Host "      The browser sign-in did not complete in time -> DEVICE CODE."
             Write-Host "      A URL and a short code will be shown below. Open https://microsoft.com/devicelogin and enter the code:"
-            devtunnel user login -d
+            & $script:DtExe user login -d
         }
     }
     $who = (Dt user show) -join " "
@@ -438,23 +643,48 @@ if ($who -match 'Logged in as') {
 }
 
 # --- 3. ensure the tunnel + port exist (idempotent; reuse an existing tunnel) -----------------
+# A LISTING THAT CANNOT BE READ IS NOT AN EMPTY ACCOUNT (D19 in the 2026-09-24 new-PC review).
+# Every decision below -- reuse or create, and whether a create failure is a name collision --
+# rests on this list. An empty or garbled answer (network switch, token refresh, CLI hiccup)
+# used to read as "you own no tunnels", so the recorded name was created again, collided with
+# itself, and the collision branch renamed the tunnel to <name>-<suffix>: a new public URL
+# written to .env while Copilot Studio still pointed at the old one. The same parse doctor.ps1's
+# Test-TunnelOwned uses: at least one tunnel id, or an explicit "no tunnels" answer; anything
+# else stops the run with nothing changed.
+function Get-OwnedTunnelNames([string[]]$listOutput, [int]$exitCode) {
+    if ($exitCode -ne 0) { return $null }
+    $ids = @($listOutput | Select-String -Pattern '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' -AllMatches |
+        ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value })
+    if ($ids.Count -gt 0) { return ,@($ids | ForEach-Object { ($_ -split '\.')[0] }) }
+    if (($listOutput -join "`n") -match '(?i)no (dev )?tunnels|\b0 tunnels') { return ,@() }
+    return $null
+}
 $listed = Dt list
-# All tunnel IDs found in the listing, as "name.cluster".
-$existingIds = @($listed | Select-String -Pattern '^\s*([a-z0-9][a-z0-9-]+\.[a-z0-9]+)\s' -AllMatches |
-    ForEach-Object { $_.Matches } | ForEach-Object { $_.Groups[1].Value })
-# Bare tunnel names (strip the .cluster suffix).
-$existingNames = @($existingIds | ForEach-Object { ($_ -split '\.')[0] })
+$listExit = $LASTEXITCODE
+$existingNames = Get-OwnedTunnelNames $listed $listExit
+if ($null -eq $existingNames) {
+    Write-Host "[3/4] ERROR: 'devtunnel list' did not return a readable list of your tunnels (exit $listExit)."
+    Write-Host "      What it printed:"
+    foreach ($l in @($listed)) { Write-Host ("        " + $l) }
+    Write-Host "      Nothing was created, renamed or written: whether your tunnel already exists is"
+    Write-Host "      decided from this list, and guessing would change the public URL. This is usually"
+    Write-Host "      a passing network or sign-in hiccup -- run quickstart.bat again. If it repeats, run"
+    Write-Host "      'devtunnel list' yourself; if it asks you to sign in, run 'devtunnel user login'."
+    exit 1
+}
 
 # A previous run (or the supervisor) may have recorded the tunnel name in .env.
 # That name MUST win over the default: creating a differently-named tunnel here
 # would rewrite .env and silently break an already-configured Copilot Studio
 # connector pointing at the old URL -- UNLESS that recorded (or explicitly passed)
 # name is itself identifying, in which case privacy wins (see the guard below).
+$tunnelNameSource = ""
+if ($TunnelName) { $tunnelNameSource = "the -TunnelName parameter" }
 if (-not $TunnelName) {
     $envPath0 = Join-Path $root ".env"
     if (Test-Path $envPath0) {
-        foreach ($ln in Get-Content $envPath0) {
-            if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); break }
+        foreach ($ln in Get-Content $envPath0 -Encoding UTF8) {
+            if ($ln -match '^MCP_TUNNEL_NAME=(.+)$') { $TunnelName = $matches[1].Trim(); $tunnelNameSource = ".env (MCP_TUNNEL_NAME)"; break }
         }
     }
 }
@@ -466,6 +696,8 @@ if (-not $TunnelName) {
 # recognized below for backward compatibility with installs created before this change.
 $machineSuffix = Get-MachineSuffix
 $safeDefault = "$DEFAULT_NAME-$machineSuffix"
+# The name the pre-D22 scheme generated on this machine (SHA1 of COMPUTERNAME|USERNAME, 6 hex).
+$legacyDefault = "$DEFAULT_NAME-$(Get-LegacyMachineSuffix)"
 
 # Privacy guard: an explicitly-passed -TunnelName or a name recorded in .env is normally
 # honored as-is (see above) -- UNLESS it is identifying, in which case it must NOT be
@@ -475,7 +707,9 @@ if ($TunnelName -and (Test-IdentifyingTunnelName $TunnelName)) {
     Write-Host ""
     Write-Host "NOTICE: the previous Dev Tunnel name ('$TunnelName') is identifying (it leaks" -ForegroundColor Yellow
     Write-Host "        an organization/user token to the dev tunnel service) and has been" -ForegroundColor Yellow
-    Write-Host "        replaced with a private name for this machine." -ForegroundColor Yellow
+    Write-Host "        replaced with a private name for this machine ('$safeDefault')." -ForegroundColor Yellow
+    # SAID ONLY WHEN IT IS TRUE. Generated names can no longer land here (Test-IdentifyingTunnelName
+    # exempts them), so the replacement is always a different name and a different URL.
     Write-Host "        The PUBLIC URL will change -- after this run, re-paste the new" -ForegroundColor Yellow
     Write-Host "        MCP_TUNNEL_URL into the Copilot Studio MCP connector." -ForegroundColor Yellow
     Write-Host "        Manual cleanup of the old tunnel (optional; not done automatically):" -ForegroundColor Yellow
@@ -493,6 +727,11 @@ if ($TunnelName) {
     # first tunnel.
     $target = $safeDefault
     $reuse = $true
+} elseif ($existingNames -contains $legacyDefault) {
+    # This machine's default under the pre-D22 suffix scheme: same machine, same URL -- reuse it
+    # rather than creating a second tunnel because the hash function changed.
+    $target = $legacyDefault
+    $reuse = $true
 } elseif ($existingNames -contains $DEFAULT_NAME) {
     # Backward-compat: a run from before this change may have created the bare,
     # unsuffixed default name. That name is itself safe/generic (not identifying) --
@@ -503,6 +742,37 @@ if ($TunnelName) {
     $target = $safeDefault
 }
 
+# NEVER ADOPT A TUNNEL ANOTHER MACHINE IS HOSTING RIGHT NOW (2026-09-24). "In this account's list"
+# is all the reuse above asks, and with one Microsoft account signed in on two PCs every tunnel
+# of either PC is in the list. Measured that day: a second PC hosted the first PC's tunnel, the
+# first PC's re-host was knocked off 27 s after it connected, and every call to the first PC's
+# URL went to the second PC. Two hosts on one tunnel cannot both be served; the one that took it
+# last wins until the other takes it back.
+#
+# So a tunnel that `devtunnel show` reports as hosted (Host connections >= 1) while no devtunnel
+# host on THIS machine hosts it is not adopted, whether its name came from .env (carried from
+# the other PC or not), the -TunnelName parameter, or the bare legacy default. This machine gets
+# its own default instead, and the run says so. This machine's OWN default names (current and
+# pre-D22 suffix) are exempt: they are this machine's by construction, so another host on them
+# is the other PC borrowing this one's tunnel, not a reason for this one to move. A count that
+# cannot be read is not evidence of anything and changes nothing.
+# Get-HostConnectionsFromShow / Test-IsTunnelHostCommandLine / Test-ThisMachineHostsTunnel live in
+# tunnel_name_util.ps1 since 2026-09-24; heal_tunnel.ps1 applies the same rule on every start.
+if ($reuse -and ($target -ne $safeDefault) -and ($target -ne $legacyDefault)) {
+    $hostCount = Get-HostConnectionsFromShow (Dt show $target)
+    if ($null -ne $hostCount -and $hostCount -ge 1 -and -not (Test-ThisMachineHostsTunnel $target)) {
+        $from = ""
+        if ($tunnelNameSource -and ($target -eq $TunnelName)) { $from = " (the name came from $tunnelNameSource)" }
+        Write-Host "[3/4] '$target' is in your account, but ANOTHER machine is hosting it right now${from}:" -ForegroundColor Yellow
+        Write-Host "      the relay reports $hostCount host connection(s) and no devtunnel host on this PC." -ForegroundColor Yellow
+        Write-Host "      Adopting it would make both PCs take turns serving one URL, so this PC gets its own" -ForegroundColor Yellow
+        Write-Host "      tunnel '$safeDefault' instead. Paste THIS PC's new URL (printed below) into the" -ForegroundColor Yellow
+        Write-Host "      Copilot Studio connector that should reach this PC; the other PC keeps '$target'." -ForegroundColor Yellow
+        $target = $safeDefault
+        $reuse = ($existingNames -contains $safeDefault)
+    }
+}
+
 if ($reuse) {
     Write-Host "[3/4] reusing existing tunnel: $target"
 } elseif (-not ($existingNames -contains $target)) {
@@ -510,7 +780,7 @@ if ($reuse) {
         Write-Host "[3/4] creating tunnel '$target' (anonymous-reachable, so Copilot Studio can connect)..."
         $createOut = Dt create $target --allow-anonymous
     } else {
-        Write-Host "[3/4] creating tunnel '$target' (NOT anonymous-reachable; MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1)..."
+        Write-Host "[3/4] creating tunnel '$target' (NOT anonymous-reachable; access chosen for this run: $AccessMode)..."
         $createOut = Dt create $target
     }
     $createExit = $LASTEXITCODE
@@ -518,16 +788,33 @@ if ($reuse) {
         $createMsg = ($createOut -join "`n")
         Write-Host "      devtunnel create failed (exit ${createExit}):"
         Write-Host "      $createMsg"
-        if ($createMsg -match 'already exists|already in use|conflict|taken|forbidden|permission') {
+        # ONLY A NAME COLLISION RENAMES. 'forbidden' and 'permission' were in this pattern, so a
+        # sign-in or policy refusal was treated as "the name is taken" and the tunnel was created
+        # under <name>-<suffix> -- a different public URL -- for a failure that had nothing to do
+        # with the name (D19). Those now stop the run with the CLI's own text and nothing renamed.
+        if ($createMsg -match 'already exists|already in use|conflict|taken') {
             $suffix = Get-MachineSuffix
             $newTarget = "$target-$suffix"
-            Write-Host "      name collision in the global devtunnels.ms namespace -> retrying ONCE with a machine-unique name: $newTarget"
-            if ($AllowAnonymous) {
+            Write-Host "      name collision in the global devtunnels.ms namespace -> using a machine-unique name: $newTarget"
+            if ($TunnelName) {
+                Write-Host "      '$target' was recorded in .env but is not in your account's tunnel list, so it belongs"
+                Write-Host "      to another account; this machine's URL will differ from the one recorded."
+            }
+            # AN EARLIER RUN MAY HAVE MADE IT ALREADY. A run interrupted after this create and
+            # before .env was written left '<name>-<suffix>' in the account; the next run collided
+            # again and then failed "already exists" on the retry for ever (B16). The list is
+            # trustworthy here (validated above), so an owned suffixed name is simply reused.
+            if ($existingNames -contains $newTarget) {
+                Write-Host "      '$newTarget' already exists in your account (made by an earlier run) -> reusing it."
+                $createOut2 = @()
+                $createExit2 = 0
+            } elseif ($AllowAnonymous) {
                 $createOut2 = Dt create $newTarget --allow-anonymous
+                $createExit2 = $LASTEXITCODE
             } else {
                 $createOut2 = Dt create $newTarget
+                $createExit2 = $LASTEXITCODE
             }
-            $createExit2 = $LASTEXITCODE
             if ($createExit2 -ne 0) {
                 $createMsg2 = ($createOut2 -join "`n")
                 Write-Host "      ERROR: devtunnel create failed again (exit ${createExit2}):"
@@ -541,8 +828,10 @@ if ($reuse) {
             # and it will be picked up as MCP_TUNNEL_NAME on future re-runs so the URL stays stable.
             $target = $newTarget
         } else {
-            Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
-            Write-Host "      If login/permission, run: devtunnel user login"
+            Write-Host "      devtunnel could not create the tunnel; the error above is from the devtunnel CLI."
+            Write-Host "      Nothing was renamed and .env was not changed."
+            Write-Host "      If it mentions sign-in, permission or 'forbidden', run: devtunnel user login"
+            Write-Host "      (or ask IT whether dev tunnels are allowed for your account), then run quickstart.bat again."
             exit 1
         }
     }
@@ -563,6 +852,56 @@ if (-not ((Dt port list $target) -match ("\b" + [string]$Port + "\b"))) {
             Write-Host "      $portMsg"
             Write-Host "      devtunnel could not create/host the tunnel; the error above is from the devtunnel CLI."
             Write-Host "      If login/permission, run: devtunnel user login"
+            exit 1
+        }
+    }
+}
+
+# Reading access grants. MEASURED on the owner's working machine (see
+# scripts/test_operational_resilience.py): `devtunnel access list <tunnel>` prints an allow entry
+# as "+Anonymous [connect]". The tenant entry's exact text has not been observed here, so it is
+# matched as "+Tenant" / "+Tenants". doctor.ps1's Get-AccessGrantFromListing is the same parse;
+# scripts/test_setup_devtunnel_access_and_identity.py runs both on the same listings.
+function Test-AnonymousInListing([string]$text) { return [bool]($text -match '\+\s*Anonymous\b') }
+function Test-TenantInListing([string]$text) { return [bool]($text -match '\+\s*Tenants?\b') }
+function Get-AccessGrantFromListing([string]$text) {
+    if (Test-AnonymousInListing $text) { return "anonymous" }
+    if (Test-TenantInListing $text) { return "tenant" }
+    return "none"
+}
+# One level's listing as text ($p = 0: the tunnel itself; else that port), or $null when the
+# CLI did not answer successfully.
+function Read-AccessLevel([string]$t, [int]$p) {
+    if ($p) { $o = Dt access list $t -p $p } else { $o = Dt access list $t }
+    if ($LASTEXITCODE -ne 0) { return $null }
+    return (@($o) -join "`n")
+}
+# anonymous / tenant / none across the tunnel and its port, or $null when either level could
+# not be read.
+function Get-TunnelAccessGrant([string]$t, [int]$p) {
+    $a = Read-AccessLevel $t 0
+    $b = Read-AccessLevel $t $p
+    if (($null -eq $a) -or ($null -eq $b)) { return $null }
+    return (Get-AccessGrantFromListing ($a + "`n" + $b))
+}
+function Revoke-AnonymousAccess([string]$t, [int]$p) {
+    foreach ($lvl in @(0, $p)) {
+        $where = "tunnel '$t'"
+        if ($lvl) { $where = "port $lvl of '$t'" }
+        $txt = Read-AccessLevel $t $lvl
+        if (($null -ne $txt) -and -not (Test-AnonymousInListing $txt)) { continue }
+        if ($null -eq $txt) {
+            Write-Host "      could not read the access list of $where -> resetting it so no anonymous grant can remain"
+        } else {
+            Write-Host "      $where has an ANONYMOUS grant from an earlier choice -> removing it (access reset)"
+        }
+        if ($lvl) { $rOut = Dt access reset $t -p $lvl } else { $rOut = Dt access reset $t }
+        $rExit = $LASTEXITCODE
+        if ($rExit -ne 0) {
+            Write-Host "      ERROR: 'devtunnel access reset' failed for $where (exit ${rExit}):"
+            Write-Host ("      " + ($rOut -join "`n      "))
+            Write-Host "      The anonymous grant may still be in place, so this run stops here."
+            Write-Host "      If login/permission, run: devtunnel user login  -- then run quickstart.bat again."
             exit 1
         }
     }
@@ -602,37 +941,124 @@ if ($AllowAnonymous) {
             exit 1
         }
     }
-} elseif ($TenantId) {
-    # APPLIED, NOT PRINTED. This was documented as a command for the operator to type, which is
-    # not something an installer can rely on: the tunnel is unreachable until it is run.
-    # THROUGH Dt, like every other CLI call here. The first version of this line invoked
-    # $DevTunnel, which is not defined anywhere in this file -- so the more restrictive of the
-    # two choices was the one that could not work.
-    Write-Host "      Granting Entra/tenant-scoped access (tenant $TenantId)..."
-    $tenantOut = Dt access create $target --tenant $TenantId
-    $tenantExit = $LASTEXITCODE
-    $tenantOut | ForEach-Object { Write-Host "        $_" }
-    if ($tenantExit -eq 0) {
-        Write-Host "      Tenant-scoped access granted. Copilot Studio can reach this tunnel"
-        Write-Host "      when signed in to that tenant; it is NOT open to the anonymous internet."
-    } else {
-        # A FAILURE OF STEP 4, not a note. A tunnel with no access grant cannot be connected to,
-        # which is the entire reason the choice is offered -- carrying on would hand the operator
-        # a connection test that cannot pass.
-        Write-Host "      ERROR: tenant access grant failed (exit ${tenantExit}). The tunnel is not"
-        Write-Host "      reachable by a remote client until an access grant succeeds."
-        Write-Host "      If login/permission, run: devtunnel user login"
-        exit 1
-    }
 } else {
-    Write-Host "      MCP_TUNNEL_ALLOW_ANONYMOUS is not set to 1 -- skipping anonymous access grant."
-    Write-Host "      This tunnel is NOT anonymously reachable. A remote client (e.g. Copilot Studio)"
-    Write-Host "      will NOT be able to connect until you either:"
-    Write-Host "        (a) set MCP_TUNNEL_ALLOW_ANONYMOUS=1 and re-run this script (accepts exposing"
-    Write-Host "            the server to the anonymous internet, gated only by the MCP_API_KEY"
-    Write-Host "            app-layer key), or"
-    Write-Host "        (b) grant Entra/tenant-scoped access instead, e.g.:"
-    Write-Host "            devtunnel access create $target --tenant <your-tenant-id>"
+    # --- 3b. NOT ANONYMOUS: REVOKE any anonymous grant, then apply what was chosen (D4). ------
+    # Skipping the grant is not enough: a tunnel created or granted anonymous by an earlier run
+    # (or by bootstrap.py) keeps that entry until something removes it, and nothing did.
+    # `devtunnel access` has create / delete -i <index> / reset / list (checked with
+    # `devtunnel access --help`, CLI 1.0.1516). Deleting by index would mean trusting a parse of
+    # the list's numbering, which has not been observed on a real tunnel here; `reset` needs no
+    # parse. So a level (tunnel, or port $Port) whose list shows an anonymous entry -- or whose
+    # list cannot be read, because then the absence of one cannot be shown -- is reset to the
+    # default (owner only). A reset also removes any other entry at that level; the tenant grant
+    # is re-applied afterwards when it is the choice, and the screen says what was reset.
+    Revoke-AnonymousAccess $target $Port
+
+    if ($AccessMode -eq "tenant") {
+        # --tenant IS A FLAG, NOT A VALUE (D16, settled with `devtunnel access create --help`,
+        # CLI 1.0.1516): "-t, --tenant  Allow or deny all users in the current Entra tenant".
+        # `--tenant <GUID>` passed the GUID as a stray argument, so the grant the T choice exists
+        # for could not succeed. The tenant granted is the one of the account devtunnel is signed
+        # in with; the id typed at the prompt cannot be passed to the CLI and is NOT checked
+        # against it.
+        $tunnelLevel = Read-AccessLevel $target 0
+        if (($null -ne $tunnelLevel) -and (Test-TenantInListing $tunnelLevel)) {
+            Write-Host "      Tenant access is already granted on '$target'."
+        } else {
+            Write-Host "      Granting tenant-only access (all users in the Entra tenant of the signed-in account)..."
+            $tenantOut = Dt access create $target --tenant
+            $tenantExit = $LASTEXITCODE
+            $tenantOut | ForEach-Object { Write-Host "        $_" }
+            if ($tenantExit -ne 0 -and -not (($tenantOut -join "`n") -match 'already exists|conflict')) {
+                # A FAILURE OF STEP 4, not a note. A tunnel with no access grant cannot be
+                # connected to, which is the entire reason the choice is offered.
+                Write-Host "      ERROR: tenant access grant failed (exit ${tenantExit}); the CLI's text is above."
+                Write-Host "      No anonymous access was granted, so the tunnel is not reachable by a remote"
+                Write-Host "      client until a grant succeeds. If login/permission, run: devtunnel user login"
+                exit 1
+            }
+        }
+        if ($TenantId) {
+            Write-Host "      The id you entered ($TenantId) is not passed to devtunnel -- it grants the tenant of"
+            Write-Host ("      the signed-in account (" + $who + ").")
+        }
+    }
+}
+
+# --- 3c. SAY WHICH ACCESS THE TUNNEL ENDS THIS RUN WITH, read back from the service. ----------
+# NEVER "READY" WITH NO GRANT (2026-09-24, new-PC report: quickstart finished, doctor then said
+# "No access grant: nothing remote can connect", and the owner had to re-run and press A). Three
+# ways this script ended a run with grant none and exit 0: N (or a prompt nobody answered) chosen;
+# A chosen, `access create` answered "conflict" (tolerated as already-there) while the list read
+# back showed nothing -- a WARN only; T chosen and the read-back showed no entry. Now:
+#   * a read-back that fails is retried before it is believed,
+#   * A that does not show up is granted once more and re-read; still absent -> exit 4,
+#   * T that shows no allow entry at all -> exit 4,
+#   * none chosen -> the tunnel and its URL are still set up and recorded, and the run ends with
+#     exit 3 saying exactly what to choose (quickstart stops there instead of reporting success).
+# The exit codes are quickstart's to explain (bootstrap.py --tunnel-access-advice, EN + JA).
+function Test-AnyAllowEntry([string]$text) { return [bool]($text -match '(?m)^\s*\+\s*\S') }
+$FinalAccess = Get-TunnelAccessGrant $target $Port
+for ($try = 0; ($null -eq $FinalAccess) -and ($try -lt 2); $try++) {
+    Start-Sleep -Seconds 2
+    $FinalAccess = Get-TunnelAccessGrant $target $Port
+}
+if ($AccessMode -eq "anonymous" -and $FinalAccess -and $FinalAccess -ne "anonymous") {
+    Write-Host "      the anonymous grant does not show in the access list read back -> granting it again"
+    [void](Dt access create $target --anonymous)
+    [void](Dt access create $target -p $Port --anonymous)
+    $FinalAccess = Get-TunnelAccessGrant $target $Port
+}
+$accessUnapplied = $false
+if ($AccessMode -eq "anonymous" -and $FinalAccess -and $FinalAccess -ne "anonymous") { $accessUnapplied = $true }
+if ($AccessMode -eq "tenant" -and $FinalAccess -eq "none") {
+    $rawA = Read-AccessLevel $target 0
+    $rawB = Read-AccessLevel $target $Port
+    if (Test-AnyAllowEntry ([string]$rawA + "`n" + [string]$rawB)) {
+        # An allow entry whose wording this parse does not know (the tenant entry's exact text has
+        # not been observed on a real tunnel). It is a grant; it is not "none".
+        $FinalAccess = "tenant"
+        Write-Host "      (the tenant entry's wording was not recognised; an allow entry is present)"
+    } else {
+        $accessUnapplied = $true
+    }
+}
+Write-Host ""
+switch ($FinalAccess) {
+    "anonymous" {
+        Write-Host "  ACCESS: ANONYMOUS -- anyone who has the URL reaches this server; your Bearer token" -ForegroundColor Yellow
+        Write-Host "          (MCP_API_KEY) is the only gate in front of the file and shell tools." -ForegroundColor Yellow
+    }
+    "tenant" {
+        Write-Host "  ACCESS: TENANT ONLY -- a caller must present an Entra sign-in of your tenant to the"
+        Write-Host "          tunnel. NOT VERIFIED: a Copilot Studio connector set up with an API key (as this"
+        Write-Host "          project documents) sends no such sign-in, so it is NOT expected to get through."
+        Write-Host "          If STEP 5's connection test fails, run quickstart.bat again and choose A."
+    }
+    "none" {
+        Write-Host "  ACCESS: NONE -- no remote client (Copilot Studio included) can connect to this tunnel." -ForegroundColor Yellow
+        Write-Host "          To allow it, run quickstart.bat again and choose A (anonymous) or T (tenant)." -ForegroundColor Yellow
+    }
+    default {
+        Write-Host "  ACCESS: COULD NOT BE READ BACK ('devtunnel access list $target' failed)." -ForegroundColor Yellow
+        Write-Host "          Check it yourself with that command before relying on the tunnel." -ForegroundColor Yellow
+    }
+}
+if ($AccessMode -ne "anonymous" -and $FinalAccess -eq "anonymous") {
+    Write-Host "  ERROR: '$AccessMode' access was chosen but the tunnel is still anonymous-reachable." -ForegroundColor Red
+    Write-Host "         Remove it by hand:  devtunnel access reset $target   and" -ForegroundColor Red
+    Write-Host "                             devtunnel access reset $target -p $Port" -ForegroundColor Red
+    Write-Host "         then run quickstart.bat again." -ForegroundColor Red
+    exit 1
+}
+if ($accessUnapplied) {
+    $key = "A"
+    if ($AccessMode -eq "tenant") { $key = "T" }
+    Write-Host "  ERROR: '$AccessMode' access was chosen, but the tunnel's access list read back shows no" -ForegroundColor Red
+    Write-Host "         such grant, so nothing remote can connect. Run quickstart.bat again and press $key;" -ForegroundColor Red
+    Write-Host "         if this repeats, look at:  devtunnel access list $target   and" -ForegroundColor Red
+    Write-Host "                                    devtunnel access list $target -p $Port" -ForegroundColor Red
+    exit 4
 }
 
 # --- 4. host the tunnel so the public URL is assigned, then surface it ------------------------
@@ -648,7 +1074,7 @@ function Tunnel-Url($name) {
 $url = Tunnel-Url $target
 if (-not $url) {
     Write-Host "[4/4] hosting the tunnel to obtain its public URL (a few seconds)..."
-    Start-Process devtunnel -ArgumentList @("host", $target) -WindowStyle Hidden | Out-Null
+    Start-Process $script:DtExe -ArgumentList @("host", $target) -WindowStyle Hidden | Out-Null
     for ($i = 0; $i -lt 20; $i++) {
         Start-Sleep -Seconds 2
         $url = Tunnel-Url $target
@@ -666,6 +1092,9 @@ if ($url) {
     Write-Host ""
     Write-Host " Paste this URL (plus your MCP endpoint path) into the Copilot"
     Write-Host " Studio MCP connector. The tunnel name is: $target"
+    $accessWord = $FinalAccess
+    if (-not $accessWord) { $accessWord = "unknown (could not be read back)" }
+    Write-Host " Access this tunnel ends the run with: $accessWord  (details under ACCESS: above)"
 } else {
     if ($script:DtWarnings.Count -gt 0) {
         Write-Host " devtunnel CLI messages captured along the way (may explain the failure):"
@@ -684,10 +1113,13 @@ if ($url) {
     try {
         $envPath = Join-Path $root ".env"
         if (Test-Path $envPath) {
-            $lines = @(Get-Content $envPath | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=' })
+            $lines = @(Get-Content $envPath -Encoding UTF8 | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=|^MCP_TUNNEL_HOST=' })
             $lines += "# devtunnel (auto) -- the public URL to register in Copilot Studio; supervisor hosts MCP_TUNNEL_NAME"
             $lines += "MCP_TUNNEL_NAME=$target"
-            Set-Content -Path $envPath -Value $lines -Encoding ASCII
+            # NOT -Encoding ASCII (drops every non-ASCII line to '?') and NOT
+            # -Encoding UTF8 (PS 5.1 writes a BOM, which folds into the first key
+            # name and breaks the .env parser). UTF8Encoding($false) is no-BOM.
+            [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
         }
     } catch { }
     exit 1
@@ -698,12 +1130,29 @@ Write-Host "==================================================================="
 try {
     $envPath = Join-Path $root ".env"
     if (Test-Path $envPath) {
-        $lines = @(Get-Content $envPath | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=' })
+        $lines = @(Get-Content $envPath -Encoding UTF8 | Where-Object { $_ -notmatch '^# devtunnel \(auto\)|^MCP_TUNNEL_NAME=|^MCP_TUNNEL_URL=|^MCP_TUNNEL_HOST=' })
         $lines += "# devtunnel (auto) -- the public URL to register in Copilot Studio; supervisor hosts MCP_TUNNEL_NAME"
         $lines += "MCP_TUNNEL_NAME=$target"
         $lines += "MCP_TUNNEL_URL=$url"
-        Set-Content -Path $envPath -Value $lines -Encoding ASCII
+        # WHICH MACHINE MINTED IT. A devtunnel URL is reachable only while a
+        # machine hosts that tunnel, and .env is carried to a new PC during
+        # setup -- so without this, bootstrap.py sees a non-empty URL belonging
+        # to the old machine and skips provisioning. Reported 2026-09-08.
+        # bootstrap.py's identity (platform.node(), lowercased), not %COMPUTERNAME% -- D22.
+        $lines += "MCP_TUNNEL_HOST=$(Get-ThisHost)"
+        # No-BOM UTF-8: ASCII would drop non-ASCII lines to '?', and PS 5.1's
+        # -Encoding UTF8 emits a BOM that breaks the .env parser.
+        [IO.File]::WriteAllLines($envPath, $lines, (New-Object System.Text.UTF8Encoding($false)))
         Write-Host "Recorded MCP_TUNNEL_NAME and MCP_TUNNEL_URL in .env."
+        if ($FinalAccess -eq "none") {
+            # Set up, recorded -- and NOT ready: no grant was chosen (see 3c). Exit 3, never 0.
+            Write-Host ""
+            Write-Host "NOT READY: the tunnel has NO access grant, so Copilot Studio cannot connect to it." -ForegroundColor Yellow
+            Write-Host "  Run quickstart.bat again and press A (anonymous -- what a Copilot Studio connector" -ForegroundColor Yellow
+            Write-Host "  using an API key needs; the Bearer token is the only gate) or T (your Entra tenant" -ForegroundColor Yellow
+            Write-Host "  only; not verified to work with an API-key connector)." -ForegroundColor Yellow
+            exit 3
+        }
     } else {
         Write-Host "ERROR: .env not found at $envPath -- cannot record MCP_TUNNEL_URL."
         exit 1

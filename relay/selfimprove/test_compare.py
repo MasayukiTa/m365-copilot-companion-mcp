@@ -6,6 +6,7 @@
 最良の1回だけを見せる表示が揃うと、それは p-hacking 装置になる。
 """
 import json
+import os
 
 import pytest
 
@@ -221,6 +222,19 @@ def test_every_attempt_on_a_pair_is_kept_not_the_best_one(env, monkeypatch, tmp_
     got = C.attempts_for("fast", "slow")
     assert len(got) == 2
     assert [r["verdict"] for r in got] == [C.VERDICT_NONE, C.VERDICT_A]
+
+
+def test_the_recorded_harness_id_comes_from_runtime_configs_own_function(env, monkeypatch,
+                                                                          tmp_path):
+    """`_active_harness_id` は `M.harness_id(RC.active_manifest(...))` を自前で再計算していた
+    -- runtime_config.active_harness_id() と同じ式を別の場所に書いた重複。ここでは
+    `RC.active_harness_id` を差し替えて、記録された値がその差し替えを実際に通ることを見る。"""
+    from relay.selfimprove import runtime_config as RC
+    _clean(monkeypatch, tmp_path)
+    monkeypatch.setattr(RC, "active_harness_id", lambda refresh=False: "stubbed-harness-id")
+    req = C.enqueue("fast", "slow", archive=env)
+    row = C.record(req, _order(400), _order(350), C.decide(_order(400), _order(350)))
+    assert row["active_harness_id"] == "stubbed-harness-id"
 
 
 def test_a_refusal_at_run_time_is_recorded_against_the_request(env, monkeypatch, tmp_path):
@@ -499,6 +513,39 @@ def test_withdrawing_rewrites_nothing(env, monkeypatch, tmp_path):
     assert raw_after.startswith(raw_before), "既存の行が書き換えられている"
 
 
+def test_the_cli_has_a_withdraw_subcommand(env, monkeypatch, tmp_path, capsys):
+    """`withdraw` 自体を呼ぶ手段が `_cli` に無かった -- 読み手 (`history`) は配線されて
+    いたのに、書き手をオペレータが実際に叩ける場所が無かった。"""
+    _clean(monkeypatch, tmp_path)
+    req = C.enqueue("fast", "slow", archive=env)
+    C.record(req, _order(400), _order(350), C.decide(_order(400), _order(350)))
+    rc = C._cli(["withdraw", req["id"], "one ordering never ran"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert "withdrawn" in out
+    rows = C.attempts_for("fast", "slow")
+    assert rows[0]["verdict"] == "WITHDRAWN"
+
+
+def test_the_cli_has_a_materialize_subcommand(env, monkeypatch, tmp_path, capsys):
+    """`materialize_to_file` を名前付きブランチに対して叩く手段が operator 側に無かった。
+    `MCP_HARNESS_MANIFEST` へ子プロセスを向けるための唯一の書き手を CLI から呼べること
+    を確認する。"""
+    _clean(monkeypatch, tmp_path)
+    monkeypatch.setattr(C, "_archive", lambda: env)
+    rc = C._cli(["materialize", "fast"])
+    assert rc == 0
+    out = capsys.readouterr().out
+    lines = out.splitlines()
+    written_path = lines[0]
+    assert os.path.isfile(written_path)
+    with open(written_path, encoding="utf-8") as fh:
+        written = json.load(fh)
+    expected = BR.resolve("fast", archive=env)["manifest"]
+    assert written == expected
+    os.unlink(written_path)
+
+
 # ---- 計器が自分の測定範囲を宣言すること -----------------------------------------------------------
 
 def test_the_scope_is_declared_by_the_instrument_not_by_this_module():
@@ -555,9 +602,9 @@ def test_every_public_name_is_defined_before_the_entry_point():
 
 def test_the_cli_runs_as_a_module_not_only_as_an_import():
     """import 経由でしか確かめないと、この種の欠陥は最後まで見えない。"""
-    import subprocess
     import sys
-    out = subprocess.run([sys.executable, "-m", "relay.selfimprove.compare", "--help"],
-                         capture_output=True, text=True, timeout=120)
+    from tools.childproc import run as _run_child
+    out = _run_child([sys.executable, "-m", "relay.selfimprove.compare", "--help"],
+                      timeout=120)
     assert out.returncode == 0, out.stderr[-400:]
     assert "branches" in out.stdout and "history" in out.stdout

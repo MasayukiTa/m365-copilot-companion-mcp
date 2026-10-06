@@ -120,3 +120,14 @@ def test_no_comment_still_claims_the_socket_cannot_reach_work_iq():
     policy = (__import__("pathlib").Path(RF.__file__).parent / "transport_policy.py"
               ).read_text(encoding="utf-8", errors="replace")
     assert "IS FALSE" in policy, "否定の記録側が消えている"
+
+
+def test_worker_specific_retry_evidence_overrides_the_coarse_outcome():
+    src = inspect.getsource(RF.run_relay_fleet)
+    assert 'getattr(worker, "retryable_override", None)' in src
+    assert 'return bool(_override)' in src
+
+
+def test_deterministic_terminal_branches_set_retry_override_false():
+    src = inspect.getsource(RF.RelayWorker._decide_impl)
+    assert src.count("self.retryable_override = False") >= 4

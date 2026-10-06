@@ -28,8 +28,18 @@ import json
 import os
 import re
 
+from relay import invariants as _inv
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 TRANSCRIPTS = os.path.join(REPO, ".fleet", "transcripts")
+
+#: A reader that cannot read is worse than a reader that stops. See the check at the end of
+#: load_completions for the measurement this was written from.
+_INV_TRANSCRIPTS_READABLE = _inv.register(
+    "reconciler.transcripts_are_readable", "relay.fleet_reconcile", _inv.RAISE,
+    "load_completions matched transcript files and returned nothing: the reconciler would "
+    "compare every worker's claim against an empty evidence set and report the result as "
+    "though it had looked")
 
 #: Where a claim stops and its supporting evidence starts. Splitting here is what lets two
 #: workers that AGREE on a verdict but cite different pages read as agreement rather than as a
@@ -153,10 +163,31 @@ def load_completions(run=None, transcripts=TRANSCRIPTS):
     """{goal_key: [(worker, goal, final_message)]} for transcripts that reached a final message."""
     out = collections.defaultdict(list)
     pattern = os.path.join(transcripts, ("%s*" % run) if run else "*")
-    for path in glob.glob(pattern + ".jsonl"):
+    # COMPRESSED TRANSCRIPTS ARE STILL TRANSCRIPTS. This globbed only "*.jsonl" and opened with
+    # io.open, and the retention job gzips transcripts as they age -- so a run's record fell out
+    # of this function's view a few days after it finished, silently: the dict just got smaller.
+    # Measured 2026-09-13 on the live directory: 2 plain files, 1555 .gz, and load_completions()
+    # returned 2 goals. A reconciler that compares a worker's claim against its transcript was
+    # working from 0.1% of the record.
+    #
+    # `fleet_retention.open_maybe_gz` was written for this and had no caller: "a reader that has
+    # to know is a reader that will one day be added without knowing." Two other readers had
+    # already re-implemented it independently.
+    #
+    # Names are collapsed to the uncompressed form because a just-compressed run can have both
+    # files for a moment, and open_maybe_gz prefers the plain one -- so each transcript is read
+    # exactly once whichever forms exist.
+    from relay.fleet_retention import open_maybe_gz as _open_maybe_gz
+
+    seen = []
+    for found in glob.glob(pattern + ".jsonl") + glob.glob(pattern + ".jsonl.gz"):
+        plain = found[:-3] if found.endswith(".gz") else found
+        if plain not in seen:
+            seen.append(plain)
+    for path in seen:
         goal, last = None, None
         try:
-            for ln in io.open(path, encoding="utf-8", errors="replace"):
+            for ln in _open_maybe_gz(path):
                 ln = ln.strip()
                 if not ln:
                     continue
@@ -170,6 +201,17 @@ def load_completions(run=None, transcripts=TRANSCRIPTS):
         if goal and last:
             key = hashlib.sha1(goal.encode("utf-8")).hexdigest()[:10]
             out[key].append((os.path.basename(path), goal, last))
+    # THE POST-CONDITION THAT WAS FALSE FOR WEEKS AND COST NOTHING TO BE FALSE. This globbed
+    # only "*.jsonl" while retention gzips transcripts as they age, so it returned 2 goals out
+    # of 1557 transcripts and the reconciler compared claims against 0.1% of the evidence.
+    # Nothing raised; the dict was simply smaller. It RAISES now, because a reconciler that
+    # reports on a twentieth of a percent of the record is worse than one that stops. `seen` is
+    # what this function actually matched, so an empty result with files in hand means the
+    # READING broke; a run filter matching no transcript leaves `seen` empty too, and that is a
+    # legitimately empty answer rather than a violation.
+    _inv.assert_invariant(_INV_TRANSCRIPTS_READABLE, out or not seen,
+                 "matched %d transcript file(s) and read none of them" % len(seen),
+                 transcripts=transcripts, run=run or "")
     return out
 
 

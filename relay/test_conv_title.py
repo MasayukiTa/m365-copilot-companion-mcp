@@ -161,14 +161,24 @@ def test_the_real_archive_stops_repeating(tmp_path):
     if len(rows) < 50:
         pytest.skip("archive too small to say anything")
 
+    # Mirror fleet_runner._register_convs's own key precedence (url, then the transcript
+    # path, and only then the title) -- not reinvent it. Every row in this archive has an
+    # empty "url" (these are local `source: "fleet"` workers, not Copilot-URL conversations),
+    # so falling back straight to "title" collapses the key for every row sharing one of the
+    # three mass-produced titles (732/172/153 rows) down to that one identical string, which
+    # made neutral_title()'s hash tag identical across all of them too -- the fallback that
+    # exists specifically to give indistinguishable rows something unique ended up giving them
+    # nothing of the kind. "transcript" is the one field this archive does carry unique per
+    # row (1083 distinct paths, one per session), same as production's `tr`.
     first = [CT.make_title((r.get("title") or "").strip(),
                            existing=(r.get("title") or "").strip(),
-                           key=(r.get("url") or r.get("title") or ""), when=r.get("ts"))
+                           key=(r.get("url") or r.get("transcript") or r.get("title") or ""),
+                           when=r.get("ts"))
              for r in rows]
     counts = Counter(first)
     final = []
     for r, d in zip(rows, first):
-        key = r.get("url") or (r.get("title") or "")
+        key = r.get("url") or r.get("transcript") or (r.get("title") or "")
         n = counts[d]
         if n < 3:
             final.append(d)
@@ -177,7 +187,33 @@ def test_the_real_archive_stops_repeating(tmp_path):
         else:
             final.append(CT.neutral_title(key, r.get("ts")))
 
-    before = len({(r.get("title") or "").strip() for r in rows})
-    assert len(set(final)) > before * 3, "titles are still collapsing onto each other"
+    raw = [(r.get("title") or "").strip() for r in rows]
+    before = len(set(raw))
+    after = len(set(final))
+
+    # `after > before * 3` USED TO BE THE ASSERTION, AND IT WAS UNSATISFIABLE HERE.
+    #
+    # That multiplier encoded ONE archive's shape -- the comment above describes 1083 rows
+    # whose three mass-produced titles covered 732/172/153 of them, where `before` was tiny and
+    # `after` was nearly the row count. It is not a property of the rule under test.
+    #
+    # Measured 2026-09-11 on this machine: 85 rows, 34 distinct raw titles. `after` can never
+    # exceed the ROW COUNT, so the bar was 102 against a ceiling of 85 -- no implementation,
+    # however correct, could pass it. And it had been invisible because the archive sat under
+    # the 50-row skip above until a day's fleet runs pushed it over, so the first time this
+    # test ever really ran, it failed for arithmetic rather than for a defect.
+    #
+    # What the rule actually promises is stated directly instead: disambiguation may never make
+    # the archive LESS distinguishable, and the collapse it exists to break must actually be
+    # broken. Both hold whatever shape the archive happens to have.
+    assert after >= before, (
+        "disambiguation made titles less distinct than the raw archive (%d -> %d)"
+        % (before, after))
+    worst_before = Counter(raw).most_common(1)[0][1]
+    worst_after = Counter(final).most_common(1)[0][1]
+    if worst_before >= 3:
+        assert worst_after < worst_before, (
+            "the biggest pile of identical titles (%d rows) came through unchanged"
+            % worst_before)
     assert not CT.repeated(final, 3), "something is still shared by three or more rows"
     assert all(f.strip() for f in final), "a title came out empty"

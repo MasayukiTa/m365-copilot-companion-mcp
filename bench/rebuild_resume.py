@@ -26,8 +26,8 @@ def main():
         safe = fname(g)
         folder = os.path.join(bench, safe)
         try:
-            r = subprocess.run([sys.executable, eval_py, safe, folder],
-                               capture_output=True, text=True, timeout=40)
+            from tools.childproc import run as _run_child
+            r = _run_child([sys.executable, eval_py, safe, folder], timeout=40)
             ok = r.returncode == 0
         except Exception:
             ok = False

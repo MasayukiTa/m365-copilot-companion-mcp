@@ -1,14 +1,17 @@
 @echo off
-REM Build the native WPF fleet cockpit with the C# compiler that ships with Windows.
-REM No Visual Studio, no .NET SDK, no Node. Then launch it.
+REM Build and launch the WPF fleet cockpit.
+REM
+REM THIS FILE NO LONGER CARRIES A SOURCE LIST. It used to spell out which .cs go into
+REM FleetCockpit.exe, which made it the third of four copies of one fact -- and on 2026-09-22 the
+REM copies drifted: ui\FleetCommands.cs was added to rebuild_ui.ps1 and to nothing else, so CI's
+REM C# build broke with "CS0103: The name 'FleetCommands' does not exist in the current context"
+REM and THIS FILE was broken too, silently, for anybody who ran it. A list nobody compiles is a
+REM list nobody notices going stale.
+REM
+REM rebuild_ui.ps1 is what actually produces the shipped binaries, so it owns the list. It also
+REM removes the race this pair of .bats created: each of them ended with `start <exe>`, and the
+REM cockpit relaunches CopilotChat, so building them one after the other could leave an OLD chat
+REM running. Building both is the point, not an extra cost.
 setlocal
-set "FW=C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
-set "CSC=%FW%\csc.exe"
-set "WPF=%FW%\WPF"
-if not exist "%CSC%" ( echo ERROR: csc.exe not found - .NET Framework 4.x required & exit /b 1 )
-REM /win32manifest embeds app.manifest (Per-Monitor V2 DPI) so the OS loader marks the process
-REM DPI-aware at creation -> crisp on high-DPI/secondary monitors instead of bitmap-stretched.
-"%CSC%" /nologo /target:winexe /win32manifest:"%~dp0app.manifest" /out:"%~dp0FleetCockpit.exe" /r:"%WPF%\PresentationFramework.dll" /r:"%WPF%\PresentationCore.dll" /r:"%WPF%\WindowsBase.dll" /r:"%FW%\System.Xaml.dll" /r:"%FW%\System.Web.Extensions.dll" /r:"%FW%\System.Windows.Forms.dll" "%~dp0FleetCockpit.cs" "%~dp0SelfImproveDashboard.cs" "%~dp0Theme.cs"
-if errorlevel 1 ( echo BUILD FAILED & exit /b 1 )
-echo BUILD OK: %~dp0FleetCockpit.exe
-start "" "%~dp0FleetCockpit.exe"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0rebuild_ui.ps1"
+exit /b %ERRORLEVEL%

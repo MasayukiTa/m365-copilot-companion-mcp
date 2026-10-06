@@ -51,7 +51,7 @@ def test_the_cooldown_counts_from_the_last_recycle_not_from_the_start():
 
 
 def test_the_marker_is_set_where_the_recycle_happens():
-    src = _src(RF.RelayWorker._decide)
+    src = _src(RF.RelayWorker._decide_impl)
     i = src.index("self._recycles += 1")
     assert "_heap_recycle_turn" in src[i:i + 200], (
         "リサイクルしたのに前回位置が更新されない。次のターンでまた発火する")
@@ -59,7 +59,7 @@ def test_the_marker_is_set_where_the_recycle_happens():
 
 def test_the_worker_does_not_reset_its_global_turn_budget_on_recycle():
     """リセットすると max_turns が無限になる。ヒープ用の目印を別に持つ理由。"""
-    src = _src(RF.RelayWorker._decide)
+    src = _src(RF.RelayWorker._decide_impl)
     i = src.index("self._recycles += 1")
     body = src[i:i + 1400]
     assert "self.turn = 0" not in body, "会話リサイクルで総ターン予算が巻き戻っている"
@@ -74,7 +74,7 @@ def test_it_reuses_the_existing_recycle_road():
     いた。組み立てが _recycle_job() に切り出された時点で、**性質は保たれたまま文面だけが
     消えて**落ちた。ソース断言はその形で壊れるので、片方は実行して確かめる。
     """
-    src = _src(RF.RelayWorker._decide)
+    src = _src(RF.RelayWorker._decide_impl)
     i = src.index("heavy = ")
     # ブロックの終わりまで見る。最初の `return` で切ると、再アンカーの手前にある
     # stuck 経路の return を境界にしてしまい、通っているものを見落とす。
@@ -97,7 +97,7 @@ def test_the_recycle_road_actually_re_anchors_the_goal():
 
 def test_exhaustion_still_wins_and_is_not_relabelled():
     """トークン枯渇はヒープとは別の事象。同じ道を通るが、理由は取り違えない。"""
-    src = _src(RF.RelayWorker._decide)
+    src = _src(RF.RelayWorker._decide_impl)
     assert "not conversation_exhausted(resp)) and self._memory_pressure()" in src, (
         "枯渇しているのにヒープ由来と記録され得る")
     assert "会話トークン上限" in src and "ヒープ" in src
@@ -115,7 +115,7 @@ def test_an_unreadable_heap_never_triggers_and_never_raises():
 
 
 def test_every_turn_records_its_heap_so_the_threshold_can_be_measured():
-    src = _src(RF.RelayWorker._decide)
+    src = _src(RF.RelayWorker._decide_impl)
     assert 'metric(self.turn, "heap_mb"' in src, "ターンごとの実測が残らない"
 
 

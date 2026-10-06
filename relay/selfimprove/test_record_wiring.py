@@ -126,7 +126,7 @@ def test_infra_failure_is_not_recorded_as_a_functional_failure(tmp_path):
 
 # ---- 凍結ゲートは記録より先に効く ----------------------------------------------------------------
 
-def test_a_changed_frozen_set_aborts_before_anything_is_recorded(tmp_path):
+def test_a_changed_frozen_set_aborts_before_anything_is_recorded(tmp_path, monkeypatch):
     """記録は「走った」ことの証拠であり、走ってはいけない走行の証拠を残してはならない。
 
     凍結セットが変わっている＝判定器が無傷でない、という状態では run_candidate は
@@ -138,21 +138,44 @@ def test_a_changed_frozen_set_aborts_before_anything_is_recorded(tmp_path):
     path = tmp_path / "records.jsonl"
     baseline = _isolated_baseline(tmp_path)
 
-    # 凍結対象の1つを、このテストの中だけで書き換える。
-    target = os.path.join(F.REPO, F.FROZEN_MANIFEST[0])
-    original = open(target, "rb").read()
-    try:
-        with open(target, "ab") as fh:
-            fh.write(b"\n# touched by a test\n")
-        assert F.frozen_intact(baseline_path=baseline)[0] is False, "改変が検出されていない"
-        out = _run(_controller(tmp_path, records_path=str(path), baseline_path=baseline))
-    finally:
-        with open(target, "wb") as fh:
-            fh.write(original)
+    # 検出器自体は本物のファイル変更で試す。ただし**リポジトリのファイルではなく**、
+    # 使い捨ての木の上で。以前は実リポの FROZEN_MANIFEST[0] に追記し finally で戻していたが、
+    # プロセスが殺されれば finally は走らない。実際 2026-09-09 にマーカーが2つ残っており、
+    # 憲法ファイルが改変済みのまま = 凍結ゲートが落ち、自己改善ループが止まっていた。
+    # しかも「誰かが意図して編集した」と見分けがつかない。
+    #
+    # frozen_intact は repo_root を引数で受ける。この木に対して snapshot すれば、他の21件は
+    # 両辺とも MISSING で一致するので、判定を動かせるのはここで触る1ファイルだけになる。
+    import shutil
+    fake_repo = tmp_path / "fakerepo"
+    rel = F.FROZEN_MANIFEST[0]
+    # EVERY manifest entry, not just the one under test. snapshot_baseline refuses a set with
+    # missing files -- "these pin nothing" -- because a baseline that pins nothing reports
+    # INTACT forever. 22 files, ~420 KB; copying them all is cheaper than the assumption.
+    for _rel in F.FROZEN_MANIFEST:
+        _dst = fake_repo / _rel
+        _dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(os.path.join(F.REPO, _rel), str(_dst))
+    copy = fake_repo / rel
+    fake_baseline = str(tmp_path / "fake_baseline.json")
+    F.snapshot_baseline(repo_root=str(fake_repo), baseline_path=fake_baseline)
+    assert F.frozen_intact(repo_root=str(fake_repo), baseline_path=fake_baseline)[0] is True, \
+        "使い捨ての木が最初から不一致"
+    with open(str(copy), "ab") as fh:
+        fh.write(b"\n# touched by a test\n")
+    assert F.frozen_intact(repo_root=str(fake_repo), baseline_path=fake_baseline)[0] is False, \
+        "改変が検出されていない"
+
+    # コントローラ側の性質。このファイルの他のテストと同じく差し替えで与える――
+    # ここで固定したいのは「凍結セットが変わっているとき、記録を1行も書かずに止まる」であって、
+    # チェックサムの計算そのものではない（そちらは直上で実ファイルを使って確かめた）。
+    monkeypatch.setattr(F, "frozen_intact",
+                        lambda repo=None, repo_root=None, baseline=None, baseline_path=None,
+                               manifest=None: (False, [rel]))
+    out = _run(_controller(tmp_path, records_path=str(path), baseline_path=baseline))
 
     assert out["decision"]["state"] == "INFRA_ABORT"
     assert not path.exists(), "止まるべき走行がエピソード記録を残した"
-    assert F.frozen_intact(baseline_path=baseline)[0] is True, "後始末が効いていない"
 
 
 # ---- 供給できないものは供給しない -----------------------------------------------------------------

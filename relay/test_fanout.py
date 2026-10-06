@@ -66,6 +66,61 @@ def test_a_repeated_step_is_not_run_twice():
     assert len(fo.subtasks_from(body)) == 2
 
 
+def test_trailing_dependent_merge_is_not_launched_as_a_parallel_child():
+    body = (
+        "1. Review slides 1-5 and save partial_1.md\n"
+        "2. Review slides 6-10 and save partial_2.md\n"
+        "3. Review slides 11-15 and save partial_3.md\n"
+        "4. Review slides 16-20 and save partial_4.md\n"
+        "5. Read the outputs from subtasks 1-4 and merge them into final.md\n"
+        + READY
+    )
+    assert fo.subtasks_from(body) == [
+        "Review slides 1-5 and save partial_1.md",
+        "Review slides 6-10 and save partial_2.md",
+        "Review slides 11-15 and save partial_3.md",
+        "Review slides 16-20 and save partial_4.md",
+    ]
+
+
+def test_observed_japanese_tail_aggregator_is_removed():
+    body = (
+        "1. S1〜S5をレビューし _partial_S01-05.md に保存\n"
+        "2. S6〜S10をレビューし _partial_S06-10.md に保存\n"
+        "3. S11〜S15をレビューし _partial_S11-15.md に保存\n"
+        "4. S16〜S20をレビューし _partial_S16-20.md に保存\n"
+        "5. サブタスク1〜4が生成した4ファイルを読み込み、S1〜S20を統合して最終ファイルに保存\n"
+        + READY
+    )
+    got = fo.subtasks_from(body)
+    assert len(got) == 4
+    assert all("統合" not in step for step in got)
+    assert got[-1].startswith("S16〜S20")
+
+
+def test_a_dependency_in_the_middle_refuses_the_whole_split():
+    body = (
+        "1. Collect January records\n"
+        "2. Read subtask 1 results and validate them\n"
+        "3. Collect March records\n"
+        + READY
+    )
+    assert fo.subtasks_from(body) == []
+
+
+def test_self_reference_does_not_count_as_a_cross_subtask_dependency():
+    body = (
+        "1. Subtask 1: collect January records\n"
+        "2. Subtask 2: collect February records\n"
+        + READY
+    )
+    assert len(fo.subtasks_from(body)) == 2
+
+
+def test_split_prompt_forbids_a_parallel_merge_child():
+    assert "Do not add a merge/aggregation subtask" in fo.SPLIT_JOB
+
+
 def test_prose_with_no_list_yields_nothing():
     assert fo.subtasks_from("分割は不要です。このまま進めます。%s" % READY) == []
 
@@ -98,6 +153,27 @@ def test_children_share_one_campaign_and_name_their_parent():
     assert [k["subtask_index"] for k in kids] == [1, 2]
 
 
+
+
+def test_nested_campaign_id_is_scoped_by_the_splitting_task_identity():
+    root = fo.campaign_id_for("same text")
+    # Root compatibility: old persisted campaigns still resolve exactly as before.
+    assert root == fo.campaign_id_for("same text", parent_task_id="")
+    a = fo.campaign_id_for("same text", parent_task_id="outer-c1")
+    b = fo.campaign_id_for("same text", parent_task_id="outer-c2")
+    assert a != b != root
+    assert a == fo.campaign_id_for("same text", parent_task_id="outer-c1")
+
+
+def test_nested_children_get_a_family_unique_to_their_parent_task():
+    steps = ["slice A collect records", "slice B collect records"]
+    a = fo.child_goals("same nested goal", steps, parent_task_id="outer-c1")
+    b = fo.child_goals("same nested goal", steps, parent_task_id="outer-c2")
+    assert a and b
+    assert a[0]["campaign_id"] != b[0]["campaign_id"]
+    assert {k["parent_task_id"] for k in a} == {"outer-c1"}
+    assert {k["parent_task_id"] for k in b} == {"outer-c2"}
+
 def test_the_campaign_id_is_derived_from_the_goal_so_a_resume_rejoins_the_family():
     a = fo.child_goals("同じ目標", ["範囲A を取得する", "範囲B を取得する"])
     b = fo.child_goals("同じ目標", ["範囲A を取得する", "範囲B を取得する"])
@@ -112,11 +188,27 @@ def test_children_do_not_split_again():
                           depth=fo.MAX_DEPTH) == []
 
 
-def test_a_child_inherits_acceptance_checks_and_cwd():
-    kids = fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"],
-                          checks=[{"kind": "file"}], cwd="C:/x")
-    assert kids[0]["checks"] == [{"kind": "file"}]
+def test_a_child_inherits_the_cwd_but_NOT_the_whole_goals_check():
+    """子は作業ディレクトリを継ぐが、**親の受入検査は継がない**。
+
+    以前はこの検査が「継ぐこと」を要求していた。それが欠陥だった。計測(2026-09-13):
+    親の検査 `{"type":"pytest","args":"-q tests/"}` を3分割すると3子とも同一の検査を持ち、
+    一方で子のプロンプトは「他の範囲は別の会話が並行して担当しているので、手を出さないこと」
+    と指示している。厳しい検査なら兄弟が終わるまで永久に通らず、緩い検査(file_exists 等)なら
+    兄弟が作った成果物で**何もしていない子まで通る**（さらに `_salvage_via_checks` が
+    それを salvaged DONE に昇格させる）。
+
+    親の検査は「目標全体が成功したか」を問うもので、それに答えられるのは統合ワーカーだけ。
+    そこへ回す (aggregation_goal の parent_checks)。引数は残さず削除した -- 黙って無視すると
+    既存の呼び出し側は子が検証され続けていると思い込む。
+    """
+    kids = fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"], cwd="C:/x")
     assert kids[0]["cwd"] == "C:/x"
+    assert not kids[0].get("checks"), "子が全体目標の検査を背負っている"
+
+    with pytest.raises(TypeError):
+        fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"],
+                       checks=[{"type": "pytest"}])
 
 
 # ---- putting the answers back together ----------------------------------------------------
@@ -221,6 +313,24 @@ def test_the_merge_joins_the_campaign_it_merges():
     g = fo.aggregation_goal("元の目標", [_r(1, "DONE", "a")])
     assert g["campaign_id"] == kids[0]["campaign_id"]
     assert g["task_id"].endswith("-merge")
+
+
+def test_nested_merge_fallback_uses_the_same_parent_scoped_campaign_as_children():
+    steps = ["slice A collect records", "slice B collect records"]
+    kids = fo.child_goals("same nested goal", steps, parent_task_id="outer-c1")
+    merge = fo.aggregation_goal("same nested goal", [_r(1, "DONE", "a")],
+                                parent_task_id="outer-c1")
+    assert kids
+    assert merge["campaign_id"] == kids[0]["campaign_id"]
+    assert merge["parent_task_id"] == "outer-c1"
+
+
+def test_nested_merge_fallback_changes_with_parent_task_identity():
+    a = fo.aggregation_goal("same nested goal", [_r(1, "DONE", "a")],
+                            parent_task_id="outer-c1")
+    b = fo.aggregation_goal("same nested goal", [_r(1, "DONE", "a")],
+                            parent_task_id="outer-c2")
+    assert a["campaign_id"] != b["campaign_id"]
 
 
 # ---- a slice that was retried ---------------------------------------------------------------

@@ -27,6 +27,15 @@ import subprocess
 import sys
 import tempfile
 import time
+try:                       # bench/ on sys.path (how the swe_* scripts import siblings)
+    import verdicts as _V
+except ImportError:        # repo root on sys.path
+    from bench import verdicts as _V
+try:                       # scratch under the swept temp home; plain %TEMP% if unavailable
+    from relay.temp_home import temp_home as _temp_home
+except ImportError:
+    def _temp_home():
+        return None
 
 # THE HOST COMES FROM THE ENVIRONMENT, WITH NO DEFAULT. It used to default to the machine's
 # actual name, which put an operator's hostname in a public repository -- and a wrong default
@@ -77,6 +86,27 @@ _SSH_BASE = ["ssh", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
              "-o", "ServerAliveInterval=20", SSH_HOST]
 
 
+def _decode_child(raw):
+    """Decode child output without ever raising.
+
+    Delegates to tools.code_exec._decode -- UTF-8 first, then the local codepage with
+    errors="replace" -- so there is one implementation of this and not two. Falls back to a
+    local equivalent only if that import is unavailable, because this module is run as a script
+    from the bench harness and must not fail to start over a decoding helper.
+    """
+    if not raw:
+        return ""
+    try:
+        from tools.code_exec import _decode
+        return _decode(raw)
+    except Exception:
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            import locale
+            return raw.decode(locale.getpreferredencoding(False) or "utf-8", errors="replace")
+
+
 def _ssh_ps(ps_script, timeout=60, tries=3):
     """Run a PowerShell snippet on the eval host via -EncodedCommand. Returns stdout (NULs
     stripped). Retries on the flaky tunnel; returns '' if every attempt is empty."""
@@ -89,9 +119,15 @@ def _ssh_ps(ps_script, timeout=60, tries=3):
     b64 = base64.b64encode(full.encode("utf-16-le")).decode()
     for _ in range(tries):
         try:
+            # BYTES, THEN DECODE. `text=True` with no encoding decodes with the local
+            # codepage (cp932 here), and the eval host's output is not ours to constrain -- a
+            # test name or a traceback can carry anything. The `or ""` below means a decode
+            # failure would NOT crash: it returns empty, retries, gives up, and the caller
+            # reports ZERO REAL VERDICTS, which loop.py logs as "the eval host unreachable".
+            # A host that answered correctly would be recorded as down, and an arm thrown away.
             r = subprocess.run(_SSH_BASE + ["powershell", "-NoProfile", "-EncodedCommand", b64],
-                               capture_output=True, text=True, timeout=timeout)
-            out = (r.stdout or "").replace("\x00", "")
+                               capture_output=True, timeout=timeout)
+            out = _decode_child(r.stdout).replace("\x00", "")
             if out.strip():
                 return out
         except Exception:
@@ -115,7 +151,7 @@ def _scp(local_path, remote_win_path):
     try:
         r = subprocess.run(["scp", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
                             local_path, "%s:%s" % (SSH_HOST, remote_win_path)],
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True, errors="replace", timeout=120)
         return r.returncode == 0
     except Exception:
         return False
@@ -129,7 +165,7 @@ def _scp_from(remote_win_path, local_path):
     try:
         r = subprocess.run(["scp", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes",
                             "%s:%s" % (SSH_HOST, remote_win_path), local_path],
-                           capture_output=True, text=True, timeout=60)
+                           capture_output=True, text=True, errors="replace", timeout=60)
         return r.returncode == 0 and os.path.exists(local_path) and os.path.getsize(local_path) > 0
     except Exception:
         return False
@@ -144,8 +180,10 @@ def main():
 
     # 1) capture the candidate diff from the worktree (BEFORE building run_id, which hashes it)
     try:
-        diff = subprocess.run(["git", "-C", wt, "diff"], capture_output=True, text=True,
-                              timeout=60).stdout
+        # A patch is arbitrary bytes; see bench/swe_solve_decoupled.py, where this exact
+        # line cost a 100-instance arm after 60 were already solved.
+        diff = _decode_child(subprocess.run(["git", "-C", wt, "diff"],
+                                            capture_output=True, timeout=60).stdout)
     except Exception as e:
         print("REMOTE_GRADE diff failed: %s" % e, file=sys.stderr)
         return 2
@@ -161,7 +199,7 @@ def main():
     runid = "g" + re.sub(r"[^A-Za-z0-9]", "", inst) + diff_hash
 
     tf = tempfile.NamedTemporaryFile("w", suffix=".patch", delete=False, newline="\n",
-                                     encoding="utf-8")
+                                     encoding="utf-8", dir=_temp_home())
     tf.write(diff)
     tf.close()
 
@@ -177,40 +215,45 @@ def main():
     except Exception:
         pass
 
-    # 3) launch grade.py detached as a transient systemd unit (survives SSH drops; the eval
-    #    can take many minutes on the first per-repo Docker image build).
-    launch = ("$j = Start-Job { (wsl.exe -d " + DISTRO + " -u root -- bash -lc "
-              "'systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/grade_" + runid + ".log; "
-              "systemd-run --no-block --unit=" + runid + " bash " + RUNNER_WSL
-              + " " + inst + " " + remote_patch_wsl + " " + runid + "' 2>$null) -join '' }; "
-              "if(Wait-Job $j -Timeout 25){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    _ssh_ps(launch, 55)
+    # 3) RUN THE GRADE INSIDE A HELD SESSION. Not detached: on this host detachment does not
+    # survive. Measured 2026-09-10 -- the identical batch command completes in 107s when run
+    # synchronously inside the invoking wsl session, and is STOPPED after 44-51s when handed to
+    # `systemd-run --no-block` ("Stopping ... Deactivated successfully", no error, no OOM, no
+    # timeout; dmesg shows journald re-initialising, i.e. the distro's systemd being torn down
+    # once no session holds it). `setsid nohup` dies identically, and touching the distro every
+    # 20s does not rescue it, because a new session brings up a new systemd rather than
+    # re-adopting the old one's units. Three days of EVALERR verdicts were this fact.
+    #
+    # So the session is held for the length of the grade, bounded by the same ceiling the poll
+    # loop used to have (POLL_SECONDS * POLL_MAX), and the verdict is read once afterwards.
+    hold_s = max(120, int(POLL_SECONDS * POLL_MAX))
+    body = ("bash " + RUNNER_WSL + " " + inst + " " + remote_patch_wsl + " " + runid)
+    run_ps = ("$j = Start-Job { (wsl.exe -d " + DISTRO + " -u root -- bash -lc \"" + body + "\" 2>$null)"
+              " -join '' }; if(Wait-Job $j -Timeout " + str(hold_s) + "){ Receive-Job $j } else { 'TIMEOUT' };"
+              " Remove-Job $j -Force")
+    _ssh_ps(run_ps, hold_s + 60)
 
-    # 4) poll for the verdict FILE (grade_runner.sh writes VERDICT=.. + RUNNER_DONE to a
-    #    Windows-side file). scp it back each tick -- reliable, unlike grep-over-SSH which
-    #    drops multi-line output on this tunnel.
+    # 4) read the verdict FILE the runner wrote. scp is reliable where grep-over-SSH silently
+    #    drops output, so the verdict is read back as a file rather than parsed from a remote grep.
     remote_verdict = "%s/verdicts/%s.verdict" % (REMOTE_DIR, runid)
-    lv = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False)
+    lv = tempfile.NamedTemporaryFile(suffix=".verdict", delete=False, dir=_temp_home())
     lv.close()
     verdict = ""
-    for _ in range(POLL_MAX):
-        time.sleep(POLL_SECONDS)
-        if _scp_from(remote_verdict, lv.name):
-            try:
-                content = open(lv.name, encoding="utf-8", errors="replace").read()
-            except Exception:
-                content = ""
-            if "RUNNER_DONE" in content:
-                m = re.search(r"VERDICT=([A-Za-z]+)", content)
-                verdict = m.group(1) if m else ""
-                break
+    if _scp_from(remote_verdict, lv.name):
+        try:
+            content = open(lv.name, encoding="utf-8", errors="replace").read()
+        except Exception:
+            content = ""
+        if "RUNNER_DONE" in content:
+            m = re.search(r"VERDICT=([A-Za-z]+)", content)
+            verdict = m.group(1) if m else ""
     try:
         os.unlink(lv.name)
     except Exception:
         pass
 
     print("REMOTE_GRADE %s -> %s" % (inst, verdict or "EVALERR"))
-    if verdict == "RESOLVED":
+    if _V.is_resolved(verdict):
         return 0
     if verdict == "not":
         return 1

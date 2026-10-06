@@ -74,12 +74,23 @@ def test_the_credential_lines_use_show_only(transcript):
     # Source-level and stated as such: writing .env end to end would mint real credentials and
     # touch the operator's own file. What is pinned is that neither call site can reach the
     # transcript, which is what the alerts were about.
+    #
+    # RESHAPED 2026-09-24 (D1): the values are no longer printed on one line each but framed by
+    # _show_secrets_box and repeated at the end of the run. The property pinned is unchanged:
+    # every place a value is printed is show_only, and the box has no other output path.
     import inspect
-    src = inspect.getsource(B)
-    for label in ("Your Bearer token (MCP_API_KEY): ", "Your unlock password:"):
-        i = src.index(label)
-        line = src[src.rindex(chr(10), 0, i) + 1:src.index(chr(10), i)]
-        assert "show_only(" in line, "this line still reaches the transcript: %s" % line.strip()
+    box = inspect.getsource(B._show_secrets_box)
+    assert "show_only(" in box
+    assert "log(" not in box.replace("show_only(", "") and "_transcribe(" not in box, \
+        "the secrets box can reach the transcript"
+    src = inspect.getsource(B.step_gen_env)
+    values = ("api_key", "unlock_code", "minted_api", "minted_unlock")
+    for line in src.splitlines():
+        code = line.split("#", 1)[0]
+        if "log(" in code or "_transcribe(" in code:
+            assert not any(v in code for v in values), \
+                "a credential value reaches log/_transcribe: %s" % line.strip()
+    assert src.count("_remember_and_show(") == 2, "a credential display left the box"
 
 
 def test_the_transcript_still_says_the_credentials_were_shown(transcript):
@@ -95,3 +106,66 @@ def test_a_failing_transcript_still_never_raises(monkeypatch, capsys):
     monkeypatch.setattr(B, "TRANSCRIPT", pathlib.Path("Z:/nope/nowhere/bootstrap.log"))
     B.log("still fine")
     assert "still fine" in capsys.readouterr().out
+
+
+# ---- the top-up path, driven rather than read ------------------------------------------
+#
+# The two tests above are source-level and say so. This one runs step_gen_env against a real
+# .env that is missing both secrets -- the branch that MINTS them -- and looks at what the
+# transcript actually received. Alert #30 pointed at _transcribe, and the reason it stayed open
+# after the show_only work is that this branch fed log() a list built from the "KEY=value" lines
+# and relied on `s.split("=", 1)[0]` to take the value back off. That split is correct and it is
+# a sanitizer nobody can see; the names are now collected as names and never held a value.
+
+
+#: SKIPPED OFF WINDOWS, AND RUN ON THE WINDOWS JOB INSTEAD -- the rule this repository already
+#: applies to scripts/test_bootstrap.py for the same reason. step_gen_env protects the secret it
+#: writes with DPAPI, which does not exist on the ubuntu runner, so a failure there is a missing
+#: capability rather than a broken assertion. A skip on its own would retire the coverage
+#: silently; it is honest only while ci.yml's windows-install-smoke job names this file.
+needs_dpapi = pytest.mark.skipif(os.name != "nt",
+                                 reason="step_gen_env protects with DPAPI; Windows only")
+
+
+@pytest.fixture()
+def repo_with_env(tmp_path, monkeypatch, transcript):
+    """A .env carrying neither secret, so the top-up branch mints both."""
+    monkeypatch.setattr(B, "ROOT", tmp_path)
+    env = tmp_path / ".env"
+    env.write_text("SOMETHING_ELSE=1\n", encoding="utf-8")
+    return env
+
+
+@needs_dpapi
+def test_the_minted_secrets_do_not_reach_the_transcript(repo_with_env, transcript, capsys):
+    B.step_gen_env()
+    written = repo_with_env.read_text(encoding="utf-8")
+    api = [l.split("=", 1)[1] for l in written.splitlines() if l.startswith("MCP_API_KEY_PROTECTED=")]
+    assert api and api[0].startswith("dpapi:"), written  # it really did persist only ciphertext
+    recorded = io.open(str(transcript), encoding="utf-8").read()
+    assert api[0] not in recorded, "the freshly minted Bearer token is in the transcript"
+
+
+@needs_dpapi
+def test_the_transcript_still_names_the_keys_it_generated(repo_with_env, transcript):
+    """Withholding the values must not cost the operator the record of WHICH secrets setup
+    created -- that is the line they read when a key they expected is missing."""
+    B.step_gen_env()
+    recorded = io.open(str(transcript), encoding="utf-8").read()
+    assert "MCP_API_KEY" in recorded
+    assert B.UNLOCK_PASSWORD_PROTECTED_VAR in recorded
+
+
+@needs_dpapi
+def test_the_unlock_password_is_stored_only_in_its_protected_form(repo_with_env, capsys):
+    """Not about the transcript: the value printed on screen must not also be sitting in .env.
+    If these ever became equal, the show_only work would be protecting a file that already has
+    the cleartext in it."""
+    B.step_gen_env()
+    shown = capsys.readouterr().out
+    written = repo_with_env.read_text(encoding="utf-8")
+    line = [l for l in written.splitlines()
+            if l.startswith(B.UNLOCK_PASSWORD_PROTECTED_VAR + "=")]
+    assert line, written
+    stored = line[0].split("=", 1)[1]
+    assert stored not in shown or stored == "", "the stored form equals what was displayed"

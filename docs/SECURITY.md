@@ -34,15 +34,15 @@
 
 ## 知っておくべきこと
 
-- unlock パスワードは API キーとは **別物**。`unlock()` は成功時に **unlock_token** を1度だけ返し、
-  サーバはそのハッシュのみを保持します。変更系・実行系は `call_tool(..., unlock_token=...)` で
-  これを提示します。
-- **既定ではトークンの提示は必須ではありません**（`MCP_REQUIRE_UNLOCK_TOKEN=1` で必須化）。
-  必須化前は、解錠済みの識別子だけで変更系が通ります。この識別子は転送ヘッダ由来で、
-  呼び出し側が申告する値です。したがって **必須化するまでは「片方の鍵だけでは通らない」とは
-  言えません**。以前この文書と README はそう書いていましたが、事実と異なりました。
-  トークン無しで通った回数は `.fleet/unlock_token_gap.json` に記録されるので、
-  これが増えなくなった時点で必須化してください。
+- unlock パスワードは API キーとは **別物**。`unlock()` が成功すると、現在の `Mcp-Session-Id` を
+  その識別子に対して認可し、同時にフォールバック用の **unlock_token** を1度だけ返します。
+  通常の MCP 会話では transport が同じ session ID を自動送信するため、モデルが token を保持して
+  毎回の `call_tool` に再添付する必要はありません。解錠後は**同じ会話のまま**拒否された操作を再試行します。
+- `MCP_REQUIRE_UNLOCK_TOKEN` は既定で **ON**。ただし `MCP_UNLOCK_SESSION_AUTH` も既定で **ON** のため、
+  正しいパスワードで解錠済みの同一 MCP session は token 引数なしでも第二要素を満たします。
+  session auth を明示的に無効化した場合、または session ID を利用できない transport では、
+  `unlock()` が返した `unlock_token` を変更系・実行系の `call_tool(..., unlock_token=...)` に渡します。
+  `.fleet/unlock_token_gap.json` は enforcement を明示的に OFF にした配備向けの互換・診断記録です。
 - `127.0.0.1` / `::1` は自動的に信頼（ローカル開発用）。
 - ODBC は `readonly=True` で接続し、`SELECT / WITH / EXEC / SHOW / DESCRIBE` のみ許可。
 - DB 認証は Windows / Entra 統合認証なので、エージェントは **あなたの既存権限の範囲でしか SQL を投げられません**。DBA への新規アカウント申請は不要。

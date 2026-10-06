@@ -82,7 +82,10 @@ def test_an_expired_token_is_not_red_unless_a_run_wants_one():
     """
     body = _dots_body()
     assert 'else if (live)' in body and 'T("hs_signin_stale")' in body
-    assert 'SetDot(3, HealthState.Gray, T("hs_signin_gray"), now)' in body
+    # The key gained a suffix when hs_signin_gray stopped covering three different
+    # situations with one sentence ("No capture on record" was false in two of them).
+    # The rule under test is unchanged: expired token, no run, grey rather than red.
+    assert 'SetDot(3, HealthState.Gray, T("hs_signin_gray_expired"), now)' in body
 
 
 # ---- エージェントのドット ---------------------------------------------------------------------
@@ -96,7 +99,9 @@ def test_agent_is_gray_when_no_run_is_live():
 def test_a_closed_route_is_amber_and_says_workers_are_on_tabs():
     """経路が閉じている = タブで走っている。障害ではないので赤ではなく黄。"""
     body = _dots_body()
-    assert "else if (RouteIsClosed())" in body
+    # RouteIsClosed became RouteState() when "I could not read the record" needed
+    # somewhere to go that was not "open". The rule under test is unchanged.
+    assert "else if (RouteState() == ROUTE_CLOSED)" in body
     assert 'T("hs_agent_tabs")' in body
     assert 'SetDot(4, HealthState.Yellow, note, now)' in body
 
@@ -109,7 +114,7 @@ def test_the_canned_answer_sniff_only_annotates_the_amber():
     body = _dots_body()
     # RouteIsClosed の分岐**だけ**を切り出す。文字数窓で見ると、コメントを落とした後は
     # 隣の分岐まで届いてしまい、無関係な SetDot を捕まえて落ちる(実際に落ちた)。
-    blk = body[body.index("else if (RouteIsClosed())"):]
+    blk = body[body.index("else if (RouteState() == ROUTE_CLOSED)"):]
     blk = blk[:blk.index("else if (FleetAgentIsBound())")]
     assert "LooksLikeCannedNonAnswer" in blk, "定型無回答の判定が黄色の分岐の外にある"
     assert 'note += T("hs_agent_canned")' in blk, "注記ではなく色を決めている"
@@ -119,14 +124,22 @@ def test_the_canned_answer_sniff_only_annotates_the_amber():
 
 
 def test_agent_is_green_only_on_positive_evidence():
-    """緑になるのは、フリートが agent に束ねられているか、捕捉が agent を名指ししたときだけ。
+    """緑になるのは、フリート自身の紐付けが確認できたときだけ。
 
     「悪い証拠が無い」は緑の理由にならない。それが消えた規則の失敗そのもの。
+
+    2026-09-16、この検査は緑の分岐が2つあることを要求していた。2つ目は
+    capture_status.json の gpt_id への fallback で、FleetAgentIsBound 自身のコメントが
+    「あれは ANY surface の最後の捕捉であり、他人についての出来事は自分についての証拠では
+    ない」と書いている、まさにそのフィールドである。主判定が避けるために作られたものを
+    次の分岐が緑の根拠にしていた。fallback は残す（非空の gpt_id は無ではない）が、
+    黄である。この検査は今それを要求する。
     """
     body = _dots_body()
     assert "else if (FleetAgentIsBound())" in body
     assert "else if (!string.IsNullOrEmpty(gptId))" in body
-    assert body.count('SetDot(4, HealthState.Green, T("hs_agent_ok"), now)') == 2
+    assert body.count('SetDot(4, HealthState.Green, T("hs_agent_ok"), now)') == 1,         "別サーフェスの証拠が再び緑になっている"
+    assert 'SetDot(4, HealthState.Yellow, T("hs_agent_other_surface"), now)' in body
 
 
 def test_agent_is_red_when_nothing_names_an_agent():

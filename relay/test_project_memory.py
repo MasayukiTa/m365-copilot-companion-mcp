@@ -12,6 +12,7 @@ sys.path.insert(0, str(REPO))
 
 from relay.code_task import build_goal
 from relay.project_memory import load_notes, record_task
+from relay.relay_fleet import _MEMORY_POINTER
 
 results = []
 
@@ -73,7 +74,13 @@ def main():
     # build_goal primes the notes into the task text
     record_task(folder, "前回: バグ修正", "DONE", note="重要メモ", state_dir=sd, ts=999)
     goal, gnotes = build_goal("新しい作業", folder, with_map=False, state_dir=sd)
-    check("build_goal_primes_memory", "過去の作業" in goal["text"] and "前回: バグ修正" in goal["text"])
+    # WHAT IS SENT IS A POINTER, NOT THE NOTES. This check used to require the note CONTENT
+    # ("前回: バグ修正") in the goal, which is the behaviour the operator ruled out: the index may
+    # be handed over, the entries may not. Their objection generalises past taste -- "suppose
+    # there are 10,000 of them; are you going to print them all?" -- and it applies to notes for
+    # the same reason it applies to skills. What is asserted now is both halves of that rule.
+    check("build_goal_points_at_memory", _MEMORY_POINTER in goal["text"])
+    check("build_goal_does_not_paste_the_notes", "前回: バグ修正" not in goal["text"])
     check("build_goal_notes_flag", any("project memory" in n for n in gnotes))
 
     # with_memory off -> no priming

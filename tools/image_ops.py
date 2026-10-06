@@ -5,15 +5,206 @@ from typing import Optional
 
 from .file_ops import _validate_path
 
-MAX_BYTES = 8 * 1024 * 1024  # 8 MB cap for safety
+MAX_BYTES = 8 * 1024 * 1024  # 8 MB cap for safety -- on the FILE, which is not what breaks
+
+#: THE CEILING THAT ACTUALLY BINDS, in the currency the caller spends.
+#:
+#: MAX_BYTES above has never once been the binding constraint. It caps the file at 8 MB, which
+#: is about 10.7 MILLION characters of base64 -- and what runs out is the conversation, not the
+#: process. Measured over 424 read_image calls in .fleet/tool_events.jsonl: median 142,642
+#: characters returned, p90 1,166,294, max 1,762,326. One call could put over a million and a
+#: half characters into a chat and the cap was satisfied.
+#:
+#: The downscale below made it worse by looking harmless: it only ran when the image was
+#: LARGER than max_dimension, so a 1400x788 desktop capture at the 1600 default was encoded
+#: untouched. Measured on a real capture -- 1400x788 unresized is 205,240 characters; 1200 is
+#: 176,460; 1024 is 141,724; 900 is 113,996; 800 is 94,512.
+#:
+#: 120,000 lands a full desktop at roughly 900px, which is legible, and leaves a cropped
+#: single window -- the thing screen_look's `window=` argument produces, about seven times
+#: smaller -- untouched. It is a CEILING, so the p90 and the max above stop being reachable
+#: at all; that is the property, not the exact figure.
+#:
+#: This does not on its own fix the loop it was found in. Seventeen calls in one run at the
+#: median is 2,424,914 characters; seventeen at this ceiling is still 2,040,000. The count is
+#: the larger lever, which is why screen_look grew a window crop and why screen_windows --
+#: median 506 characters, 282 times cheaper -- answers "what is open" without a picture.
+MAX_DATA_URI_CHARS = 120_000
+
+#: Stop shrinking here. Below this a screenshot stops being readable, and returning something
+#: unreadable to save characters is not a saving.
+MIN_DIMENSION = 400
+
+#: JPEG quality for the fallback. 85 keeps screen text legible -- the content this path
+#: actually meets -- while being the difference between 470,444 characters and 103,224
+#: for one 800px capture. Lower starts ringing around glyphs, which is the one thing a
+#: screenshot is read for.
+JPEG_QUALITY = 85
 
 
-def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:
-    """Read an image file and return it as a data URI so a vision model can see it.
 
-    Use this to verify a chart/diagram/screenshot was generated correctly before
-    reporting completion. The returned string is `data:image/<type>;base64,...`
-    and is directly consumable by vision-capable LLMs.
+def _encoded_chars(raw: bytes) -> int:
+    """Characters a data URI will cost, without building it. base64 is 4 per 3 bytes."""
+    return ((len(raw) + 2) // 3) * 4
+
+
+def _fit_to_character_budget(data: bytes, suffix: str):
+    """Bring the encoded size under MAX_DATA_URI_CHARS, losing as little of the picture as
+    possible. Returns (bytes, suffix).
+
+    WHY THE FIRST VERSION FAILED, and it failed in production rather than in a test. It only
+    ever shrank, keeping PNG, and PNG is the wrong format for a screenshot once LANCZOS has
+    blurred its flat runs into gradients. Measured on a real 1600x900 capture:
+
+        1600x900  1,492,444 chars   (PNG, untouched)
+         430x242    157,752         (PNG, aiming at the budget and overshooting)
+         400x225    142,912         (PNG, MIN_DIMENSION reached -- stop)
+
+    So it bottomed out at the readability floor, still 19% over the ceiling, having thrown
+    away 94% of the pixels on the way. Both constants were satisfied and the result was the
+    worst of both: over budget AND unreadable. The unit test passed throughout, because it
+    asserts "within budget OR at the floor" -- a disjunction that is true here and says
+    nothing useful. A live run reading one 1.1 MB file is what found it.
+
+    The same image as JPEG:
+
+         800x450    103,224 chars   (q85) -- inside the budget
+        1024x576    153,880
+         400x225     31,288
+
+    So the answer is not fewer pixels, it is a format that suits the content. At 800px this
+    returns four times the picture AND fits, where the old path returned a quarter of it and
+    did not.
+
+    PNG IS STILL TRIED FIRST and kept whenever it fits, because it is exact: a diagram, a
+    chart or a screenshot of code survives it without ringing around the glyphs. JPEG is the
+    fallback for the case where exactness was going to be lost anyway.
+    """
+    if _encoded_chars(data) <= MAX_DATA_URI_CHARS:
+        return data, suffix
+    try:
+        from io import BytesIO
+
+        from PIL import Image as PILImage
+    except ImportError:
+        return data, suffix
+
+    try:
+        im = PILImage.open(BytesIO(data))
+        im.load()
+        w, h = im.size
+        longest = max(w, h)
+        rgb = None
+
+        def _at(dim, fmt):
+            """Encode at this longest-edge, or None if it does not fit the budget."""
+            scale = 1.0 if dim >= longest else dim / float(longest)
+            src = im if fmt == "PNG" else (rgb or im.convert("RGB"))
+            out = src if scale >= 1 else src.resize(
+                (max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS)
+            buf = BytesIO()
+            if fmt == "PNG":
+                out.save(buf, format="PNG", optimize=True)
+            else:
+                out.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+            raw = buf.getvalue()
+            if _encoded_chars(raw) > MAX_DATA_URI_CHARS:
+                return None
+            return (out.size[0] * out.size[1], raw, "png" if fmt == "PNG" else "jpeg")
+
+        rgb = im.convert("RGB")
+
+        # THE OBJECTIVE IS PIXELS, NOT THE FIRST THING THAT FITS. The previous rule shrank as
+        # PNG and returned as soon as it was under budget, which on a real 816 KB capture gave
+        # 425x238 -- inside the budget and barely readable, when JPEG at 1024px also fits.
+        # Measured on one 1600x900 screenshot: PNG needs 400px to approach the budget and
+        # still misses it at 142,912 characters, while JPEG fits at 800px with 103,224.
+        #
+        # So every candidate is priced and the biggest survivor wins. PNG is preferred only on
+        # a tie, where it is free exactness: a diagram or a screenshot of code keeps its edges.
+        # ENCODED SIZE FALLS WITH DIMENSION, so walking DOWN and stopping at the first fit
+        # gives that format's largest survivor -- there is no need to price the rest. Pricing
+        # all nine widths in both formats was the first version and cost 1.2 to 3.1 SECONDS
+        # per call, measured on these captures; read_image is called hundreds of times, so
+        # that lands inside every worker's turn.
+        best = None
+        dims = [d for d in (longest, 1600, 1280, 1024, 900, 800, 640, 512, MIN_DIMENSION)
+                if MIN_DIMENSION <= d <= longest]
+        # PNG GETS TWO PROBES, NOT NINE. When PNG cannot fit at any useful size -- the normal
+        # case for a photographic or anti-aliased screen capture -- walking all nine widths
+        # meant nine expensive PNG encodes that were all going to fail, and that alone was the
+        # 1.2-3.1 seconds. Encoded size tracks AREA, so the width that could fit is
+        # longest * sqrt(budget / chars_at_full); if that lands below the readability floor,
+        # PNG is hopeless and is skipped entirely. The estimate is optimistic for PNG (its
+        # compression degrades as resizing blurs flat runs), which is fine: an optimistic
+        # probe that fails costs one encode, and JPEG is right behind it.
+        png_dims = []
+        if (suffix or "").lower() == "png":
+            full = _encoded_chars(data)
+            est = int(longest * ((MAX_DATA_URI_CHARS / float(full)) ** 0.5)) if full else 0
+            png_dims = [d for d in dict.fromkeys([longest, est]) if MIN_DIMENSION <= d <= longest]
+        for fmt, cand in (("PNG", png_dims), ("JPEG", dims)):
+            for dim in cand:
+                got = _at(dim, fmt)
+                if got:
+                    if best is None or got[0] > best[0] or (got[0] == best[0]
+                                                            and got[2] == "png"):
+                        best = got
+                    break       # descending: this is the biggest that fits for this format
+        if best:
+            return best[1], best[2]
+
+        # Nothing fits even at the floor. Return the smallest readable JPEG rather than the
+        # original: over budget is bad, over budget AND huge is worse.
+        scale = MIN_DIMENSION / float(longest)
+        out = rgb.resize((max(1, int(w * scale)), max(1, int(h * scale))), PILImage.LANCZOS)
+        buf = BytesIO()
+        out.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return buf.getvalue(), "jpeg"
+    except Exception:
+        # A budget is a courtesy, not a guarantee worth failing a read over.
+        return data, suffix
+
+
+def read_image(path: str, max_dimension: Optional[int] = 1600):
+    """Read an image file and return it AS A PICTURE, for a client that can see one.
+
+    THE DEFECT WAS THE RETURN TYPE, NOT THE TOOL. This was annotated `-> str` and returned a
+    base64 data URI. FastMCP serialises a `str` as a TEXT content block, so what arrived was a
+    wall of base64 that nothing renders -- while looking, to the model that called it, exactly
+    like a successful read. Measured 2026-09-17: a worker asked to read six characters off a
+    picture called this and then answered a string that was not on it, twice, describing both
+    times how it had looked. The refuter caught both.
+
+    The conclusion drawn from that at first was "stop using this tool", and that was wrong.
+    A visual path is not optional: computer-use decides where to click, and a one-pixel error
+    is a miss, so nothing built on OCR or on pixel arithmetic can replace seeing the screen.
+    Removing the tool would have made the broken plumbing permanent. It now returns a
+    `fastmcp.utilities.types.Image`, which FastMCP serialises as an IMAGE content block.
+
+    WHAT THIS DOES AND DOES NOT FIX. A vision-capable MCP client now receives a picture. The
+    fleet's own workers reach this through a browser UI whose handling of an image block is not
+    something this repository controls or has measured -- so for those, `ocr_image` remains the
+    measured answer for text, and `ANALYZE` the measured answer for "what does this show", with
+    the Analyst caveat below. Do not assume this change reaches them until it is measured.
+
+    Still true, and still the right tool for those questions:
+
+      * `ocr_image(path)` for text on a plain background -- measured on the same file this was
+        fabricating about, it returned the six characters exactly. Cheaper than an image.
+      * `run_python` with PIL/numpy for pixel facts -- dimensions, a colour at a point, whether
+        a region is blank. Deterministic, and cheapest of all.
+      * `ANALYZE: <absolute path> | <instruction>` as the last line of your turn, to put the
+        file in front of Copilot itself through a real file attachment. NOT A STRONG PATH:
+        relay/agent_profiles.ANALYST has `model_picker=None`, so it runs on the Analyst agent's
+        default model and cannot be switched to Claude, and spec §5 already requires its
+        numeric claims to be ground-verified locally. It has been measured transcribing text
+        off an image faithfully, which says nothing about reasoning. See
+        docs/architecture/showing_a_picture_to_a_model.md.
+
+    THE COST IS STILL NOT SMALL, and the budget below still applies: an image is not free
+    because it is no longer text. Median 142,642 characters per call over 424 calls as a data
+    URI, which is what the downscaling exists to bound.
 
     Args:
         path: Image path (.png, .jpg, .jpeg, .gif, .bmp, .webp).
@@ -55,14 +246,32 @@ def read_image(path: str, max_dimension: Optional[int] = 1600) -> str:
             except ImportError:
                 pass
 
+        # SHRINK UNTIL IT FITS, rather than only when it started too big. The branch above
+        # resizes when the image exceeds max_dimension; this one asks the question that
+        # matters -- how much of the conversation will this cost -- and keeps halving the
+        # longest edge until the answer is affordable or the image would stop being readable.
+        # Silent by design: the return value is a data URI and a note appended to it would
+        # corrupt the thing the caller is about to decode.
+        data, suffix = _fit_to_character_budget(data, suffix)
+
         if len(data) > MAX_BYTES:
             return (
                 f"[read_image error: image is {len(data):,} bytes after resize; "
                 f"limit {MAX_BYTES:,}. Lower max_dimension.]"
             )
-        mime = mimetypes.guess_type(f"f.{suffix}")[0] or f"image/{suffix}"
-        b64 = base64.b64encode(data).decode("ascii")
-        return f"data:{mime};base64,{b64}"
+        # AN IMAGE CONTENT BLOCK, NOT A STRING. FastMCP turns this into an ImageContent;
+        # returning the data URI as a str is what made the result invisible.
+        try:
+            from fastmcp.utilities.types import Image as _FastMCPImage
+            return _FastMCPImage(data=data, format=("png" if suffix == "png" else "jpeg"))
+        except ImportError:
+            # Without FastMCP there is no content block to build, and a data URI is at least
+            # the bytes. Says so, because a caller that cannot see it must not read this as a
+            # picture it merely failed to look at.
+            mime = mimetypes.guess_type(f"f.{suffix}")[0] or f"image/{suffix}"
+            b64 = base64.b64encode(data).decode("ascii")
+            return f"[read_image: no image content block available here; bytes follow as a " \
+                   f"data URI, which nothing renders] data:{mime};base64,{b64}"
     except Exception as e:
         return f"[read_image error: {type(e).__name__}: {e}]"
 

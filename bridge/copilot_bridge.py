@@ -18,11 +18,18 @@ Setup (once):
   * In .env set the bare agent URL of YOUR agent (the one with the MCP connector):
       MCP_IMPL_AGENT_URL=https://m365.cloud.microsoft/chat/agent/T_....<id>
   * Run:  .venv\\Scripts\\python.exe bridge\\copilot_bridge.py
-  * Open http://127.0.0.1:8765
+  * Talk to it from the CopilotChat window (ui/CopilotChat.exe) or bridge/session_cli.py.
+
+EVERY REQUEST IS AUTHENTICATED (2026-09-24). State changes and page reads are POST only and
+must carry the per-start token from bridge/bridge_auth.py in X-Bridge-Token; anything a
+browser would send (Origin, Referer, a cross-site Sec-Fetch-Site, a non-loopback Host) is
+refused. The in-browser chat page this used to serve at / could not authenticate and is gone.
+See bridge/bridge_auth.py for the model and Handler._dispatch for the enforcement.
 """
 from __future__ import annotations
 
 import hashlib
+import hmac
 import http.client
 import json
 import logging
@@ -89,8 +96,14 @@ _PROCESS_STARTED = time.time()
 
 REPO = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(REPO))
+from tools import childproc
+from relay.code_staleness import BRIDGE_CODE_FILES, CodeWatch
 
-DELETE_LOG = REPO / ".fleet" / "delete_log.jsonl"
+#: What this process loaded, fingerprinted at start. /status compares it with the disk so "is the
+#: bridge running the code that was merged?" is answered by the process, not by file timestamps.
+_CODE_WATCH = CodeWatch(str(REPO), BRIDGE_CODE_FILES)
+
+DELETE_LOG =REPO / ".fleet" / "delete_log.jsonl"
 FLEET_CONVS_PATH = REPO / ".fleet" / "conversations.json"
 GUID_RE = re.compile(r"/conversation/([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})")
 # A bare GUID (not URL-embedded) -- e.g. a sidebar row's id/conversationId, as found live on
@@ -157,6 +170,18 @@ def classify_conv_ref(ref):
     return "bare_url"
 
 
+def startup_resume_candidate(store=None):
+    """Return exactly the newest session row for startup resume policy.
+
+    Do not search backward for a row that merely happens to be attached.  ``should_autoresume``
+    decides whether this newest row is resumable; if it is not, startup must be fresh rather
+    than silently reopening an older conversation.  ``store`` is injectable for a hermetic
+    regression test of the selection rule.
+    """
+    source = S if store is None else store
+    return source.latest_session()
+
+
 def should_autoresume(sess, fresh_flag=False):
     """Pure decision function for startup auto-resume: given the MOST RECENT session (dict or
     None) and the --fresh CLI flag, decide whether main() should attempt to reattach. No
@@ -209,6 +234,9 @@ def _log_delete(guid, title, ok, reason):
 # and must tolerate the file being briefly absent, non-list, or corrupt mid-rewrite by the other
 # writer -- never raise out of a chat turn over this.
 
+from relay.conversation_lineage import merge_transcript_chains, with_transcript_lineage
+
+
 def merge_fleet_conversations(existing, new_entries):
     """PURE merge/dedup function: list-in/list-out, no file I/O (fully unit-testable).
 
@@ -241,18 +269,34 @@ def merge_fleet_conversations(existing, new_entries):
             continue
         u = entry.get("url") or ""
         if u and u in by_url:
-            clean[by_url[u]] = entry
+            idx = by_url[u]
+            prior = clean[idx]
+            merged = dict(entry)
+            chain = merge_transcript_chains(prior, entry)
+            if chain:
+                merged["transcripts"] = chain
+            if not (entry.get("transcript") or "") and prior.get("transcript"):
+                merged["transcript"] = prior.get("transcript")
+            clean[idx] = merged
             continue
         if not u:
             key = (entry.get("source"), entry.get("name"))
             if key in by_source_name:
-                clean[by_source_name[key]] = entry
+                idx = by_source_name[key]
+                prior = clean[idx]
+                merged = dict(entry)
+                chain = merge_transcript_chains(prior, entry)
+                if chain:
+                    merged["transcripts"] = chain
+                if not (entry.get("transcript") or "") and prior.get("transcript"):
+                    merged["transcript"] = prior.get("transcript")
+                clean[idx] = merged
                 continue
             by_source_name[key] = len(clean)
-            clean.append(entry)
+            clean.append(with_transcript_lineage(entry))
             continue
         by_url[u] = len(clean)
-        clean.append(entry)
+        clean.append(with_transcript_lineage(entry))
     return clean
 
 
@@ -383,6 +427,7 @@ from relay.copilot_autopilot_relay import COPILOT_SELECTORS, CopilotWebDriver, P
 from relay.relay_fleet import CONSENT_MARKERS
 from bridge import session_store as S
 from bridge import review_command
+from bridge import bridge_auth
 from relay.skills import SkillError, SkillStore, format_skill_list
 # tool_probe is stdlib-only (see its module docstring) -- cheap to import here regardless of
 # the heavy relay chain already loaded above. Used by the idle tool-call self-probe, see the
@@ -787,6 +832,17 @@ class PageExecutor:
         self._q: "queue.Queue" = queue.Queue()
         self._thread = None
 
+    def alive(self) -> bool:
+        """Whether the owner thread exists and is running.
+
+        submit() waits on its queue with NO timeout, which is correct while the thread is
+        there -- a real turn legitimately holds it for minutes. It is a trap when the thread
+        was never started or has died: the wait can then never succeed, and the caller blocks
+        for the life of the process.
+        """
+        t = self._thread
+        return bool(t is not None and t.is_alive())
+
     def start(self, target):
         """Start the owner thread running `target()` (main()'s page-setup-then-serve
         function). `target` is responsible for calling drain_once()/run_forever() itself once
@@ -809,6 +865,16 @@ class PageExecutor:
             finally:
                 done.set()
 
+        # FAIL FAST WHEN NOBODY WILL EVER RUN IT. Measured 2026-09-10: a call added to
+        # ensure_driver() reached run_on_page_thread from an ordinary thread in a process
+        # where the owner thread had never been started (the hermetic test suite), and
+        # done.wait() blocked forever -- CI's `test` job ran for two and a half hours against
+        # a seven-minute norm, and six queued runs behind it never started. Waiting cannot
+        # succeed when there is no servicer, so waiting is the wrong answer: say so instead.
+        if not self.alive():
+            raise RuntimeError(
+                "the page-owner thread is not running, so this job would never be serviced "
+                "(callers on a non-page thread must handle this rather than block forever)")
         self._q.put(_job)
         done.wait()
         if "error" in box:
@@ -1181,6 +1247,79 @@ def _queue_input_locked(sid, text):
         S.queue_input(sid, text)
 
 
+#: A message that could not be delivered is written here rather than dropped.
+#:
+#: drain_pending_once POPS EVERY ITEM UP FRONT, so anything not delivered has to be put back
+#: explicitly. The wrong-session branch below does that, with a comment saying the first
+#: version of it lost messages and a test caught it -- and the two branches beside it, "the
+#: turn raised" and "the turn returned nothing", did not. Measured 2026-09-18: the operator
+#: sent, got {"ok":true,"promotion_attempted":true}, and the message existed nowhere
+#: afterwards. It had been popped, the turn had raised, and the exception handler logged and
+#: moved on.
+#:
+#: Retried, then recorded. Retried because the cause was a transient-looking write to a closed
+#: socket and a fresh attempt is usually right; recorded rather than retried forever because a
+#: message that cannot be delivered must not sit in front of the next one.
+UNDELIVERED_PATH = os.environ.get("MCP_BRIDGE_UNDELIVERED_FILE") or os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "bridge_undelivered.jsonl")
+
+#: (sid, text) -> attempts so far. In process only, and deliberately: a bridge restart forgets,
+#: which is the right default because a fresh process has a fresh page and the message deserves
+#: another try. Bounded so a long-lived bridge cannot grow it without limit.
+_DRAIN_ATTEMPTS = {}
+_DRAIN_ATTEMPTS_MAX = 512
+_DRAIN_MAX_TRIES = 2
+
+#: How much of an undelivered message is kept. Generous, because the record exists so
+#: the operator can see WHAT was lost; bounded, because this is written from the request
+#: path. A cut is announced in the row, beside `text_len`.
+_UNDELIVERED_TEXT_CHARS = 20000
+
+
+def _record_undelivered(sid, text, why):
+    """Say where a message went. Never raises -- this runs on the failure path."""
+    try:
+        d = os.path.dirname(UNDELIVERED_PATH)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        # THE MESSAGE IS THE WHOLE POINT OF THIS FILE, so a cut in it must be visible.
+        # Written silently at [:2000] when this record was added earlier the same day --
+        # the very failure class the sweep was looking for, in the code written to fix a
+        # different instance of it.
+        _text = str(text or "")
+        row = {"ts": time.time(), "sid": str(sid or ""), "why": str(why)[:300],
+               "text_len": len(_text),
+               "text": _text if len(_text) <= _UNDELIVERED_TEXT_CHARS else (
+                   _text[:_UNDELIVERED_TEXT_CHARS]
+                   + "\n[cut: kept %d of %d characters]"
+                     % (_UNDELIVERED_TEXT_CHARS, len(_text)))}
+        with open(UNDELIVERED_PATH, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _retry_or_record(sid, item, why):
+    """Put a failed message back, or -- once it has had its tries -- write down that it is gone.
+
+    Returns True when it was re-queued, False when it was recorded as undelivered."""
+    key = (str(sid or ""), str(item or "")[:200])
+    if len(_DRAIN_ATTEMPTS) >= _DRAIN_ATTEMPTS_MAX:
+        _DRAIN_ATTEMPTS.clear()      # a bound, not a cache policy
+    tries = _DRAIN_ATTEMPTS.get(key, 0) + 1
+    _DRAIN_ATTEMPTS[key] = tries
+    if tries < _DRAIN_MAX_TRIES:
+        try:
+            _queue_input_locked(sid, item)
+            return True
+        except Exception:
+            pass
+    _DRAIN_ATTEMPTS.pop(key, None)
+    _record_undelivered(sid, item, why)
+    return False
+
+
 def drain_pending_once(sid, pop_fn=None, max_n=50):
     """Pop up to `max_n` queued inputs for `sid` via `pop_fn` (defaults to _next_pending, which
     is INPUT_LOCK-guarded) and return them as a list, oldest-first. Pure w.r.t. control flow --
@@ -1199,12 +1338,72 @@ def drain_pending_once(sid, pop_fn=None, max_n=50):
     return out
 
 
+#: The sign-in wall this bridge's page last landed on, for GET /status ("signin_wall"). None when
+#: the composer has rendered since. See _note_signin_wall.
+_SIGNIN_WALL = None
+
+
+def _is_signin_wall(url):
+    """ONE definition of "a sign-in page", shared with the doctor and the supervisor:
+    relay.edge_auth.looks_like_signin_wall. edge_recover.looks_like_login, used here before,
+    knew only login.microsoftonline / login.live.com -- a federated tenant's AD FS page
+    (https://<sts>/adfs/ls/...) was "not a login" to this file while the doctor called it one,
+    so on 2026-09-24 nothing brought the window forward."""
+    try:
+        from relay.edge_auth import looks_like_signin_wall
+        return looks_like_signin_wall(url or "")
+    except Exception:
+        try:
+            from relay.edge_recover import looks_like_login
+            return looks_like_login(url or "")
+        except Exception:
+            return False
+
+
+def _note_signin_wall(url):
+    """Record that the page is on a sign-in wall, for /status.
+
+    THE TAB DOES NOT STAY. Startup closes its page once startup is over, so a wall met at
+    startup is gone from the browser's tab list minutes later -- and scripts/start_bridge.ps1's
+    supervisor, which is what brings the window forward, reads the tab list. This is the record
+    that outlives the tab. Scheme, host and path only: a sign-in URL's query carries
+    login_hint= (an e-mail address)."""
+    global _SIGNIN_WALL
+    try:
+        import urllib.parse as _up
+        p = _up.urlsplit(url or "")
+        bare = "%s://%s%s" % (p.scheme, p.netloc, p.path)
+    except Exception:
+        bare = ""
+    if _SIGNIN_WALL is None:
+        logger.warning("sign-in page on the bridge Edge: %s -- the start_bridge supervisor "
+                       "brings the window forward for the person", bare)
+    _SIGNIN_WALL = {"url": bare, "at": time.time()}
+
+
+def _clear_signin_wall():
+    global _SIGNIN_WALL
+    _SIGNIN_WALL = None
+
+
+def _supervisor_owns_signin():
+    """True when scripts/start_bridge.ps1 -Keepalive is watching this bridge's browser.
+
+    THEN THIS PROCESS MUST NOT SURFACE THE WINDOW ITSELF. surface() on a HEADLESS Edge kills
+    it and relaunches it headed -- the very browser this process is connected to -- and each
+    call site here did that once PER CALL, so every /history against a wall fired it again. The
+    supervisor owns the browser's lifecycle and surfaces once per sign-in need; this process
+    only reports the wall (_note_signin_wall)."""
+    return os.environ.get("MCP_BRIDGE_SIGNIN_SUPERVISED", "").strip() == "1"
+
+
 def _wait_composer(timeout=40):
     surfaced = False
     force_timer = None
     for _ in range(timeout):
         PAGE.wait_for_timeout(1000)
         if PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+            _clear_signin_wall()
             # If we surfaced the hidden Edge for sign-in, auth is now done (the
             # composer rendered) -> drop the window back to the background at once.
             if surfaced:
@@ -1220,9 +1419,12 @@ def _wait_composer(timeout=40):
         # page is still up, refresh the keeper's pause file every ~1s so a slow MFA login
         # is not re-minimized out from under the user (the 180s backoff would else expire).
         try:
-            from relay.edge_recover import surface, looks_like_login, touch_pause
-            if looks_like_login(PAGE.url):
-                if not surfaced:
+            from relay.edge_recover import surface, touch_pause
+            if _is_signin_wall(PAGE.url):
+                _note_signin_wall(PAGE.url)
+                if _supervisor_owns_signin():
+                    pass                       # reported above; the supervisor shows it
+                elif not surfaced:
                     # surface() now returns a TRUTHFUL bool (a headed process was actually
                     # verified) -- there is no notify/toast mechanism in this file to gate,
                     # but log the real outcome so a failed auto-surface is visible in logs
@@ -1261,6 +1463,10 @@ _REDIRECT_MARKERS = ("redirfrom", "csrtossr", "auth=2", "/login", "login.microso
 def _looks_redirected(landed_url, target_url=""):
     u = (landed_url or "").lower()
     if any(m in u for m in _REDIRECT_MARKERS):
+        return True
+    # A FEDERATED IdP's page is a landing too. None of the markers above name an AD FS host,
+    # so a goto of the bare agent URL that ended on https://<sts>/adfs/ls/ read as "settled".
+    if _is_signin_wall(landed_url or ""):
         return True
     g = _conv_guid(target_url)            # asked for a specific conversation ...
     if g and g.lower() not in u:          # ... but didn't land on it -> bounced
@@ -1333,8 +1539,17 @@ def _bridge_socket_driver():
     if not url:
         return None
     try:
-        if route.needs_refresh(url) and not run_on_page_thread(route.refresh, CTX, url):
-            return None
+        if route.needs_refresh(url):
+            # THE CAPTURE IS THE LONG JOB. Declared before it starts so the watchdog does not
+            # hand the process back mid-capture -- which is what pinned this bridge on the page
+            # transport for an hour. CAPTURE_DECLARED_S covers the default capture_via_tab path,
+            # which sends a real turn; the light path finishes in about a minute.
+            declare_long_job(CAPTURE_DECLARED_S, "socket token capture")
+            try:
+                if not run_on_page_thread(route.refresh, CTX, url):
+                    return None
+            finally:
+                end_long_job()
         # S.load, NOT S.get -- session_store has never had a `get`. This read was written
         # as S.get, so it raised AttributeError on EVERY call, the bare except below turned
         # that into an empty conversation id, and socket_route reads an empty id as `start a
@@ -1519,6 +1734,51 @@ def return_page(borrowed):
     return True
 
 
+def _release_resident_page_locked(reason=""):
+    """PAGE-OWNER THREAD ONLY. Close the resident agent tab, keeping a blank page behind.
+
+    Same three steps as the startup release, and for the same measured reasons: Edge exits with
+    its LAST page (closing the agent tab took the whole browser down and CDP with it), a
+    restart that opens a keep-alive without reusing an existing blank accumulates about:blank
+    tabs, and a PAGE without its DRIVER is the state ensure_page_alive exists to repair. If any
+    step fails the page simply stays -- the saving is not worth risking the browser for.
+    """
+    global PAGE, DRIVER
+    if PAGE is None or CTX is None:
+        return False
+    try:
+        if not any((pg.url or "") in ("about:blank", "")
+                   for pg in CTX.pages if pg is not PAGE):
+            CTX.new_page()
+        doomed, PAGE = PAGE, None
+        if not getattr(DRIVER, "IS_SOCKET", False):
+            DRIVER = None
+        doomed.close()
+        print("bridge: resident page released (%s); a blank page holds the browser open"
+              % (reason or "no longer needed"), flush=True)
+        return True
+    except Exception as exc:
+        print("bridge: keeping the resident page (%s: %s)"
+              % (type(exc).__name__, str(exc)[:120]), flush=True)
+        return False
+
+
+def release_resident_page(reason=""):
+    """Release the resident agent tab from any thread. Never raises, never blocks.
+
+    Asking the page thread to do nothing is still asking it, and the ask is what blocks: this
+    is called from ensure_driver(), which runs wherever a turn is sent. The two guards below
+    are the difference between "there is no tab, carry on" and a caller parked forever on a
+    queue nobody is servicing.
+    """
+    if PAGE is None or not PAGE_EXECUTOR.alive():
+        return False
+    try:
+        return bool(run_on_page_thread(_release_resident_page_locked, reason))
+    except Exception:
+        return False
+
+
 def ensure_driver():
     """The driver for the CONVERSATION: a socket when one can be had, else the page.
 
@@ -1551,6 +1811,11 @@ def ensure_driver():
         # a channel that does not exist. Every other operational line here is a print for the
         # same reason.
         print("bridge: conversation is on a SOCKET (no tab needed for turns)", flush=True)
+        # AND THE TAB GOES. "No tab needed for turns" was printed while a Copilot tab stayed
+        # open and resident, because the only release lived in startup and nothing revisited it
+        # once a socket arrived later. The DOM endpoints reopen one on demand (borrow_page), so
+        # nothing is lost but the memory.
+        release_resident_page("the conversation moved to a socket")
         return DRIVER
     if DRIVER is not None and not _on_socket():
         print("bridge: conversation stays on the PAGE (no socket available)", flush=True)
@@ -1716,11 +1981,15 @@ def _goto_settled(url, timeout=25000, tries=3, compose_wait=40):
                     pass
             return True
         try:
-            from relay.edge_recover import surface, looks_like_login, touch_pause
-            if looks_like_login(PAGE.url or ""):
+            from relay.edge_recover import surface, touch_pause
+            if _is_signin_wall(PAGE.url or ""):
+                _note_signin_wall(PAGE.url or "")
                 # Surface once so the user can sign in; keep the keeper backed off while the
                 # login page is still showing so a slow MFA login is not re-minimized.
-                if not surfaced:
+                # UNLESS THE SUPERVISOR OWNS IT -- see _supervisor_owns_signin.
+                if _supervisor_owns_signin():
+                    pass
+                elif not surfaced:
                     # surface() now returns a TRUTHFUL bool (verified headed process) -- no
                     # notify/toast mechanism exists in this file, but log a real failure so
                     # it is visible rather than silently assumed to have worked. Pass the
@@ -2107,12 +2376,121 @@ def _redact_unlock_password(text):
     対象は解錠パスワードだけではない。エージェントが .env の中身を読み上げた回が
     あり、API キーと HF トークンまで転写ログに平文で残っていた。名前で拾う共通の
     仕組みに寄せて、鍵が増えても取りこぼさないようにする。
+
+    FAILS CLOSED. The except here used to return the ORIGINAL text, so a redactor that could
+    not be imported or raised put the injected unlock password into the session ledger in
+    clear. It now returns _REDACTION_FAILED_MARKER and logs the failure. Only the ledger copy
+    is withheld: the turn was sent before this runs, from the unredacted text.
     """
     try:
         from tools.secret_store import redact_secrets
         return redact_secrets(text)
-    except Exception:
-        return text or ""
+    except Exception as exc:
+        try:
+            logger.warning("ledger redaction failed (%s); wrote %r instead of the text",
+                           type(exc).__name__, _REDACTION_FAILED_MARKER)
+        except Exception:
+            pass
+        return _REDACTION_FAILED_MARKER
+
+
+#: tools.secret_store.REDACTION_FAILED_MARKER, repeated for the case where that module could not
+#: be imported at all. A test holds the two equal.
+_REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
+
+
+#: Where an exchange goes when the session store could not take it. A second place on disk, so a
+#: locked or full store does not mean the words are gone; .fleet/ is the bridge's own state dir.
+PERSIST_FAILURES_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet",
+    "chat_persist_failures.jsonl")
+
+#: How many chat exchanges this process was asked to store, and how many are in the store. The
+#: difference is what the self-check reports to the window on every turn. In process only: a
+#: restart starts at zero, which is right -- the check is "did THIS process lose any".
+_CHAT_PERSIST = {"asked": 0, "written": 0, "failed": 0}
+_CHAT_PERSIST_LOCK = threading.Lock()
+
+#: Backoff between tries of a write that failed for a reason that is usually transient (a
+#: reader holding the file, a momentary I/O error). Three tries, then it is reported.
+_PERSIST_RETRY_DELAYS = (0.5, 1.5)
+
+
+def _persist_failure_reason(exc):
+    """One short, human-readable cause for the notice. Never the traceback."""
+    text = str(exc) or type(exc).__name__
+    low = text.lower()
+    if "full" in low or "no space" in low:
+        return "disk full (%s)" % text[:120]
+    if "locked" in low or "busy" in low:
+        return "store locked (%s)" % text[:120]
+    if "readonly" in low or "read-only" in low or "permission" in low:
+        return "store not writable (%s)" % text[:120]
+    return "%s: %s" % (type(exc).__name__, text[:120])
+
+
+def _spill_unstored_exchange(sid, user_text, assistant_text, reason):
+    """Keep the words somewhere else when the store refused them. Returns True when it landed."""
+    try:
+        os.makedirs(os.path.dirname(PERSIST_FAILURES_PATH), exist_ok=True)
+        row = {"ts": time.time(), "sid": str(sid or ""), "why": str(reason)[:300],
+               "user": str(user_text or "")[:20000], "assistant": str(assistant_text or "")[:20000]}
+        with open(PERSIST_FAILURES_PATH, "a", encoding="utf-8", newline=chr(10)) as fh:
+            fh.write(json.dumps(row, ensure_ascii=False) + chr(10))
+        return True
+    except OSError:
+        return False
+
+
+def _record_exchange_durably(sid, user_msg, final_text, sleep=time.sleep):
+    """Write one chat exchange to the session store, and ALWAYS say whether it landed.
+
+    THE DEFECT THIS REPLACES: the exchange was written by two separate appends inside
+    `except Exception: logger.warning(...)`. Any failure -- a locked file, a full disk, an invalid
+    session id -- left the ledger short and said so on a line of bridge.log that nobody reads, and
+    the window drew the answer as if it had been kept. The conversation then existed on screen
+    and nowhere else, which is "the chats since 9/18 are gone".
+
+    Now: ONE transaction (session_store.record_exchange), retried on the transient failures, a
+    spill to .fleet/chat_persist_failures.jsonl when it still fails, an error-level log line, and a
+    (False, reason) result the caller turns into a visible notice. Nothing is swallowed.
+
+    `final_text` empty stores the user line alone -- what was typed is kept even when no answer
+    came back."""
+    with _CHAT_PERSIST_LOCK:
+        _CHAT_PERSIST["asked"] += 1
+    user_text = _redact_unlock_password(user_msg)
+    assistant_text = _redact_unlock_password(final_text) if final_text else ""
+    last = None
+    for attempt in range(len(_PERSIST_RETRY_DELAYS) + 1):
+        try:
+            S.record_exchange(sid, user_text, assistant_text)
+            with _CHAT_PERSIST_LOCK:
+                _CHAT_PERSIST["written"] += 1
+            return True, ""
+        except ValueError as exc:            # an invalid sid does not get better with waiting
+            last = exc
+            break
+        except Exception as exc:             # StoreUnavailable, sqlite3.Error, OSError
+            last = exc
+            if attempt < len(_PERSIST_RETRY_DELAYS):
+                sleep(_PERSIST_RETRY_DELAYS[attempt])
+    reason = _persist_failure_reason(last)
+    spilled = _spill_unstored_exchange(sid, user_text, assistant_text, reason)
+    with _CHAT_PERSIST_LOCK:
+        _CHAT_PERSIST["failed"] += 1
+    logger.error("chat exchange NOT stored for sid=%s: %s (spilled to %s: %s)",
+                 logsafe(sid), logsafe(reason), PERSIST_FAILURES_PATH, spilled)
+    return False, reason
+
+
+def _chat_persist_selfcheck():
+    """What the stream tells the window after every turn: the asked/written/failed counts and,
+    when they disagree, the sentence to show."""
+    with _CHAT_PERSIST_LOCK:
+        c = dict(_CHAT_PERSIST)
+    c["ok"] = (c["asked"] == c["written"])
+    return c
 
 
 def _persist_exchange(sid, user_msg, final_text):
@@ -2123,12 +2501,14 @@ def _persist_exchange(sid, user_msg, final_text):
         worse than no resume -- no stale-marker or most-recent-entry fallback).
       * session HAS conv_url: never overwrite. Verify the pane's aria-current still matches
         and warn on mismatch.
-    Exception-guarded: a persistence hiccup must never break the chat turn."""
+    The TURNS are written first, durably and unconditionally (see _record_exchange_durably); the
+    conv_url bookkeeping after them is exception-guarded, because a failure THERE must never
+    break the chat turn or take the already-written turns with it.
+
+    Returns (ok, reason): ok False means the exchange is NOT in the session store, and the caller
+    owns telling the person (the /stream handler sends a `persist_error` event to the window)."""
+    ok, reason = _record_exchange_durably(sid, user_msg, final_text)
     try:
-        # 送る側は元の文（解錠の前置きを付けない方）を渡しているので平文は入らないが、
-        # 返ってきた側は相手次第。復唱されれば同じ台帳に平文で残る。両方に掛ける。
-        S.append_turn(sid, "user", _redact_unlock_password(user_msg))
-        S.append_turn(sid, "assistant", _redact_unlock_password(final_text))
         sess = S.load(sid) or {}
         existing = sess.get("conv_url") or ""
         if existing:
@@ -2182,7 +2562,8 @@ def _persist_exchange(sid, user_msg, final_text):
                 register_bridge_session_in_fleet_convs(
                     sid, new_sess.get("title") or "", ref, new_sess.get("transcript") or "")
     except Exception:
-        logger.warning("session persistence failed for sid=%s", logsafe(sid), exc_info=True)
+        logger.warning("session conv_url bookkeeping failed for sid=%s", logsafe(sid), exc_info=True)
+    return ok, reason
 
 
 def _verify_pane_on_guid(guid, cur_wait=10, turns_wait=20):
@@ -2620,6 +3001,7 @@ _CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
 _SETTLE_RESET_TRACE_AFTER_S = float(os.environ.get("MCP_SETTLE_RESET_TRACE_AFTER_S", "20"))
 _SETTLE_RESET_TRACE_PATH = os.path.join(".fleet", "settle_reset.jsonl")
 _SETTLE_RESET_TRACE_MAX_BYTES = 2_000_000
+_OUTER_READ_CAPPED_SAID = False
 
 
 def _outer_read_trace(t0, cleaned, final, partial):
@@ -2631,7 +3013,8 @@ def _outer_read_trace(t0, cleaned, final, partial):
     times a second, to be discarded on the next line.
     """
     try:
-        age = time.time() - t0
+        now = time.time()
+        age = now - t0
         if age < _SETTLE_RESET_TRACE_AFTER_S:
             return
         if callable(cleaned):
@@ -2639,15 +3022,37 @@ def _outer_read_trace(t0, cleaned, final, partial):
         path = os.path.join(".fleet", "outer_read.jsonl")
         try:
             if os.path.getsize(path) > _SETTLE_RESET_TRACE_MAX_BYTES:
+                # SAME AS _settle_reset_trace: a log that stops quietly reads as good news.
+                global _OUTER_READ_CAPPED_SAID
+                if not _OUTER_READ_CAPPED_SAID:
+                    _OUTER_READ_CAPPED_SAID = True
+                    with open(path, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(
+                            {"ts": now, "event": "log_capped",
+                             "note": "size limit reached; nothing after this line was "
+                                     "recorded"}, ensure_ascii=False) + chr(10))
                 return
         except OSError:
             pass
+        # TWO FACTS, BECAUSE ONE OF THEM ANSWERED NOTHING FOR THREE MONTHS. `final_is_proc`
+        # is `_is_proc(final)`, and `_is_proc("")` is True by design -- empty text means the
+        # turn is still going, which is right where this predicate gates the STREAM. As a
+        # recorded column it collapses "there was no text" into "a processing marker matched",
+        # and measured over all 13,694 rows of this file, `final_is_proc == (final_len == 0)`
+        # held every single time: not one row was ever a real marker hit. Anyone tuning
+        # PROCESSING_MARKERS against this trace was tuning a branch it never reached.
+        #
+        # The column stays -- old rows mean what they meant -- and `final_marker_hit` is the
+        # question it was supposed to be answering: a marker matched TEXT THAT EXISTS.
+        _final = final or ""
         rec = {
+            "ts": now,
             "age_s": round(age, 1),
             "clean_len": len(cleaned or ""), "clean_tail": (cleaned or "")[-70:],
-            "final_len": len(final or ""), "final_tail": (final or "")[-70:],
+            "final_len": len(_final), "final_tail": _final[-70:],
             "partial_len": len(partial or ""),
-            "final_is_proc": bool(_is_proc(final or "")),
+            "final_is_proc": bool(_is_proc(_final)),
+            "final_marker_hit": bool(_final.strip()) and bool(_is_proc(_final)),
         }
         os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "a", encoding="utf-8") as fh:
@@ -2656,17 +3061,36 @@ def _outer_read_trace(t0, cleaned, final, partial):
         pass
 
 
+#: Whether the "this log has stopped" line has already been written. See its use.
+_SETTLE_RESET_CAPPED_SAID = False
+
+
 def _settle_reset_trace(t0, final, stable_text, gen_active):
+    global _SETTLE_RESET_CAPPED_SAID
     try:
-        age = time.time() - t0
+        now = time.time()
+        age = now - t0
         if age < _SETTLE_RESET_TRACE_AFTER_S:
             return
         try:
             if os.path.getsize(_SETTLE_RESET_TRACE_PATH) > _SETTLE_RESET_TRACE_MAX_BYTES:
+                # A LOG THAT STOPS QUIETLY READS AS GOOD NEWS. Past the cap this returned, so
+                # the absence of later entries meant either "the settle no longer resets" or
+                # "the file filled up", and nothing on disk said which. One line, once.
+                if not _SETTLE_RESET_CAPPED_SAID:
+                    _SETTLE_RESET_CAPPED_SAID = True
+                    with open(_SETTLE_RESET_TRACE_PATH, "a", encoding="utf-8") as fh:
+                        fh.write(json.dumps(
+                            {"ts": now, "event": "log_capped",
+                             "note": "size limit reached; nothing after this line was "
+                                     "recorded"}, ensure_ascii=False) + chr(10))
                 return
         except OSError:
             pass
         rec = {
+            # ts, NOT ONLY age_s -- the absolute time is what age_s was computed from, and
+            # without it these rows cannot be placed beside anything else that happened.
+            "ts": now,
             "age_s": round(age, 1), "gen_active": bool(gen_active),
             "final_len": len(final or ""), "stable_len": len(stable_text or ""),
             "final_tail": (final or "")[-80:], "stable_tail": (stable_text or "")[-80:],
@@ -3444,62 +3868,231 @@ def _scrape_history():
     return out
 
 
-PAGE_HTML = """<!doctype html><html lang="ja"><head><meta charset="utf-8">
+# THE IN-BROWSER CHAT PAGE IS GONE, and this is why. It streamed through
+# `new EventSource('/stream?msg=...')` -- a GET with no credential, which is precisely the request
+# shape any other web page could also make the browser send to 127.0.0.1. A page that could
+# authenticate would have to be handed the token, and serving the token to whoever asks for /
+# hands it to every local process too. So / now says where the chat went, and nothing more.
+PAGE_HTML = """<!doctype html><html lang="en"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Copilot (local bridge)</title>
-<style>
-  :root{color-scheme:dark}
-  *{box-sizing:border-box}
-  body{margin:0;background:#1a1a1a;color:#e8e8e8;font:15px/1.6 -apple-system,Segoe UI,Roboto,sans-serif}
-  header{padding:12px 18px;border-bottom:1px solid #333;font-weight:600;color:#c9a36a}
-  #log{max-width:820px;margin:0 auto;padding:18px}
-  .msg{margin:14px 0;display:flex;gap:10px}
-  .who{flex:0 0 64px;color:#888;font-size:13px;padding-top:2px}
-  .body{white-space:pre-wrap;word-break:break-word;flex:1}
-  .user .body{color:#9ecbff}
-  .bar{position:sticky;bottom:0;background:#1a1a1a;border-top:1px solid #333;padding:12px}
-  form{max-width:820px;margin:0 auto;display:flex;gap:8px}
-  textarea{flex:1;resize:none;background:#252525;color:#e8e8e8;border:1px solid #3a3a3a;border-radius:8px;padding:10px;font:inherit}
-  button{background:#c9a36a;color:#1a1a1a;border:0;border-radius:8px;padding:0 18px;font-weight:600;cursor:pointer}
-  button:disabled{opacity:.5;cursor:default}
-  .cursor::after{content:"\\25ae";color:#c9a36a;animation:b 1s steps(1) infinite}
-  @keyframes b{50%{opacity:0}}
-</style></head><body>
-<header>● Copilot — local bridge (Python + Edge, no Node)</header>
-<div id="log"></div>
-<div class="bar"><form id="f">
-  <textarea id="q" rows="2" placeholder="メッセージを入力 (Enter で送信)"></textarea>
-  <button id="send" type="submit">送信</button>
-</form></div>
-<script>
-const log=document.getElementById('log'),q=document.getElementById('q'),btn=document.getElementById('send'),f=document.getElementById('f');
-function add(who,cls){const m=document.createElement('div');m.className='msg '+cls;
-  const w=document.createElement('div');w.className='who';w.textContent=who;
-  const b=document.createElement('div');b.className='body';m.append(w,b);log.append(m);
-  window.scrollTo(0,document.body.scrollHeight);return b;}
-function ask(text){
-  add('You','user').textContent=text;
-  const out=add('Copilot','asst');out.classList.add('cursor');
-  btn.disabled=true;
-  const es=new EventSource('/stream?msg='+encodeURIComponent(text));
-  es.onmessage=e=>{const d=JSON.parse(e.data);
-    if(d.replace!==undefined){out.textContent=d.replace;window.scrollTo(0,document.body.scrollHeight);}
-    else if(d.delta){out.textContent+=d.delta;window.scrollTo(0,document.body.scrollHeight);}};
-  es.addEventListener('done',()=>{out.classList.remove('cursor');es.close();btn.disabled=false;q.focus();});
-  es.onerror=()=>{out.classList.remove('cursor');es.close();btn.disabled=false;};
-}
-f.onsubmit=e=>{e.preventDefault();const t=q.value.trim();if(!t)return;q.value='';ask(t);};
-q.addEventListener('keydown',e=>{if(e.key==='Enter'&&!e.shiftKey){e.preventDefault();f.requestSubmit();}});
-</script></body></html>"""
+<title>Copilot bridge</title>
+<style>body{margin:0;padding:24px;background:#1a1a1a;color:#e8e8e8;
+font:15px/1.6 -apple-system,Segoe UI,Roboto,sans-serif}code{color:#c9a36a}</style>
+</head><body>
+<p>This is the local Copilot bridge. It no longer serves a browser chat page: every request
+must carry the bridge token, which a browser page cannot hold safely.</p>
+<p>Use the <code>CopilotChat</code> window (<code>ui\\CopilotChat.exe</code>) or
+<code>python bridge\\session_cli.py</code>.</p>
+</body></html>"""
+
+
+#: Every path the bridge serves. Anything else is a 404 -- after the browser checks, so a web
+#: page cannot use the 404/200 difference to probe what is here either.
+BRIDGE_ROUTES = frozenset({
+    "/", "/stream", "/goal", "/stop", "/new", "/status", "/conv", "/switch", "/sessions",
+    "/adopt", "/resume", "/send", "/history", "/delete", "/forget", "/agent_conversations",
+    "/upload",
+})
+
+#: Answered to a GET, and without a token -- each with a REDUCED answer (see Handler._route):
+#:   /        the static note above
+#:   /status  liveness and busy flags only. scripts/supervisor.ps1, scripts/stale_server_check.py,
+#:            scripts/status.py and scripts/start_all.ps1 read turn_running/busy from here to
+#:            decide whether a restart would kill a live turn; none of them needs a secret for
+#:            that, and "the bridge is unreadable" must not turn into "the bridge is busy".
+#:   /conv    liveness only; the conversation URL is withheld without a token.
+#:            scripts/start_all.ps1 and scripts/doctor.ps1 probe it to see whether the process
+#:            holding :8765 is a working bridge.
+#: Everything else is POST-only and needs the token.
+BRIDGE_OPEN_ROUTES = frozenset({"/", "/status", "/conv"})
+
+#: The largest POST body read. A message is text; nothing legitimate comes near this.
+BRIDGE_MAX_BODY = 8 * 1024 * 1024
+
+#: Host header values a native client sends. A browser that reached 127.0.0.1 through a
+#: rebinding DNS name sends that NAME, which is the whole of the DNS-rebinding defence.
+_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "[::1]"})
+
+#: Set by main() once the listening socket is bound (bridge_auth.install_token). None means no
+#: token was ever installed, and every token-requiring request is then refused -- fail closed.
+BRIDGE_TOKEN: "str | None" = None
+
+_UPDATE_HINT = "rebuild the chat window (ui\\rebuild_ui.ps1) or update the client"
+
+
+def bridge_request_refusal(method, path, headers, expected_token):
+    """(status, reason phrase, detail) for a request the bridge must refuse, or None. Pure.
+
+    ORDER IS DELIBERATE. The browser checks run first and on EVERY path, /status included:
+    a browser has no business here at all, and answering it anything -- even a 404 -- tells a
+    hostile page what exists. Then the method, then the token.
+
+    The reason phrase is what an OLD client shows the person: .NET's WebException message is
+    "(405) <reason phrase>", so the phrase itself says what to do. ASCII only (it goes out in
+    the status line).
+    """
+    host = (headers.get("Host") or "").strip().lower()
+    if host:
+        hostname = host.split("]")[0] + "]" if host.startswith("[") else host.rsplit(":", 1)[0]
+        if hostname not in _LOOPBACK_HOSTS:
+            return (403, "Forbidden - Host is not loopback",
+                    "Host %r is not a loopback name; refused (DNS rebinding)" % host[:80])
+    if headers.get("Origin") is not None:
+        return (403, "Forbidden - browser origin",
+                "requests carrying an Origin header are refused: the bridge takes no "
+                "browser traffic")
+    if headers.get("Referer") is not None:
+        return (403, "Forbidden - browser referer",
+                "requests carrying a Referer header are refused: the bridge takes no "
+                "browser traffic")
+    site = headers.get("Sec-Fetch-Site")
+    if site is not None and site.strip().lower() not in ("none", "same-origin"):
+        return (403, "Forbidden - cross-site request",
+                "Sec-Fetch-Site %r is refused: the bridge takes no browser traffic" % site[:40])
+    if method == "OPTIONS":
+        # NEVER a positive preflight. No Access-Control-* header is ever sent by this server,
+        # so a browser can never be told a cross-origin request with X-Bridge-Token is allowed.
+        return (403, "Forbidden - no cross-origin access", "CORS preflight refused")
+    if path not in BRIDGE_ROUTES:
+        return (404, "Not Found", "no such endpoint")
+    if method not in ("GET", "POST"):
+        return (405, "Method Not Allowed", "only GET (status probes) and POST are served")
+    if method == "GET" and path not in BRIDGE_OPEN_ROUTES:
+        return (405, "Method Not Allowed - this bridge takes POST with X-Bridge-Token; "
+                + _UPDATE_HINT,
+                "%s changes state or reads the page, so it is POST-only and needs the %s "
+                "header (see bridge/bridge_auth.py); %s" % (path, bridge_auth.TOKEN_HEADER,
+                                                           _UPDATE_HINT))
+    supplied = headers.get(bridge_auth.TOKEN_HEADER)
+    if supplied is None and path in BRIDGE_OPEN_ROUTES:
+        return None                      # the reduced, token-free answer
+    if not expected_token:
+        return (503, "Service Unavailable - bridge token not initialised",
+                "the bridge has no token installed, so nothing that needs one is served")
+    if supplied is None:
+        return (401, "Unauthorized - missing X-Bridge-Token; " + _UPDATE_HINT,
+                "%s needs the %s header; the token is in %s"
+                % (path, bridge_auth.TOKEN_HEADER, "the per-user bridge token file"))
+    if not hmac.compare_digest(supplied.strip().encode("utf-8", "replace"),
+                               expected_token.encode("utf-8")):
+        return (401, "Unauthorized - wrong X-Bridge-Token",
+                "the token does not match this bridge (it may have restarted: re-read the "
+                "token file)")
+    return None
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
 
+    # ── the door. Every request, whatever its method, goes through _dispatch. ─────────────────
+
     def do_GET(self):
-        global ACTIVE_SID
+        self._dispatch("GET")
+
+    def do_POST(self):
+        self._dispatch("POST")
+
+    def do_OPTIONS(self):
+        self._dispatch("OPTIONS")
+
+    def do_PUT(self):
+        self._dispatch("PUT")
+
+    def do_DELETE(self):
+        self._dispatch("DELETE")
+
+    def _refuse(self, code, reason, detail):
+        body = json.dumps({"ok": False, "error": detail, "refused": code},
+                          ensure_ascii=False).encode("utf-8")
+        self.send_response(code, reason)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if code == 405:
+            self.send_header("Allow", "POST")
+        self.end_headers()
+        self.wfile.write(body)
+
+    #: What an OLD chat window shows when it streams with a bare GET. Bilingual because it is
+    #: displayed verbatim, as the answer bubble.
+    OUTDATED_CLIENT_TEXT = (
+        "[bridge error: このチャット画面はブリッジより古いため、送信できませんでした（何も送信されて"
+        "いません）。ui\\rebuild_ui.ps1 を実行して画面を更新してください。 / This chat window is "
+        "older than the bridge, which now requires POST with X-Bridge-Token -- nothing was sent. "
+        "Run ui\\rebuild_ui.ps1 to update it.]")
+
+    def _refuse_as_stream(self):
+        """A GET /stream or /goal from an old client: refused -- nothing runs -- but answered as
+        the stream it expects, carrying the instruction.
+
+        WHY NOT THE 405. The old window reads a stream body only on a 200; on any error it shows
+        .NET's WebException message, and .NET substitutes its OWN localized text for a known
+        status ("(405) メソッドは使用できません", measured) -- the reason phrase that says what to
+        do never reaches the person. The text is framed as "[bridge error: ...]" because every
+        old stream reader already treats that marker as a failed turn, not an answer
+        (tools/judge_backend.py, bench/companionbench/agents.py). Only reached by a request that
+        passed every browser check, so this is not something a web page can use.
+        """
+        body = ("data: %s\n\nevent: done\ndata: {}\n\n"
+                % json.dumps({"replace": self.OUTDATED_CLIENT_TEXT, "refused": 405},
+                             ensure_ascii=False)).encode("utf-8")
+        self.send_response(200, "OK - refused, client outdated")
+        self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Bridge-Refused", "405")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _dispatch(self, method):
         parsed = urllib.parse.urlparse(self.path)
+        body = b""
+        if method in ("POST", "PUT", "DELETE"):
+            # READ THE BODY BEFORE ANY REFUSAL. Closing a socket with unread bytes in its
+            # receive buffer makes Windows send RST, and the client then reports "connection
+            # reset" instead of the refusal that explains itself.
+            if self.headers.get("Transfer-Encoding"):
+                self._refuse(411, "Length Required", "chunked bodies are not accepted")
+                return
+            try:
+                n = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self._refuse(400, "Bad Request", "unreadable Content-Length")
+                return
+            if n < 0 or n > BRIDGE_MAX_BODY:
+                self._refuse(413, "Payload Too Large", "body over %d bytes" % BRIDGE_MAX_BODY)
+                return
+            body = self.rfile.read(n) if n else b""
+        refusal = bridge_request_refusal(method, parsed.path, self.headers, BRIDGE_TOKEN)
+        if refusal is not None:
+            if refusal[0] in (401, 403, 503):
+                logger.warning("bridge refused %s %s: %s", method, logsafe(parsed.path),
+                               logsafe(refusal[2]))
+            if refusal[0] == 405 and method == "GET" and parsed.path in ("/stream", "/goal"):
+                self._refuse_as_stream()
+                return
+            self._refuse(*refusal)
+            return
+        authed = self.headers.get(bridge_auth.TOKEN_HEADER) is not None   # validated above
+        if body:
+            ctype = (self.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype != "application/x-www-form-urlencoded":
+                self._refuse(415, "Unsupported Media Type",
+                             "POST bodies are application/x-www-form-urlencoded")
+                return
+            try:
+                form = body.decode("ascii")
+            except UnicodeDecodeError:
+                self._refuse(400, "Bad Request", "a form body is percent-encoded ASCII")
+                return
+            # The handlers read parse_qs(parsed.query); the form fields join the query string,
+            # so every handler below is unchanged by the move from GET to POST.
+            parsed = parsed._replace(query=(parsed.query + "&" + form) if parsed.query else form)
+        self._route(parsed, authed)
+
+    def _route(self, parsed, authed):
+        global ACTIVE_SID
         if parsed.path == "/":
             body = PAGE_HTML.encode("utf-8")
             self.send_response(200)
@@ -3607,7 +4200,8 @@ class Handler(BaseHTTPRequestHandler):
                 store = S.store_stats() or {}
             except Exception as exc:
                 store = {"error": "%s: %s" % (type(exc).__name__, str(exc)[:80])}
-            self._json({
+            _code_changed = _CODE_WATCH.changed()
+            status = {
                 "ok": True,
                 "transport": "socket" if _on_socket() else ("page" if DRIVER else "none"),
                 "socket_enabled": BRIDGE_SOCKET,
@@ -3625,14 +4219,63 @@ class Handler(BaseHTTPRequestHandler):
                 "store": store,
                 "pid": os.getpid(),
                 "started": _PROCESS_STARTED,
+                # ADDITIVE. True when a file this process loaded has changed on disk since it
+                # started (restart needed; the restart itself needs idle, see turn_running/busy).
+                "code_stale": bool(_code_changed),
+                "code_changed": _code_changed,
                 "python": platform.python_version(),
-            })
+                "authenticated": authed,
+                # WHETHER THIS BRIDGE'S PAGE IS STUCK ON A SIGN-IN PAGE. Read by
+                # scripts/ensure_m365_signin.py --bridge-watch, which is how the start_bridge
+                # supervisor knows to bring the window forward after startup has closed the
+                # tab the wall was on. The URL (IdP host) only with the token.
+                "signin_wall": _SIGNIN_WALL is not None,
+                "signin_wall_url": (_SIGNIN_WALL or {}).get("url", "") if authed else "",
+                # WHY THE TOOL-CALL CHECK DID OR DID NOT SEND A MESSAGE (additive, open route:
+                # numbers, a reason code and a tool name only). The same dict the cockpit reads
+                # from .fleet/tool_probe_state.json.
+                "probe": _probe_state_snapshot(),
+            }
+            if not authed:
+                # WITHOUT THE TOKEN: liveness and the busy flags, nothing that names a
+                # conversation. The restart gates (supervisor.ps1, stale_server_check.py,
+                # start_all.ps1) read only turn_running/busy; a caller that wants the ids sends
+                # the token (scripts/win/verify_stack.py does).
+                status.pop("conversation", None)
+                status.pop("active_sid", None)
+                status.pop("code_changed", None)   # file names only with the token
+            self._json(status)
             return
         if parsed.path == "/conv":         # current conversation URL (for saving)
+            if not authed:
+                # LIVENESS ONLY. start_all.ps1 and doctor.ps1 ask /conv "is this a working
+                # bridge?" and need a 200 for yes; the URL is the page's, so it needs the token.
+                # Answered before the lock: a probe must not queue behind a turn.
+                self._json({"ok": True, "url": "", "url_withheld": True,
+                            "note": "send X-Bridge-Token to read the conversation url"})
+                return
             if not PAGE_LOCK.acquire(blocking=False):
                 self._json({"ok": False, "error": "busy"}); return
             try:
-                run_on_page_thread(lambda: self._json({"url": PAGE.url}))
+                # NO PAGE IS A NORMAL STATE, AND THIS HANDLER DIED ON IT. `PAGE.url` on a None
+                # PAGE raises inside the page thread, the request ends without a response, and
+                # the socket closes mid-request -- so a caller sees a connection failure and
+                # concludes the bridge is DOWN. It is not: /status answers 200 beside it, saying
+                # has_resident_page false, which is the very condition this line cannot survive.
+                #
+                # That misreading is the whole cost. ui/CopilotChat.cs probes /conv before every
+                # send, and on failure refuses to send and offers to restart the stack -- so a
+                # healthy bridge with no page open presents as an unreachable one, and restarting
+                # the stack does not fix it because nothing is broken. Reported by the operator
+                # after the stack had already come back up. 2026-09-09.
+                #
+                # /switch and /new next to this one already ask for a page and answer "no agent
+                # page" when there is none. This is the same guard, and it was missing here.
+                page = PAGE
+                if page is None:
+                    self._json({"ok": True, "url": ""})
+                else:
+                    run_on_page_thread(lambda: self._json({"ok": True, "url": page.url}))
             finally:
                 PAGE_LOCK.release()
             return
@@ -3803,11 +4446,28 @@ class Handler(BaseHTTPRequestHandler):
                 "promotion_attempted": True,
                 "page_busy": consumer_running,
                 "queue_depth": depth,
+                # THE FIELD WAS FIXED AND THE SENTENCE WENT ON MAKING THE SAME CLAIM. The key
+                # above was renamed from "promoted" to "promotion_attempted" precisely because
+                # this reply cannot know the outcome -- and the note still read "a turn is
+                # being run for it now", which is the same assertion in prose.
+                #
+                # It is not always true. `_promote` runs on another thread and can fail
+                # outright: with the page-owner thread down, run_on_page_thread raises
+                # immediately ("the page-owner thread is not running, so this job would never
+                # be serviced"), the exception is logged, and the message stays queued. The
+                # operator was told a turn had started. Measured 2026-09-22 by standing this
+                # handler up with no page thread: ok, queued, page_busy false, and that note.
+                #
+                # So the note now describes the ATTEMPT, which is the only thing this reply
+                # is in a position to describe, and names both ways it can come to nothing.
                 "note": ("queued, and a turn will be run for it as soon as the page is free "
                          "(something is using it right now). If it is still busy in %d seconds "
                          "this stays queued." % int(SEND_PROMOTION_WAIT_S)
                          if consumer_running else
-                         "queued, and a turn is being run for it now."),
+                         "queued, and a turn has been requested for it. That happens on "
+                         "another thread, so this reply cannot say it started: if the page "
+                         "thread is not running, or the page is still busy in %d seconds, "
+                         "the message stays queued." % int(SEND_PROMOTION_WAIT_S)),
             })
             return
         if parsed.path == "/history":      # scrape ALL turns of a conversation in order
@@ -4012,19 +4672,74 @@ class Handler(BaseHTTPRequestHandler):
         # a different one. Two docstrings already claimed /resume released it; it did not.
         release_socket_driver("/resume")
         global ACTIVE_SID
-        sid = (urllib.parse.parse_qs(parsed.query).get("sid") or [""])[0]
+        _qs = urllib.parse.parse_qs(parsed.query)
+        sid = (_qs.get("sid") or [""])[0]
+        # BY GUID TOO, BECAUSE A FLEET CONVERSATION HAS NO SID. The cockpit's fleet rows carry
+        # `sess:<guid>` and a worker name; resuming by the worker name would ask the store for a
+        # session that does not exist, so the chat's send had only `/switch` left -- the path
+        # that releases the socket and opens a tab. Resolving the guid here is what lets the
+        # socket-first branch below apply to them.
+        #
+        # An existing row wins (find_by_conv_url matches on the guid whichever shape is stored);
+        # otherwise a session is minted for it. That is what /adopt does, minus the navigation
+        # that was the whole problem.
         if not sid:
-            self._json({"ok": False, "error": "missing sid"}); return
+            _guid = (_qs.get("guid") or [""])[0].strip()
+            if _guid:
+                _ref = make_sessref(_guid)
+                try:
+                    sid = S.find_by_conv_url(_ref) or ""
+                except Exception:
+                    sid = ""
+                if not sid:
+                    try:
+                        sid = S.new_session(title="")["sid"]
+                        S.touch(sid, conv_url=_ref, status="active", source="chat")
+                    except Exception as exc:
+                        self._json({"ok": False,
+                                    "error": "could not bind that conversation: %s"
+                                             % type(exc).__name__})
+                        return
+        if not sid:
+            self._json({"ok": False, "error": "missing sid or guid"}); return
         sess = S.load(sid)
         if sess is None:
             self._json({"ok": False, "error": "unknown sid"}); return
         ref = sess.get("conv_url") or ""
         kind = classify_conv_ref(ref)
+        via = "page"
         try:
-            _reap_orphan_tabs()
+            # THE SOCKET FIRST, AND WITHOUT A PAGE. A sessref is exactly the shape
+            # socket_route.driver_for(conversation_id=) continues, so the navigation this used
+            # to require was a precondition for the wrong thing: the page had to settle before
+            # ACTIVE_SID moved, and ACTIVE_SID is the only input the socket driver reads.
+            #
+            # The order inverts. Point the session at the conversation, ask for a socket, and
+            # keep it if one comes back. Nothing is navigated, nothing is clicked, and no tab
+            # is opened -- which is the difference between "resumable" and "resumable if you
+            # are willing to open a browser".
             if kind == "sessref":
-                ok, reason = _resume_to_ref(ref)
+                _prev = ACTIVE_SID
+                ACTIVE_SID = sid
+                _drv = None
+                try:
+                    _drv = _bridge_socket_driver()
+                except Exception:
+                    _drv = None
+                if _drv is not None:
+                    global DRIVER
+                    DRIVER = _drv
+                    release_resident_page("resumed over the socket")
+                    ok, reason, via = True, "ok", "socket"
+                else:
+                    # NO SOCKET TO BE HAD. Falling back to the page is still better than
+                    # refusing, but it is the exception now and the caller is told which one
+                    # happened rather than left to assume.
+                    ACTIVE_SID = _prev
+                    _reap_orphan_tabs()
+                    ok, reason = _resume_to_ref(ref)
             elif kind == "conv_url":
+                _reap_orphan_tabs()
                 ok = _goto_settled(ref)
                 reason = "ok" if ok else "navigation did not settle on the conversation"
             else:
@@ -4034,7 +4749,7 @@ class Handler(BaseHTTPRequestHandler):
         if ok:
             ACTIVE_SID = sid
             S.touch(sid, status="active")
-            self._json({"ok": True, "sid": sid})
+            self._json({"ok": True, "sid": sid, "via": via})
         else:
             self._json({"ok": False, "error": reason})
 
@@ -4289,8 +5004,19 @@ class Handler(BaseHTTPRequestHandler):
         if matched:
             try:
                 skill_prompt = SKILL_STORE.render(matched["name"], msg)
+                # APPLICABILITY CHECK, ADDED 2026-09-24. Measured on a held-out set: 2 of 30
+                # requests that should have matched nothing instead got a confident hit with
+                # the right topic and the wrong task (a job-posting request matched onboarding;
+                # a leave-law question matched a leave application). A lexical matcher cannot
+                # see "same topic, different task" -- the model reading the description can, so
+                # it is told to check before following what render() already handed it.
+                desc = str(matched.get("description") or "").strip()
+                note = (("\n%s Use this only if the request is for that exact task, not merely "
+                         "the same topic; if the topic matches but the task differs, proceed "
+                         "without it.\n" % desc) if desc else "")
                 self._stream_text(
-                    BRIDGE_DISCIPLINE + skill_prompt + "\n\nOriginal user request:\n" + msg
+                    BRIDGE_DISCIPLINE + skill_prompt + note
+                    + "\n\nOriginal user request:\n" + msg
                 )
                 return
             except SkillError:
@@ -4343,6 +5069,7 @@ class Handler(BaseHTTPRequestHandler):
             proc = subprocess.Popen(
                 argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 text=True, encoding="utf-8", errors="replace",
+                creationflags=childproc.headless_creationflags(),
             )
 
             # Read the subprocess's stdout on a background thread so this thread can keep
@@ -4422,6 +5149,7 @@ class Handler(BaseHTTPRequestHandler):
         proc = subprocess.Popen(
             argv, cwd=repo_root, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
             text=True, encoding="utf-8", errors="replace",
+            creationflags=childproc.headless_creationflags(),
         )
         line_q: "queue.Queue[str | None]" = queue.Queue()
 
@@ -4621,7 +5349,8 @@ class Handler(BaseHTTPRequestHandler):
                         _settle_reset_trace(t0, final, stable_text, gen_active)
                         stable_text, stable_since = final, time.time()
                     time.sleep(0.3)
-                    self._ping()             # detect Esc/Stop disconnect promptly
+                    if stream_out:
+                        self._ping()         # detect Esc/Stop disconnect promptly
                     # An EMPTY clean body is not a new answer -- it is a failed read. Falling
                     # back to the RAW last message here was the bug: the raw text carries the
                     # "<agent> said:" heading and the avatar's alt text, so it never equals the
@@ -4639,7 +5368,21 @@ class Handler(BaseHTTPRequestHandler):
                 # (placeholder->answer cursor corruption, leaked loading lines).
                 return _answer_clean() or final
             time.sleep(0.3)
-            self._ping()                     # detect Esc/Stop disconnect promptly
+            # GUARDED, LIKE EVERY OTHER WRITE IN THIS LOOP. `stream_out=False` was honoured by
+            # each self._sse(...) above and missed here -- and this is the one that writes
+            # unconditionally, because its whole job is to poke the client and see if the poke
+            # raises. On the no-stream path there is no client: the promoted /send answered its
+            # HTTP request and returned before this thread started, so self.wfile is the
+            # finished socket of a request nobody is reading.
+            #
+            # Measured 2026-09-18 in .setup/logs/bridge.log: every promoted /send died 0.3 s
+            # into this loop with "OSError: [WinError 10038] an operation was attempted on
+            # something that is not a socket", before any answer could be read. The endpoint
+            # had already replied {"ok":true,"promotion_attempted":true} and the message was
+            # gone from the queue, so the store showed a session with turns:0 and an empty
+            # conv_url and nothing anywhere said why.
+            if stream_out:
+                self._ping()                 # detect Esc/Stop disconnect promptly
         # outer-loop timeout end: same authoritative-final read
         return _answer_clean()
 
@@ -4697,7 +5440,7 @@ class Handler(BaseHTTPRequestHandler):
         both. Raises on a driver/page error, exactly as _send_and_stream_once did before this
         was split out of _stream_text -- callers own the Esc/Stop-button + error-SSE handling.
         """
-        global _LAST_USER_TURN_TS, _BRIDGE_UNLOCK_ATTEMPTS, _BRIDGE_UNLOCK_PREFLIGHT_DONE
+        global _LAST_USER_TURN_TS
 
         # THE TURN GOES WHERE IT WAS ADDRESSED, OR IT DOES NOT GO. `sid` names the session
         # this message belongs to; the send below goes to whatever conversation the driver
@@ -4720,15 +5463,15 @@ class Handler(BaseHTTPRequestHandler):
 
         _LAST_USER_TURN_TS = time.time()   # see its module-level docstring: the tool probe reads this
         _turn_sent_at = _LAST_USER_TURN_TS  # boundary for the lock check at the end of this turn
-        turn_payload = msg
-        if not _BRIDGE_UNLOCK_PREFLIGHT_DONE:
-            _BRIDGE_UNLOCK_PREFLIGHT_DONE = True
-            pw = _bridge_unlock_password()
-            if pw and _BRIDGE_UNLOCK_ATTEMPTS < MAX_BRIDGE_UNLOCK_ATTEMPTS:
-                _BRIDGE_UNLOCK_ATTEMPTS += 1
-                turn_payload = (BRIDGE_UNLOCK_PREFIX % pw) + msg
-                logger.info("bridge proactive unlock: attempt %d/%d",
-                            _BRIDGE_UNLOCK_ATTEMPTS, MAX_BRIDGE_UNLOCK_ATTEMPTS)
+        # PROACTIVE UNLOCK ON THE FIRST TURN OF EACH CONVERSATION (see MAX_BRIDGE_UNLOCK_ATTEMPTS):
+        # every conversation is its own MCP session, and an unlock is bound to the session.
+        def _with_preflight(conv_key):
+            if _bridge_unlock_preflight_due(conv_key):
+                pw = _bridge_unlock_password()
+                if pw and _bridge_unlock_take(conv_key, "proactive"):
+                    return (BRIDGE_UNLOCK_PREFIX % pw) + msg
+            return msg
+        turn_payload = _with_preflight(_bridge_unlock_conv_key(sid))
         _prepare_capture_baseline(sid)
         final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
         # The conversation can simply be out of budget. Every later turn then returns the
@@ -4737,6 +5480,9 @@ class Handler(BaseHTTPRequestHandler):
         # not a consent card and must not be mistaken for one.
         if isinstance(final, str) and _bridge_recycle_if_exhausted(final):
             _prepare_capture_baseline(ACTIVE_SID)
+            # A FRESH CHAT IS A NEW MCP SESSION: it gets its own proactive unlock (and its
+            # own budget), built from `msg` so a prefix is never doubled.
+            turn_payload = _with_preflight(_bridge_unlock_conv_key(sid))
             final = self._send_and_stream_once(turn_payload, stream_out=stream_out)
         if final is not None and _looks_like_consent(final):
             # Consent card, not a real answer -- do NOT show it to the user; auto-approve and
@@ -4771,20 +5517,31 @@ class Handler(BaseHTTPRequestHandler):
         # reports it in prose. Ask the server's own record instead, then unlock and redo
         # the turn -- the same shape as the consent retry above. The backend IP rotates,
         # so a few of these across a session are normal; the attempt cap stops a loop.
-        if _bridge_should_auto_unlock(_turn_sent_at):
+        _conv = _bridge_unlock_conv_key(sid)
+        if _bridge_should_auto_unlock(_turn_sent_at, _conv):
             pw = _bridge_unlock_password()
-            if pw:
-                _BRIDGE_UNLOCK_ATTEMPTS += 1
-                logger.info("bridge auto-unlock: attempt %d/%d",
-                            _BRIDGE_UNLOCK_ATTEMPTS, MAX_BRIDGE_UNLOCK_ATTEMPTS)
+            if not pw:
+                logger.warning("bridge auto-unlock: MCP_UNLOCK_PASSWORD not set locally")
+            elif _bridge_unlock_take(_conv, "auto"):
                 try:
                     final = self._send_and_stream_once(
                         (BRIDGE_UNLOCK_PREFIX % pw) + msg, stream_out=stream_out)
                 except Exception:
                     logger.warning("bridge auto-unlock turn raised", exc_info=True)
-            else:
-                logger.warning("bridge auto-unlock: MCP_UNLOCK_PASSWORD not set locally")
         return final
+
+    def _sse_persist_result(self, ok, reason):
+        """Tell the window whether this turn is in the session store: `persist` on success,
+        `persist_error` (with the reason) when it is not, both carrying the process's
+        asked/written/failed counts. Sent for every /stream turn so silence can be read as an
+        old bridge, and a missing store row can never be silent."""
+        check = _chat_persist_selfcheck()
+        if ok:
+            self._sse({"persist": "ok", "persist_asked": check["asked"],
+                       "persist_written": check["written"]})
+        else:
+            self._sse({"persist_error": reason or "unknown", "persist_asked": check["asked"],
+                       "persist_written": check["written"], "persist_failed": check["failed"]})
 
     def _stream_text(self, msg: str):
         """Send `msg` to the agent and stream the answer back over the ALREADY-open
@@ -4806,6 +5563,7 @@ class Handler(BaseHTTPRequestHandler):
             ACTIVE_SID = S.new_session()["sid"]
             logger.info("no active session -- created %s", ACTIVE_SID)
         sid = ACTIVE_SID
+        recorded = False          # True once this turn's user line is in the store (or was refused)
         try:
             final = self._run_one_turn(sid, msg)
             if isinstance(final, dict) and final.get("consent_failed"):
@@ -4815,13 +5573,28 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if final:
                 self._sse({"replace": final})
-                # SESSION LIFECYCLE: only a genuine (non-consent-card) answer is worth
-                # persisting. Change-based capture / verify / warn all live in
-                # _persist_exchange (exception-guarded there).
-                _persist_exchange(sid, msg, final)
+                # SESSION LIFECYCLE: a genuine (non-consent-card) answer is persisted with
+                # its user line. Change-based capture / verify / warn all live in
+                # _persist_exchange; the TURNS are written durably there and the outcome comes
+                # back so the window is told when they were not stored.
+                ok, reason = _persist_exchange(sid, msg, final)
+            else:
+                # NO ANSWER, BUT THE PERSON TYPED SOMETHING: keep the line. An empty reply used
+                # to leave nothing at all in the ledger.
+                ok, reason = _record_exchange_durably(sid, msg, "")
+            recorded = True
+            self._sse_persist_result(ok, reason)
             self._sse({}, "done")
             self._drain_pending_queue(sid)
         except Exception as e:
+            # The turn raised or the client hung up, so the user's line has not been recorded
+            # yet. Record it now; it is what was typed, and it must survive the failure.
+            try:
+                if not recorded:
+                    ok, reason = _record_exchange_durably(sid, msg, "")
+                    self._sse_persist_result(ok, reason)
+            except Exception:
+                logger.error("recording the user line after a failed turn raised", exc_info=True)
             # The client hung up (the user pressed Esc/Stop) OR a real error -- either way, click
             # Copilot's OWN stop button so the SERVER-SIDE generation actually halts. Before this,
             # Esc only closed our local stream while Copilot kept generating.
@@ -4897,7 +5670,9 @@ class Handler(BaseHTTPRequestHandler):
             final = final or ""
             done, turn_text = detect_done(final)
             if turn_text:
-                _persist_exchange(sid, msg, turn_text)
+                ok, reason = _persist_exchange(sid, msg, turn_text)
+                if not ok:
+                    self._sse_persist_result(ok, reason)
             last_turn_text = turn_text
             self._sse({"turn_done": turn, "text": turn_text})
             outcome = decide_outcome(done, STOP_REQUESTED, turn, max_turns, consecutive_errors)
@@ -5139,11 +5914,22 @@ class Handler(BaseHTTPRequestHandler):
                     # to persist, and the next queued item may still be fine.
                     logger.warning("drain_pending_queue: consent not auto-approved for sid=%s",
                                    logsafe(sid))
+                    _retry_or_record(sid, item, "consent not auto-approved")
                     continue
                 if final:
                     _persist_exchange(sid, item, final)
-            except Exception:
+                else:
+                    # A TURN THAT RETURNED NOTHING IS NOT A TURN THAT HAPPENED, and this fell
+                    # off the end of the loop with the message already popped.
+                    logger.warning("drain_pending_queue: the turn produced no answer for "
+                                   "sid=%s", logsafe(sid))
+                    _retry_or_record(sid, item, "the turn produced no answer")
+            except Exception as exc:
                 logger.warning("drain_pending_queue: queued send failed for sid=%s", logsafe(sid), exc_info=True)
+                # AND THE MESSAGE IS NOT GONE. Logging it was the whole of the old handling,
+                # so a failure here consumed the operator's instruction and left a log line
+                # nobody was reading -- see UNDELIVERED_PATH above for the measurement.
+                _retry_or_record(sid, item, "%s: %s" % (type(exc).__name__, exc))
 
 
 def _agent_tab_matches(pg, base_url):
@@ -5173,6 +5959,56 @@ def _agent_tab_matches(pg, base_url):
     return True
 
 
+def _agent_tab_url_matches(pg, base_url):
+    """True if `pg` is PARKED ON the agent surface, whether or not it still works.
+
+    THE CLEANER MUST NOT ASK WHETHER THE TAB IS USABLE. _agent_tab_matches answers "can I hand
+    this tab to a conversation", so it requires a live composer -- correct for REUSE and exactly
+    wrong for CLEANUP. Measured 2026-09-10: 69 orphaned tabs sat on this very URL for hours on
+    the bridge's headless Edge, and _close_duplicate_agent_tabs closed none of them, because a
+    headless browser holding scores of tabs discards their renderers and a discarded page
+    answers 0 to locator().count(). The tabs most in need of closing were the only ones the
+    cleaner could not see, and each one made the next renderer likelier to be discarded.
+    """
+    try:
+        u = pg.url or ""
+    except Exception:
+        # A handle that cannot even be asked for its url is a dead tab, which is a tab to close
+        # -- but only if it is not somebody's claim, which the caller checks separately.
+        return False
+    return ("m365.cloud.microsoft/chat" in u) or ("/chat/agent/" in u)
+
+
+def _page_claimed_by_a_live_owner(pg):
+    """Whether some live process has claimed this page (relay.ownership).
+
+    A URL-only cleaner would otherwise close a page a capture is mid-way through: the light
+    token capture claims its page before it navigates, precisely so another run does not take
+    it away (see relay/relay_fleet.py's _claim_page). Unknown answers count as CLAIMED -- when
+    the ledger cannot be read, not closing is the safe direction.
+    """
+    try:
+        from relay import ownership
+        from relay.relay_fleet import _page_target_id
+        tid = _page_target_id(pg)
+        if not tid:
+            return False
+        def _alive(pid):
+            if not pid:
+                return False
+            try:
+                os.kill(int(pid), 0)
+                return True
+            except OSError:
+                return False
+            except Exception:
+                return True
+        return ("page", tid) in {(k[0], k[1]) if isinstance(k, tuple) else ("page", k)
+                                 for k in ownership.live_claims(_alive).keys()}
+    except Exception:
+        return True          # cannot tell -> treat as claimed and leave it alone
+
+
 def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
     """BUG 4c self-healing: close every OTHER tab already on this same agent surface, keeping
     only `keep_pg`. Guards against closing non-agent tabs (only closes pages that
@@ -5183,18 +6019,24 @@ def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
     except Exception:
         return
     closed = 0
+    skipped_claimed = 0
     for pg in pages:
         if pg is keep_pg:
             continue
         try:
-            if _agent_tab_matches(pg, base_url):
-                pg.close()
-                closed += 1
+            # URL, NOT USABILITY. See _agent_tab_url_matches for the 69 tabs this cost.
+            if not _agent_tab_url_matches(pg, base_url):
+                continue
+            if _page_claimed_by_a_live_owner(pg):
+                skipped_claimed += 1
+                continue
+            pg.close()
+            closed += 1
         except Exception:
             continue
-    if closed:
-        logger.info("_find_or_open_agent: closed %d duplicate agent tab(s) left over from "
-                    "prior restart(s)", closed)
+    if closed or skipped_claimed:
+        logger.info("_find_or_open_agent: closed %d duplicate agent tab(s); left %d claimed by "
+                    "a live owner", closed, skipped_claimed)
 
 
 def _find_or_open_agent(ctx):
@@ -5209,6 +6051,7 @@ def _find_or_open_agent(ctx):
             if _agent_tab_matches(pg, url):
                 reused = pg
                 break
+        opened_here = False
         if reused is not None:
             pg = reused
             try:
@@ -5219,14 +6062,46 @@ def _find_or_open_agent(ctx):
             logger.info("_find_or_open_agent: reused existing agent tab instead of opening a new one")
         else:
             pg = ctx.new_page()
-            pg.goto(url, wait_until="domcontentloaded")
-            logger.info("_find_or_open_agent: no reusable agent tab found -- opened a new one")
-        for _ in range(40):
-            pg.wait_for_timeout(1000)
-            if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-                break
-        _close_duplicate_agent_tabs(ctx, pg, url)   # self-heal any tabs left over from before
-        return pg
+            opened_here = True
+        # WHOEVER OPENS A TAB CLOSES IT IF IT DOES NOT WORK OUT.
+        #
+        # MEASURED 2026-09-10. Everything from the navigation to the composer wait can raise,
+        # and the only caller, ensure_page_alive, catches that and logs "agent page had closed
+        # and could not be reopened" -- keeping no reference, so the tab this function had
+        # already created stayed open with nobody holding it. bridge.log recorded that line 76
+        # times in 2.6 hours and CDP :9223 was found holding 69 pages on this exact URL, on a
+        # HEADLESS browser nobody can click. One orphan per failed reopen.
+        #
+        # A REUSED tab is never closed here: it may be somebody's live conversation, and the
+        # failure that brought us here says nothing about who else is holding it.
+        try:
+            if opened_here:
+                pg.goto(url, wait_until="domcontentloaded")
+                logger.info("_find_or_open_agent: no reusable agent tab found -- opened a new one")
+            composed = False
+            for _ in range(40):
+                pg.wait_for_timeout(1000)
+                if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                    composed = True
+                    break
+            # STARTUP MET A SIGN-IN PAGE AND SAID NOTHING. This wait is where a fresh PC's
+            # bridge first lands on the IdP, and it waited 40s and moved on; startup then
+            # closed the page, taking the only evidence with it. Say so, for /status.
+            if composed:
+                _clear_signin_wall()
+            elif _is_signin_wall(pg.url or ""):
+                _note_signin_wall(pg.url or "")
+            _close_duplicate_agent_tabs(ctx, pg, url)   # self-heal any tabs left over from before
+            return pg
+        except Exception:
+            if opened_here:
+                try:
+                    pg.close()
+                except Exception:
+                    pass
+                logger.info("_find_or_open_agent: closed the tab this attempt had just opened, "
+                            "because the attempt failed")
+            raise
     for pg in ctx.pages:                       # fall back to any open agent tab
         if "/chat/agent/" in (pg.url or "") and pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
             _close_duplicate_agent_tabs(ctx, pg, url)
@@ -5245,8 +6120,13 @@ def _find_or_open_agent(ctx):
 # is opened, and no click/consent logic is reimplemented. Runs ONLY when idle (see PAGE_LOCK
 # try-acquire and _LAST_USER_TURN_TS check below), never inside a real user turn.
 
-# 0 disables the probe entirely (opt-out); default 600s (10 min) matches the module docstring.
-MCP_TOOL_PROBE_SEC = float(os.environ.get("MCP_TOOL_PROBE_SEC", "600"))
+# THE ENVIRONMENT VARIABLE IS THE OVERRIDE OF LAST RESORT, NOT THE SCHEDULE. Unset (the normal
+# case) the cadence comes from the `tool_probe_idle_min` setting (cockpit: Recovery section;
+# default 30 min, 0 = never probe), re-read every time the probe decides. Set, it wins over the
+# setting exactly as it always did: a number of seconds, <= 0 disables the probe. None = unset.
+# See tools.tool_probe.probe_interval and _probe_interval_s below.
+_MCP_TOOL_PROBE_ENV = os.environ.get("MCP_TOOL_PROBE_SEC", "").strip()
+MCP_TOOL_PROBE_SEC = float(_MCP_TOOL_PROBE_ENV) if _MCP_TOOL_PROBE_ENV else None
 # Never fire within this many seconds of a real user/goal turn (_LAST_USER_TURN_TS, stamped by
 # _run_one_turn) -- a probe must not compete with, or be mistaken for, live work, and must not
 # burn the user's agent context while they are actively using the bridge.
@@ -5265,6 +6145,132 @@ TOOL_PROBE_TIMEOUT_SEC = 180
 # no longer needs to resolve or reference the user's Desktop path for probing at all.
 
 _TOOL_PROBE_TIMER = None  # the pending threading.Timer, so _schedule_tool_probe can re-arm it
+
+# ── when the probe may cost a Copilot message ──────────────────────────────────────────────
+# Copilot Studio counts SESSIONS, and every probe message opens one (a conversation idle for
+# 30 minutes times out and the next message starts a new session). Measured 2026-09-28..10-05:
+# 118-158 probe messages on full days, a third to a half of them sent within 30 minutes of a REAL
+# tool call that had already proved what the probe exists to prove. So the probe is now the
+# fallback:
+#   * it is skipped while a real, successful, non-probe tool call reached the server within the
+#     last interval (that call's own timestamp is recorded as the health check's evidence);
+#   * when nothing has proved the path for a whole interval it runs, every `tool_probe_idle_min`
+#     minutes (default 30; 0 = never; MCP_TOOL_PROBE_SEC, when set, still overrides);
+#   * after a failed probe it backs off (interval x 2^failures, capped at 2 h) instead of
+#     re-asking quickly -- a failing probe used to be followed by a re-probe and, after a streak,
+#     a conversation recycle, which is a new session each.
+# The decision state is exported (bridge /status "probe", .fleet/tool_probe_state.json) so the
+# screen can say why no probe ran.
+#: How often the timer wakes to re-read the setting and re-check whether a probe is due. Waking
+#: costs nothing (no message); it is what makes a setting change take effect within minutes
+#: instead of after the old interval has run out.
+PROBE_POLL_SEC = 300.0
+_PROBE_RT = {"anchor": 0.0,     # when the last probe turn was SENT (0 = none / retry pending)
+             "defer": 0.0,      # do not run before this (a short retry the caller asked for)
+             "fails": 0,        # consecutive failed verdicts (drives the backoff)
+             "empty": 0}        # consecutive turns that never ran (drives the short-retry backoff)
+_PROBE_STATE = {"last_sent": None, "last_skipped_reason": None, "last_skipped_ts": None,
+                "skipped_since_start": 0, "evidence_ts": None, "evidence_tool": None}
+_PROBE_STATE_WRITTEN = [None]
+
+
+def _probe_interval_s():
+    """(interval_s, source) from MCP_TOOL_PROBE_SEC when set, else the setting. Re-read every call."""
+    return tool_probe.probe_interval(MCP_TOOL_PROBE_SEC, tool_probe.idle_min_setting())
+
+
+def _probe_state_snapshot(now=None):
+    """The probe's state as the screen and /status report it. Never raises."""
+    try:
+        now = time.time() if now is None else now
+        interval_s, src = _probe_interval_s()
+        due = _probe_due_at(interval_s)
+        snap = {
+            "enabled": interval_s > 0,
+            "interval_min": round(interval_s / 60.0, 2),
+            "source": src,
+            "last_sent": _PROBE_STATE["last_sent"],
+            "last_skipped_reason": _PROBE_STATE["last_skipped_reason"],
+            "last_skipped_ts": _PROBE_STATE["last_skipped_ts"],
+            "skipped_since_start": _PROBE_STATE["skipped_since_start"],
+            "evidence_ts": _PROBE_STATE["evidence_ts"],
+            "evidence_tool": _PROBE_STATE["evidence_tool"],
+            "backoff_failures": _PROBE_RT["fails"],
+            "next_due": (due if interval_s > 0 else None),
+        }
+        return snap
+    except Exception:
+        return {"enabled": None}
+
+
+def _publish_probe_state():
+    """Write the snapshot beside the verdict for the cockpit, only when it changed."""
+    try:
+        snap = _probe_state_snapshot()
+        key = json.dumps({k: v for k, v in snap.items() if k != "next_due"}, sort_keys=True)
+        if key == _PROBE_STATE_WRITTEN[0]:
+            return
+        snap["written"] = time.time()
+        if tool_probe.write_state(snap):
+            _PROBE_STATE_WRITTEN[0] = key
+    except Exception:
+        pass
+
+
+def _probe_skipped(reason, count=True, **extra):
+    """Say why this tick sent nothing. `count` is False for 'switched off', which is not a probe
+    that would have run."""
+    now = time.time()
+    # One skipped probe is one count: a user turn keeps the retry at 5-30 s and would otherwise
+    # be counted every time it looks again.
+    if count and (reason != _PROBE_STATE["last_skipped_reason"]
+                  or now - float(_PROBE_STATE["last_skipped_ts"] or 0.0) > 120.0):
+        _PROBE_STATE["skipped_since_start"] += 1
+    _PROBE_STATE["last_skipped_reason"] = reason
+    _PROBE_STATE["last_skipped_ts"] = now
+    for k, v in extra.items():
+        _PROBE_STATE[k] = v
+    _publish_probe_state()
+
+
+def _probe_due_at(interval_s):
+    """Epoch time before which no probe message is sent: the last send + the interval, stretched
+    by the failure backoff, or the explicit short retry the last tick asked for."""
+    base = tool_probe.backoff_s(interval_s, _PROBE_RT["fails"])
+    return max(_PROBE_RT["anchor"] + base if _PROBE_RT["anchor"] > 0 else 0.0, _PROBE_RT["defer"])
+
+
+def _probe_wait_s(now=None):
+    """Seconds until the next tick should look at the probe again: the time until it is due,
+    never longer than PROBE_POLL_SEC (so a changed setting is noticed) and never zero."""
+    now = time.time() if now is None else now
+    interval_s, _src = _probe_interval_s()
+    if interval_s <= 0:
+        return PROBE_POLL_SEC
+    return max(5.0, min(PROBE_POLL_SEC, _probe_due_at(interval_s) - now))
+
+
+def _probe_not_due_yet(now=None):
+    """Seconds to wait if no probe is due yet, else None. Disabled counts as 'not due'."""
+    now = time.time() if now is None else now
+    interval_s, _src = _probe_interval_s()
+    if interval_s <= 0:
+        return None            # _run_tool_probe records the reason and returns
+    remaining = _probe_due_at(interval_s) - now
+    return None if remaining <= 0 else max(5.0, min(PROBE_POLL_SEC, remaining))
+
+
+def _record_probe_backoff(kind, failures, wait_s):
+    """One mechanism row per backed-off probe, so 'how often did the probe fail and how long did
+    it stay quiet afterwards' is a query and not a log search. Never raises."""
+    try:
+        from relay import mechanism_telemetry as _mt
+        _mt.record("tool_probe_backoff", configured=True, config_source="tool_probe_idle_min",
+                   eligible=True, triggered=True, executed=True,
+                   extra={"kind": kind, "consecutive_failures": int(failures),
+                          "next_probe_in_s": int(wait_s)})
+    except Exception:
+        pass
 
 
 # ── conversation recycling on token exhaustion ──────────────────────────────────
@@ -5579,9 +6585,82 @@ def _bridge_recycle_if_exhausted(resp):
 # write "淡々と事実とタスク結果のみ", so it paraphrases the tool error and the server's
 # literal marker never appears. tools/lock_state records the refusal where it happens; this
 # only asks whether one just did.
+#
+# A BUDGET PER CONVERSATION, NOT PER PROCESS (2026-09-24). With the unlock second factor enforced
+# by default (e25b7a3) an unlock is bound to the MCP session that made it, and every new Copilot
+# conversation is a new MCP session -- so every conversation needs its own unlock. This used to
+# be one proactive injection per bridge PROCESS and MAX_BRIDGE_UNLOCK_ATTEMPTS per process
+# lifetime: a bridge that stays up for days served its first three conversations and then
+# refused to unlock any later one, which surfaced as the agent asking a human for a password
+# that is in .env. Now: the proactive unlock runs on the first turn of each conversation, and
+# MAX_BRIDGE_UNLOCK_ATTEMPTS bounds the injections (proactive + reactive) WITHIN one
+# conversation. A conversation is the bridge session the turn is sent in (ACTIVE_SID): every
+# path that starts a new chat -- /new, the out-of-budget recycle, a resume -- gives it a new one.
+# The loop guard stays two-layered: the per-conversation cap stops an unlock loop inside one
+# chat, and a process-wide sliding window (MAX_BRIDGE_UNLOCKS_PER_WINDOW in
+# BRIDGE_UNLOCK_WINDOW_S) stops a runaway that keeps opening new conversations.
 MAX_BRIDGE_UNLOCK_ATTEMPTS = max(1, int(os.environ.get("MCP_BRIDGE_MAX_UNLOCK", "3")))
-_BRIDGE_UNLOCK_ATTEMPTS = 0
-_BRIDGE_UNLOCK_PREFLIGHT_DONE = False
+MAX_BRIDGE_UNLOCKS_PER_WINDOW = max(1, int(os.environ.get("MCP_BRIDGE_MAX_UNLOCK_PER_WINDOW", "20")))
+BRIDGE_UNLOCK_WINDOW_S = max(1.0, float(os.environ.get("MCP_BRIDGE_UNLOCK_WINDOW_S", "600")))
+#: conversation key -> {"attempts": int, "preflight": bool}; insertion-ordered, the oldest
+#: conversations are forgotten past _BRIDGE_UNLOCK_KEEP (a forgotten one only starts over).
+_BRIDGE_UNLOCK_BY_CONV = {}
+_BRIDGE_UNLOCK_KEEP = 256
+_BRIDGE_UNLOCK_TIMES = []
+_BRIDGE_UNLOCK_LOCK = threading.Lock()
+
+
+def _bridge_unlock_conv_key(sid=None):
+    """The conversation a turn is sent in: the active session, else the one it was queued for."""
+    return str(ACTIVE_SID or sid or "")
+
+
+def _bridge_unlock_state(key):
+    st = _BRIDGE_UNLOCK_BY_CONV.pop(key, None) or {"attempts": 0, "preflight": False}
+    _BRIDGE_UNLOCK_BY_CONV[key] = st                      # most recently used last
+    while len(_BRIDGE_UNLOCK_BY_CONV) > _BRIDGE_UNLOCK_KEEP:
+        _BRIDGE_UNLOCK_BY_CONV.pop(next(iter(_BRIDGE_UNLOCK_BY_CONV)))
+    return st
+
+
+def _bridge_unlock_budget_left(key):
+    """True while this conversation may still be sent an unlock. Does not consume."""
+    with _BRIDGE_UNLOCK_LOCK:
+        st = _BRIDGE_UNLOCK_BY_CONV.get(key)
+        return (st or {}).get("attempts", 0) < MAX_BRIDGE_UNLOCK_ATTEMPTS
+
+
+def _bridge_unlock_preflight_due(key):
+    """True exactly once per conversation: its first turn carries the proactive unlock."""
+    with _BRIDGE_UNLOCK_LOCK:
+        st = _bridge_unlock_state(key)
+        if st["preflight"]:
+            return False
+        st["preflight"] = True
+        return True
+
+
+def _bridge_unlock_take(key, why):
+    """Consume one unlock injection for this conversation, or refuse (and say why) when its
+    cap or the process-wide window is spent."""
+    now = time.time()
+    with _BRIDGE_UNLOCK_LOCK:
+        st = _bridge_unlock_state(key)
+        if st["attempts"] >= MAX_BRIDGE_UNLOCK_ATTEMPTS:
+            logger.warning("bridge %s unlock: this conversation already had %d unlock attempts; "
+                           "not sending another (loop guard)", why, st["attempts"])
+            return False
+        _BRIDGE_UNLOCK_TIMES[:] = [t for t in _BRIDGE_UNLOCK_TIMES if now - t < BRIDGE_UNLOCK_WINDOW_S]
+        if len(_BRIDGE_UNLOCK_TIMES) >= MAX_BRIDGE_UNLOCKS_PER_WINDOW:
+            logger.warning("bridge %s unlock: %d unlocks in the last %.0fs across conversations; "
+                           "not sending another (loop guard)", why, len(_BRIDGE_UNLOCK_TIMES),
+                           BRIDGE_UNLOCK_WINDOW_S)
+            return False
+        st["attempts"] += 1
+        _BRIDGE_UNLOCK_TIMES.append(now)
+        logger.info("bridge %s unlock: attempt %d/%d in this conversation", why, st["attempts"],
+                    MAX_BRIDGE_UNLOCK_ATTEMPTS)
+        return True
 
 BRIDGE_UNLOCK_PREFIX = (
     "【要解錠】書込/実行ツールは接続のIP単位ロック解除が必要です。まず最初に call_tool で "
@@ -5591,13 +6670,14 @@ BRIDGE_UNLOCK_PREFIX = (
 )
 
 
-def _bridge_should_auto_unlock(sent_at):
-    """True when THIS turn was refused for lock and a retry is still allowed.
+def _bridge_should_auto_unlock(sent_at, key=None):
+    """True when THIS turn was refused for lock and a retry is still allowed in THIS
+    conversation (`key`, default the active one).
 
     Scoped to the turn on purpose: "was anything refused lately" would let a refusal
     from an unrelated earlier call mark the next few minutes of replies as locked.
     """
-    if _BRIDGE_UNLOCK_ATTEMPTS >= MAX_BRIDGE_UNLOCK_ATTEMPTS:
+    if not _bridge_unlock_budget_left(_bridge_unlock_conv_key() if key is None else key):
         return False
     try:
         from tools import lock_state
@@ -5654,11 +6734,21 @@ def _do_tool_probe_turn(instruction):
     composer check above it already passed, so verify_probe_reply naturally resolves this to
     kind="error" rather than the misleading "agent_unreachable" (which is reserved for the
     composer never having rendered at all)."""
-    agent_loaded = False
-    try:
-        agent_loaded = PAGE is not None and PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0
-    except Exception:
+    # A SOCKET TURN DOES NOT NEED A DOM COMPOSER, and requiring one is what kept a Copilot tab
+    # resident for the life of the process. The probe borrowed a page every MCP_TOOL_PROBE_SEC
+    # purely to satisfy this gate, then held it -- measured 2026-09-10: transport=socket with
+    # has_resident_page=True and a 380 MB Copilot tab on the bridge's Edge, while every turn was
+    # going over the socket and touching nothing on that tab. The composer check is the right
+    # question for the page transport, and the wrong one to ask of a transport that has no page.
+    if _on_socket():
+        agent_loaded = True
+    else:
         agent_loaded = False
+        try:
+            agent_loaded = (PAGE is not None
+                            and PAGE.locator(COPILOT_SELECTORS["composer"]).count() > 0)
+        except Exception:
+            agent_loaded = False
     if not agent_loaded:
         return False, "", False
     try:
@@ -5749,14 +6839,38 @@ def _run_tool_probe():
     _probe_borrowed = None       # bound before the try: the finally below reads it on every
                                  # path, including one that throws before the borrow.
     try:
-        if MCP_TOOL_PROBE_SEC <= 0:
-            return  # opt-out
+        _interval_s, _interval_src = _probe_interval_s()
+        if _interval_s <= 0:
+            # Opt-out: the setting (0 = never) or MCP_TOOL_PROBE_SEC<=0. The health check then
+            # reads "not checked", never green -- nothing is measured, nothing is claimed.
+            _probe_skipped("disabled_env" if _interval_src == "env" else "disabled_setting",
+                           count=False)
+            return
+        # A REAL CALL IS BETTER EVIDENCE THAN OURS, AND FREE. If a real tool call -- not a probe,
+        # not discovery chatter -- reached the server and succeeded within the last interval, the
+        # thing this probe exists to prove has just been proved, so no message is sent. The health
+        # check is recorded as passed by THAT call, at ITS timestamp (never "now"), so the age the
+        # screen shows is the age of something that happened and the check can never be green
+        # without an event behind it.
+        try:
+            from tools import fleet_tool_health as _fth
+            _ev = _fth.last_real_success(time.time(), _interval_s)
+        except Exception:
+            _ev = None
+        if _ev is not None:
+            tool_probe.record_evidence(_ev[0], _ev[1])
+            _probe_skipped("fleet_evidence", evidence_ts=_ev[0], evidence_tool=_ev[1])
+            # Look again when that call would stop counting (it is the newest one, so nothing
+            # younger exists): until then every tick would find the same answer.
+            return max(60.0, min(_interval_s, _ev[0] + _interval_s - time.time()))
         since_user = time.time() - _LAST_USER_TURN_TS
         if since_user < TOOL_PROBE_MIN_IDLE_SEC:
             logger.debug("tool probe: skipped (user turn %.0fs ago)", since_user)
+            _probe_skipped("user_turn")
             return max(5.0, TOOL_PROBE_MIN_IDLE_SEC - since_user)
         if not PAGE_LOCK.acquire(blocking=False):
             logger.debug("tool probe: skipped (page busy)")
+            _probe_skipped("page_busy")
             return 15.0
         try:
             # BORROW INSIDE THE LOCK, AND GIVE IT BACK BEFORE RELEASING.
@@ -5769,7 +6883,22 @@ def _run_tool_probe():
             # Under the default MCP_BRIDGE_RELEASE_PAGE=1 -- a resident tab costs about half a
             # gigabyte -- PAGE is None whenever the bridge is idle, and idle is the only time
             # this probe runs. Borrowing is not an edge case here; it is every cycle.
-            if PAGE is None:
+            # A SOCKET TURN NEEDS NO PAGE, SO IT BORROWS NONE.
+            #
+            # MEASURED 2026-09-10. With transport=socket and no resident page, this probe still
+            # borrowed one every MCP_TOOL_PROBE_SEC -- 10-minute cadence, 37 "opened a new one"
+            # lines in a day, and page counts on :9223 visibly oscillating 1 -> 2 -> 1 while
+            # every turn went over the socket and touched nothing on that tab. The composer gate
+            # in _do_tool_probe_turn had already been taught that a socket turn does not need a
+            # DOM; the BORROW was left behind, so the page was opened to satisfy nothing.
+            #
+            # It also mattered beyond waste: each borrow runs _find_or_open_agent, and a failure
+            # in there is what orphaned 69 tabs on this very port (see
+            # docs/incidents/20260910_bridge_agent_tab_leak.md). Not opening a page is the only
+            # way not to leak one.
+            #
+            # The page transport still borrows: there, the page IS the conversation.
+            if PAGE is None and not _on_socket():
                 try:
                     _ok_borrow, _probe_borrowed = PAGE_EXECUTOR.submit_bounded(30.0, borrow_page)
                 except Exception:
@@ -5794,6 +6923,13 @@ def _run_tool_probe():
             # FleetCockpit renders this as a spinner, so a 30-180s real tool round-trip never
             # looks like an inert stale-red indicator.
             tool_probe.record_probe(False, "checking", detail="tool probe in progress")
+            # From here a message is going out, whatever its outcome: this is the anchor the next
+            # due time is counted from (and the backoff stretches), and what the screen reports
+            # as the last probe sent.
+            _PROBE_RT["anchor"] = time.time()
+            _PROBE_RT["defer"] = 0.0
+            _PROBE_STATE["last_sent"] = _PROBE_RT["anchor"]
+            _publish_probe_state()
             # A FRESH, unguessable challenge every probe (see tool_probe.new_probe_challenge's
             # docstring) -- the token has to travel with this specific turn, so it is captured
             # here and threaded through to the verify_probe_reply() call(s) below rather than
@@ -5922,7 +7058,15 @@ def _run_tool_probe():
                     detail="probe turn returned empty in %.1fs; retrying" % _turn_s)
             except Exception:
                 pass
-            return PROBE_EMPTY_TURN_RETRY_SEC
+            # BACK OFF, NOT A FIXED 30 s FOREVER. Each of these retries is a real message (and a
+            # new session), and a page that keeps answering "idle" before anything was sent used
+            # to be asked again every 30 s without limit. 30 s, 60 s, 120 s ... never beyond the
+            # interval; reset by the first turn that really ran.
+            _PROBE_RT["empty"] += 1
+            _wait = min(_interval_s, PROBE_EMPTY_TURN_RETRY_SEC * (2 ** (_PROBE_RT["empty"] - 1)))
+            _record_probe_backoff("empty_turn", _PROBE_RT["empty"], _wait)
+            return _wait
+        _PROBE_RT["empty"] = 0
         tool_probe.record_probe(ok, kind, detail=(reply or "")[:200],
                                 alive=bool((reply or "").strip()), inbound=_inbound)
         # Additive: preserve the FULL reply (record_probe's `detail` above stays truncated to
@@ -5934,6 +7078,7 @@ def _run_tool_probe():
         except Exception:
             pass
         logger.info("tool probe: ok=%s kind=%s", ok, kind)
+        _publish_probe_state()
         try:
             _report_recycle_memory_effect()
         except Exception:
@@ -5954,6 +7099,7 @@ def _run_tool_probe():
         # conversation that caused it.
         global _PROBE_FAIL_STREAK
         if ok:
+            _PROBE_RT["fails"] = 0
             _PROBE_FAIL_STREAK = 0
             # ONLY AFTER A GOOD PROBE, and only after the record above. Recycling a
             # conversation that just failed would replace the evidence of the failure with a
@@ -5965,6 +7111,13 @@ def _run_tool_probe():
                 logger.warning("conversation recycle raised", exc_info=True)
         else:
             _PROBE_FAIL_STREAK += 1
+            # A FAILED PROBE MAKES THE NEXT ONE LATER, NOT SOONER. interval x 2^failures, capped
+            # at two hours (tools.tool_probe.backoff_s); _probe_due_at applies it. A path that is
+            # down is not found sooner by asking it more often -- and each ask is a session.
+            _PROBE_RT["fails"] += 1
+            _record_probe_backoff(
+                kind, _PROBE_RT["fails"],
+                tool_probe.backoff_s(_interval_s, _PROBE_RT["fails"]))
             if _PROBE_FAIL_STREAK >= PROBE_STUCK_CONVERSATION_FAILURES:
                 # The evidence is already on disk -- record_probe and journal_probe_failure
                 # both ran above, this time and the previous times -- so the objection to
@@ -5977,6 +7130,7 @@ def _run_tool_probe():
                     _recycle_long_conversation(force=True)
                 except Exception:
                     logger.warning("conversation recycle raised", exc_info=True)
+        _publish_probe_state()          # again: the failure count above changed the report
         if _page_probe_requires_restart(kind):
             try:
                 tool_probe.record_probe(
@@ -6041,15 +7195,26 @@ def _schedule_tool_probe(delay=None):
     fix above). Every self-re-arm from _tick() below omits it, so all SUBSEQUENT runs use the
     normal MCP_TOOL_PROBE_SEC idle cadence unchanged."""
     global _TOOL_PROBE_TIMER
-    if MCP_TOOL_PROBE_SEC <= 0:
+    if MCP_TOOL_PROBE_SEC is not None and MCP_TOOL_PROBE_SEC <= 0:
+        # The environment override says never: nothing is armed, as before. (The SETTING being 0
+        # is different -- it can be switched back on from the cockpit, so the timer keeps polling
+        # it; see _probe_wait_s.)
         logger.info("tool probe: disabled (MCP_TOOL_PROBE_SEC<=0)")
+        _probe_skipped("disabled_env", count=False)
         return
-    wait = MCP_TOOL_PROBE_SEC if delay is None else max(0.0, delay)
+    wait = _probe_wait_s() if delay is None else max(0.0, delay)
 
     def _tick():
         retry_delay = None
         try:
-            retry_delay = _run_tool_probe()
+            retry_delay = _probe_not_due_yet()
+            if retry_delay is None:
+                retry_delay = _run_tool_probe()
+                if retry_delay is not None:
+                    # A number from _run_tool_probe means "run me again after this long": it
+                    # replaces the normal cadence (a short retry, or the end of the evidence).
+                    _PROBE_RT["anchor"] = 0.0
+                    _PROBE_RT["defer"] = time.time() + float(retry_delay)
         except Exception:
             logger.warning("tool probe: _tick raised", exc_info=True)
             retry_delay = 30.0
@@ -6116,6 +7281,103 @@ CONNECTION_DEAD_GRACE_S = max(5.0, float(os.environ.get("MCP_CONN_DEAD_GRACE_SEC
 CONNECTION_RECONNECT_TRIES = max(1, int(os.environ.get("MCP_CONN_RECONNECT_TRIES", "3")))
 
 
+#: How often the watchdog records how many PAGES the browser is holding, and the count above
+#: which it stops being routine.
+#:
+#: THE INSTRUMENT THIS INCIDENT WAS MISSING. On 2026-09-10 the bridge's headless Edge was found
+#: holding 71 pages, 69 of them orphans on one URL. Nothing noticed for hours, and afterwards
+#: the onset could not even be dated, because no log on this machine had ever recorded a page
+#: count over time. Process counts had been sampled repeatedly and were useless by construction:
+#: the pages were same-origin, so Chromium shared ~7 renderers between all 70 and the process
+#: count sat flat at 17 the whole time. Only a PAGE count can see this class, and only a
+#: persisted one can date it. See docs/incidents/20260910_bridge_agent_tab_leak.md.
+PAGE_COUNT_SAMPLE_SEC = max(15.0, float(os.environ.get("MCP_PAGE_COUNT_SAMPLE_SEC", "60")))
+PAGE_COUNT_WARN_AT = max(3, int(os.environ.get("MCP_PAGE_COUNT_WARN_AT", "8")))
+PAGE_COUNT_LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                              ".fleet", "page_counts.jsonl")
+#: Keep the history bounded without losing the shape of an onset: one line a minute is ~1440/day.
+PAGE_COUNT_LOG_MAX_LINES = max(2000, int(os.environ.get("MCP_PAGE_COUNT_LOG_MAX", "20000")))
+
+_PAGE_COUNT_LAST_SAMPLE = 0.0
+_PAGE_COUNT_LAST_WARNED = 0
+
+
+def count_pages(cdp, timeout=4.0):
+    """How many PAGE targets the browser holds, and how many are on the agent surface.
+
+    Returns (total, agent) or (None, None) when the endpoint cannot be read. Plain HTTP against
+    /json/list -- no Playwright, so this is safe to call from the watchdog thread and can never
+    queue work behind the page-owner thread it is watching.
+    """
+    try:
+        parsed = urllib.parse.urlparse(cdp)
+        conn = http.client.HTTPConnection(parsed.hostname or "127.0.0.1",
+                                          parsed.port or 80, timeout=timeout)
+        conn.request("GET", "/json/list")
+        resp = conn.getresponse()
+        raw = resp.read()
+        conn.close()
+        if resp.status != 200:
+            return None, None
+        targets = json.loads(raw.decode("utf-8", "replace"))
+        pages = [t for t in targets if (t or {}).get("type") == "page"]
+        agent = [t for t in pages if "m365.cloud.microsoft/chat" in ((t or {}).get("url") or "")]
+        return len(pages), len(agent)
+    except Exception:
+        return None, None
+
+
+def sample_page_count(cdp, now=None):
+    """Record the page count, and say so out loud once it stops being routine. Never raises.
+
+    Returns the (total, agent) it recorded, or (None, None) when it did not sample -- either
+    because the interval has not elapsed or because the endpoint could not be read.
+
+    WARNS ON A RISING EDGE ONLY. A bridge that legitimately holds several pages must not print a
+    warning every minute forever; the line that matters is the one that says the count has grown
+    past where it was last complained about.
+    """
+    global _PAGE_COUNT_LAST_SAMPLE, _PAGE_COUNT_LAST_WARNED
+    now = time.time() if now is None else now
+    if now - _PAGE_COUNT_LAST_SAMPLE < PAGE_COUNT_SAMPLE_SEC:
+        return None, None
+    _PAGE_COUNT_LAST_SAMPLE = now
+    total, agent = count_pages(cdp)
+    if total is None:
+        return None, None
+    try:
+        os.makedirs(os.path.dirname(PAGE_COUNT_LOG), exist_ok=True)
+        with open(PAGE_COUNT_LOG, "a", encoding="utf-8") as fh:
+            print(json.dumps({"ts": round(now, 3), "cdp": cdp,
+                              "pages": total, "agent": agent}), file=fh)
+        _trim_page_count_log()
+    except Exception:
+        pass
+    if total > PAGE_COUNT_WARN_AT and total > _PAGE_COUNT_LAST_WARNED:
+        _PAGE_COUNT_LAST_WARNED = total
+        logger.warning("the browser is holding %d pages (%d on the agent surface); a page count "
+                       "that climbs on its own is a tab leak, and process counts cannot see it "
+                       "because same-origin pages share renderers", total, agent)
+    elif total <= PAGE_COUNT_WARN_AT:
+        _PAGE_COUNT_LAST_WARNED = 0
+    return total, agent
+
+
+def _trim_page_count_log():
+    """Bounded history: keep the newest PAGE_COUNT_LOG_MAX_LINES lines. Never raises."""
+    try:
+        if not os.path.isfile(PAGE_COUNT_LOG):
+            return
+        with open(PAGE_COUNT_LOG, "r", encoding="utf-8", errors="replace") as fh:
+            lines = fh.readlines()
+        if len(lines) <= PAGE_COUNT_LOG_MAX_LINES:
+            return
+        with open(PAGE_COUNT_LOG, "w", encoding="utf-8") as fh:
+            fh.writelines(lines[-PAGE_COUNT_LOG_MAX_LINES:])
+    except Exception:
+        pass
+
+
 def _cdp_healthy(cdp, timeout=2.0):
     try:
         parsed = urllib.parse.urlparse(cdp)
@@ -6141,12 +7403,97 @@ _PAGE_THREAD_WEDGED = None
 #: 600s but the probe is submitted with its own short timeout and only its REPEATED failure counts.
 PAGE_THREAD_WEDGE_LIMIT_S = max(30.0, float(os.environ.get("MCP_PAGE_WEDGE_LIMIT_SEC", "120")))
 
+#: THE SAME LIMIT KILLED THE PROCESS BEFORE IT HAD FINISHED STARTING, every time, for over an
+#: hour. Measured 2026-09-10: `_page_main` opens the agent tab, runs proactive auto-consent and
+#: startup auto-resume, and all of that is ONE job on the owner thread -- so the 10s liveness
+#: probe cannot be serviced while it runs, `_PAGE_THREAD_WEDGED` starts ticking at ~11s, and at
+#: 120s wedge_escalation_step() exits the process. The keepalive restarts it, `_find_or_open_agent`
+#: opens ANOTHER agent tab, and the same 120s runs out again. The log shows the thread was never
+#: stuck at all: "startup proactive auto-consent: no consent card handled" printed at 11:50:02,
+#: while the watchdog was reporting "still wedged (20s)". Every cycle leaked a tab and an Edge
+#: process tree; the machine reached 40 msedge processes holding 4.3 GB.
+#:
+#: A busy thread and a stuck thread look identical from outside, so the only honest fix is to
+#: stop asking the question before the answer can mean anything. Until the owner thread reaches
+#: run_forever() -- the point from which a missed probe really does mean the queue is blocked --
+#: startup gets its own, much larger budget. Still bounded: a startup that genuinely hangs is
+#: still handed back, just not on a deadline shorter than startup itself.
+PAGE_STARTUP_WEDGE_LIMIT_S = max(PAGE_THREAD_WEDGE_LIMIT_S,
+                                 float(os.environ.get("MCP_PAGE_STARTUP_LIMIT_SEC", "600")))
+
+#: How long a token capture may hold the owner thread before it counts as a wedge again. The
+#: default capture sends a real Copilot turn, whose own budget is minutes; the light path
+#: (MCP_CAPTURE_LIGHT=1) measured 53.9s with no turn sent. Generous enough for the slow path,
+#: finite so a capture that never returns is still handed back.
+CAPTURE_DECLARED_S = max(PAGE_THREAD_WEDGE_LIMIT_S,
+                         float(os.environ.get("MCP_PAGE_CAPTURE_LIMIT_SEC", "420")))
+
+#: Set by the owner thread when it stops setting up and starts serving the queue. Before that,
+#: a missed liveness probe says "still starting", not "wedged".
+_PAGE_SERVING = threading.Event()
+
 #: How long a wedge must last before it is logged at WARNING rather than INFO. A missed probe is
 #: the normal state of a thread inside a long job, so severity is decided by duration, not by the
 #: miss (see the emit site in probe_connection for the measurement that forced this). Half
 #: the escalation limit: far enough in that "just busy" is no longer the likely reading, early
 #: enough to precede the hand-back rather than coincide with it.
 PAGE_THREAD_WEDGE_WARN_AFTER_S = PAGE_THREAD_WEDGE_LIMIT_S / 2.0
+
+
+#: A DECLARED LONG JOB IS NOT A WEDGE. Deadline (epoch seconds) until which the owner thread is
+#: known to be inside work that legitimately outlasts the liveness probe.
+#:
+#: THE JOB THIS EXISTS FOR IS THE TOKEN CAPTURE, and without this the bridge could never get
+#: onto a socket at all. Measured 2026-09-10: the tool probe borrows a page, _send_counted ->
+#: ensure_driver -> _bridge_socket_driver runs route.refresh on the owner thread, and the
+#: default capture (capture_via_tab, since MCP_CAPTURE_LIGHT is off) sends a REAL turn -- so the
+#: thread stops answering the 10s probe, hits the 120s wedge limit, and the process is handed
+#: back before the capture can finish. Every attempt to leave the page transport was killed by
+#: the watchdog, which is why transport stayed "page" with a resident Copilot tab through an
+#: hour of restarts.
+#:
+#: Bounded, and by the job's own numbers rather than a new guess: the capture's declared budget.
+#: A job that overruns its own declaration is a wedge again, so a capture that really hangs is
+#: still handed back.
+_PAGE_LONG_JOB_UNTIL = 0.0
+_PAGE_LONG_JOB_NAME = ""
+
+
+def declare_long_job(seconds, name="") -> None:
+    """Tell the wedge watchdog the owner thread is inside known-long work for `seconds`."""
+    global _PAGE_LONG_JOB_UNTIL, _PAGE_LONG_JOB_NAME
+    _PAGE_LONG_JOB_UNTIL = time.time() + max(0.0, float(seconds))
+    _PAGE_LONG_JOB_NAME = str(name or "")
+
+
+def end_long_job() -> None:
+    """The declared work finished (or failed); ordinary wedge rules apply again."""
+    global _PAGE_LONG_JOB_UNTIL, _PAGE_LONG_JOB_NAME
+    _PAGE_LONG_JOB_UNTIL = 0.0
+    _PAGE_LONG_JOB_NAME = ""
+
+
+def long_job_remaining_s(now=None):
+    """Seconds left on the declared long job, or 0.0 when none is in flight."""
+    return max(0.0, _PAGE_LONG_JOB_UNTIL - float(now if now is not None else time.time()))
+
+
+def mark_serving() -> None:
+    """The owner thread has finished setting up and is about to service the queue.
+
+    FROM HERE A MISSED PROBE MEANS THE QUEUE IS BLOCKED -- and, just as importantly, the clock
+    STARTS FROM ZERO. Widening the startup budget alone did not break the restart loop, because
+    the wedge clock kept accumulating ACROSS this transition: startup legitimately holds the
+    thread and misses probes for a couple of minutes, so the instant the serving limit took over
+    `wedged_for` was already past it and the process was handed back immediately. Measured
+    2026-09-10: "the page-owner thread has not answered for 121s; exiting for keepalive
+    recovery", three seconds after the startup page was released. The clock measures how long
+    the QUEUE has been blocked, and the queue does not exist until run_forever(), so nothing
+    before this point is a wedge.
+    """
+    global _PAGE_THREAD_WEDGED
+    _PAGE_THREAD_WEDGED = None
+    _PAGE_SERVING.set()
 
 
 def page_thread_wedged_for_s():
@@ -6163,7 +7510,20 @@ def wedge_escalation_step(exiter=None, wedged_for=None) -> bool:
     """
     if wedged_for is None:
         wedged_for = page_thread_wedged_for_s()
-    if wedged_for is None or wedged_for < PAGE_THREAD_WEDGE_LIMIT_S:
+    # See PAGE_STARTUP_WEDGE_LIMIT_S: before the thread is serving, the probe is competing with
+    # startup rather than reporting on a blocked queue.
+    limit = (PAGE_THREAD_WEDGE_LIMIT_S if _PAGE_SERVING.is_set()
+             else PAGE_STARTUP_WEDGE_LIMIT_S)
+    if wedged_for is None or wedged_for < limit:
+        return False
+    # A declared long job (see declare_long_job) is known work, not a blocked queue. Checked
+    # here rather than folded into `limit` so the wait is against the JOB's own remaining
+    # budget: an overrunning job becomes a wedge again the moment its declaration expires.
+    remaining = long_job_remaining_s()
+    if remaining > 0.0:
+        logger.info("the page-owner thread has not answered for %.0fs, but %r is declared for "
+                    "another %.0fs; not handing the process back yet",
+                    wedged_for, _PAGE_LONG_JOB_NAME or "a long job", remaining)
         return False
     try:
         tool_probe.record_probe(False, "starting",
@@ -6338,6 +7698,11 @@ def _start_cdp_watchdog(cdp):
         reconnects = 0
         while True:
             time.sleep(CDP_WATCHDOG_SEC)
+            # Cheap, HTTP-only, and on this thread on purpose: see PAGE_COUNT_SAMPLE_SEC.
+            try:
+                sample_page_count(cdp)
+            except Exception:
+                pass
             if _cdp_healthy(cdp):
                 if failures:
                     logger.info("CDP watchdog: recovered after %d failed check(s)", failures)
@@ -6437,7 +7802,7 @@ def _page_main(cdp, fresh):
         latest = None
         try:
             # THE NEWEST SESSION, not the newest resumable one -- see should_autoresume.
-            latest = S.latest_session()
+            latest = startup_resume_candidate()
         except Exception:
             logger.warning("startup auto-resume: S.latest_session() failed", exc_info=True)
         do_resume, why = should_autoresume(latest, fresh_flag=fresh)
@@ -6495,6 +7860,23 @@ def _page_main(cdp, fresh):
             _record_capture_baseline()
 
         print("copilot bridge: driving %s" % PAGE.url[-40:], flush=True)
+        # RECORD A STARTUP WALL BEFORE THE PAGE THAT SHOWS IT IS CLOSED.
+        #
+        # MEASURED 2026-09-25 (a fresh PC, bridge.log): startup opened the agent page, it
+        # landed on an IdP URL ("...login_hint=<email>"), and the code below closed that page
+        # and released it for a blank keep-alive tab a few lines later -- WITHOUT this call.
+        # _note_signin_wall's own docstring already explains why that is fatal ("the tab does
+        # not stay... this is the record that outlives the tab"), but the startup path that
+        # actually closes the page never called it, so /status's signin_wall stayed false and
+        # scripts/start_bridge.ps1's supervisor (which decides whether to surface the window
+        # purely from that field) never had anything to act on. No window ever appeared, and
+        # the person had no way to sign in. Mirrors the same check at the other two
+        # PAGE-closing/turn sites (_wait_composer above, and the socket-recapture site below).
+        try:
+            if _is_signin_wall(PAGE.url or ""):
+                _note_signin_wall(PAGE.url or "")
+        except Exception:
+            pass
         if BRIDGE_RELEASE_STARTUP_PAGE and BRIDGE_SOCKET and AGENT_URL:
             # Startup is finished and it needed a page; nothing after this does, until an
             # endpoint asks for the DOM.
@@ -6527,6 +7909,9 @@ def _page_main(cdp, fresh):
         # run_on_page_thread(...) call from any HTTP request thread executes here, inside the
         # SAME `with sync_playwright()` context that created PAGE/DRIVER above. This call
         # blocks for the lifetime of the process (mirrors the old srv.serve_forever()).
+        # Setup is over; see mark_serving(). Called before run_forever() because that call
+        # never returns.
+        mark_serving()
         PAGE_EXECUTOR.run_forever()
 
 
@@ -6583,6 +7968,22 @@ def main():
                        exc_info=True)
 
     srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
+    # THE TOKEN IS WRITTEN AFTER THE BIND, NEVER BEFORE. A second instance that loses the bind
+    # (or exits at the single-instance guard above) must not overwrite the token of the bridge
+    # that is actually serving -- that would lock every client out of a healthy bridge.
+    # Nothing is served until serve_forever(), so no request can see BRIDGE_TOKEN unset.
+    global BRIDGE_TOKEN
+    try:
+        BRIDGE_TOKEN, _acl = bridge_auth.install_token(port)
+    except Exception as exc:
+        # FAIL CLOSED. Serving with a token in a file other accounts can read is serving
+        # without one; serving with no token at all refuses everything anyway. Say so and stop.
+        logger.error("bridge: could not write an owner-only token file (%s: %s); refusing to "
+                     "serve", type(exc).__name__, exc)
+        srv.server_close()
+        raise SystemExit(3)
+    print("copilot bridge: token file %s (owner-only: %s)"
+          % (bridge_auth.token_path(port), " ".join(str(_acl).split())[:200]), flush=True)
     print("copilot bridge: http://127.0.0.1:%d" % port, flush=True)
     srv.serve_forever()
 

@@ -41,12 +41,15 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import random
 import re
 import sqlite3
 import time
 from pathlib import Path
+
+_log = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parent.parent
 SESS_DIR = os.path.join(str(REPO), ".fleet", "sessions")
@@ -113,16 +116,40 @@ def _db_path():
     return os.path.join(_base_dir(), "sessions.sqlite3")
 
 
+class StoreUnavailable(RuntimeError):
+    """The session store's database file could not be opened at all -- an unwritable or
+    missing store directory, a locked file, or anything else sqlite3 refuses.
+
+    Raised by `_connect()` instead of letting `sqlite3.Error` (or the FileNotFoundError a
+    missing directory produces) reach a caller as a bare traceback naming sqlite3 internals.
+    Carries the path so the one line `main()` prints says WHERE, not just that something
+    failed.
+    """
+
+    def __init__(self, path, cause):
+        super().__init__("cannot open session store at %s: %s" % (path, cause))
+        self.path = path
+        self.cause = cause
+
+
 def _connect():
-    conn = sqlite3.connect(_db_path(), timeout=10.0, isolation_level=None)
-    conn.row_factory = sqlite3.Row
-    # BEFORE ANY OTHER PRAGMA THAT WRITES. auto_vacuum is fixed at the first write to a new
-    # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
-    # first was enough to lock it at NONE, so pruning freed rows and returned no disk.
-    conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-    # WAL so a reader (the cockpit, a CLI) never blocks the bridge mid-turn.
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA foreign_keys=ON")
+    path = _db_path()
+    try:
+        conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+        conn.row_factory = sqlite3.Row
+        # BEFORE ANY OTHER PRAGMA THAT WRITES. auto_vacuum is fixed at the first write to a new
+        # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
+        # first was enough to lock it at NONE, so pruning freed rows and returned no disk.
+        conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
+        # WAL so a reader (the cockpit, a CLI) never blocks the bridge mid-turn.
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA foreign_keys=ON")
+    except (sqlite3.Error, OSError) as exc:
+        # sqlite3.connect() itself is lazy about opening the file on some platforms -- the
+        # actual OS-level failure (e.g. an unwritable directory) can surface here on the first
+        # PRAGMA instead of on connect(). Either way, the caller gets one readable exception
+        # naming the path, never a bare OperationalError/FileNotFoundError traceback.
+        raise StoreUnavailable(path, exc) from exc
     return conn
 
 
@@ -145,6 +172,86 @@ def _migrate(conn):
         # ALTER TABLE ADD COLUMN only appends, so existing rows keep every value they had
         # and take the default for the new one. No data is rewritten.
         conn.execute("ALTER TABLE sessions ADD COLUMN %s %s" % (name, decl))
+    if "goal_id" not in {r[1] for r in conn.execute("PRAGMA table_info(fleet_turns)")}:
+        conn.execute("ALTER TABLE fleet_turns ADD COLUMN goal_id INTEGER")
+    _collapse_goals(conn)
+
+
+#: How long one automatic fold may spend, and a row cap behind it.
+#:
+#: BOUNDED BY TIME, BECAUSE TIME IS WHAT HURTS. This runs on a connection the bridge is about to
+#: record a turn through, so the cost that matters is the stall, not the row count -- and a row
+#: count is a poor proxy for it: the first version capped at 4,000 rows and was measured at
+#: 47 SECONDS per connection on the live store (8 connections, 374s, to fold 30,903 rows).
+#: A turn-recording path does not have 47 seconds.
+#:
+#: THE BATCH IS NOW THE READ SIZE, not the pass size: the budget loops over batches. Reading
+#: 4,000 rows of goal is ~10 MB before any folding starts, which is why a 0.5s budget still cost
+#: 1.37s per connection until the read moved inside it.
+GOAL_COLLAPSE_SECONDS = 0.5
+GOAL_COLLAPSE_BATCH = 200
+
+
+def _collapse_goals(conn):
+    """Fold duplicated goal text out of fleet_turns, a bounded slice at a time.
+
+    WHY THIS EXISTS AT ALL, rather than only interning what is written from now on: the
+    duplication is already on disk, and a compression that only applies to future rows leaves
+    the 68.9 MB where it is and reports success. Automatic because the alternative is a person
+    remembering to run it, and nobody has -- `prune()` has never had fleet_turns in it and
+    `compact()` has no caller in the repository at all.
+
+    NEVER RAISES. This is on the connection path; a store that cannot be folded must still be a
+    store that can be written to.
+    """
+    deadline = time.time() + float(GOAL_COLLAPSE_SECONDS)
+    done = 0
+    try:
+        # SMALL BATCHES INSIDE THE BUDGET, rather than one big read the deadline cannot reach.
+        # The second version read GOAL_COLLAPSE_BATCH rows up front and only then started
+        # checking the clock -- so a 0.5s budget still cost 1.37s per connection, because
+        # fetching 4,000 rows of goal is ~10 MB before any work begins. The read is part of the
+        # cost, so it has to be inside the bound too.
+        while True:
+            rows = conn.execute(
+                "SELECT id, goal FROM fleet_turns WHERE goal <> '' LIMIT ?",
+                (int(GOAL_COLLAPSE_BATCH),)).fetchall()
+            if not rows:
+                break
+            for row in rows:
+                gid = _intern_goal(conn, row["goal"])
+                # ONE STATEMENT, so the goal cannot be lost between two. The first version set
+                # goal_id and then blanked goal separately, reasoning about which order survived
+                # a crash -- there is no such ordering to get right when the write is atomic.
+                conn.execute("UPDATE fleet_turns SET goal_id = ?, goal = '' WHERE id = ?",
+                             (gid, row["id"]))
+                done += 1
+                # PER ROW, NOT PER BATCH. Checking only between batches made the granularity of
+                # the bound a whole batch: measured 2.35s worst against a 0.5s budget, because
+                # 200 rows of interning and updating is already over it. The check is after the
+                # write, so a pass always folds at least one row and can never spin.
+                if time.time() >= deadline:
+                    break
+            if time.time() >= deadline:
+                break
+        if done:
+            # Hand the freed pages back; auto_vacuum is INCREMENTAL, so they do not return by
+            # themselves. The rows MUST be consumed or the pragma stops after one page -- the
+            # same lesson prune() records below.
+            list(conn.execute("PRAGMA incremental_vacuum"))
+        return done
+    except Exception:
+        return done
+
+
+def _intern_goal(conn, goal):
+    """The id of this goal text, storing it if it is new. Empty goal -> None, not a row."""
+    goal = str(goal or "")
+    if not goal:
+        return None
+    conn.execute("INSERT OR IGNORE INTO fleet_goals (goal) VALUES (?)", (goal,))
+    row = conn.execute("SELECT goal_id FROM fleet_goals WHERE goal = ?", (goal,)).fetchone()
+    return row["goal_id"] if row else None
 
 
 def _initialize(conn):
@@ -190,6 +297,10 @@ def _initialize(conn):
             id    INTEGER PRIMARY KEY AUTOINCREMENT,
             key   TEXT NOT NULL,
             name  TEXT NOT NULL DEFAULT '',
+            -- KEPT, AND EMPTY ON EVERY ROW WRITTEN FROM 2026-09-14. The goal text now lives
+            -- once in fleet_goals and this row points at it; see _intern_goal. Rows written
+            -- before that still carry their own copy, and the reader coalesces the two -- so
+            -- the column cannot be dropped, and nothing new should be written into it.
             goal  TEXT NOT NULL DEFAULT '',
             turn  INTEGER,
             role  TEXT NOT NULL,
@@ -197,8 +308,61 @@ def _initialize(conn):
             extra TEXT NOT NULL DEFAULT '{}',
             ts    REAL NOT NULL
         );
+        -- THE SAME GOAL, ONCE. A fleet turn row repeats the whole goal text, and a goal is run
+        -- for many turns by many workers: measured 2026-09-14 on the live store, 30,903 rows
+        -- held 74.08 MB of goal against 5.12 MB of distinct goal text (1,950 of them). That is
+        -- 68.9 MB of pure duplication -- 26% of a 265 MB database, and MORE than every turn's
+        -- text put together (64.15 MB).
+        --
+        -- INTERNED ON THE TEXT, NOT ON THE RUN KEY, and the difference is not academic: 60 keys
+        -- in that store carry more than one distinct goal, so keying the table by `key` would
+        -- have silently given those rows the wrong goal. A hash of the text cannot do that.
+        CREATE TABLE IF NOT EXISTS fleet_goals (
+            goal_id INTEGER PRIMARY KEY AUTOINCREMENT,
+            goal    TEXT NOT NULL UNIQUE
+        );
         CREATE INDEX IF NOT EXISTS fleet_turns_key_idx ON fleet_turns(key, id);
         CREATE INDEX IF NOT EXISTS fleet_turns_ts_idx ON fleet_turns(ts DESC);
+        -- THE ROWS _collapse_goals STILL HAS TO FOLD, AND ONLY THOSE. Its query is
+        -- `WHERE goal <> ''`, which no index answered, so once the fold was finished every
+        -- connection -- one per transcript line the fleet records -- scanned the whole table
+        -- to find nothing: 0.22 s warm on a 197 MB store, and 6.5 s for the first write of a
+        -- cold fleet start (measured 2026-09-24, the gap between a worker's `pending` and its
+        -- transcript appearing). Partial, so it holds the unfolded rows and nothing else:
+        -- empty once the fold is done, and new rows are written with goal = '' and never
+        -- enter it.
+        CREATE INDEX IF NOT EXISTS fleet_turns_unfolded_idx ON fleet_turns(id) WHERE goal <> '';
+        -- THE AUDIT LEDGER OF THE VALIDITY TOOLS, one row per piece of conversation, bound to a
+        -- claim id (or 'UNATTRIBUTED' -- never dropped) and tagged by role: goal / worker_prompt
+        -- / worker_prompt_wire / worker_reply / tool_call / tool_result / refuter_prompt /
+        -- refuter_prompt_wire / refuter_reply / verdict / outcome. Added 2026-10-06, additive
+        -- (CREATE IF NOT EXISTS; no existing table is altered). Append-only: a row is never
+        -- updated. Written by bridge/validity_audit.py (live and by scripts/validity_audit_backfill.py).
+        --
+        -- IDEMPOTENT ON THE SOURCE, not on position: UNIQUE is (claim, worker, role, sha16, the
+        -- row it was read from), so re-running over more data never duplicates and never depends
+        -- on a sequence number that would shift when later rows arrive. `seq` only orders.
+        -- `text` is whole and redacted by the shared redactor; a cut at MCP_FULLTEXT_MAX_CHARS is
+        -- flagged in `truncated` with the full sha256 / orig_chars.
+        CREATE TABLE IF NOT EXISTS validity_audit (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            claim_id     TEXT NOT NULL,
+            run_id       TEXT NOT NULL DEFAULT '',
+            worker_key   TEXT NOT NULL DEFAULT '',
+            seq          INTEGER NOT NULL DEFAULT 0,
+            role_tag     TEXT NOT NULL,
+            ts           REAL NOT NULL,
+            sha16        TEXT NOT NULL,
+            sha256       TEXT NOT NULL DEFAULT '',
+            orig_chars   INTEGER NOT NULL DEFAULT 0,
+            truncated    INTEGER NOT NULL DEFAULT 0,
+            text         TEXT NOT NULL DEFAULT '',
+            source_table TEXT NOT NULL DEFAULT '',
+            source_key   TEXT NOT NULL DEFAULT '',
+            extra_json   TEXT NOT NULL DEFAULT '{}',
+            UNIQUE (claim_id, worker_key, role_tag, sha16, source_table, source_key)
+        );
+        CREATE INDEX IF NOT EXISTS validity_audit_claim_idx ON validity_audit(claim_id, ts, seq);
         """
     )
     _migrate(conn)
@@ -473,6 +637,119 @@ def append_turn(sid, role, text):
         pass                    # the row is already committed; the export is best effort
 
 
+#: An exchange identical to one this old (same session, same user text) is the SAME exchange
+#: arriving twice -- a retried write -- and is not recorded again.
+EXCHANGE_DEDUPE_SECONDS = 120.0
+
+
+def record_exchange(sid, user_text, assistant_text="", expect_turn=None):
+    """Record one chat exchange, ALL OR NOTHING, and say how many turn rows were written.
+
+    THE CHAT PATH'S ONLY WRITER. `append_turn` ran once for the user line and once for the
+    reply, each its own autocommit, and the caller wrapped both in `except Exception: warn`,
+    so a lock, a full disk or a half-finished pair left the ledger short and said so only in
+    a log. Here the user turn, the reply and the session's counter commit in ONE
+    transaction (BEGIN IMMEDIATE: it waits on the busy timeout rather than failing on a
+    reader), and every failure RAISES -- StoreUnavailable, sqlite3.Error, ValueError -- for the
+    caller to retry or to show.
+
+    `assistant_text` empty records the user line alone: the user typed something, and that is
+    kept even when no answer ever came back.
+
+    IDEMPOTENT two ways. `expect_turn` is the turn number the user line should get; when that
+    number already exists for the session the call writes nothing (a replay or a backfill can
+    be run twice). Without it, an exchange equal to the session's latest turns and recorded
+    within EXCHANGE_DEDUPE_SECONDS is treated as the same one arriving twice.
+
+    Returns the number of turn rows this call added (0 when it was a duplicate).
+    """
+    if not _valid_sid(sid):
+        raise ValueError("invalid session id")
+    user_text = user_text if isinstance(user_text, str) else str(user_text or "")
+    assistant_text = assistant_text if isinstance(assistant_text, str) else str(assistant_text or "")
+    if not user_text.strip() and not assistant_text.strip():
+        return 0
+    _ensure_dir()
+    conn = _db()
+    added = []
+    title = ""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute("SELECT * FROM sessions WHERE sid = ?", (sid,)).fetchone()
+            sess = _row_to_session(row) if row else None
+            title = sess.get("title", "") if sess else ""
+            row_max = int(conn.execute(
+                "SELECT COALESCE(MAX(turn), 0) FROM turns WHERE sid = ?", (sid,)).fetchone()[0] or 0)
+            first = max(int(sess.get("turns", 0) if sess else 0), row_max) + 1
+            now = time.time()
+            if expect_turn is not None:
+                if conn.execute("SELECT 1 FROM turns WHERE sid = ? AND turn = ?",
+                                (sid, int(expect_turn))).fetchone():
+                    conn.execute("ROLLBACK")
+                    return 0
+                first = int(expect_turn)
+            else:
+                tail = conn.execute(
+                    "SELECT role, text, ts FROM turns WHERE sid = ? ORDER BY turn DESC LIMIT 2",
+                    (sid,)).fetchall()
+                want = [("assistant", assistant_text)] if assistant_text.strip() else []
+                if user_text.strip():
+                    want = want + [("user", user_text)]
+                got = [(r["role"], r["text"]) for r in tail][:len(want)]
+                if want and got == want and (now - float(tail[0]["ts"] or 0)) < EXCHANGE_DEDUPE_SECONDS:
+                    conn.execute("ROLLBACK")
+                    return 0
+            count = (1 if user_text.strip() else 0) + (1 if assistant_text.strip() else 0)
+            base = sess or {"sid": sid, "title": "", "conv_url": "", "created_ts": now,
+                            "status": "active", "transcript": _transcript_ref(sid),
+                            "pending": []}
+            # The session row FIRST: turns.sid is a foreign key, so a session that does not
+            # exist yet cannot take a turn. Same transaction, so it still commits or rolls back
+            # with the rows below.
+            _write_session(conn, dict(base, turns=first + count - 1, last_active_ts=now))
+            n = first
+            if user_text.strip():
+                conn.execute(
+                    "INSERT INTO turns (sid, turn, role, text, ts) VALUES (?, ?, 'user', ?, ?)",
+                    (sid, n, user_text, now))
+                added.append((n, "user", user_text, now))
+                n += 1
+            if assistant_text.strip():
+                conn.execute(
+                    "INSERT INTO turns (sid, turn, role, text, ts) VALUES (?, ?, 'assistant', ?, ?)",
+                    (sid, n, assistant_text, now))
+                added.append((n, "assistant", assistant_text, now))
+                n += 1
+            conn.execute("COMMIT")
+        except BaseException:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        conn.close()
+    # The cockpit's compatibility transcript, after the commit, exactly as append_turn does:
+    # it may lag the table by a crash and never leads it. Best effort by design -- the rows
+    # above are the record.
+    path = _transcript_path(sid)
+    try:
+        lines = []
+        if not os.path.isfile(path):
+            lines.append(json.dumps({"meta": True, "sid": sid, "title": title, "ts": added[0][3]},
+                                    ensure_ascii=False))
+        for (tn, role, text, ts) in added:
+            lines.append(json.dumps({"turn": tn, "role": role, "text": text, "ts": ts},
+                                    ensure_ascii=False))
+        with open(path, "a", encoding="utf-8") as fh:
+            for line in lines:
+                fh.write(line + "\n")
+    except OSError:
+        pass
+    return len(added)
+
+
 def recent_turns(sid, limit=20):
     """The last `limit` turns, oldest-first. The reason this store exists.
 
@@ -564,18 +841,260 @@ def record_fleet_turn(key, obj, name="", goal=""):
                  if k not in ("turn", "role", "text", "ts")}
         conn = _db(import_files=False)
         try:
+            # THE GOAL GOES IN ONCE AND THIS ROW POINTS AT IT. `goal` stays empty; the reader
+            # coalesces, so rows written before 2026-09-14 (which carry their own copy) and
+            # rows written after are indistinguishable to every caller.
             conn.execute(
-                "INSERT INTO fleet_turns (key, name, goal, turn, role, text, extra, ts) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                (str(key), str(name or ""), str(goal or ""),
+                "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                (str(key), str(name or ""), _intern_goal(conn, goal),
                  obj.get("turn"), str(role), str(obj.get("text") or ""),
                  json.dumps(extra, ensure_ascii=False, default=str),
                  float(obj.get("ts") or time.time())))
         finally:
             conn.close()
         return True
-    except Exception:
+    except Exception as exc:
+        # NOT SWALLOWED (the chat-persist lesson, PR #130: a store that fails silently is a
+        # store that silently holds nothing). The fleet still must not stall, so this returns
+        # False -- but it says so on the log, with the key and the exception type.
+        _log.error("record_fleet_turn failed for key=%r: %s: %s", str(key)[:80],
+                   type(exc).__name__, str(exc)[:200])
         return False
+
+
+#: How many characters of ONE stored text are kept. 0 = no cap. The default is far above any
+#: real prompt (the longest worker turn measured is ~300 KB) -- it exists so a runaway text
+#: cannot fill the disk, not to shorten ordinary ones. Over it, the text is cut AND the row
+#: says so (`truncated`, `orig_chars`, full-text `sha256`); a cut is never silent.
+FULLTEXT_MAX_CHARS_ENV = "MCP_FULLTEXT_MAX_CHARS"
+FULLTEXT_MAX_CHARS_DEFAULT = 4_000_000
+
+
+def fulltext_max_chars():
+    raw = os.environ.get(FULLTEXT_MAX_CHARS_ENV, "").strip()
+    if not raw:
+        return FULLTEXT_MAX_CHARS_DEFAULT
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        _log.error("%s=%r is not an integer; using the default %d", FULLTEXT_MAX_CHARS_ENV,
+                   raw, FULLTEXT_MAX_CHARS_DEFAULT)
+        return FULLTEXT_MAX_CHARS_DEFAULT
+
+
+def _redact_for_record(text):
+    """Run the shared redactor over text about to be stored. Fails closed (marker), never raises.
+
+    The same function the fleet transcript uses, selected by secret NAME in one shared place.
+    Applied here, at the single write point, so no caller can forget it.
+    """
+    text = "" if text is None else str(text)
+    try:
+        from tools.secret_store import redact_secrets
+        return redact_secrets(text)
+    except Exception as exc:
+        _log.error("redaction unavailable (%s); stored the withheld marker instead of the text",
+                   type(exc).__name__)
+        return "[redaction failed: content withheld]"
+
+
+def _prepare_full_text(text):
+    """(stored_text, sha16, sha256, orig_chars, truncated) for a redacted full text."""
+    full = _redact_for_record(text)
+    digest = hashlib.sha256(full.encode("utf-8", "replace")).hexdigest()
+    cap = fulltext_max_chars()
+    truncated = bool(cap and len(full) > cap)
+    stored = full[:cap] if truncated else full
+    if truncated:
+        _log.error("full text of %d chars exceeds %s=%d; stored %d chars and flagged the row "
+                   "truncated (sha256=%s)", len(full), FULLTEXT_MAX_CHARS_ENV, cap, cap, digest)
+    return stored, digest[:16], digest, len(full), truncated
+
+
+def _redact_extra(extra):
+    """Redact string values in a free-form extra dict (shallow)."""
+    out = {}
+    for k, v in (extra or {}).items():
+        out[str(k)] = _redact_for_record(v) if isinstance(v, str) else v
+    return out
+
+
+def _unredacted_sha16(text):
+    """sha16 of the text BEFORE redaction, so a reader holding the original can match it.
+
+    A short prefix of a hash of text that may contain a secret is not a way to recover it (the
+    secret is a fraction of a longer text), and it is what lets a later reader prove which
+    prompt a redacted row came from.
+    """
+    return hashlib.sha256(("" if text is None else str(text)).encode("utf-8", "replace")
+                          ).hexdigest()[:16]
+
+
+def record_wire_turn(key, turn, text, *, name="", goal="", run_id="", route="", round=0):
+    """Store the string actually put on the wire for one worker turn, as a fleet_turns row.
+
+    role = "user_wire", distinct from the "user" row (the job text BEFORE the transport added
+    its protocol preamble / tool catalogue / whitespace collapse). Full text; the cap and the
+    redaction are the shared ones, and a cut is flagged on the row.
+    """
+    stored, sha16, sha256, orig_chars, truncated = _prepare_full_text(text)
+    return record_fleet_turn(
+        key,
+        {"turn": turn, "role": "user_wire", "text": stored, "ts": time.time(),
+         "sha16": sha16, "pre_redaction_sha16": _unredacted_sha16(text), "sha256": sha256,
+         "orig_chars": orig_chars, "truncated": truncated, "route": route,
+         "round": int(round or 0), "run_id": str(run_id or "")},
+        name=name, goal=goal)
+
+
+#: The fleet_turns roles the refuter / review panel writes, one row per text.
+#:   refuter_user       the prompt composed for the reviewer (what we meant to send)
+#:   refuter_wire       the payload the socket transport really sent (preamble/tools included)
+#:   refuter_assistant  one reply the reviewer settled on (a nudged review has several)
+#:   refuter_verdict    the verdict as the fleet took it, with its full reason
+REFUTER_ROLES = ("refuter_user", "refuter_wire", "refuter_assistant", "refuter_verdict")
+
+
+def refuter_key(parent_key, lens=""):
+    """The fleet_turns key a reviewer's conversation is stored under: parent key + lens."""
+    return "%s__refuter_%s" % (parent_key, lens or "single")
+
+
+def record_refuter_turn(parent_key, role, seq, text, *, lens="", name="", goal="", run_id="",
+                        extra=None, ts=None):
+    """Store one text of the reviewer's conversation in full, as a fleet_turns row. Idempotent.
+
+    Returns True when the row was written or is already there. NEVER RAISES, NEVER SWALLOWS: a
+    failure returns False and is logged with the exception type. IDEMPOTENT on (key, role,
+    turn=seq, sha16): fleet_turns has no unique key, so the check is a lookup before the insert;
+    a DIFFERENT text at the same position is a new row, not a dropped one.
+    """
+    key = refuter_key(parent_key, lens)
+    try:
+        stored, sha16, sha256, orig_chars, truncated = _prepare_full_text(text)
+        conn = _db(import_files=False)
+        try:
+            for r in conn.execute("SELECT extra FROM fleet_turns WHERE key = ? AND role = ? "
+                                  "AND turn = ?", (key, str(role), int(seq))):
+                try:
+                    if json.loads(r["extra"] or "{}").get("sha16") == sha16:
+                        return True
+                except ValueError:
+                    pass
+            obj_extra = _redact_extra(extra)
+            obj_extra.update({"sha16": sha16, "pre_redaction_sha16": _unredacted_sha16(text),
+                              "sha256": sha256, "orig_chars": orig_chars,
+                              "truncated": truncated, "run_id": str(run_id or ""),
+                              "parent_key": str(parent_key), "lens": str(lens or "")})
+            conn.execute(
+                "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                (key, str(name or ""), _intern_goal(conn, goal), int(seq), str(role), stored,
+                 json.dumps(obj_extra, ensure_ascii=False, default=str),
+                 float(ts or time.time())))
+        finally:
+            conn.close()
+        return True
+    except Exception as exc:
+        _log.error("record_refuter_turn failed (key=%r role=%r): %s: %s", key[:80], role,
+                   type(exc).__name__, str(exc)[:200])
+        return False
+
+
+def append_validity_audit(rows):
+    """Append audit rows (dicts) in ONE transaction. Idempotent. Returns (inserted, already_there).
+
+    Each row: claim_id, role_tag, ts, text, and optionally run_id, worker_key, seq,
+    source_table, source_key, extra (dict). Redaction and the size cap are the shared ones.
+    RAISES on a database failure: the caller is a batch job (live hook or backfill) that must
+    know a batch did not land, so nothing here is swallowed.
+    """
+    conn = _db(import_files=False)
+    inserted = skipped = 0
+    try:
+        conn.execute("BEGIN")
+        for r in rows:
+            stored, sha16, sha256, orig_chars, truncated = _prepare_full_text(r.get("text"))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO validity_audit (claim_id, run_id, worker_key, seq, "
+                "role_tag, ts, sha16, sha256, orig_chars, truncated, text, source_table, "
+                "source_key, extra_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (str(r["claim_id"]), str(r.get("run_id") or ""), str(r.get("worker_key") or ""),
+                 int(r.get("seq") or 0), str(r["role_tag"]), float(r.get("ts") or time.time()),
+                 sha16, sha256, int(orig_chars), 1 if truncated else 0, stored,
+                 str(r.get("source_table") or ""), str(r.get("source_key") or ""),
+                 json.dumps(_redact_extra(r.get("extra")), ensure_ascii=False, default=str)))
+            if cur.rowcount:
+                inserted += 1
+            else:
+                skipped += 1
+        conn.execute("COMMIT")
+    except Exception:
+        try:
+            conn.execute("ROLLBACK")
+        except Exception:
+            pass
+        raise
+    finally:
+        conn.close()
+    return inserted, skipped
+
+
+def validity_audit_ledger(claim_id, limit=200, max_chars=20000):
+    """The conversation bound to one claim id, oldest first, every row tagged by role.
+
+    BOUNDED, AND SAYS SO. `limit` caps rows and `max_chars` caps the text returned in total; rows
+    past either bound are not returned and `omitted_rows` says how many, and a row whose text was
+    cut to fit has `text_cut_to` set. Nothing is dropped without being counted.
+    """
+    limit = max(1, int(limit))
+    max_chars = max(0, int(max_chars))
+    conn = _db(import_files=False)
+    try:
+        total = conn.execute("SELECT COUNT(*) FROM validity_audit WHERE claim_id = ?",
+                             (str(claim_id),)).fetchone()[0]
+        rows = conn.execute(
+            "SELECT * FROM validity_audit WHERE claim_id = ? ORDER BY ts, worker_key, seq, id "
+            "LIMIT ?", (str(claim_id), limit)).fetchall()
+    finally:
+        conn.close()
+    out, budget = [], max_chars
+    for r in rows:
+        d = dict(r)
+        d["extra"] = json.loads(d.pop("extra_json") or "{}")
+        text = d["text"]
+        if budget <= 0 and text:
+            break
+        if len(text) > budget:
+            d["text"], d["text_cut_to"] = text[:budget], budget
+        budget -= len(d["text"])
+        out.append(d)
+    return {"claim_id": str(claim_id), "total_rows": total, "returned_rows": len(out),
+            "omitted_rows": total - len(out), "limit": limit, "max_chars": max_chars,
+            "rows": out}
+
+
+def validity_audit_claims():
+    """Every claim id that has audit rows, with its row count and time span."""
+    conn = _db(import_files=False)
+    try:
+        return [dict(r) for r in conn.execute(
+            "SELECT claim_id, COUNT(*) AS rows, MIN(ts) AS first_ts, MAX(ts) AS last_ts "
+            "FROM validity_audit GROUP BY claim_id ORDER BY claim_id")]
+    finally:
+        conn.close()
+
+
+#: Both shapes at once. A row written before the goal was interned carries its own copy in
+#: `goal`; one written after carries a `goal_id` and an empty `goal`. COALESCE puts the same
+#: value in front of every caller, which is what lets the fold above run a slice at a time
+#: instead of having to finish before the store is readable.
+_FLEET_TURN_SELECT = (
+    "SELECT t.key AS key, t.name AS name, t.turn AS turn, t.role AS role, t.text AS text, "
+    "       t.extra AS extra, t.ts AS ts, "
+    "       COALESCE(NULLIF(t.goal, ''), g.goal, '') AS goal "
+    "FROM fleet_turns t LEFT JOIN fleet_goals g ON g.goal_id = t.goal_id ")
 
 
 def fleet_turns(key=None, limit=200):
@@ -584,11 +1103,11 @@ def fleet_turns(key=None, limit=200):
     try:
         if key:
             rows = conn.execute(
-                "SELECT * FROM fleet_turns WHERE key = ? ORDER BY id DESC LIMIT ?",
+                _FLEET_TURN_SELECT + "WHERE t.key = ? ORDER BY t.id DESC LIMIT ?",
                 (str(key), int(limit))).fetchall()
         else:
             rows = conn.execute(
-                "SELECT * FROM fleet_turns ORDER BY id DESC LIMIT ?", (int(limit),)).fetchall()
+                _FLEET_TURN_SELECT + "ORDER BY t.id DESC LIMIT ?", (int(limit),)).fetchall()
     finally:
         conn.close()
     return [{"key": r["key"], "name": r["name"], "goal": r["goal"], "turn": r["turn"],
@@ -691,16 +1210,27 @@ def store_stats():
                                 if oldest else None)}
 
 
-def prune(max_age_days=None, max_mb=None, now=None):
+def prune(max_age_days=None, max_mb=None, now=None, limit=None):
     """Delete old sessions, oldest first, and hand the pages back. Returns what it did.
 
     NEITHER LIMIT IS ON BY DEFAULT, and that is deliberate. This store exists because
     conversations were losing their history; a retention policy that starts deleting the
-    moment it ships would be that same loss arriving on a schedule. The operator turns it on.
+    moment it ships would be that same loss arriving on a schedule. The operator turns it on
+    (or, since the 2026-09-24 owner decision, leaves session_retention_days unset and gets the
+    90-day default applied by apply_retention() below -- prune() itself still does nothing
+    unless a caller hands it a limit).
 
     Whole sessions go, never a slice of one. Half a conversation is worse than none of it:
     it reads as complete and is not, and anything re-supplying context after a recycle would
     quietly feed the model a version of events with the middle removed.
+
+    `limit` BOUNDS HOW MANY SESSIONS ONE CALL WILL REMOVE. A machine whose retention was never
+    configured before today's default can have years of history sitting past the new 90-day
+    line; deleting all of it in the same pass that runs at bridge startup would block that
+    startup for however long tens of thousands of DELETEs take. Passing a limit turns "prune
+    everything over the line" into "prune the oldest `limit` sessions over the line" -- still
+    oldest-first, still whole sessions, just bounded per call. A later bridge start prunes the
+    next batch.
     """
     now = time.time() if now is None else now
     removed, freed_before = [], store_stats()["bytes"]
@@ -708,8 +1238,12 @@ def prune(max_age_days=None, max_mb=None, now=None):
     try:
         if max_age_days:
             cutoff = now - float(max_age_days) * 86400.0
-            rows = conn.execute(
-                "SELECT sid FROM sessions WHERE last_active_ts < ?", (cutoff,)).fetchall()
+            q = "SELECT sid FROM sessions WHERE last_active_ts < ? ORDER BY last_active_ts ASC"
+            params = [cutoff]
+            if limit:
+                q += " LIMIT ?"
+                params.append(int(limit))
+            rows = conn.execute(q, params).fetchall()
             removed.extend(r["sid"] for r in rows)
 
         if max_mb:
@@ -727,6 +1261,8 @@ def prune(max_age_days=None, max_mb=None, now=None):
             scale = (total / max(sum(r["w"] for r in per), 1)) if per else 1.0
             for r in per:
                 if total <= budget:
+                    break
+                if limit and len(removed) >= limit:
                     break
                 if r["sid"] in removed:
                     continue
@@ -763,7 +1299,10 @@ def prune(max_age_days=None, max_mb=None, now=None):
     return {"removed_sessions": len(removed), "sids": removed,
             "bytes_before": freed_before, "bytes_after": after["bytes"],
             "mb_after": after["mb"],
-            "still_over": bool(max_mb and after["mb"] > float(max_mb))}
+            "still_over": bool(max_mb and after["mb"] > float(max_mb)),
+            # True when `limit` cut this pass short -- there may be more sessions past the
+            # cutoff than this call was willing to remove. A later prune picks up the rest.
+            "batched": bool(limit and len(removed) >= limit)}
 
 
 #: The shared settings file the cockpit writes and the fleet reads. Retention lives here rather
@@ -771,18 +1310,50 @@ def prune(max_age_days=None, max_mb=None, now=None):
 #: setting -- and because .env is rewritten by the release updater while this is not.
 SETTINGS_KEYS = ("session_retention_days", "session_max_mb")
 
+#: OWNER DECISION 2026-09-24. Absent used to mean "keep everything forever" -- the store exists
+#: because history was disappearing, and a policy that starts deleting the day it ships is that
+#: same loss arriving on a schedule. It shipped, operators did not find the dialog, and years of
+#: chat history piled up unbounded on machines nobody had told to turn retention on. 90 days is
+#: now what "never touched this setting" means. It is NOT what "chose 0" means: an operator who
+#: explicitly sets session_retention_days=0 in the cockpit (T("ret_keep")) still gets to keep
+#: everything -- see read_retention()'s explicit-zero handling below. tools/settings_keys.py
+#: declares the same number for session_retention_days; test_the_declared_default_is_the_one_
+#: the_code_uses (tools/test_a_setting_declares_when_it_takes_effect.py) and
+#: ui/test_retention_settings.py both fail if the two drift apart, or if FleetCockpit.cs's own
+#: `_retDays` field disagrees with either.
+DEFAULT_RETENTION_DAYS = 90.0
+
+#: How many sessions ONE apply_retention() call will remove by age. Bridge start is a single
+#: pass, not a loop, and a machine that has never had a limit before today's default can have
+#: years of sessions sitting past the new 90-day line -- deleting all of them before the bridge
+#: can accept its first turn would turn "add a default" into "the next startup hangs". Bounded
+#: per call; a later bridge start removes the next batch. Chosen well above what a normal
+#: install accumulates (thousands of sessions), so it only ever binds on that first catch-up.
+PRUNE_BATCH_LIMIT = 2000
+
 
 def _settings_path():
-    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+    from tools.settings_path import settings_file      # one resolver; see that module
+    return settings_file()
 
 
 def read_retention():
-    """(days, max_mb) from settings.txt. Either may be None, which means "keep everything".
+    """(days, max_mb) from settings.txt.
 
-    ABSENT AND ZERO BOTH MEAN OFF, and they have to, because a settings file written before
-    these keys existed has neither -- and a fresh install that read a missing key as "0 days"
-    would delete the operator's history on first run. The feature that exists to stop history
-    disappearing must not be the thing that deletes it.
+    max_mb is None when absent, unparseable, or <= 0 -- it has no default, "no cap" is what
+    absent has always meant, and the 2026-09-24 owner decision did not touch it.
+
+    days is THREE-VALUED, and the distinction matters because apply_retention() now has a
+    default to fall back to:
+      * None  -- the key is absent (or unparseable, or negative): the operator has never set
+                 this. apply_retention() applies DEFAULT_RETENTION_DAYS to it.
+      * 0.0   -- the key is present and explicitly "0": the operator chose "keep everything"
+                 (the cockpit shows this as T("ret_keep"), never as the number 0). This must
+                 stay distinguishable from "absent" or an explicit opt-out would silently be
+                 overridden by the new default the next time the bridge starts.
+      * > 0   -- the operator chose that many days.
+    A settings file written before this key existed has neither -- same as None, on purpose,
+    so an old install does not have its choice reinterpreted as anything but "never asked".
     """
     days = mb = None
     try:
@@ -798,11 +1369,15 @@ def read_retention():
                     number = float(value)
                 except ValueError:
                     continue
-                if number <= 0:
-                    continue
                 if key == "session_retention_days":
-                    days = number
+                    if number == 0:
+                        days = 0.0                # explicit "keep everything" -- not absent
+                    elif number > 0:
+                        days = number
+                    # negative: garbled/invalid, treated the same as absent (unset)
                 else:
+                    if number <= 0:
+                        continue
                     mb = number
     except OSError:
         pass
@@ -810,16 +1385,23 @@ def read_retention():
 
 
 def apply_retention(now=None):
-    """Prune according to settings.txt. Returns the prune report, or None when nothing is set.
+    """Prune according to settings.txt, applying the 90-day default when the operator has
+    never set session_retention_days. Returns the prune report, or None when the effective
+    policy is "keep everything" (explicit 0 for days, and no size cap either).
 
     Called once at bridge start rather than on a timer. A retention pass that can fire in the
     middle of a turn is a retention pass that can delete the conversation being written to,
     and the difference between running it now and running it in an hour is not worth that.
+
+    The age-based half of the prune is BATCHED (see PRUNE_BATCH_LIMIT): the first pass on a
+    machine with years of unpruned history removes at most that many sessions, oldest first,
+    rather than blocking startup on however many thousands are past the line.
     """
     days, mb = read_retention()
-    if not days and not mb:
+    effective_days = DEFAULT_RETENTION_DAYS if days is None else days
+    if not effective_days and not mb:
         return None
-    return prune(max_age_days=days, max_mb=mb, now=now)
+    return prune(max_age_days=effective_days, max_mb=mb, now=now, limit=PRUNE_BATCH_LIMIT)
 
 
 def compact():
@@ -875,6 +1457,13 @@ def latest_session():
 
     A policy that wants "resume only if the thing we just left is resumable" needs to see the
     thing we just left, whether or not it is resumable. That is this.
+
+    `latest_attached()` was DELETED on 2026-09-14 rather than left listed as unreached. It had
+    no caller from the day this replaced it, and its test pinned the skip that caused the
+    incident above -- so the repository was holding a tested function whose tested behaviour is
+    the one it had decided against. If a future caller wants "newest row with a conversation",
+    write it there and name what it is for; do not restore a name whose only documentation is
+    why it was wrong.
     """
     conn = _db()
     try:
@@ -885,26 +1474,45 @@ def latest_session():
     return _row_to_session(row) if row else None
 
 
-def latest_attached():
-    """Most recent session (by last_active_ts) that has a conversation attached.
+def main(argv=None):
+    """Operator entry point. The only subcommand today is `compact`.
 
-    NAMED FOR ITS CONDITION, WHICH IS conv_url <> '' AND NOT status. It was latest_active,
-    which is the third thing in this program called active and the second that does not
-    mean what the others do:
-
-      - the `status` column, written as 'active' by every touch() and read by nothing
-      - ACTIVE_SID in the bridge, the session a turn actually goes to
-      - this, which asked only whether a conversation was attached
-
-    A reader reasoning from the name would have expected the status column to matter here.
-    It never did, and a filter that is named but not applied is worse than one that is
-    absent, because it gets relied on.
+    `compact()` itself has been callable since the store was built, but nothing in the
+    repository ever called it -- no `__main__`, no `.ps1`, no MCP tool (see `_collapse_goals`'s
+    own comment, above, on why that gap matters: it is the one case that predates incremental
+    `auto_vacuum` and that `prune()` does not reach). This gives it the operator-reachable
+    surface its own docstring assumed existed. Honours MCP_SESSION_STORE_DIR like every other
+    entry point in this module -- it does NOT default to the operator's live store unless that
+    env var is unset, same as `_base_dir()` always has.
     """
-    conn = _db()
-    try:
-        row = conn.execute(
-            "SELECT * FROM sessions WHERE conv_url <> '' "
-            "ORDER BY last_active_ts DESC LIMIT 1").fetchone()
-    finally:
-        conn.close()
-    return _row_to_session(row) if row else None
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        prog="python -m bridge.session_store",
+        description="Operate on the session store (%s honours MCP_SESSION_STORE_DIR)."
+                     % STORE_DIR_ENV)
+    sub = ap.add_subparsers(dest="cmd")
+    sub.add_parser("compact", help="VACUUM the store so deleted space returns to the OS")
+
+    a = ap.parse_args(argv)
+    if a.cmd == "compact":
+        try:
+            before = store_stats()
+            after = compact()
+        except StoreUnavailable as exc:
+            # ONE READABLE LINE, NOT A BARE TRACEBACK. See StoreUnavailable's docstring: this
+            # is the operator-reachable surface for `_connect()` refusing to open the store,
+            # e.g. an unwritable MCP_SESSION_STORE_DIR.
+            print(str(exc))
+            return 1
+        print(json.dumps({"db_path": _db_path(), "before": before, "after": after},
+                          ensure_ascii=False))
+        return 0
+    # No subcommand named -- print usage rather than guessing. `compact` mutates the file on
+    # disk (a VACUUM rewrite); unlike contract_gate's read-only default it must be asked for.
+    ap.print_usage()
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

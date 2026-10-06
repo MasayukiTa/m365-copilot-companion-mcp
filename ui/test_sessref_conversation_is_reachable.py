@@ -23,7 +23,7 @@
 import re
 from pathlib import Path
 
-RAW = (Path(__file__).with_name("CopilotChat.cs")).read_text(encoding="utf-8")
+RAW = (Path(__file__).with_name("ChatSend.cs")).read_text(encoding="utf-8-sig")
 
 
 def _executable(cs):
@@ -43,33 +43,41 @@ def _executable(cs):
 SOURCE = _executable(RAW)
 
 
-def _pinning_block():
-    """SendText の中の「ページを target に合わせる」分岐だけを切り出す。"""
-    body = SOURCE[SOURCE.index("void SendText(string text)"):]
-    return body[:body.index("_sendInFlight = true;")]
+def _door_decision():
+    """「ページを target に合わせる」扉の選択。2026-09-24 に ui/ChatSend.cs の DecideDoor へ移り、
+    ui/test_the_chat_window_sends_what_was_typed.py が**実行して**確かめている(door_sid /
+    door_unknown / door_new 等のケース)。ここに残るのは形の確認だけ。"""
+    body = SOURCE[SOURCE.index("string DecideDoor("):]
+    return body[:body.index("return DOOR_UNKNOWN;") + len("return DOOR_UNKNOWN;")]
+
+
+def _door_opening():
+    """SendText の中で、選ばれた扉を実際の GET に変える部分。"""
+    body = SOURCE[SOURCE.index("void SendText(IChatSendEffects fx, string text)"):]
+    return body[:body.index("fx.MarkSendInFlight();")]
 
 
 def test_a_conversation_without_a_url_is_resumed_by_sid():
-    blk = _pinning_block()
-    assert "/resume?sid=" in blk, (
+    assert "return DOOR_RESUME_SID;" in _door_decision(), (
         "URL を持たない会話を sid で再開する分岐が無い -- ソケットで捕捉した会話は"
         "一覧に出るのに続けられない")
+    assert '"/resume?sid="' in _door_opening(), "sid の扉が /resume?sid= に繋がっていない"
 
 
 def test_the_resume_branch_is_gated_on_a_chat_row():
     """fleet 行の Name はワーカー名なので、sid として使ってはいけない。"""
-    blk = _pinning_block()
-    i = blk.index("/resume?sid=")
-    guard = blk[:i]
-    assert 'Source == "chat"' in guard, (
+    blk = _door_decision()
+    i = blk.index("return DOOR_RESUME_SID;")
+    line = blk[blk.rindex(chr(10), 0, i):i]
+    assert 'Source == "chat"' in line, (
         "Source で絞っていない -- fleet 行の Name(w0 など)を sid として resume してしまう")
-    assert "IsNullOrEmpty(target.Name)" in guard, "Name が空のときも resume しようとしている"
+    assert "IsNullOrEmpty(target.Name)" in line, "Name が空のときも resume しようとしている"
 
 
 def test_the_refusal_still_exists_for_a_conversation_with_no_identity():
     """身元が何も無い会話は、やはり断ること。全部通すための変更ではない。"""
-    blk = _pinning_block()
-    assert "send_unknown_conv" in blk, (
+    assert "return DOOR_UNKNOWN;" in _door_decision()
+    assert "send_unknown_conv" in _door_opening(), (
         "識別できない会話への送信を止める分岐が消えている")
 
 
@@ -79,6 +87,6 @@ def test_the_branch_order_puts_identity_before_starting_a_new_chat():
     再起動直後はメッセージが読み込まれていないことがある。そこで /new を撃つと、
     続けたかった会話の代わりに新しい会話が始まる。
     """
-    blk = _pinning_block()
-    assert blk.index("/resume?sid=") < blk.index('HttpGet("/new"'), (
+    blk = _door_decision()
+    assert blk.index("return DOOR_RESUME_SID;") < blk.index("return DOOR_NEW;"), (
         "/new の分岐が先にある -- 履歴未読込の既存会話が新規会話にすり替わる")

@@ -91,8 +91,34 @@ def test_the_composed_body_still_ends_with_the_goal():
 
 # Frozen from the current module; a change to PROTOCOL (intended or not) flips these and
 # forces a deliberate re-pin rather than a silent edit.
-_PROTOCOL_SHA256 = "a45b126857d377a01ab0478b449c093bd2d3b6a011659a4022b3e79ff1af82cd"
-_PROTOCOL_LEN = 1401
+#
+# RE-PINNED 2026-09-15: PROTOCOL trimmed 1401 -> 1147 chars (first-turn budget push, the
+# ContextTokenLimitExceeded incident). The preamble dropped a stale tool count and two of
+# three example names; the tail dropped a STUCK-specific "verify before declaring stuck"
+# sentence that had no incident comment of its own and duplicated OUTPUT_DISCIPLINE's
+# already-guarded "don't declare 無い/できない without checking" clause within this same
+# first turn (see the comments at those two edit sites in copilot_autopilot_relay.py). The
+# contract-prefix wiring this file's part (b) tests is unaffected: the contract still lands
+# ahead of the goal, never inside PROTOCOL's tail.
+#: RE-PINNED 2026-09-17 (+11 chars). ANALYZE was introduced to the worker as データ分析,
+#: so a worker told in its own goal to open a PNG with ANALYZE never emitted one --
+#: reading six characters off a picture is not what that phrase describes, and
+#: read_image was sitting there claiming to do it. Renamed for what it does (attach the
+#: file so the model itself can look), and the next run emitted the line on turn 1.
+#: NARROWED AND REVERTED WITHIN THE HOUR, back to this hash. The narrowing was written
+#: because a run appeared to be sending screenshots to the Analyst for no reason; the
+#: operator then established that the goal was a folder handed over to be examined,
+#: images included, and reading them WAS the task. The sentence was producing good
+#: behaviour and the reason to change it had been withdrawn, so it went back. What was
+#: learned is recorded beside the sentence instead of spent as instruction bytes.
+#: RE-PINNED 2026-09-24 (+81 chars). SKILL_SENTENCE (relay/copilot_autopilot_relay.py,
+#: commit 6f5178f "Stop treating a skill_match miss as 'the request is impossible'") gained a
+#: parenthetical spelling out what "proceed as normal" means on a skill_match miss: keep using
+#: other means (web search etc.) to finish the goal, and don't read "no matching skill" as "the
+#: requested thing does not exist". A worker had stopped at the empty local catalogue and closed
+#: DONE without ever searching further, and refuter#1 upheld it. Intended content change; re-pin.
+_PROTOCOL_SHA256 = "34335083940c0ac8793235f7ebdbacb07127e060a17fb4de361bb2e8463c78c2"
+_PROTOCOL_LEN = 1239
 
 
 def _protocol():

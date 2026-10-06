@@ -29,6 +29,19 @@ Queue layout (all under .fleet/tasks/):
   by some route they could not determine. Nothing had moved: the record and the handoff are
   two artifacts written in the same pass, and only the handoff is the outstanding work.
 
+  AND ONCE A FLEET GOAL LANDED, NOTHING EVER LOOKED AT THE JOB AGAIN EITHER -- until
+  2026-09-15. "dispatched" was written the instant the goal left the queue and never revisited:
+  a goal that finished cleanly ten minutes later and one that was still running when someone
+  stopped the fleet both read exactly "dispatched" in done/<jid>.json, indefinitely, because
+  the outcome existed only in relay/relay_fleet.py's own per-worker ledger
+  (<state_dir>/socket_route.jsonl) and nothing joined the two. `job_status(jid)` (below) is the
+  read path that closes this: it answers "did this job finish, and how" by checking, in order,
+  a reconciled outcome record, a live scan of that ledger, whether the jid is a worker the
+  CURRENT run is still holding, and only then falling back to an honest "unknown" rather than
+  repeating "dispatched" forever. `_reconcile_outcomes()` is the write path that keeps
+  done/<jid>.outcome.json current on every dispatch tick so a caller does not have to run the
+  read path's live-scan fallback to get an up-to-date answer.
+
 Design notes:
   * One writer claims a job by moving pending/ -> running/ (atomic rename) so two routers never
     double-run a job.
@@ -52,6 +65,7 @@ import hashlib
 import itertools
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -80,7 +94,7 @@ except Exception:
     pass
 
 TASKS = os.path.join(REPO, ".fleet", "tasks")
-SUBDIRS = ("pending", "running", "done", "awaiting", "for_fleet", "for_claude")
+SUBDIRS = ("pending", "running", "done", "awaiting", "awaiting_ack", "for_fleet", "for_claude")
 VENVPY = os.path.join(REPO, ".venv", "Scripts", "python.exe")
 APPROVED_JOBS_FILE = os.path.join(REPO, ".fleet", "approved_jobs.json")
 
@@ -103,6 +117,7 @@ DESTINATION = {
 }
 DEFAULT_DESTINATION = "claude"
 
+
 # A job may force its destination with payload {"escalate": true} -> CLAUDE, regardless of type.
 LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
 
@@ -113,6 +128,9 @@ LOCAL_TIMEOUT_S = int(os.environ.get("TASK_LOCAL_TIMEOUT_S", "120"))
 #              job held in awaiting/); once a human approves that class, later same-class jobs
 #              auto-run -- UNLESS the specific payload is itself flagged destructive (see
 #              job_gate() below: an approved class never bypasses a fresh destructive check).
+#              A "class" is only as wide as a payload's text cannot carry code: python code and
+#              interpreter / shell-operator commands are keyed by their exact normalised text,
+#              so approving one approves that text only (see _job_class_key).
 #   auto    -- purely STATIC risk check (never executes the payload to test it): clean -> run,
 #              a STOP-pattern -> deny, an ASK-pattern -> fall back to a confirm gate.
 #   bypass  -- current (pre-gate) behavior: run anything. The H3 path floor (see _exec_file /
@@ -129,6 +147,10 @@ if TASK_JOB_APPROVAL_MODE not in ("default", "auto", "bypass"):
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
+from relay.control_envelopes import is_local_loop_control_submission
+
+from tools import childproc
+
 # These helpers are reused, not reimplemented (see module docstring / design notes below).
 # Imports are defensive: the router must stay importable even if tools/relay siblings are
 # absent from a stripped-down deployment -- job_gate() then degrades to "never flags risk",
@@ -144,6 +166,11 @@ except Exception:
         return False
 
 try:
+    from relay import splittability as _splittability
+except Exception:
+    _splittability = None
+
+try:
     from relay.autonomy_gate import _STOP_PATTERNS, _ASK_PATTERNS, _matches as _autonomy_matches
 except Exception:
     _STOP_PATTERNS = ()
@@ -152,11 +179,36 @@ except Exception:
     def _autonomy_matches(_text, _patterns):
         return []
 
-try:
-    from tools.file_ops import _validate_path, ALLOWED_BASE
-except Exception:
-    _validate_path = None
-    ALLOWED_BASE = None
+# RESOLVED ON FIRST USE, NOT AT IMPORT. `tools.file_ops` imports `tools.security`, which imports
+# fastmcp and the server's auth stack -- and this module is run by the supervisor as
+# `task_router.py --once` every tick, usually to find an empty queue. Measured 2026-09-24: the
+# import alone took 3-12 s and ~89 MB per tick, and it was the largest single part of the ~26 s a
+# submitted job waited before anything picked it up. The two names stay module attributes because
+# tests set `task_router.ALLOWED_BASE` directly; `_UNRESOLVED` means "ask file_ops when needed".
+#
+# NOT FIXED IN tools/security.py, although that is where the heavy import lives: that file is in
+# the self-improvement frozen set, and a latency fix is not a reason to spend a re-sign.
+_UNRESOLVED = object()
+_validate_path = _UNRESOLVED
+ALLOWED_BASE = _UNRESOLVED
+
+
+def _file_ops_names():
+    """(validate_path, allowed_base) -- this module's attributes if set, else tools.file_ops'.
+
+    Same failure behaviour as the import it replaces: if file_ops cannot be imported, both are
+    None and the callers' existing `is None` branches take over."""
+    global _validate_path, ALLOWED_BASE
+    if _validate_path is _UNRESOLVED or ALLOWED_BASE is _UNRESOLVED:
+        try:
+            from tools.file_ops import _validate_path as _vp, ALLOWED_BASE as _ab
+        except Exception:
+            _vp, _ab = None, None
+        if _validate_path is _UNRESOLVED:
+            _validate_path = _vp
+        if ALLOWED_BASE is _UNRESOLVED:
+            ALLOWED_BASE = _ab
+    return _validate_path, ALLOWED_BASE
 
 try:
     from tools.notify_ops import notify_approval_gate
@@ -188,6 +240,38 @@ def _p(sub, name):
     return os.path.join(TASKS, sub, name)
 
 
+_SUBMITTER_CACHE = {}
+
+
+def submitter_for_jid(jid, tasks_dir=None):
+    """Who handed this job in, as short text: 'mcp:<source>' / 'cli:<args>' / 'ui:<...>'.
+
+    Read from the provenance fleet_intake / the CLI recorded on the job (`origin`), looked for in
+    the pending, running and done directories. Empty when the job id is unknown or carries no
+    origin. Cached per job id (a found answer never changes) so the status snapshot can ask on
+    every sweep. Never raises.
+    """
+    jid = str(jid or "")
+    if not jid or not all(ch.isalnum() or ch in "-_" for ch in jid):
+        return ""
+    if jid in _SUBMITTER_CACHE:
+        return _SUBMITTER_CACHE[jid]
+    base = tasks_dir or TASKS
+    for sub in ("done", "running", "pending", "for_fleet", "awaiting", "awaiting_ack"):
+        path = os.path.join(base, sub, jid + ".json")
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                origin = (json.load(fh) or {}).get("origin")
+        except (OSError, ValueError, AttributeError):
+            continue
+        if isinstance(origin, dict) and (origin.get("via") or origin.get("source")):
+            text = ("%s:%s" % (origin.get("via") or "", origin.get("source") or "")).strip(":")
+            text = " ".join(text.split())[:80]
+            _SUBMITTER_CACHE[jid] = text
+            return text
+    return ""
+
+
 # ── LOCAL executors (bounded; return a (status, result, error) tuple) ─────────────────────────
 
 def _exec_shell(payload):
@@ -195,7 +279,8 @@ def _exec_shell(payload):
     if not cmd:
         return "error", None, "shell job missing 'cmd'"
     r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
-                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO)
+                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO,
+                       creationflags=childproc.headless_creationflags())
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None
 
@@ -207,7 +292,8 @@ def _exec_python(payload):
     py = VENVPY if os.path.isfile(VENVPY) else sys.executable
     env = dict(os.environ, PYTHONIOENCODING="utf-8")
     r = subprocess.run([py, "-c", code], capture_output=True, text=True,
-                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO, env=env)
+                       errors="replace", timeout=LOCAL_TIMEOUT_S, cwd=REPO, env=env,
+                       creationflags=childproc.headless_creationflags())
     out = (r.stdout or "") + (("\n[stderr]\n" + r.stderr) if r.stderr else "")
     return ("ok" if r.returncode == 0 else "error"), {"rc": r.returncode, "output": out[:20000]}, None
 
@@ -236,7 +322,8 @@ def _exec_screenshot(payload):
     elif payload.get("region") and len(payload["region"]) == 4:
         cmd += ["-Region", ",".join(str(int(x)) for x in payload["region"])]
     r = subprocess.run(cmd, capture_output=True, text=True, errors="replace",
-                       timeout=LOCAL_TIMEOUT_S)
+                       timeout=LOCAL_TIMEOUT_S,
+                       creationflags=childproc.headless_creationflags())
     if r.returncode == 0 and os.path.isfile(out):
         return "ok", {"path": out, "mode": (r.stdout or "").strip()[:80]}, None
     return "error", None, ((r.stderr or r.stdout or "screenshot failed")[:2000])
@@ -254,9 +341,10 @@ def _resolve_file_path(path, allow_outside):
 
     Returns (resolved_path_str, None) on success, or (None, error_message) on rejection.
     """
+    validate_path, _ = _file_ops_names()
     try:
-        if _validate_path is not None:
-            resolved = str(_validate_path(path))
+        if validate_path is not None:
+            resolved = str(validate_path(path))
         else:
             resolved = str(Path(path).expanduser().resolve())
     except PermissionError as e:
@@ -309,20 +397,125 @@ LOCAL_EXECUTORS = {
 
 # ── Job-approval gate: class key, allowlist store, static risk, decision ──────────────────────
 
+#: Programs that run code or a command taken from their OWN ARGUMENTS. For these, the first two
+#: tokens name no action at all: `python -c`, `powershell -Command`, `cmd /c`, `bash -c`,
+#: `node -e`, `wsl <anything>` each describe "whatever text follows", so a class built from them
+#: is a class of every program. Missing an entry here fails toward the weaker class key, so this
+#: is the list to extend when a new launcher turns up.
+_CODE_RUNNERS = frozenset((
+    "python", "python3", "py", "pyw", "pythonw", "pypy", "pypy3", "ipython",
+    "powershell", "powershell_ise", "pwsh", "cmd", "command", "conhost",
+    "bash", "sh", "zsh", "dash", "ksh", "fish", "wsl", "busybox",
+    "node", "nodejs", "deno", "bun", "npx", "perl", "ruby", "php", "lua", "tclsh", "osascript",
+    "cscript", "wscript", "mshta", "rundll32", "regsvr32", "msiexec", "installutil", "msbuild",
+    "start", "call", "env", "xargs", "find", "forfiles", "wmic", "schtasks", "at", "runas",
+    "sudo", "nohup", "iex", "invoke-expression", "awk", "gawk", "sed", "uv", "uvx", "pipx",
+))
+
+#: Argument tokens that hand the NEXT text to something that executes it, whatever the program:
+#: `git -c core.pager=..`, `find -exec`, `git rebase -x`, `git fetch --upload-pack=..`,
+#: `git submodule foreach`, `docker run`, `npm exec`. Compared case-insensitively, before any `=`.
+_CODE_CARRYING_ARGS = frozenset((
+    "-c", "/c", "/k", "/r", "-e", "-x", "--eval", "-command", "--command", "-encodedcommand",
+    "-enc", "-ec", "-exec", "--exec", "-execdir", "-ok", "--upload-pack", "--receive-pack",
+    "--config", "exec", "run", "foreach", "eval", "call", "start", "invoke-expression", "iex",
+))
+
+#: A token a class may be built from: letters, digits and path/option punctuation only. No
+#: quote (a quoted program path hides where the program name ends), no shell operator
+#: (& | ; < > ^), no expansion (% ! $ `), no grouping or glob. Anything else and the text can
+#: say more than its first two tokens do.
+_PLAIN_TOKEN = re.compile(r"^[\w.:\\/@+,=~-]+$")
+
+
+def _normalised_payload_text(text):
+    """The text an exact approval is keyed on: line endings unified, outer whitespace dropped.
+    Nothing inside is collapsed -- in Python indentation and string contents are code, so two
+    texts that differ inside are two different payloads."""
+    return str(text or "").replace("\r\n", "\n").replace("\r", "\n").strip()
+
+
+def _payload_text(job_type, payload):
+    """What the operator is shown, and what an exact approval covers, for one job."""
+    payload = payload or {}
+    if job_type == "shell":
+        return str(payload.get("cmd") or payload.get("command") or "")
+    if job_type == "python":
+        return str(payload.get("code") or "")
+    return json.dumps({k: v for k, v in payload.items() if k != "id"},
+                      ensure_ascii=False, sort_keys=True, default=str)
+
+
+def _exact_key(job_type, payload):
+    """Approval key for exactly this payload and nothing else.
+
+    `@sha256:` rather than `::` so no class key can ever spell one: a class key is always
+    `<type>::<tokens>`, and a command whose first token happened to read `exact::<hex>` must not
+    be able to stand in for the payload that hex was computed from."""
+    text = _normalised_payload_text(_payload_text(job_type, payload))
+    return "%s@sha256:%s" % (job_type, hashlib.sha256(text.encode("utf-8")).hexdigest())
+
+
+def _program_name(token):
+    """`C:\\Python\\python.exe` -> `python`. Lower-cased, directory and executable suffix dropped."""
+    name = token.replace("\\", "/").rsplit("/", 1)[-1].lower()
+    for ext in (".exe", ".com", ".bat", ".cmd", ".ps1"):
+        if name.endswith(ext):
+            name = name[:-len(ext)]
+            break
+    return name
+
+
+def _shell_class_prefix(cmd):
+    """The first-two-token class this command may share an approval with -- or None when its
+    own text can carry code, so that only an approval of this exact text may cover it.
+
+    None when: the command spans lines; any token is not plain (see _PLAIN_TOKEN); the program
+    runs code from its arguments (_CODE_RUNNERS, including `python3.12`-style names); the
+    second token is an option rather than a subcommand, so the pair names no action
+    (`git -c`, `node -e`); or any token is a code-carrying argument (_CODE_CARRYING_ARGS)."""
+    text = _normalised_payload_text(cmd)
+    if not text or "\n" in text:
+        return None
+    tokens = text.split()
+    if not all(_PLAIN_TOKEN.match(t) for t in tokens):
+        return None
+    prog = _program_name(tokens[0])
+    if prog in _CODE_RUNNERS or re.match(r"^(python|pypy)[\d.]*w?$", prog):
+        return None
+    if len(tokens) > 1 and tokens[1][:1] in ("-", "/"):
+        return None
+    if any(t.split("=", 1)[0].lower() in _CODE_CARRYING_ARGS for t in tokens[1:]):
+        return None
+    return " ".join(tokens[:2])
+
+
 def _job_class_key(job_type, payload):
     """Pure fn: map (job_type, payload) -> a stable class-key string for the approval
     allowlist. Deliberately granular: "git status" and "git push --force" are DISTINCT
     classes -- collapsing to just the program name (e.g. "git") would let one approval of
-    a benign invocation silently cover a destructive one later. shell/python key on the
-    first two whitespace-normalized tokens of the command/code; file keys on
-    (op, resolved parent dir). Hermetically testable: no I/O besides path resolution."""
+    a benign invocation silently cover a destructive one later. file keys on
+    (op, resolved parent dir). Hermetically testable: no I/O besides path resolution.
+
+    THE SAME REASONING, CARRIED ONE STEP FURTHER. shell and python used to key on the first two
+    whitespace tokens of the command/code, which for an interpreter is no class at all:
+    `python -c "print(1)"` and `python -c "<anything>"` share `shell::python -c`, and a python
+    job's own code keyed on its first two tokens (`import os`), so one approval covered every
+    program that began the same way -- with only the regex static check between an obfuscated
+    payload and execution, and no further human decision (SEC-07).
+
+    So a key now only groups payloads whose differences cannot be code:
+      python -- always the exact normalised code (_exact_key). The payload IS code.
+      shell  -- the first-two-token class only when _shell_class_prefix() finds the command
+                cannot carry code past that prefix; otherwise the exact normalised command."""
     payload = payload or {}
     if job_type == "shell":
-        cmd = (payload.get("cmd") or payload.get("command") or "").split()
-        return "shell::%s" % " ".join(cmd[:2])
+        prefix = _shell_class_prefix(payload.get("cmd") or payload.get("command") or "")
+        if prefix is None:
+            return _exact_key(job_type, payload)
+        return "shell::%s" % prefix
     if job_type == "python":
-        code = (payload.get("code") or "").split()
-        return "python::%s" % " ".join(code[:2])
+        return _exact_key(job_type, payload)
     if job_type == "file":
         op = payload.get("op") or ""
         path = payload.get("path") or ""
@@ -412,6 +605,14 @@ def job_gate(job_type, payload, mode):
     (decision, reason)."""
     payload = payload or {}
     if mode == "bypass":
+        try:
+            from tools.approval_policy import record_bypass_decision
+            record_bypass_decision(
+                "task_router.job_gate",
+                _job_gate_question(job_type, payload, _job_class_key(job_type, payload)),
+                "ALLOW (bypass); job_type=%s" % job_type)
+        except Exception:
+            pass
         return "ALLOW", "bypass"
 
     level, why = _static_risk(job_type, payload)
@@ -443,6 +644,44 @@ def _gate_token_for_class(key):
     return "gate_%s" % h
 
 
+def _gate_key(job_type, payload, level):
+    """The key a CONFIRM gate is posted under -- which is exactly what answering it approves.
+
+    A clean payload asks about its class key (for code-carrying forms that already IS the exact
+    payload). A payload the static check flagged asks about THAT payload only.
+
+    WHY THE SECOND HALF. Gate files are durable and the token was derived from the class key
+    alone, so once any `git log ...` gate had been answered "approved", a later same-class
+    payload that job_gate() held back as risky ("class approved but this payload is risky")
+    was moved to awaiting/, found the old answered gate under the same token, and ran on the
+    next recheck -- the confirm existed, nobody was asked. The same replay reached `auto`
+    mode's ASK-pattern confirms. A flagged payload's gate is now its own."""
+    if level == "clean":
+        return _job_class_key(job_type, payload)
+    return _exact_key(job_type, payload)
+
+
+def _job_gate_question(job_type, payload, gate_key):
+    """The approval text: says what answering it covers, and shows the payload IN FULL.
+
+    It used to show the first 160 characters -- the tail of an obfuscated payload is exactly
+    what would sit past that cut -- and to call every approval a class approval even when the
+    class was every program an interpreter could run."""
+    text = _normalised_payload_text(_payload_text(job_type, payload))
+    if "@sha256:" in gate_key:
+        return ("ジョブ承認（この内容のみ）: %s\n"
+                "承認されるのは以下の内容そのものだけです。1文字でも違えば再度確認します。\n"
+                "Approve exactly this %s job? Only this exact text is approved; any change "
+                "asks again.\n"
+                "----\n%s\n----\n%s" % (job_type, job_type, text, gate_key))
+    return ("ジョブ承認（クラス）: %s\n"
+            "承認すると、クラス %r に属する以後のジョブは静的検査が clean な限り確認なしで"
+            "実行されます。\n"
+            "Approve job class %r ? Later jobs in this class run without asking while the "
+            "static check finds them clean.\n"
+            "----\n%s\n----" % (job_type, gate_key, gate_key, text))
+
+
 def _write_job_gate(token, question, context):
     """Write a HITL gate file DIRECTLY -- same shape and directory as
     tools/contract_gate.py's _create_gate() / tools/gate_ops.py's GATE_DIR
@@ -454,10 +693,11 @@ def _write_job_gate(token, question, context):
     Deliberately does NOT call tools/gate_ops.gate_ask(): that function calls
     require_unlocked(), which DENIES outside an HTTP request context, and task_router runs
     as a standalone process (no HTTP request in flight)."""
-    if ALLOWED_BASE is None:
+    _, allowed_base = _file_ops_names()
+    if allowed_base is None:
         return
     try:
-        gate_dir = ALLOWED_BASE / ".companion_gates"
+        gate_dir = allowed_base / ".companion_gates"
         gate_dir.mkdir(parents=True, exist_ok=True)
         gate_file = gate_dir / ("%s.json" % token)
         if gate_file.is_file():
@@ -481,10 +721,11 @@ def _write_job_gate(token, question, context):
 
 def _read_job_gate(token):
     """Read a gate file written by _write_job_gate(). Returns dict or None (missing/bad)."""
-    if ALLOWED_BASE is None:
+    _, allowed_base = _file_ops_names()
+    if allowed_base is None:
         return None
     try:
-        gate_file = ALLOWED_BASE / ".companion_gates" / ("%s.json" % token)
+        gate_file = allowed_base / ".companion_gates" / ("%s.json" % token)
         if not gate_file.is_file():
             return None
         return json.loads(gate_file.read_text(encoding="utf-8"))
@@ -521,14 +762,48 @@ def fleet_is_live(state_dir=None) -> bool:
     decides whether a goal joins the current run or waits, and the failure it prevents is
     already on the record: two fleets share the one dedicated Edge and clobber each other's
     status.json, and the second run's work showed up as a phantom worker behind the first.
+
+    A STALE status.json IS NOT PROOF THE PROCESS DIED. `fleet_runner.on_tick` writes
+    status.json inside `try: ... except Exception: pass` (fleet_runner.py), so a write that
+    fails -- e.g. `_write_atomic`'s PermissionError against the cockpit's own reader losing its
+    retry race, or the disk floor being exhausted by a long, heavy run -- is swallowed silently
+    and the sweep loop keeps going with a live browser and live workers. Measured 2026-09-25:
+    a run that had grown to 41 workers over free RAM 2151 MB / free disk 0.6 GB went stale by
+    this reading while its process (and Edge window) were still very much alive, and
+    autostart's "a fleet is already running" gate read the stale file as "not live" and started
+    a SECOND fleet_runner on top of it -- two coordinator processes, two Edge windows, the
+    second one's workers counted as refusals by the first one's rate budget.
+    Before giving up on a stale/missing status.json, fall back to the OS-level signal:
+    fleet_runner writes `fleet_run_active.json` once at startup (pid/start_ts/argv) and clears
+    it on a clean exit (see fleet_runner._write_active_marker / ACTIVE_MARKER). If that marker
+    names a pid that is still running, the fleet is live even though its status snapshot is not
+    advancing -- join it, do not start a second one.
     """
     sd = state_dir or FLEET_STATE_DIR
     try:
         sp = os.path.join(sd, "status.json")
-        if not os.path.isfile(sp) or (time.time() - os.path.getmtime(sp)) > FLEET_LIVE_MAX_AGE_S:
+        if os.path.isfile(sp) and (time.time() - os.path.getmtime(sp)) <= FLEET_LIVE_MAX_AGE_S:
+            with open(sp, encoding="utf-8-sig") as fh:
+                return bool(json.load(fh).get("running"))
+    except Exception:
+        pass
+    return _active_marker_process_alive(sd)
+
+
+def _active_marker_process_alive(state_dir) -> bool:
+    """Fallback liveness read for a stale/unreadable status.json: is the pid recorded in
+    fleet_runner's `fleet_run_active.json` still running? Never raises; a missing/corrupt
+    marker or an unreadable pid answers False, same as "no fleet" did before this fallback
+    existed -- this only ADDS a way to say True, it never removes the old one.
+    """
+    try:
+        marker_path = os.path.join(state_dir, "fleet_run_active.json")
+        with open(marker_path, encoding="utf-8-sig") as fh:
+            rec = json.load(fh)
+        pid = rec.get("pid")
+        if pid is None:
             return False
-        with open(sp, encoding="utf-8-sig") as fh:
-            return bool(json.load(fh).get("running"))
+        return _pid_alive(pid)
     except Exception:
         return False
 
@@ -596,66 +871,60 @@ def write_command(state_dir, patch: dict) -> str:
             time.sleep(0.02)
 
 
-#: A goal handed to a live fleet carries an ack nonce. The fleet stamps <state_dir>/acked/
-#: <ack>.json the instant it consumes the command, and the sender waits for that stamp before
-#: it dares call the goal delivered. This exists because the ONLY prior evidence of delivery
-#: was the sender's own "dispatched" record -- which is written whether or not anything read
-#: the command -- so a run that ended in the up-to-30s window fleet_is_live cannot see took the
-#: goal down with it and left "delivered" behind. The receiver's stamp is the first proof that
-#: is on the reader's side of the handoff.
-ACKED_DIR = "acked"
+#: Where the fleet drops a receipt when it actually READS a command. One file per goal id,
+#: written by relay/fleet_runner.read_commands the instant before it deletes the command. Its
+#: presence is the only proof on the receiving side that a dispatched goal was picked up rather
+#: than lost into the stale-status window (see fleet_landing_confirmed and the probe note).
+ACKS_DIR = "acks"
 
 
-def _ack_dir(state_dir=None) -> str:
-    return os.path.join(state_dir or FLEET_STATE_DIR, ACKED_DIR)
+def _ack_path(jid: str, state_dir=None) -> str:
+    sd = state_dir or FLEET_STATE_DIR
+    return os.path.join(sd, ACKS_DIR, "%s.ack" % jid)
 
 
-def _new_ack() -> str:
-    return uuid.uuid4().hex
+def fleet_landing_confirmed(jid: str, state_dir=None) -> bool:
+    """Whether the running fleet has actually read the goal handed over as `jid`.
 
-
-def ack_seen(ack: str, state_dir=None) -> bool:
-    """Whether the fleet has stamped this ack -- i.e. actually consumed the command.
-
-    A missing file is a firm "not yet", not an error: the stamp appears only when read_commands
-    on the fleet side removes the command it came in on, so its absence is exactly the state
-    this check is here to report.
+    dispatched IS NOT DELIVERED. fleet_handoff writes a done/ record saying "dispatched" the
+    moment fleet_is_live() is True, but that check trusts a status.json up to
+    FLEET_LIVE_MAX_AGE_S old -- so a run that had already died still read as live for up to
+    30s, and a goal queued in that window went into commands.d/ that no one would ever read.
+    read_commands now drops an ack receipt as it consumes a command; this reports whether that
+    receipt exists, which is what turns "we said we delivered it" into "the fleet took it".
     """
-    if not ack:
-        return False
     try:
-        return os.path.isfile(os.path.join(_ack_dir(state_dir), "%s.json" % ack))
+        return os.path.isfile(_ack_path(jid, state_dir))
     except OSError:
         return False
 
 
-#: How long fleet_handoff waits for the receiver's stamp before it stops claiming delivery and
-#: parks the goal as waiting instead. Short by default -- a live fleet drains commands every
-#: few seconds -- and env-tunable so a test can drop it to near zero rather than sleep. The
-#: failure it guards against is the reverse of the old one: better to under-claim and re-park a
-#: goal the fleet did in fact take than to over-claim one it never saw.
-FLEET_ACK_WAIT_S = float(os.environ.get("FLEET_ACK_WAIT_S", "8") or 8)
+def read_ack_receipt(jid: str, state_dir=None):
+    """The parsed receipt body fleet_runner.read_commands wrote when it took `jid`'s command,
+    or None when there is none yet (not landed) or it cannot be read.
 
-
-def _wait_for_ack(ack: str, state_dir=None, timeout_s=None) -> bool:
-    """Poll for the receiver's ack stamp up to timeout_s. Returns True once seen.
-
-    Polling, not a watch, because the writer is another process (or the C# cockpit) and there
-    is no shared primitive to wait on. The interval is small and the ceiling low, so the caller
-    blocks briefly at most.
+    A SEPARATE QUESTION FROM fleet_landing_confirmed's PLAIN EXISTENCE CHECK (e822fb6 gap #1).
+    That commit made _apply_command validate every command before touching anything and, when
+    a command is refused, write the SAME receipt file anyway -- {"read": True, "rejected": True,
+    "errors": [...]} -- because the fleet still genuinely READ it off the channel; only applying
+    it was refused (see fleet_runner.read_commands' own comment on this). A caller that only
+    checks "does the ack file exist" cannot tell that apart from a command that was read AND
+    applied, and task_router._reconcile_landings did exactly that: it turned a rejected
+    add_goal into a done/ record saying "dispatched", "landing_confirmed": True -- the operator
+    told a goal had landed for a goal the fleet never queued at all. This is the read that lets
+    a caller check `rejected` before believing "landed" means "queued".
     """
-    deadline = time.time() + (FLEET_ACK_WAIT_S if timeout_s is None else timeout_s)
-    while True:
-        if ack_seen(ack, state_dir):
-            return True
-        if time.time() >= deadline:
-            return False
-        time.sleep(0.05)
+    try:
+        with open(_ack_path(jid, state_dir), encoding="utf-8") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else None
+    except Exception:
+        return None
 
 
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
-                           entry: dict = None) -> str:
-    """Append a goal to the running fleet's command channel. Returns the ack nonce written.
+                           entry: dict = None, jid: str = None) -> None:
+    """Append a goal to the running fleet's command channel.
 
     utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
     fleet reads both, and writing what the other writer writes is how the two stay compatible.
@@ -663,17 +932,23 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
     `entry` lets a caller supply the whole command dict -- code_task adds `cwd` and `checks` --
     so it can share this path instead of keeping its own copy of it.
 
-    The returned ack nonce is stamped by the fleet when it consumes the command; callers that
-    need proof of delivery wait on ack_seen()/`_wait_for_ack`. An `entry` without its own `ack`
-    gets one so this path always yields a nonce a caller can wait on; an entry that already
-    carries one is left as the caller set it.
+    `jid`, when given, adds an `ack` path to the COMMAND (so the fleet leaves a receipt when
+    it reads it) AND an `jid` key on the ITEM itself, so this admission-time id survives into
+    the worker goals_from_command builds and, from there, into every snapshot row and
+    history.json entry that worker ever produces. Without the second half, `jid` never
+    reached the item goals_from_command reads, and nothing downstream of admission could join
+    back to `.fleet/tasks/done/<jid>.json` -- the codex-plan item-1 gap (2026-09-09): run_id
+    identifies a fleet SWEEP, jid identifies a GOAL, and until now no field carried the
+    latter past this function. `add_goal` readers ignore keys they do not recognise, so
+    adding this one is safe for every existing consumer that predates it.
     """
     sd = state_dir or FLEET_STATE_DIR
     item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
-    ack = item.get("ack") or _new_ack()
-    item["ack"] = ack
-    write_command(sd, {"add_goal": [item]})
-    return ack
+    patch = {"add_goal": [item]}
+    if jid:
+        patch["ack"] = _ack_path(jid, sd)
+        item["jid"] = jid
+    write_command(sd, patch)
 
 
 #: Where an autostart attempt is recorded, beside the run's own state. Kept so the NEXT pass
@@ -690,17 +965,126 @@ AUTOSTART_GRACE_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_GRACE_S", "240"
 #: spawn a browser every drain pass -- every fifteen seconds -- for as long as the goal waits.
 AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "900") or 900)
 
+#: The free-space floor an autostarted (non-bench) run admits against. Small on purpose -- it is
+#: not protecting a Docker build, it is protecting the machine's ability to keep working at all.
+#: Sized from what stops being possible below it: git cannot write a loose object, the fleet
+#: cannot write a transcript, and the browser cannot cache. Measured 2026-09-14, all three
+#: failed together at zero, and 174 MB was not enough for a commit of five files.
+#:
+#: See the long note at its use site for why this is not 0 (an "ordinary" goal wrote 5.43 GB)
+#: and not the bench's 6 GB (which blocked everything, silently, for twenty-five minutes twice).
+AUTOSTART_DISK_FLOOR_GB = float(os.environ.get("FLEET_AUTOSTART_DISK_FLOOR_GB", "2") or 2)
+
+
+def _operator_set_a_disk_floor() -> bool:
+    """Has the operator chosen a disk floor in the cockpit, or is there nothing to respect?
+
+    `settings_disk_floor` substitutes a default when the key is absent, so it cannot answer this
+    on its own -- a sentinel default is passed and a negative result means "no line in
+    settings.txt". Any real choice, including 0, counts: the cockpit clamps that control to
+    0..100 and therefore offers 0, so treating it as "unset" would be substituting a number for
+    one the operator picked.
+
+    Never raises. An unreadable settings file reads as "nothing chosen", which lands on the
+    autostart default -- the conservative side, since the alternative is inheriting the bench
+    reserve and admitting nothing.
+    """
+    # Moved next to settings_disk_floor, the function it is about, when the bench
+    # orchestrators turned out to need the same answer. The reasoning above is kept here
+    # because this is where it was learned.
+    try:
+        from relay.fleet_runner import operator_set_a_disk_floor
+        return operator_set_a_disk_floor()
+    except Exception:
+        return False
+
+#: When an autostarted run gets --fanout. fleet_runner exposes the flag and threads it into
+#: run_relay_fleet(fanout=...), but autostart_fleet never passed it, so a goal that arrives
+#: from the tunnel could never be split -- the one path where a phone-sized instruction is
+#: most likely to be "a quarter of mail", which is exactly the size problem fan-out exists
+#: for. Fan-out is ON by default: nothing is spent by saying yes (each goal is judged on its
+#: own), and only an explicit off (settings.txt fanout=off, FLEET_INTAKE_AUTOSTART_FANOUT=0, or
+#: this value <= 0) turns the capability off. The number is no longer a size gate.
+AUTOSTART_FANOUT_MIN_CHARS = int(
+    os.environ.get("FLEET_INTAKE_AUTOSTART_FANOUT_MIN_CHARS", "600") or 600)
+
+
+def _truthy_env(name):
+    """An explicit operator override, or None when the variable is unset.
+
+    Returns True/False when FLEET_INTAKE_AUTOSTART_FANOUT is set to a yes/no value, and None
+    when it is absent -- so the caller can tell "forced on", "forced off" and "decide by size"
+    apart. A blank string is treated as unset, matching how the other flags here read .env.
+    """
+    raw = os.environ.get(name)
+    if raw is None or raw.strip() == "":
+        return None
+    return raw.strip().lower() in ("1", "true", "yes", "on")
+
+
+def _wants_fanout(goals) -> bool:
+    """Should this launch be fan-out-CAPABLE? Yes, unless an operator said otherwise.
+
+    CAPABILITY, NOT DECISION, AND IT NO LONGER JUDGES ANYTHING. This used to run
+    `splittability.judge` over the goals and answer "no" when none looked splittable. That was
+    the same judgement RelayWorker makes per goal, run earlier and with less information, and
+    its only possible effect was to take the question away from the real judge -- for every
+    goal in the run, including goals added mid-run that nobody has seen yet. Answering "no"
+    here is the one answer that cannot be revisited later, which is why it now requires an
+    operator to say it.
+
+    Nothing is spent by saying yes. RelayWorker computes
+    `self.fanout = bool(fanout) and _depth0 and _goal_splittable`, so a goal judged NO_SPLIT
+    costs no turn at all; only a SPLIT or an UNCERTAIN triage spends one asking the agent,
+    which may itself answer NO_SPLIT. See docs/fanout_contract.md for the whole staircase.
+
+    WHERE THE OLD MEASUREMENT WENT. The corpus study that replaced the length proxy (1214 real
+    goal occurrences; 60.8% called SPLIT by length alone against 0.7% by independence) is the
+    reason `splittability` exists and is still what RelayWorker consults. It was never a reason
+    to gate the capability -- the judge it justifies runs downstream of this function.
+
+    The two off switches: FLEET_INTAKE_AUTOSTART_FANOUT (explicit, wins outright) and
+    AUTOSTART_FANOUT_MIN_CHARS <= 0 (kept as the documented kill switch it already was).
+    """
+    override = _truthy_env("FLEET_INTAKE_AUTOSTART_FANOUT")
+    if override is not None:
+        return override
+    # THE SWITCH IN FRONT OF THE OPERATOR COUNTS AS THE OPERATOR SAYING OTHERWISE. The
+    # docstring above promises "yes, unless an operator said otherwise" and then offered only
+    # an environment variable and a kill switch as ways to say it -- while the cockpit has a
+    # fan-out control, writes `fanout=` from it, and honours it for its own launches. On the
+    # autostart path the setting was never read, so settings.txt said off and every
+    # autostarted run carried --fanout. A control that does nothing is worse than no control:
+    # the operator believes the question is settled.
+    #
+    # Unset stays unset: None falls through to the size rule below, so a machine where nobody
+    # has touched the switch behaves exactly as before.
+    try:
+        from relay.fleet_runner import settings_fanout
+        chosen = settings_fanout()
+    except Exception:
+        chosen = None
+    if chosen is not None:
+        return chosen
+    if AUTOSTART_FANOUT_MIN_CHARS <= 0:
+        return False
+    # CAPABILITY, NOT DECISION -- so it is on. This function chooses whether the RUN can fan
+    # out at all; RelayWorker then judges each goal on its own (offline triage, then the agent,
+    # which may answer NO_SPLIT), and a goal judged NO_SPLIT costs nothing. Answering "no" here
+    # is the only answer that cannot be revisited: it takes the question away from the judge
+    # for every goal in the run, including goals added mid-run that nobody has seen yet.
+    return True
+
 
 def launch_creationflags() -> int:
-    """Windows creation flags for spawning a fleet. Split out so it can be tested.
+    """Windowless creation flags for an unattended fleet child.
 
-    The spawn itself cannot be exercised in a test -- autostart_fleet refuses to Popen under
-    pytest, deliberately, because reaching that line for real opens a browser. So the decision
-    lives here where it can be asserted without one, rather than in a source-text check that
-    would pass on a comment.
+    Keep this identical to the repository-wide policy. CREATE_NEW_PROCESS_GROUP used to be
+    ORed in here, but a CREATE_NO_WINDOW child has no shared console for Ctrl+C/CTRL_BREAK and
+    this repository does not use GenerateConsoleCtrlEvent as a shutdown channel.
     """
-    return (getattr(subprocess, "CREATE_NO_WINDOW", 0)
-            | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0))
+    from tools.childproc import headless_creationflags
+    return headless_creationflags()
 
 
 def _autostart_path(state_dir) -> str:
@@ -727,6 +1111,59 @@ def _write_autostart(state_dir, rec: dict) -> None:
         pass
 
 
+#: How long an `owner_pid` is believed. A pid is not a durable identity -- Windows reuses
+#: them -- so after this the entry is treated as abandoned whatever the pid says. An hour is
+#: far longer than any fleet startup and far shorter than a pid recycles in practice.
+OWNER_PID_GRACE_S = 3600.0
+
+
+def _still_owned(path: str, alive_cache=None) -> bool:
+    """Is this pending entry still held by a live process that wrote it about itself?
+
+    `relay/fleet_runner.py` writes one entry per CLI goal the moment it is known, so a
+    submission is visible before anything can refuse it -- but tasks/pending/ is not a display
+    surface, it is this module's inbox, and dispatch_once claims everything in it. Without
+    this the router could deliver a goal into a live fleet while the process that wrote it was
+    starting up to run the same goal itself. Measured artifact: a cli*.delivered.json beside
+    the cli*.json the same run wrote.
+
+    ABANDONED IS THE CASE THAT MUST STILL WORK. A run that dies during startup leaves its
+    entry behind with a dead pid, and taking it then is the whole point of recording it -- an
+    unclaimed entry is the difference between "refused" and "never happened". So this answers
+    "still mine", not "mine at all".
+
+    UNREADABLE MEANS NOT OWNED. A file that vanished (another router claimed it) or will not
+    parse must fall through to the claim, where the rename decides and a parse error becomes
+    a done-record. Refusing to claim on a read failure would strand it silently instead.
+    """
+    try:
+        with open(path, encoding="utf-8") as fh:
+            job = json.load(fh) or {}
+    except Exception:
+        return False
+    pid = job.get("owner_pid")
+    if not pid:
+        return False
+    try:
+        age = time.time() - float(job.get("created") or 0.0)
+    except Exception:
+        age = 0.0
+    if age > OWNER_PID_GRACE_S:
+        return False
+    # ONE LIVENESS QUERY PER PID PER PASS. `_pid_alive` shells out to tasklist, measured at
+    # 316 ms here, and a CLI run records ONE ENTRY PER GOAL -- all of them owned by the same
+    # process. Asking once per entry made a ten-goal run cost 3.2 s of every pass, against a
+    # --poll-s default of 2.0: the router would have spent its life in tasklist. The cache is
+    # a dict handed in by the caller and thrown away with the pass, so it cannot go stale and
+    # no test has to know it exists.
+    if alive_cache is None:
+        return _pid_alive(pid)
+    key = str(pid)
+    if key not in alive_cache:
+        alive_cache[key] = _pid_alive(pid)
+    return alive_cache[key]
+
+
 def _pid_alive(pid) -> bool:
     """Whether a launched runner is still around. Windows has no os.kill(0), so ask the OS."""
     try:
@@ -738,7 +1175,8 @@ def _pid_alive(pid) -> bool:
     try:
         out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid, "/NH"],
                              capture_output=True, text=True, encoding="utf-8",
-                             errors="replace", timeout=20)
+                             errors="replace", timeout=20,
+                             creationflags=childproc.headless_creationflags())
         return str(pid) in (out.stdout or "")
     except Exception:
         # UNKNOWN IS TREATED AS ALIVE, deliberately. The only thing this answer gates is
@@ -759,6 +1197,18 @@ def autostart_status(state_dir=None, now=None) -> tuple:
         return False, "autostart is off (FLEET_INTAKE_AUTOSTART)"
     if fleet_is_live(state_dir):
         return False, "a fleet is already running"
+    # THE INTERRUPTED RUN COMES FIRST. A pending snapshot whose automatic resume is on its way
+    # (or a resume the supervisor has just launched and that has not written its marker yet)
+    # must not be answered by a FRESH coordinator for the queued goals: that one ignores the
+    # snapshot and the interrupted trees are lost. The goals stay queued and join the resumed
+    # run through the live-fleet delivery. Bounded -- see relay.fleet_resume.autostart_hold.
+    try:
+        from relay import fleet_resume as _fres
+        held = _fres.autostart_hold(state_dir or FLEET_STATE_DIR, now=now)
+    except Exception:
+        held = ""
+    if held:
+        return False, "an interrupted run is being resumed first (%s)" % held
     rec = _read_autostart(state_dir)
     started = float(rec.get("started_at") or 0)
     if started:
@@ -788,6 +1238,30 @@ def _agent_url() -> str:
             or os.environ.get("MCP_IMPL_AGENT_URL") or "").strip()
 
 
+#: How long to wait before believing a fleet started. Covers the import-and-argparse class
+#: only -- see the comment at the launch site.
+STARTUP_LIVENESS_S = 2.0
+
+
+def _coordinator_log_tail(state_dir, lines=3):
+    """The last few lines of the newest coordinator log, for a launch that did not survive.
+
+    The traceback is already on disk; nothing was reading it. Never raises -- a failure to
+    explain a failure must not become a second failure.
+    """
+    try:
+        import glob as _glob
+        logs = _glob.glob(os.path.join(state_dir, "coordinator_*.log"))
+        if not logs:
+            return ""
+        newest = max(logs, key=lambda p: os.stat(p).st_mtime)
+        with open(newest, encoding="utf-8", errors="replace") as fh:
+            rows = [r.strip() for r in fh.read().splitlines() if r.strip()]
+        return " | ".join(rows[-lines:])[:400]
+    except Exception:
+        return ""
+
+
 def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     """Launch a fleet for `goals` (a list of goal dicts). Returns what happened.
 
@@ -815,6 +1289,9 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     goals = [g for g in (goals or []) if (g or {}).get("text")]
     if not goals:
         return {"ok": False, "detail": "no goals to start a fleet for"}
+    if any(is_local_loop_control_submission((g or {}).get("text")) for g in goals):
+        return {"ok": False, "refused": True,
+                "detail": "LOCAL_LOOP control envelope is not Fleet work"}
     url = _agent_url()
     if not url:
         return {"ok": False, "detail": "no agent URL (MCP_FLEET_AGENT_URL / MCP_IMPL_AGENT_URL)"}
@@ -847,9 +1324,47 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     # multi-gigabyte Docker reserve was a category error, and the failure it produced (silent,
     # unobservable from the device that asked) is worse than the disk pressure it was avoiding.
     # Bench runs still pass their own floor and keep the protection that was actually earned.
+    #
+    # BUT NOT ZERO, AND "KILOBYTES" WAS WRONG. Measured 2026-09-14: an ordinary goal told to back
+    # a folder up before editing it wrote a **5.43 GB** archive (zip_create walked its own output
+    # -- fixed in tools/archive_ops, but the premise it broke is the one this line rested on).
+    # With the gate disabled the fleet kept admitting while C: drained to **zero bytes**, which
+    # took out git, the fleet's own writes and a business folder's backups together. A goal that
+    # writes kilobytes is the common case, not a guarantee, and this is the last brake before the
+    # machine stops working at all.
+    #
+    # The floor that silently blocked everything is not being restored either: it was the SIZE
+    # (a Docker-sized reserve for a goal that needs none) and the SILENCE (a log line nobody
+    # could see) together that made it unusable. `_note_disk_defer` now reports a block outward
+    # once it outlasts DISK_DEFER_ALERT_AFTER_S, so a floor this small can only ever cost a
+    # notification -- never another twenty-five silent minutes.
+    #
+    # AND IT IS A DEFAULT, NOT AN OVERRIDE. fleet_runner resolves the floor as
+    # "CLI --disk-floor-gb >= 0 -> settings.txt disk_floor_gb -> env", so passing the flag at all
+    # BEATS the cockpit's own control. Measured 2026-09-15: the settings panel showed 1 GB, the
+    # operator had set it there, and an autostarted run used 2 -- the panel was displaying a
+    # number the run did not use. (It was worse before, at 0: the same override, further from
+    # the setting.) The cockpit clamps that control to 0..100, so 1 is a choice it offers and
+    # 0 is too; silently substituting a number for one the operator chose makes the panel lie,
+    # which is the defect class this session has spent its length removing.
+    #
+    # So the flag goes on ONLY when settings.txt carries no floor -- which is the case the
+    # hard-coding was written for, a tunnel goal inheriting the bench reserve because nobody
+    # had chosen anything. When the operator has chosen, their choice is left to the chain, and
+    # the cockpit's live `set_disk_floor_gb` keeps working because nothing is pinned at launch.
     cmd = [sys.executable, "-m", "relay.fleet_runner",
-           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd,
-           "--disk-floor-gb", "0"]
+           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd]
+    if not _operator_set_a_disk_floor():
+        cmd += ["--disk-floor-gb", str(AUTOSTART_DISK_FLOOR_GB)]
+    # FAN-OUT WAS WIRED EVERYWHERE BUT HERE. fleet_runner parses --fanout and passes it to
+    # run_relay_fleet(fanout=...); the worker gates the split turn itself (depth 0 only). The
+    # missing link was this command line: without the flag an autostarted goal could never
+    # split, however large. Added by goal size so a goal that fits pays nothing for it.
+    # BOTH VALUES ARE SAID OUT LOUD (as the cockpit's own launches do). Saying only "--fanout"
+    # and omitting the flag for "no" was a silent inversion: fleet_runner's flag defaults to ON,
+    # so an operator's explicit fanout=off made _wants_fanout answer False, no flag was passed,
+    # and the coordinator fanned out anyway.
+    cmd.append("--fanout" if _wants_fanout(goals) else "--no-fanout")
     try:
         if launcher is not None:
             pid = launcher(cmd)
@@ -869,15 +1384,36 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
             #
             # CREATE_NO_WINDOW gives this process a console with no window, and descendants
             # INHERIT it rather than allocating their own -- which is what reaches the grandchild.
-            # CREATE_NEW_PROCESS_GROUP is kept so a Ctrl+C in the router's own console does not
-            # travel to the run. Detachment was never what kept the child alive: Windows does not
-            # kill children when a parent exits unless they share a job object, and these do not.
+            # No extra process-group flag: shutdown is file/taskkill based, and a windowless child
+            # cannot receive console control events from a console it does not share.
             kwargs = {"cwd": REPO}
             if os.name == "nt":
                 kwargs["creationflags"] = launch_creationflags()
             else:
                 kwargs["start_new_session"] = True
-            pid = subprocess.Popen(cmd, **kwargs).pid
+            proc = subprocess.Popen(cmd, **kwargs)
+            pid = proc.pid
+            # A PID IS NOT A RUN. The Popen used to be discarded here, so nothing could ask
+            # whether the child survived -- and on 2026-09-17 one died a second after launch
+            # while the queue recorded it as started and the task moved to done/. Two seconds
+            # covers the import-and-argparse class: a missing module, a syntax error, an
+            # UnboundLocalError in main(). It does NOT cover a run that comes up and fails
+            # later; the ack receipt and the reconcile pass own that, and this does not
+            # replace them.
+            try:
+                rc = proc.wait(timeout=STARTUP_LIVENESS_S)
+            except subprocess.TimeoutExpired:
+                rc = None                      # still running, which is what we wanted
+            if rc is not None:
+                detail = "the fleet exited %s within %gs of launch" % (rc,
+                                                                       STARTUP_LIVENESS_S)
+                tail = _coordinator_log_tail(sd)
+                if tail:
+                    detail += " -- " + tail
+                rec = {"started_at": now, "pid": pid, "outcome": "died_at_startup",
+                       "error": detail, "goals": goals, "goals_file": goals_file}
+                _write_autostart(sd, rec)
+                return {"ok": False, "detail": detail}
     except Exception as exc:
         rec = {"started_at": now, "pid": None, "outcome": "launch_failed",
                "error": "%s: %s" % (type(exc).__name__, exc),
@@ -1038,73 +1574,629 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
         if not text:
             continue
         jid = uuid.uuid4().hex[:12]
-        try:
-            with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8", newline="\n") as fh:
-                fh.write(text)
+        if _write_for_fleet(jid, text):
             restored.append(jid)
-        except OSError:
-            pass
     _write_autostart(sd, dict(rec, outcome="never_became_live", restored=restored))
     return restored
 
 
-def _park_in_for_fleet(goal, jid):
+def read_for_fleet(text: str) -> tuple:
+    """A parked file's contents as (goal, priority). The inverse of `_write_for_fleet`.
+
+    OLD FILES ARE PLAIN TEXT AND MUST KEEP WORKING. Anything already sitting in for_fleet/
+    when this shipped is a bare goal, and so is every goal parked without a field worth
+    carrying -- which is nearly all of them. Only a goal that HAS something to carry is
+    written as JSON, so the format stays the cheap one by default and the reader tells them
+    apart by looking.
+
+    A goal whose own text begins with a brace is not mistaken for one: the parse has to
+    succeed AND produce a mapping with a `text` in it, and anything else falls back to
+    treating the whole contents as the goal, which is what it is.
+    """
+    body = text or ""
+    if body.lstrip().startswith("{"):
+        try:
+            obj = json.loads(body)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict) and isinstance(obj.get("text"), str):
+            return obj["text"], bool(obj.get("priority"))
+    return body, False
+
+
+def _write_for_fleet(jid, goal, priority: bool = False) -> bool:
+    """Put a waiting goal on disk so a reader never sees half of one. Returns whether it landed.
+
+    THE EMPTY CHECK WAS NOT A TORN-WRITE CHECK. `_deliver_waiting_goals` skips a file whose
+    contents are blank, which catches a write that had not started -- and nothing caught one
+    that had started and not finished. All four writers used a plain `open(..., "w")`, so a
+    reader arriving mid-write got a PREFIX of the goal, which is not blank, and handed the
+    fleet an instruction that stops in the middle of a sentence. A truncated goal is worse
+    than a missing one: it looks like something the operator wrote.
+
+    Same shape as `write_command`: a `.tmp` beside it, then `os.replace`, which is atomic on
+    NTFS. The reader already ignores anything that is not `.txt`, so a writer mid-flight is
+    invisible for free. The rename is retried briefly because Windows refuses it while another
+    process holds the target open -- measured there, and the same reason it is retried there.
+    """
+    ensure_dirs()
+    path = _p("for_fleet", "%s.txt" % jid)
+    tmp = _p("for_fleet", "%s.tmp" % jid)
+    # JSON ONLY WHEN THERE IS SOMETHING TO CARRY. A parked goal used to be its text and
+    # nothing else, so any field the door accepts was lost the moment no fleet was running --
+    # the same goal delivered a second later kept it. `read_for_fleet` reads both shapes.
+    body = json.dumps({"text": goal, "priority": True}, ensure_ascii=False) if priority \
+        else goal
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(body)
+    except OSError:
+        return False
+    until = time.time() + 2.0
+    while True:
+        try:
+            os.replace(tmp, path)
+            return True
+        except PermissionError:
+            if time.time() > until:
+                break
+            time.sleep(0.02)
+        except OSError:
+            break
+    try:
+        os.remove(tmp)
+    except OSError:
+        pass
+    return False
+
+
+def _park_in_for_fleet(goal, jid, priority=False):
     """Write the goal into for_fleet/<jid>.txt so a waiting goal is visible on disk, not just
     named in a status string. Returns the handoff path label either way. Best-effort: a goal
     the queue cannot see is the very failure this module exists to prevent, but if the write
     itself fails the caller still reports "waiting" rather than a false "delivered"."""
-    ensure_dirs()
-    try:
-        with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(goal)
-    except OSError:
-        pass
+    _write_for_fleet(jid, goal, priority=priority)
     return "for_fleet/%s.txt" % jid
 
 
-def fleet_handoff(goal: str, jid: str, state_dir=None):
-    """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry."""
+def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
+    """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry.
+
+    `priority` HAS TO SURVIVE ALL THREE ROUTES OR IT IS A LIE ON ONE OF THEM. A goal leaves
+    here by joining a live run, by starting one, or by waiting in for_fleet/ -- and the third
+    stored nothing but the goal's text, so a field added at the door and not here would be
+    silently dropped by whichever route the machine happened to take. That is the shape
+    resume_conv had: set at one end, read at the other, lost in between, and working on one
+    path while guessing on another.
+    """
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
+    if is_local_loop_control_submission(goal):
+        return "refused", {"handoff": "for_fleet/%s.txt" % jid, "refused": True,
+                           "detail": "LOCAL_LOOP control envelope is not Fleet work"}
     if fleet_is_live(state_dir):
-        # PARK FIRST, CLAIM SECOND. The goal is written to for_fleet/ before the command goes
-        # out, so if this process dies mid-handoff -- or the fleet ends in the up-to-30s window
-        # fleet_is_live cannot see -- the goal is on disk as waiting, not merely named in a
-        # "dispatched" record nobody re-reads. It is removed only once the fleet stamps its ack.
-        _park_in_for_fleet(goal, jid)
-        ack = add_goal_to_live_fleet(goal, state_dir)
-        if _wait_for_ack(ack, state_dir):
-            try:
-                os.remove(_p("for_fleet", "%s.txt" % jid))
-            except OSError:
-                pass
-            return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
-                                  "delivered": "add_goal", "ack": ack,
-                                  "note": "consumed by the running fleet (ack stamped)"}
-        # SENT BUT UNCONFIRMED. The command was written and the fleet looked live, but no ack
-        # arrived in time -- exactly the run-ended-in-the-window case. Leave the goal parked in
-        # for_fleet/ and say awaiting, rather than claim a delivery that may have vanished.
-        return "awaiting_fleet", {"handoff": "for_fleet/%s.txt" % jid, "ack": ack,
-                                  "note": "handed to a live fleet but no ack within "
-                                          "%ss; parked as waiting" % FLEET_ACK_WAIT_S}
+        # Clear any stale receipt for this id before queueing, so a confirmation seen later
+        # belongs to THIS handoff and not a previous run's leftover file.
+        try:
+            os.remove(_ack_path(jid, state_dir))
+        except OSError:
+            pass
+        add_goal_to_live_fleet(goal, state_dir, priority=priority, jid=jid)
+        # RECORD THE OPEN CLAIM so a later pass can check it. "dispatched" is written to done/
+        # now, but done/ is terminal -- nothing re-reads it -- so on its own it can never be
+        # corrected when the fleet turns out to have died inside the stale-status window. This
+        # marker is the one thing _reconcile_landings scans: it holds the goal so a goal lost to
+        # that window can be re-queued, and it is deleted the moment the ack proves the goal
+        # landed. Best-effort: a goal already on the channel must not be lost because the marker
+        # write failed, so the delivery above happens first and this cannot raise past here.
+        try:
+            with open(_p("awaiting_ack", "%s.json" % jid), "w", encoding="utf-8") as _mf:
+                json.dump({"id": jid, "goal": goal, "ts": time.time(),
+                           # CARRIED SO THE RE-QUEUE IS NOT A DEMOTION. _reconcile_landings
+                           # re-parks from this marker when the ack never arrives, and a goal
+                           # that came back from a lost delivery is not less urgent than it
+                           # was when it left.
+                           "priority": bool(priority),
+                           "ack": _ack_path(jid, state_dir)}, _mf, ensure_ascii=False)
+        except OSError:
+            pass
+        # STILL "dispatched", because the goal is on the channel and joining the run in flight
+        # is the right destination. But delivery is now CHECKABLE: the command carries an ack
+        # path, the fleet drops a receipt when it reads it, and fleet_landing_confirmed(jid)
+        # (or the reconcile pass) tells a delivered goal apart from one lost to the stale
+        # window fleet_is_live cannot close on its own. `ack` names where that receipt lands.
+        return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
+                              "delivered": "add_goal", "note": "queued into the running fleet",
+                              "ack": _ack_path(jid, state_dir)}
     if AUTOSTART:
         may, why = autostart_status(state_dir)
         if may:
-            out = autostart_fleet([{"text": goal}], state_dir)
+            # jid carried into the goal dict, same as add_goal_to_live_fleet's live path
+            # above -- _read_goals_file() keeps a JSON-object goal line verbatim, so this
+            # survives into the cold-started fleet's Worker unchanged. Without it, a goal
+            # delivered via autostart could never be joined back to its admission record.
+            out = autostart_fleet([{"text": goal, "jid": jid,
+                                    "priority": bool(priority)}], state_dir)
             if out.get("ok"):
                 return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
                                       "delivered": "autostart",
                                       "note": "started a fleet for this goal (pid %s)"
                                               % out.get("pid")}
-            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
+            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority),
                                       "note": "autostart could not start a fleet: %s"
                                               % out.get("detail")}
-        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid), "note": why}
+        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority), "note": why}
     # SAYS IT IS WAITING, rather than "dispatched". The old wording claimed delivery for a
     # file nobody read, and a status that overstates what happened is how a queue goes
     # unnoticed for months.
-    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid),
+    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority),
                               "note": "no fleet run is in flight; the goal waits for one"}
+
+
+#: How long a "dispatched" goal may wait for its landing ack before _reconcile_landings treats
+#: it as lost to the stale-status window and re-queues it. Must be comfortably longer than
+#: FLEET_LIVE_MAX_AGE_S (the width of that window) plus one drain interval, so a fleet that is
+#: genuinely alive but slow to read its command channel is not re-queued out from under itself.
+RECONCILE_ACK_GRACE_S = float(os.environ.get("FLEET_RECONCILE_ACK_GRACE_S", "90") or 90)
+
+
+def _reconcile_landings(now_ts=None, state_dir=None):
+    """Turn every "dispatched" claim into a checked outcome, using the fleet's landing acks.
+
+    THE GAP THIS CLOSES. fleet_handoff files a goal "dispatched" the instant fleet_is_live() is
+    True, but that check trusts a status.json up to FLEET_LIVE_MAX_AGE_S old: a run that had
+    already died still read as live for up to that long, and a goal queued in that window went
+    into commands.d/ that no live reader would ever consume. "dispatched" was the only record,
+    done/ is terminal, and nothing ever revisited the claim -- so a goal lost this way looked
+    exactly like one delivered. The receiving side now drops an ack when it actually reads a
+    command; this pass is the reader of those acks.
+
+    For each open claim in awaiting_ack/:
+      * ack present            -> the fleet really took it. Record done/<id>.landed.json and
+                                  drop the marker. This is the confirmation "dispatched" could
+                                  never give on its own.
+      * no ack, past the grace -> lost to the stale window. Re-queue it as a for_fleet/ waiter
+                                  (the same channel _deliver_waiting_goals drains on the next
+                                  live pass, which will hand it over WITH a fresh ack), record
+                                  done/<id>.reconcile-requeued.json, and drop the marker.
+      * no ack, still in grace -> leave it; a live-but-slow fleet has not answered yet.
+
+    Runs on every drain pass. Costs one listdir when there are no open claims.
+    """
+    out = []
+    ensure_dirs()
+    # AGE IS MEASURED ON THE WALL CLOCK, not on now_ts. now_ts is a record stamp the caller may
+    # pass as any monotonic value (tests pass small integers), and comparing a marker ts taken
+    # from time.time() against that would make the grace meaningless. now_ts is only written
+    # into the done/ records below.
+    now = time.time()
+    try:
+        names = sorted(os.listdir(_p("awaiting_ack", "")))
+    except OSError:
+        return out
+    for name in names:
+        if not name.endswith(".json"):
+            continue
+        mpath = _p("awaiting_ack", name)
+        try:
+            with open(mpath, encoding="utf-8") as fh:
+                marker = json.load(fh)
+        except Exception:
+            continue  # unreadable -- leave for manual inspection rather than losing the claim
+        jid = marker.get("id", name[:-5])
+        goal = marker.get("goal", "")
+        if fleet_landing_confirmed(jid, state_dir):
+            receipt = read_ack_receipt(jid, state_dir) or {}
+            if receipt.get("rejected"):
+                # THE FLEET READ THIS COMMAND AND REFUSED IT (e822fb6's admit_command /
+                # validate_command). "Landed" only ever meant "the fleet took it off the
+                # channel" -- it never meant "the fleet queued it as a goal". Recording this
+                # as "dispatched" told the operator a goal had joined the run when it never
+                # did, and nothing else was ever going to say otherwise: a refused command
+                # produces no worker, so no worker_done row will ever arrive to correct it,
+                # and job_status() would have sat on "dispatched"/"unknown" until
+                # JOB_STATUS_UNKNOWN_AFTER_S pretending the wait might still resolve. Written
+                # straight to the OUTCOME path (not a side "*.landed.json" file) so
+                # job_status()'s very first check -- os.path.isfile(outcome_path) -- reports
+                # "refused" immediately instead of decaying into "nothing further is known".
+                errors = list(receipt.get("errors") or [])
+                rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                       "status": "refused",
+                       "detail": "the fleet command channel rejected this goal at admission",
+                       "result": {"landing_confirmed": True, "rejected": True,
+                                  "errors": errors, "ack": _ack_path(jid, state_dir)},
+                       "error": ("command rejected: " + "; ".join(errors))[:500] if errors
+                                else "command rejected"}
+                try:
+                    with open(_p("done", "%s.outcome.json" % jid), "w",
+                              encoding="utf-8") as fh:
+                        json.dump(rec, fh, ensure_ascii=False, indent=2)
+                except OSError:
+                    pass
+                try:
+                    os.remove(mpath)
+                except OSError:
+                    pass
+                out.append(rec)
+                continue
+            rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                   "status": "dispatched", "result": {"landing_confirmed": True,
+                   "ack": _ack_path(jid, state_dir)}, "error": None}
+            try:
+                with open(_p("done", "%s.landed.json" % jid), "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, indent=2)
+            except OSError:
+                pass
+            try:
+                os.remove(mpath)
+            except OSError:
+                pass
+            out.append(rec)
+            continue
+        age = now - float(marker.get("ts", now))
+        if age <= RECONCILE_ACK_GRACE_S:
+            continue  # live-but-slow fleet may still read it; do not re-queue yet
+        # Past the grace with no ack: the goal was lost into the stale-status window. Put it
+        # back on the waiter channel so a live fleet picks it up again, this time with an ack
+        # we can confirm. Written before the marker is removed, so a crash between the two
+        # leaves a waiter (re-tried) rather than nothing (lost).
+        requeued = False
+        if (goal or "").strip():
+            try:
+                requeued = _write_for_fleet(jid, goal,
+                                            priority=bool(marker.get("priority")))
+            except OSError:
+                pass
+        rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+               "status": "awaiting_fleet",
+               "result": {"landing_confirmed": False, "reconciled": True,
+                          "requeued": requeued,
+                          "note": "no landing ack within %ss; goal was lost to the "
+                                  "stale-status window and has been re-queued"
+                                  % int(RECONCILE_ACK_GRACE_S)},
+               "error": None}
+        try:
+            with open(_p("done", "%s.reconcile-requeued.json" % jid), "w",
+                      encoding="utf-8") as fh:
+                json.dump(rec, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            pass
+        try:
+            os.remove(mpath)
+        except OSError:
+            pass
+        out.append(rec)
+    return out
+
+
+# ── Outcome reconciliation: done/ RECORDS DISPATCH, NOT COMPLETION ────────────────────────────
+#
+# THE GAP _reconcile_landings DOES NOT CLOSE. That pass confirms the fleet actually READ a
+# goal off its command channel -- it turns "dispatched" into "dispatched, landing confirmed".
+# It says nothing about what happened next. A goal that landed cleanly and then ran for
+# twenty minutes, or a goal that landed and was still running when someone stopped the fleet,
+# both still read exactly "dispatched" in done/<jid>.json today, forever, because nothing
+# after landing ever looks at the job again.
+#
+# THE RECORD THAT ALREADY HAS THE ANSWER. relay/relay_fleet.py's RelayWorker.close() writes
+# one line to <state_dir>/socket_route.jsonl for every worker that ever finishes, cockpit
+# open or not, run still live or not: outcome, turns, reason, the works. It is the one
+# completion record in this whole stack that does not depend on a second program (the C#
+# cockpit) choosing to archive it -- .fleet/history.json is written by the cockpit FROM the
+# live status.json snapshot, so a fleet started by a phone with nobody watching (see
+# ensure_cockpit's own docstring) never gets archived there at all. socket_route.jsonl is
+# written by the same Python process that ran the goal, unconditionally.
+#
+# THE JOIN KEY THIS FILE MINTS AND socket_route.jsonl DID NOT CARRY. `jid` -- the admission
+# id this module hands every fleet-bound goal in add_goal_to_live_fleet / autostart_fleet --
+# already reached history.json and the final sweep snapshot (see the comment on
+# add_goal_to_live_fleet above), but the one line RelayWorker.close() writes on ITS way out
+# never carried it. Fixed at the write site: relay/relay_fleet.py's `_socket_route().record(
+# "worker_done", ...)` call now passes `jid=(self.jid or "")`. A row written before that fix
+# has no jid and cannot be joined here -- there is no way to recover an id that was never
+# recorded, and this module does not fall back to matching on goal text to paper over that:
+# the text is truncated to 600 chars and the same goal is routinely dispatched more than once
+# as a retry, so a text match risks attributing one goal's outcome to a different admission.
+def _find_worker_outcome_by_jid(jid, state_dir=None):
+    """The worker_done row for `jid`, or None if the ledger has never recorded one -- either
+    because the worker has not finished yet, or because the row predates the jid fix above.
+
+    Full linear scan on purpose: this is the on-demand path job_status() uses for a one-off
+    "did X finish" question, and a single pass over even a many-thousand-line ledger is
+    milliseconds. _reconcile_outcomes() below is the path that runs forever (once per dispatch
+    tick) and is the one that actually needs a cursor to stay cheap.
+    """
+    if not jid:
+        return None
+    path = _socket_route_path(state_dir)
+    found = None
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue          # several processes append; a torn tail is normal
+                if not isinstance(row, dict) or row.get("event") != "worker_done":
+                    continue
+                if row.get("jid") == jid:
+                    found = row       # newest wins; jid is minted once per admission so this
+                                      # should never see two rows, but "last word" is the
+                                      # same rule every other reader in this file uses
+    except OSError:
+        return None
+    return found
+
+
+def _socket_route_path(state_dir=None):
+    """Where the fleet's own append-only completion ledger lives. Resolved through state_dir/
+    FLEET_STATE_DIR exactly like status.json and the acks directory above -- in production all
+    three live under the same .fleet/, and a test that redirects one must be free to redirect
+    the rest identically rather than this module hard-coding relay.socket_route's own default."""
+    return os.path.join(state_dir or FLEET_STATE_DIR, "socket_route.jsonl")
+
+
+#: Terminal `status` values a worker_done row can carry (relay/relay_fleet.py sets self.status
+#: to one of these before recording -- measured against the live ledger: done/cancelled/error/
+#: stuck cover 8,014 of 8,027 rows sampled). Mapped to the status this module reports so a
+#: reader never has to know the fleet's own vocabulary. "pending" (13 rows measured, all with
+#: outcome=None) is not a real terminal state -- an artifact of a row recorded before the
+#: worker had settled -- so it deliberately maps to nothing and is treated the same as no row
+#: at all: not yet resolved.
+# "interrupted" (fleet reaper: the coordinator died, work resumable) is deliberately absent, so it
+# maps to "unknown" = not yet resolved, which is right for a job whose fleet may resume.
+_WORKER_STATUS_TO_JOB_STATUS = {"done": "done", "cancelled": "cancelled",
+                                "error": "error", "stuck": "stuck"}
+
+#: One cursor per state_dir. The ledger this repo already has runs to several thousand lines
+#: and _reconcile_outcomes runs on every dispatch tick (every couple of seconds, forever), so
+#: unlike _find_worker_outcome_by_jid's one-off scan this path re-reads only what is new.
+#: A byte offset, read and written on a RAW binary handle -- Python's text-mode seek/tell only
+#: promises correct behaviour for a cookie obtained from tell() on that same handle, not for an
+#: offset computed independently by summing encoded line lengths, which is exactly what this
+#: does. Binary mode sidesteps that entirely.
+OUTCOME_CURSOR_FILE = "outcome_cursor.json"
+
+
+def _outcome_cursor_path(state_dir=None):
+    return os.path.join(state_dir or FLEET_STATE_DIR, OUTCOME_CURSOR_FILE)
+
+
+def _read_outcome_cursor(state_dir=None):
+    try:
+        with open(_outcome_cursor_path(state_dir), encoding="utf-8") as fh:
+            return int((json.load(fh) or {}).get("offset") or 0)
+    except Exception:
+        return 0
+
+
+def _write_outcome_cursor(offset, state_dir=None):
+    path = _outcome_cursor_path(state_dir)
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = "%s.%d.tmp" % (path, os.getpid())
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            json.dump({"offset": offset}, fh)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def _reconcile_outcomes(now_ts=None, state_dir=None):
+    """Turn every worker_done row the ledger has grown since the last pass into a completion
+    record for the job that finished, IF that job is still sitting at "dispatched" or
+    "awaiting_fleet" in done/. Returns the list of completion records written.
+
+    Cursor-based (see OUTCOME_CURSOR_FILE above). A torn tail -- a line with no trailing
+    newline yet, because another process is mid-write -- stops the scan for this pass without
+    advancing past it; the next pass picks up from the same byte and reads it whole once the
+    writer finishes. Idempotent: a jid that already has a done/<jid>.outcome.json is skipped,
+    so replaying the same cursor twice (a crash between advancing it and finishing this
+    function) cannot double-write.
+    """
+    out = []
+    ensure_dirs()
+    now = time.time()
+    path = _socket_route_path(state_dir)
+    offset = _read_outcome_cursor(state_dir)
+    try:
+        size = os.path.getsize(path)
+    except OSError:
+        return out                     # no ledger yet -- nothing to reconcile
+    if offset > size:
+        offset = 0                     # the ledger was rotated/replaced under us
+    new_offset = offset
+    rows = []
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(offset)
+            for raw in fh:
+                if not raw.endswith(b"\n"):
+                    break               # torn tail -- leave it for the next pass
+                new_offset += len(raw)
+                try:
+                    line = raw.decode("utf-8", errors="replace").strip()
+                except Exception:
+                    continue
+                if not line:
+                    continue
+                try:
+                    row = json.loads(line)
+                except Exception:
+                    continue
+                if isinstance(row, dict) and row.get("event") == "worker_done" and row.get("jid"):
+                    rows.append(row)
+    except OSError:
+        return out
+    _write_outcome_cursor(new_offset, state_dir)
+
+    for row in rows:
+        jid = row.get("jid")
+        base_path = _p("done", "%s.json" % jid)
+        outcome_path = _p("done", "%s.outcome.json" % jid)
+        if os.path.isfile(outcome_path):
+            continue
+        try:
+            with open(base_path, encoding="utf-8") as fh:
+                base_rec = json.load(fh)
+        except Exception:
+            continue                   # no dispatch record for this jid (a bare -g goal, an
+                                        # interactive retry) -- nothing here to reconcile
+        if base_rec.get("status") not in ("dispatched", "awaiting_fleet"):
+            continue
+        norm = _WORKER_STATUS_TO_JOB_STATUS.get(row.get("status"), "unknown")
+        rec = {"id": jid, "type": "fleet_goal", "destination": "fleet",
+               "ts_done": now_ts if now_ts is not None else now,
+               "status": norm,
+               "result": {"worker": row.get("worker"), "outcome": row.get("outcome"),
+                          "turns": row.get("turns"), "reason": row.get("reason"),
+                          "route": row.get("route"), "worker_status": row.get("status"),
+                          "ledger_ts": row.get("ts")},
+               "error": None}
+        try:
+            with open(outcome_path, "w", encoding="utf-8") as fh:
+                json.dump(rec, fh, ensure_ascii=False, indent=2)
+        except OSError:
+            continue
+        out.append(rec)
+    return out
+
+
+#: How long a fleet-bound job may sit at "dispatched"/"awaiting_fleet" with no landing ack, no
+#: recorded outcome, and no matching live worker before job_status() stops repeating that word
+#: and says plainly that nothing more is known. Generous: autostart's own grace is measured in
+#: minutes, and reporting "unknown" too early would just be a second word for the silence this
+#: function exists to replace.
+JOB_STATUS_UNKNOWN_AFTER_S = float(
+    os.environ.get("TASK_JOB_STATUS_UNKNOWN_AFTER_S", "1800") or 1800)
+
+
+def _jid_is_live_worker(jid, state_dir=None):
+    """Is `jid` a worker the CURRENT live run is actually holding right now? Reads status.json
+    with the same liveness rule fleet_is_live uses, so a stale snapshot from a run that has
+    already died cannot be read as "still in flight"."""
+    if not jid:
+        return False
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if not os.path.isfile(sp) or (time.time() - os.path.getmtime(sp)) > FLEET_LIVE_MAX_AGE_S:
+            return False
+        with open(sp, encoding="utf-8-sig") as fh:
+            snap = json.load(fh) or {}
+        if not snap.get("running"):
+            return False
+        for w in snap.get("workers") or []:
+            if isinstance(w, dict) and w.get("jid") == jid:
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def job_status(jid, state_dir=None):
+    """Answer "did this job finish, and how", for one admitted goal, without the caller needing
+    to know that done/<jid>.json records dispatch rather than completion, or that the real
+    answer might be sitting in a different file entirely. Read-only: never writes, so it is
+    always safe to call against a live queue.
+
+    Returns {id, state, status, detail, ts_done, result}. `state` is one of:
+      "finished"   a worker_done row for this jid exists (already reconciled into
+                   done/<jid>.outcome.json, or found live if that pass has not run yet).
+                   `status` is the normalized outcome (done/cancelled/error/stuck).
+      "in_flight"  no outcome yet, but the jid is a worker in the CURRENT live run right now --
+                   it has not finished, and this function can plainly see it has not been
+                   lost either.
+      "unknown"    the base record says "dispatched"/"awaiting_fleet", nothing else has ever
+                   been recorded for it, it is not a live worker, and either no fleet is
+                   running now or the wait has outlasted JOB_STATUS_UNKNOWN_AFTER_S. This is
+                   the case this module exists to stop mis-stating: a goal dispatched into a
+                   run that was later stopped, or one whose completion predates jid reaching
+                   the ledger, no longer reads as though it were quietly still in progress --
+                   it reads as exactly what is true, which is that nothing further is known.
+      "refused"    the fleet command channel READ this goal's add_goal command and REFUSED to
+                   apply it (validate_command / admit_command, e822fb6). `result.errors` names
+                   why. Definitive and immediate -- unlike "unknown" this never waits out
+                   JOB_STATUS_UNKNOWN_AFTER_S, because a refused command produces no worker and
+                   nothing will ever arrive later to say more.
+      "not_found"  no done/ record exists for this jid at all.
+      (anything else) the job's own recorded terminal status, unchanged -- local jobs
+                   (ok/error/denied/awaiting_approval) and CLAUDE escalations already resolve
+                   through their own path and are not the gap this function closes.
+    """
+    ensure_dirs()
+    outcome_path = _p("done", "%s.outcome.json" % jid)
+    if os.path.isfile(outcome_path):
+        try:
+            with open(outcome_path, encoding="utf-8") as fh:
+                rec = json.load(fh)
+            # A REFUSED COMMAND IS WRITTEN TO THIS SAME PATH (see _reconcile_landings), not
+            # because a worker finished -- none ever ran -- but because this is the one place
+            # job_status already treats as terminal-and-checked-first, and re-deriving that
+            # here as a second file to check would risk missing it the way "landed"/
+            # "reconcile-requeued" records already are (see the "unknown" wording above: those
+            # are supplementary, base_path stays authoritative for them). `detail` is carried
+            # from the record when the writer set one (the refusal does); worker-outcome
+            # records never set it, so they keep the ledger wording unchanged.
+            state = "refused" if rec.get("status") == "refused" else "finished"
+            return {"id": jid, "state": state, "status": rec.get("status"),
+                    "detail": rec.get("detail") or "completion recorded by the fleet's own ledger",
+                    "ts_done": rec.get("ts_done"), "result": rec.get("result")}
+        except Exception:
+            pass
+
+    base_path = _p("done", "%s.json" % jid)
+    if not os.path.isfile(base_path):
+        return {"id": jid, "state": "not_found", "status": None,
+                "detail": "no done/ record exists for this id", "ts_done": None, "result": None}
+    try:
+        with open(base_path, encoding="utf-8") as fh:
+            base_rec = json.load(fh)
+    except Exception:
+        base_rec = {}
+
+    if base_rec.get("status") not in ("dispatched", "awaiting_fleet"):
+        return {"id": jid, "state": base_rec.get("status"), "status": base_rec.get("status"),
+                "detail": "terminal status recorded at dispatch time",
+                "ts_done": base_rec.get("ts_done"), "result": base_rec.get("result")}
+
+    # A completion that landed in the ledger since the last _reconcile_outcomes tick.
+    row = _find_worker_outcome_by_jid(jid, state_dir)
+    if row is not None:
+        norm = _WORKER_STATUS_TO_JOB_STATUS.get(row.get("status"), "unknown")
+        return {"id": jid, "state": "finished", "status": norm,
+                "detail": "completion recorded by the fleet's own ledger",
+                "ts_done": row.get("ts"),
+                "result": {"worker": row.get("worker"), "outcome": row.get("outcome"),
+                          "turns": row.get("turns"), "reason": row.get("reason"),
+                          "route": row.get("route"), "worker_status": row.get("status")}}
+
+    if _jid_is_live_worker(jid, state_dir):
+        return {"id": jid, "state": "in_flight", "status": base_rec.get("status"),
+                "detail": "still an active worker in the current live run",
+                "ts_done": None, "result": None}
+
+    try:
+        dispatched_ts = os.path.getmtime(base_path)
+    except OSError:
+        dispatched_ts = 0
+    age = time.time() - dispatched_ts
+    live_now = fleet_is_live(state_dir)
+    if (not live_now) or age > JOB_STATUS_UNKNOWN_AFTER_S:
+        why = ("no fleet is running now" if not live_now
+               else "it has been waiting %.0fs with no result" % age)
+        return {"id": jid, "state": "unknown", "status": base_rec.get("status"),
+                "detail": ("no completion was ever recorded for this goal, and %s -- this is "
+                           "not a claim that it failed, only that nothing further is known"
+                           % why),
+                "ts_done": None, "result": base_rec.get("result")}
+
+    return {"id": jid, "state": "dispatched", "status": base_rec.get("status"),
+            "detail": "recently dispatched; no completion or live-worker signal yet",
+            "ts_done": None, "result": base_rec.get("result")}
 
 
 def run_job(job, now_ts=None):
@@ -1122,6 +2214,14 @@ def run_job(job, now_ts=None):
     # deleted. A distinction that does not reach the audit trail is not a distinction.
     if job.get("origin"):
         rec["origin"] = job["origin"]
+    # AND `created`, WHICH IS THE OTHER HALF OF EVERY QUESTION ts_done CAN ANSWER. The comment
+    # above rescued `origin` and stopped one field short. A done record carrying only ts_done
+    # cannot say how long the job waited before anything picked it up -- the difference between
+    # a queue that drains and one that does not -- and the pending file holding `created` is
+    # deleted at this same moment. Found 2026-09-18 reading a real archived job: its `created`
+    # was absent, so it read as 1970-01-01 and the wait was unrecoverable.
+    if job.get("created"):
+        rec["created"] = job["created"]
     try:
         if dest == "local":
             job_type = job.get("type")
@@ -1142,18 +2242,29 @@ def run_job(job, now_ts=None):
                 elif decision == "DENY":
                     rec["status"], rec["error"] = "denied", reason
                 else:  # CONFIRM -- hold the job, raise a desktop gate, do NOT block the loop
-                    key = _job_class_key(job_type, payload)
+                    # The gate is keyed on what answering it approves (see _gate_key), and the
+                    # question shows that payload in full.
+                    key = _gate_key(job_type, payload, _static_risk(job_type, payload)[0])
                     token = _gate_token_for_class(key)
-                    detail = (payload.get("cmd") or payload.get("command") or
-                              payload.get("code") or payload.get("path") or "")
-                    question = ("ジョブ承認: %s %s ? "
-                                "(このクラスを許可すると次回以降自動実行) / "
-                                "Approve job class %r ?" % (job_type, str(detail)[:160], key))
+                    question = _job_gate_question(job_type, payload, key)
                     _write_job_gate(token, question, "task_router job class: %s" % key)
                     rec["status"] = "awaiting_approval"
                     rec["result"] = {"gate_token": token, "class_key": key}
                     rec["error"] = reason
         elif dest == "fleet":
+            payload = job.get("payload") or {}
+            goal = payload.get("goal") or payload.get("text", "")
+            source = ((job.get("origin") or {}).get("source")
+                      if isinstance(job.get("origin"), dict) else "")
+            if is_local_loop_control_submission(goal, source):
+                rec["status"] = "refused"
+                rec["error"] = (
+                    "LOCAL_LOOP control envelope is not executable Fleet work; repair the "
+                    "Copilot Studio LOCAL_LOOP Agent Instructions instead of routing RUN/control "
+                    "messages into fleet_submit"
+                )
+                rec["result"] = {"refused": True, "reason": "LOCAL_LOOP control feedback"}
+                return rec
             # A HANDOFF NOBODY COLLECTED. This branch wrote for_fleet/<id>.txt, marked the job
             # "dispatched" and stopped -- and no file in relay/, bridge/, tools/, ui/ or
             # scripts/ ever read that directory. Every fleet-bound job this router has ever
@@ -1169,11 +2280,13 @@ def run_job(job, now_ts=None):
             # that was delivered leaves no file, because its done/ record already says
             # "dispatched" and names how; a goal that was not leaves one, and every drain pass
             # tries the waiting ones again while a fleet is live.
-            goal = (job.get("payload") or {}).get("goal") or (job.get("payload") or {}).get("text", "")
-            rec["status"], rec["result"] = fleet_handoff(goal, jid)
+            prio = bool(payload.get("priority"))
+            rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio)
             if rec["status"] != "dispatched":
-                with open(_p("for_fleet", "%s.txt" % jid), "w", encoding="utf-8") as f:
-                    f.write(goal)
+                # fleet_handoff already parked it on every non-dispatched path, carrying the
+                # priority with it; this second write is the belt to that braces and must
+                # carry the same field or it would overwrite the parked copy with a poorer one.
+                _write_for_fleet(jid, goal, priority=prio)
         else:  # claude
             with open(_p("for_claude", "%s.json" % jid), "w", encoding="utf-8") as f:
                 json.dump(job, f, ensure_ascii=False, indent=2)
@@ -1192,11 +2305,14 @@ def dispatch_once(now_ts=None):
     so this call always returns promptly regardless of approval-gate state."""
     ensure_dirs()
     out = []
+    alive_cache = {}                       # one liveness query per pid per pass
     for name in sorted(os.listdir(_p("pending", ""))):
         if not name.endswith(".json"):
             continue
         src = _p("pending", name)
         claimed = _p("running", name)
+        if _still_owned(src, alive_cache):
+            continue
         try:
             os.replace(src, claimed)   # atomic claim; if another router grabbed it, this raises
         except OSError:
@@ -1229,6 +2345,22 @@ def dispatch_once(now_ts=None):
         recover_failed_autostart(now=now_ts)
     except Exception:
         pass
+    # RECONCILE BEFORE DELIVERY. Turn open "dispatched" claims into confirmed landings or
+    # re-queued waiters first, so a goal that was lost to the stale-status window is back on
+    # the for_fleet/ channel in time for _deliver_waiting_goals to hand it over on this same
+    # sweep rather than the next.
+    try:
+        out.extend(_reconcile_landings(now_ts=now_ts))
+    except Exception:
+        pass
+    # OUTCOME RECONCILE. Independent of the landing pass above: landing says the fleet TOOK a
+    # goal, this says what happened to it afterwards. Runs every tick so a completion shows up
+    # in done/ within one poll interval of the ledger recording it, rather than only when
+    # someone happens to call job_status() for that particular id.
+    try:
+        out.extend(_reconcile_outcomes(now_ts=now_ts))
+    except Exception:
+        pass
     out.extend(_deliver_waiting_goals(now_ts=now_ts))
     return out
 
@@ -1241,24 +2373,62 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
     The status was the only thing waiting. Six such records had built up, each naming a goal
     that would never be delivered however long a fleet ran afterwards.
 
-    Runs on every drain pass. With no fleet in flight it does nothing and costs one status
-    read, which is the same check fleet_handoff already makes.
+    WHY THIS NO LONGER RETURNS EARLY WHEN NOTHING IS LIVE. It used to open with
+    `if not fleet_is_live(state_dir): return out` -- the function whose stated job is to
+    deliver goals that arrived while no fleet was running gave up precisely when no fleet was
+    running. That made for_fleet/ a one-way door. A goal parked here by a FRESH submission had
+    already passed through fleet_handoff and could reach autostart, but a goal parked by
+    _reconcile_landings' requeue path is written straight into the directory, so once it
+    landed here with nothing live, nothing ever looked at it again. Measured 2026-09-09: one
+    goal sat in for_fleet/ while the supervisor ran this pass every 15s for 47 minutes and
+    logged nothing at all -- silence, not an error, because dispatch_once kept returning [].
+    The guard was the very condition it existed to fix.
+
+    fleet_handoff already makes the same liveness check itself, and falls through to AUTOSTART
+    when it fails, so the guard bought nothing except the dead end.
+
+    THERE IS NO CLAIM HERE, AND WHAT MAKES THAT SAFE IS SOMEWHERE ELSE. dispatch_once takes
+    its work with an atomic rename into running/, so two routers cannot both get the same job.
+    This loop only reads the file and delivers, deleting it afterwards, so two routers running
+    together WOULD hand the same goal over twice. What prevents that is not in this module:
+    scripts/supervisor.ps1:139 holds `Global\\m365-copilot-companion-supervisor` as a
+    single-instance mutex and runs this with --once, sequentially. (The doubled backslash is
+    the docstring escaping itself -- the mutex name has one. Writing it with one made this
+    an invalid escape sequence, which tools/test_a_backslash_in_a_literal_means_what_it_says
+    caught on a commit that changed nothing but prose.)
+
+    So the exposure is a second router started BY HAND while the supervisor is up -- which is
+    a documented thing to do -- and it is written down here rather than guarded because a
+    claim needs a restore path for a delivery that fails and a recovery for one that dies
+    mid-claim. That is machinery for a case the mutex already covers, and this repository has
+    paid for machinery built ahead of the caller that needed it. An unstated dependency,
+    though, is how the console-window defect survived: everything downstream of
+    supervisor.ps1 was windowless because it started the tree with -WindowStyle Hidden, and
+    nothing said so, so each new launch site inherited safety it did not know it had.
+
+    ONE COLD HANDOFF PER PASS. Removing the guard alone would let N waiting files each attempt
+    an autostart within a single pass, and autostart_status cannot deduplicate them: a launch
+    takes seconds to become live, so every file in the same pass still reads "nothing in
+    flight". N goals would mean N fleets -- trading a stall for an amplification. So when
+    nothing is live, exactly one goal is offered per pass; if it starts a fleet, the next pass
+    finds it live and delivers the whole backlog by the normal path. AUTOSTART_BACKOFF_S stays
+    the outer bound; this only stops one pass from racing itself.
     """
     out = []
     ensure_dirs()
-    if not fleet_is_live(state_dir):
-        return out
     try:
         names = sorted(os.listdir(_p("for_fleet", "")))
     except OSError:
         return out
+    live = fleet_is_live(state_dir)
+    offered_cold = False
     for name in names:
         if not name.endswith(".txt"):
             continue
         path = _p("for_fleet", name)
         try:
             with open(path, encoding="utf-8") as fh:
-                goal = fh.read()
+                goal, parked_priority = read_for_fleet(fh.read())
         except OSError:
             continue
         jid = name[:-4]
@@ -1270,7 +2440,28 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
             except OSError:
                 pass
             continue
-        status, result = fleet_handoff(goal, jid, state_dir)
+        if is_local_loop_control_submission(goal):
+            rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
+                   "status": "refused",
+                   "result": {"refused": True,
+                              "reason": "LOCAL_LOOP control envelope is not Fleet work",
+                              "stale_waiting_residue": True},
+                   "error": "LOCAL_LOOP control envelope is not Fleet work"}
+            try:
+                with open(_p("done", "%s.delivered.json" % jid), "w", encoding="utf-8") as fh:
+                    json.dump(rec, fh, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                # Fail closed: if the audit write/removal cannot complete, leave the source in
+                # place for inspection rather than pretending it was consumed.
+                continue
+            out.append(rec)
+            continue
+        if not live:
+            if offered_cold:
+                continue                   # one cold start per pass -- see the docstring
+            offered_cold = True
+        status, result = fleet_handoff(goal, jid, state_dir, priority=parked_priority)
         if status != "dispatched":
             continue                       # still no run; leave it waiting
         # DELETED ONLY AFTER DELIVERY SUCCEEDS. Removing it first would lose the goal if the
@@ -1282,6 +2473,27 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
         rec = {"id": jid, "type": "fleet_goal", "destination": "fleet", "ts_done": now_ts,
                "status": status, "result": dict(result or {}, delivered_late=True),
                "error": None}
+        # PROVENANCE, THE SECOND TIME. run_job already rescues `origin` and `created` across
+        # the moment a job becomes a record, with the reason written beside it: "a distinction
+        # that does not reach the audit trail is not a distinction". This writer is the OTHER
+        # place a done-record is built, and it built one from scratch -- so a goal delivered
+        # late read origin=null, which says "nobody knows where this came from" about a job
+        # whose origin was on disk the whole time.
+        #
+        # Measured 2026-09-18: cli1789703602_14000_0.delivered.json carried origin=null while
+        # cli1789703602_14000_0.json, written by the earlier pass for the SAME id, carried
+        # {"via": "cli", "source": "...fleet_runner.py --goals-file ..."}.
+        #
+        # The pending file is already gone by here -- it is deleted the moment delivery
+        # succeeds, a few lines up -- so the earlier done-record is where to look.
+        try:
+            with open(_p("done", "%s.json" % jid), encoding="utf-8") as fh:
+                earlier = json.load(fh) or {}
+            for field in ("origin", "created"):
+                if earlier.get(field) and not rec.get(field):
+                    rec[field] = earlier[field]
+        except Exception:
+            pass
         try:
             with open(_p("done", "%s.delivered.json" % jid), "w", encoding="utf-8") as fh:
                 json.dump(rec, fh, ensure_ascii=False, indent=2)
@@ -1319,17 +2531,69 @@ def _recheck_awaiting(now_ts=None):
         jid = job.get("id", name[:-5] if name.endswith(".json") else name)
         job_type = job.get("type")
         payload = dict(job.get("payload") or {}, id=jid)
-        key = _job_class_key(job_type, payload)
-        token = _gate_token_for_class(key)
-        gate = _read_job_gate(token)
-        if gate is None or not gate.get("answered"):
-            continue  # still waiting -- no sleep, just move on to the next tick
-        answer = str(gate.get("answer") or "").lower().strip()
         rec = {"id": jid, "type": job_type, "destination": "local",
                "ts_done": now_ts, "status": None, "result": None, "error": None}
+        # EVERYTHING BELOW IS DERIVED FROM THE PAYLOAD, NEVER READ FROM THE FILE. awaiting/ is
+        # as writable as pending/, so a job can arrive here without job_gate() ever having
+        # seen it. The policy is therefore asked again: a payload the current mode refuses
+        # outright is refused here too, rather than being run on some other job's answer.
+        decision, why = job_gate(job_type, payload, _current_approval_mode(TASK_JOB_APPROVAL_MODE))
+        if decision == "DENY":
+            rec["status"], rec["error"] = "denied", why
+            try:
+                with open(_p("done", name), "w", encoding="utf-8") as f:
+                    json.dump(rec, f, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                pass
+            out.append(rec)
+            continue
+        if decision == "ALLOW":
+            # e.g. the operator switched to `bypass` (or `auto` cleared it) while this job
+            # sat in awaiting/ from an earlier, stricter mode. job_gate already logged the
+            # bypass decision if that's why; the only thing left is to NOT fall into the
+            # gate-lookup/-creation code below, which would raise exactly the question this
+            # mode exists to skip -- see the STUCK-unlock incident this whole file's bypass
+            # handling was written to close (gates kept arriving after bypass was chosen).
+            try:
+                fn = LOCAL_EXECUTORS.get(job_type)
+                if not fn:
+                    rec["status"], rec["error"] = "error", "no local executor for type %r" % job_type
+                else:
+                    rec["status"], rec["result"], rec["error"] = fn(payload)
+            except subprocess.TimeoutExpired:
+                rec["status"], rec["error"] = "error", "timeout after %ds" % LOCAL_TIMEOUT_S
+            except Exception as e:
+                rec["status"], rec["error"] = "error", "%s: %s" % (type(e).__name__, e)
+            try:
+                with open(_p("done", name), "w", encoding="utf-8") as f:
+                    json.dump(rec, f, ensure_ascii=False, indent=2)
+                os.remove(path)
+            except OSError:
+                pass
+            out.append(rec)
+            continue
+        class_key = _job_class_key(job_type, payload)
+        key = _gate_key(job_type, payload, _static_risk(job_type, payload)[0])
+        token = _gate_token_for_class(key)
+        gate = _read_job_gate(token)
+        if gate is None:
+            # A waiting job that no gate asks about can never be answered: it arrived here
+            # directly, or its key changed since it was parked. Ask about it now -- once, since
+            # _write_job_gate never overwrites an existing gate.
+            _write_job_gate(token, _job_gate_question(job_type, payload, key),
+                            "task_router job class: %s" % key)
+            continue
+        if not gate.get("answered"):
+            continue  # still waiting -- no sleep, just move on to the next tick
+        answer = str(gate.get("answer") or "").lower().strip()
         try:
             if answer == "approved":
-                _approve_class(key, example=json.dumps(payload, ensure_ascii=False)[:200])
+                # Record only what the gate asked about. A gate for a payload the static check
+                # flagged approved that payload, once -- not its class, and recording the exact
+                # key would change nothing (job_gate never ALLOWs a flagged payload).
+                if key == class_key:
+                    _approve_class(key, example=json.dumps(payload, ensure_ascii=False)[:200])
                 fn = LOCAL_EXECUTORS.get(job_type)
                 if not fn:
                     rec["status"], rec["error"] = "error", "no local executor for type %r" % job_type
@@ -1356,8 +2620,15 @@ def main():
     ap = argparse.ArgumentParser(description="Typed-job task router (LOCAL/FLEET/CLAUDE).")
     ap.add_argument("--once", action="store_true", help="process the pending queue once and exit")
     ap.add_argument("--poll-s", type=float, default=2.0, help="poll interval when looping")
+    ap.add_argument("--status", metavar="JID",
+                    help="print job_status() for one admitted job id and exit -- 'did this "
+                         "job finish, and how', read-only, without needing to know done/ "
+                         "records dispatch rather than completion")
     args = ap.parse_args()
     ensure_dirs()
+    if args.status:
+        print(json.dumps(job_status(args.status), ensure_ascii=False, indent=2))
+        return
     if args.once:
         recs = dispatch_once()
         print(json.dumps(recs, ensure_ascii=False))

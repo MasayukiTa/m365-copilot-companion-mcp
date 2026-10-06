@@ -56,12 +56,45 @@ KEEP_S = 7200.0
 _LOCK = threading.Lock()
 
 
+def _oldest_ts(path):
+    """The timestamp of the FIRST row, or 0.0. One line, so this cost does not grow with the
+    file -- which is the whole point of checking it on every append."""
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            line = fh.readline().strip()
+        return float(json.loads(line).get("ts") or 0.0) if line else 0.0
+    except (OSError, ValueError, AttributeError):
+        return 0.0
+
+
 def _append(row):
     try:
         with _LOCK:
             os.makedirs(os.path.dirname(METER_PATH), exist_ok=True)
             with open(METER_PATH, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+    # ENFORCE THE RETENTION THIS FILE DECLARES. `KEEP_S` says records older than two hours are
+    # dropped "when the file is rewritten", and `prune` does the rewriting -- and nothing called
+    # it. Measured on the live meter 2026-09-14: 4,845 rows spanning 12.8 DAYS, 100% of them
+    # past the window. The reason that matters is written beside KEEP_S itself: keeping more
+    # "would make the meter itself the thing that fills a disk that has already stopped a run
+    # tonight." The mitigation for a real incident was written and never wired.
+    #
+    # AND IT COSTS THE READERS TOO. `snapshot()` parses the WHOLE file to answer a question
+    # about the last minute, so an unpruned meter makes every admission check slower without
+    # bound.
+    #
+    # TRIGGERED ON THE OLDEST ROW, NOT A SIZE OR A COUNTER. A byte threshold is a number
+    # somebody invents; a counter resets with the process. "The first row is older than twice
+    # the window" is the policy restating itself, and reading one line does not get slower as
+    # the file grows. Twice rather than once so an append never rewrites a file that is merely
+    # at the edge.
+    try:
+        oldest = _oldest_ts(METER_PATH)
+        if oldest and (float(row.get("ts") or time.time()) - oldest) > 2 * KEEP_S:
+            prune()
     except Exception:
         pass
 
@@ -125,15 +158,28 @@ def snapshot(now: float = None, path: str = None) -> dict:
     rows = read(path, since=now - 3600.0)
     turns = [r for r in rows if r.get("event") == "turn"]
     refusals = [r for r in rows if r.get("event") == "refusal"]
-    rpm = sum(1 for r in turns if r["ts"] >= now - 60.0)
-    rph = len(turns)
+    # BOUNDED AT BOTH ENDS. This was `>= now - 60` alone, which is every row after that
+    # instant -- including rows AFTER `now`. With now=time.time() there are none, which is why
+    # it survived; with a past `now`, the only reason this parameter exists, it counted the
+    # whole file. Measured: snapshot(now=<first row's ts>) reported rpm 4698.
+    rpm = sum(1 for r in turns if now - 60.0 <= r["ts"] <= now)
+    rph = sum(1 for r in turns if r["ts"] <= now)
     by_kind = {}
     for r in refusals:
         if r["ts"] >= now - 300.0:
             by_kind[r.get("kind", "unknown")] = by_kind.get(r.get("kind", "unknown"), 0) + 1
+    # THE DENOMINATOR sustainable_workers NEEDS, counted rather than estimated. record_turn
+    # has written `worker` on every turn row since the meter existed, so "how many workers were
+    # spending quota in that minute" is a set size. Without it that function returns 0.0 for
+    # any snapshot, which is why it had no caller worth having.
+    workers_1m = len({(r.get("worker") or "") for r in turns
+                      if now - 60.0 <= r["ts"] <= now and r.get("worker")})
+    per_worker_rpm = (float(rpm) / workers_1m) if workers_1m else 0.0
     return {
         "rpm": rpm,
         "rph": rph,
+        "workers_1m": workers_1m,
+        "per_worker_rpm": round(per_worker_rpm, 3),
         "limit_rpm": LIMIT_RPM,
         "limit_rph": LIMIT_RPH,
         "pct_rpm": (100.0 * rpm / LIMIT_RPM) if LIMIT_RPM > 0 else 0.0,
@@ -164,7 +210,10 @@ def sustainable_workers(snap: dict, per_worker_rpm: float = None) -> float:
     is what the arithmetic says it should be. Returns 0.0 when there is nothing measured to
     divide by, because a made-up denominator is how the last estimate went wrong.
     """
-    rate = per_worker_rpm or 0.0
+    # FROM THE SNAPSHOT WHEN THE CALLER DOES NOT SAY. The argument stays, because a caller
+    # asking "what if each worker spent twice as much" is a real question -- but requiring it
+    # meant every caller had to compute a number the meter was already holding, and none did.
+    rate = per_worker_rpm if per_worker_rpm else float(snap.get("per_worker_rpm") or 0.0)
     if rate <= 0:
         return 0.0
     return round((snap.get("limit_rpm") or 0.0) * 0.7 / rate, 1)
@@ -183,3 +232,42 @@ def prune(path: str = None, now: float = None) -> int:
     except OSError:
         return 0
     return len(rows)
+
+
+def main(argv=None) -> int:
+    """`python -m relay.quota_meter` -- what the meter knows, and what it implies.
+
+    A NUMBER NOBODY PRINTS IS A NUMBER NOBODY ACTS ON. `sustainable_workers` existed for
+    fourteen days without a caller while the meter recorded 4,698 turns, and the concurrency it
+    is about stayed a number typed on a command line.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description="Copilot turn-quota meter.")
+    ap.add_argument("--per-worker-rpm", type=float, default=None,
+                    help="override the observed rate (to ask 'what if each worker spent more')")
+    args = ap.parse_args(argv)
+
+    snap = snapshot()
+    if not snap.get("measured"):
+        print("the meter has no records in the last hour")
+        return 0
+    print("turns    %d/min (%.0f%% of %g)   %d/hour (%.0f%% of %g)"
+          % (snap["rpm"], snap["pct_rpm"], snap["limit_rpm"],
+             snap["rph"], snap["pct_rph"], snap["limit_rph"]))
+    print("workers  %d active in the last minute, %.2f turns each"
+          % (snap["workers_1m"], snap["per_worker_rpm"]))
+    if snap["refusals_5m"]:
+        print("refused  %d in the last 5 min: %s"
+              % (snap["refusals_5m"],
+                 ", ".join("%s x%d" % kv for kv in sorted(snap["refusals_by_kind"].items()))))
+    n = sustainable_workers(snap, args.per_worker_rpm)
+    if n <= 0:
+        print("sustainable workers: unknown -- nothing measured to divide by")
+    else:
+        print("sustainable workers: %.1f at the observed rate (reference line x0.7)" % n)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

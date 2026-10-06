@@ -40,6 +40,31 @@ def _restore(monkeypatch):
     monkeypatch.delenv("MCP_TOOL_MAP", raising=False)
 
 
+@pytest.fixture(scope="module", autouse=True)
+def _reload_main_with_the_real_environment():
+    """Every _registered()/_gateway_orphans() call above reloads main.py, which rebinds EVERY
+    module-level name -- API_KEY, TOOLS, _ALL_TOOLS -- to whatever the synthetic env
+    (MCP_API_KEY="test-key-not-a-real-one", MCP_TOOL_MAP=...) says at that moment. monkeypatch
+    restores the environment VARIABLES after each test, but nothing re-imports the MODULE, so
+    the last reload in this file leaves `main.API_KEY` permanently equal to the synthetic key
+    for the rest of the pytest session -- including files that run hundreds of tests later,
+    like tests/test_health_route.py, whose bearer-token checks compare an incoming header
+    against `main.API_KEY` and silently got "test-key-not-a-real-one" instead of the real one
+    (CI, 2026-09-24: two of its tests failed with the full payload missing).
+
+    A function-scoped fixture depending on `monkeypatch` cannot fix this: pytest tears down a
+    fixture's dependents BEFORE the fixture itself, so a reload there runs before monkeypatch
+    restores the environment and sees this test's OWN synthetic values (tried and reverted
+    once already -- see test_tool_map_pinning.py's `_restore` docstring for the same lesson).
+    A module-scoped fixture with no such dependency is set up before any function-scoped
+    fixture here and is therefore torn down after ALL of them, once every test's monkeypatch
+    has already put the environment back -- the one moment a reload is safe.
+    """
+    yield
+    import main
+    importlib.reload(main)
+
+
 def test_execution_tools_are_not_registered_directly(monkeypatch):
     names = _registered(monkeypatch, MCP_TOOL_MAP="1")
     still_direct = EXEC & names

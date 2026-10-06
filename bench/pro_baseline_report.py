@@ -31,6 +31,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 SW = os.path.join(REPO, ".fleet", "swe")
 
 from bench import pro_ledger_report as PR   # noqa: E402
+from bench import verdicts as _V
 
 
 def wilson(k, n, z=1.96):
@@ -88,7 +89,10 @@ def main(argv=None):
     unsolvable = {}
     gold = PR.latest_rows(a.gold) if a.gold else {}
     for inst, row in gold.items():
-        if inst in rows and str(row.get("verdict") or "").upper() != "RESOLVED":
+        # THROUGH THE SHARED RULE. A literal comparison reads a boolean True as "not
+        # resolved" -- verdicts.normalise exists because "Some producers write
+        # {instance_id: bool}" -- so a gold row written that way read as unsolvable.
+        if inst in rows and not _V.is_resolved(row.get("verdict")):
             unsolvable[inst] = "gold パッチでも解決しない"
     if unsolvable:
         rows = {i: r for i, r in rows.items() if i not in unsolvable}

@@ -51,7 +51,6 @@ import hmac
 import json
 import os
 import secrets
-import socket
 import shutil
 import subprocess
 import sys
@@ -59,6 +58,8 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
+
+from relay.temp_home import temp_home as _temp_home  # scratch under the swept temp home
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -207,7 +208,7 @@ class JobAuthority:
         self.python = python or sys.executable
         # OUTSIDE the workdir, and the agent is never told the path. The episode's own
         # fixtures live in the workdir; the evidence does not.
-        self.root = tempfile.mkdtemp(prefix="cb_authority_")
+        self.root = tempfile.mkdtemp(prefix="cb_authority_", dir=_temp_home())
         self.db = os.path.join(self.root, "jobs.sqlite3")
         self.agent_token = secrets.token_hex(16)
         self.judge_token = secrets.token_hex(16)
@@ -223,7 +224,8 @@ class JobAuthority:
     def __enter__(self):
         self._proc = subprocess.Popen(
             [self.python, "-c", _server_source()],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+            encoding="utf-8", errors="replace")
         self._proc.stdin.write(json.dumps({
             "repo": REPO, "db": self.db, "agent_token": self.agent_token,
             "judge_token": self.judge_token, "secret": self._secret}) + "\n")
@@ -329,11 +331,3 @@ class JobAuthority:
             "  対象ジョブ: %s\n"
             % (self.url, self.agent_token, ", ".join(AGENT_OPERATIONS), job_id))
 
-
-def free_port() -> int:
-    """An unused loopback port. Only for tests that need to point at nothing."""
-    s = socket.socket()
-    s.bind(("127.0.0.1", 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port

@@ -8,27 +8,43 @@ from typing import Optional
 
 from .security import require_unlocked
 
+#: The explicit opt-in to every drive. The ONLY value that yields unrestricted access.
+ALLOW_EVERY_DRIVE = "*"
+
+
 def _parse_allowed_bases():
     """Scope for the file tools, from MCP_ALLOWED_BASE.
 
-    Policy is DEFAULT-OPEN, OPT-OUT:
-      * unset / empty / '*'  -> None  == unrestricted (all drives/paths allowed).
+    Policy is FAIL-CLOSED, OPT-IN (changed 2026-09-24, D6 of the new-PC install review):
+      * unset / empty        -> [home dir]  -- the same scope .env.example ships (`~`).
+      * '*'                  -> None == unrestricted (all drives). Deliberate opt-in only.
       * otherwise a list of allowed roots separated by the OS path separator
         (';' on Windows). Roots may be whole drives ('C:' / 'D:' -> the drive
         root) or specific folders ('~', 'D:/data'). A path is allowed if it sits
         under ANY listed root.
 
+    WHY ABSENT NO LONGER MEANS "EVERYTHING". An absent key is not a decision. It is what a
+    .env looks like when configure_env.ps1 created it before bootstrap ran (start_all's
+    first-time dialog does exactly that on a machine where start_all is clicked before
+    quickstart), and bootstrap's backfill then never added the template's `MCP_ALLOWED_BASE=~`
+    -- so an install the operator believed was scoped to their home directory handed every
+    drive to anyone holding the Bearer token. A missing line must not widen access; only
+    someone who writes `*` gets every drive. An existing install that relied on the old
+    default keeps it by adding `MCP_ALLOWED_BASE=*` to .env.
+
     Examples:
-      MCP_ALLOWED_BASE=            -> all drives (default)
-      MCP_ALLOWED_BASE=*           -> all drives
+      MCP_ALLOWED_BASE=            -> home dir only (default)
+      MCP_ALLOWED_BASE=*           -> all drives (explicit opt-in)
       MCP_ALLOWED_BASE=C:/;D:/     -> only the C: and D: drives
       MCP_ALLOWED_BASE=~;D:/data   -> home dir + one folder
 
     Returns a list of resolved roots, or None for unrestricted.
     """
     raw = os.environ.get("MCP_ALLOWED_BASE", "").strip()
-    if not raw or raw == "*":
+    if raw == ALLOW_EVERY_DRIVE:
         return None
+    if not raw:
+        return [Path("~").expanduser().resolve()]
     bases = []
     for part in raw.split(os.pathsep):
         part = part.strip().strip('"')
@@ -41,10 +57,12 @@ def _parse_allowed_bases():
             bases.append(Path(part).expanduser().resolve())
         except Exception:
             continue
-    return bases or None
+    # A value that names no usable root (";", a path that will not resolve) is a mistake, not
+    # a request for every drive -- the same fail-closed reading as an absent key.
+    return bases or [Path("~").expanduser().resolve()]
 
 
-ALLOWED_BASES = _parse_allowed_bases()  # None => unrestricted (all drives)
+ALLOWED_BASES = _parse_allowed_bases()  # None => unrestricted, only via MCP_ALLOWED_BASE=*
 # Canonical base for sibling modules' state (gate_ops, runlog_ops, trace_ops): the
 # first restricted root, else the home dir. State never lands on an external drive.
 ALLOWED_BASE = ALLOWED_BASES[0] if ALLOWED_BASES else Path("~").expanduser().resolve()
@@ -99,7 +117,7 @@ def _validate_path(path: str) -> Path:
     # other callers.
     _refuse_security_state(p, path)
     if not bases:
-        return p  # unrestricted (default-open policy)
+        return p  # unrestricted: only reachable through MCP_ALLOWED_BASE=* (explicit opt-in)
     for base in bases:
         try:
             p.relative_to(base)
@@ -116,6 +134,12 @@ _SECURITY_STATE_NAMES = frozenset({
     ".unlock_state.json",
     "unlock_token_gap.json",
     "lock_state.json",
+    # The unlock table's companions (tools/security.py, SEC-03). Writing {} over the revocation
+    # ledger would un-revoke every grant a stale copy still carries; the generation mark and the
+    # lock file are the ordering and the mutual exclusion that ledger relies on.
+    "unlock_revocations.json",
+    "unlock_generation.json",
+    "unlock_state.lock",
     # THE CREDENTIALS FILE ITSELF. This list already refused the table of authorised
     # identities while leaving the API key readable in plain text one directory up, so a
     # caller could simply read the key and then be the operator.
@@ -151,8 +175,59 @@ _SECURITY_STATE_NAMES = frozenset({
 _SECURITY_STATE_DIRS = ("companion_runs", ".companion_runs", ".companion_gates")
 
 
+#: THE FLEET'S CONTROL CHANNEL (SEC-08). A file dropped into <fleet state>/commands.d/ is a
+#: command the running fleet obeys: close or add workers, change the admission floors, steer
+#: a conversation, or have the unlock password delivered into a worker's next turn. Handing
+#: that directory to write_file would let a worker reconfigure and redirect the fleet it runs
+#: in. acks/ holds the landing receipts task_router trusts as proof a goal was taken, and
+#: commands.json is the legacy single-file channel the fleet still reads.
+#:
+#: NARROWED, NOT CLOSED -- the same honest posture as .companion_gates above: run_python and
+#: shell_exec write files without passing through this module. An HMAC on each command would
+#: not change that either, since its key would have to sit where this same account (and so
+#: run_python) can read it; removing the file tools as the cheap route is what is available.
+_FLEET_CHANNEL_DIRS = ("commands.d", "acks")
+_FLEET_CHANNEL_FILES = ("commands.json",)
+
+
+def _fleet_state_roots():
+    roots = [Path(__file__).resolve().parent.parent / ".fleet"]
+    env = (os.environ.get("FLEET_STATE_DIR") or "").strip()
+    if env:
+        try:
+            roots.append(Path(env).expanduser().resolve())
+        except Exception:
+            pass
+    return roots
+
+
+def _is_fleet_channel(resolved: Path) -> bool:
+    low = [q.lower() for q in resolved.parts]
+    # Any `.fleet/commands.d` (or acks/, commands.json), wherever the checkout is ...
+    for i in range(len(low) - 1):
+        if low[i] == ".fleet" and (low[i + 1] in _FLEET_CHANNEL_DIRS
+                                   or (i + 2 == len(low) and low[i + 1] in _FLEET_CHANNEL_FILES)):
+            return True
+    # ... and the configured state dir by its own path, whatever it is called.
+    target = os.path.normcase(str(resolved))
+    for root in _fleet_state_roots():
+        base = os.path.normcase(str(root))
+        for d in _FLEET_CHANNEL_DIRS:
+            sub = os.path.join(base, os.path.normcase(d))
+            if target == sub or target.startswith(sub + os.sep):
+                return True
+        for f in _FLEET_CHANNEL_FILES:
+            if target == os.path.join(base, os.path.normcase(f)):
+                return True
+    return False
+
+
 def _refuse_security_state(resolved: Path, requested: str) -> None:
     """Raise if `resolved` is the server's own authorisation or audit state."""
+    if _is_fleet_channel(resolved):
+        raise PermissionError(
+            "Refusing to touch the fleet's command channel (%s). A file there is an order the "
+            "running fleet obeys; use fleet_submit to hand the fleet a goal." % requested)
     if resolved.name in _SECURITY_STATE_NAMES:
         raise PermissionError(
             "Refusing to touch the server's own authorisation state (%s). This file records "
@@ -179,6 +254,17 @@ def _under(child: Path, parent: Path) -> bool:
         return False
 
 
+#: Hard ceiling on how many bytes of *content* (not counting the "N: " line-number prefixes)
+#: read_file will ever hand back, whatever start_line/max_lines asked for. OPS-17: the old
+#: implementation did `p.read_text().splitlines()` and only sliced afterwards, so max_lines=1
+#: against a multi-GB file still decoded and held the entire file in memory before throwing
+#: away everything but one line. This cap is the second half of the fix -- streaming (below)
+#: fixes the case a caller bounded correctly; this fixes the case nobody bounded at all
+#: (max_lines=None, or max_lines larger than the file), which would otherwise still try to
+#: return the whole file as one giant string.
+READ_FILE_MAX_OUTPUT_BYTES = 2_000_000  # ~2 MB of text
+
+
 def read_file(
     path: str,
     encoding: str = "utf-8",
@@ -192,6 +278,12 @@ def read_file(
         encoding: Text encoding.
         start_line: 1-based line number to start reading from.
         max_lines: Optional maximum number of lines to return.
+
+    Streams the file line-by-line rather than loading it whole: only the requested
+    line range (plus whatever falls under READ_FILE_MAX_OUTPUT_BYTES) is ever held in
+    memory, so a huge file with a small max_lines does not blow up peak memory (OPS-17).
+    Output is also hard-capped in bytes regardless of max_lines, so an unbounded read of
+    a huge file returns a clearly-marked partial result instead of everything at once.
     """
     try:
         p = _validate_path(path)
@@ -201,11 +293,33 @@ def read_file(
                 "Hint: to locate a file by name anywhere under a root, use "
                 "find_files(name_contains=..., path=...)."
             )
-        lines = p.read_text(encoding=encoding).splitlines()
+        # Stat before opening: settles "is this even a regular file" and gives the size
+        # used in the truncation note below, without decoding a single byte of content.
+        size = p.stat().st_size
         start = max(start_line - 1, 0)
         end = None if max_lines is None else start + max_lines
-        selected = lines[start:end]
-        return "\n".join(f"{idx}: {line}" for idx, line in enumerate(selected, start + 1))
+        selected: list[str] = []
+        content_bytes = 0
+        hit_cap = False
+        with p.open("r", encoding=encoding) as f:
+            for idx, raw_line in enumerate(f):
+                if idx < start:
+                    continue
+                if end is not None and idx >= end:
+                    break
+                line = raw_line.rstrip("\r\n")
+                content_bytes += len(line.encode(encoding, errors="replace")) + 1
+                if content_bytes > READ_FILE_MAX_OUTPUT_BYTES:
+                    hit_cap = True
+                    break
+                selected.append(f"{idx + 1}: {line}")
+        out = "\n".join(selected)
+        if hit_cap:
+            out += (
+                f"\n[read_file: truncated at {READ_FILE_MAX_OUTPUT_BYTES:,} bytes "
+                f"(file is {size:,} bytes); use start_line/max_lines to read further]"
+            )
+        return out
     except Exception as e:
         return f"[read_file error: {type(e).__name__}: {e}]"
 

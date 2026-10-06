@@ -1,4 +1,16 @@
+import os
+
+import pytest
+
 from scripts import bootstrap
+
+# WINDOWS-ONLY, AND RUN ON THE WINDOWS JOB INSTEAD. Every test here calls step_gen_env, which
+# protects the generated secrets with tools.secret_store.protect_secret -- DPAPI, which raises
+# "DPAPI protection is only available on Windows" on the ubuntu runner. These were red there
+# for that reason alone, not for anything they assert. A bare skip would have retired the
+# coverage silently, so ci.yml's windows-install-smoke job now runs this file.
+pytestmark = pytest.mark.skipif(
+    os.name != "nt", reason="step_gen_env protects secrets with DPAPI, which is Windows-only")
 
 
 def test_existing_env_gets_default_off_once(tmp_path, monkeypatch):
@@ -17,7 +29,10 @@ def test_existing_env_gets_default_off_once(tmp_path, monkeypatch):
     assert text.count("MCP_LOCAL_REVIEW_MAX_CONCURRENT=2") == 1
     assert text.count("MCP_LOCAL_ROTATE_AFTER_TURNS=3") == 1
     assert text.count("MCP_LOCAL_EDGE_MB_LIMIT=1400") == 1
-    assert "MCP_API_KEY=secret" in text
+    from tools.secret_store import unprotect_secret
+    blob = [ln.split("=", 1)[1] for ln in text.splitlines() if ln.startswith("MCP_API_KEY_PROTECTED=")][0]
+    assert unprotect_secret(blob) == "secret"
+    assert "MCP_API_KEY=secret" not in text
 
 
 def test_existing_explicit_on_is_never_overwritten(tmp_path, monkeypatch):

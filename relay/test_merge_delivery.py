@@ -166,8 +166,23 @@ def test_gaps_become_acceptance_checks():
             {"subtask_index": 4, "outcome": "STUCK"}]
     assert missing_slices(recs) == [2, 4]
     checks = merge_acceptance_checks(recs)
-    assert len(checks) == 1
-    assert "2, 4" in checks[0], "検査条件が欠落番号を名指ししていない: %r" % checks
+
+    # 検査は**dict**でなければならない。以前は素の文字列で、`normalize_checks` が
+    # 「dict 以外は黙って捨てる」ため、ワーカーに届く時点で [] になっていた。
+    # 計測(2026-09-13): aggregation_goal は文字列を載せ、goal_fields は [] を返した。
+    # その結果ワーカーは `if not self.checks` 分岐（検査なし=DONEをそのまま信用）に入り、
+    # 欠落を隠した統合を止める唯一のゲートが一度も走っていなかった。
+    assert all(isinstance(c, dict) for c in checks), "文字列は normalize_checks に捨てられる"
+    assert all(c.get("type") == "reply_contains" for c in checks)
+
+    named = [c for c in checks if c.get("all_of")]
+    assert named and named[0]["all_of"] == ["2", "4"], (
+        "検査条件が欠落番号を名指ししていない: %r" % checks)
+
+    # 記録された失敗は「書かなかった」ではなく「**間違って書いた**」 --
+    # 欠落があるのに「欠落なし」と書いた統合が2件。肯定形の検査では捕まらない。
+    forbidden = [c for c in checks if c.get("expect") is False]
+    assert forbidden and forbidden[0]["needle"] == "欠落なし"
 
 
 def test_a_complete_sweep_has_nothing_to_check():
@@ -233,9 +248,13 @@ def test_a_merged_campaign_stops_retrying_its_failed_merges():
     with io.open(os.path.join(root, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
         src = fh.read()
     code = "\n".join(l for l in src.splitlines() if not l.strip().startswith("#"))
-    i = code.index("RETRYABLE_OUTCOMES:")
+    # ANCHORED ON THE GUARD ITSELF, not on a neighbouring line. This used to find
+    # `RETRYABLE_OUTCOMES:` and read 900 characters forward -- and that line disappeared the
+    # day the retry decision started going through `outcomes.is_retryable`, so the test broke
+    # on a change that did not touch what it checks. A source assertion should point at the
+    # thing it is about.
+    i = code.index('role", "") == "aggregator"')
     blk = code[i:i + 900]
-    assert 'role", "") == "aggregator"' in blk, "統合かどうかを見ていない"
     assert '(x.outcome or "") == "DONE"' in blk, "家族に成功した統合があるかを見ていない"
     assert "already merged" in src, "止めた理由を記録していない"
 
@@ -249,9 +268,9 @@ def test_a_failed_child_is_still_retried():
     with io.open(os.path.join(root, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
         code = "\n".join(l for l in fh.read().splitlines()
                          if not l.strip().startswith("#"))
-    i = code.index("RETRYABLE_OUTCOMES:")
-    blk = code[i:i + 900]
+    # 再試行の判定行からではなく、ガードそのものからたどる（上の注記と同じ理由）。
+    guard = code.index('role", "") == "aggregator"')
+    done = code.index('(x.outcome or "") == "DONE"', guard)
+    assert done - guard < 900, "DONE 判定が aggregator ガードから離れすぎている"
     # aggregator ガードは role 判定の内側にあること(外に出ると全ワーカーに効く)
-    guard = blk.index('role", "") == "aggregator"')
-    done = blk.index('(x.outcome or "") == "DONE"')
     assert guard < done, "統合以外にも DONE 判定が効いている"

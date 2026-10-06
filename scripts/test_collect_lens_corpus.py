@@ -112,14 +112,24 @@ def test_the_reason_is_kept_so_a_silent_lens_can_be_told_from_an_unsure_one():
     assert "verdict, _reason = got" not in src, "reason を捨てると診断が消える"
 
 
-def test_an_all_silent_panel_becomes_a_skip_not_a_row():
+def test_a_verdict_that_is_not_unclear_survives_the_flattening():
+    """**この関数は名前が古い設計のまま残っていた。** 元は
+    `test_an_all_silent_panel_becomes_a_skip_not_a_row` — 全員が黙った盤は捨てる、という
+    主張で、**すぐ下の `test_a_candidate_every_lens_found_unclear_is_kept` が正反対を言う。**
+    本体は述語 `all_unclear` しか触っていなかったので、判断のほうが逆になっても緑のまま
+    だった: 名前が設計を主張し、本体は主張していなかった。
+
+    **`all_unclear` 自体もその後消した。** 最後の production の消費者は calibrate 側の
+    skip 判断で、それは `harness_faults` を使う規則に揃えた。残っていた参照はこの述語を
+    説明するテストだけ — テストしか使わない述語を「テストのために残す」のは、この
+    リポジトリが何度も外してきた正当化の形。残すべき断言は下の `harness_faults` 側にある。
+
+    ここに残すのは flattening の性質だけ: UNCLEAR でない評決が潰れないこと。"""
     detail = {"correctness": {"verdict": "UNCLEAR", "reason": ""},
-              "edge": {"verdict": "UNCLEAR", "reason": ""},
+              "edge": {"verdict": "UPHELD", "reason": ""},
               "security": {"verdict": "UNCLEAR", "reason": ""}}
-    assert CL.all_unclear(detail)
-    detail["edge"]["verdict"] = "UPHELD"
-    assert not CL.all_unclear(detail)
-    assert CL.verdicts_only(detail)["edge"] == "UPHELD"
+    assert CL.verdicts_only(detail) == {"correctness": "UNCLEAR", "edge": "UPHELD",
+                                        "security": "UNCLEAR"}
 
 
 # ---- 穴と、答えとしての UNCLEAR は別物 ------------------------------------------------------------
@@ -130,7 +140,7 @@ def test_a_candidate_every_lens_found_unclear_is_kept():
     detail = {ln: {"verdict": "UNCLEAR", "elapsed_s": 200.0,
                    "reason": "the nudge budget ran out without a parseable verdict"}
               for ln in ("correctness", "edge", "security")}
-    assert CL.all_unclear(detail)
+    assert all(d["verdict"] == "UNCLEAR" for d in detail.values())
     assert CL.harness_faults(detail) == [], "レビュアの答えを障害として扱っている"
     assert CL.timed_out_lenses(detail) == []
 
@@ -192,14 +202,27 @@ def test_the_retry_count_is_recorded():
     assert '"attempts": attempt + 1' in src
 
 
+def _collect_body():
+    """`collect` の本体だけ。**次の top-level `def` までで切る。**
+
+    以前は `src.index("def load_corpus(")` を終端にしていた — つまり、たまたま次に
+    置かれている無関係な関数の名前に2つのテストが依存していた。その `load_corpus` は
+    呼出元のない写し（`analyze_lens_corpus.load` と同一）で、消そうとした瞬間に
+    このテストが壊れた。**検査が、検査対象と関係のないものに固定されていた。**
+    """
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    start = src.index("def collect(")
+    nxt = src.find(chr(10) + "def ", start)
+    return src[start:nxt if nxt != -1 else len(src)]
+
+
 def test_the_workdir_outlives_the_lens_run():
     """実測(2026-08-20)でレビュアが逐語でこう答えた:
     「invoice.txt と total.txt が実在せず、報告された計算は事実として確認できない」。
     採点直後に workdir を消し、その12行あとでレンズに検証を頼んでいた。
     誠実なレビュアの正解は常に INCONCLUSIVE になり、語彙がそれを UNCLEAR に丸め、
     全政策が同点のコーパスができる。パネルを死体の上で回していた。"""
-    src = Path(CL.__file__).read_text(encoding="utf-8")
-    body = src[src.index("def collect("):src.index("def load_corpus(")]
+    body = _collect_body()
     first_lens = body.index("run_lenses(cdp_url")
     first_rm = body.index("shutil.rmtree(workdir")
     assert first_lens < first_rm, "レンズより前に workdir を消している"
@@ -208,7 +231,56 @@ def test_the_workdir_outlives_the_lens_run():
 def test_every_exit_from_a_candidate_releases_its_workdir():
     """本体には continue が複数ある。末尾に片付けを置くと、
     スキップのたびに workdir が残る。"""
-    src = Path(CL.__file__).read_text(encoding="utf-8")
-    body = src[src.index("def collect("):src.index("def load_corpus(")]
+    body = _collect_body()
     i = body.index("shutil.rmtree(workdir")
     assert "finally:" in body[:i], "finally を通らない片付けになっている"
+
+
+# ---- 同じ判断が3箇所にあり、1箇所だけ古い規則のままだった ----------------------------------------
+
+def test_no_site_throws_a_row_away_merely_because_every_lens_was_unsure():
+    """**`harness_faults` が止めるために書かれたことが、3箇所のうち1箇所でまだ起きていた。**
+
+    その docstring は明示している: 「全レンズが UNCLEAR の候補はデータであり、以前の版は
+    それを捨てていた。3本とも聞かれて誰も評決を出せなかったなら、それは候補の性質で、
+    どの方策も同じ点になるのが正しい。点をつけられないのは**聞かれなかった**レンズのほう」。
+
+    それでも calibrate 側の分岐は `timed_out_lenses(detail) or all_unclear(detail)` で
+    「incomplete panel」として捨てていた。**盤が不完全なのはレンズを聞けなかったときで、
+    レンズが「判断できない」と答えたときではない。** 他の2箇所は sessions が理由を書く
+    ようになった時点でこれを区別できるようになっており、ここだけ取り残されていた。
+
+    実行テストにはできない（CDP とブラウザが要る）ので、判断の形をソースで押さえる。
+    このファイルは既に同じ手を使っている（`test_the_reason_is_kept_...`）。
+    """
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    assert "or all_unclear(detail)" not in src, \
+        "a row is being skipped because every lens was unsure, not because one was unasked"
+    # 3箇所すべてが同じ規則を使っている
+    assert src.count(
+        "starved = sorted(set(timed_out_lenses(detail)) | set(harness_faults(detail)))") == 3, \
+        "the three keep/discard sites no longer make the same decision the same way"
+
+
+def test_the_skip_reason_names_the_lens_that_could_not_be_asked():
+    """「incomplete panel」は、どのレンズがなぜ落ちたのかを読み手から隠す。
+    他の2箇所は最初から名前を書いていた。"""
+    src = Path(CL.__file__).read_text(encoding="utf-8")
+    assert '"why": "incomplete panel"' not in src
+    assert src.count('"why": "lens(es) could not be asked: %s" % starved') == 2
+
+
+def test_neither_retired_predicate_is_still_around():
+    """**撤去であって、配線し忘れではない。** その docstring は「以前は捨てられていた:
+    語彙に INCONCLUSIVE が無く UNCLEAR に丸められ、`all_unclear` が不完全な盤として
+    行を捨てていた」と、既に直った欠陥を説明していた。語彙には INCONCLUSIVE があり、
+    捨てる判断は `harness_faults` が答える。
+
+    **満たされ済みの目的を述べる述語を残すと、守りがそこに在ると読まれる。** 実際には
+    別の場所にある。`bridge/session_store.py::latest_attached` を「配線されていない関数」
+    として残さず消したのと同じ判断。"""
+    assert not hasattr(CL, "all_inconclusive")
+    # `all_unclear` went the same way and for a sharper reason: after the calibrate site was
+    # brought in line with its two siblings it had NO production consumer at all, and the only
+    # references left were tests describing the predicate itself.
+    assert not hasattr(CL, "all_unclear")

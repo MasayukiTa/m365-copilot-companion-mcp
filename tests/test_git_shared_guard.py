@@ -9,15 +9,24 @@
 契約が INERT(既定)のときは素通りする -- それを実リポジトリで動かして示す。
 """
 import os
-import subprocess
 import pytest
 
 from tools import coding_ops as C
 
 
 def _git(cwd, *args):
-    subprocess.run(["git", *args], cwd=str(cwd), check=True,
-                   capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    _run_child(["git", *args], cwd=str(cwd), check=True)
+
+
+def _staged(cwd):
+    from tools.childproc import run as _run_child
+    return _run_child(["git", "diff", "--cached", "--name-only"], cwd=str(cwd)).stdout
+
+
+def _head(cwd):
+    from tools.childproc import run as _run_child
+    return _run_child(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd=str(cwd)).stdout.strip()
 
 
 @pytest.fixture(autouse=True)
@@ -67,8 +76,7 @@ def test_git_add_refuses_dash_A(shared_repo):
     out = C.git_add(["-A"], repo_path=str(shared_repo))
     assert "refused" in out
     # 何もステージされていないこと
-    staged = subprocess.run(["git", "diff", "--cached", "--name-only"],
-                            cwd=str(shared_repo), capture_output=True, text=True).stdout
+    staged = _staged(shared_repo)
     assert staged.strip() == ""
 
 
@@ -82,8 +90,7 @@ def test_git_add_allows_explicit_paths(shared_repo):
     (shared_repo / "b.txt").write_text("two\n", encoding="utf-8")
     out = C.git_add(["b.txt"], repo_path=str(shared_repo))
     assert "refused" not in out
-    staged = subprocess.run(["git", "diff", "--cached", "--name-only"],
-                            cwd=str(shared_repo), capture_output=True, text=True).stdout
+    staged = _staged(shared_repo)
     assert "b.txt" in staged
 
 
@@ -93,16 +100,14 @@ def test_git_checkout_switch_refused_in_shared_tree(shared_repo):
     _git(shared_repo, "branch", "other")
     out = C.git_checkout("other", repo_path=str(shared_repo), create=False)
     assert "refused" in out
-    cur = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                         cwd=str(shared_repo), capture_output=True, text=True).stdout.strip()
+    cur = _head(shared_repo)
     assert cur == "main"  # 切り替わっていない
 
 
 def test_git_checkout_create_allowed_in_shared_tree(shared_repo):
     out = C.git_checkout("fresh", repo_path=str(shared_repo), create=True)
     assert "refused" not in out
-    cur = subprocess.run(["git", "rev-parse", "--abbrev-ref", "HEAD"],
-                         cwd=str(shared_repo), capture_output=True, text=True).stdout.strip()
+    cur = _head(shared_repo)
     assert cur == "fresh"
 
 

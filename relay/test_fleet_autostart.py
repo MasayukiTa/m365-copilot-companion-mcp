@@ -92,33 +92,71 @@ def test_a_second_goal_while_the_first_is_still_coming_up_does_not_start_another
     assert "coming up" in why
 
 
-@pytest.fixture
-def autoack(monkeypatch):
-    """Stamp each goal's ack the instant it is written, standing in for a fleet that drained it.
-
-    Same purpose as the fixture of the same name in test_fleet_handoff, reused here: fleet_handoff
-    now waits for the receiver's stamp before reporting a goal delivered, and no fleet drains in
-    these unit tests. Wrapping the real writer to stamp through the runner's real _stamp_acks lets
-    a live-looking handoff reach 'dispatched' without a 30-second wait.
-    """
-    from relay.test_fleet_handoff import _stamp_pending_acks
-    real = TR.add_goal_to_live_fleet
-
-    def wrapper(goal, state_dir=None, priority=False, entry=None):
-        ack = real(goal, state_dir=state_dir, priority=priority, entry=entry)
-        _stamp_pending_acks(state_dir or TR.FLEET_STATE_DIR)
-        return ack
-
-    monkeypatch.setattr(TR, "add_goal_to_live_fleet", wrapper)
-    return wrapper
-
-
-def test_once_the_run_is_live_autostart_has_nothing_to_do(state, autoack):
+def test_once_the_run_is_live_autostart_has_nothing_to_do(state):
     """fleet_handoff never reaches autostart while a run is live -- the goal joins it instead."""
     _live(state)
     status, result = TR.fleet_handoff("join the running one", "j1", str(state))
     assert status == "dispatched"
     assert result["delivered"] == "add_goal"
+
+
+# -- a stale status.json is not proof the process died --------------------------------------
+#
+# 2026-09-25 OWNER: two `relay.fleet_runner` processes ran at once, each with its own Edge
+# window. `fleet_is_live` read status.json's mtime alone: fleet_runner.on_tick writes it inside
+# `except Exception: pass`, so a write that fails (a losing PermissionError race against the
+# cockpit's own reader, or a starved disk under a heavy run) is swallowed and the mtime simply
+# stops advancing even though the sweep loop -- and the browser, and every worker -- is still
+# alive. Once the file is older than FLEET_LIVE_MAX_AGE_S, the OLD fleet_is_live said "not
+# live" and a second fleet_runner was launched on top of the first. The fix adds a fallback:
+# when status.json is stale or unreadable, check the pid fleet_runner recorded once at startup
+# in fleet_run_active.json (ACTIVE_MARKER) -- if that process is still running, join it.
+
+def _write_active_marker(sd, pid):
+    with io.open(os.path.join(str(sd), "fleet_run_active.json"), "w", encoding="utf-8") as fh:
+        json.dump({"pid": pid, "start_ts": time.time(), "argv": [], "resume_argv": []}, fh)
+
+
+def test_a_stale_status_json_with_a_dead_marker_process_is_not_live(state, monkeypatch):
+    """The ordinary case this project already relied on: status.json goes stale because the
+    process actually died. No active-run marker at all -> still correctly "not live"."""
+    _live(state)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    assert TR.fleet_is_live(str(state)) is False
+
+
+def test_a_stale_status_json_with_a_live_marker_process_is_still_live(state, monkeypatch):
+    """THE 2026-09-25 CASE. status.json is stale (its own write kept failing), but the pid
+    fleet_runner recorded at startup is still running -- must be read as live, or autostart
+    launches a second fleet_runner on top of the first, exactly as happened in production."""
+    _live(state)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    _write_active_marker(state, pid=9999)
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: pid == 9999)
+    assert TR.fleet_is_live(str(state)) is True
+    # and the practical consequence: autostart must refuse to launch a second runner
+    may, why = TR.autostart_status(str(state))
+    assert may is False, why
+
+
+def test_a_missing_status_json_with_a_live_marker_process_is_still_live(state, monkeypatch):
+    """Same fallback, no status.json at all (e.g. deleted, or never written yet this run)."""
+    _write_active_marker(state, pid=7777)
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: pid == 7777)
+    assert TR.fleet_is_live(str(state)) is True
+
+
+def test_a_stale_status_json_with_the_markers_process_gone_is_not_live(state, monkeypatch):
+    """The marker exists but its pid is gone (a clean-exit marker that was never cleared, or a
+    crash before cleanup) -- must not be read as live forever."""
+    _live(state)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    _write_active_marker(state, pid=1234)
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    assert TR.fleet_is_live(str(state)) is False
 
 
 # -- and it does not spin ----------------------------------------------------------------------
@@ -224,7 +262,7 @@ def test_a_launch_that_raises_is_recorded_and_not_reported_as_started(state):
     assert TR._read_autostart(str(state))["outcome"] == "launch_failed"
 
 
-def test_the_handoff_says_which_way_the_goal_went(state, autoack):
+def test_the_handoff_says_which_way_the_goal_went(state):
     """dispatched-by-autostart and dispatched-by-add_goal are different events, and the record
     is the only place the difference survives."""
     TR.autostart_fleet([{"text": "seed"}], str(state), now=1.0, launcher=_Launcher())
@@ -480,27 +518,45 @@ class _FakeProc:
     pid = 4242
 
 
-def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state):
-    """A GOAL FROM A PHONE IS NOT A BENCH EVAL.
+def test_a_tunnel_goal_is_not_gated_behind_the_bench_disk_floor(state, monkeypatch):
+    """A GOAL FROM A PHONE IS NOT A BENCH EVAL -- BUT IT IS NOT WEIGHTLESS EITHER.
 
-    The floor protects against SWE-bench Docker builds -- five concurrent ones once filled C:
-    and corrupted WSL. Autostart passed no --disk-floor-gb, so a tunnel goal inherited that
-    bench reserve, and below the floor the run admits NOTHING: every sweep refuses, breaks and
-    defers, with no timeout. The reason is printed once a minute into the coordinator's log,
-    which is exactly where the person holding the phone cannot look -- and they have already
-    been told the goal is queued and will be picked up.
+    The bench floor protects against SWE-bench Docker builds; five concurrent ones once filled
+    C: and corrupted WSL. Autostart passed no --disk-floor-gb, so a tunnel goal inherited that
+    multi-gigabyte reserve, and below it the run admits NOTHING: every sweep refuses, breaks and
+    defers, with no timeout, while the submitter has been told the goal is queued.
 
-    An ordinary goal writes kilobytes. Both relay_fleet.disk_admission_ok and --disk-floor-gb
-    already say "0 = disable the disk gate (normal, non-bench use)"; this only passes it.
+    THIS TEST USED TO PIN THE FLOOR AT EXACTLY "0", on the stated grounds that "an ordinary goal
+    writes kilobytes". Measured 2026-09-14, that premise is false: an ordinary goal told to back
+    a folder up before editing it wrote a 5.43 GB archive, and with the gate disabled the fleet
+    kept admitting while C: drained to zero bytes -- taking git, the fleet's own writes and a
+    business folder's backups down together.
+
+    So what is asserted now is the thing that was actually right about the original decision --
+    a tunnel goal must not inherit the BENCH reserve -- without the part that turned out to be a
+    hole. The silence that made a floor unusable is fixed separately, in `_note_disk_defer`,
+    which now reports a lasting block outward instead of only into the coordinator's log.
     """
+    # NOTHING CHOSEN IN THE COCKPIT, which is the case this flag exists for. When the operator
+    # HAS chosen, the flag must not be passed at all -- it beats settings.txt in fleet_runner's
+    # resolution chain, so passing it would override the number the settings panel is showing.
+    # That is asserted separately in test_the_panel_shows_the_floor_the_run_uses.py; without
+    # pinning it here, this test read whatever the machine happened to be configured with.
+    monkeypatch.setattr(TR, "_operator_set_a_disk_floor", lambda: False)
     launcher = _Launcher()
     plan = TR.autostart_fleet([{"text": "anything", "priority": False}], str(state),
                               launcher=launcher)
     assert plan["ok"] is True, plan
     cmd = launcher.calls[0]
     assert "--disk-floor-gb" in cmd, "the disk gate was left at the bench default: %s" % cmd
-    assert cmd[cmd.index("--disk-floor-gb") + 1] == "0", (
-        "a tunnel goal is still gated on free space: %s" % cmd)
+    floor = float(cmd[cmd.index("--disk-floor-gb") + 1])
+    assert floor > 0, (
+        "the disk gate is disabled outright; C: reached zero bytes this way on 2026-09-14: %s"
+        % cmd)
+    from relay.relay_fleet import DEFAULT_DISK_FLOOR_GB
+    assert floor < DEFAULT_DISK_FLOOR_GB, (
+        "a tunnel goal is gated behind the bench reserve (%.1f GB): %s"
+        % (DEFAULT_DISK_FLOOR_GB, cmd))
 
 
 def test_the_goal_still_reaches_the_launch_alongside_the_floor_flag(state):
@@ -511,6 +567,28 @@ def test_the_goal_still_reaches_the_launch_alongside_the_floor_flag(state):
     assert "--goals-file" in cmd and cmd[cmd.index("--goals-file") + 1].endswith(".jsonl")
     assert "--state-dir" in cmd
 
+
+
+def test_the_pid_probe_is_windowless(monkeypatch):
+    """task_router runs unattended; its tasklist probe must not allocate a console window."""
+    import subprocess as sp
+    if os.name != "nt":
+        pytest.skip("console creation flags exist only on Windows")
+    seen = {}
+
+    class Result:
+        stdout = "12345 image.exe"
+
+    def fake_run(argv, **kwargs):
+        seen["argv"] = list(argv)
+        seen["kwargs"] = dict(kwargs)
+        return Result()
+
+    monkeypatch.setattr(TR.subprocess, "run", fake_run)
+    assert TR._pid_alive(12345) is True
+    flags = int(seen["kwargs"].get("creationflags", 0))
+    assert flags & sp.CREATE_NO_WINDOW, (
+        "the tasklist liveness probe can allocate a visible console: %r" % seen["kwargs"])
 
 def test_the_launch_asks_for_no_console_window():
     """A GOAL FROM A PHONE MUST NOT PUT A BLACK WINDOW ON THE DESKTOP.
@@ -532,9 +610,12 @@ def test_the_launch_asks_for_no_console_window():
     if os.name != "nt":
         pytest.skip("console creation flags exist only on Windows")
     flags = TR.launch_creationflags()
+    from tools import childproc
+    assert flags == childproc.headless_creationflags(), (
+        "fleet launch drifted from the repository-wide windowless policy: %r" % flags)
     assert flags & sp.CREATE_NO_WINDOW, (
         "the launch does not ask for a windowless console: %r" % flags)
     assert not (flags & sp.DETACHED_PROCESS), (
         "DETACHED_PROCESS is back; the grandchild will allocate its own console window")
-    assert flags & sp.CREATE_NEW_PROCESS_GROUP, (
-        "a Ctrl+C in the router's console would travel to the run")
+    assert not (flags & sp.CREATE_NEW_PROCESS_GROUP), (
+        "windowless fleet launch reintroduced an unused console-control process group")

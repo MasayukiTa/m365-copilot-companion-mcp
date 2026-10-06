@@ -37,7 +37,6 @@ def test_a_variable_nobody_listed_is_withheld_on_its_VALUE(monkeypatch):
 
 
 @pytest.mark.parametrize("name,value", [
-    ("PYTHONPATH", "C:/p"),
     ("TEMP", "C:/t"),
     ("MY_PLAIN_URL", "https://example.invalid/no-userinfo"),
 ])
@@ -45,6 +44,35 @@ def test_ordinary_variables_survive(monkeypatch, name, value):
     """A sanitiser that breaks execution gets turned off, which protects nothing."""
     monkeypatch.setenv(name, value)
     assert sanitized_child_env().get(name) == value
+
+
+def test_the_operators_pythonpath_still_reaches_the_child(monkeypatch):
+    """PYTHONPATH is the one ordinary variable something else deliberately adds to.
+
+    It used to be asserted byte-identical alongside TEMP, and that stopped being the right
+    question when `_with_pptx_autostamp` began prepending its own directory so the deck stamp
+    reaches code the worker composed. Equality then failed while nothing was actually broken --
+    the operator's entries were all still there, with one more in front.
+
+    What this test protects is the property the old assertion was standing in for: whatever the
+    operator put on PYTHONPATH still reaches the child, in their order. A sanitiser (or a
+    feature) that DROPPED or REORDERED their entries would break imports in ways that look like
+    the child being broken rather than the environment being edited, and that is what must not
+    happen. That something may be prepended is deliberate and documented; that anything of
+    theirs may be lost is not.
+    """
+    import os
+
+    # NO COLONS IN THE VALUES. The first version used "C:/p" and "C:/q" -- Windows paths, in
+    # a test the Linux job also runs -- joined with os.pathsep, which is ":" there. The
+    # separator was inside the values, so splitting produced ['C', '/p', 'C', '/q'] and the
+    # test failed on a platform where nothing was wrong. The entries only have to be
+    # distinguishable and ordered; what they look like is not the subject.
+    first, second = "operator_dir_one", "operator_dir_two"
+    monkeypatch.setenv("PYTHONPATH", os.pathsep.join([first, second]))
+    got = (sanitized_child_env().get("PYTHONPATH") or "").split(os.pathsep)
+    assert first in got and second in got, got
+    assert got.index(first) < got.index(second), ("their order changed", got)
 
 
 def test_path_is_always_kept():

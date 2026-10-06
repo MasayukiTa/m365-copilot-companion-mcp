@@ -39,15 +39,83 @@ pass it: both transports were asked about a calendar entry created earlier that 
 verified independently, and BOTH named it. A route without Work IQ cannot invent an entry it
 has never seen.
 
-So the fear was right and the target was wrong. What survives as FIXED is the one property
-measured to force a tab, and it is not a guess about text at all: an ATTACHMENT. The Analyst
-puts a local file into a real <input type=file>, and a socket has nowhere to put a file. It is
-knowable from a parameter the caller already set, so it needs no classifier and can never be
-wrong in the silent direction.
+So the fear was right and the target was wrong. What survives as FIXED is an ATTACHMENT: the
+Analyst puts a local file into a real <input type=file>, so a task carrying one is routed to a
+tab. It is knowable from a parameter the caller already set, so it needs no classifier and can
+never be wrong in the silent direction.
 
-It sits ABOVE the version table rather than inside a version, because it is not a policy. A
-version table exists to let two opinions be compared; there is no second opinion about where a
-file can be put.
+THE REASON RECORDED HERE USED TO BE "A SOCKET HAS NOWHERE TO PUT A FILE". THAT IS FALSE, AND
+WAS NEVER OBSERVED -- it was inferred from the UI plus one incident where the bridge attached
+to a page it had already released and the file silently vanished (which is about a released
+page, not about the wire). Measured 2026-09-17 by recording the page's own frames during an
+ANALYZE:
+
+    POST https://substrate.office.com/m365Copilot/UploadFile   (multipart, scenario=UploadImage)
+
+    and the OUTGOING ChatHub frame then carried
+
+    "messageAnnotations":[{"id":"0-wjp-d3-...","messageAnnotationMetadata":{"@type":"File",
+      "fileType":"png","fileName":"monthly.png"},"messageAnnotationType":"ImageFile"}]
+
+The protocol has a field for it. The bytes go over HTTP and an ID rides the socket; the
+<input type=file> is the UI's door, not the protocol's requirement.
+
+THE AUDIENCE QUESTION IS ANSWERED, 2026-09-18: THE TOKEN WE ALREADY HOLD IS ACCEPTED.
+
+    the page's own UploadFile request, re-issued with ONLY the Authorization header swapped
+    for the token relay/profile_token captures  ->  HTTP 200
+    {"docId": "0-ejp-d1-...", "fileSanitizer": "ImageSanitizerBingAI",
+     "result": {"value": "Success", "message": "Success"}}
+
+So the socket route is not blocked by the credential, and the docId in that response is what a
+frame carries as messageAnnotations[0].id -- the response was captured for the first time on the
+same day, which is also when "the page uploaded successfully" stopped being an inference from a
+POST plus a later annotation.
+
+IT TOOK THREE ATTEMPTS AND THE FIRST TWO WERE REPORTED AS ANSWERS. Both returned 403 and both
+were about the request, not the credential:
+
+    1  a binary multipart part named "file", an invented conversationId, our token
+    2  the right three fields, a real conversationId, our token
+       -- still wrong: the real body has SIX fields, not three (scenario, conversationId,
+          FileBase64, and optionsSets THREE TIMES), and the probe sent ONE header where the
+          page sends eighteen, among them x-anchormailbox, which routes the request.
+
+The three-field list came from a 400-character truncated body_head, and a test had been written
+to pin agreement with it -- a guard holding a probe to an incomplete record. Reconstructing the
+request is what failed, every time. scripts/probes/replay_upload_with_our_token.py does not
+reconstruct it: it captures the page's bytes and headers and re-issues them, replacing the
+credential and nothing else, which is the only reason its result means anything.
+
+TWO QUESTIONS WERE OPEN HERE. ONE IS ANSWERED AND THIS PARAGRAPH SAID OTHERWISE FOR A DAY.
+
+"Whether an annotation sent over the socket is accepted" -- YES, measured 2026-09-19 end to
+end: `transport=socket`, the tab count went 1 -> 1 (no tab was opened for the attachment), and
+the reply read the phrase "どんぐり84" back off the image. `relay/socket_attachment.py`
+uploads the bytes over HTTP and `relay/agent_profiles.py::_try_socket` sends the resulting
+docId as a `messageAnnotations` entry on the socket frame.
+
+So "an attachment still goes to a tab" stopped being true, and the sentence stayed. It is
+worth naming why, because the same shape is the reason the fix took two days: the rule lived
+in TWO places. `ATTACHMENT` below was retired on 2026-09-18 and NOTHING CHANGED, because the
+copy the fleet actually consulted was a private guard inside `_try_socket`
+(`if self.upload_path: return False`). Retiring a rule that is not the deciding copy looks
+exactly like fixing it -- right up until you measure. Prose that outlives the behaviour it
+describes is the same failure one level down.
+
+STILL OPEN, AND GENUINELY: how long a docId lives. It is measurable but nothing caches a
+docId today -- every attachment uploads immediately before the frame that carries it -- so
+the answer changes no decision now. It would matter the moment something reuses one.
+
+WHAT IS AT STAKE IF IT IS PURSUED. The socket was measured at 255 seconds against 673-809 for
+the same Researcher work in a tab, and its completion arrives as a protocol frame rather than
+being inferred from text that lies -- the same inference that made every short Analyst answer
+time out for 600 seconds until 2026-09-17. The Analyst is the only profile still on the
+fragile half, and this is the reason.
+
+It sits ABOVE the version table rather than inside a version because it is not a preference to
+be compared. That remains true of the ROUTING. It was never true of the explanation, and a
+sentence that says "there is no second opinion" is the one most worth checking.
 
 FALLBACKS ARE NOT ALL LABELS
 
@@ -62,22 +130,54 @@ import re
 
 TAB, SOCKET = "tab", "socket"
 
-#: FIXED. Not read from any genome, and `evolvable_fields()` refuses to return it.
+#: RETIRED 2026-09-18. It said "a socket has nowhere to put a local file", and a socket has
+#: one. Kept as a name because the reason it went is worth more than the rule was.
 #:
-#: The whole rule. Measured across twenty socket turns and eight request classes as the only
-#: property that structurally forces a tab -- see the module note for why the previous rule
-#: (anything mentioning an M365 surface) was removed rather than narrowed.
-ATTACHMENT = "attachment: a socket has nowhere to put a local file"
+#: The rule survived one correction already: its REASON was rewritten on 2026-09-17 when a
+#: CDP recording showed the protocol carries an attachment -- bytes to UploadFile over HTTP,
+#: the returned id riding the socket in messageAnnotations -- while the BEHAVIOUR was kept,
+#: because knowing a request's shape is not knowing we can make it. Three questions stood
+#: between the two, and all three are now answered by measurement:
+#:
+#:   the protocol has a place for it   observed 2026-09-17; the page's own frame carried
+#:                                     messageAnnotations and the server echoed it back with
+#:                                     messageAnnotationSource "UserAnnotated"
+#:   our credential opens UploadFile   measured 2026-09-18: HTTP 200, result.value "Success",
+#:                                     by replaying the page's own request with ONLY the
+#:                                     Authorization header swapped
+#:   a model on the socket SEES it     measured 2026-09-18: an image carrying a randomly
+#:                                     generated phrase was uploaded, its docId sent as an
+#:                                     annotation on a socket turn, and the reply read the
+#:                                     phrase back. It appears in no filename, no path and no
+#:                                     prompt, so it could only have come from the pixels.
+#:
+#: A rule whose premise has been measured false is not made safer by leaving it in place; it
+#: is a routing decision nobody can explain. So an attachment no longer forces a tab.
+#:
+#: AND RETIRING IT HERE CHANGED NOTHING, WHICH IS THE PART WORTH REMEMBERING. The same rule
+#: existed a second time, as `if self.upload_path: return False` inside ResearchSession.
+#: _try_socket, and THAT is what the fleet consults -- this module can only decide what
+#: somebody asks it. The commit that retired the rule here was measured afterwards and the
+#: fleet still opened a tab for every attachment. A policy module is not where behaviour
+#: lives; if a rule is removed here, the callers must be swept for a private copy of it.
+ATTACHMENT = "attachment: retired -- a socket carries one (measured 2026-09-18)"
 
 
 def needs_tab(upload_path: str = "") -> bool:
     """True when this task cannot be carried by a socket, whatever any policy prefers.
 
-    Takes the caller's own parameter, NOT the goal text. Reading the text is what the removed
-    rule did, and the measurement says the text carries no signal about this: goals that name
-    mail, calendars and SharePoint were carried by the socket, with ground truth to prove it.
+    NOTHING RETURNS TRUE TODAY, and the function stays because the SHAPE is the valuable
+    part: a structural veto applied before any policy, that no genome can reach. The
+    attachment was the last thing in it, and it left by measurement rather than by
+    preference -- see ATTACHMENT above.
+
+    Still takes the caller's own parameter rather than the goal text. Reading the text is
+    what the FIRST removed rule did, and the measurement says the text carries no signal:
+    goals naming mail, calendars and SharePoint were carried by the socket with ground
+    truth to prove it. If a genuine structural veto is found later it belongs here, as a
+    parameter, not as a pattern over prose.
     """
-    return bool(upload_path)
+    return False
 
 
 #: A fallback reason matching any of these is the ROUTE's failure, not the goal's. Kept as
@@ -142,6 +242,13 @@ def classify_fallback(reason: str) -> str:
     return "unknown"
 
 
+#: The one knob a genome may move here, spelled once. `_policy_v2` reads through this name
+#: rather than repeating the string, because "written twice, these drift" -- the argument
+#: mechanism_telemetry.patch_hash makes about itself, and the reason it now has one
+#: implementation instead of two.
+ELIGIBLE_KINDS = "transport_eligible_kinds"
+
+
 def _policy_v1(goal: str, *, kind="", knobs=None, explore=False) -> str:
     """Whatever the route offers. THE BEHAVIOUR THAT WAS ALREADY THERE.
 
@@ -171,7 +278,7 @@ def _policy_v2(goal: str, *, kind="", knobs=None, explore=False) -> str:
     whose two arms are not reproducible is not measurable.
     """
     knobs = knobs or {}
-    eligible = knobs.get("transport_eligible_kinds")
+    eligible = knobs.get(ELIGIBLE_KINDS)
     if eligible is not None and kind and kind not in set(eligible):
         return SOCKET if explore else TAB
     return SOCKET
@@ -185,20 +292,74 @@ TRANSPORT_VERSIONS = {
 }
 
 
+#: Declared at import so the promise is listable, and guarded so a transport decision can never
+#: fail over its own bookkeeping. RECORD rather than RAISE: an undeclared knob is a campaign's
+#: mistake about what it is measuring, not a reason to lose the run that revealed it.
+try:
+    from relay import invariants as _invariants
+    _KNOB_INVARIANT = _invariants.register(
+        "transport_knob_is_declared", owner="relay/transport_policy.py",
+        disposition=_invariants.RECORD,
+        why=("a genome knob no policy reads produces an A/B arm identical to its control, "
+             "which the loop then scores as a result; transport_explore_rate was exactly "
+             "that, declared and read by nothing"))
+except Exception:                                  # pragma: no cover - import-order safety
+    _invariants = None
+    _KNOB_INVARIANT = ""
+
+
 def evolvable_fields() -> tuple:
-    """The knobs a genome may move. The attachment rule is deliberately absent."""
-    return ("transport_eligible_kinds", "transport_explore_rate")
+    """The knobs a genome may move. The attachment rule is deliberately absent.
+
+    `transport_explore_rate` WAS HERE AND NOTHING READ IT. A scan over `git ls-files` found the
+    name in exactly one place: this return tuple. That is the defect the version table twelve
+    lines above says this repository "has now found in four separate components" -- a name a
+    genome could carry that nothing reads -- sitting inside the fix for the first four.
+
+    It is not an oversight about where to read it, either: `_policy_v2`'s own docstring says
+    "the exploration decision is the caller's, not this function's", so an explore RATE has no
+    home in a transport policy at all. It goes back only with a reader.
+
+    THE GUARD THAT EXISTS COULD NOT HAVE SEEN IT. `relay/selfimprove/
+    test_parameters_have_effect.py` reads `manifest.DEFAULT_PARAMETERS`, and neither of these is
+    declared there -- which is its own disagreement, recorded in docs/unreached_burndown.md
+    rather than resolved by adding a coordinate to a loop that has no driver. What replaces it
+    here is a test that asks the question that guard asks, of whatever THIS function declares:
+    change the value, and something observable changes.
+    """
+    return (ELIGIBLE_KINDS,)
 
 
 def choose(goal: str, *, kind="", knobs=None, explore=False, upload_path="") -> str:
     """The transport for one goal, under whichever version the active harness names.
 
-    THE STRUCTURAL RULE IS APPLIED FIRST, so no version -- present or future, hand-written or
-    evolved -- can send an attachment over a socket. A version that could would not be a worse
-    policy; it would be a broken one.
+    THE STRUCTURAL VETO IS STILL APPLIED FIRST, and as of 2026-09-18 it vetoes nothing: the
+    attachment rule was retired when all three of its open questions were measured. The call
+    stays ahead of every policy because that ordering is the point -- a veto found later must
+    bind versions that already exist, including evolved ones.
+
+    `upload_path` is still accepted and still passed through, so a caller that names a file
+    keeps saying so and a future veto has its parameter waiting.
     """
     if needs_tab(upload_path):
         return TAB
+    # A KNOB NOTHING DECLARES IS AN A/B ARM IDENTICAL TO ITS CONTROL. project_memory says the
+    # rule -- "an evolvable parameter that no running code reads produces A/B arms that are the
+    # same" -- and until now nothing checked the genome's side of it: a campaign could set any
+    # key it liked and the policy would quietly ignore it while the run was scored as a variant.
+    # RECORDED, NOT REFUSED. Dropping the knob would change what the policy sees; raising would
+    # let a bookkeeping mistake fail a run. The undeclared name is written down and the call
+    # proceeds exactly as before.
+    if knobs:
+        _undeclared = sorted(set(knobs) - set(evolvable_fields()))
+        if _undeclared and _KNOB_INVARIANT:
+            try:
+                _invariants.assert_invariant(
+                    _KNOB_INVARIANT, False,
+                    "genome set knobs no transport policy reads: %s" % (_undeclared,),
+                    declared=list(evolvable_fields()))
+            except Exception:
+                pass
     try:
         from relay.selfimprove import runtime_config as _rc
         impl = TRANSPORT_VERSIONS.get(_rc.component("transport"), _policy_v1)
@@ -303,6 +464,71 @@ ACTING = (
 )
 
 
+# English negative imperatives are constraints, not effects.  This matters especially for the
+# fleet's own READ-ONLY audit prompts: "Do not edit, write, create, delete, commit, push..."
+# used to trip every action keyword and turn a safely-repeatable review into a landed-action
+# refusal.  Strip ONLY an explicitly-negated CLAUSE before scanning for ACTING verbs.
+#
+# This is deliberately conservative.  Negation-inverting phrases ("do not forget to send",
+# "do not just review, send...") remain untouched. Any contrast/exception/condition marker
+# ("but/instead/except/unless") also leaves the WHOLE clause acting; interpreting its scope
+# would risk deleting the very action whose delivery is uncertain. An ambiguous comma-separated clause with multiple action
+# verbs but no and/or list marker is also left acting rather than risk hiding a real imperative.
+_NEGATED_ACTION_PREFIX = re.compile(
+    r"^\s*(?:do\s+not|don't|dont|must\s+not|mustn't|should\s+not|shouldn't|cannot|can't)\b\s*(?P<body>.*)$",
+    re.IGNORECASE | re.DOTALL,
+)
+_NEGATION_INVERTER = re.compile(
+    r"^\s*(?:forget|fail|hesitate|neglect|avoid|just|only|merely)\b", re.IGNORECASE)
+_NEGATION_PIVOT = re.compile(
+    r"\b(?:but|however|instead|rather|except|unless)\b", re.IGNORECASE)
+_NEGATION_CLAUSE_SPLIT = re.compile(r"([.;\n]+)")
+
+
+def _action_scan_text(goal: str) -> str:
+    """Text whose explicit negative-imperative clauses cannot trigger ``ACTING``.
+
+    This is NOT a general natural-language negation engine.  It handles the narrow syntax the
+    product itself emits for read-only work while preserving the safe default for ambiguous text.
+    """
+    parts = _NEGATION_CLAUSE_SPLIT.split(goal or "")
+    out = []
+    for idx, segment in enumerate(parts):
+        if idx % 2:                     # punctuation/newline separator
+            out.append(segment)
+            continue
+        m = _NEGATED_ACTION_PREFIX.match(segment)
+        if not m:
+            out.append(segment)
+            continue
+        body = m.group("body") or ""
+
+        # "Do not forget to send" / "do not just review, send" are positive imperatives
+        # wrapped in negation.  Never hide their action verbs.
+        if _NEGATION_INVERTER.match(body):
+            out.append(segment)
+            continue
+
+        # Contrast/exception/condition makes scope ambiguous. Fail closed: retain the whole
+        # segment so any action verb, including one before "unless", remains visible.
+        if _NEGATION_PIVOT.search(body):
+            out.append(segment)
+            continue
+
+        # A comma can either enumerate prohibitions or separate two imperatives.  A proper
+        # prohibition list normally carries and/or; without it, multiple acting verbs are
+        # ambiguous, so retain the whole clause and fail closed as acting.
+        hits = sum(1 for pattern in ACTING if re.search(pattern, body, re.IGNORECASE))
+        if "," in body and hits >= 2 and not re.search(r"\b(?:and|or)\b", body, re.IGNORECASE):
+            out.append(segment)
+            continue
+
+        # The entire clause is an explicit prohibition.  Preserve only its separator (handled
+        # by the next split part); no action from this clause should affect resend policy.
+        out.append("")
+    return "".join(out)
+
+
 def goal_may_act(goal: str) -> bool:
     """Whether re-sending this goal's turn could repeat something done to the world.
 
@@ -310,7 +536,7 @@ def goal_may_act(goal: str) -> bool:
     reconnect path and the tab fallback both re-sent the turn verbatim, and the only guard
     was a count of how many times they had done it.
     """
-    text = (goal or "")
+    text = _action_scan_text(goal or "")
     for pattern in ACTING:
         if re.search(pattern, text, re.IGNORECASE):
             return True
@@ -339,3 +565,116 @@ def delivery_status(reason: str) -> str:
 def duplicate_risk(reason: str) -> bool:
     """True when re-sending this turn could repeat an act the model already performed."""
     return delivery_status(reason) in ("delivered", "unknown")
+
+
+# ------------------------------------------------------------------------------------------
+# Is the act's EFFECT one that can be checked before deciding to re-send?
+# ------------------------------------------------------------------------------------------
+#
+# `goal_may_act` answers one question -- does this goal do something to the world -- and the
+# reconnect budget refused every acting goal whose turn might already have landed. That is the
+# right default and stays the default. But it is too coarse for the acts this fleet actually
+# runs: almost all of them are git commits, and a commit LEAVES A TRACE. `git log` shows
+# whether the commit the turn was about is already there. So the ambiguity a re-send would
+# gamble on -- did the turn land -- is not a gamble for a commit; it is a lookup.
+#
+# THE SECOND AXIS IS "CAN THE EFFECT BE OBSERVED", NOT "IS IT REVERSIBLE". A mail send cannot
+# be observed from here at all: nothing this process can read tells it whether the message
+# went, so re-sending is a guess and a guess is a second mail. A commit can be observed, and
+# an observation is not a guess. The rule that falls out of the module's own comment --
+# "confirm the commit already exists ... where we can confirm, we may re-send" -- is exactly
+# this split.
+#
+# DELIBERATELY NARROW, and narrow on the SAFE side. Only effects that (a) act and (b) leave a
+# trace this process can read without side effects belong here. Anything not listed is treated
+# as unobservable and keeps the old refuse-on-landed behaviour. A false negative here costs a
+# lost turn and a message to a person; a false positive would re-send an act nobody can check,
+# which is the very thing the refuse branch exists to prevent -- so the list only grows for an
+# effect whose checker has actually been written and measured.
+#
+# Git commit/push are the only members today because they are the only acts this fleet does in
+# bulk AND the only ones with a checker below. English and Japanese, matched with the same verb
+# discipline `ACTING` uses so a noun or a past-tense description is not read as a request.
+CHECKABLE_EFFECT = (
+    r"\bcommit\b",
+    r"\bpush\b",
+    r"コミット(?:して(?!い)|しろ|せよ|します|する|してください)",
+    r"プッシュ(?:して(?!い)|しろ|せよ|します|する|してください)",
+    # A FILE PUT SOMEWHERE IS AS CHECKABLE AS A COMMIT, and for a while it was not treated as
+    # such. Measured 2026-09-14: a goal reading 「…9月報告分の資料を作ってください。…同じフォルダ
+    # に出してください」 lost its websocket six minutes in, was correctly refused a re-send
+    # because it acts and delivery was unknown, and then sat dead for the remaining fifty
+    # minutes and overnight. Nothing had been written at all -- the question "did the act
+    # happen" had an answer sitting on disk, and nobody asked it.
+    #
+    # The deliberate asymmetry with mail is kept: mail leaves no trace this process can read,
+    # so it stays uncheckable and stays refused. A file does leave one.
+    r"(?:出力|保存|書き出|作成|出して|置いて)(?:して)?(?:ください|しろ|せよ|する|します)?",
+    r"\b(?:save|write|output|export|produce)\b.{0,40}\b(?:file|folder|directory|pptx|xlsx|docx|pdf|csv)\b",
+)
+
+
+def effect_is_checkable(goal: str) -> bool:
+    """Whether this goal's real-world effect can be observed before re-sending.
+
+    True only for a goal that BOTH acts and whose act leaves a trace this process can read
+    (a commit in `git log`). A goal that does not act is not the question this answers -- it
+    is idempotent and never reached the refuse branch -- so this returns False for it, keeping
+    the predicate about acting goals alone.
+
+    Unknown stays False, which routes an un-checkable landed act to the existing refusal. The
+    careful side is the default here exactly as it is for `needs_tab` and `goal_may_act`.
+    """
+    text = (goal or "")
+    if not goal_may_act(text):
+        return False
+    for pattern in CHECKABLE_EFFECT:
+        if re.search(pattern, text, re.IGNORECASE):
+            return True
+    return False
+
+
+#: What a checker is allowed to conclude about an effect it was asked to look for.
+#: `present`  -- the effect is already in the world (a re-send would be a no-op).
+#: `absent`   -- the effect is demonstrably NOT in the world (a re-send is safe and needed).
+#: `unknown`  -- the checker could not tell (treated as un-checkable: refuse).
+CHECK_PRESENT, CHECK_ABSENT, CHECK_UNKNOWN = "present", "absent", "unknown"
+
+RESEND, REFUSE = "resend", "refuse"
+
+
+def resend_decision_for_landed_act(goal: str, checker=None) -> str:
+    """'resend' or 'refuse' for a landed, acting goal -- consulting a checker when it can.
+
+    The caller has already established the two facts that make this branch dangerous: the turn
+    MAY ALREADY HAVE LANDED, and the goal ACTS. Left there, the only safe answer is 'refuse',
+    because re-sending gambles on whether the act ran. This function keeps that answer for
+    every effect that cannot be observed -- and for a checkable effect, replaces the gamble
+    with a look.
+
+    `checker` is a callable taking the goal and returning one of CHECK_PRESENT / CHECK_ABSENT
+    / CHECK_UNKNOWN. It is the caller's, not this module's, because only the caller knows
+    where the repository is and how to read it; this module owns the DECISION, not the I/O.
+    A checker that raises is read as CHECK_UNKNOWN -- a checker failing is not evidence the
+    effect is absent.
+
+      * effect not checkable, or no checker            -> refuse   (unchanged default)
+      * checker says the effect is already present     -> resend   (the re-send is a no-op)
+      * checker says the effect is absent              -> resend   (the act did not happen)
+      * checker says unknown / raises                  -> refuse   (fall back to careful)
+
+    Re-sending on 'present' is safe because the model, re-handed a goal whose commit already
+    exists, has nothing left to do that changes the world -- and it is preferred over refusing
+    so a transient socket wobble on an already-finished commit does not end the worker. The
+    'absent' case is the one the count was meant for all along: the act did not land, so the
+    turn is genuinely lost and re-sending it is the recovery, not a duplicate.
+    """
+    if not effect_is_checkable(goal) or checker is None:
+        return REFUSE
+    try:
+        verdict = checker(goal)
+    except Exception:
+        verdict = CHECK_UNKNOWN
+    if verdict in (CHECK_PRESENT, CHECK_ABSENT):
+        return RESEND
+    return REFUSE

@@ -88,26 +88,75 @@ if (-not (Test-Path $venvPython)) {
 # 3. Python dependencies
 # ---------------------------------------------------------------------------
 Write-Step "Installing Python dependencies"
-# Corporate TLS-inspecting proxy: its root CA is not in pip's bundled certifi store, so
-# pip otherwise dies with SSL CERTIFICATE_VERIFY_FAILED ("unable to get local issuer
-# certificate") on pypi.org / files.pythonhosted.org. Pass --trusted-host ON THE COMMAND
-# LINE so it works regardless of whether the user/system pip.ini is read (the venv here is
-# a uv-provisioned CPython, which may not pick up %APPDATA%\pip\pip.ini).
-$pipTrusted = @(
-    "--trusted-host", "pypi.org",
-    "--trusted-host", "files.pythonhosted.org",
-    "--trusted-host", "pypi.python.org"
-)
-& $venvPython -m pip install @pipTrusted --upgrade pip --quiet
-& $venvPython -m pip install @pipTrusted -r requirements.txt
+# Delegate to scripts/bootstrap.py's own install_deps step (INST-09) instead of shelling out
+# to pip directly here. That is the ONE place that decides pip's TLS args: verified against
+# this machine's exported CA bundle (ca_bundle.ps1) or pip's own truststore by default, and
+# only --trusted-host (certificate checking OFF) when the operator opts in with
+# SETUP_PIP_TRUSTED_HOST=1. This script used to carry its own hardcoded, unconditional
+# --trusted-host list -- a second copy of a workaround bootstrap.py has since replaced with a
+# verified default. Do not reintroduce a copy here; if pip needs different args, change
+# pip_tls_args() in bootstrap.py and every caller (this script, tools/env_ops.py) gets it.
+& $venvPython (Join-Path $repoRoot "scripts\bootstrap.py") --only install_deps
+if ($LASTEXITCODE -ne 0) {
+    Write-Warn2 "Dependency install failed (bootstrap.py --only install_deps exited $LASTEXITCODE)"
+    exit 1
+}
 Write-Ok "Dependencies installed"
 
 # ---------------------------------------------------------------------------
 # 4. .env with fresh secrets
 # ---------------------------------------------------------------------------
 Write-Step "Preparing .env"
+function Protect-UserSecret([string]$plain) {
+    Add-Type -AssemblyName System.Security -ErrorAction SilentlyContinue
+    $bytes = [Text.Encoding]::UTF8.GetBytes($plain)
+    $cipher = [Security.Cryptography.ProtectedData]::Protect(
+        $bytes, $null, [Security.Cryptography.DataProtectionScope]::CurrentUser)
+    return "dpapi:" + [Convert]::ToBase64String($cipher)
+}
+function Write-EnvUtf8Atomic([string]$path, [object[]]$lines) {
+    $full = [IO.Path]::GetFullPath($path)
+    $tmp = $full + ".tmp-" + $PID
+    $enc = New-Object System.Text.UTF8Encoding($false)
+    try {
+        [IO.File]::WriteAllLines($tmp, $lines, $enc)
+        if ([IO.File]::Exists($full)) {
+            [IO.File]::Replace($tmp, $full, $null)
+        } else {
+            [IO.File]::Move($tmp, $full)
+        }
+    } finally {
+        if ([IO.File]::Exists($tmp)) { [IO.File]::Delete($tmp) }
+    }
+}
+
+
 if (Test-Path ".env") {
-    Write-Ok ".env already exists (left untouched)"
+    $lines = Get-Content ".env" -Encoding UTF8
+    $hasApiProtected = [bool]($lines | Where-Object { $_ -match "^\s*MCP_API_KEY_PROTECTED\s*=" })
+    $hasUnlockProtected = [bool]($lines | Where-Object { $_ -match "^\s*MCP_UNLOCK_PASSWORD_PROTECTED\s*=" })
+    $changed = $false
+    $out = foreach ($line in $lines) {
+        if ($line -match "^\s*MCP_API_KEY\s*=\s*(.*)$") {
+            $changed = $true
+            if (-not $hasApiProtected) {
+                $hasApiProtected = $true
+                "MCP_API_KEY_PROTECTED=$(Protect-UserSecret $matches[1])"
+            }
+        } elseif ($line -match "^\s*MCP_UNLOCK_PASSWORD\s*=\s*(.*)$") {
+            $changed = $true
+            if (-not $hasUnlockProtected) {
+                $hasUnlockProtected = $true
+                "MCP_UNLOCK_PASSWORD_PROTECTED=$(Protect-UserSecret $matches[1])"
+            }
+        } else { $line }
+    }
+    if ($changed) {
+        Write-EnvUtf8Atomic ".env" $out
+        Write-Ok ".env existed; migrated legacy clear-text secrets to DPAPI-protected storage"
+    } else {
+        Write-Ok ".env already exists (left untouched)"
+    }
 } else {
     function New-Hex([int]$bytes) {
         $buf = New-Object byte[] $bytes
@@ -117,24 +166,32 @@ if (Test-Path ".env") {
     }
     $apiKey   = New-Hex 20   # 40 hex chars
     $unlockPw = New-Hex 8    # 16 hex chars
+    $apiProtected = Protect-UserSecret $apiKey
+    $unlockProtected = Protect-UserSecret $unlockPw
 
     if (Test-Path ".env.example") {
-        $lines = Get-Content ".env.example"
+        # PS 5.1 reads with the ANSI codepage unless told otherwise, so a UTF-8
+        # .env.example comes back mojibake and is written straight back out.
+        $lines = Get-Content ".env.example" -Encoding UTF8
     } else {
         $lines = @(
-            "MCP_API_KEY=replace",
-            "MCP_UNLOCK_PASSWORD=replace",
+            "MCP_API_KEY_PROTECTED=dpapi:generated-by-setup",
+            "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:generated-by-setup",
             "MCP_UNLOCK_TTL_DAYS=30",
             "MCP_ALLOWED_BASE=~"
         )
     }
     $out = foreach ($line in $lines) {
-        if ($line -match "^\s*MCP_API_KEY\s*=")          { "MCP_API_KEY=$apiKey" }
-        elseif ($line -match "^\s*MCP_UNLOCK_PASSWORD\s*=") { "MCP_UNLOCK_PASSWORD=$unlockPw" }
+        if ($line -match "^\s*MCP_API_KEY(_PROTECTED)?\s*=") { "MCP_API_KEY_PROTECTED=$apiProtected" }
+        elseif ($line -match "^\s*MCP_UNLOCK_PASSWORD(_PROTECTED)?\s*=") { "MCP_UNLOCK_PASSWORD_PROTECTED=$unlockProtected" }
         else { $line }
     }
-    Set-Content -Path ".env" -Value $out -Encoding ASCII
-    Write-Ok "Wrote .env with fresh random MCP_API_KEY and MCP_UNLOCK_PASSWORD"
+    # NOT ASCII: it replaces every non-ASCII byte with '?', so a Japanese line
+    # carried over from .env.example is destroyed on the way in. NOT PS 5.1's
+    # -Encoding UTF8 either: that writes a BOM, which folds into the first key
+    # name and makes the .env parser miss it. UTF8Encoding($false) is no-BOM.
+    Write-EnvUtf8Atomic ".env" $out
+    Write-Ok "Wrote .env with fresh random protected Bearer and unlock credentials"
     Write-Host "    Keep these secret. Your Bearer token is: $apiKey" -ForegroundColor Magenta
     Write-Host "    Your unlock password is:               $unlockPw" -ForegroundColor Magenta
 }
@@ -185,4 +242,4 @@ Write-Host "  2. (Remote clients) sign in to Dev Tunnels ONCE, then host + keep 
 Write-Host "       devtunnel login          # one-time interactive sign-in (persists across reboots) -- BEFORE the supervisor"
 Write-Host "       .\scripts\supervisor.ps1 -TunnelName <your-tunnel-name>"
 Write-Host "  3. Point your MCP client at http://localhost:8000/mcp with header"
-Write-Host "       Authorization: Bearer <MCP_API_KEY from .env>"
+Write-Host "       Authorization: Bearer <value shown by copilot_studio_values.bat>"

@@ -45,12 +45,12 @@ if runid:
     cmd = "mkdir -p /mnt/c/wsl-setup/_miss; " + "; ".join(parts) + "; ls /mnt/c/wsl-setup/_miss | wc -l"
     print("the eval host copy:", R._wsl_token(cmd, timeout=120) or "(none)")
     # scp the whole staging dir down
-    import subprocess
+    from tools.childproc import run as _run_child
     local_logs = os.path.join(OUT, "_logs")
     os.makedirs(local_logs, exist_ok=True)
-    subprocess.run(["scp", "-q", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes", "-r",
-                    os.environ.get("EVAL_SSH_HOST", "") + ":C:/wsl-setup/_miss/.", local_logs],
-                   capture_output=True, text=True, timeout=180)
+    _run_child(["scp", "-q", "-o", "ConnectTimeout=30", "-o", "BatchMode=yes", "-r",
+                os.environ.get("EVAL_SSH_HOST", "") + ":C:/wsl-setup/_miss/.", local_logs],
+               timeout=180)
     for i in misses:
         s = safe[i]
         to = os.path.join(local_logs, s + ".to")

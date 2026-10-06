@@ -1,11 +1,11 @@
-// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
+﻿// FleetCockpit.cs -- native Windows (WPF) LIVE cockpit for parallel execution.
 //
 // relay/fleet_runner.py drives N autonomous Copilot conversations at once and writes a
 // live snapshot to .fleet/status.json after every round-robin sweep. This window tails
 // that JSON and renders one live card per goal. You can also release a running one from
-// here (writes .fleet/commands.json, which the fleet consumes -> stops + frees its tab).
+// here (writes one command file into .fleet/commands.d/, which the fleet consumes -> stops + frees its tab).
 //
-//   [ fleet_runner.py ] <--(commands.json)-- [ this ]
+//   [ fleet_runner.py ] <--(commands.d/)--- [ this ]
 //                       --(status.json)----->
 //
 // Icons are Google Material Symbols, rendered as vector geometry from
@@ -111,6 +111,14 @@ class CockpitProgram
             }
             return;
         }
+        // --selftest: construct the window the ordinary way, pump once, exit (WindowSelfTest.cs).
+        // Its status.json lives in an empty scratch directory, not the real .fleet, and the
+        // health poll -- which reaches the network and can start the stack -- does not start.
+        if (args.Length >= 1 && args[0].Equals("--selftest", StringComparison.OrdinalIgnoreCase))
+        {
+            string scratch = Path.Combine(WindowSelfTest.ScratchDir("cockpit-fleet"), "status.json");
+            Environment.Exit(WindowSelfTest.Run(delegate { return new CockpitWindow(scratch); }));
+        }
         string path = args.Length > 0 ? args[0] : null;
         new Application().Run(new CockpitWindow(path));
     }
@@ -150,9 +158,13 @@ class CockpitProgram
 // required. One process drains all pending gates so a burst of workers never creates a window storm.
 class ApprovalPromptWindow : Window
 {
-    readonly JavaScriptSerializer _js = new JavaScriptSerializer();
+    readonly JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
     string _gateDir;
     string _currentPath;
+    //: Why the path was refused, kept so the window can say it. It used to close itself in
+    //: `Loaded` before painting, so a refused gate and a working one looked identical from the
+    //: outside: the notification was clicked and nothing happened at all.
+    string _gateWhy;
     Dictionary<string, object> _current;
     TextBlock _kind, _question, _context, _count, _policyHelp;
     Button _approve, _deny;
@@ -173,14 +185,72 @@ class ApprovalPromptWindow : Window
     static double NowUnix()
     { return (DateTime.UtcNow - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalSeconds; }
 
-    static string SettingsFile
+    //: WHERE THE SETTINGS LIVE, in both places, new first.
+    //:
+    //: %APPDATA% is redirected for a process running inside an MSIX package, so the same
+    //: absolute path resolved to the operator's file from one context and to a private copy
+    //: from another. On 2026-09-16 the panel showed 1 GB while every fleet coordinator
+    //: reserved 4 GB, for a month, and neither side could see the other's file. The
+    //: repository is the one directory every context agrees about.
+    //:
+    //: READS take the new location when it exists and the old one otherwise, so a machine
+    //: mid-migration keeps working and one that never migrates behaves exactly as before.
+    //: WRITES always go to the new location. Kept in step with tools/settings_path.py --
+    //: test_the_settings_path_is_the_same_in_every_language pins the two together.
+    static string SettingsFileNew
+    {
+        get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); }
+    }
+
+    static string SettingsFileOld
     {
         get
         {
             string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
             return Path.Combine(app, "copilot-bridge", "settings.txt");
         }
     }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    //: The repository root as seen from the running executable: ui\ sits directly under it.
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            string dir = Path.GetDirectoryName(exe);
+            DirectoryInfo d = new DirectoryInfo(dir);
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
+
 
     // True until the FIRST LoadNext() completes. The prompt is normally launched by
     // clicking a toast, so an empty gate list on that first pass means "the thing you
@@ -214,20 +284,48 @@ class ApprovalPromptWindow : Window
         Background = Bg; ShowInTaskbar = true; FontFamily = new FontFamily(Theme.UiFont);
         try
         {
+            // THE SAME QUESTION THE WRITER ASKED. Not "is this folder called .companion_gates"
+            // -- gate_ops.py writes to MCP_GATE_DIR when it is set, and a cockpit that only
+            // recognises the default name can never open what it wrote. Still a whitelist, and
+            // still exactly one directory: an arbitrary path handed to --approval-gate is
+            // refused as firmly as before, it is simply the RIGHT directory now.
             string full = Path.GetFullPath(initialGatePath);
             _gateDir = Path.GetDirectoryName(full);
+            string allowed = CockpitWindow.ResolveGateDirectory("", "");
             if (!Path.GetFileName(full).StartsWith("gate_", StringComparison.OrdinalIgnoreCase) ||
-                !Path.GetExtension(full).Equals(".json", StringComparison.OrdinalIgnoreCase) ||
-                !Path.GetFileName(_gateDir).Equals(".companion_gates", StringComparison.OrdinalIgnoreCase))
-                throw new InvalidOperationException("invalid approval-gate path");
+                !Path.GetExtension(full).Equals(".json", StringComparison.OrdinalIgnoreCase))
+                throw new InvalidOperationException("not an approval gate file: " + full);
+            // ASK THE FILESYSTEM, DO NOT COMPARE SPELLINGS. The first version compared
+            // Path.GetFullPath of both directories as strings, and failed the moment they were
+            // spelled differently -- measured with a gate under %TEMP%, which Windows hands back
+            // in its 8.3 short form, against the same directory written long. The window closed
+            // and the operator saw nothing. GetFullPath does not expand a short name, and
+            // neither does any string comparison; enumerating the allowed directory answers "is
+            // this file in there" in whatever spelling either side used.
+            if (!Directory.Exists(allowed) ||
+                Directory.GetFiles(allowed, Path.GetFileName(full)).Length == 0)
+                throw new InvalidOperationException(
+                    "approval gate is not in the gate directory: " + _gateDir +
+                    " (expected " + allowed + ")");
             _currentPath = full;
         }
-        catch { _gateDir = null; _currentPath = null; }
+        catch (Exception ex) { _gateDir = null; _currentPath = null; _gateWhy = ex.Message; }
 
         Build();
         Loaded += delegate
         {
-            if (_gateDir == null) { Close(); return; }
+            if (_gateDir == null)
+            {
+                // A REFUSAL IS AN ANSWER AND HAS TO BE GIVEN. Closing here is what made a
+                // clicked notification do nothing at all -- no window, no message, no log.
+                MessageBox.Show(this,
+                    L("承認ゲートを開けませんでした。", "The approval gate could not be opened.")
+                    + "\n\n" + (_gateWhy ?? ""),
+                    L("承認が必要です", "Approval required"),
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+                Close();
+                return;
+            }
             LoadNext();
             _timer = new DispatcherTimer(); _timer.Interval = TimeSpan.FromSeconds(2);
             _timer.Tick += delegate
@@ -416,8 +514,15 @@ class ApprovalPromptWindow : Window
             FontSize = Theme.FsSection, FontWeight = FontWeights.SemiBold });
         _policy = new ComboBox { Margin = new Thickness(0, 8, 0, 0), MinWidth = 220,
             HorizontalAlignment = HorizontalAlignment.Left, Background = Surface, Foreground = Fg };
-        AddPolicyItem(L("確認（推奨）", "Confirm (recommended)"), "default");
-        AddPolicyItem(L("自動", "Auto"), "auto"); AddPolicyItem(L("バイパス", "Bypass"), "bypass");
+        // ORDER AND LABELS FOLLOW WHAT IS ACTUALLY RECOMMENDED. "Confirm" was first and was
+        // labelled 推奨 / recommended; it is the mode that asks about every first-seen class
+        // and keeps asking, which is how an approval queue becomes something nobody reads.
+        // Auto refuses a prohibited pattern outright -- stricter than Confirm, which puts the
+        // same operation to a person who can approve it -- and differs only on operations the
+        // deterministic classifier finds clean.
+        AddPolicyItem(L("自動（推奨）", "Auto (recommended)"), "auto");
+        AddPolicyItem(L("バイパス", "Bypass"), "bypass");
+        AddPolicyItem(L("毎回確認（非推奨）", "Confirm every time (not recommended)"), "default");
         _policy.SelectionChanged += PolicyChanged; policyCol.Children.Add(_policy);
         _policyHelp = new TextBlock { Foreground = Muted, FontSize = Theme.FsMeta, TextWrapping = TextWrapping.Wrap,
             Margin = new Thickness(0, 7, 0, 0) }; policyCol.Children.Add(_policyHelp);
@@ -435,7 +540,7 @@ class ApprovalPromptWindow : Window
     { _policy.Items.Add(new ComboBoxItem { Content = label, Tag = value, Foreground = Fg, Background = Surface }); }
 
     string SelectedPolicy()
-    { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "default" : (string)item.Tag; }
+    { var item = _policy.SelectedItem as ComboBoxItem; return item == null ? "auto" : (string)item.Tag; }
 
     void SelectPolicy(string mode)
     {
@@ -472,14 +577,17 @@ class ApprovalPromptWindow : Window
             "Safe operations run automatically; risky ones ask here; prohibited ones are denied.");
         else if (mode == "bypass") _policyHelp.Text = L("手動確認を省略します。STOP条件・パス制限・外部Skillのハッシュ承認は解除しません。",
             "Skip manual confirmation. STOP rules, path limits, and external-Skill hash approval remain.");
-        else _policyHelp.Text = L("初回の操作クラスを確認し、承認済みでも危険な内容は毎回確認します。",
-            "Confirm first-seen operation classes; risky payloads still ask every time.");
+        else _policyHelp.Text = L("初回の操作クラスを毎回確認します。非推奨: 確認が多すぎると内容が読まれなくなります。",
+            "Asks about every first-seen operation class. Not recommended: an approval that is always there stops being read.");
     }
 
     public static string ReadPolicy()
     {
-        string fallback = (Environment.GetEnvironmentVariable("TASK_JOB_APPROVAL_MODE") ?? "default").Trim().ToLowerInvariant();
-        if (fallback != "auto" && fallback != "bypass") fallback = "default";
+        // Matches tools/approval_policy.FALLBACK_APPROVAL_MODE. Two readers of one setting
+        // that disagree about its default would show the operator a mode the relay is not
+        // using.
+        string fallback = (Environment.GetEnvironmentVariable("TASK_JOB_APPROVAL_MODE") ?? "auto").Trim().ToLowerInvariant();
+        if (fallback != "auto" && fallback != "bypass" && fallback != "default") fallback = "auto";
         try
         {
             if (!File.Exists(SettingsFile)) return fallback;
@@ -505,8 +613,8 @@ class ApprovalPromptWindow : Window
                 else lines.Add(line);
             }
             if (!found) lines.Add("job_approval_mode=" + mode);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
         }
         catch { }
     }
@@ -622,16 +730,47 @@ class ApprovalPromptWindow : Window
             L("影響の大きい操作です。対象を確認したうえで本当に承認しますか？\n\n",
               "This is a high-impact operation. Approve after reviewing the exact scope?\n\n") + S(_current, "question"),
             L("最終確認", "Final confirmation"), MessageBoxButton.YesNo, MessageBoxImage.Warning, MessageBoxResult.No) != MessageBoxResult.Yes) return;
+        // EVERY PATH OUT OF HERE ENDS AT LoadNext(). This used to `return` twice without it --
+        // once when the gate file was missing and once when the write threw -- leaving
+        // _current set and the same request on screen. Reported 2026-09-12: 承認 pressed
+        // repeatedly on a gate whose file had been removed elsewhere, and nothing ever
+        // happened. A button that does nothing teaches people the window is broken, and after
+        // that they stop reading what it says, which is the whole failure an approval queue
+        // exists to avoid.
+        var gate = ReadGate(_currentPath);
+        if (gate == null)
+        {
+            // GONE IS RESOLVED, NOT BROKEN. The file is removed when a request is answered
+            // from the console, from another window, or by a cleanup -- so there is nothing
+            // to decide here any more. Move on quietly; saying "it vanished" about something
+            // the operator did themselves is noise.
+            _current = null; _currentPath = null; LoadNext(); return;
+        }
         try
         {
-            var gate = ReadGate(_currentPath); if (gate == null) return;
             gate.Remove("path"); gate["answered"] = true; gate["answer"] = verdict; gate["answered_at"] = NowUnix();
             string tmp = _currentPath + ".tmp";
             File.WriteAllText(tmp, _js.Serialize(gate), new UTF8Encoding(false));
             try { File.Replace(tmp, _currentPath, null); }
             catch { File.Copy(tmp, _currentPath, true); try { File.Delete(tmp); } catch { } }
         }
-        catch { return; }
+        catch (Exception ex)
+        {
+            // A WRITE THAT FAILED IS NOT THE SAME AS A GATE THAT VANISHED, and the operator
+            // has to hear about this one: the operation they just approved will NOT proceed,
+            // because the thing that reads the answer never sees it.
+            try
+            {
+                MessageBox.Show(this,
+                    L("この承認を記録できませんでした。操作は実行されません。\n\n",
+                      "This answer could not be recorded, so the operation will not proceed.\n\n")
+                    + ex.Message,
+                    L("承認の記録に失敗", "Could not record the answer"),
+                    MessageBoxButton.OK, MessageBoxImage.Warning);
+            }
+            catch { }
+            _current = null; _currentPath = null; LoadNext(); return;
+        }
         _current = null; _currentPath = null; LoadNext();
     }
 }
@@ -666,16 +805,65 @@ class CockpitWindow : Window
     double _diskFloor = 6.0;   // admission disk floor (GB) -> settings.txt disk_floor_gb=; user-editable
                                // in the settings panel. Persisted via SaveKey AND pushed live to a
                                // running fleet via {"set_disk_floor_gb":N} (fleet_runner.py ~L561).
-    double _ramFloor = 2048.0; // admission RAM floor (MB) -> settings.txt ram_floor_mb=; user-editable.
+    //: MUST MATCH tools/settings_keys.py's declared default for ram_floor_mb. It said 2048
+    //: while the coordinator used 1400 and the admission gates used 512 -- three owners of one
+    //: default, none of them wrong about itself. test_a_setting_declares_when_it_takes_effect
+    //: fails if this drifts again.
+    double _ramFloor = 512.0;  // admission RAM floor (MB) -> settings.txt ram_floor_mb=; user-editable.
                                // The free RAM the autoscale keeps for the user (RAM analog of the disk
                                // floor). Persisted via SaveKey AND pushed live via {"set_ram_floor_mb":N}.
     string _effort = "auto";   // effort mode min|max|ultra|auto -> settings.txt effort= (NEW)
+    string _effortPolicy = "off";   // effort policy off|shadow|on -> settings.txt effort_policy= (EffortPolicy.cs)
     // Split a goal into independent sub-goals, run them in parallel, and merge the answers.
     // For work whose SIZE is the problem: a goal that cannot fit in one conversation fails at
     // the conversation, not at the work. Off by default -- a goal that fits should not pay for
     // a split turn and a merge turn. Toggled with /fanout on|off, like /effort and /approval.
-    bool _fanout = false;      // -> settings.txt fanout=
+    // ON, matching relay.fleet_runner's own default since 2026-09-13. Every goal is still
+    // judged separately (offline triage, then the agent, which may answer NO_SPLIT), so a goal
+    // that fits costs nothing; this only decides whether the question is ever asked.
+    bool _fanout = true;       // -> settings.txt fanout= ; absent key = ON (FanoutView.DefaultOn)
+    // per-tree fan-out budget -> settings.txt fanout_max_total / _active / _turns / _wall_min
+    int[] _fbVals = (int[])FanoutBudgetView.Defaults.Clone();
+    TextBox[] _fbBox = new TextBox[4];
+    TextBlock _fbLbl, _fbNow, _fbPending;
+    TextBlock[] _fbCap = new TextBlock[4];
+    // split depth 1|2|3 -> settings.txt fanout_max_depth ; absent key = 1 (FanoutDepthView.Default)
+    int _fdVal = FanoutDepthView.Default;
+    ComboBox _fdBox;
+    TextBlock _fdLbl, _fdNow, _fdPending;
+    // sibling write scope off|shadow -> settings.txt fanout_write_scope ; absent key = off (WriteScopeView.Default)
+    string _wsVal = WriteScopeView.Default;
+    // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
+    string _hmVal = HierarchicalMergeView.Default;
+    ComboBox _hmBox;
+    TextBlock _hmLbl, _hmNow, _hmPending;
+    // merge conversation fresh|parent -> settings.txt merge_conversation ; absent key = fresh
+    string _mcVal = MergeConversationView.Default;
+    ComboBox _mcBox;
+    TextBlock _mcLbl, _mcNow, _mcPending;
+    ComboBox _wsBox;
+    TextBlock _wsLbl, _wsNow, _wsPending;
+    // auto-resume of an interrupted run off|on -> settings.txt fleet_auto_resume ; absent key = on
+    string _arVal = AutoResumeView.Default;
+    ComboBox _arBox;
+    TextBlock _arLbl, _arNow, _arPending;
+    // supervisor self-restart off|on -> settings.txt supervisor_self_restart ; absent key = on
+    string _srVal = SupervisorCodeView.Default;
+    ComboBox _srBox;
+    TextBlock _srLbl, _srNow;
+    DateTime _srReadAt = DateTime.MinValue;   // supervisor_state.json is re-read at most every 5 s
+    string _srText = null;
+    // tool-call check interval 0|15|30|60 minutes -> settings.txt tool_probe_idle_min ; absent key = 30
+    string _tpVal = ToolProbeView.Default;
+    ComboBox _tpBox;
+    TextBlock _tpLbl, _tpNow, _tpPending;
+    double _tpStateMtimeTicks = -1;          // the state file is re-read only when it changed
+    Dictionary<string, object> _tpState;     // .fleet/tool_probe_state.json as last read (null = none)
     string _approval = "run";  // approval mode run|plan|auto -> settings.txt approval=
+    string _runtimeMode = "fleet"; // next launch: fleet | durable -> settings.txt runtime=
+    bool _durableEnqueuePending = false; // one durable campaign intake process at a time
+    bool _durableStartPending = false; // initial durable launch awaits LOCAL_LOOP status acceptance
+    bool _fleetLaunchPending = false; // fresh Start waits for a closing prior coordinator
     bool _paused = false;      // local fleet pause/resume toggle state (NEW)
     // FIX B: optimistic "stopping" state set the instant Stop is clicked (dims non-terminal cards +
     // flips the Stop button's tooltip/icon) so the click never feels dead for the ~700ms sweep.
@@ -722,8 +910,11 @@ class CockpitWindow : Window
     // gear-popup live value label + stepper refs (re-themed nowhere else; rebuilt each open)
     TextBlock _uiScaleVal;
 
-    readonly string _statusPath, _commandsPath, _historyPath, _openPath;
-    string _convsPath, _hiddenPath, _resumeDismissPath;
+    // _fleetDir is the .fleet state dir. It replaced _commandsPath when the cockpit stopped
+    // writing commands.json directly: commands now go one-per-file into <_fleetDir>/commands.d
+    // through FleetCommands.Write. Nothing here needs the old aggregate path any more.
+    readonly string _statusPath, _fleetDir, _historyPath, _openPath;
+    string _convsPath, _hiddenPath, _resumeDismissPath, _clearedLogPath;
     System.Collections.Generic.HashSet<string> _archivedKeys = new System.Collections.Generic.HashSet<string>();
     // Persistent "cleared" set: keys of TERMINAL cards the user dismissed via Clear. Survives
     // the runner regenerating status.json every second, so cleared cards stay gone mid-run.
@@ -732,9 +923,58 @@ class CockpitWindow : Window
     System.Collections.Generic.HashSet<string> _hiddenKeys = new System.Collections.Generic.HashSet<string>();
     List<object> _history = new List<object>();
     int _openSeq = 0;
-    static readonly string SettingsFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "copilot-bridge", "settings.txt");
+    //: The same two-location rule as ApprovalPromptWindow above and tools/settings_path.py.
+    //: This file carried TWO independent copies of the path and the audit found five more
+    //: across the repo -- the fact that had six readers and no owner.
+    static string SettingsFileNew
+    { get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); } }
+
+    static string SettingsFileOld
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            DirectoryInfo d = new DirectoryInfo(Path.GetDirectoryName(exe));
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
 
     TextBlock _header, _sub;
     WrapPanel _subChips;   // Feature 2: discrete Pill() chips replacing _sub's single concatenated sentence
@@ -774,7 +1014,18 @@ class CockpitWindow : Window
     List<Dictionary<string, object>> _toolbarShown = new List<Dictionary<string, object>>();
     DispatcherTimer _timer;
     string _lastSig = "";
-    JavaScriptSerializer _js = new JavaScriptSerializer();
+    // MaxJsonLength IS NOT OPTIONAL HERE. JavaScriptSerializer defaults to 2,097,152 chars,
+    // and .fleet/status.json crosses that at roughly 266 workers (~7.5 KB each). The
+    // 2026-09-09 run wrote 900 workers = 6,774,180 bytes, so DeserializeObject threw on every
+    // tick from about a third of the way in. ReadStatus caught it and returned null, OnTick
+    // read null as "idle" and returned BEFORE ArchiveTerminal / ArchiveRunTailOnce /
+    // MaybeAutoArchive -- so SaveHistory never ran and .fleet/history.json was never even
+    // created. A full run of finished work accumulated nowhere, silently, for twenty hours.
+    //
+    // This is a ceiling, not a one-off: every run past ~266 workers hits it. The same
+    // instance also SERIALIZES history.json, which meets the identical limit from the other
+    // side once history itself grows past 2 MB, so raising it here covers both directions.
+    JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
     // Cached meta string for the directive-band row Sig (avoids per-tick rebuild when nothing changed).
     string _directiveBandMeta = "";
@@ -840,13 +1091,24 @@ class CockpitWindow : Window
     bool _autoRetry = true;
     int _autoRetryMax = 2;
     Dictionary<string, int> _autoRetryCount = new Dictionary<string, int>();
+    HashSet<string> _autoRetriedWorkers = new HashSet<string>();   // RetryWorkerKey of workers already re-queued
 
-    // Conversation retention. BOTH DEFAULT TO ZERO, WHICH MEANS KEEP EVERYTHING. This store
-    // exists because history was disappearing; a retention policy that starts deleting the day
-    // it ships is that same loss arriving on a schedule. The operator opts in.
-    int _retDays = 0;          // settings.txt session_retention_days= ; 0 = keep forever
+    // Conversation retention. OWNER DECISION 2026-09-24: _retDays now DEFAULTS TO 90, not 0.
+    // The store exists because history was disappearing, and a policy that started deleting
+    // the day it shipped would have been that same loss arriving on a schedule -- but the
+    // opt-in default meant operators who never found this dialog kept every conversation
+    // forever, unbounded, on purpose. 90 is now what "never touched this control" means. An
+    // operator who explicitly sets it to 0 still gets "keep everything": this field only ever
+    // starts at 90 when settings.txt has no session_retention_days line at all (LoadSettings,
+    // below, overwrites it -- including with 0 -- the moment the line exists). Mirrors
+    // bridge/session_store.py's DEFAULT_RETENTION_DAYS and tools/settings_keys.py's declared
+    // default for this key; test_the_panel_shows_the_same_default_the_fleet_uses
+    // (tools/test_a_setting_declares_when_it_takes_effect.py) and ui/test_retention_settings.py
+    // both fail if this literal drifts from either. _retMb is unrelated and unchanged: no
+    // owner decision touched the size cap, so it keeps defaulting to "no cap".
+    int _retDays = 90;         // settings.txt session_retention_days= ; 0 = keep forever, unset = 90
     int _retMb = 0;            // settings.txt session_max_mb=        ; 0 = no size cap
-    TextBlock _retDaysValue, _retMbValue, _retNote;
+    TextBlock _retDaysValue, _retMbValue;
 
     // THE DENOMINATOR OF THE RATE STRIP, AND THE LINE ADMISSION HOLDS AT. Microsoft documents
     // 100 generative messages per minute per Dataverse environment, which is the default and
@@ -864,7 +1126,17 @@ class CockpitWindow : Window
     // writing 26 MB a day.
     int _fleetLogDays = 14;    // settings.txt fleet_log_days=
     int _fleetStoreDays = 30;  // settings.txt fleet_store_days=   (run transcripts)
+    int _sidebarCap = 8;       // settings.txt sidebar_section_cap= (chat sidebar rows per section; 0 = all)
+    TextBlock _sidebarCapValue;
+    //: MUST MATCH tools/settings_keys.py's declared defaults, which
+    //: test_the_panel_shows_the_same_default_the_fleet_uses pins. relay/fleet_retention.py
+    //: read both of these on every run while no control here wrote either, so the panel's
+    //: starting value is the only number an operator ever saw for them -- and until today
+    //: there was no panel value at all.
+    int _fleetScratchDays = 14;     // settings.txt fleet_scratch_days=
+    int _fleetCompressHours = 6;    // settings.txt fleet_compress_hours=
     TextBlock _fleetLogDaysValue, _fleetStoreDaysValue;
+    TextBlock _fleetScratchDaysValue, _fleetCompressHoursValue;
 
     // ── P0 HEALTH STRIP ─────────────────────────────────────────────────────────────
     // Six infra dots (Server/Tunnel/Edge/Sign-in/Agent/Tool) in the header, always visible,
@@ -879,9 +1151,63 @@ class CockpitWindow : Window
     // component -- bridge/copilot_bridge.py + tools/tool_probe.py -- this file only reads it).
     enum HealthState { Gray = 0, Green = 1, Yellow = 2, Red = 3, Checking = 4 }
     class DotState { public HealthState State = HealthState.Gray; public string Detail = ""; public DateTime Checked = DateTime.MinValue; }
+    class PlannedServerTransition
+    {
+        public string State = "";
+        public string Reason = "";
+        public double Started = 0;
+        public double Expires = 0;
+        public int SupervisorPid = 0;
+        public double SupervisorStarted = 0;
+    }
+    // Old supervisors wrote only `started`; preserve that format for one deployment generation.
+    // New supervisors write their own policy-derived expiry. The hard cap is only corruption /
+    // stale-file safety: it is intentionally NOT the normal restart budget.
+    const double LEGACY_SERVER_TRANSITION_MAX_AGE_S = 60.0;
+    const double SERVER_TRANSITION_HARD_MAX_AGE_S = 600.0;
     // Index map: 0=server 1=tunnel 2=edge 3=signin 4=agent 5=tool(bridge probe).
-    readonly DotState[] _health = { new DotState(), new DotState(), new DotState(), new DotState(), new DotState(), new DotState() };
+    // SIZED BY THE COUNT, never by however many literals somebody typed. This was six
+    // `new DotState()` in a row. Adding a seventh dot compiled cleanly, and the first
+    // poll threw IndexOutOfRange from SetDot(6, ...) -- which took the whole window down
+    // at startup, so the cockpit did not appear at all and the exit code was the only
+    // evidence. A length kept in step by hand is one that will eventually not be.
+    readonly DotState[] _health = NewDotStates();
+
+    static DotState[] NewDotStates()
+    {
+        var a = new DotState[HEALTH_DOT_COUNT];
+        for (int i = 0; i < a.Length; i++) a[i] = new DotState();
+        return a;
+    }
     readonly object _healthLock = new object();
+    // EXACT HEALTH-POLL SELFTEST SEAMS. Null in every normal process. They exist so a temp
+    // harness can execute PollHealthOnce() itself against an unreachable synthetic server and a
+    // temp transition marker without stopping the production MCP server. Both uses are gated by
+    // WindowSelfTest.Active below; normal cockpit behaviour cannot redirect either source.
+    string _serverTransitionPathForSelfTest = null;
+    Func<string, int, string> _serverHealthBodyForSelfTest = null;
+    // The last /health body, captured by the Server dot's poll so dot 5 can read the FLEET
+    // tool path from it without a second HTTP round trip. Empty until the first successful
+    // poll, and empty must read as "no evidence" everywhere it is used.
+    static string _lastHealthBody = "";
+
+    //: WHEN that body was true, because a payload with no timestamp is indistinguishable from
+    //: a current one. _lastHealthBody was kept for the lifetime of the process and never
+    //: aged: once /health started failing, the last-known fleet_tool_ok went on softening the
+    //: tool dot from red to amber for as long as the cockpit stayed open. The window is the
+    //: same 30 seconds the poll runs on, doubled, so one missed sweep does not blank the dot
+    //: and two do.
+    static double _lastHealthBodyAt = 0;
+    const double HEALTH_BODY_MAX_AGE_S = 60;
+    // SIX. A 7th "frozen set" dot lived here 2026-09-19 to 2026-09-24: it named the
+    // self-improvement judge-file check, sized to HEALTH_DOT_COUNT=7 like every other axis.
+    // Owner feedback on 12b06fd (screenshot + "そもそも置く必要ある？"): the label did not fit
+    // the strip even in plain language, and the strip is the wrong place for it -- the
+    // self-improvement loop already refuses to run on drift, and the self-improvement
+    // dashboard already shows the same fact with its own re-sign button. Removed rather than
+    // shortened. SelfImproveDashboardWindow.FrozenGate / SelfImproveInUse existed only to
+    // feed this dot and were removed with it; the dashboard's own plain-language labels
+    // (auth_intact etc.) are unrelated and unchanged.
     const int HEALTH_DOT_COUNT = 6;
     Border[] _healthDot;           // the 6 colored dots (re-tinted by ApplyHealthToUi)
     FrameworkElement[] _healthSpin;  // rotating in-progress marks, shown instead of a stale color
@@ -897,20 +1223,19 @@ class CockpitWindow : Window
     readonly AutoResetEvent _healthWake = new AutoResetEvent(false); // immediate post-action refresh
     volatile bool _bridgeReconnectRunning = false;   // guard: manual "Reconnect chat" button, never two at once
     string _agentMarkerId = "";    // T_.../P_... id extracted from the configured agent URL (.env)
-    volatile bool _startAllLaunched = false;   // reentry guard for RunStartAll (per-cooldown, not per-app-run only)
-    double _startAllLastUnix = 0.0;            // NowUnix() at last RunStartAll launch; 120s cooldown
     bool _startupHealCheckDone = false;        // set after the first PollHealthOnce's auto-heal decision runs once
 
     public CockpitWindow(string path)
     {
         _statusPath = ResolvePath(path);
         string dir = Path.GetDirectoryName(_statusPath);
-        _commandsPath = Path.Combine(dir, "commands.json");
+        _fleetDir = dir;
         _historyPath = Path.Combine(dir, "history.json");
         _openPath = Path.Combine(dir, "open.json");
         _convsPath = Path.Combine(dir, "conversations.json");
         _hiddenPath = Path.Combine(dir, "cockpit_hidden.json");
         _resumeDismissPath = Path.Combine(dir, "cockpit_resume_dismissed.json");
+        _clearedLogPath = Path.Combine(dir, "history_cleared.jsonl");
         LoadGlyphs();
         LoadHistory();
         LoadHidden();
@@ -945,6 +1270,188 @@ class CockpitWindow : Window
         _healthStop = true;
         try { _healthWake.Set(); } catch (Exception) { }
         base.OnClosed(e);
+    }
+
+    // ── the TASK QUEUE, which this window never looked at ──────────────────────────────────
+    //
+    // This panel reads .fleet/status.json and nothing else -- the runner's snapshot of WORKERS.
+    // A job submitted through fleet_submit lands in .fleet/tasks/pending/<id>.json and has no
+    // worker until a coordinator starts, so for the whole gap between "on disk" and "a worker
+    // exists" the queue was invisible here and EmptyState() said "タスクはまだありません" --
+    // which was not slow, it was false. The operator watching this screen could not tell a
+    // submission that landed from one that vanished, and the standing rule in this project is
+    // that what cannot be confirmed in the GUI does not count as working. So a submitted job
+    // could not be verified at all.
+    //
+    // A worker held at status "pending" ("待機列") is a DIFFERENT state -- the admission gate
+    // holding a worker that exists -- and the two are shown apart on purpose.
+    //
+    // AND THEN IT WAS STILL INVISIBLE, because the queue was drawn only inside EmptyState():
+    // with a run live or anything in history, a submitted job did not appear until a worker
+    // existed for it. The queue is now one of three sources of a "submitted, not picked up
+    // yet" group drawn at the TOP of the list in every state (ui/SubmittedTasks.cs says what
+    // is merged and when an entry leaves). EmptyState and the published strip read the SAME
+    // merged list, through ReadQueuedJobs(), so the three cannot disagree.
+    readonly SubmittedTasks _submitted = new SubmittedTasks();
+    // Replaced wholesale on the UI thread each tick and never mutated afterwards, so the health
+    // poll's background thread can read it (PublishHealthStrip) without a lock.
+    volatile List<SubmittedView> _submittedNow = new List<SubmittedView>();
+    string _submittedSig = "";
+
+    static string TasksDir()
+    {
+        string exeDir = AppDomain.CurrentDomain.BaseDirectory;          // ...\ui\
+        return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "tasks"));
+    }
+
+    // What the "submitted" group shows right now: the merged list, newest first, as of the
+    // last tick. The one read EmptyState, the rows and PublishHealthStrip all share.
+    List<SubmittedView> ReadQueuedJobs()
+    {
+        List<SubmittedView> now = _submittedNow;
+        return now ?? new List<SubmittedView>();
+    }
+
+    // Once per tick: read the three on-disk sources and merge them with this window's own
+    // submissions. NEVER THROWS INTO THE TICK -- SubmittedTasks.ReadFiles swallows a torn or
+    // half-written file, and anything else here leaves the previous list on screen.
+    //
+    // WHERE IT LOOKS, named here rather than inside SubmittedTasks so the panel's published
+    // strip (queue_dir) and this read cannot point at different places:
+    //   <state dir>/commands.d   add_goal commands no run has consumed yet
+    //   <tasks>/"pending"        fleet_submit's queue, not yet routed
+    //   <tasks>/"for_fleet"      routed, waiting for a fleet to start
+    void RefreshSubmitted(Dictionary<string, object> root)
+    {
+        try
+        {
+            string tasks = TasksDir();
+            List<SubmittedFile> files = SubmittedTasks.ReadFiles(
+                Path.Combine(_fleetDir, "commands.d"),
+                Path.Combine(tasks, "pending"),
+                Path.Combine(tasks, "for_fleet"));
+            List<SubmittedView> views = _submitted.Refresh(files, StartedOf(root),
+                                                           WorkersOf(root), HistoryWorkers(), NowUnix());
+            _submittedNow = views;
+            _submittedSig = SubmittedTasks.Signature(views, _lang == 0);
+        }
+        catch (Exception) { }
+    }
+
+    static string StartedOf(Dictionary<string, object> root)
+    {
+        return root == null ? "" : S(root, "started");
+    }
+
+    static List<Dictionary<string, object>> WorkersOf(Dictionary<string, object> root)
+    {
+        var l = new List<Dictionary<string, object>>();
+        object wo;
+        if (root != null && root.TryGetValue("workers", out wo) && wo is object[])
+            foreach (object o in (object[])wo)
+            {
+                var d = o as Dictionary<string, object>;
+                if (d != null) l.Add(d);
+            }
+        return l;
+    }
+
+    List<Dictionary<string, object>> HistoryWorkers()
+    {
+        var l = new List<Dictionary<string, object>>();
+        if (_history == null) return l;
+        foreach (object o in _history)
+        {
+            var d = o as Dictionary<string, object>;
+            if (d != null) l.Add(d);
+        }
+        return l;
+    }
+
+    // THE INSTANT THIS WINDOW SUBMITS: put each goal in the "submitted" group before any file
+    // is read back, then re-render on the next dispatcher turn. BeginInvoke, not a direct
+    // ForceRender: AutoRetryScan calls RetryGoal from inside OnTick, and a nested OnTick there
+    // would re-enter the scan. The status.json read here is what a retry's goal is measured
+    // against -- the worker being retried is already on the board with this very goal text,
+    // and must not count as the new submission's worker (see SubmittedTasks.AddLocal).
+    // Snapshot what existed BEFORE a submission leaves this process. A worker can appear in the
+    // few milliseconds between SendCommand/Process.Start and the optimistic UI row. If we sample
+    // after the handoff, that brand-new worker looks "preexisting" and the submitted row can
+    // remain `taken` forever even though the fleet already created its worker.
+    sealed class SubmissionBaseline
+    {
+        public string Started;
+        public List<Dictionary<string, object>> Workers;
+        public List<Dictionary<string, object>> History;
+        public double CapturedUnix;
+    }
+
+    SubmissionBaseline CaptureSubmissionBaseline()
+    {
+        try
+        {
+            Dictionary<string, object> root = ReadStatus();
+            return new SubmissionBaseline {
+                Started = StartedOf(root),
+                Workers = WorkersOf(root),
+                History = HistoryWorkers(),
+                CapturedUnix = NowUnix() };
+        }
+        catch (Exception)
+        {
+            return new SubmissionBaseline {
+                Started = "", Workers = new List<Dictionary<string, object>>(),
+                History = new List<Dictionary<string, object>>(), CapturedUnix = NowUnix() };
+        }
+    }
+
+    void NoteSubmitted(IEnumerable<string> goals)
+    {
+        NoteSubmitted(goals, CaptureSubmissionBaseline());
+    }
+
+    void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)
+    {
+        try
+        {
+            SubmissionBaseline b = baseline ?? CaptureSubmissionBaseline();
+            foreach (string g in goals)
+                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), b.CapturedUnix,
+                                    b.Started, b.Workers, b.History);
+            Dispatcher.BeginInvoke(new Action(ForceRender));
+        }
+        catch (Exception) { }
+    }
+
+    static string OneLine(string text, int cap)
+    {
+        string t = (text ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        while (t.Contains("  ")) t = t.Replace("  ", " ");
+        if (t.Length > cap) t = t.Substring(0, cap) + "…";
+        return t;
+    }
+
+    //: How long a server may be stale before it is worth a colour.
+    //:
+    //: The supervisor checks roughly every 30 s and requires the condition to persist across
+    //: TWO consecutive checks before it cycles, and it only cycles while the fleet is idle. Ten
+    //: minutes is comfortably past a healthy cycle and still short enough that a person who
+    //: needs to know finds out in the same sitting. Below it, staleness is a fact in the detail
+    //: line; above it, the machine has had its chance and failed.
+    const double STALE_AMBER_AFTER_S = 600.0;
+
+    static bool StaleLongEnoughToMatter(string srvBody)
+    {
+        string raw = HealthField(srvBody, "server_stale_for_s");
+        // AN OLDER SERVER DOES NOT PUBLISH THIS, and absence must not read as zero -- that would
+        // make every stale server green forever, which is the opposite failure and a worse one.
+        // Unknown is treated as "worth a colour", the same way an unreadable state is elsewhere.
+        if (string.IsNullOrEmpty(raw) || raw == "null") return true;
+        double secs;
+        if (!double.TryParse(raw, System.Globalization.NumberStyles.Float,
+                             System.Globalization.CultureInfo.InvariantCulture, out secs))
+            return true;
+        return secs >= STALE_AMBER_AFTER_S;
     }
 
     static string ResolvePath(string path)
@@ -1010,11 +1517,13 @@ class CockpitWindow : Window
         if (k == "flt_active") return ja ? "実行中" : "Active";
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
+        if (k == "flt_intr") return ja ? "中断" : "Interrupted";
         // legacy key kept for safety (no longer rendered)
         // Feature C: retry
         if (k == "retry") return ja ? "再試行" : "Retry";
         if (k == "retry_all") return ja ? "停止を一括再試行" : "Retry all stopped";
         if (k == "retry_note") return ja ? "停止中のため、このゴール用にフリートを再起動しました" : "No run live — relaunched a fleet for this goal";
+        if (k == "retry_capped") return ja ? "再試行上限に達したゴールを除外" : "at retry cap, skipped";
         if (k == "autoretry") return ja ? "自動再試行" : "Auto-retry";
         if (k == "cap") return ja ? "上限" : "cap";
         if (k == "to_history") return ja ? "履歴へ" : "To history";
@@ -1025,6 +1534,7 @@ class CockpitWindow : Window
         if (k == "rate") return ja ? "件/時" : "/h";
         // Effort selector + fleet-wide pause/stop (NEW)
         if (k == "effort") return ja ? "推論" : "Reasoning";
+        if (k == "effort_policy") return ja ? "推論方針" : "Effort policy";
         if (k == "approval") return ja ? "承認" : "Approval";
         if (k == "run_mode") return ja ? "実行方式" : "Run mode";
         if (k == "pause") return ja ? "一時停止" : "Pause";
@@ -1043,6 +1553,7 @@ class CockpitWindow : Window
         if (k == "hs_fix") return ja ? "直す" : "Fix";
         if (k == "hs_fixing_button") return ja ? "修復中…" : "Fixing…";
         if (k == "hs_fix_hint") return ja ? "検出された不具合を直す" : "Fix the detected problem";
+        if (k == "hs_queue_stale") return ja ? "未着手の投入済みタスクが {0} 件、最長 {1} 続いています" : "{0} submitted task(s) still unstarted; oldest {1}";
         if (k == "hs_ok") return ja ? "正常" : "OK";
         if (k == "hs_down") return ja ? "応答なし" : "down";
         if (k == "hs_unknown") return ja ? "未設定/不明" : "unknown";
@@ -1051,11 +1562,28 @@ class CockpitWindow : Window
         if (k == "hs_never") return ja ? "未確認" : "not checked yet";
         if (k == "hs_srv_detail_ok") return ja ? "ローカルサーバは応答しています (127.0.0.1:8000)" : "Local server responding (127.0.0.1:8000)";
         if (k == "hs_srv_detail_bad") return ja ? "ローカルサーバが応答しません。start_all.bat を実行してください。" : "Local server not responding. Run start_all.bat.";
+        // Amber, not red: the process IS up and answering. It is telling us its callers are
+        // being rejected, which /health has always reported and this dot never read.
+        if (k == "hs_srv_detail_auth") return ja ? "サーバは応答しているが、直近10分に認証失敗が出ています。MCP_API_KEY の不一致を疑ってください。件数:" : "Server is responding, but reporting auth failures in the last 10 minutes. Suspect an MCP_API_KEY mismatch. Count:";
         if (k == "hs_tun_detail_ok") return ja ? "トンネル経由でサーバに到達できます" : "Server reachable through the tunnel";
         if (k == "hs_tun_detail_bad") return ja ? "トンネルからサーバに到達できません" : "Server not reachable through the tunnel";
         if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
+        if (k == "hs_edge_detail_notabs") return ja ? "ブラウザは応答しています。この走行はソケット経路でタブを使わないため、タブが無いのは正常です。" : "The browser is responding. This run uses the socket route and drives no tabs, so having none is expected.";
+        // A SEPARATE SENTENCE FOR A SEPARATE FACT. The message above asserts a socket-route
+        // run, and it was shown on an idle machine where no run existed at all.
+        if (k == "hs_edge_detail_norun") return ja ? "ブラウザは応答しています。走行が無いので、タブについては何も確認していません。" : "The browser is responding. No run is active, so nothing has been checked about tabs.";
+        if (k == "hs_signin_old_ok") return ja ? "サインイン記録は有効期限内ですが、取得が古く現在の状態を保証しません。再取得までは未確認です。" : "The sign-in record is unexpired, but it is old and does not attest to the session right now. Unverified until the next capture.";
+        if (k == "hs_agent_other_surface") return ja ? "エージェント紐付けの直接の証拠がありません。別サーフェスの直近取得にgpt_idがあるだけで、フリート自身の紐付けは未確認です。" : "No direct evidence that THIS surface is bound to an agent -- only a gpt_id from the last capture on ANOTHER surface. The fleet own binding is unverified.";
+        if (k == "hs_srv_detail_stale") return ja ? "サーバは応答していますが、起動時のコードのままでチェックアウトが先に進んでいます。再起動しないと修正は反映されません。起動時HEAD:" : "The server is responding but is still running the code it started on; the checkout has moved past it. Fixes are not live until it restarts. Started at HEAD:";
+        // THE SAME FACT, NOT PRESENTED AS SOMETHING TO DO. Shown on a GREEN dot while the
+        // supervisor still has its chance to cycle the server; the line above is for when
+        // it has had that chance and the server is still stale.
+        if (k == "hs_srv_detail_stale_recent") return ja ? "サーバは応答しています。チェックアウトが先に進んでいますが、フリートがアイドルになれば自動で入れ替わります。人の操作は不要です。" : "The server is responding. The checkout has moved past it, and it will be cycled automatically once the fleet is idle. Nothing for you to do.";
+        if (k == "hs_tun_detail_other") return ja ? "トンネルは応答していますが、このマシンで動いているサーバとは別のプロセスに繋がっています。pid:" : "The tunnel is responding, but it reaches a DIFFERENT process than the server running on this machine. pid:";
+        if (k == "hs_tool_detail_fleet_down") return ja ? "ブリッジ側はツールを呼べていますが、フリート側のツール呼び出しが連続失敗しています。作業を実行する経路はこちらです。" : "The bridge can call tools, but the FLEET path is failing repeatedly. That is the path that does the work.";
+        if (k == "hs_tool_detail_bridge_only_down") return ja ? "落ちているのはブリッジのチャット経路だけで、フリートのツール呼び出しは成功しています。ツール全体が不通ではありません。" : "Only the bridge chat path is down; fleet tool calls are succeeding. This is not a total tool outage.";
         if (k == "hs_tool_detail_never") return ja ? "自己診断がまだ一度も結果を書いていない（ブリッジ未起動か診断側の不具合）" : "the self-probe has never written a result (bridge not started, or the probe is broken)";
         if (k == "hs_signin_old") return ja ? "サインイン失敗の記録が古く、現在の状態を表していない可能性" : "the sign-in failure on record is old and may not describe the present";
         if (k == "hs_edge_detail_blank") return ja ? "ブラウザは動作中だがエージェントのページが開かれていない" : "browser up, but no agent page open";
@@ -1064,14 +1592,25 @@ class CockpitWindow : Window
         if (k == "hs_signin_ok") return ja ? "M365 にサインイン済み（ログイン画面なし）" : "Signed in to M365 (no login wall)";
         if (k == "hs_signin_bad") return ja ? "サインインが必要です（ログイン画面を検出）" : "Sign-in required (login wall detected)";
         if (k == "hs_agent_ok") return ja ? "専用エージェントに接続中" : "Bound to the configured agent";
-        if (k == "hs_agent_warn") return ja ? "既定Copilotに落ちている可能性（エージェント未検出）" : "Possible default-Copilot fallback (agent tab not found)";
-        if (k == "hs_agent_bad") return ja ? "実行中ですがM365チャットタブを検出できません" : "Run is active but no M365 chat tab is available";
+        if (k == "hs_agent_warn") return ja ? "M365のタブはありますが、設定されたエージェントではありません。既定Copilotに落ちている可能性があります（コネクタ無し・テナント接地無しで、それらしく答えます）。" : "An M365 tab is open, but it is not the configured agent -- possibly the default Copilot, which answers fluently with no connectors and no tenant grounding.";
+        // WAS TAB-ERA TEXT. This dot stopped reading tabs when the socket route landed, so
+        // under that route there is never a chat tab and the one red message on the agent
+        // dot sent the reader looking for something whose absence is normal. The branch
+        // that still reaches this is: route open, no cached binding, no gpt_id anywhere.
+        if (k == "hs_agent_bad") return ja ? "実行中ですが、このサーフェスがエージェントに紐付いている証拠がありません（テンプレート未取得または期限切れ）" : "Run is active, but there is no evidence this surface is bound to an agent (no cached template, or it has expired)";
+        if (k == "hs_agent_unknown_live") return ja ? "実行中ですが取得記録がまだありません。未確認であって失敗ではありません。" : "Run is active but no capture has been recorded yet. Unverified, not failed.";
+        if (k == "hs_agent_route_unknown") return ja ? "ソケット経路の記録が読めず、タブ利用かどうか判定できません。故障ではなく未確認です。" : "The socket route record could not be read, so whether this run drives tabs is unknown. Unverified, not failed.";
         // hs_agent_gray no longer means "Edge is down": under the socket route the agent dot
         // is grey when no run is in flight, which is the ordinary idle state.
         if (k == "hs_agent_gray") return ja ? "走行なし" : "No run in flight";
         if (k == "hs_agent_canned") return ja ? "（直近の返答が定型の無回答）" : " (the last reply was the canned non-answer)";
         if (k == "hs_agent_tabs") return ja ? "ソケット経路が閉鎖 — 全ワーカーがタブ（動作するがコスト大）" : "Socket route closed — every worker on a tab (works, costs several times more)";
         if (k == "hs_signin_gray") return ja ? "捕捉の記録なし（走行なし）" : "No capture on record (no run)";
+        // TWO OF THE THREE BRANCHES THAT USED hs_signin_gray DO have a record; it is
+        // merely old, or the token has run out. Saying "no capture on record" there is a
+        // statement a reader can check and find false, which costs more than saying less.
+        if (k == "hs_signin_gray_old") return ja ? "取得記録はありますが古く、走行も無いため現在の状態は未確認です。" : "There is a capture on record, but it is old and no run is active, so the present state is unverified.";
+        if (k == "hs_signin_gray_expired") return ja ? "記録上のトークンは期限切れですが、走行が無いため必要とされていません。" : "The token on record has expired, but no run is asking for one.";
         if (k == "hs_signin_unknown_live") return ja ? "走行中だが捕捉の記録がない" : "A run is live and no capture is on record";
         if (k == "hs_signin_failed_other") return ja ? "直近の捕捉が失敗（サインイン以外の理由）" : "The last capture failed for a reason other than sign-in";
         if (k == "hs_signin_stale") return ja ? "トークンが期限切れ（走行中）" : "The token has expired while a run is live";
@@ -1087,6 +1626,15 @@ class CockpitWindow : Window
         if (k == "hs_fix_done") return ja ? "完了" : "done";
         if (k == "hs_fix_err") return ja ? "修復でエラー" : "fix error";
         if (k == "hs_fix_manual_needed") return ja ? "手動での対応が必要です" : "Manual step needed";
+        // 2026-09-24 startup-loop fix: see StartupGate / AutoFixBudget in
+        // ui/SelfImproveDashboard.cs for the mechanism these three strings surface.
+        if (k == "autofix_start_all_running") return ja ? "起動処理が進行中です" : "Startup is already in progress";
+        if (k == "autofix_exhausted") return ja
+            ? "自動修復を繰り返しましたが直りませんでした。しばらく待つか、「直す」ボタンで再試行してください。"
+            : "Automatic repair kept failing and has stopped retrying for now. Wait a bit, or use the Fix button to try again.";
+        if (k == "hs_fix_repair_unreadable") return ja
+            ? "自動修復の結果を読み取れませんでした。doctor.bat を実行して原因を確認してください。"
+            : "Could not read the automatic repair result. Run doctor.bat to see what is wrong.";
         if (k == "infra_wait") return ja ? "インフラ待ち" : "Infra wait";
         if (k == "infra_retry") return ja ? "再投入" : "Re-queue";
         if (k == "badge_default_copilot") return ja ? "既定Copilot" : "default Copilot";
@@ -1111,32 +1659,64 @@ class CockpitWindow : Window
         // Settings panel (gear popup) -- consolidates the scattered toolbar controls
         if (k == "settings") return ja ? "設定" : "Settings";
         if (k == "set_tabs_section") return ja ? "並列タブ" : "Parallel tabs";
+        // Header chip "タブ X/Y". Y is the LIVE admission ceiling (shrinks/grows with free RAM);
+        // X is real browser tabs open right now. A shrink is soft -- it stops new tabs from
+        // opening, it does not close ones already running -- so X can sit above Y for a while as
+        // the fleet drains down to the new ceiling, and one worker mid fan-out (research +
+        // refuter side-pages) alone can be up to 3 of X. Neither is a bug; the tooltip says so
+        // instead of leaving "3/1" looking like a broken cap.
+        if (k == "tabs_chip_hint") return ja
+            ? "今開いているタブ数 / 上限（空きRAMで自動増減）。上限を下げても今動いている分は閉じません。次に空くまで新規だけ止めます。1ワーカーが調査・反論用の子タブを開くと、それだけで数字が上限を超えて見えることがあります。"
+            : "Open tabs now / the live ceiling (auto-adjusts with free RAM). Lowering the ceiling doesn't close tabs already running -- it only stops new ones until one frees up. One worker fanning out to research/refuter side-tabs can push the count above the ceiling by itself.";
         if (k == "set_retry_section") return ja ? "自動再試行" : "Auto-retry";
         if (k == "set_retention_section") return ja ? "会話の保持" : "Conversation retention";
         if (k == "set_rate_section") return ja ? "レート上限" : "Rate ceiling";
         if (k == "rate_rpm") return ja ? "毎分の上限" : "Per minute";
+        // ONE LINE, BECAUSE THE PANEL IS A LIST OF CONTROLS AND NOT A MANUAL. This was five
+        // sentences -- what the ceiling does, what the bar is drawn against, where the default
+        // comes from, when to lower it, what 0 means. Together with the retention note below it
+        // made the panel taller than the display, and the section at the bottom (詳細設定) was
+        // pushed off the screen entirely. The operator reported that section as missing.
+        // What survives is what changes a decision: the number's meaning and how to turn it off.
         if (k == "rate_note") return ja
-            ? "直近１分がこの本数に達している間は新しい投入を止め、下がったら再開します。上のバーもこの数字を分母に描きます。既定100はMicrosoftの公開値(環境あたり毎分)。拒否が出るのに余裕があるように見えるなら、ここを下げてください。0で無効。"
-            : "While the last minute is at this number, nothing new is admitted; it resumes when it drops. The bar above is drawn against it too. The default 100 is Microsoft's published per-environment figure. If refusals arrive while the bar still shows headroom, lower this. 0 disables it.";
+            ? "直近1分がこの本数に達したら投入を止め、下がったら再開。0で無効。"
+            : "Admission pauses while the last minute is at this number, and resumes when it drops. 0 disables it.";
         if (k == "set_fleetret_section") return ja ? "作業ディレクトリの保持" : "Working directory retention";
         if (k == "fleet_log_days") return ja ? "ログ(日)" : "Logs (days)";
         if (k == "fleet_store_days") return ja ? "実行記録(日)" : "Run records (days)";
+        if (k == "set_sidebar_section") return ja ? "チャットのサイドバー" : "Chat sidebar";
+        if (k == "sidebar_section_cap") return ja ? "各節の表示件数(0=すべて)" : "Rows per section (0 = all)";
+        if (k == "sidebar_cap_all") return ja ? "すべて" : "All";
+        if (k == "fleet_scratch_days") return ja ? "作業ファイル(日)" : "Scratch files (days)";
+        if (k == "fleet_compress_hours") return ja ? "圧縮まで(時間)" : "Compress after (h)";
         if (k == "fleet_ret_note") return ja
-            ? "終わった走行のログの保持期間。会話の保持とは別物で、消えるのはログだけです。これより新しいものは圧縮して残します(93〜99%小さくなるので、期間を縮めるより先に効きます)。"
-            : "How long finished runs' logs are kept. Separate from conversation retention -- only logs are removed. Anything newer is compressed rather than deleted (93-99% smaller, which does more than shortening this ever will).";
+            ? "終わった走行のログのみ。会話は消えません。新しい分は圧縮して残します。"
+            : "Finished runs' logs only -- conversations are not touched. Newer ones are compressed, not deleted.";
         if (k == "ret_days") return ja ? "保持日数" : "Keep for (days)";
         if (k == "ret_keep") return ja ? "消さない" : "keep all";
         if (k == "ret_mb") return ja ? "上限サイズ (MB)" : "Size cap (MB)";
-        if (k == "ret_off") return ja
-            ? "0 = 消さない（既定）。会話はローカルの SQLite に残り、タブを作り直しても失われません。"
-            : "0 = keep everything (default). Conversations live in local SQLite and survive a fresh tab.";
-        if (k == "ret_whole") return ja
-            ? "削除は会話単位です。途中だけ消えた会話は、完全な顔をして中身が抜けているため作りません。"
-            : "Whole conversations only -- a half-kept one reads as complete and is not.";
         if (k == "set_capacity_section") return ja ? "容量ガード" : "Capacity guard";
         if (k == "disk_floor") return ja ? "実行下限ディスク (GB)" : "Disk floor (GB)";
         if (k == "disk_floor_hint") return ja ? "空きディスクがこの値を下回るとタブ開放を待機します。" : "Pauses opening tabs when free disk drops below this.";
         if (k == "ram_floor") return ja ? "確保する空きRAM (MB)" : "RAM floor (MB)";
+        // FALLBACK: on-demand re-unlock. Automatic recovery already exists (relay_fleet
+        // injects the unlock password into a worker's first turn, and a heuristic retries
+        // it when a reply looks like a lock refusal) but both can miss -- see
+        // relay/fleet_runner.py's apply_reunlock docstring for the incident this answers:
+        // twice in one day a worker was refused for lock, nothing recovered it, and the
+        // run carried on regardless. The route is visible here; the password never is --
+        // it is read on the coordinator's machine from its own .env and never appears in
+        // the command file this button writes.
+        if (k == "set_approval_section") return ja ? "操作承認" : "Approval policy";
+        if (k == "set_approval_hint") return ja
+            ? "自動=禁止パターンは即拒否・それ以外は通す（推奨）／バイパス=ゲートを掛けない／毎回確認=初見の種類ごとに人に訊く"
+            : "Auto = refuse prohibited patterns outright, pass the rest (recommended) / Bypass = no gate / Confirm = ask a person about every first-seen class";
+        if (k == "set_approval_note") return ja
+            ? "承認ダイアログと同じ設定です。ダイアログは承認待ちのときしか開かないので、落ち着いて見直せる場所にも置いてあります。次の判定から効きます。"
+            : "The same setting the approval dialog carries. That dialog only opens while an approval is being demanded, so the choice lives here too. Takes effect from the next decision.";
+        // The re-unlock control's four strings were removed with it. They described a text box
+        // for typing which worker to rescue -- a question the records can answer and a person
+        // cannot. relay/fleet_runner.py sweep_unclaimed_refusals does the rescuing now.
         if (k == "ui_scale_section") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale") return ja ? "表示サイズ" : "UI scale";
         if (k == "ui_scale_hint") return ja ? "Ctrl+ホイールや Ctrl +/− でも変更できます（Ctrl+0 で自動）。" : "Also change with Ctrl+wheel or Ctrl +/− (Ctrl+0 = auto).";
@@ -1192,6 +1772,7 @@ class CockpitWindow : Window
         if (s == "maxturns") return ja ? "上限" : "Max turns";
         if (s == "error") return ja ? "エラー" : "Error";
         if (s == "cancelled") return ja ? "停止" : "Stopped";
+        if (s == "interrupted") return ja ? "中断" : "Interrupted";
         if (s == "pending") return ja ? "待機列" : "Queued";
         if (s == "ready") return ja ? "準備" : "Ready";
         return s;
@@ -1255,8 +1836,14 @@ class CockpitWindow : Window
                     _rateCeiling = Math.Max(0, Math.Min(10000, v));
                 else if (ln.StartsWith("fleet_log_days=") && int.TryParse(ln.Substring(15).Trim(), out v))
                     _fleetLogDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("sidebar_section_cap=") && int.TryParse(ln.Substring(20).Trim(), out v))
+                    _sidebarCap = Math.Max(0, Math.Min(500, v));
                 else if (ln.StartsWith("fleet_store_days=") && int.TryParse(ln.Substring(17).Trim(), out v))
                     _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("fleet_scratch_days=") && int.TryParse(ln.Substring(19).Trim(), out v))
+                    _fleetScratchDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("fleet_compress_hours=") && int.TryParse(ln.Substring(21).Trim(), out v))
+                    _fleetCompressHours = Math.Max(1, Math.Min(720, v));
                 else if (ln.StartsWith("disk_floor_gb="))
                 {
                     double df;
@@ -1291,6 +1878,11 @@ class CockpitWindow : Window
                                         System.Globalization.CultureInfo.InvariantCulture, out ut))
                     { _scaleTarget = Math.Max(0.8, Math.Min(3.0, ut)); _scaleTargetLoaded = true; }
                 }
+                else if (ln.StartsWith(EffortPolicyView.Key + "="))
+                {
+                    string epm = EffortPolicyView.ParseMode(ln);
+                    if (epm != null) _effortPolicy = epm;
+                }
                 else if (ln.StartsWith("effort="))
                 {
                     string ef = ln.Substring(7).Trim();
@@ -1303,8 +1895,56 @@ class CockpitWindow : Window
                 }
                 else if (ln.StartsWith("fanout="))
                 {
-                    string fx = ln.Substring(7).Trim().ToLower();
-                    _fanout = (fx == "on" || fx == "1" || fx == "true");
+                    bool? fxv = FanoutView.ParseSetting(ln);   // same reading as Python's settings_fanout
+                    if (fxv.HasValue) _fanout = fxv.Value;
+                }
+                else if (ln.StartsWith("fanout_write_scope="))
+                {
+                    string wsv = WriteScopeView.ParseLine(ln);   // off|shadow only; junk keeps the value
+                    if (wsv != null) _wsVal = wsv;
+                }
+                else if (ln.StartsWith("fleet_auto_resume="))
+                {
+                    string arv = AutoResumeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (arv != null) _arVal = arv;
+                }
+                else if (ln.StartsWith("supervisor_self_restart="))
+                {
+                    string srv = SupervisorCodeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (srv != null) _srVal = srv;
+                }
+                else if (ln.StartsWith("tool_probe_idle_min="))
+                {
+                    string tpv = ToolProbeView.ParseLine(ln);   // 0|15|30|60 only; junk keeps the value
+                    if (tpv != null) _tpVal = tpv;
+                }
+                else if (ln.StartsWith("merge_conversation="))
+                {
+                    string mcv = MergeConversationView.ParseLine(ln);   // fresh|parent only; junk keeps the value
+                    if (mcv != null) _mcVal = mcv;
+                }
+                else if (ln.StartsWith("fanout_hierarchical_merge="))
+                {
+                    string hmv = HierarchicalMergeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (hmv != null) _hmVal = hmv;
+                }
+                else if (ln.StartsWith("fanout_max_depth="))
+                {
+                    int? fdv = FanoutDepthView.ParseLine(ln);   // clamped; junk keeps the value
+                    if (fdv.HasValue) _fdVal = fdv.Value;
+                }
+                else if (ln.StartsWith("fanout_max_"))
+                {
+                    for (int fbi = 0; fbi < FanoutBudgetView.Keys.Length; fbi++)
+                    {
+                        int? fbv = FanoutBudgetView.ParseLine(fbi, ln);   // clamped; junk keeps the value
+                        if (fbv.HasValue) _fbVals[fbi] = fbv.Value;
+                    }
+                }
+                else if (ln.StartsWith("runtime="))
+                {
+                    string rt = ln.Substring(8).Trim().ToLower();
+                    if (rt == "fleet" || rt == "durable") _runtimeMode = rt;
                 }
             }
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
@@ -1323,8 +1963,8 @@ class CockpitWindow : Window
                     else lines.Add(ln);
                 }
             if (!found) lines.Add(key + "=" + val);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
             _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
         }
         catch (Exception) { }
@@ -1423,6 +2063,9 @@ class CockpitWindow : Window
         PaintWorkerChipBorder(_workerChipBorder);
         ctrls.Children.Add(_workerChipBorder);
 
+        // HEADER CONTROL SET IS PINNED by relay/test_cockpit_header_controls.py. Do NOT add a
+        // control here: new settings belong in the gear popup (BuildSettingsPanel), in the
+        // "Fan-out" / "Effort" sections or a new section of their own.
         ctrls.Children.Add(EffortControl());
         ctrls.Children.Add(ApprovalControl());
         ctrls.Children.Add(ApprovalCenterControl());
@@ -1485,6 +2128,7 @@ class CockpitWindow : Window
         // BuildGateBanner() is NOT added here -- it is docked inside the run column (col1) so it
         // cannot overhang the timeline spine. See the comment at that call site.
         root.Children.Add(BuildCapBanner());
+        root.Children.Add(BuildRejectionBanner());
         // The composer docks to the BOTTOM (spec: agent-workspace feel, not a form). It must be
         // added before _list so the list — the LastChildFill element — fills the space above it.
         root.Children.Add(BuildInputBar());
@@ -1496,7 +2140,7 @@ class CockpitWindow : Window
         _list = new ListBox();
         _list.BorderThickness = new Thickness(0);
         _list.Background = Brushes.Transparent;
-        _list.Padding = new Thickness(16, 6, 16, 18);  // bottom clears the composer DropShadow (BlurRadius 14 + ShadowDepth 2 ≈ 12px) so the last row is not overlapped by the shadow
+        _list.Padding = new Thickness(16, 6, 16, 20);  // bottom clears the composer DropShadow (BlurRadius 14 + ShadowDepth 2 ≈ 12px) so the last row is not overlapped by the shadow. 20, not 18: the spacing scale steps in fours above the optical range, and 18 was the only value off it.
         ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
         // Pixel scroll (not item scroll) so the list can SIZE TO CONTENT inside an Auto row and
@@ -2022,6 +2666,11 @@ class CockpitWindow : Window
     // MUST run on the UI thread (called from BuildHealthStrip and from the Dispatcher marshal).
     void ApplyHealthToUi()
     {
+        // BEFORE the early return: the reconnect control lives in the settings panel, which is
+        // built and shown independently of the health dots. Putting this after the guard would
+        // leave it stuck on whatever tint it was born with on any machine where `_healthDot` is
+        // null -- which is the "it is always amber" symptom, reintroduced by the fix for it.
+        RefreshReconnectChatTint();
         if (_healthDot == null) return;
         bool anyBad = false;
         DotState[] snap = new DotState[HEALTH_DOT_COUNT];
@@ -2038,14 +2687,16 @@ class CockpitWindow : Window
             }
             if (_healthSpin != null && _healthSpin[i] != null)
                 _healthSpin[i].Visibility = checking ? Visibility.Visible : Visibility.Collapsed;
-            if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow) anyBad = true;
+            if (snap[i].State == HealthState.Red || snap[i].State == HealthState.Yellow)
+                anyBad = true;
             if (_healthDotWrap[i] != null)
             {
                 string when = snap[i].Checked == DateTime.MinValue
                     ? T("hs_never")
                     : snap[i].Checked.ToLocalTime().ToString("HH:mm:ss");
                 string detail = string.IsNullOrEmpty(snap[i].Detail) ? T("hs_checking") : snap[i].Detail;
-                _healthDotWrap[i].ToolTip = T(_healthKeys[i]) + ": " + detail + "\n" + T("hs_lastcheck") + when;
+                _healthDotWrap[i].ToolTip = T(_healthKeys[i]) + ": " + detail + "\n"
+                    + T("hs_lastcheck") + when;
             }
         }
         if (_fixBtn != null)
@@ -2055,13 +2706,24 @@ class CockpitWindow : Window
             _fixBtn.IsEnabled = !_fixRunning;
             _fixBtn.Content = BuildFixPillContent(_fixRunning);
         }
-        // Clear the stale hint text once everything the strip knows about is healthy again (not
-        // mid-fix): RunFix's note() writes _fixNote.Text once and nothing else used to clear it,
-        // so "run start_all.bat"-style residue could persist forever after the stack recovered.
-        // This runs on the UI thread already (ApplyHealthToUi's documented contract), so no
-        // Dispatcher marshal is needed here (mirrors the rest of this method).
-        if (!anyBad && !_fixRunning && _fixNote != null && _fixNote.Text.Length > 0)
-            _fixNote.Text = "";
+        // Queue starvation is a SEPARATE operational fact, not a seventh infra dot. If a
+        // submitted item survives the worker-pickup budget after current/history reconciliation,
+        // surface it here so the operator does not have to discover it by scrolling.
+        SubmittedHealth queueHealth = SubmittedTasks.SummarizeHealth(ReadQueuedJobs());
+        if (!anyBad && !_fixRunning && _fixNote != null)
+        {
+            if (queueHealth.StaleCount > 0)
+            {
+                _fixNote.Text = string.Format(T("hs_queue_stale"), queueHealth.StaleCount,
+                    SubmittedTasks.Age(queueHealth.OldestAgeS, _lang == 0));
+                _fixNote.Foreground = Theme.Br(Theme.Warning(_dark));
+            }
+            else if (_fixNote.Text.Length > 0)
+            {
+                _fixNote.Text = "";
+                _fixNote.Foreground = Muted;
+            }
+        }
     }
     static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
 
@@ -2070,6 +2732,7 @@ class CockpitWindow : Window
     // running, so we don't restart it — we just refresh the UI from the still-updating cache.
     void StartHealthPoll()
     {
+        if (WindowSelfTest.Active) return;   // probes the network and may start the stack
         _agentMarkerId = ExtractAgentMarker();
         if (_healthThread != null && _healthThread.IsAlive) { ApplyHealthToUi(); return; }
         _healthStop = false;
@@ -2090,7 +2753,10 @@ class CockpitWindow : Window
             // Startup auto-heal: once per app run, right after the FIRST sweep completes, check
             // whether the stack needs bringing up and do it ourselves -- this is what makes
             // launching FleetCockpit.exe directly (not via the desktop icon) self-healing too.
-            // Guarded by _startupHealCheckDone (runs once) and RunStartAll's own 120s cooldown.
+            // Guarded by _startupHealCheckDone (runs once), StartupGate (below -- start_all
+            // already running, or this process was launched BY start_all), RunStartAll's own
+            // persisted cooldown, and FleetRunIsLive(). See StartupGate's doc comment in
+            // ui/SelfImproveDashboard.cs for the loop this whole gate exists to stop.
             if (!_startupHealCheckDone)
             {
                 _startupHealCheckDone = true;
@@ -2099,17 +2765,20 @@ class CockpitWindow : Window
                 System.Diagnostics.Debug.WriteLine("[FleetCockpit] HealthLoop: startup auto-heal check server=" + srv0 + " tunnel=" + tun0);
                 if (srv0 == HealthState.Red || tun0 == HealthState.Red)
                 {
-                    try
+                    var gate = StartupGate.GateAutomaticLaunch(IsStartAllRunning(), LaunchedByStartAll(), true);
+                    if (!gate.Allow)
                     {
-                        if (!Dispatcher.HasShutdownStarted)
-                            Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = T("hs_fix_stack"); }));
+                        if (!string.IsNullOrEmpty(gate.ReasonKey)) NoteFromAnyThread(T(gate.ReasonKey));
                     }
-                    catch (Exception) { }
-// THE SAME GUARD AS EVERY OTHER AUTOMATIC ACTION. This ran RunStartAll on the
+                    // THE SAME GUARD AS EVERY OTHER AUTOMATIC ACTION. This ran RunStartAll on the
                     // first sweep regardless of whether a fleet run was in flight, so a cockpit
                     // opened during a run could restart the stack underneath it.
-                    if (FleetRunIsLive()) { /* leave it to the person */ }
-                    else RunStartAll();
+                    else if (FleetRunIsLive()) { /* leave it to the person */ }
+                    else
+                    {
+                        NoteFromAnyThread(T("hs_fix_stack"));
+                        RunStartAll();
+                    }
                 }
             }
 
@@ -2126,17 +2795,194 @@ class CockpitWindow : Window
         }
     }
 
+    PlannedServerTransition ReadPlannedServerTransition()
+    {
+        try
+        {
+            string path = (WindowSelfTest.Active && !string.IsNullOrEmpty(_serverTransitionPathForSelfTest))
+                ? _serverTransitionPathForSelfTest
+                : Path.Combine(RepoRootForSettings(), ".fleet", "server_transition.json");
+            if (!File.Exists(path)) return null;
+            var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            if (raw == null) return null;
+            object stateObj, reasonObj, startedObj, expiresObj, supervisorPidObj, supervisorStartedObj;
+            if (!raw.TryGetValue("state", out stateObj) || stateObj == null) return null;
+            string state = Convert.ToString(stateObj).Trim().ToLowerInvariant();
+            if (state != "planned_restart") return null;
+            if (!raw.TryGetValue("started", out startedObj) || startedObj == null) return null;
+            double started = Convert.ToDouble(startedObj, System.Globalization.CultureInfo.InvariantCulture);
+            double nowUnix = NowUnix();
+            double age = nowUnix - started;
+            if (age < -5.0 || age > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+
+            double expires = started + LEGACY_SERVER_TRANSITION_MAX_AGE_S;
+            if (raw.TryGetValue("expires", out expiresObj) && expiresObj != null)
+                expires = Convert.ToDouble(expiresObj, System.Globalization.CultureInfo.InvariantCulture);
+            double declaredWindow = expires - started;
+            if (declaredWindow <= 0.0 || declaredWindow > SERVER_TRANSITION_HARD_MAX_AGE_S) return null;
+            double effectiveExpiry = Math.Min(expires, started + SERVER_TRANSITION_HARD_MAX_AGE_S);
+            if (nowUnix > effectiveExpiry) return null;
+
+            // OWNERSHIP IS PART OF FRESHNESS. A PID alone is unsafe on Windows because it can be
+            // reused after the supervisor dies. New markers therefore name both PID and process
+            // birth. If either is missing/unreadable/mismatched, fail closed: an unverifiable
+            // marker is never permission to soften a real server outage from red to yellow.
+            if (!raw.TryGetValue("supervisor_pid", out supervisorPidObj) || supervisorPidObj == null) return null;
+            if (!raw.TryGetValue("supervisor_started", out supervisorStartedObj) || supervisorStartedObj == null) return null;
+            int supervisorPid = Convert.ToInt32(supervisorPidObj, System.Globalization.CultureInfo.InvariantCulture);
+            double supervisorStarted = Convert.ToDouble(supervisorStartedObj, System.Globalization.CultureInfo.InvariantCulture);
+            if (supervisorPid <= 0 || supervisorStarted <= 0.0) return null;
+            try
+            {
+                var supervisorProcess = System.Diagnostics.Process.GetProcessById(supervisorPid);
+                if (supervisorProcess.HasExited) return null;
+                double processStarted = new DateTimeOffset(supervisorProcess.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                if (Math.Abs(processStarted - supervisorStarted) > 2.0) return null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+
+            string reason = "planned restart";
+            if (raw.TryGetValue("reason", out reasonObj) && reasonObj != null)
+                reason = Convert.ToString(reasonObj).Trim();
+            if (string.IsNullOrEmpty(reason)) reason = "planned restart";
+            return new PlannedServerTransition { State = state, Reason = reason, Started = started, Expires = expires, SupervisorPid = supervisorPid, SupervisorStarted = supervisorStarted };
+        }
+        catch (Exception)
+        {
+            // An unreadable transition is not permission to soften a red health signal.
+            return null;
+        }
+    }
+
+    // Execute the REAL server segment of PollHealthOnce in a --selftest process. This is not a
+    // second implementation: it only supplies the two external inputs (HTTP body + marker path),
+    // calls PollHealthOnce below, and returns the dot state it actually wrote. Production callers
+    // cannot use it because WindowSelfTest.Active is false.
+    internal string SelfTestServerHealthPoll(string transitionPath, bool reachable)
+    {
+        if (!WindowSelfTest.Active)
+            throw new InvalidOperationException("server health selftest seam is available only under --selftest");
+        string oldPath = _serverTransitionPathForSelfTest;
+        Func<string, int, string> oldBody = _serverHealthBodyForSelfTest;
+        try
+        {
+            _serverTransitionPathForSelfTest = transitionPath;
+            _serverHealthBodyForSelfTest = delegate(string url, int timeoutMs)
+            {
+                if (!reachable) return null;
+                return "{\"status\":\"ok\",\"auth_fail_10m\":0,\"server_code\":\"current\"}";
+            };
+            PollHealthOnce();
+            lock (_healthLock)
+                return _health[0].State.ToString() + "|" + (_health[0].Detail ?? "");
+        }
+        finally
+        {
+            _serverTransitionPathForSelfTest = oldPath;
+            _serverHealthBodyForSelfTest = oldBody;
+        }
+    }
+
     // One full infra sweep. Writes results into _health under _healthLock.
     void PollHealthOnce()
     {
         DateTime now = DateTime.UtcNow;
+        PlannedServerTransition plannedRestart = ReadPlannedServerTransition();
 
-        // 0) Server: GET http://127.0.0.1:8000/health == 200
-        bool srvOk = HttpOk("http://127.0.0.1:8000/health", 3500);
-        SetDot(0, srvOk ? HealthState.Green : HealthState.Red,
-               T(srvOk ? "hs_srv_detail_ok" : "hs_srv_detail_bad"), now);
+        // 0) Server: GET http://127.0.0.1:8000/health, and READ WHAT IT SAYS.
+        //
+        // A 200 means the event loop answered. It does not mean the server is doing its job:
+        // the handler is deliberately non-blocking (main.py:303-309), so it returns 200 while
+        // authentication is failing and while every tool call is refused. Green on the status
+        // code alone is the single most trusted dot reporting the least.
+        //
+        // So: unreachable stays Red, and a reachable server that is REPORTING A PROBLEM about
+        // itself goes Amber rather than Green. Amber, not Red, because the server process is
+        // genuinely up -- the distinction matters for what a person does next.
+        string srvBody = (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null)
+            ? _serverHealthBodyForSelfTest("http://127.0.0.1:8000/health", 3500)
+            : HttpBody("http://127.0.0.1:8000/health", 3500);
+        bool srvOk = srvBody != null;
+        if (srvOk) { _lastHealthBody = srvBody; _lastHealthBodyAt = NowUnix(); }
+        string authFails = HealthField(srvBody, "auth_fail_10m");
+        // A BURST, NOT A STRAY. This first read "any non-zero count is amber", which is the
+        // same mistake as judging the fleet tool path on a single failure -- caught there by
+        // running it, not caught here. Measured 2026-09-16: one 401 from 127.0.0.1, generated
+        // by this repository is own test suite touching the live server, ambered the most
+        // trusted dot for ten minutes.
+        //
+        // What this dot exists to catch is a key desync (Copilot Studio holding a stale
+        // MCP_API_KEY): every gated call then fails, so the count is dozens within the same
+        // ten-minute window, not one. Three separates that from a stray probe or a single
+        // retry, and is deliberately far below what a real desync produces.
+        int authFailN = 0; int.TryParse(authFails, out authFailN);
+        bool authStorm = authFailN >= 3;
+        // STALE CODE IS NOT A HEALTHY SERVER, and 200 cannot tell you. A running process keeps
+        // executing what it imported at startup; a pull lands new code and every dot stays
+        // green while the checkout and the live process disagree. doctor.ps1:690 has checked
+        // this for a while; this dot never did. On 2026-09-16 the process serving all morning
+        // had started the previous evening, before every fix of that night, and was reported
+        // healthy. server_code is computed by the server itself via the pure, pytest-covered
+        // scripts/stale_server_check.classify_staleness.
+        string codeState = HealthField(srvBody, "server_code");
+        if (!srvOk)
+        {
+            if (plannedRestart != null)
+                SetDot(0, HealthState.Yellow,
+                       (_lang == 0 ? "計画されたサーバ再起動中: " : "Planned server restart in progress: ")
+                       + plannedRestart.Reason, now);
+            else
+                SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
+        }
+        else if (authStorm)
+            SetDot(0, HealthState.Yellow,
+                   T("hs_srv_detail_auth") + " (" + authFails + ")", now);
+        else if (codeState == "stale" && StaleLongEnoughToMatter(srvBody))
+            SetDot(0, HealthState.Yellow,
+                   T("hs_srv_detail_stale") + " (" + HealthField(srvBody, "server_head") + ")", now);
+        else if (codeState == "stale")
+            // GREEN, AND IT SAYS WHY. A commit that touches a watched package makes the running
+            // server genuinely stale, so on a machine where an agent improves the code all day
+            // this was amber almost all of the time -- and a colour that is on in the normal
+            // working state distinguishes nothing. The operator put it plainly on 2026-09-18:
+            // "if that is the condition, the colour is only a false report."
+            //
+            // The FACT is still true and still shown, in the detail line. What was wrong was
+            // treating it as something a person must act on: the supervisor cycles the server
+            // itself once the fleet is idle. So the colour now marks the case a person can do
+            // something about -- stale for longer than the machine should have needed, meaning
+            // the cycle could not run or did not work.
+            SetDot(0, HealthState.Green, T("hs_srv_detail_stale_recent"), now);
+        else
+            SetDot(0, HealthState.Green, T("hs_srv_detail_ok"), now);
+
+        if (WindowSelfTest.Active && _serverHealthBodyForSelfTest != null) return;
 
         // 1) Tunnel: read MCP_TUNNEL_URL from ..\.env; GET <url>/health == 200. Gray if none.
+        //
+        // BUT FIRST: has the supervisor (scripts/supervisor.ps1, commit 57ad0d1) already worked
+        // out that ANOTHER PC is the one actually serving THIS PC's tunnel right now? A probe
+        // through the tunnel cannot tell "nobody is listening" from "someone else answered for
+        // me" -- both read as the same failed (or, for "shared", even a SUCCEEDING) GET -- so
+        // when .fleet\tunnel_host.json says foreign/shared, and the supervisor that wrote it is
+        // still alive, that verdict overrides the generic probe below: red, with the file's own
+        // plain message and action, not "server not reachable through the tunnel" -- which may
+        // even be false (a foreign host can answer fine) and which tells the operator to look in
+        // the wrong place either way. "ours"/"none" (or no file / dead supervisor) add nothing
+        // the probe does not already establish, so they fall through to it unchanged.
+        TunnelHostState tunHost = ReadTunnelHostState();
+        if (tunHost != null && (tunHost.State == "foreign" || tunHost.State == "shared"))
+        {
+            string detail = tunHost.Message;
+            if (!string.IsNullOrEmpty(tunHost.Action)) detail = detail + "  " + tunHost.Action;
+            if (string.IsNullOrEmpty(detail)) detail = T("hs_tun_detail_bad");  // file present, no text -- never show a blank dot
+            SetDot(1, HealthState.Red, detail, now);
+        }
+        else
+        {
         string tunnel = EnvValue("MCP_TUNNEL_URL");
         if (string.IsNullOrEmpty(tunnel))
             // AMBER, NOT GRAY. Gray reads as "no evidence expected" and shows no Fix button,
@@ -2155,9 +3001,38 @@ class CockpitWindow : Window
             string turl = origin + "/health";
             // 6s, not the local 4s budget: this is a remote round-trip (devtunnels region)
             // that on a corporate machine also traverses the system proxy -- 4s false-reds it.
-            bool tunOk = HttpOk(turl, 6000);
-            SetDot(1, tunOk ? HealthState.Green : HealthState.Red,
-                   T(tunOk ? "hs_tun_detail_ok" : "hs_tun_detail_bad"), now);
+            // REACHING *A* SERVER IS NOT REACHING *THIS* SERVER. A 200 through the tunnel
+            // proves something answered; it does not prove the tunnel forwards to the process
+            // this machine is running. A tunnel left pointing at a previous host, or at a
+            // second instance, answers 200 all day while the agent talks to the wrong server
+            // and nothing on this strip disagrees.
+            //
+            // /health now names the process (server_pid). Comparing it to the pid loopback
+            // just reported turns "something answered" into "the thing I meant answered".
+            // Both sides empty means an older server build on one end -- no evidence, so it
+            // does not colour anything.
+            string tunBody = HttpBody(turl, 6000);
+            bool tunOk = tunBody != null;
+            string tunPid = HealthField(tunBody, "server_pid");
+            string locPid = HealthField(srvBody, "server_pid");
+            bool pidsDisagree = tunPid.Length > 0 && locPid.Length > 0 && tunPid != locPid;
+            if (!tunOk)
+            {
+                // If the local server is deliberately between processes, the tunnel cannot reach
+                // it either.  That is the same planned transition, not a second independent fault.
+                if (plannedRestart != null && !srvOk)
+                    SetDot(1, HealthState.Yellow,
+                           (_lang == 0 ? "計画されたサーバ再起動に伴いトンネル待機中"
+                                       : "Tunnel waiting for the planned server restart"), now);
+                else
+                    SetDot(1, HealthState.Red, T("hs_tun_detail_bad"), now);
+            }
+            else if (pidsDisagree)
+                SetDot(1, HealthState.Yellow,
+                       T("hs_tun_detail_other") + " (" + tunPid + " != " + locPid + ")", now);
+            else
+                SetDot(1, HealthState.Green, T("hs_tun_detail_ok"), now);
+        }
         }
 
         // 2) Edge: CDP answers, AND a tab is actually on the agent.
@@ -2180,7 +3055,22 @@ class CockpitWindow : Window
         else
         {
             string tabs = HttpGetBody("http://127.0.0.1:9222/json/list", 3500);
-            bool onAgent = tabs != null && tabs.IndexOf("m365.cloud.microsoft", StringComparison.OrdinalIgnoreCase) >= 0;
+            // THE DOMAIN IS NOT THE AGENT. This asked whether "m365.cloud.microsoft" appeared
+        // anywhere in the /json/list body, which is satisfied by a tab on the DEFAULT
+        // Copilot -- no connectors, no tenant grounding -- the failure this file elsewhere
+        // renders as a warning badge. It is also satisfied by another agent's tab, and by the
+        // string turning up in a title, a description or a favicon URL of any target, since
+        // nothing filters to "type":"page". The tunnel dot carries a comment about exactly
+        // this class: a 200 proves something answered, not that it was the right something.
+        //
+        // _agentMarkerId is the T_/P_ id parsed from MCP_FLEET_AGENT_URL and is already used
+        // for this judgement elsewhere in this file. When it is unset there is nothing to
+        // check against, and the domain is then the most that can honestly be claimed.
+        bool onDomain = tabs != null
+                     && tabs.IndexOf("m365.cloud.microsoft", StringComparison.OrdinalIgnoreCase) >= 0;
+        bool onAgent = onDomain
+                    && (string.IsNullOrEmpty(_agentMarkerId)
+                        || tabs.IndexOf(_agentMarkerId, StringComparison.OrdinalIgnoreCase) >= 0);
             if (onAgent)
                 SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
             else if (!FleetRunIsLive() || !RunDrivesTabs())
@@ -2200,11 +3090,29 @@ class CockpitWindow : Window
                 // Whether workers can actually reach the agent is the AGENT dot's question, and
                 // that one was already moved off the tab list when the socket route landed. This
                 // dot answers for the browser.
-                SetDot(2, HealthState.Green, T("hs_edge_detail_ok"), now);
+                //
+                // ITS OWN WORDING, THOUGH. Both green branches are correct and they mean
+                // different things -- a tab sitting on the agent, versus a run that needs no
+                // tab at all -- and they shared one detail string, so the strip could not tell
+                // a reader which. The colour is right in both cases; only the sentence was
+                // missing.
+                SetDot(2, HealthState.Green,
+                       T(FleetRunIsLive() ? "hs_edge_detail_notabs" : "hs_edge_detail_norun"),
+                       now);
             else
-                // Amber, not red: the browser is up and one navigation away from usable, which
-                // is exactly what the automatic repair is for.
-                SetDot(2, HealthState.Yellow, T("hs_edge_detail_blank"), now);
+                // TWO DIFFERENT FAULTS, AND THE WORSE ONE HAD NO MESSAGE. No m365 tab at all
+                // is visible: the run has nowhere to go and the repair navigates. An m365 tab
+                // that is NOT the configured agent is the silent one -- the default Copilot
+                // answers fluently with no connectors and no tenant grounding, which is the
+                // 2026-08-31 failure where two benchmark runs produced patches written from
+                // memory. hs_agent_warn was written for exactly this and had never been
+                // reachable, because until the marker check above the dot could not tell a
+                // wrong tab from the right one.
+                //
+                // Amber for both: the browser is up and one navigation away from usable,
+                // which is what the automatic repair is for.
+                SetDot(2, HealthState.Yellow,
+                       T(onDomain ? "hs_agent_warn" : "hs_edge_detail_blank"), now);
         }
 
         // 5) Tool: independent of the fleet Edge (:9222) probed above -- this reads the BRIDGE's
@@ -2236,7 +3144,108 @@ class CockpitWindow : Window
         //      and audience, the agent the template names, and whether the capture worked.
         //      Never the token: an expiry and an audience grant nothing on their own.
         UpdateCaptureDots(now);
+
         MaybeAutoFix();
+        PublishHealthStrip();
+    }
+
+    //: WRITE THE STRIP DOWN, because until 2026-09-17 it existed only on the screen.
+    //:
+    //: Asked why the server dot was lit, the command-line tool could say the server was
+    //: reachable and that its code was stale -- it says both -- but not what the DOT was
+    //: showing, which is what a person actually looks at. The answer had to be read off a
+    //: tooltip by hand. That is the inversion of "the command line first, then the GUI".
+    //:
+    //: The file's own mtime is half the value: a strip that stopped being swept is a
+    //: different failure from a strip that is all green, and neither was visible before.
+    //: Never raises -- a panel that fell over while publishing its health would be reporting
+    //: the opposite of what happened.
+    void PublishHealthStrip()
+    {
+        try
+        {
+            string dir = Path.Combine(RepoRootForSettings(), ".fleet");
+            Directory.CreateDirectory(dir);
+            var sb = new System.Text.StringBuilder();
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            sb.Append("{\"ts\":").Append(NowUnix().ToString("F3", inv));
+            sb.Append(",\"dots\":[");
+            lock (_healthLock)
+            {
+                for (int i = 0; i < HEALTH_DOT_COUNT; i++)
+                {
+                    if (i > 0) sb.Append(',');
+                    double age = _health[i].Checked == DateTime.MinValue
+                        ? -1.0 : (DateTime.UtcNow - _health[i].Checked).TotalSeconds;
+                    sb.Append("{\"key\":\"").Append(JsonEscape(_healthKeys[i]))
+                      .Append("\",\"state\":\"")
+                      .Append(_health[i].State.ToString().ToLowerInvariant())
+                      .Append("\",\"detail\":\"").Append(JsonEscape(_health[i].Detail ?? ""))
+                      .Append("\",\"checked_age_s\":").Append(age.ToString("F1", inv))
+                      .Append('}');
+                }
+            }
+            sb.Append(']');
+            // AND THE QUEUE THIS PANEL IS SHOWING.
+            //
+            // The rule in this project is that work which cannot be confirmed in the GUI does
+            // not count as working, and a job submitted to the fleet was invisible here until a
+            // worker existed. The display is fixed; this is how the claim is CHECKABLE without
+            // asking someone to describe their screen -- the same reason the dots above are
+            // published, added the day before for the same complaint.
+            //
+            // It is the panel reporting what IT rendered, not a second opinion computed from
+            // the same files. That distinction is the whole value: a reader comparing this
+            // against .fleet/tasks/pending can see the display and the truth disagree.
+            var qj = ReadQueuedJobs();
+            SubmittedHealth qh = SubmittedTasks.SummarizeHealth(qj);
+            // WHERE IT LOOKED. A panel that reports "nothing queued" without saying where
+            // it looked cannot be checked against the queue on disk -- which is the one
+            // comparison this publication exists to make possible.
+            sb.Append(",\"queue_dir\":\"").Append(JsonEscape(TasksDir())).Append('"');
+            sb.Append(",\"queued_count\":").Append(qj.Count.ToString(inv));
+            sb.Append(",\"queued_stale_count\":").Append(qh.StaleCount.ToString(inv));
+            sb.Append(",\"queued_taken_stale_count\":").Append(qh.TakenStaleCount.ToString(inv));
+            sb.Append(",\"queued_oldest_age_s\":").Append(qh.OldestAgeS.ToString("F1", inv));
+            sb.Append(",\"queued\":[");
+            for (int qi = 0; qi < qj.Count && qi < 20; qi++)
+            {
+                if (qi > 0) sb.Append(',');
+                // `where` is the entry's source in the merged "submitted" group: local (this
+                // window, no file yet), command (commands.d), pending, for_fleet, or taken (its
+                // file was consumed and no worker exists yet). `unconfirmed` is the stale mark.
+                sb.Append("{\"id\":\"").Append(JsonEscape(qj[qi].Id ?? ""))
+                  .Append("\",\"where\":\"").Append(JsonEscape(qj[qi].Source ?? ""))
+                  .Append("\",\"unconfirmed\":").Append(qj[qi].Unconfirmed ? "true" : "false")
+                  .Append(",\"label\":\"").Append(JsonEscape(SubmittedTasks.Label(qj[qi], _lang == 0)))
+                  .Append("\",\"age_s\":").Append(qj[qi].AgeS.ToString("F1", inv))
+                  .Append(",\"goal_head\":\"").Append(JsonEscape(OneLine(qj[qi].Goal, 90)))
+                  .Append("\"}");
+            }
+            sb.Append("]}");
+            string path = Path.Combine(dir, "health_strip.json");
+            string tmp = path + ".tmp";
+            File.WriteAllText(tmp, sb.ToString(), new System.Text.UTF8Encoding(false));
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tmp, path);
+        }
+        catch (Exception) { }
+    }
+
+    static string JsonEscape(string s)
+    {
+        if (string.IsNullOrEmpty(s)) return "";
+        var sb = new System.Text.StringBuilder(s.Length + 8);
+        foreach (char c in s)
+        {
+            if (c == '"' || c == '\\') { sb.Append('\\').Append(c); }
+            else if (c == '\n') sb.Append("\\n");
+            else if (c == '\r') sb.Append("\\r");
+            else if (c == '\t') sb.Append("\\t");
+            else if (c < ' ') sb.Append("\\u").Append(((int)c).ToString("x4"));
+            else sb.Append(c);
+        }
+        return sb.ToString();
     }
 
     // Is a fleet run in flight.
@@ -2310,6 +3319,52 @@ class CockpitWindow : Window
         catch (Exception) { return !MarkerPidIsDead(); }
     }
 
+    // Parsed .fleet\tunnel_host.json, written by scripts/supervisor.ps1 (commit 57ad0d1): the
+    // supervisor's own verdict on who is CURRENTLY serving this PC's tunnel. State is one of
+    // "ours" (this machine's supervisor owns it -- nothing to add), "none" (nobody -- the health
+    // probe below already says so), "foreign" (another PC's supervisor answered for this one) or
+    // "shared" (both this PC and another appear to be serving it). `message`/`action` are the
+    // supervisor's own plain-language explanation and suggested next step -- written once, at
+    // the place that actually knows which PC is which, rather than re-guessed here from a failed
+    // GET that looks identical for "nobody is listening".
+    class TunnelHostState
+    {
+        public string State = "";
+        public string Message = "";
+        public string Action = "";
+    }
+
+    // Read tunnel_host.json, but ONLY while the supervisor_pid it names is still alive. A file
+    // is a snapshot, not a subscription: a supervisor that has since exited (this PC's own
+    // supervisor started, superseding the foreign one; the operator killed it; a reboot) leaves
+    // its last verdict sitting on disk, and treating that stale verdict as still true would keep
+    // reporting a hijack that ended when the process that observed it did. Returns null on a
+    // missing file, a dead supervisor_pid, or any parse failure -- all three mean "this file has
+    // nothing to add right now", which the caller treats the same as state=="ours"/"none".
+    TunnelHostState ReadTunnelHostState()
+    {
+        try
+        {
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "tunnel_host.json");
+            if (!File.Exists(path)) return null;
+            var d = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            if (d == null) return null;
+            object pidObj;
+            if (!d.TryGetValue("supervisor_pid", out pidObj) || pidObj == null) return null;
+            int pid;
+            try { pid = Convert.ToInt32(pidObj); } catch (Exception) { return null; }
+            try { System.Diagnostics.Process.GetProcessById(pid); }
+            catch (ArgumentException) { return null; }   // the supervisor that wrote this is gone
+            var t = new TunnelHostState();
+            t.State = S(d, "state");
+            t.Message = S(d, "message");
+            t.Action = S(d, "action");
+            return t;
+        }
+        catch (Exception) { return null; }
+    }
+
     // Whether the live run drives TABS at all. Under the socket route it does not: workers hold
     // no page, and one is opened only to read a token -- about four seconds per token lifetime,
     // which the runner logs as 46 minutes. So "no tab is on the agent" is the normal state for
@@ -2332,7 +3387,10 @@ class CockpitWindow : Window
 
     //: How old a capture may be and still describe the present. Beyond this a sign-in
     //: failure is history, not a fault to act on.
-    const double SIGNIN_EVIDENCE_MAX_AGE_S = 1800.0;
+    //: 1.4x the token lifetime measured on this machine (3,848s), not a round number
+    //: chosen for looking like one. This is the maximum time a broken sign-in may go
+    //: unreported, and it is deliberately independent of the issuer's token policy.
+    const double SIGNIN_EVIDENCE_MAX_AGE_S = 5400.0;
 
     // ── automatic repair, before anyone is asked to click ───────────────────────────────────
     //
@@ -2346,11 +3404,21 @@ class CockpitWindow : Window
     // bounded number of times, and hands over to the human only when it has genuinely failed.
     const int AUTOFIX_CONSECUTIVE_POLLS = 2;   // ~30s of a steady fault, not one flap
     const int AUTOFIX_MAX_ATTEMPTS      = 3;   // then it is the human's turn
+    // 2026-09-24: the window AUTOFIX_MAX_ATTEMPTS applies over. This used to be an unbounded
+    // process lifetime -- which was fine as long as the process lived, and meant nothing at all
+    // once the loop this file's startup-gate comment describes made "the process" mean a few
+    // seconds. 30 minutes bounds a genuinely stuck repair without permanently locking one out.
+    const double AUTOFIX_BUDGET_WINDOW_S = 1800.0;
     const int AUTOFIX_GREEN_POLLS_TO_RESET = 3; // one green poll is a flap, not a recovery
     int _autoFixBadPolls = 0;
     int _autoFixGreenPolls = 0;
     string _autoFixFault = "";
     int _autoFixAttempts = 0;
+    // Which repair keys this PROCESS has already told the operator gave up, so a persisted
+    // exhaustion (bug (b): a fresh process used to get a fresh budget and a fresh silence)
+    // still surfaces the "not a loop" message once here, without repeating it every ~15s poll
+    // for as long as the fault and the exhaustion both persist.
+    readonly HashSet<string> _autoFixExhaustedNoted = new HashSet<string>();
 
     // Which dot a repair would target, and whether that repair touches the FLEET's Edge.
     //
@@ -2390,6 +3458,26 @@ class CockpitWindow : Window
         return -1;
     }
 
+    // WHICH REPAIR A RED DOT LEADS TO, so the retry budget can be charged to the repair rather
+    // than to the observation. The mapping is RunFix's own branch structure, read off it:
+    //
+    //   3 sign-in  -> start_companion_edge.ps1 -Foreground   (Priority 1)
+    //   2 edge     -> start_companion_edge.ps1 -HardReset    (Priority 1b/2)
+    //   4 agent    -> RunReconnect                           (Priority 3)
+    //   0 server   -\
+    //   1 tunnel   -/ scripts\repair.ps1 -Auto               (Priority 4, ONE branch)
+    //   5 tool     -> its own tier
+    //
+    // ONLY 0 AND 1 ARE MERGED, and only because RunFix merges them in a single `if`. sign-in and
+    // edge both relaunch :9222 and might look mergeable, but they take different branches with
+    // different arguments -- merging them from that resemblance would be inference, and the one
+    // thing this function must not do is guess which repairs are the same.
+    static string AutoFixRepairKey(int dot)
+    {
+        if (dot == 0 || dot == 1) return "repair:stack";
+        return "repair:dot" + dot;
+    }
+
     static bool RepairTouchesFleetEdge(int dot)
     {
         // sign-in and edge relaunch :9222; agent reconnects it. tool targets :9223, and
@@ -2415,6 +3503,19 @@ class CockpitWindow : Window
     // An automatic repair that leaves no record cannot be audited: if it fires at three in the
     // morning and makes things worse, there is nothing to look at, and "did it even run?" is
     // unanswerable. I could not answer that question about its first real firing, which is how
+    // UTF-8 WITHOUT THE PREAMBLE, WHICH Encoding.UTF8 IS NOT. .NET's Encoding.UTF8 emits a
+    // BOM, and File.AppendAllText writes it when it creates the file -- so the FIRST line of
+    // every ledger this cockpit starts carries three bytes no line-oriented reader expects.
+    // Measured 2026-09-22: .fleet/autofix.jsonl and .fleet/ui_errors.jsonl both begin with
+    // one, and line 1 of autofix.jsonl is the single row in that file that json.loads
+    // refuses ("Unexpected UTF-8 BOM (decode using utf-8-sig)"). One unreadable row in five
+    // hundred is the kind of thing that gets called a torn write and is not.
+    //
+    // The rule this repository already holds is write no-BOM, read utf-8-sig; the write half
+    // was missing here. Shared so the next ledger written from this file cannot pick the
+    // wrong one -- the same reason ui/FleetCommands.cs exists.
+    static readonly Encoding NoBomUtf8 = new UTF8Encoding(false);
+
     // this line came to exist.
     void AutoFixRecord(int dot, string what)
     {
@@ -2430,9 +3531,127 @@ class CockpitWindow : Window
                         + ",\"what\":\"" + what.Replace("\"", "'") + "\""
                         + ",\"detail\":\"" + detail.Replace("\\", "/").Replace("\"", "'") + "\"}";
             string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "autofix.jsonl");
-            File.AppendAllText(path, line + Environment.NewLine, Encoding.UTF8);
+            File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
         }
         catch (Exception) { }   // a trace that can break the repair is worse than no trace
+    }
+
+    // ── cross-process gates for automatic startup/repair (2026-09-24 startup-loop fix) ──────
+    //
+    // Whether start_all.ps1 is CURRENTLY mid-bring-up on this machine, checked the same way its
+    // own Enter-StartAllLock does: the "Global\m365-copilot-companion-start-all" named mutex.
+    // WaitOne(0) is a non-blocking probe -- acquire-and-immediately-release if free, so this
+    // never itself waits the up-to-600s a real start_all launch would. An abandoned mutex (the
+    // holder died) is taken as "not running", same interpretation start_all.ps1's own comment
+    // gives it ("still handed over ownership... rather than treated as a failure"). A missing
+    // lock (no OS support) must never be mistaken for "running forever", so any exception here
+    // also reads as "not running" -- the same fail-open start_all.ps1 itself uses.
+    static bool IsStartAllRunning()
+    {
+        try
+        {
+            using (var m = new Mutex(false, @"Global\m365-copilot-companion-start-all"))
+            {
+                try
+                {
+                    if (m.WaitOne(0)) { m.ReleaseMutex(); return false; }
+                    return true;
+                }
+                catch (AbandonedMutexException)
+                {
+                    try { m.ReleaseMutex(); } catch (Exception) { }
+                    return false;
+                }
+            }
+        }
+        catch (Exception) { return false; }
+    }
+
+    // scripts/start_all.ps1 sets M365_LAUNCHED_BY_START_ALL=1 in the environment of ONLY the UI
+    // process it launches (see its "THE WINDOW MAY ASK 'WHO OPENED ME?'" comment) -- this reads
+    // that flag. No start_all.ps1 change needed; the flag already existed and was unread here.
+    static bool LaunchedByStartAll()
+    {
+        try { return Environment.GetEnvironmentVariable("M365_LAUNCHED_BY_START_ALL") == "1"; }
+        catch (Exception) { return false; }
+    }
+
+    const string AUTOFIX_BUDGET_FILENAME = "autofix_budget.json";
+
+    static string AutoFixBudgetPath()
+    {
+        return Path.Combine(Path.GetDirectoryName(ResolvePath(null)), AUTOFIX_BUDGET_FILENAME);
+    }
+
+    // Best-effort read of {"<key>": [ts, ts, ...], ...}. Any I/O/parse failure (missing file,
+    // torn write, a hand-edited file) reads as "no history for any key" -- the safe direction,
+    // since it costs one extra attempt rather than silencing repair for ever.
+    Dictionary<string, object> LoadAutoFixBudgetRaw()
+    {
+        try
+        {
+            string path = AutoFixBudgetPath();
+            if (!File.Exists(path)) return new Dictionary<string, object>();
+            var d = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            return d ?? new Dictionary<string, object>();
+        }
+        catch (Exception) { return new Dictionary<string, object>(); }
+    }
+
+    static List<double> AttemptTimestampsFor(Dictionary<string, object> data, string key)
+    {
+        var list = new List<double>();
+        object v;
+        if (data != null && data.TryGetValue(key, out v) && v is object[])
+            foreach (object o in (object[])v)
+                try { list.Add(Convert.ToDouble(o, CultureInfo.InvariantCulture)); }
+                catch (Exception) { }
+        return list;
+    }
+
+    // tmp+delete+move, the same atomic-write shape PublishHealthStrip already uses for its own
+    // file in this same directory.
+    void SaveAutoFixBudgetRaw(Dictionary<string, object> data)
+    {
+        try
+        {
+            string path = AutoFixBudgetPath();
+            string tmp = path + ".tmp";
+            File.WriteAllText(tmp, _js.Serialize(data), NoBomUtf8);
+            if (File.Exists(path)) File.Delete(path);
+            File.Move(tmp, path);
+        }
+        catch (Exception) { }
+    }
+
+    // Read-decide-write in one call: the ONE place FleetCockpit.cs touches the budget file, so
+    // every automatic launch (RunStartAll's own cooldown, and each MaybeAutoFix repair key)
+    // shares one persistence path rather than growing a second. Cross-process races (two
+    // cockpits reading, deciding, and writing back within the same instant) are not locked
+    // against here -- the same risk PublishHealthStrip already accepts for this directory --
+    // but the failure mode of a lost race is "one extra attempt slips through the cap", not the
+    // unbounded-relaunch loop this exists to fix.
+    bool TryConsumeAutoFixBudget(string key, int maxAttempts, double windowS, out bool exhausted)
+    {
+        var data = LoadAutoFixBudgetRaw();
+        var attempts = AttemptTimestampsFor(data, key);
+        AutoFixBudget.Decision d = AutoFixBudget.Decide(attempts, NowUnix(), maxAttempts, windowS);
+        data[key] = d.Kept.ToArray();
+        SaveAutoFixBudgetRaw(data);
+        exhausted = d.Exhausted;
+        return d.Allow;
+    }
+
+    // Marshal a note onto the UI thread from wherever (poll thread or UI thread alike),
+    // mirroring the Dispatcher pattern the startup auto-heal block already used inline.
+    void NoteFromAnyThread(string text)
+    {
+        try
+        {
+            if (!Dispatcher.HasShutdownStarted)
+                Dispatcher.BeginInvoke(new Action(delegate { if (_fixNote != null) _fixNote.Text = text; }));
+        }
+        catch (Exception) { }
     }
 
     // ONE COCKPIT REPAIRS. Nothing stops a second one being opened, and each process has its
@@ -2473,6 +3692,7 @@ class CockpitWindow : Window
                 _autoFixBadPolls = 0;
                 _autoFixAttempts = 0;
                 _autoFixFault = "";
+                _autoFixExhaustedNoted.Clear();
             }
             return;
         }
@@ -2480,7 +3700,23 @@ class CockpitWindow : Window
 
         // A DIFFERENT FAULT GETS ITS OWN BUDGET. One persistent high-priority failure used to
         // consume all three attempts and leave every later fault unrepaired.
-        string fault = "dot" + dot;
+        //
+        // AND THE BUDGET BELONGS TO THE REPAIR, NOT THE DOT -- which is what that earlier fix
+        // got wrong, in a way that made AUTOFIX_MAX_ATTEMPTS bound nothing at all. RunFix
+        // handles `server == Red || tunnel == Red` in ONE branch (Priority 4, scripts\repair.ps1
+        // -Auto), so those two dots are the same repair observed from two probes: any cause that
+        // takes the backend down reddens both, and they flap. Every flip changed `fault`, which
+        // reset _autoFixAttempts to 0, which handed out a fresh budget of three. Measured in
+        // .fleet/autofix.jsonl on 2026-09-14, 07:49-07:51 JST:
+        //
+        //     tunnel#1  tunnel#2  server#1  tunnel#1  tunnel#2  tunnel#3
+        //                                   ^ the cap was reached and then reset
+        //
+        // -- repair.ps1 relaunched every ~186s (its own run time plus the post-repair
+        // _healthWake re-poll) with no bound in sight. Keying on the repair collapses that pair
+        // into one budget while leaving genuinely different repairs their own, which is what the
+        // paragraph above was for.
+        string fault = AutoFixRepairKey(dot);
         if (fault != _autoFixFault)
         {
             _autoFixFault = fault;
@@ -2490,8 +3726,24 @@ class CockpitWindow : Window
 
         _autoFixBadPolls++;
         if (_autoFixBadPolls < AUTOFIX_CONSECUTIVE_POLLS) return;
-        if (_autoFixAttempts >= AUTOFIX_MAX_ATTEMPTS) return;   // the button is the way on
         if (_fixRunning) return;
+
+        // PERSISTED, not per-process (2026-09-24 startup-loop fix): AUTOFIX_MAX_ATTEMPTS used
+        // to bound only _autoFixAttempts, a field of THIS process. A cockpit relaunched by the
+        // very loop this budget exists to stop got a brand-new field, and so a brand-new three
+        // tries, every time -- the budget bound nothing across the relaunches that mattered
+        // most. TryConsumeAutoFixBudget reads/writes .fleet/autofix_budget.json instead.
+        bool exhausted;
+        if (!TryConsumeAutoFixBudget(fault, AUTOFIX_MAX_ATTEMPTS, AUTOFIX_BUDGET_WINDOW_S, out exhausted))
+        {
+            if (exhausted && !_autoFixExhaustedNoted.Contains(fault))
+            {
+                _autoFixExhaustedNoted.Add(fault);
+                AutoFixRecord(dot, "exhausted: automatic repair stopped retrying " + fault);
+                NoteFromAnyThread(T("autofix_exhausted"));
+            }
+            return;   // the button is the way on
+        }
 
         _autoFixAttempts++;
         _autoFixBadPolls = 0;
@@ -2529,8 +3781,13 @@ class CockpitWindow : Window
             // unhealthy. Amber during a run, because then the evidence IS expected.
             SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
                    T(live ? "hs_signin_unknown_live" : "hs_signin_gray"), now);
-            SetDot(4, live ? HealthState.Red : HealthState.Gray,
-                   T(live ? "hs_agent_bad" : "hs_agent_gray"), now);
+            // AMBER FIRST, by this file's own rule two lines up: evidence that is expected
+            // and missing is not evidence of failure. The sign-in dot gets amber in exactly
+            // this situation on the line above; the agent dot jumped to red, and red here
+            // drives a reconnect. A first run on a fresh checkout has no capture record at
+            // all, and neither does one where the status writer swallowed an exception.
+            SetDot(4, live ? HealthState.Yellow : HealthState.Gray,
+                   T(live ? "hs_agent_unknown_live" : "hs_agent_gray"), now);
             return;
         }
 
@@ -2562,6 +3819,30 @@ class CockpitWindow : Window
         // repair that relaunches the browser HEADED, for a refusal that may long since have
         // resolved. Evidence about the past is not evidence about now.
         double capAgeS = (capTs > 0) ? (nowEpoch - capTs) : -1;
+        // HOW LONG A BROKEN SIGN-IN MAY GO UNNOTICED IS OUR REQUIREMENT, NOT THE ISSUER'S.
+        // Two wrong answers were tried here before this one.
+        //
+        // A flat 30 minutes was never measured against anything. The token on disk when this
+        // was written lived 3,848s (at=1789532602, expires_at=1789536451, about 64 minutes)
+        // and captures happen roughly once per token lifetime, so the back half of EVERY
+        // healthy cycle showed amber "unverified" with nothing wrong -- and a dot that is
+        // amber through half of normal operation is one people stop reading, which is the
+        // failure this file argues against repeatedly, reached from the other side.
+        //
+        // Then the window was taken from the record as (expires_at - at) and called "one
+        // capture cycle". It is not one: now - at <= expires_at - at reduces to
+        // now <= expires_at, which is "green while the token has not expired" -- redundant
+        // with the lifeLeft > 0 already on this branch, and worse, it hands the detection
+        // delay to whoever issues the tokens. If their lifetime became 24 hours, a capture
+        // path that died would stay green for 24 hours and nothing here would have changed.
+        //
+        // So: a constant, because the requirement is ours -- but one with a measurement under
+        // it. 5,400s is 1.4 token lifetimes as measured on this machine, which leaves room
+        // for a capture that comes slightly late without keeping green alive across a whole
+        // missed cycle. Expiry is a separate and additional ceiling (lifeLeft > 0 below), so
+        // green needs both: a token that has not run out AND evidence no older than this.
+        // Neither establishes that the session was not revoked in between; nothing in a
+        // record of past captures can.
         bool capFresh = capAgeS >= 0 && capAgeS <= SIGNIN_EVIDENCE_MAX_AGE_S;
         if (!ok && string.Equals(kind, "signin", StringComparison.OrdinalIgnoreCase) && capFresh)
             SetDot(3, HealthState.Red, T("hs_signin_bad"), now);
@@ -2569,12 +3850,26 @@ class CockpitWindow : Window
             SetDot(3, HealthState.Yellow, T("hs_signin_old"), now);
         else if (!ok)
             SetDot(3, HealthState.Yellow, T("hs_signin_failed_other"), now);
-        else if (lifeLeft > 0)
+        else if (lifeLeft > 0 && capFresh)
             SetDot(3, HealthState.Green, T("hs_signin_ok"), now);
+        else if (lifeLeft > 0)
+            // THE RULE THE PARAGRAPH ABOVE ARGUES FOR, APPLIED TO SUCCESSES TOO. "Evidence
+            // about the past is not evidence about now" was written for failures and only
+            // ever gated failures: an ok=true capture with a far-future expires_at read as
+            // green forever, however old the record, because nothing re-verifies the session.
+            // A token can be revoked by tenant policy or a sign-out elsewhere and this dot
+            // would not notice until some later capture happened to fail.
+            //
+            // Amber while a run is live, because then the evidence IS expected and its
+            // absence matters. Grey when idle, because nothing is asking and an old record is
+            // simply not current evidence -- painting an idle machine amber would be the
+            // false-alarm half of the same mistake.
+            SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
+                   T(live ? "hs_signin_old_ok" : "hs_signin_gray_old"), now);
         else if (live)
             SetDot(3, HealthState.Yellow, T("hs_signin_stale"), now);
         else
-            SetDot(3, HealthState.Gray, T("hs_signin_gray"), now);
+            SetDot(3, HealthState.Gray, T("hs_signin_gray_expired"), now);
 
         // AGENT. The template naming an agent is a STRONGER guarantee than the tab sniffing
         // it replaces: a capture whose request names no agent raises NotAnAgentSurface and
@@ -2582,7 +3877,12 @@ class CockpitWindow : Window
         // connectors, no tenant grounding, and a fluent answer -- cannot happen unnoticed.
         if (!live)
             SetDot(4, HealthState.Gray, T("hs_agent_gray"), now);
-        else if (RouteIsClosed())
+        else if (RouteState() == ROUTE_UNKNOWN)
+            // Amber, not green: the route's own record could not be read, so whether workers
+            // are on tabs is unknown, and the binding check below would be answering a
+            // different question than the one being asked.
+            SetDot(4, HealthState.Yellow, T("hs_agent_route_unknown"), now);
+        else if (RouteState() == ROUTE_CLOSED)
         {
             // THE CANNED-ANSWER SNIFF SURVIVES HERE AND NOWHERE ELSE. It used to decide the
             // dot's colour, which made a judgement about ONE TURN'S QUALITY into a statement
@@ -2596,7 +3896,16 @@ class CockpitWindow : Window
         else if (FleetAgentIsBound())
             SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
         else if (!string.IsNullOrEmpty(gptId))
-            SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
+            // THIS FALLBACK IS THE FIELD THE CHECK ABOVE EXISTS TO DISTRUST. Read
+            // FleetAgentIsBound's own comment: capture_status.json's gpt_id is "the LAST
+            // capture on ANY surface", the route also captures for side agents, and "the last
+            // event about somebody else is not evidence about you". Then this line took that
+            // same field as sufficient for GREEN, reintroducing precisely what the primary
+            // check was built to avoid.
+            //
+            // It is kept, because a non-empty gpt_id is not nothing -- some surface did bind
+            // to some agent. It is amber, because it is not evidence about THIS one.
+            SetDot(4, HealthState.Yellow, T("hs_agent_other_surface"), now);
         else
             SetDot(4, HealthState.Red, T("hs_agent_bad"), now);
     }
@@ -2622,7 +3931,29 @@ class CockpitWindow : Window
             string path = Path.Combine(RepoRoot(), ".fleet", "templates",
                                        "template_" + Sha256Prefix(url) + ".json");
             if (!File.Exists(path)) return false;
-            return File.ReadAllText(path).IndexOf("gptId", StringComparison.Ordinal) >= 0;
+            // EXISTENCE IS NOT THE BINDING, and the comment above used to say it was. The
+            // module that writes this file refuses to return one older than
+            // TEMPLATE_MAX_AGE_S (relay/profile_token.py), and refuses one whose gpt_id is
+            // empty (load_template's "a template without an agent is not a cache hit"). This
+            // dot checked neither, so it could report a binding the route itself would evict
+            // on first use -- and would go on reporting it, because the eviction only happens
+            // when a capture runs, about once per token lifetime.
+            //
+            // Measured when this was written: .fleet/templates held one template 211.7 hours
+            // old, 8.8 days against a 24 hour cap. Dot 3 was given an explicit max age for
+            // exactly this reason ("evidence about the past is not evidence about now"); dot
+            // 4 was not.
+            var tpl = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8))
+                      as Dictionary<string, object>;
+            if (tpl == null) return false;
+            double savedAt = NumberField(tpl, "ts");
+            double ageS = NowUnix() - savedAt;
+            if (savedAt <= 0 || ageS > TEMPLATE_MAX_AGE_S) return false;
+            var query = tpl.ContainsKey("query") ? tpl["query"] as Dictionary<string, object>
+                                                 : null;
+            // Non-EMPTY, not merely present. The old substring test asked whether the five
+            // characters "gptId" appeared, which is a question about the file's spelling.
+            return !string.IsNullOrEmpty(StringField(query, "gptId"));
         }
         catch (Exception) { return false; }
     }
@@ -2630,6 +3961,11 @@ class CockpitWindow : Window
     // The same 16 hex characters relay/profile_token.py names its cache files with. If these
     // two ever disagree the lookup finds nothing and the dot reports "not bound" for ever --
     // a silent zero -- so the algorithm is stated in both places rather than assumed.
+    //: A COPY OF relay/profile_token.py's TEMPLATE_MAX_AGE_S, and copies drift, so a test
+    //: fails if the two stop agreeing. Stated here rather than read from the environment
+    //: because the cockpit must not report a binding on terms looser than the route's.
+    const double TEMPLATE_MAX_AGE_S = 24 * 3600;
+
     static string Sha256Prefix(string s)
     {
         using (var sha = System.Security.Cryptography.SHA256.Create())
@@ -2655,12 +3991,21 @@ class CockpitWindow : Window
     // Has the route's one-way breaker tripped DURING THIS RUN? Read from the route's own
     // append-only record. Scanned from the run's start, because a close is per-run: the route
     // is rebuilt with each coordinator, and a close from yesterday says nothing about now.
-    bool RouteIsClosed()
+    //: What RouteState() found. UNKNOWN exists because the alternative is a check that
+    //: reports a healthy open route when it could not read the file at all.
+    const int ROUTE_OPEN = 0;
+    const int ROUTE_CLOSED = 1;
+    const int ROUTE_UNKNOWN = 2;
+
+    int RouteState()
     {
         try
         {
             string path = Path.Combine(RepoRoot(), ".fleet", "socket_route.jsonl");
-            if (!File.Exists(path)) return false;
+            // NO FILE IS A REAL ANSWER, not a failure to read one: nothing has ever closed
+            // the route on this checkout. Only a file that exists and cannot be understood
+            // is unknown.
+            if (!File.Exists(path)) return ROUTE_OPEN;
             string stamp = RunStartedLocal().ToString("yyyy-MM-ddTHH:mm:ss");
             // THE LAST ROUTE EVENT DECIDES, NOT THE FIRST CLOSE. A closed route can now be
             // reopened mid-run (relay/route_reopen.py), and this used to answer "closed" if
@@ -2669,11 +4014,13 @@ class CockpitWindow : Window
             // had already left. Both events carry the same timestamp key, so the scan just
             // keeps the newest one it sees.
             bool closed = false;
+            int routeLines = 0, parsed = 0;
             foreach (string line in File.ReadLines(path))
             {
                 bool isClose = line.IndexOf("route_closed", StringComparison.Ordinal) >= 0;
                 bool isOpen = line.IndexOf("route_reopened", StringComparison.Ordinal) >= 0;
                 if (!isClose && !isOpen) continue;
+                routeLines++;
                 // The record is written by json.dumps, which puts a space after the colon:
                 //   {"ts": 1787270671.84, "at": "2026-08-21T09:04:31", "event": "route_closed"}
                 // Matching without the space finds nothing, and finding nothing here means the
@@ -2685,12 +4032,20 @@ class CockpitWindow : Window
                 int from = i + AtKey.Length;
                 if (from + 19 > line.Length) continue;
                 string at = line.Substring(from, 19);
+                parsed++;
                 if (string.CompareOrdinal(at, stamp) >= 0) closed = isClose;
             }
-            return closed;
+            // ROUTE EVENTS THAT NONE OF THIS COULD READ. The comment above explains why the
+            // marker is copied from a real line rather than composed; this is what happens
+            // when that copy stops matching anyway. Saying "open" there is the silent zero
+            // the comment warns about, stated and then not guarded against.
+            if (routeLines > 0 && parsed == 0) return ROUTE_UNKNOWN;
+            return closed ? ROUTE_CLOSED : ROUTE_OPEN;
         }
         catch (Exception) { }
-        return false;
+        // An unreadable file is not an open route. It is nothing at all, and the dot now has
+        // somewhere to put that.
+        return ROUTE_UNKNOWN;
     }
 
     DateTime RunStartedLocal()
@@ -2749,9 +4104,12 @@ class CockpitWindow : Window
     //   GRAY  -- file has never existed (probe disabled / MCP_TOOL_PROBE_SEC=0 on this machine).
     //            Deliberately NOT red: a new/unconfigured feature must never read as an outage.
     //   RED   -- file missing after having looked (can't happen here since we check Exists first,
-    //            kept as a safety fallback) OR stale (>20 min since ts -- the probe itself isn't
-    //            running) OR the probe failed with nothing coming back at all.
-    //   GREEN -- ok==true AND fresh (<20 min old).
+    //            kept as a safety fallback) OR stale (older than the configured probe interval + 10
+    //            min, at least 20 -- ToolProbeStaleAfterMin; the probe itself isn't running) OR the
+    //            probe failed with nothing coming back at all.
+    //   GREEN -- ok==true AND fresh. ok may now come from a REAL tool call instead of a probe
+    //            (record kind "answer" with "evidence":"real_call", at that call's own time).
+    //   GRAY  -- also when the bridge reports the probe switched off (tool_probe_idle_min=0).
     //   YELLOW-- consent_card/canned_fallback, or the probe failed while "alive" says a reply
     //            DID arrive. Red is reserved for silence: a failed probe on a chat that is
     //            answering normally used to paint this dot red, and a red dot is read as
@@ -2766,7 +4124,7 @@ class CockpitWindow : Window
             // and grey means "no evidence expected" -- so two of those three were reported as
             // nothing to see. The setting is readable, so the three can be told apart.
             string probeSec = EnvValue("MCP_TOOL_PROBE_SEC");
-            bool disabled = probeSec == "0";
+            bool disabled = probeSec == "0" || ToolProbeReportedOff();
             SetDot(5, disabled ? HealthState.Gray : HealthState.Yellow,
                    T(disabled ? "hs_tool_detail_none" : "hs_tool_detail_never"), now);
             return;
@@ -2795,7 +4153,51 @@ class CockpitWindow : Window
             // Only while it is plausibly still running. A probe that started an hour ago and
             // never recorded a result is not "in progress", it is a prober that died.
             bool probing = probingAgeMin < 20.0;
-            if (ageMin >= 20.0)
+
+            // TWO TOOL PATHS, AND THIS DOT ONLY EVER WATCHED ONE. Everything above comes from
+            // .fleet/tool_probe.json, written solely by the BRIDGE's idle self-probe on its
+            // own Edge profile (CDP :9223). Fleet workers call tools over a different
+            // transport entirely, and on 2026-09-16 this dot was red -- truthfully, the bridge
+            // agent had lost its tool list -- while fleet workers completed 84 tool calls in
+            // an hour and a goal finished DONE with the refuter upholding it. A dot labelled
+            // "Tool" showed red and tool access was fine.
+            //
+            // fleet_tool_ok comes from /health (tools/fleet_tool_health.py), derived from the
+            // ledger of real calls rather than from a probe. "" or "null" means no calls
+            // lately, which is NOT evidence of anything and must not colour the dot.
+            // Read through the age gate, not from the field directly: HealthField's contract is
+        // that "" means "no evidence", and a stale body has exactly as much evidence in it.
+        string fleetTool = (_lastHealthBodyAt > 0
+                            && NowUnix() - _lastHealthBodyAt <= HEALTH_BODY_MAX_AGE_S)
+                         ? HealthField(_lastHealthBody, "fleet_tool_ok") : "";
+            bool fleetWorking = fleetTool == "true";
+            bool fleetFailing = fleetTool == "false";
+
+            if (fleetWorking)
+            {
+                // CURRENT OPERABILITY WINS THE COLOUR. The Fleet is the path this cockpit is
+                // supervising. If real Fleet calls are succeeding, Tool is green. A degraded
+                // bridge/chat probe remains visible in the detail, but must not turn the Fleet
+                // traffic light amber while the work path is demonstrably healthy.
+                string detail = ok
+                    ? (ageTxt + " " + T("hs_tool_detail_ok"))
+                    : (ageTxt + " " + T("hs_tool_detail_bridge_only_down"));
+                if (ok && probing) detail += " / " + T("hs_tool_detail_checking");
+                SetDot(5, HealthState.Green, detail, now);
+            }
+            else if (ok && fleetFailing)
+                // The bridge can call tools and the fleet cannot. Green here would hide the
+                // failure of the path that does the work.
+                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
+            else if (ToolProbeReportedOff())
+                // SWITCHED OFF IN THE SETTINGS (or by the environment): nothing is measured, so
+                // nothing is claimed. Not green (no event behind it) and not red (nothing broke):
+                // an old record from before it was switched off must not read as a stale outage.
+                SetDot(5, HealthState.Gray, T("hs_tool_detail_none"), now);
+            else if (ageMin >= ToolProbeStaleAfterMin())
+                // How long a green check stays valid FOLLOWS THE CONFIGURED INTERVAL (interval +
+                // 10 min, never under the 20 min it always was): with the probe idle-only at 30
+                // min a fixed 20 would paint a healthy, idle machine red between probes.
                 SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_stale"), now);
             else if (kind == "checking" || kind == "starting")
                 // A record written by an older prober, which still overwrote the verdict.
@@ -2822,6 +4224,31 @@ class CockpitWindow : Window
             // since the file DOES exist (the feature is active, just unreadable right now).
             SetDot(5, HealthState.Red, T("hs_tool_detail_down"), now);
         }
+    }
+
+    // The bridge's own account of its probe cadence, read on the poll thread (a fresh small parse;
+    // the settings-popup copy is cached separately). Null = no report / old bridge / unreadable.
+    Dictionary<string, object> ToolProbeStateForHealth()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe_state.json");
+            if (!File.Exists(path)) return null;
+            return _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+        }
+        catch (Exception) { return null; }
+    }
+    // True when the bridge says the probe is off (setting 0 or MCP_TOOL_PROBE_SEC<=0).
+    bool ToolProbeReportedOff()
+    {
+        var st = ToolProbeStateForHealth();
+        return st != null && st.ContainsKey("enabled") && st["enabled"] != null
+               && !Convert.ToBoolean(st["enabled"]);
+    }
+    double ToolProbeStaleAfterMin()
+    {
+        var st = ToolProbeStateForHealth();
+        return ToolProbeView.StaleAfterMin(st != null ? Dbl(st, "interval_min") : 0.0);
     }
 
     // "N分前" / "N min ago" -- small formatter local to the Tool dot's tooltip; not routed through
@@ -2982,6 +4409,54 @@ class CockpitWindow : Window
     // GET a URL; true iff it returns HTTP 200. Short timeout, fully guarded.
     // Loopback URLs bypass the system proxy: on corporate machines the PAC/proxy can
     // swallow 127.0.0.1 requests, turning a healthy local server into a false-red dot.
+    // THE BODY WAS ALWAYS THERE AND NOBODY READ IT. /health returns status, auth_fail_10m,
+    // tool_ok and fleet_tool_ok (main.py:296-323), and main.py's own docstring says the
+    // endpoint is deliberately non-blocking so it answers 200 even while auth is failing and
+    // every tool call is dying. HttpOk discards the body, so the Server dot was green in
+    // exactly the states the payload was written to expose. Audited 2026-09-16: no consumer
+    // of /health anywhere in the repository parsed the body -- not this file, not doctor.ps1,
+    // not supervisor.ps1, not the relay.
+    //
+    // Returns the body on a 200, or null on any failure, so a caller can tell "unreachable"
+    // from "reachable and complaining". No JSON parser is pulled in for this: the payload is
+    // flat and the two questions asked of it are substring-shaped.
+    static string HttpBody(string url, int timeoutMs)
+    {
+        try
+        {
+            EnsureTls();
+            var req = (HttpWebRequest)WebRequest.Create(url);
+            req.Method = "GET";
+            req.Timeout = timeoutMs;
+            req.ReadWriteTimeout = timeoutMs;
+            req.AllowAutoRedirect = true;
+            if (url.Contains("127.0.0.1") || url.Contains("localhost")) req.Proxy = null;
+            else if (req.Proxy != null) req.Proxy.Credentials = CredentialCache.DefaultCredentials;
+            using (var resp = (HttpWebResponse)req.GetResponse())
+            {
+                if (resp.StatusCode != HttpStatusCode.OK) return null;
+                using (var sr = new StreamReader(resp.GetResponseStream()))
+                    return sr.ReadToEnd();
+            }
+        }
+        catch (Exception) { return null; }
+    }
+
+    // Pull one flat JSON value out without a parser. Returns "" when absent, which every
+    // caller must treat as "no evidence" rather than as a negative -- /health omits fields it
+    // has nothing to say about, and an omission is not a failure.
+    static string HealthField(string body, string key)
+    {
+        if (string.IsNullOrEmpty(body)) return "";
+        int i = body.IndexOf("\"" + key + "\"");
+        if (i < 0) return "";
+        int c = body.IndexOf(':', i);
+        if (c < 0) return "";
+        int e = c + 1;
+        while (e < body.Length && body[e] != ',' && body[e] != '}') e++;
+        return body.Substring(c + 1, e - c - 1).Trim().Trim('"');
+    }
+
     static bool HttpOk(string url, int timeoutMs)
     {
         try
@@ -3156,19 +4631,52 @@ class CockpitWindow : Window
         // UI thread like the other async tiers above so a slow repair pass cannot freeze the UI.
         if (server == HealthState.Red || tunnel == HealthState.Red)
         {
+            // ANOTHER PC IS SERVING THIS TUNNEL (state foreign/shared, scripts/supervisor.ps1,
+            // commit 57ad0d1) -- and if that is the ONLY reason this branch fired (server is
+            // fine), repair.ps1 has nothing to repair. Its Tier A for the tunnel IS start_all,
+            // which brings up THIS machine's own stack; it cannot make a different PC stop
+            // answering for this one. Running it anyway would not fix anything -- it would
+            // relaunch start_all every autofix cycle against a condition it structurally cannot
+            // change, spending the auto-fix retry budget (AUTOFIX_MAX_ATTEMPTS) on a loop with no
+            // exit. Tell the operator the supervisor's own diagnosis instead, the same way the
+            // Tier C (human-only, e.g. devtunnel login) branch below already does.
+            TunnelHostState tunHost = ReadTunnelHostState();
+            bool tunnelHijacked = tunnel == HealthState.Red && server != HealthState.Red
+                                 && tunHost != null
+                                 && (tunHost.State == "foreign" || tunHost.State == "shared");
+            if (tunnelHijacked)
+            {
+                string msg = tunHost.Message;
+                if (!string.IsNullOrEmpty(tunHost.Action)) msg = msg + "  " + tunHost.Action;
+                note(string.IsNullOrEmpty(msg) ? T("hs_tun_detail_bad") : msg);
+                done();
+                return;
+            }
             note(T("hs_fix_stack"));
             var t = new Thread(new ThreadStart(delegate
             {
                 try
                 {
+                    // repair.ps1's Tier A for server/tunnel IS another start_all.ps1 invocation
+                    // (`-NoUi -NoSplash`) -- running it while one is already mid-bring-up does
+                    // not fix anything, it queues a second startup behind the first one's lock.
+                    // Same check RunStartAll() makes itself, made here too because this branch
+                    // can reach repair.ps1 without ever calling RunStartAll directly.
+                    if (IsStartAllRunning()) { note(T("autofix_start_all_running")); return; }
                     string repairPs1 = Path.Combine(repo, "scripts", "repair.ps1");
                     RepairResult rr = File.Exists(repairPs1) ? ParseRepairResult(RunRepairDispatcher(repairPs1)) : null;
                     if (rr == null)
                     {
-                        // repair.ps1 missing, failed to run, or its output could not be parsed --
-                        // never regress: fall back to the previous blind stack bring-up.
-                        RunStartAll();
-                        note(T("hs_fix_stack"));
+                        // repair.ps1 missing, failed to run, or its output could not be parsed.
+                        // THIS USED TO fall back to a blind RunStartAll() "to never regress" --
+                        // measured (2026-09-24, .fleet/autofix.jsonl + process trees, 07:35-
+                        // 07:53) to be the third way this exact branch could add another queued
+                        // startup on top of an already-running one, with nothing to show for it
+                        // when repair.ps1's own diagnosis was simply unreadable. Record it and
+                        // tell the operator instead of guessing at a fix.
+                        AutoFixRecord(0, "repair.ps1 output unparsable or unavailable; not "
+                                       + "falling back to a blind start_all");
+                        note(T("hs_fix_repair_unreadable"));
                     }
                     else if (rr.HumanSteps.Count > 0)
                     {
@@ -3229,6 +4737,23 @@ class CockpitWindow : Window
     // throw into the UI thread. Reuses ShowScaleToast -- the cockpit's existing lightweight toast
     // -- for the optimistic "reconnecting…" message and the outcome (mirrors the steer-ack toast
     // pattern at "steer_collapsed_ack").
+    /// Tint the manual reconnect control by the Tool dot -- amber only when a reconnect is
+    /// actually indicated (dot Yellow or Red), muted otherwise.
+    ///
+    /// GRAY IS MUTED, NOT AMBER. Gray means the probe has no opinion (it has not run, or this
+    /// machine does not run it). "No opinion" is not "something is wrong", and painting it amber
+    /// is how the control came to be permanently lit in the first place.
+    void RefreshReconnectChatTint()
+    {
+        if (_reconnectChatBtn == null) return;
+        HealthState tool;
+        lock (_healthLock) { tool = _health[5].State; }
+        bool needed = tool == HealthState.Yellow || tool == HealthState.Red;
+        var tint = needed ? Theme.Br(Theme.Warning(_dark)) : Muted;
+        _reconnectChatBtn.Foreground = tint;
+        _reconnectChatBtn.BorderBrush = tint;
+    }
+
     void RunBridgeReconnectManual()
     {
         if (_bridgeReconnectRunning) return;
@@ -3452,19 +4977,28 @@ class CockpitWindow : Window
         catch (Exception) { return null; }
     }
 
+    const double START_ALL_COOLDOWN_S = 120.0;
+
     // Fire the full stack bring-up EXACTLY the way the desktop icon does: wscript.exe running
     // start_all_hidden.vbs, which in turn drives scripts\start_all.ps1 (Invoke-Startup starts
     // supervisor.ps1 [MCP server + devtunnel], companion Edge, bridge, UIs). start_all.ps1 is
     // idempotent -- it skips components already running -- so calling this when the stack is
     // already healthy is a safe no-op. Fire-and-forget: we do not wait for it to finish (up to
-    // ~2 min), we just launch it and let it self-log. Guarded by a 120s cooldown so repeated
-    // Fix clicks or health-poll ticks cannot stack multiple launches.
+    // ~2 min), we just launch it and let it self-log.
+    //
+    // TWO GUARDS, BOTH CROSS-PROCESS (2026-09-24 startup-loop fix; see StartupGate's doc
+    // comment in ui/SelfImproveDashboard.cs): if start_all.ps1 is ALREADY running, launching a
+    // second one only queues behind its lock and relaunches this cockpit again -- do nothing
+    // and say so, rather than repeat the mechanism that caused the loop. Otherwise, the 120s
+    // cooldown that used to live in this process's own fields (_startAllLaunched/
+    // _startAllLastUnix, so a freshly relaunched cockpit always saw it as never-yet-fired) is
+    // now the persisted "start_all" budget key, so a new process inherits the real cooldown.
     void RunStartAll()
     {
-        double nowU = NowUnix();
-        if (_startAllLaunched && (nowU - _startAllLastUnix) < 120.0) return;
-        _startAllLaunched = true;
-        _startAllLastUnix = nowU;
+        if (WindowSelfTest.Active) return;   // a selftest never starts the stack
+        if (IsStartAllRunning()) { NoteFromAnyThread(T("autofix_start_all_running")); return; }
+        bool exhausted;
+        if (!TryConsumeAutoFixBudget("start_all", 1, START_ALL_COOLDOWN_S, out exhausted)) return;
         try
         {
             string vbs = Path.Combine(RepoRoot(), "scripts", "start_all_hidden.vbs");
@@ -3555,7 +5089,9 @@ class CockpitWindow : Window
                 pastTag.Margin = new Thickness(0, 0, 0, 2);
                 wrap.Children.Add(pastTag);
                 var titleTag = new TextBlock();
-                titleTag.Text = CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
+                string focusSummary = S(focusEntry, "goal_summary");
+                titleTag.Text = !string.IsNullOrEmpty(focusSummary)
+                    ? focusSummary : CardTitle(S(focusEntry, "conv_title"), S(focusEntry, "goal"));
                 titleTag.Foreground = Theme.Br(Theme.Muted(_dark)); titleTag.FontSize = 10;
                 titleTag.TextTrimming = TextTrimming.CharacterEllipsis;
                 titleTag.Margin = new Thickness(0, 0, 0, 2);
@@ -3618,26 +5154,19 @@ class CockpitWindow : Window
             if (runEnded || allDone) overallPhase = "ended";
         }
         string started = root != null ? S(root, "started") : "";
-        // Re-key on the PRIMARY worker's own status + phase-event count so this panel repaints
-        // when workers[0] itself progresses, even while sibling workers keep overallPhase pinned
-        // to "running" (a repaint-gating bug, not a BuildSpineContent rendering bug -- that method
-        // already reads workers[0].phase_events correctly, it just wasn't being re-invoked).
-        string primaryStatus = "";
-        int primaryPhaseCount = 0;
+        // Re-key on the selected task's OPERATOR-FACING CONTENT. The old spine was a timeline,
+        // so phase-event count was enough. Content details must repaint when progress/current/next/
+        // waiting/artifacts change even if status and phase-event count do not.
+        string primaryDetailSig = "";
         if (spineWorkers != null && spineWorkers.Count > 0)
         {
             Dictionary<string, object> primaryW = SpineFocusWorker(spineWorkers);
-            if (primaryW != null)
-            {
-                primaryStatus = S(primaryW, "name") + ":" + S(primaryW, "status");
-                object pe;
-                if (primaryW.TryGetValue("phase_events", out pe) && pe is object[]) primaryPhaseCount = ((object[])pe).Length;
-            }
+            if (primaryW != null) primaryDetailSig = SpineDetailSignature(primaryW);
         }
         string spineSig = (hasWorkers ? "1" : "0") + "|" + started + "|" + overallPhase
                           + "|" + (_toolbarAll != null ? _toolbarAll.Count : 0)
                           + "|" + (_dark ? "D" : "L") + _lang
-                          + "|" + primaryStatus + "|" + primaryPhaseCount;
+                          + "|" + primaryDetailSig;
         if (spineSig == _spineSig) return;
         _spineSig = spineSig;
 
@@ -3677,7 +5206,63 @@ class CockpitWindow : Window
         return workers[0];
     }
 
-    // Build the spine panel content: section header + vertical [COMPUTED] execution timeline.
+    string SpineDetailSignature(Dictionary<string, object> w)
+    {
+        if (w == null) return "";
+        var parts = new List<string>();
+        parts.Add(S(w, "name"));
+        parts.Add(S(w, "status"));
+        parts.Add(I(w, "turn").ToString());
+        parts.Add(I(w, "max_turns").ToString());
+        parts.Add(S(w, "goal_summary"));
+        parts.Add(S(w, "reason"));
+        parts.Add(S(w, "outcome"));
+        parts.Add(I(w, "verify_attempts").ToString());
+        object phaseRaw;
+        if (w.TryGetValue("phase_events", out phaseRaw) && phaseRaw is object[])
+        {
+            object[] phaseArr = (object[])phaseRaw;
+            parts.Add(phaseArr.Length.ToString());
+            if (phaseArr.Length > 0)
+            {
+                var lastPhase = phaseArr[phaseArr.Length - 1] as Dictionary<string, object>;
+                if (lastPhase != null)
+                {
+                    parts.Add(S(lastPhase, "event"));
+                    parts.Add(S(lastPhase, "label"));
+                    parts.Add(S(lastPhase, "ts"));
+                }
+            }
+        }
+        var execution = Obj(w, "execution");
+        if (execution != null)
+        {
+            parts.Add(S(execution, "state"));
+            parts.Add(S(execution, "current_step"));
+            parts.Add(S(execution, "last_progress"));
+            parts.Add(S(execution, "next_step"));
+            parts.Add(S(execution, "waiting_reason"));
+            parts.Add(I(execution, "completed_count").ToString());
+            parts.Add(I(execution, "total_steps").ToString());
+            object artsRaw;
+            if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+            {
+                foreach (object obj in (object[])artsRaw)
+                {
+                    var artifact = obj as Dictionary<string, object>;
+                    if (artifact == null) continue;
+                    parts.Add(S(artifact, "path"));
+                    parts.Add(S(artifact, "name"));
+                    parts.Add(S(artifact, "uri"));
+                }
+            }
+        }
+        return string.Join("|", parts.ToArray());
+    }
+
+    // Left task-inspection spine. Content details answer "what is it doing now?"; the timeline
+    // directly below answers "how did it get here?". Both follow the same selected worker, and
+    // the expanded card keeps the richer evidence view rather than being the only timeline.
     // GIVE THE SPINE A VIEWPORT. The column is a fixed 220px lane whose content has NO upper
     // bound: the timeline is one entry per phase transition, and the Border it sat in simply
     // CLIPPED everything past the fold. The entries were rendered and unreachable, with no
@@ -3709,410 +5294,226 @@ class CockpitWindow : Window
         return sv;
     }
 
+    void AddSpineTimeline(StackPanel outer, Dictionary<string, object> w)
+    {
+        if (outer == null || w == null) return;
+        bool ja = _lang == 0;
+
+        var divider = new Border();
+        divider.Height = 1;
+        divider.Background = Theme.Br(Theme.Border(_dark));
+        divider.Margin = new Thickness(0, 12, 0, 8);
+        outer.Children.Add(divider);
+
+        var title = new TextBlock();
+        title.Text = ja ? "実行タイムライン" : "Execution timeline";
+        title.Foreground = Theme.Br(Theme.Muted(_dark));
+        title.FontSize = 10.5;
+        title.FontWeight = FontWeights.SemiBold;
+        title.Margin = new Thickness(0, 0, 0, 2);
+        outer.Children.Add(title);
+
+        bool real = false;
+        object peRaw;
+        if (w.TryGetValue("phase_events", out peRaw) && peRaw is object[])
+            real = ((object[])peRaw).Length > 0;
+        outer.Children.Add(new TextBlock {
+            Text = real ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
+                        : (ja ? "(ターン記録から推定)" : "(estimated from turns)"),
+            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 9.5,
+            Margin = new Thickness(0, 0, 0, 7) });
+
+        // The phase name alone is not enough operationally. Surface what this selected worker
+        // is doing NOW, but only from fields the runner actually published -- no invented step.
+        string timelineNow = "";
+        var timelineExec = Obj(w, "execution");
+        if (timelineExec != null)
+        {
+            string current = S(timelineExec, "current_step");
+            string progress = S(timelineExec, "last_progress");
+            if (!string.IsNullOrEmpty(current)) timelineNow = current;
+            if (!string.IsNullOrEmpty(progress) && progress != current)
+                timelineNow = string.IsNullOrEmpty(timelineNow) ? progress : (timelineNow + " · " + progress);
+        }
+        if (string.IsNullOrEmpty(timelineNow)) timelineNow = S(w, "reason");
+        timelineNow = (timelineNow ?? "").Replace("\r", " ").Replace("\n", " ").Trim();
+        if (timelineNow.Length > 180) timelineNow = timelineNow.Substring(0, 179).TrimEnd() + "…";
+        if (!string.IsNullOrEmpty(timelineNow))
+            outer.Children.Add(new TextBlock {
+                Text = (ja ? "現在: " : "Now: ") + timelineNow,
+                Foreground = Muted, FontSize = 10.5, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 8) });
+
+        string status = S(w, "status");
+        string outcome = S(w, "outcome");
+        bool terminal = status == "done" || status == "stuck" || status == "maxturns"
+                     || status == "error" || status == "cancelled";
+        int reviews = I(w, "verify_attempts");
+        var events = BuildTimelineEvents(S(w, "transcript"), outcome, terminal, reviews, w);
+        for (int i = 0; i < events.Count; i++)
+        {
+            bool last = i == events.Count - 1;
+            string label = events[i].Item1;
+            string color = events[i].Item2;
+
+            var row = new Grid();
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
+            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+
+            var rail = new DockPanel();
+            rail.HorizontalAlignment = HorizontalAlignment.Center;
+            var head = new Border { Width = 1.5, Height = 7,
+                Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent,
+                HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(head, Dock.Top);
+            rail.Children.Add(head);
+            var dot = new System.Windows.Shapes.Ellipse { Width = 8, Height = 8,
+                Fill = Theme.Br(color), HorizontalAlignment = HorizontalAlignment.Center };
+            DockPanel.SetDock(dot, Dock.Top);
+            rail.Children.Add(dot);
+            rail.Children.Add(new Border { Width = 1.5,
+                Background = last ? Brushes.Transparent : Theme.Br(Theme.Border(_dark)),
+                HorizontalAlignment = HorizontalAlignment.Center });
+            Grid.SetColumn(rail, 0);
+            row.Children.Add(rail);
+
+            var tb = new TextBlock { Text = label, Foreground = Theme.Br(color), FontSize = 11.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(4, i == 0 ? 1 : 0, 0, 5) };
+            Grid.SetColumn(tb, 1);
+            row.Children.Add(tb);
+            outer.Children.Add(row);
+        }
+    }
+
     // Derives events honestly from available data: run started ts, transcript first-turn ts,
     // current overall phase (polled), run ended state. No fabricated phase_events.
     UIElement BuildSpineContent(Dictionary<string, object> root, string overallPhase, bool runEnded,
                                 List<Dictionary<string, object>> workers)
     {
         bool ja = _lang == 0;
-
         var outer = new StackPanel();
         outer.Margin = new Thickness(12, 12, 8, 12);
 
-        // ── Section label ──────────────────────────────────────────────────────────
         var sectionLbl = new TextBlock();
-        sectionLbl.Text = ja ? "実行タイムライン" : "Execution timeline";
+        sectionLbl.Text = ja ? "内容詳細" : "Content details";
         sectionLbl.Foreground = Theme.Br(Theme.Muted(_dark));
         sectionLbl.FontSize = 10.5;
         sectionLbl.FontWeight = FontWeights.SemiBold;
-        sectionLbl.Margin = new Thickness(0, 0, 0, 1);
+        sectionLbl.Margin = new Thickness(0, 0, 0, 7);
         outer.Children.Add(sectionLbl);
 
-        // ── Check for real phase_events from the primary worker ────────────────────
-        // The primary worker is the first/earliest worker in the workers list.
-        // If phase_events is present and non-empty, render from those (REAL mode).
-        // Otherwise, fall through to the [COMPUTED] turn-timestamp fallback below.
-        bool usingRealEvents = false;
-        var realPhaseEvents = new List<Tuple<string, string, string>>();  // label, timeStr, colorHex
-        if (workers != null && workers.Count > 0)
+        Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
+        if (primaryWorker == null)
         {
-            Dictionary<string, object> primaryWorker = SpineFocusWorker(workers);
-            object peRaw;
-            if (primaryWorker.TryGetValue("phase_events", out peRaw) && peRaw is object[])
-            {
-                object[] peArr = (object[])peRaw;
-                if (peArr.Length > 0)
-                {
-                    usingRealEvents = true;
-                    foreach (object peObj in peArr)
-                    {
-                        var pe = peObj as Dictionary<string, object>;
-                        if (pe == null) continue;
-                        // ts: epoch double
-                        double peTs = 0;
-                        object peTsRaw;
-                        if (pe.TryGetValue("ts", out peTsRaw) && peTsRaw != null)
-                        {
-                            try { peTs = Convert.ToDouble(peTsRaw); } catch { }
-                        }
-                        // event: the status-key string
-                        string peEvent = "";
-                        object peEventRaw;
-                        if (pe.TryGetValue("event", out peEventRaw) && peEventRaw != null)
-                            peEvent = peEventRaw.ToString();
-                        // label: English fallback from the stored label field
-                        string peFallbackLabel = peEvent;
-                        object peLabelRaw;
-                        if (pe.TryGetValue("label", out peLabelRaw) && peLabelRaw != null)
-                            peFallbackLabel = peLabelRaw.ToString();
-                        // Localized label via Theme.StatusLabel; fall back to stored English label
-                        string localLabel = Theme.StatusLabel(peEvent, _lang);
-                        if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
-                        {
-                            // Theme.StatusLabel returns the key itself when unrecognized; use stored fallback
-                            string knownKey = Theme.StatusLabel(peEvent, _lang);
-                            localLabel = (knownKey == peEvent && !string.IsNullOrEmpty(peFallbackLabel))
-                                ? peFallbackLabel : knownKey;
-                        }
-                        string kind = Theme.StatusKind(peEvent);
-                        string colorHex = Theme.KindColor(kind, _dark);
-                        string timeStr = "";
-                        if (peTs > 0)
-                        {
-                            try
-                            {
-                                timeStr = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                                    .AddSeconds(peTs).ToLocalTime().ToString("HH:mm");
-                            }
-                            catch { }
-                        }
-                        realPhaseEvents.Add(new Tuple<string, string, string>(localLabel, timeStr, colorHex));
-                    }
-                }
-            }
-        }
-
-        // Sub-label changes based on mode (real vs computed)
-        var subLbl = new TextBlock();
-        subLbl.Text = usingRealEvents
-            ? (ja ? "(フェーズ遷移)" : "(phase transitions)")
-            // "from turns" did not say that these times are INFERRED. That was the whole content
-            // of the [COMPUTED] tag underneath, so it moves up here where it is read first.
-            : (ja ? "(会話ターンから推定)" : "(estimated from turns)");
-        subLbl.Foreground = Theme.Br(Theme.Faint(_dark));
-        subLbl.FontSize = 9.5;
-        subLbl.Margin = new Thickness(0, 0, 0, 8);
-        outer.Children.Add(subLbl);
-
-        // ── If real events mode: render from phase_events and skip [COMPUTED] path ─
-        if (usingRealEvents)
-        {
-            for (int i = 0; i < realPhaseEvents.Count; i++)
-            {
-                string evLabel = realPhaseEvents[i].Item1;
-                string evTime  = realPhaseEvents[i].Item2;
-                string evColor = realPhaseEvents[i].Item3;
-                bool isLast = (i == realPhaseEvents.Count - 1);
-                var row = new Grid();
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });
-                row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-                // A DOCKPANEL, NOT A STACKPANEL. Measured on screen: an 8px hole in every
-                // connector, at every step, in both of this widget's two implementations. The
-                // rail was drawn as a fixed 8px above the dot and a fixed 8px below it -- 24px
-                // of column against a row whose height is set by the label and its timestamp,
-                // about 32px. It could never reach, and a wrapped label opens the gap further.
-                // Docking the head to the top and letting the tail take the remaining height
-                // makes the rail follow the row instead of guessing at it.
-                var lineAndDot = new DockPanel();
-                lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-                {
-                    var connector = new Border();
-                    connector.Width = 1.5; connector.Height = 8;
-                    // Transparent rather than absent on the first row: the head still has to
-                    // occupy its 8px so every dot lands at the same height down the column.
-                    connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
-                    connector.HorizontalAlignment = HorizontalAlignment.Center;
-                    DockPanel.SetDock(connector, Dock.Top);
-                    lineAndDot.Children.Add(connector);
-                }
-                var dot = new System.Windows.Shapes.Ellipse();
-                dot.Width = 8; dot.Height = 8;
-                dot.Fill = Theme.Br(evColor);
-                dot.HorizontalAlignment = HorizontalAlignment.Center;
-                DockPanel.SetDock(dot, Dock.Top);
-                lineAndDot.Children.Add(dot);
-                {
-                    // The last child of a DockPanel fills what is left, so this is the piece that
-                    // reaches the next dot however tall the row turns out to be. Added even on the
-                    // last row -- invisible there -- because if it were absent the dot would
-                    // become the filling child and stretch.
-                    var tail = new Border();
-                    tail.Width = 1.5;
-                    tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
-                    tail.HorizontalAlignment = HorizontalAlignment.Center;
-                    lineAndDot.Children.Add(tail);
-                }
-                Grid.SetColumn(lineAndDot, 0);
-                row.Children.Add(lineAndDot);
-                var labelBlock = new StackPanel();
-                labelBlock.VerticalAlignment = VerticalAlignment.Top;
-                labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
-                var labelTb = new TextBlock();
-                labelTb.Text = evLabel;
-                labelTb.Foreground = Theme.Br(evColor);
-                labelTb.FontSize = 11; labelTb.FontWeight = FontWeights.SemiBold;
-                labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
-                labelBlock.Children.Add(labelTb);
-                if (!string.IsNullOrEmpty(evTime))
-                {
-                    var timeTb = new TextBlock();
-                    timeTb.Text = evTime;
-                    timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
-                    timeTb.FontSize = 10;
-                    labelBlock.Children.Add(timeTb);
-                }
-                Grid.SetColumn(labelBlock, 1);
-                row.Children.Add(labelBlock);
-                outer.Children.Add(row);
-            }
-            // [REAL] used to be printed here. It is a tag from this project's own spec, where
-            // every displayed field is marked [REAL] / [COMPUTED] / [FUTURE] so nobody ships a
-            // fabricated number -- a good rule that had leaked into the product as jargon. The
-            // distinction it carried is already stated in words at the top of this panel:
-            // "(phase transitions)" against "(estimated from turns)". Saying it twice, once in
-            // brackets, is not more honest.
+            outer.Children.Add(new TextBlock {
+                Text = ja ? "表示できるタスク情報がありません" : "No task details available",
+                Foreground = Theme.Br(Theme.Muted(_dark)), FontSize = 12.0,
+                TextWrapping = TextWrapping.Wrap });
             return outer;
         }
 
-        // ── [COMPUTED] fallback: derive timestamps from transcript ────────────────
-        // Use the first worker in the workers list that has a transcript path.
-        string transcriptPath = "";
-        if (workers != null)
-        {
-            foreach (Dictionary<string, object> tw in workers)
-            {
-                string tp = S(tw, "transcript");
-                if (!string.IsNullOrEmpty(tp) && File.Exists(tp)) { transcriptPath = tp; break; }
-            }
-            if (string.IsNullOrEmpty(transcriptPath) && workers.Count > 0)
-                transcriptPath = S(workers[0], "transcript");
-        }
+        string fullGoal = S(primaryWorker, "goal");
+        string goalSummary = S(primaryWorker, "goal_summary");
+        if (string.IsNullOrEmpty(goalSummary))
+            goalSummary = CardTitle(S(primaryWorker, "conv_title"), fullGoal);
+        if (!string.IsNullOrEmpty(goalSummary))
+            outer.Children.Add(new TextBlock {
+                Text = goalSummary, Foreground = Fg, FontSize = 13.0,
+                FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+                Margin = new Thickness(0, 0, 0, 7) });
 
-        // Read meta ts (= "queued") and first turn ts (= "started") from transcript.
-        double metaTs = 0, firstTurnTs = 0;
-        try
+        string status = S(primaryWorker, "status");
+        int turn = I(primaryWorker, "turn");
+        int maxTurns = I(primaryWorker, "max_turns");
+        string statusText = StatusLabel(status);
+        if (string.IsNullOrEmpty(statusText)) statusText = overallPhase;
+        if (turn > 0)
+            statusText += maxTurns > 0 ? ("  ·  Turn " + turn + "/" + maxTurns) : ("  ·  Turn " + turn);
+        if (!string.IsNullOrEmpty(statusText))
+            outer.Children.Add(new TextBlock {
+                Text = statusText, Foreground = Theme.Br(Theme.Secondary(_dark)), FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 7) });
+
+        var execution = Obj(primaryWorker, "execution");
+        string waiting = "";
+        if (execution != null)
         {
-            if (!string.IsNullOrEmpty(transcriptPath) && File.Exists(transcriptPath))
+            string state = S(execution, "state");
+            string current = S(execution, "current_step");
+            string progress = S(execution, "last_progress");
+            string next = S(execution, "next_step");
+            waiting = S(execution, "waiting_reason");
+
+            if (!string.IsNullOrEmpty(current))
             {
-                string[] tlines;
-                using (var fsr = new FileStream(transcriptPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-                using (var sr = new StreamReader(fsr, Encoding.UTF8))
-                    tlines = sr.ReadToEnd().Replace("\r", "").Split('\n');
-                foreach (var tln in tlines)
+                outer.Children.Add(new TextBlock { Text = ja ? "現在" : "Current",
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                    FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 2, 0, 1) });
+                string currentText = current;
+                if (!string.IsNullOrEmpty(state) && state != current) currentText = state + "  ·  " + current;
+                outer.Children.Add(new TextBlock { Text = currentText, Foreground = Fg, FontSize = 12.0,
+                    TextWrapping = TextWrapping.Wrap, Margin = new Thickness(0, 0, 0, 5) });
+            }
+            else if (!string.IsNullOrEmpty(state))
+            {
+                outer.Children.Add(new TextBlock { Text = (ja ? "状態: " : "State: ") + state,
+                    Foreground = Fg, FontSize = 12.0, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 2, 0, 5) });
+            }
+
+            if (!string.IsNullOrEmpty(progress))
+                outer.Children.Add(new TextBlock { Text = (ja ? "進捗: " : "Progress: ") + progress,
+                    Foreground = Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 1, 0, 4) });
+            if (!string.IsNullOrEmpty(next))
+                outer.Children.Add(new TextBlock { Text = (ja ? "次: " : "Next: ") + next,
+                    Foreground = Muted, FontSize = 11.5, TextWrapping = TextWrapping.Wrap,
+                    Margin = new Thickness(0, 1, 0, 4) });
+
+            object artsRaw;
+            if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+            {
+                object[] arts = (object[])artsRaw;
+                if (arts.Length > 0)
                 {
-                    if (string.IsNullOrEmpty(tln)) continue;
-                    Dictionary<string, object> obj;
-                    try { obj = _js.DeserializeObject(tln) as Dictionary<string, object>; } catch { continue; }
-                    if (obj == null) continue;
-                    if (obj.ContainsKey("meta") && Convert.ToBoolean(obj["meta"]))
+                    outer.Children.Add(new TextBlock { Text = ja ? "成果物" : "Artifacts",
+                        Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                        FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 5, 0, 1) });
+                    int shown = 0;
+                    foreach (object obj in arts)
                     {
-                        if (obj.ContainsKey("ts") && obj["ts"] != null) metaTs = Convert.ToDouble(obj["ts"]);
-                        continue;
+                        var artifact = obj as Dictionary<string, object>;
+                        if (artifact == null) continue;
+                        string label = S(artifact, "path");
+                        if (string.IsNullOrEmpty(label)) label = S(artifact, "name");
+                        if (string.IsNullOrEmpty(label)) label = S(artifact, "uri");
+                        if (string.IsNullOrEmpty(label)) continue;
+                        outer.Children.Add(new TextBlock { Text = "• " + label,
+                            Foreground = Muted, FontSize = 11.0, TextWrapping = TextWrapping.Wrap,
+                            Margin = new Thickness(5, 1, 0, 1) });
+                        shown++;
+                        if (shown >= 5) break;
                     }
-                    if (obj.ContainsKey("role") && obj.ContainsKey("ts") && obj["ts"] != null && firstTurnTs == 0)
-                        firstTurnTs = Convert.ToDouble(obj["ts"]);
-                    if (firstTurnTs > 0) break;
+                    if (arts.Length > shown)
+                        outer.Children.Add(new TextBlock { Text = "+" + (arts.Length - shown),
+                            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                            Margin = new Thickness(5, 1, 0, 2) });
                 }
             }
         }
-        catch { }
 
-        // Fall back: if meta ts is absent, use root["started"] (epoch, top-level).
-        if (metaTs <= 0 && root != null) metaTs = Dbl(root, "started");
-
-        // ── Helper: format epoch as "HH:mm" ──────────────────────────────────────
-        // C# 5: use a local method-delegate pattern
-        Func<double, string> fmtHM = delegate(double ts)
+        string reason = !string.IsNullOrEmpty(waiting) ? waiting : S(primaryWorker, "reason");
+        if (!string.IsNullOrEmpty(reason))
         {
-            if (ts <= 0) return "";
-            try
-            {
-                return new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
-                    .AddSeconds(ts).ToLocalTime().ToString("HH:mm");
-            }
-            catch { return ""; }
-        };
-
-        // ── Build events list ──────────────────────────────────────────────────────
-        // [COMPUTED] Honest markers only: queued/received, started (first turn), now/phase, ended.
-        var events = new List<Tuple<string, string, string>>();
-        // Each tuple: (label, time-string, railColor-hex)
-        string graphite = Theme.Muted(_dark);
-        string live = Theme.Info(_dark);
-        string attn = Theme.Warning(_dark);
-        string ended = Theme.Success(_dark);
-        string danger = Theme.Danger(_dark);
-
-        // Marker 1: Queued / directive received
-        string qLabel = ja ? "投入" : "Queued";
-        string qTime = fmtHM(metaTs);
-        events.Add(new Tuple<string, string, string>(qLabel, qTime, graphite));
-
-        // Marker 2: Started (first turn in transcript)
-        //
-        // ONLY WHEN IT SAYS SOMETHING THE PREVIOUS MARKER DID NOT. The meta line and the first
-        // user turn are usually written within the same second, so at HH:mm resolution 投入 and
-        // 開始 carried the identical clock time on every task first measured -- two rows, one
-        // fact. A timeline whose steps repeat each other reads as a template rather than as
-        // this task's history, which is how the wrong 終了 above stayed invisible.
-        //
-        // THE TEST IS WHETHER THE DISPLAYED TIMES DIFFER, not whether the gap clears some
-        // number of seconds. The first version used >= 60s as a stand-in for "the minute will
-        // have changed", which is sound in one direction only: 60s guarantees a different
-        // minute, but a shorter wait can straddle a boundary and be equally informative. On
-        // the real records the waits run median 6.5s with 13% over thirty seconds -- the queue
-        // does wait, in steps, as admission control staggers the workers -- so a threshold
-        // picked in seconds hides real history at 10:59:50 -> 11:00:48 while claiming to show
-        // it. Comparing the strings that will actually be rendered is the exact question, and
-        // it needs no threshold at all.
-        string sTime = fmtHM(firstTurnTs);
-        if (firstTurnTs > 0 && sTime != "" && sTime != qTime)
-        {
-            string sLabel = ja ? "開始" : "Started";
-            events.Add(new Tuple<string, string, string>(sLabel, sTime, live));
+            outer.Children.Add(new TextBlock { Text = ja ? "待機・補足" : "Waiting / note",
+                Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 10.5,
+                FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 6, 0, 1) });
+            outer.Children.Add(new TextBlock { Text = reason, Foreground = Muted, FontSize = 11.5,
+                TextWrapping = TextWrapping.Wrap });
         }
 
-        // Marker 3: Current / overall phase (polled; [COMPUTED])
-        if (!runEnded)
-        {
-            string phLabel;
-            string phColor;
-            if (overallPhase == "attn")
-            {
-                phLabel = ja ? "要対応" : "Needs attention";
-                phColor = attn;
-            }
-            else if (overallPhase == "verifying")
-            {
-                phLabel = ja ? "検証中" : "Verifying";
-                phColor = attn;
-            }
-            else if (overallPhase == "running")
-            {
-                phLabel = ja ? "実行中" : "Running";
-                phColor = live;
-            }
-            else
-            {
-                phLabel = ja ? "実行中" : "Running";
-                phColor = live;
-            }
-            string nowTime = fmtHM(NowUnix());
-            events.Add(new Tuple<string, string, string>(phLabel, nowTime, phColor));
-        }
-        else
-        {
-            // Marker 3 (ended). root["updated"] is the RUN's clock, and for a past task that is
-            // the wrong one: RefreshSpine focuses a single history entry, and every one of them
-            // was then shown ending at the same minute the run did. Measured on the last eight
-            // entries of .fleet/history.json -- true ends 10:53, 10:53, 10:56, 10:57, 10:57,
-            // 10:59, 11:01, 11:05, all displayed as 11:05. Seven of eight wrong, and wrong in
-            // the way that hides it: identical, so it reads as a rendering of the run rather
-            // than as a mistake about the task.
-            //
-            // The focused entry carries its own finish time. Use it whenever exactly one task
-            // is in view; a live run's spine covers many workers, and there the run's clock is
-            // the right one.
-            double endedTs = 0;
-            if (workers != null && workers.Count == 1)
-                endedTs = Dbl(workers[0], "ts");
-            if (endedTs <= 0 && root != null) endedTs = Dbl(root, "updated");
-            string eLabel = ja ? "終了" : "Ended";
-            string eTime = fmtHM(endedTs);
-            string eColor = (overallPhase == "attn") ? danger : ended;
-            events.Add(new Tuple<string, string, string>(eLabel, eTime, eColor));
-        }
-
-        // ── Render the vertical timeline ───────────────────────────────────────────
-        for (int i = 0; i < events.Count; i++)
-        {
-            string evLabel = events[i].Item1;
-            string evTime = events[i].Item2;
-            string evColor = events[i].Item3;
-            bool isLast = (i == events.Count - 1);
-
-            var row = new Grid();
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(18) });  // dot + line col
-            row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) }); // label col
-
-            // Vertical connector: a thin line above the dot (hidden for first item).
-            // Same rail, same hole, second copy. See the note in the phase-events branch.
-            var lineAndDot = new DockPanel();
-            lineAndDot.HorizontalAlignment = HorizontalAlignment.Center;
-            {
-                var connector = new Border();
-                connector.Width = 1.5;
-                connector.Height = 8;
-                connector.Background = i > 0 ? Theme.Br(Theme.Border(_dark)) : Brushes.Transparent;
-                connector.HorizontalAlignment = HorizontalAlignment.Center;
-                DockPanel.SetDock(connector, Dock.Top);
-                lineAndDot.Children.Add(connector);
-            }
-
-            // Dot
-            var dot = new System.Windows.Shapes.Ellipse();
-            dot.Width = 8;
-            dot.Height = 8;
-            dot.Fill = Theme.Br(evColor);
-            dot.HorizontalAlignment = HorizontalAlignment.Center;
-            dot.Margin = new Thickness(0, i == 0 ? 4 : 0, 0, 0);
-            DockPanel.SetDock(dot, Dock.Top);
-            lineAndDot.Children.Add(dot);
-
-            // Tail connector below dot (hidden for last item)
-            if (!isLast)
-            {
-                var tail = new Border();
-                tail.Width = 1.5;
-                tail.Background = isLast ? Brushes.Transparent : Theme.Br(Theme.Border(_dark));
-                tail.HorizontalAlignment = HorizontalAlignment.Center;
-                lineAndDot.Children.Add(tail);
-            }
-
-            Grid.SetColumn(lineAndDot, 0);
-            row.Children.Add(lineAndDot);
-
-            // Label + time block
-            var labelBlock = new StackPanel();
-            labelBlock.VerticalAlignment = VerticalAlignment.Top;
-            labelBlock.Margin = new Thickness(4, i == 0 ? 2 : 0, 0, 4);
-
-            var labelTb = new TextBlock();
-            labelTb.Text = evLabel;
-            labelTb.Foreground = Theme.Br(evColor);
-            labelTb.FontSize = 11;
-            labelTb.FontWeight = FontWeights.SemiBold;
-            labelTb.TextTrimming = TextTrimming.CharacterEllipsis;
-            labelBlock.Children.Add(labelTb);
-
-            if (!string.IsNullOrEmpty(evTime))
-            {
-                var timeTb = new TextBlock();
-                timeTb.Text = evTime;
-                timeTb.Foreground = Theme.Br(Theme.Muted(_dark));
-                timeTb.FontSize = 10;
-                labelBlock.Children.Add(timeTb);
-            }
-
-            Grid.SetColumn(labelBlock, 1);
-            row.Children.Add(labelBlock);
-
-            outer.Children.Add(row);
-        }
-
-        // ── [COMPUTED] footer tag ─────────────────────────────────────────────────
-        // The [COMPUTED] tag stood here; the subtitle now carries the same warning in words.
-
+        AddSpineTimeline(outer, primaryWorker);
         return outer;
     }
 
@@ -4215,7 +5616,7 @@ class CockpitWindow : Window
             if (e.Key == Key.Return && (Keyboard.Modifiers & ModifierKeys.Control) != 0)
             {
                 e.Handled = true;
-                // A2-2: Ctrl+Enter steers when a run is active; starts fleet otherwise.
+                // Ctrl+Enter adds tasks to the live run; starts a new fleet when idle.
                 //
                 // AND A SLASH SETTING IS A SETTING HERE TOO. The send button below already
                 // calls HandleSlashSetting first, with a note saying the bug was found by
@@ -4227,7 +5628,7 @@ class CockpitWindow : Window
                 // The same fault reached by two callers is one fault; fixing the caller you
                 // happened to be looking at leaves it live everywhere else.
                 if (HandleSlashSetting()) return;
-                if (_composerRunActive) TrySendSteer();
+                if (_composerRunActive) TryAddGoalsToActiveRun();
                 else StartFleet();
             }
         };
@@ -4257,21 +5658,20 @@ class CockpitWindow : Window
         _folderBtn.Click += delegate { FolderToGoals(); };
         btns.Children.Add(_folderBtn);
         _startBtn = new Button();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_startBtn, "startButton");
         _startBtn.Cursor = Cursors.Hand; _startBtn.BorderThickness = new Thickness(0);
         _startBtn.Height = Theme.BtnH; _startBtn.MinWidth = 132; _startBtn.FontWeight = FontWeights.SemiBold;
         _startBtn.Margin = new Thickness(8, 0, 0, 0); _startBtn.Padding = new Thickness(16, 0, 16, 0);
-        // A2-2: when a run is active, the button sends a steer instead of starting a fleet.
+        // When a run is active, the primary button adds tasks to that run.
         _startBtn.Click += delegate
         {
-            // A SETTING IS NEVER A MESSAGE. While a run is live this button steers the running
-            // worker, and the steer is simply whatever the composer holds -- so `/fanout on`,
-            // `/effort max` and `/approval plan` were being sent to Copilot as instructions
-            // instead of changing anything here. Nothing failed visibly: the composer cleared,
-            // the note read like a steer had gone out, and the setting was silently unchanged.
-            // Found by typing `/fanout on` into the real window; settings.txt had no fanout key
-            // afterwards, and the running worker had been handed the text.
+            // A SETTING IS NEVER A TASK. Slash settings are consumed locally before the primary
+            // action is chosen. With an active run, ordinary text is durably added to that run;
+            // when idle, ordinary text starts a new run. Worker-specific steering lives on each
+            // worker card, so `/fanout`, `/effort`, and `/approval` must never enter either task
+            // path as Copilot instructions.
             if (HandleSlashSetting()) return;
-            if (_composerRunActive) TrySendSteer();
+            if (_composerRunActive) TryAddGoalsToActiveRun();
             else StartFleet();
         };
         btns.Children.Add(_startBtn);
@@ -4383,6 +5783,20 @@ class CockpitWindow : Window
                 handled = true;
             }
         }
+        else if (g0.StartsWith("/runtime ", StringComparison.OrdinalIgnoreCase))
+        {
+            string v = g0.Substring(9).Trim().ToLower();
+            if (v == "fleet" || v == "durable")
+            {
+                _runtimeMode = v;
+                SaveKey("runtime", _runtimeMode);
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? (_runtimeMode == "durable" ? "次のタスクは長時間実行モードで開始します。" : "次のタスクは従来Fleetで開始します。")
+                        : (_runtimeMode == "durable" ? "Next task will use the durable runtime." : "Next task will use classic Fleet.");
+                handled = true;
+            }
+        }
         else if (g0.StartsWith("/fanout", StringComparison.OrdinalIgnoreCase))
         {
             string v = g0.Length > 7 ? g0.Substring(7).Trim().ToLower() : "";
@@ -4390,6 +5804,7 @@ class CockpitWindow : Window
             {
                 _fanout = (v == "on");
                 SaveKey("fanout", _fanout ? "on" : "off");
+                PaintFanout();
                 if (_startNote != null)
                     _startNote.Text = _lang == 0
                         ? (_fanout ? "分割実行 ON — 長い依頼を独立したサブタスクに分けて並列実行し、結果を統合します。"
@@ -4407,6 +5822,20 @@ class CockpitWindow : Window
     {
         try
         {
+            if (_durableStartPending)
+            {
+                _startNote.Text = _lang == 0
+                    ? "長時間タスクの開始確認中です。入力は保持されています。"
+                    : "Waiting for the durable task to be accepted; your input is kept.";
+                return;
+            }
+            if (_fleetLaunchPending)
+            {
+                _startNote.Text = _lang == 0
+                    ? "前の実行終了を待って新しいタスクを開始中です。"
+                    : "Waiting for the previous run to finish closing before starting this task.";
+                return;
+            }
             // refuse if a fleet is already running (both would write the same status.json)
             Dictionary<string, object> st = ReadStatus();
             if (st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
@@ -4426,6 +5855,14 @@ class CockpitWindow : Window
                 _startNote.Text = _lang == 0 ? "ゴールを入力してください。" : "Enter goals (one per line).";
                 return;
             }
+            foreach (string goal in goals)
+            {
+                if (!IsLocalLoopControlGoal(goal)) continue;
+                if (_startNote != null) _startNote.Text = _lang == 0
+                    ? "LOCAL_LOOP の内部制御文は通常タスクとして再実行できません。耐久タスクのカードから再開してください。"
+                    : "LOCAL_LOOP control text cannot run as ordinary Fleet work. Resume the durable task card instead.";
+                return;
+            }
             if (goals.Count == 1 && goals[0].Equals("/help", StringComparison.OrdinalIgnoreCase))
             {
                 _goalInput.Text = "";
@@ -4434,18 +5871,48 @@ class CockpitWindow : Window
                 return;
             }
             // Slash settings are handled by the shared HandleSlashSetting(), which the
-            // send button also calls BEFORE deciding start-vs-steer -- see there for why.
+            // send button also calls before deciding whether to start or add to a live run.
             if (HandleSlashSetting()) return;
 
+            if (_runtimeMode == "durable")
+            {
+                if (goals.Count != 1)
+                {
+                    _startNote.Text = _lang == 0 ? "長時間実行モードは現在1タスクずつ開始します。1件にまとめてください。"
+                                                  : "Durable runtime currently starts one task at a time.";
+                    return;
+                }
+                if (_approval != "run")
+                {
+                    _startNote.Text = _lang == 0 ? "長時間実行モードのPhase 1は /approval run が必要です。"
+                                                  : "Durable Phase 1 requires /approval run.";
+                    return;
+                }
+                if (!DurableRuntimeEnabled())
+                {
+                    _startNote.Text = _lang == 0 ? "長時間実行は無効です。MCP_EXECUTION_PROFILES=1 を設定してMCPサーバを再起動してください。"
+                                                  : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 and restart the MCP server.";
+                    return;
+                }
+                string durableSubmittedText = _goalInput.Text ?? "";
+                if (!SpawnDurableTask(goals[0], durableSubmittedText)) return;
+                _startNote.Text = _lang == 0
+                    ? "長時間タスクの開始を確認中です。入力は保持されています。"
+                    : "Starting durable task; your input is kept until LOCAL_LOOP accepts it.";
+                _lastSig = "";
+                return;
+            }
+
             bool planMode = _approval == "plan" || _approval == "auto";
-            SpawnFleet(goals, "goals_input.txt", planMode);
-            _goalInput.Text = "";
-            _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
-                              + (_lang == 0 ? " 件）" : " goals)")
-                              + (planMode
-                                  ? (_lang == 0 ? "。承認待ちの計画を各カードに出します。" : ". Each card will wait at plan approval.")
-                                  : "");
-            _lastSig = "";   // force a re-render once status.json starts updating
+            string submittedText = _goalInput.Text ?? "";
+            string freshFile = "fresh_start_" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString()
+                             + "_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".jsonl";
+            if (!SpawnFleet(goals, freshFile, planMode, waitForClosingRun: true,
+                            submittedText: submittedText)) return;
+            _startNote.Text = _lang == 0
+                ? "前の実行終了を待って開始します。タスクは保持されています。"
+                : "Waiting for the previous run to close; the task is kept until the new run starts.";
+            _lastSig = "";
         }
         catch (Exception ex)
         {
@@ -4453,77 +5920,280 @@ class CockpitWindow : Window
         }
     }
 
-    // A2-2: Send a steer from the bottom composer. Parses "W2: ..." prefix to target a specific
-    // worker; otherwise broadcasts to the first running worker (or ALL via broadcast if no live
-    // specific worker is found -- the relay picks the right one). Reuses RequestSteer() exactly
-    // as the per-card SteerRow does: writes {"steer":[{worker,text},...]} into commands.json.
-    void TrySendSteer()
+    bool ActiveRunIsLocalLoop(Dictionary<string, object> st)
     {
-        string text = (_goalInput != null ? _goalInput.Text : "").Trim();
-        if (string.IsNullOrEmpty(text)) return;
-        if (!RunIsLive())
+        try
         {
-            if (_startNote != null) _startNote.Text = T("steer_dead");
+            return st != null && string.Equals(
+                S(st, "execution_mode"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+        }
+        catch (Exception) { return false; }
+    }
+
+    bool ActiveRunIsLocalLoop()
+    {
+        try { return ActiveRunIsLocalLoop(ReadStatus()); }
+        catch (Exception) { return false; }
+    }
+
+    void TryAddGoalsToActiveRun()
+    {
+        // LOCAL_LOOP and classic Fleet intentionally have different durable command channels.
+        // LOCAL_LOOP additions become campaign jobs in SQLite/manifest; classic Fleet additions
+        // keep using the one-command-per-file channel. Never let either side consume the other.
+        if (ActiveRunIsLocalLoop())
+        {
+            TryAddGoalsToDurableRun();
             return;
         }
+        TryAddGoalsToLiveFleet();
+    }
 
-        // Parse optional "Wx: " / "W0: " / "W10: " prefix for targeted worker routing.
-        string targetWorker = "";
-        string steerText = text;
-        if (text.Length > 2 && (text[0] == 'W' || text[0] == 'w'))
+    void TryAddGoalsToDurableRun()
+    {
+        if (_goalInput == null) return;
+        if (_durableEnqueuePending)
         {
-            int colonIdx = text.IndexOf(':');
-            if (colonIdx >= 2 && colonIdx <= 4)
-            {
-                string maybeWorker = text.Substring(0, colonIdx).Trim();
-                bool allDigits = true;
-                for (int ci = 1; ci < maybeWorker.Length; ci++)
-                    if (!char.IsDigit(maybeWorker[ci])) { allDigits = false; break; }
-                if (allDigits && maybeWorker.Length >= 2)
-                {
-                    targetWorker = maybeWorker;      // e.g. "W2"
-                    steerText = text.Substring(colonIdx + 1).Trim();
-                }
-            }
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "前の長時間タスクをキューへ登録中です。"
+                                              : "The previous durable task submission is still being queued.";
+            return;
         }
-
-        // If no explicit worker prefix, broadcast to the first non-terminal running worker.
-        if (string.IsNullOrEmpty(targetWorker))
+        var goals = new List<string>();
+        foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
         {
-            var workers = _toolbarAll ?? new List<Dictionary<string, object>>();
-            foreach (Dictionary<string, object> tw in workers)
-            {
-                string st = S(tw, "status");
-                if (!IsTerminalWorker(tw) && st != "pending")
-                {
-                    targetWorker = S(tw, "name");
-                    break;
-                }
-            }
-            // Still empty: fall back to empty string (relay broadcasts to all workers).
+            string goal = ln.Trim();
+            if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
         }
+        if (goals.Count == 0) return;
 
-        RequestSteer(targetWorker, steerText);
-        if (_goalInput != null) _goalInput.Text = "";
-        // SAY WHICH WORKER, AND SAY IT TAKES A TURN. This used to read "queued for the
-        // next turn" whatever happened -- including when no live worker was found and an
-        // EMPTY name went out, which the relay then dropped because nothing there
-        // broadcast. The person believed they had redirected the work and watched it
-        // continue in the old direction. The relay broadcasts now, and the note says
-        // which case this was so a surprise is visible rather than inferred.
-        if (_startNote != null)
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        string submittedText = _goalInput.Text ?? "";
+        string goalsFile = null;
+        System.Diagnostics.Process proc = null;
+        try
         {
-            bool ja = _lang == 0;
-            if (!string.IsNullOrEmpty(targetWorker))
-                _startNote.Text = ja ? (targetWorker + " の次のターンに送ります")
-                                     : ("Queued for " + targetWorker + "'s next turn");
-            else
-                _startNote.Text = ja ? "実行中の全ワーカーの次のターンに送ります"
-                                     : "Queued for every live worker's next turn";
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            goalsFile = Path.Combine(stateDir, "durable_enqueue_" + token + ".json");
+            File.WriteAllText(goalsFile, _js.Serialize(goals), new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --enqueue-goals-file \"" + goalsFile
+                          + "\" --state-dir \"" + stateDir + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("durable enqueue process did not start");
+            _durableEnqueuePending = true;
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "長時間タスクをdurable queueへ登録中..."
+                                              : "Queueing durable task(s)...";
+
+            var timer = new System.Windows.Threading.DispatcherTimer();
+            timer.Interval = TimeSpan.FromMilliseconds(200);
+            timer.Tick += delegate
+            {
+                try
+                {
+                    proc.Refresh();
+                    if (!proc.HasExited) return;
+                    timer.Stop();
+                    string stderr = "";
+                    try { stderr = proc.StandardError.ReadToEnd(); } catch (Exception) { }
+                    _durableEnqueuePending = false;
+                    try { if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile)) File.Delete(goalsFile); }
+                    catch (Exception) { }
+                    if (proc.ExitCode == 0)
+                    {
+                        NoteSubmitted(goals, submitBaseline);
+                        if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                        if (_startNote != null)
+                            _startNote.Text = _lang == 0 ? (goals.Count + " 件を長時間実行キューへ追加しました。")
+                                                          : ("Queued " + goals.Count + " durable task(s)." );
+                        _lastSig = "";
+                    }
+                    else
+                    {
+                        if (_startNote != null)
+                            _startNote.Text = (_lang == 0 ? "長時間タスクのキュー登録に失敗。入力は残しています。 "
+                                                          : "Durable queue submission failed; input was kept. ")
+                                            + (stderr ?? "").Trim();
+                    }
+                    try { proc.Dispose(); } catch (Exception) { }
+                }
+                catch (Exception ex)
+                {
+                    timer.Stop();
+                    _durableEnqueuePending = false;
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0 ? "長時間タスクのキュー確認に失敗。入力は残しています。 "
+                                                      : "Could not confirm durable queue submission; input was kept. ")
+                                        + ex.Message;
+                }
+            };
+            timer.Start();
+        }
+        catch (Exception ex)
+        {
+            _durableEnqueuePending = false;
+            try { if (!string.IsNullOrEmpty(goalsFile) && File.Exists(goalsFile)) File.Delete(goalsFile); }
+            catch (Exception) { }
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間タスクのキュー起動に失敗。入力は残しています。 "
+                                              : "Could not start durable queue submission; input was kept. ")
+                                + ex.Message;
         }
     }
 
-    // A2-2: Paint the composer into either "idle/add-goals" or "active-run/steer" mode.
+    // The bottom composer is the task intake surface in BOTH idle and live-run states.
+    // During a live run, enqueue new work through the same lossless one-command-per-file channel
+    // used by retry. Worker-specific steering remains available on each worker card.
+    void TryAddGoalsToLiveFleet()
+    {
+        if (_goalInput == null) return;
+        var goals = new List<string>();
+        foreach (string ln in (_goalInput.Text ?? "").Replace("\r", "").Split('\n'))
+        {
+            string goal = ln.Trim();
+            if (goal.Length > 0 && !goal.StartsWith("#")) goals.Add(goal);
+        }
+        if (goals.Count == 0) return;
+        foreach (string goal in goals)
+        {
+            if (!IsLocalLoopControlGoal(goal)) continue;
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "LOCAL_LOOP の内部制御文は通常Fleetへ追加できません。耐久タスクのカードから再開してください。"
+                : "LOCAL_LOOP control text cannot be added to ordinary Fleet. Resume the durable task card instead.";
+            return;
+        }
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+
+        // This method is entered from the ACTIVE composer. Do not re-decide ownership from one
+        // status read here: a transient unreadable/stale snapshot used to divert this submission
+        // into StartFleet(), where the state-dir lock correctly rejected the second coordinator
+        // after the UI had already cleared the input. Always land the tracked command; its applied
+        // receipt + WatchLiveAddHandoff resolve whether the old run consumes it or a new run adopts it.
+
+        var adds = new List<object>();
+        foreach (string goal in goals)
+        {
+            var item = new Dictionary<string, object>();
+            item["text"] = goal;
+            item["priority"] = false;
+            adds.Add(item);
+        }
+        var patch = Cmd1("add_goal", adds);
+        string ackId = "ui-live-" + Guid.NewGuid().ToString("N");
+        string ackPath = Path.Combine(_fleetDir, "acks", ackId + ".ack");
+        patch["ack"] = ackPath;
+        string commandPath;
+        if (!SendTrackedCommand(patch, out commandPath))
+        {
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "タスクをキューへ追加できませんでした。入力は残っています。"
+                                              : "Could not queue the task. Your input was kept.";
+            return;
+        }
+
+        // Optimistic row first; the runner will replace it with a real worker on the next sweep.
+        NoteSubmitted(goals, submitBaseline);
+        WatchLiveAddHandoff(commandPath, ackPath);
+        _goalInput.Text = "";
+        if (_startNote != null)
+            _startNote.Text = _lang == 0 ? (goals.Count + " 件を実行中のキューへ追加しました。")
+                                          : ("Queued " + goals.Count + " task(s) into the active run.");
+        _lastSig = "";
+    }
+
+    // 1 = the runner durably applied the command, 0 = receipt not ready/parseable yet,
+    // -1 = the runner explicitly rejected it. Mere file existence is NOT success: rejected
+    // commands also have receipts, and treating those as success silently lost a submitted task.
+    int LiveAddReceiptState(string ackPath, out string detail)
+    {
+        detail = "";
+        if (string.IsNullOrEmpty(ackPath) || !File.Exists(ackPath)) return 0;
+        try
+        {
+            var d = _js.DeserializeObject(File.ReadAllText(ackPath, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            if (d == null) return 0;
+            bool rejected = d.ContainsKey("rejected") && Convert.ToBoolean(d["rejected"]);
+            if (rejected)
+            {
+                detail = _lang == 0 ? "タスク追加がrunnerに拒否されました。" : "The runner rejected the added task.";
+                return -1;
+            }
+            if (d.ContainsKey("applied"))
+            {
+                bool applied = Convert.ToBoolean(d["applied"]);
+                if (applied) return 1;
+                detail = _lang == 0 ? "タスク追加は適用されませんでした。" : "The added task was not applied.";
+                return -1;
+            }
+        }
+        catch (Exception)
+        {
+            // Atomic receipt writes should make parse failures rare; treat one as incomplete and
+            // retry instead of converting an ambiguous file into success or failure.
+        }
+        return 0;
+    }
+
+    // A live add can race the final sweep: the UI saw running=true, wrote the command, then the
+    // coordinator finished before its next drain.  The command is durable now, so do not guess
+    // from status alone.  Receipt = applied/accepted.  No receipt + no live run = launch a
+    // rescuer that adopts THIS exact pending command after winning fleet_runner's state-dir lock.
+    void WatchLiveAddHandoff(string commandPath, string ackPath)
+    {
+        if (string.IsNullOrEmpty(commandPath) || string.IsNullOrEmpty(ackPath)) return;
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(300);
+        DateTime lastRescue = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                string receiptError;
+                int receiptState = LiveAddReceiptState(ackPath, out receiptError);
+                if (receiptState > 0) { timer.Stop(); return; }
+                if (receiptState < 0)
+                {
+                    timer.Stop();
+                    if (_startNote != null) _startNote.Text = receiptError;
+                    _lastSig = "";
+                    return;
+                }
+                if (RunIsLive()) return;
+                // Retry, rather than fire once: a dying old coordinator may still own the OS
+                // lock for a moment. A losing rescuer exits 3 before touching commandPath.
+                if ((DateTime.UtcNow - lastRescue).TotalSeconds < 2.0) return;
+                lastRescue = DateTime.UtcNow;
+                SpawnFleetAdoptCommand(commandPath);
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? "実行終了と同時に追加されたタスクを、新しい実行へ引き継いでいます。"
+                        : "The run ended during submission; carrying the pending task into a new run.";
+            }
+            catch (Exception)
+            {
+                // Keep the durable command and retry on the next tick. Losing the watcher must
+                // never mean losing the task.
+            }
+        };
+        timer.Start();
+    }
+
+    // Paint the composer as task intake in both states; a live run changes Start -> Add.
     // Only repaints when the mode actually changes (keyed off _composerRunActive).
     void PaintComposerMode(bool runActive)
     {
@@ -4533,35 +6203,33 @@ class CockpitWindow : Window
         bool ja = _lang == 0;
         if (runActive)
         {
-            // Active-run mode: steer / intervene surface
+            // Active-run mode: add new tasks to the existing queue.
             if (_composerWatermark != null)
-                _composerWatermark.Text = ja
-                    ? "ステア・割り込み...（例: W2: 修正案を確認して）"
-                    : "Steer or intervene... (e.g. W2: check the fix)";
+                _composerWatermark.Text = ja ? "タスクを追加..." : "Add tasks...";
             if (_composerHint != null)
                 _composerHint.Text = ja
-                    ? "アクティブな実行に送信 ·「/」でコマンド"
-                    : "sent to the active run · '/' for commands";
+                    ? "実行中のキューに追加 · 割り込みは各タスクカードから · / でコマンド"
+                    : "adds to the active run · steer from a task card · '/' for commands";
             if (_startBtn != null)
             {
-                _startBtn.Content = ja ? "送信" : "Send";
-                // Use accent color for primary action; same as the idle Start button.
+                _startBtn.Content = ja ? "追加" : "Add";
                 _startBtn.Background = AccentFill;
                 _startBtn.Foreground = AccentFg;
             }
             if (_folderBtn != null)
             {
-                // Folder button less prominent while steering
-                _folderBtn.Visibility = Visibility.Collapsed;
+                _folderBtn.Visibility = Visibility.Visible;
             }
         }
         else
         {
-            // Idle mode: add goals / start
+            // Idle mode: add goals / start.
             if (_composerWatermark != null)
-                _composerWatermark.Text = ja ? "タスクを入力..." : "Add tasks...";
+                _composerWatermark.Text = ja ? "タスクを追加..." : "Add tasks...";
             if (_composerHint != null)
-                _composerHint.Text = ja ? "1行に1ゴール（複数可） ·「/」でコマンド" : "One goal per line · \"/\" for commands";
+                _composerHint.Text = ja
+                    ? "1行に1ゴール（複数可） · / でコマンド"
+                    : "One goal per line · '/' for commands";
             if (_startBtn != null)
             {
                 _startBtn.Content = T("start");
@@ -4610,8 +6278,201 @@ class CockpitWindow : Window
         catch (Exception) { }
     }
 
-    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false)
+    bool DurableRuntimeEnabled()
     {
+        string raw = Environment.GetEnvironmentVariable("MCP_EXECUTION_PROFILES") ?? "";
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string envPath = Path.Combine(repo, ".env");
+            if (string.IsNullOrWhiteSpace(raw) && File.Exists(envPath))
+            {
+                foreach (string line in File.ReadAllLines(envPath))
+                {
+                    string trimmed = (line ?? "").Trim();
+                    if (trimmed.StartsWith("MCP_EXECUTION_PROFILES=", StringComparison.OrdinalIgnoreCase))
+                    {
+                        raw = trimmed.Substring(trimmed.IndexOf('=') + 1).Trim().Trim('"', (char)39);
+                        break;
+                    }
+                }
+            }
+        }
+        catch (Exception) { }
+        raw = (raw ?? "").Trim().ToLowerInvariant();
+        return raw == "1" || raw == "true" || raw == "yes" || raw == "on";
+    }
+
+    bool ResumeLocalLoopRuntime(Dictionary<string, object> w)
+    {
+        try
+        {
+            if (w == null) return false;
+            string jobId = S(w, "name").Replace("\"", "");
+            string db = S(w, "local_job_db").Replace("\"", "");
+            if (string.IsNullOrWhiteSpace(jobId)) return false;
+            if (!DurableRuntimeEnabled())
+            {
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0
+                        ? "長時間実行は無効です。MCP_EXECUTION_PROFILES=1 を設定してください。"
+                        : "Durable runtime is disabled. Set MCP_EXECUTION_PROFILES=1 first.";
+                return false;
+            }
+
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --job-id \"" + jobId
+                          + "\" --resume-runtime --state-dir \"" + stateDir + "\"";
+            if (!string.IsNullOrWhiteSpace(db)) psi.Arguments += " --db \"" + db + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            var proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("LOCAL_LOOP resume process did not start");
+            if (_startNote != null)
+                _startNote.Text = _lang == 0
+                    ? "実行環境の修復後として、同じ長時間タスクを再開しています。"
+                    : "Resuming the same durable task after runtime repair.";
+            _lastSig = "";
+            return true;
+        }
+        catch (Exception ex)
+        {
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間タスクの再開に失敗: " : "Durable resume failed: ") + ex.Message;
+            return false;
+        }
+    }
+
+    bool SpawnDurableTask(string goal, string submittedText)
+    {
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        string goalFile = null;
+        System.Diagnostics.Process proc = null;
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            goalFile = Path.Combine(stateDir, "durable_goal_" + token + ".txt");
+            File.WriteAllText(goalFile, goal ?? "", new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --goal-file \"" + goalFile
+                          + "\" --state-dir \"" + stateDir + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("durable controller process did not start");
+            _durableStartPending = true;
+            NoteSubmitted(new List<string> { goal }, submitBaseline);
+            WatchDurableStart(proc, submitBaseline, goalFile, submittedText ?? "", goal);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            _durableStartPending = false;
+            try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+            catch (Exception) { }
+            if (_startNote != null)
+                _startNote.Text = (_lang == 0 ? "長時間実行の起動に失敗: " : "Durable start failed: ") + ex.Message;
+            try { if (proc != null) proc.Dispose(); } catch (Exception) { }
+            return false;
+        }
+    }
+
+    void WatchDurableStart(System.Diagnostics.Process proc, SubmissionBaseline baseline,
+                           string goalFile, string submittedText, string goal)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        DateTime exitSeenAt = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                Dictionary<string, object> root = ReadStatus();
+                string started = StartedOf(root);
+                bool accepted = ActiveRunIsLocalLoop(root)
+                                && !string.IsNullOrEmpty(started)
+                                && !string.Equals(started, baseline == null ? "" : baseline.Started,
+                                                  StringComparison.Ordinal)
+                                && FreshRunContainsGoals(root, new List<string> { goal });
+                if (accepted)
+                {
+                    timer.Stop();
+                    _durableStartPending = false;
+                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+                    catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = _lang == 0
+                            ? "長時間タスクを開始しました。現在の工程と進捗をカードに表示します。"
+                            : "Durable task started. Current step and progress will appear on the card.";
+                    _lastSig = "";
+                    try { proc.Dispose(); } catch (Exception) { }
+                    return;
+                }
+
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                if (exitSeenAt == DateTime.MinValue)
+                {
+                    exitSeenAt = DateTime.UtcNow;
+                    return;
+                }
+                if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
+
+                timer.Stop();
+                _durableStartPending = false;
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                try { if (!string.IsNullOrEmpty(goalFile) && File.Exists(goalFile)) File.Delete(goalFile); }
+                catch (Exception) { }
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "長時間タスクを開始できませんでした。入力は残しています。終了コード "
+                        : "Could not start durable task; input was kept. Exit code ") + code;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _durableStartPending = false;
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "長時間タスクの開始確認に失敗しました。入力は残しています。 "
+                        : "Could not confirm durable task start; input was kept. ") + ex.Message;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+        };
+        timer.Start();
+    }
+
+    bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,
+                    bool waitForClosingRun = false, string submittedText = null)
+    {
+        foreach (string rawGoal in (goals ?? new List<string>()))
+        {
+            if (!IsLocalLoopControlGoal(SubmittedTasks.GoalTextOf(rawGoal))) continue;
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "LOCAL_LOOP の内部制御文は通常Fleetとして起動できません。耐久タスクのカードから再開してください。"
+                : "LOCAL_LOOP control text cannot start ordinary Fleet work. Resume the durable task card instead.";
+            return false;
+        }
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
         if (!File.Exists(py)) py = "python";
@@ -4624,13 +6485,124 @@ class CockpitWindow : Window
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
         if (planMode) psi.Arguments += " --plan";
-        if (_fanout) psi.Arguments += " --fanout";
+        if (waitForClosingRun) psi.Arguments += " --wait-for-state-dir-seconds 60";
+        // BOTH VALUES ARE SAID OUT LOUD. This used to append "--fanout" when on and nothing
+        // when off -- and once the runner's default became true, saying nothing meant ON, so
+        // a person who typed /fanout off got fan-out anyway while the cockpit reported OFF.
+        // A boolean expressed by the presence of a flag can only state one of its two values.
+        psi.Arguments += _fanout ? " --fanout" : " --no-fanout";
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
-        System.Diagnostics.Process.Start(psi);
+        System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
+        if (proc == null) return false;
+        // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
+        // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
+        // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
+        NoteSubmitted(goals, submitBaseline);
+        if (waitForClosingRun)
+        {
+            _fleetLaunchPending = true;
+            WatchFreshFleetLaunch(proc, submitBaseline, goalsFile, submittedText ?? "",
+                                  goals, planMode);
+        }
+        else
+        {
+            try { proc.Dispose(); } catch (Exception) { }
+        }
         return true;
+    }
+
+    static bool FreshRunContainsGoals(Dictionary<string, object> root, List<string> goals)
+    {
+        if (root == null || goals == null || goals.Count == 0) return false;
+        List<Dictionary<string, object>> workers = WorkersOf(root);
+        foreach (string raw in goals)
+        {
+            string wanted = SubmittedTasks.GoalTextOf(raw).Trim();
+            bool found = false;
+            foreach (Dictionary<string, object> w in workers)
+            {
+                if (string.Equals(S(w, "goal").Trim(), wanted, StringComparison.Ordinal))
+                {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) return false;
+        }
+        return true;
+    }
+
+    void WatchFreshFleetLaunch(System.Diagnostics.Process proc, SubmissionBaseline baseline,
+                               string goalsFile, string submittedText, List<string> goals, bool planMode)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        DateTime exitSeenAt = DateTime.MinValue;
+        timer.Tick += delegate
+        {
+            try
+            {
+                Dictionary<string, object> root = ReadStatus();
+                string started = StartedOf(root);
+                bool accepted = !string.IsNullOrEmpty(started)
+                                && !string.Equals(started, baseline == null ? "" : baseline.Started,
+                                                  StringComparison.Ordinal)
+                                && FreshRunContainsGoals(root, goals);
+                if (accepted)
+                {
+                    timer.Stop();
+                    _fleetLaunchPending = false;
+                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
+                                          + (_lang == 0 ? " 件）" : " goals)")
+                                          + (planMode
+                                              ? (_lang == 0 ? "。承認待ちの計画が各カードに出ます。"
+                                                            : ". Each card will wait at plan approval.")
+                                              : "");
+                    _lastSig = "";
+                    try { proc.Dispose(); } catch (Exception) { }
+                    return;
+                }
+
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                if (exitSeenAt == DateTime.MinValue)
+                {
+                    exitSeenAt = DateTime.UtcNow;
+                    return;
+                }
+                if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
+
+                timer.Stop();
+                _fleetLaunchPending = false;
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "新しい実行を開始できませんでした。入力は残しています。終了コード "
+                        : "Could not start the new run; your input was kept. Exit code ")
+                        + code;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _fleetLaunchPending = false;
+                if (_startNote != null)
+                    _startNote.Text = (_lang == 0
+                        ? "新しい実行の開始確認に失敗しました。入力は残しています。 "
+                        : "Could not confirm the new run start; your input was kept. ")
+                        + ex.Message;
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+        };
+        timer.Start();
     }
 
     // Render a goals list as the JSONL text SpawnFleet writes to its goals-file: one JSON object
@@ -4672,6 +6644,29 @@ class CockpitWindow : Window
         return sb.ToString();
     }
 
+    // Rescue ONLY a command that was already durably written by the live composer. The runner
+    // itself arbitrates ownership: --adopt-command is processed only after the state-dir OS lock,
+    // so if another coordinator already started this process exits without touching the command.
+    bool SpawnFleetAdoptCommand(string commandPath)
+    {
+        string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+        string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+        if (!File.Exists(py)) py = "python";
+        string stateDir = Path.GetDirectoryName(_statusPath);
+        var psi = new System.Diagnostics.ProcessStartInfo();
+        psi.FileName = py;
+        psi.Arguments = "-m relay.fleet_runner --adopt-command \"" + commandPath + "\""
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort
+                        + (_fanout ? " --fanout" : " --no-fanout");
+        if (_approval == "plan" || _approval == "auto") psi.Arguments += " --plan";
+        psi.WorkingDirectory = repo;
+        psi.UseShellExecute = false;
+        psi.CreateNoWindow = true;
+        try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        System.Diagnostics.Process.Start(psi);
+        return true;
+    }
+
     // P2 RESUME: spawn a fresh fleet with --resume (re-queues the unfinished goals from the durable
     // ledger, per fleet_runner.py). Mirrors SpawnFleet's launch construction but passes --resume
     // INSTEAD of a goals file (the runner reads .fleet/last_run_goals.json / last_run_done.json).
@@ -4685,7 +6680,12 @@ class CockpitWindow : Window
         var psi = new System.Diagnostics.ProcessStartInfo();
         psi.FileName = py;
         psi.Arguments = "-m relay.fleet_runner --resume"
-                        + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+                        + " --state-dir \"" + stateDir + "\" --effort " + _effort
+                        // RESUME NEVER CARRIED THIS AT ALL, so the setting was ignored on the
+                        // resume path in BOTH directions -- off before the runner's default
+                        // flipped, on after. A resumed run is the same run; it gets the same
+                        // answer the operator gave, said explicitly for the reason above.
+                        + (_fanout ? " --fanout" : " --no-fanout");
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
@@ -4824,6 +6824,7 @@ class CockpitWindow : Window
         new[]{"/effort","推論モードを設定: min|max|ultra|auto"},
         new[]{"/approval","実行方式を設定: run|plan|auto（互換コマンド）"},
         new[]{"/fanout","分割実行: on|off（長い依頼を分けて並列実行し統合）"},
+        new[]{"/runtime","実行基盤: durable|fleet（長時間実行 / 従来Fleet）"},
     };
     static readonly string[][] _goalCommandsEn = {
         new[]{"/help","Show the command list"},
@@ -4837,6 +6838,7 @@ class CockpitWindow : Window
         new[]{"/effort","set reasoning mode: min|max|ultra|auto"},
         new[]{"/approval","set approval mode: run|plan|auto"},
         new[]{"/fanout","split a long goal, run the parts in parallel, merge: on|off"},
+        new[]{"/runtime","execution runtime: durable|fleet"},
     };
     // Localized at access time so the slash palette (and the template it inserts) follows the UI language.
     string[][] _goalCommands { get { return _lang == 0 ? _goalCommandsJa : _goalCommandsEn; } }
@@ -4911,7 +6913,7 @@ class CockpitWindow : Window
 
             // /effort and /approval: if the current line has an argument, apply it immediately
             // and clear the line. If no arg, insert the template (prompts for value) instead.
-            if (cmdName == "/effort" || cmdName == "/approval")
+            if (cmdName == "/effort" || cmdName == "/approval" || cmdName == "/runtime")
             {
                 int ls2; string line2; CurrentGoalLine(out ls2, out line2);
                 // line2 looks like "/effort" or "/effort max"
@@ -4931,7 +6933,7 @@ class CockpitWindow : Window
                             if (_startNote != null) _startNote.Text = (_lang == 0 ? "推論モード→ " : "Effort set to ") + _effort;
                         }
                     }
-                    else  // /approval
+                    else if (cmdName == "/approval")
                     {
                         if (argVal == "run" || argVal == "plan" || argVal == "auto")
                         {
@@ -4940,6 +6942,19 @@ class CockpitWindow : Window
                             PaintApproval();
                             applied = true;
                             if (_startNote != null) _startNote.Text = (_lang == 0 ? "実行方式→ " : "Run mode set to ") + _approval;
+                        }
+                    }
+                    else  // /runtime
+                    {
+                        if (argVal == "fleet" || argVal == "durable")
+                        {
+                            _runtimeMode = argVal;
+                            SaveKey("runtime", _runtimeMode);
+                            applied = true;
+                            if (_startNote != null)
+                                _startNote.Text = _lang == 0
+                                    ? (_runtimeMode == "durable" ? "次のタスクは長時間実行モードで開始します。" : "次のタスクは従来Fleetで開始します。")
+                                    : (_runtimeMode == "durable" ? "Next task will use the durable runtime." : "Next task will use classic Fleet.");
                         }
                     }
                     if (applied)
@@ -4995,6 +7010,7 @@ class CockpitWindow : Window
                 + "/doc <target> - write README / docs\n"
                 + "/review <target> - review and list issues\n"
                 + "/research <question> - deep research\n"
+                + "/runtime durable|fleet - choose long-running or classic runtime\n"
                 + "\nReasoning (top bar)\n"
                 + "min - fastest, least reasoning\n"
                 + "max - deepest reasoning\n"
@@ -5211,9 +7227,32 @@ class CockpitWindow : Window
         return txt;
     }
 
-    // Build the FRESH goal text for a "Continue" run. There is NO stable reopenable URL for this
-    // agent, so we do NOT reopen the old conversation: instead we PREPEND the prior task's context
-    // and tell the agent to re-read its on-disk outputs before doing the new instruction.
+    // The follow-up as it should be SENT, given whether the old conversation is being reopened.
+    //
+    // WHEN THERE IS AN ID, SEND THE FOLLOW-UP AND NOTHING ELSE. The caller already puts
+    // `resume_conv` on the goal, so the worker continues the real conversation and the server
+    // still holds every prior turn -- pasting the prior goal on top of that is not context, it
+    // is a second copy of context the conversation already has. And it compounds: `priorGoal` is
+    // the previously ASSEMBLED goal, so each continuation swallows the last one whole. Measured
+    // on screen 2026-09-14: a follow-up of one sentence arrived as a wall containing the
+    // original goal, an earlier follow-up, a five-step editing procedure and a verification
+    // request. At that size no instruction can be tested -- the operator's rule is that anything
+    // outside bench measurement and coding goes in the length a person types, and the machinery
+    // was making that impossible.
+    //
+    // The paste below is the FALLBACK, for a row with no conversation id, and the comment it
+    // replaces stated its own premise: "There is NO stable reopenable URL for this agent". There
+    // is one now. Every fleet transcript carries a guid line and ContextTokenLimitExceeded on a
+    // resumed conversation is the proof that the server keeps the history.
+    string ContinueText(string priorGoal, string followup, string conversationId)
+    {
+        return string.IsNullOrEmpty(conversationId)
+            ? BuildContinueGoal(priorGoal, followup)
+            : followup;
+    }
+
+    // Build the FRESH goal text for a continuation that has NO conversation to reopen: prepend
+    // the prior task's context and tell the agent to re-read its on-disk outputs first.
     string BuildContinueGoal(string priorGoal, string followup)
     {
         if (_lang == 0)
@@ -5513,6 +7552,21 @@ class CockpitWindow : Window
         effortVal.VerticalAlignment = VerticalAlignment.Center;
         effortVal.Margin = new Thickness(4, 0, 24, 0);
         effortRow.Children.Add(effortVal);
+        // read-only mirror of the header effort-policy combo (the header dropdown is authoritative)
+        var epLbl = new TextBlock();
+        epLbl.Text = T("effort_policy") + ": ";
+        epLbl.FontSize = 12;
+        epLbl.Foreground = Theme.Br(Theme.Muted(_dark));
+        epLbl.VerticalAlignment = VerticalAlignment.Center;
+        effortRow.Children.Add(epLbl);
+        var epVal = new TextBlock();
+        epVal.Text = _effortPolicy;
+        epVal.FontSize = 12;
+        epVal.FontWeight = FontWeights.SemiBold;
+        epVal.Foreground = Theme.Br(Theme.Text(_dark));
+        epVal.VerticalAlignment = VerticalAlignment.Center;
+        epVal.Margin = new Thickness(4, 0, 24, 0);
+        effortRow.Children.Add(epVal);
         var approvalLbl = new TextBlock();
         approvalLbl.Text = (ja ? "実行方式 / Run mode: " : "Run mode: ");
         approvalLbl.FontSize = 12;
@@ -5635,6 +7689,10 @@ class CockpitWindow : Window
     ComboBox _effortBox;
     ComboBox _approvalBox;
     TextBlock _effortLbl;
+    ComboBox _effortPolicyBox;
+    TextBlock _effortPolicyLbl, _effortPolicyNow, _effortPolicyWarn;
+    ComboBox _fanoutBox;
+    TextBlock _fanoutLbl, _fanoutNow, _fanoutPending;
     TextBlock _approvalLbl;
     Button _pauseBtn, _stopBtn;
     System.Windows.Shapes.Path _pauseIcon, _stopIcon;   // drawn geometry (no font glyph needed)
@@ -5843,12 +7901,98 @@ class CockpitWindow : Window
     }
 
     // One labeled −/+ stepper row for the settings panel. label on the left, [− value +] on the right.
+    //: WHEN A CONTROL TAKES EFFECT. Mirrors tools/settings_keys.py, which is the declaration;
+    //: test_the_panel_states_the_same_timing_the_declaration_does pins the two together.
+    //:
+    //: This is a copy on purpose. ui/rebuild_ui.ps1 enumerates its .cs files by hand, so a
+    //: shared file added and forgotten breaks a button silently -- a trap this repository has
+    //: already sprung. Copies are allowed; disagreeing copies are not.
+    static string SettingsTiming(string key)
+    {
+        switch (key)
+        {
+            case "disk_floor_gb":
+            case "ram_floor_mb":
+            case "maxtabs":
+                return "live";
+            case "tool_probe_idle_min":
+            case "merge_conversation":
+            case "fanout_hierarchical_merge":
+            case "fleet_auto_resume":
+            case "rate_ceiling_rpm":
+            case "supervisor_self_restart":
+            case "job_approval_mode":
+            case "fanout_write_scope":
+            case "fanout_max_depth":
+            case "fanout_max_total":
+            case "fanout_max_active":
+            case "fanout_max_turns":
+            case "fanout_max_wall_min":
+            case "effort_policy":
+                return "each_gate";
+            case "session_retention_days":
+            case "session_max_mb":
+                return "bridge_start";
+            case "autoscale":
+            case "autoscale_max":
+            case "autoscale_per_tab_mb":
+            case "effort":
+            case "autoretry":
+            case "autoretry_max":
+            case "fanout":
+            case "fleet_log_days":
+            case "fleet_store_days":
+            case "fleet_scratch_days":
+            case "fleet_compress_hours":
+                return "sweep_start";
+            default:
+                return "ui_only";
+        }
+    }
+
+    //: The operator-facing words. Short enough to sit beside a label without wrapping, and
+    //: never "applied" -- the panel writes a file; whether the fleet has read it is a fact the
+    //: panel does not have, and showing the first as the second is the 2026-09-16 misreport.
+    string TimingBadge(string key)
+    {
+        bool ja = _lang == 0;
+        switch (SettingsTiming(key))
+        {
+            case "live":         return ja ? "実行中に反映" : "affects a running fleet";
+            case "each_gate":    return ja ? "次の判定から"   : "from the next decision";
+            case "sweep_start":  return ja ? "次の実行から"   : "from the next run";
+            case "bridge_start": return ja ? "bridge再起動後" : "after a bridge restart";
+            default:             return "";
+        }
+    }
+
     UIElement SettingsStepperRow(string label, TextBlock valueBlock, Button minus, Button plus)
+    {
+        return SettingsStepperRow(label, valueBlock, minus, plus, null);
+    }
+
+    UIElement SettingsStepperRow(string label, TextBlock valueBlock, Button minus, Button plus,
+                                 string settingsKey)
     {
         var row = new DockPanel(); row.Margin = new Thickness(0, 5, 0, 5); row.LastChildFill = false;
         var lbl = new TextBlock(); lbl.Text = label; lbl.Foreground = Fg; lbl.FontSize = 12.5;
         lbl.VerticalAlignment = VerticalAlignment.Center;
         DockPanel.SetDock(lbl, Dock.Left); row.Children.Add(lbl);
+        // WHEN IT TAKES EFFECT, beside the label rather than in a tooltip. Three of these
+        // controls change a fleet that is already running and the rest do not, and nothing on
+        // the screen distinguished them -- so "I changed it and nothing happened" was an
+        // ordinary experience with no way to tell it from a defect.
+        if (!string.IsNullOrEmpty(settingsKey))
+        {
+            string badge = TimingBadge(settingsKey);
+            if (!string.IsNullOrEmpty(badge))
+            {
+                var when = new TextBlock(); when.Text = badge; when.Foreground = Muted;
+                when.FontSize = 10.5; when.Margin = new Thickness(8, 0, 0, 0);
+                when.VerticalAlignment = VerticalAlignment.Center;
+                DockPanel.SetDock(when, Dock.Left); row.Children.Add(when);
+            }
+        }
         var stp = new StackPanel(); stp.Orientation = Orientation.Horizontal;
         stp.VerticalAlignment = VerticalAlignment.Center;
         DockPanel.SetDock(stp, Dock.Right);
@@ -5863,6 +8007,11 @@ class CockpitWindow : Window
     }
 
     TextBlock _diskFloorVal;
+    // The re-unlock control's fields lived here. Removed with the control itself: the harness
+    // asks every sweep whether a logged refusal went unclaimed and delivers the unlock on its
+    // own (relay/fleet_runner.py:sweep_unclaimed_refusals). The receipt it produces still lands
+    // in status.json and is printed by scripts/status.py, where a record belongs -- a panel
+    // note that has to be read while it is on screen is not a record.
     TextBlock SectionHeader(string text)
     {
         var t = new TextBlock(); t.Text = text; t.Foreground = Muted; t.FontSize = 11;
@@ -5966,7 +8115,6 @@ class CockpitWindow : Window
         _retDays = Math.Max(0, Math.Min(3650, v));
         SaveKey("session_retention_days", _retDays.ToString());
         if (_retDaysValue != null) _retDaysValue.Text = _retDays == 0 ? T("ret_keep") : _retDays.ToString();
-        PaintRetentionNote();
     }
 
     void SetRetMb(int v)
@@ -5977,7 +8125,6 @@ class CockpitWindow : Window
         _retMb = Math.Max(0, Math.Min(100000, v));
         SaveKey("session_max_mb", _retMb.ToString());
         if (_retMbValue != null) _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
-        PaintRetentionNote();
     }
 
     int RetMbStep() { return _retMb >= 1000 ? 500 : 100; }
@@ -6008,6 +8155,13 @@ class CockpitWindow : Window
         if (_fleetLogDaysValue != null) _fleetLogDaysValue.Text = _fleetLogDays.ToString();
     }
 
+    void SetSidebarCap(int v)
+    {
+        _sidebarCap = Math.Max(0, Math.Min(500, v));
+        SaveKey("sidebar_section_cap", _sidebarCap.ToString());
+        if (_sidebarCapValue != null) _sidebarCapValue.Text = _sidebarCap == 0 ? T("sidebar_cap_all") : _sidebarCap.ToString();
+    }
+
     void SetFleetStoreDays(int v)
     {
         _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
@@ -6015,30 +8169,22 @@ class CockpitWindow : Window
         if (_fleetStoreDaysValue != null) _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
     }
 
-    void PaintRetentionNote()
+    void SetFleetScratchDays(int v)
     {
-        if (_retNote == null) return;
-        bool ja = _lang == 0;
-        if (_retDays == 0 && _retMb == 0)
-        {
-            _retNote.Text = T("ret_off");
-            _retNote.Foreground = Muted;
-            return;
-        }
-        // SAY WHAT WILL BE DELETED, IN WORDS, BEFORE IT IS. A retention setting whose effect
-        // the operator has to infer from two numbers is one they will set once and regret.
-        string what;
-        if (_retDays > 0 && _retMb > 0)
-            what = ja ? string.Format("{0}日より古い会話と、{1}MB を超えた分の古い会話を、起動時に削除します。", _retDays, _retMb)
-                      : string.Format("At startup, deletes conversations older than {0} days, and the oldest ones above {1} MB.", _retDays, _retMb);
-        else if (_retDays > 0)
-            what = ja ? string.Format("{0}日より古い会話を起動時に削除します。", _retDays)
-                      : string.Format("At startup, deletes conversations older than {0} days.", _retDays);
-        else
-            what = ja ? string.Format("{0}MB を超えた分の古い会話を起動時に削除します。", _retMb)
-                      : string.Format("At startup, deletes the oldest conversations above {0} MB.", _retMb);
-        _retNote.Text = what + " " + T("ret_whole");
-        _retNote.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fleetScratchDays = Math.Max(1, Math.Min(3650, v));
+        SaveKey("fleet_scratch_days", _fleetScratchDays.ToString());
+        if (_fleetScratchDaysValue != null) _fleetScratchDaysValue.Text = _fleetScratchDays.ToString();
+    }
+
+    void SetFleetCompressHours(int v)
+    {
+        // A FLOOR OF ONE HOUR, not zero. Compressing a run's files the moment it finishes
+        // would fight whatever is still reading them, and "0" reads as "off" to an operator
+        // while relay/fleet_retention.py would take it literally.
+        _fleetCompressHours = Math.Max(1, Math.Min(720, v));
+        SaveKey("fleet_compress_hours", _fleetCompressHours.ToString());
+        if (_fleetCompressHoursValue != null)
+            _fleetCompressHoursValue.Text = _fleetCompressHours.ToString();
     }
 
     UIElement BuildSettingsPanel()
@@ -6047,6 +8193,13 @@ class CockpitWindow : Window
         card.Background = CardBg; card.BorderBrush = Border; card.BorderThickness = new Thickness(1);
         card.CornerRadius = new CornerRadius(Theme.RadPopover); card.Padding = new Thickness(16, 12, 16, 16);
         card.Margin = new Thickness(0, 6, 8, 6); card.MinWidth = 280;
+        // AND A CEILING, because MinWidth alone lets the card take the whole host. Every row
+        // here docks its label left and its stepper right, which is right at a panel width and
+        // absurd at half a window: the control ends up a hand's width from the label it
+        // belongs to. 332 = the 300 the notes in this panel already cap themselves at, plus
+        // the 16+16 padding -- so the widest thing inside decides the width, as it should,
+        // and nothing inside is wider than a readable line.
+        card.MaxWidth = 332;
         // soft shadow so the floating panel reads as elevated
         card.Effect = new System.Windows.Media.Effects.DropShadowEffect
         { BlurRadius = 16, ShadowDepth = 2, Opacity = 0.28, Color = C("#000000") };
@@ -6064,31 +8217,25 @@ class CockpitWindow : Window
         var startPlus = MiniButton("+"); startPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
         _maxMinus = startMinus; _maxPlus = startPlus;   // keep refs so PaintChrome re-themes them (mirrors ceiling)
         _maxValue = new TextBlock(); _maxValue.Text = _maxtabs.ToString();
-        col.Children.Add(SettingsStepperRow(T("def_tabs"), _maxValue, startMinus, startPlus));
+        col.Children.Add(SettingsStepperRow(T("def_tabs"), _maxValue, startMinus, startPlus, "maxtabs"));
         // ceiling stepper -- reuses _autoLbl/_autoMinus/_autoValue/_autoPlus via CeilingStepper fields
         var ceilMinus = MiniButton("−"); ceilMinus.Click += delegate { SetAutoMax(_autoMax - 1); };
         var ceilPlus = MiniButton("+"); ceilPlus.Click += delegate { SetAutoMax(_autoMax + 1); };
         _autoValue = new TextBlock(); _autoValue.Text = _autoMax.ToString();
         _autoMinus = ceilMinus; _autoPlus = ceilPlus;   // keep refs so UpdateAutoEnabled can grey them
-        col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus));
+        col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus, "autoscale_max"));
 
-        // ── Conversation retention: days + size cap, both defaulting to "keep everything" ──
+        // ── Conversation retention: days (default 90, since 2026-09-24) + size cap (default: no cap) ──
         col.Children.Add(SectionHeader(T("set_retention_section")));
         var retDMinus = MiniButton("−"); retDMinus.Click += delegate { SetRetDays(_retDays - (_retDays > 30 ? 30 : 7)); };
         var retDPlus = MiniButton("+"); retDPlus.Click += delegate { SetRetDays(_retDays + (_retDays >= 30 ? 30 : 7)); };
         _retDaysValue = new TextBlock(); _retDaysValue.Text = _retDays == 0 ? T("ret_keep") : _retDays.ToString();
-        col.Children.Add(SettingsStepperRow(T("ret_days"), _retDaysValue, retDMinus, retDPlus));
+        col.Children.Add(SettingsStepperRow(T("ret_days"), _retDaysValue, retDMinus, retDPlus, "session_retention_days"));
 
         var retMMinus = MiniButton("−"); retMMinus.Click += delegate { SetRetMb(_retMb - RetMbStep()); };
         var retMPlus = MiniButton("+"); retMPlus.Click += delegate { SetRetMb(_retMb + RetMbStep()); };
         _retMbValue = new TextBlock(); _retMbValue.Text = _retMb == 0 ? T("ret_keep") : _retMb.ToString();
-        col.Children.Add(SettingsStepperRow(T("ret_mb"), _retMbValue, retMMinus, retMPlus));
-
-        _retNote = new TextBlock();
-        _retNote.FontSize = 11; _retNote.TextWrapping = TextWrapping.Wrap;
-        _retNote.Margin = new Thickness(0, 2, 0, 2); _retNote.MaxWidth = 300;
-        PaintRetentionNote();
-        col.Children.Add(_retNote);
+        col.Children.Add(SettingsStepperRow(T("ret_mb"), _retMbValue, retMMinus, retMPlus, "session_max_mb"));
 
         // -- Rate ceiling: the line admission holds at, and the strip's denominator --
         col.Children.Add(SectionHeader(T("set_rate_section")));
@@ -6096,7 +8243,7 @@ class CockpitWindow : Window
         var rcPlus = MiniButton("+"); rcPlus.Click += delegate { SetRateCeiling(_rateCeiling + RATE_STEP); };
         _rateCeilingValue = new TextBlock();
         _rateCeilingValue.Text = _rateCeiling == 0 ? T("ret_keep") : _rateCeiling.ToString();
-        col.Children.Add(SettingsStepperRow(T("rate_rpm"), _rateCeilingValue, rcMinus, rcPlus));
+        col.Children.Add(SettingsStepperRow(T("rate_rpm"), _rateCeilingValue, rcMinus, rcPlus, "rate_ceiling_rpm"));
         var rcNote = new TextBlock();
         rcNote.FontSize = 11; rcNote.TextWrapping = TextWrapping.Wrap;
         rcNote.Margin = new Thickness(0, 2, 0, 2); rcNote.MaxWidth = 300;
@@ -6108,12 +8255,38 @@ class CockpitWindow : Window
         var flMinus = MiniButton("−"); flMinus.Click += delegate { SetFleetLogDays(_fleetLogDays - 7); };
         var flPlus = MiniButton("+"); flPlus.Click += delegate { SetFleetLogDays(_fleetLogDays + 7); };
         _fleetLogDaysValue = new TextBlock(); _fleetLogDaysValue.Text = _fleetLogDays.ToString();
-        col.Children.Add(SettingsStepperRow(T("fleet_log_days"), _fleetLogDaysValue, flMinus, flPlus));
+        col.Children.Add(SettingsStepperRow(T("fleet_log_days"), _fleetLogDaysValue, flMinus, flPlus, "fleet_log_days"));
 
         var fsMinus = MiniButton("−"); fsMinus.Click += delegate { SetFleetStoreDays(_fleetStoreDays - 7); };
         var fsPlus = MiniButton("+"); fsPlus.Click += delegate { SetFleetStoreDays(_fleetStoreDays + 7); };
         _fleetStoreDaysValue = new TextBlock(); _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
-        col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus));
+        col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus, "fleet_store_days"));
+
+        // -- Chat sidebar: how many conversations each section lists before "+N more" (the Fleet
+        // runs section hid tonight's runs behind the old fixed 8). Lives HERE, in the popup, never
+        // in the header; the chat window re-reads settings.txt and re-renders.
+        col.Children.Add(SectionHeader(T("set_sidebar_section")));
+        var sbMinus = MiniButton("\u2212"); sbMinus.Click += delegate { SetSidebarCap(_sidebarCap - 4); };
+        var sbPlus = MiniButton("+"); sbPlus.Click += delegate { SetSidebarCap(_sidebarCap + 4); };
+        _sidebarCapValue = new TextBlock(); _sidebarCapValue.Text = _sidebarCap == 0 ? T("sidebar_cap_all") : _sidebarCap.ToString();
+        col.Children.Add(SettingsStepperRow(T("sidebar_section_cap"), _sidebarCapValue, sbMinus, sbPlus, "sidebar_section_cap"));
+
+        // TWO KEYS THE PANEL READ BUT NEVER WROTE. relay/fleet_retention.py has asked for
+        // fleet_scratch_days and fleet_compress_hours on every run since it was written; no
+        // control here ever set them, so the only way to choose was to edit settings.txt by
+        // hand -- which is the one thing an operator is told not to do. A setting reachable
+        // only by breaking the rule about settings is a setting nobody has.
+        var fscMinus = MiniButton("−"); fscMinus.Click += delegate { SetFleetScratchDays(_fleetScratchDays - 7); };
+        var fscPlus = MiniButton("+"); fscPlus.Click += delegate { SetFleetScratchDays(_fleetScratchDays + 7); };
+        _fleetScratchDaysValue = new TextBlock(); _fleetScratchDaysValue.Text = _fleetScratchDays.ToString();
+        col.Children.Add(SettingsStepperRow(T("fleet_scratch_days"), _fleetScratchDaysValue,
+                                            fscMinus, fscPlus, "fleet_scratch_days"));
+
+        var fchMinus = MiniButton("−"); fchMinus.Click += delegate { SetFleetCompressHours(_fleetCompressHours - 1); };
+        var fchPlus = MiniButton("+"); fchPlus.Click += delegate { SetFleetCompressHours(_fleetCompressHours + 1); };
+        _fleetCompressHoursValue = new TextBlock(); _fleetCompressHoursValue.Text = _fleetCompressHours.ToString();
+        col.Children.Add(SettingsStepperRow(T("fleet_compress_hours"), _fleetCompressHoursValue,
+                                            fchMinus, fchPlus, "fleet_compress_hours"));
 
         var flNote = new TextBlock();
         flNote.FontSize = 11; flNote.TextWrapping = TextWrapping.Wrap;
@@ -6138,7 +8311,7 @@ class CockpitWindow : Window
         var capMinus = MiniButton("−"); capMinus.Click += delegate { SetAutoRetryMax(_autoRetryMax - 1); };
         var capPlus = MiniButton("+"); capPlus.Click += delegate { SetAutoRetryMax(_autoRetryMax + 1); };
         _autoRetryCapVal = new TextBlock(); _autoRetryCapVal.Text = _autoRetryMax.ToString();
-        col.Children.Add(SettingsStepperRow(T("cap"), _autoRetryCapVal, capMinus, capPlus));
+        col.Children.Add(SettingsStepperRow(T("cap"), _autoRetryCapVal, capMinus, capPlus, "autoretry_max"));
 
         // ── P2 (c): Auto-archive on finish (default OFF) ──
         col.Children.Add(SectionHeader(T("set_archive_section")));
@@ -6160,15 +8333,118 @@ class CockpitWindow : Window
         var dfMinus = MiniButton("−"); dfMinus.Click += delegate { SetDiskFloor(_diskFloor - 1.0); };
         var dfPlus = MiniButton("+"); dfPlus.Click += delegate { SetDiskFloor(_diskFloor + 1.0); };
         _diskFloorVal = new TextBlock(); _diskFloorVal.Text = FmtFloor(_diskFloor);
-        col.Children.Add(SettingsStepperRow(T("disk_floor"), _diskFloorVal, dfMinus, dfPlus));
+        col.Children.Add(SettingsStepperRow(T("disk_floor"), _diskFloorVal, dfMinus, dfPlus, "disk_floor_gb"));
         // RAM floor (MB) -- the free-RAM reserve the autoscale keeps for the user (256 MB steps)
         var rfMinus = MiniButton("−"); rfMinus.Click += delegate { SetRamFloor(_ramFloor - 256.0); };
         var rfPlus = MiniButton("+"); rfPlus.Click += delegate { SetRamFloor(_ramFloor + 256.0); };
         _ramFloorVal = new TextBlock(); _ramFloorVal.Text = ((int)_ramFloor).ToString();
-        col.Children.Add(SettingsStepperRow(T("ram_floor"), _ramFloorVal, rfMinus, rfPlus));
+        col.Children.Add(SettingsStepperRow(T("ram_floor"), _ramFloorVal, rfMinus, rfPlus, "ram_floor_mb"));
         var hint = new TextBlock(); hint.Text = T("disk_floor_hint"); hint.Foreground = Muted;
         hint.FontSize = 10.5; hint.TextWrapping = TextWrapping.Wrap; hint.Margin = new Thickness(0, 0, 0, 2);
+        hint.MaxWidth = 300;   // the cap its four sibling notes already carry
         col.Children.Add(hint);
+
+        // ── Approval policy, WHERE IT CAN BE CHANGED WHEN NOBODY IS WAITING.
+        //
+        // The same three choices live in ApprovalPromptWindow, and until now that was the ONLY
+        // place they lived -- so the policy could only be changed at the moment an approval was
+        // being demanded. A setting that is read at every gate (see tools/settings_keys.py:
+        // job_approval_mode is each_gate) could be reconsidered only while someone was being
+        // hurried. That is backwards for an approval control, and the operator said so.
+        //
+        // ONE OWNER FOR THE VALUE. This calls ApprovalPromptWindow's own ReadPolicy/SavePolicy
+        // rather than growing a third reader of job_approval_mode -- five copies of one
+        // settings path is how 2026-09-16 happened, and a policy is a worse thing to have two
+        // opinions about than a path.
+        col.Children.Add(SectionHeader(T("set_approval_section")));
+        var policyRow = new ComboBox();
+        policyRow.FontSize = 12;
+        policyRow.MinWidth = 210;
+        policyRow.HorizontalAlignment = HorizontalAlignment.Left;
+        policyRow.Margin = new Thickness(0, 2, 0, 2);
+        policyRow.Background = BtnBg; policyRow.Foreground = Fg; policyRow.BorderBrush = Border;
+        policyRow.Cursor = Cursors.Hand;
+        policyRow.ToolTip = T("set_approval_hint");
+        // SAME ORDER AND SAME WORDS as the dialog. Two lists that agree on the values and
+        // disagree on the labels teach an operator that they are different settings.
+        var policyVals = new[] { "auto", "bypass", "default" };
+        foreach (string v in policyVals)
+        {
+            string label = v == "auto" ? (_lang == 0 ? "自動（推奨）" : "Auto (recommended)")
+                        : v == "bypass" ? (_lang == 0 ? "バイパス" : "Bypass")
+                        : (_lang == 0 ? "毎回確認（非推奨）" : "Confirm every time (not recommended)");
+            policyRow.Items.Add(new ComboBoxItem { Content = label, Tag = v });
+        }
+        string cur = ApprovalPromptWindow.ReadPolicy();
+        for (int i = 0; i < policyRow.Items.Count; i++)
+        {
+            var it = policyRow.Items[i] as ComboBoxItem;
+            if (it != null && string.Equals((string)it.Tag, cur, StringComparison.OrdinalIgnoreCase))
+            { policyRow.SelectedIndex = i; break; }
+        }
+        if (policyRow.SelectedIndex < 0) policyRow.SelectedIndex = 0;
+        policyRow.SelectionChanged += delegate
+        {
+            var it = policyRow.SelectedItem as ComboBoxItem;
+            if (it == null) return;
+            string v = (string)it.Tag;
+            if (string.Equals(v, ApprovalPromptWindow.ReadPolicy(), StringComparison.OrdinalIgnoreCase)) return;
+            ApprovalPromptWindow.SavePolicy(v);
+        };
+        StyleFlatCombo(policyRow);
+        col.Children.Add(policyRow);
+        var policyNote = new TextBlock();
+        policyNote.Text = T("set_approval_note");
+        policyNote.Foreground = Muted; policyNote.FontSize = 10.5;
+        policyNote.TextWrapping = TextWrapping.Wrap; policyNote.MaxWidth = 300;
+        policyNote.Margin = new Thickness(0, 2, 0, 2);
+        col.Children.Add(policyNote);
+
+        // ── Effort policy. The effort level itself stays in the header; the policy that may
+        // adjust it per worker (off|shadow|on) lives here, with the runner's "in effect" line.
+        col.Children.Add(SectionHeader(L("推論", "Effort")));
+        col.Children.Add(EffortPolicyControl());
+
+        // ── Fan-out / 分割: every fan-out control in ONE section. They used to sit in the cockpit
+        // header (one slice added one control each) and crowded it out; new fan-out settings
+        // go here, not in the header (relay/test_cockpit_header_controls.py pins the header).
+        col.Children.Add(SectionHeader(L("分割 / Fan-out", "Fan-out")));
+        col.Children.Add(FanoutControl());
+        col.Children.Add(FanoutDepthControl());
+        col.Children.Add(HierarchicalMergeControl());
+        col.Children.Add(WriteScopeControl());
+        col.Children.Add(FanoutBudgetControl());
+        col.Children.Add(MergeConversationControl());
+        // the controls' Paint* run on every build, but fill the "in effect" lines from the
+        // latest status.json too, so a freshly opened popup is never blank until the next tick
+        PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
+        PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
+        PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
+        PaintMergeConversationInEffect(_lastRoot);
+
+        // ── Recovery / 復旧: what happens to a run whose coordinator died. One control for now;
+        // like the fan-out ones it lives in this popup, never in the header.
+        col.Children.Add(SectionHeader(L("復旧 / Recovery", "Recovery")));
+        col.Children.Add(AutoResumeControl());
+        PaintAutoResumeInEffect(_lastRoot);
+        col.Children.Add(SupervisorSelfRestartControl());
+        col.Children.Add(ToolProbeControl());
+        PaintToolProbeInEffect();
+
+        // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
+        //
+        // It was a worker-name box and a "send re-unlock" button, for the case its own tooltip
+        // described: a worker stopped by a lock that automatic recovery had not noticed. That
+        // is the harness handing its own failure to a person -- and the person is the part of
+        // this system least able to know which worker, if any, is the stuck one. The operator
+        // said so, twice.
+        //
+        // The hole it covered was real: twice on 2026-09-15 a worker was refused for lock, no
+        // recovery fired, and the run carried on, once producing a deliverable that claimed to
+        // have verified content it had never read. That hole is now closed on the harness side
+        // by relay/fleet_runner.py:sweep_unclaimed_refusals, which asks every sweep whether a
+        // refusal the server logged was picked up by any reader, and delivers the unlock itself
+        // when none was. A button is not needed to answer a question the machine can ask.
 
         // ── Chat: always-available manual bridge reconnect. Unlike the Fix button (only shown
         // when a dot is red/yellow), this fires on demand regardless of the Tool dot's state --
@@ -6185,9 +8461,18 @@ class CockpitWindow : Window
         _reconnectChatBtn.Margin = new Thickness(0, 2, 0, 4);
         _reconnectChatBtn.Template = FlatButtonTemplate();
         _reconnectChatBtn.Background = Brushes.Transparent;
-        _reconnectChatBtn.Foreground = Theme.Br(Theme.Warning(_dark));
-        _reconnectChatBtn.BorderBrush = Theme.Br(Theme.Warning(_dark));
         _reconnectChatBtn.ToolTip = T("reconnect_chat_hint");
+        // COLOURED BY WHETHER IT IS NEEDED, NOT BY WHETHER IT EXISTS. These two lines were
+        // `Theme.Warning` unconditionally, so the control sat amber from the moment the panel
+        // opened, on a machine with nothing wrong. A warning that is always on is not a warning;
+        // the operator asked why it is never grey, which is the question a permanently-lit
+        // indicator always eventually produces, and by then it has taught everyone to ignore it.
+        //
+        // The button STAYS clickable in every state -- that was a deliberate decision (see
+        // RunBridgeReconnectManual: the Tool dot can read Gray on a machine whose bridge
+        // self-probe is not active, and the operator may simply want to force a reconnect). What
+        // was wrong was tying the colour to the same always-true fact as the availability.
+        RefreshReconnectChatTint();
         System.Windows.Automation.AutomationProperties.SetName(_reconnectChatBtn, T("reconnect_chat"));
         _reconnectChatBtn.Click += delegate { RunBridgeReconnectManual(); };
         col.Children.Add(_reconnectChatBtn);
@@ -6224,8 +8509,33 @@ class CockpitWindow : Window
         // like a context-menu submenu, which is where people expect "more, over here".
         col.Children.Add(SectionHeader(L("詳細設定", "Advanced")));
         col.Children.Add(AdvancedSubmenuRow());
+        // Nothing is added after this point, which is exactly why it was the section that
+        // vanished: see the ScrollViewer added below `card.Child`.
 
-        card.Child = col;
+        // A POPUP DOES NOT SCROLL ON ITS OWN, and this one had grown past the screen.
+        //
+        // The settings panel is a StackPanel of sections that has only ever got longer, and the
+        // last of them -- 詳細設定, which is where アクセス範囲 and 接続クライアント live -- fell
+        // off the bottom of the display. The operator reported it as "詳細設定 が消えている",
+        // and every check said otherwise: the section is in the source (26 tests assert it), the
+        // binary was built after the source, the running process was started from that binary,
+        // and both `詳細設定` and `アクセス範囲・接続クライアント` are present as UTF-16 strings
+        // inside the running executable. It was built, it was there, and it was unreachable.
+        //
+        // The same trap is already written down 200 lines below, on the popup this row OPENS:
+        // "a popup does not scroll on its own -- without this it grows past the screen and the
+        // buttons at the bottom become unreachable." The child was given a ScrollViewer and the
+        // parent was not.
+        //
+        // MaxHeight comes from the work area rather than a constant so this cannot silently
+        // return on a shorter display or at a larger UI scale -- the panel scales with
+        // `ui_scale`, so a fixed pixel budget is only ever right for one setting of it.
+        var panelScroll = new ScrollViewer();
+        panelScroll.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+        panelScroll.HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled;
+        panelScroll.MaxHeight = Math.Max(320, SystemParameters.WorkArea.Height - 120);
+        panelScroll.Content = col;
+        card.Child = panelScroll;
         UpdateAutoEnabled();   // grey the ceiling stepper if autoscale is off
         return card;
     }
@@ -6843,9 +9153,9 @@ class CockpitWindow : Window
     }
 
     // Disk floor (GB) setter: clamp, persist via SaveKey, refresh the panel value, AND push the new
-    // floor LIVE to a running fleet via {"set_disk_floor_gb":N} through the SAME merge-with-existing
-    // ReadCommands->WriteCommands path Pause/ForceStart use, so the runner (fleet_runner.py ~L561)
-    // picks it up on its next ~1s poll. Mirrors how 強制開始 writes the floor live.
+    // floor LIVE to a running fleet via {"set_disk_floor_gb":N} through the SAME one-file-per-command
+    // writer Pause/ForceStart use, so the runner (fleet_runner.py ~L561) picks it up on its next ~1s
+    // poll. Mirrors how 強制開始 writes the floor live.
     void SetDiskFloor(double v)
     {
         _diskFloor = Math.Max(0.0, Math.Min(100.0, Math.Round(v, 1)));
@@ -6853,9 +9163,7 @@ class CockpitWindow : Window
         if (_diskFloorVal != null) _diskFloorVal.Text = FmtFloor(_diskFloor);
         if (RunIsLive())
         {
-            var cmd = ReadCommands();
-            cmd["set_disk_floor_gb"] = _diskFloor;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("set_disk_floor_gb", _diskFloor));
         }
     }
 
@@ -6870,11 +9178,22 @@ class CockpitWindow : Window
         if (_ramFloorVal != null) _ramFloorVal.Text = ((int)_ramFloor).ToString();
         if (RunIsLive())
         {
-            var cmd = ReadCommands();
-            cmd["set_ram_floor_mb"] = _ramFloor;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("set_ram_floor_mb", _ramFloor));
         }
     }
+
+    // THE FALLBACK BUTTON. Writes {"reunlock": "<name-or-empty>"} through the SAME command writer
+    // SetDiskFloor/SetRamFloor use -- one file per command, so it cannot clobber a concurrent
+    // close/steer/set_maxtabs. CARRIES NO SECRET: fleet_runner.py's
+    // apply_reunlock reads the unlock password locally, on the coordinator's own machine, from
+    // that machine's .env -- never from this file, which is plain text read by several
+    // processes. `target` blank means every live worker (fleet_runner treats "" the same as the
+    // steer broadcast rule it is built on; "*" is accepted there too for the same reason).
+    //
+    // The two methods that served the re-unlock control were removed with it. One wrote a
+    // command for a person to send; the other turned the receipt back into a note on a panel.
+    // Neither has a caller now: the harness delivers unlocks itself every sweep, and the
+    // receipt is read where records are read rather than shown while someone is looking.
 
     // Effort selector: ComboBox dropdown for min/max/ultra/auto.
     // Persists effort= to settings.txt; the fleet runner reads it at launch.
@@ -6908,6 +9227,847 @@ class CockpitWindow : Window
 
         PaintEffort();
         return wrap;
+    }
+    // Effort policy selector (off|shadow|on). Persists effort_policy= to settings.txt, which
+    // relay/effort_policy.py re-reads at every decision (each_gate). This control never passes
+    // MCP_EFFORT_POLICY itself; what is REALLY in effect is what the runner reports in
+    // status.json (see PaintEffortPolicyInEffect), and an inherited env override is shown as a
+    // conflict. All wording/parsing lives in the WPF-free EffortPolicy.cs.
+    // Layout shared by the combo rows that live in the gear popup (effort policy, fan-out, depth,
+    // hierarchical merge, write scope): label left / combo right, and the runner's "in effect" and
+    // "pending" lines wrapped underneath as the row's secondary text.
+    UIElement SettingsComboBlock(TextBlock lbl, ComboBox box, TextBlock now, TextBlock pending)
+    {
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Vertical;
+        wrap.Margin = new Thickness(0, 4, 0, 4);
+        var row = new DockPanel(); row.LastChildFill = false;
+        DockPanel.SetDock(box, Dock.Right); row.Children.Add(box);
+        lbl.Margin = new Thickness(0, 0, 8, 0);
+        DockPanel.SetDock(lbl, Dock.Left); row.Children.Add(lbl);
+        wrap.Children.Add(row);
+        foreach (TextBlock t in new[] { now, pending })
+        {
+            t.Margin = new Thickness(0, 2, 0, 0); t.MaxWidth = 300; t.TextWrapping = TextWrapping.Wrap;
+            wrap.Children.Add(t);
+        }
+        return wrap;
+    }
+    UIElement EffortPolicyControl()
+    {
+        _effortPolicyLbl = new TextBlock(); _effortPolicyLbl.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyLbl.FontSize = 12;
+
+        _effortPolicyBox = new ComboBox();
+        _effortPolicyBox.ToolTip = EffortPolicyView.Help(_lang == 0) + "\n" + EffortPolicyView.TakeEffectTip(_lang == 0);
+        _effortPolicyBox.Cursor = Cursors.Hand; _effortPolicyBox.FontSize = 12;
+        _effortPolicyBox.FontWeight = FontWeights.SemiBold; _effortPolicyBox.MinWidth = 78;
+        _effortPolicyBox.Padding = new Thickness(8, 2, 4, 2);
+        _effortPolicyBox.VerticalAlignment = VerticalAlignment.Center;
+        var epHelp = new Dictionary<string, string>();
+        foreach (string m in EffortPolicyView.Modes) epHelp[m] = EffortPolicyView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_effortPolicyBox, EffortPolicyView.Modes, epHelp, _effortPolicy);
+        _effortPolicyBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _effortPolicyBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_effortPolicyBox);
+            if (!EffortPolicyView.IsMode(sel) || sel == _effortPolicy) return;
+            _effortPolicy = sel;
+            SaveKey(EffortPolicyView.Key, _effortPolicy);
+            PaintEffortPolicyInEffect(_lastRoot);
+        };
+
+        _effortPolicyNow = new TextBlock(); _effortPolicyNow.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyNow.FontSize = 11.5;
+        _effortPolicyWarn = new TextBlock(); _effortPolicyWarn.VerticalAlignment = VerticalAlignment.Center;
+        _effortPolicyWarn.FontSize = 11.5; _effortPolicyWarn.FontWeight = FontWeights.SemiBold;
+        _effortPolicyWarn.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_effortPolicyLbl, _effortPolicyBox, _effortPolicyNow, _effortPolicyWarn);
+        PaintEffortPolicy();
+        return wrap;
+    }
+    void PaintEffortPolicy()
+    {
+        if (_effortPolicyLbl != null) { _effortPolicyLbl.Text = T("effort_policy"); _effortPolicyLbl.Foreground = Muted; }
+        if (_effortPolicyBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_effortPolicyBox), _effortPolicy)) ComboSelectVal(_effortPolicyBox, _effortPolicy);
+        _effortPolicyBox.Background = BtnBg; _effortPolicyBox.Foreground = Fg; _effortPolicyBox.BorderBrush = Border;
+        StyleFlatCombo(_effortPolicyBox);
+        PaintEffortPolicyInEffect(_lastRoot);
+    }
+    // What the RUNNER says is in effect (status.json "effort_policy"), beside the combo. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintEffortPolicyInEffect(Dictionary<string, object> root)
+    {
+        if (_effortPolicyNow == null || _effortPolicyWarn == null) return;
+        bool ja = _lang == 0;
+        string now = null, warn = null;
+        Dictionary<string, object> ep = root != null ? Obj(root, "effort_policy") : null;
+        if (ep != null)
+        {
+            string mode = S(ep, "mode");
+            object cf;
+            bool conflict = ep.TryGetValue("conflict", out cf) && cf is bool && (bool)cf;
+            now = EffortPolicyView.Describe(mode, S(ep, "source"), conflict, ja);
+            warn = EffortPolicyView.ConflictText(mode, _effortPolicy, conflict, ja);
+        }
+        _effortPolicyNow.Text = now ?? "";
+        _effortPolicyNow.Foreground = Muted;
+        _effortPolicyNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _effortPolicyWarn.Text = warn ?? "";
+        _effortPolicyWarn.Foreground = Theme.Br(Theme.Warning(_dark));
+        _effortPolicyWarn.Visibility = warn != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Fan-out selector (on|off), the visible GUI path for what used to be reachable only by typing
+    // /fanout. Persists fanout= to settings.txt (SaveKey), which every coordinator start reads
+    // (sweep_start). Absent key = ON. What the coordinator was REALLY started with comes from
+    // status.json "fanout_run" (PaintFanoutInEffect); its words live in FanoutView (EffortPolicy.cs).
+    UIElement FanoutControl()
+    {
+        _fanoutLbl = new TextBlock(); _fanoutLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutLbl.FontSize = 12;
+
+        _fanoutBox = new ComboBox();
+        _fanoutBox.ToolTip = FanoutView.Help(_lang == 0) + "\n" + FanoutView.TakeEffectTip(_lang == 0);
+        _fanoutBox.Cursor = Cursors.Hand; _fanoutBox.FontSize = 12;
+        _fanoutBox.FontWeight = FontWeights.SemiBold; _fanoutBox.MinWidth = 64;
+        _fanoutBox.Padding = new Thickness(8, 2, 4, 2);
+        _fanoutBox.VerticalAlignment = VerticalAlignment.Center;
+        var foHelp = new Dictionary<string, string>();
+        foreach (string m in FanoutView.Modes) foHelp[m] = FanoutView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_fanoutBox, FanoutView.Modes, foHelp, FanoutView.Token(_fanout));
+        _fanoutBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _fanoutBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_fanoutBox);
+            if ((sel != "on" && sel != "off") || sel == FanoutView.Token(_fanout)) return;
+            _fanout = (sel == "on");
+            SaveKey("fanout", _fanout ? "on" : "off");
+            PaintFanoutInEffect(_lastRoot);
+        };
+
+        _fanoutNow = new TextBlock(); _fanoutNow.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutNow.FontSize = 11.5;
+        _fanoutPending = new TextBlock(); _fanoutPending.VerticalAlignment = VerticalAlignment.Center;
+        _fanoutPending.FontSize = 11.5; _fanoutPending.FontWeight = FontWeights.SemiBold;
+        _fanoutPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_fanoutLbl, _fanoutBox, _fanoutNow, _fanoutPending);
+        PaintFanout();
+        return wrap;
+    }
+    void PaintFanout()
+    {
+        if (_fanoutLbl != null) { _fanoutLbl.Text = FanoutView.Label(_lang == 0); _fanoutLbl.Foreground = Muted; }
+        if (_fanoutBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_fanoutBox), FanoutView.Token(_fanout))) ComboSelectVal(_fanoutBox, FanoutView.Token(_fanout));
+        _fanoutBox.Background = BtnBg; _fanoutBox.Foreground = Fg; _fanoutBox.BorderBrush = Border;
+        StyleFlatCombo(_fanoutBox);
+        PaintFanoutInEffect(_lastRoot);
+        PaintFanoutBudget();
+        PaintFanoutDepth();
+        PaintHierarchicalMerge();
+        PaintMergeConversation();
+        PaintWriteScope();
+        PaintAutoResume();
+        PaintSupervisorSelfRestart();
+        PaintToolProbe();
+    }
+    // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
+    // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
+    void PaintFanoutInEffect(Dictionary<string, object> root)
+    {
+        if (_fanoutNow == null || _fanoutPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fr = root != null ? Obj(root, "fanout_run") : null;
+        if (fr != null)
+        {
+            object ev;
+            bool has = fr.TryGetValue("enabled", out ev) && ev is bool;
+            bool enabled = has && (bool)ev;
+            now = FanoutView.Describe(has, enabled, S(fr, "source"), ja);
+            pend = FanoutView.PendingText(has, enabled, _fanout, ja);
+        }
+        _fanoutNow.Text = now ?? "";
+        _fanoutNow.Foreground = Muted;
+        _fanoutNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fanoutPending.Text = pend ?? "";
+        _fanoutPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fanoutPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Per-tree fan-out budget: four numeric boxes (total / active / turns / minutes) beside the
+    // fan-out selector. Each persists through SaveKey only, when the operator commits (Enter or
+    // leaving the box); the runner re-reads the keys at every split (each_gate). What the
+    // COORDINATOR applies comes from status.json "fanout_budget" (PaintFanoutBudgetInEffect);
+    // the words, bounds and parsing live in FanoutBudgetView (EffortPolicy.cs).
+    UIElement FanoutBudgetControl()
+    {
+        // popup layout: the group label, then ONE compact row of four cells (caption over box)
+        var wrap = new StackPanel(); wrap.Orientation = Orientation.Vertical;
+        wrap.Margin = new Thickness(0, 4, 0, 4);
+
+        _fbLbl = new TextBlock(); _fbLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fbLbl.FontSize = 12; _fbLbl.Margin = new Thickness(0, 0, 0, 2);
+        wrap.Children.Add(_fbLbl);
+
+        var grid = new Grid();
+        for (int c = 0; c < 4; c++) grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
+        wrap.Children.Add(grid);
+
+        for (int i = 0; i < 4; i++)
+        {
+            int idx = i;
+            var cell = new StackPanel(); cell.Orientation = Orientation.Vertical;
+            cell.Margin = new Thickness(i == 0 ? 0 : 6, 0, 0, 0);
+            Grid.SetColumn(cell, i); grid.Children.Add(cell);
+
+            _fbCap[i] = new TextBlock(); _fbCap[i].VerticalAlignment = VerticalAlignment.Center;
+            _fbCap[i].FontSize = 11.5; _fbCap[i].Margin = new Thickness(0, 0, 0, 2);
+            cell.Children.Add(_fbCap[i]);
+
+            var tb = new TextBox();
+            tb.HorizontalAlignment = HorizontalAlignment.Stretch; tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
+            tb.VerticalAlignment = VerticalAlignment.Center;
+            tb.HorizontalContentAlignment = HorizontalAlignment.Right;
+            tb.MaxLength = 7;
+            tb.Text = _fbVals[i].ToString();
+            tb.LostFocus += delegate { CommitFanoutBudget(idx); };
+            tb.KeyDown += delegate(object s, KeyEventArgs e)
+            {
+                if (e.Key == Key.Enter) { CommitFanoutBudget(idx); e.Handled = true; }
+            };
+            _fbBox[i] = tb;
+            cell.Children.Add(tb);
+        }
+
+        _fbNow = new TextBlock(); _fbNow.VerticalAlignment = VerticalAlignment.Center;
+        _fbNow.FontSize = 11.5; _fbNow.Margin = new Thickness(0, 2, 0, 0);
+        _fbNow.MaxWidth = 300; _fbNow.TextWrapping = TextWrapping.Wrap;
+        wrap.Children.Add(_fbNow);
+        _fbPending = new TextBlock(); _fbPending.VerticalAlignment = VerticalAlignment.Center;
+        _fbPending.FontSize = 11.5; _fbPending.FontWeight = FontWeights.SemiBold;
+        _fbPending.Margin = new Thickness(0, 2, 0, 0);
+        _fbPending.MaxWidth = 300; _fbPending.TextWrapping = TextWrapping.Wrap;
+        _fbPending.Visibility = Visibility.Collapsed;
+        wrap.Children.Add(_fbPending);
+
+        PaintFanoutBudget();
+        return wrap;
+    }
+    // Commit one box: a non-number reverts to the held value, a number is clamped to the key's
+    // bounds, and an UNCHANGED value is not written (so leaving a box never rewrites the file).
+    void CommitFanoutBudget(int idx)
+    {
+        TextBox tb = _fbBox[idx];
+        if (tb == null) return;
+        int v;
+        if (!FanoutBudgetView.TryParseInput(idx, tb.Text, out v)) { tb.Text = _fbVals[idx].ToString(); return; }
+        tb.Text = v.ToString();
+        if (v == _fbVals[idx]) return;
+        _fbVals[idx] = v;
+        SaveFanoutBudgetKey(idx, v);
+        PaintFanoutBudgetInEffect(_lastRoot);
+    }
+    void SaveFanoutBudgetKey(int idx, int v)
+    {
+        string s = v.ToString(System.Globalization.CultureInfo.InvariantCulture);
+        switch (idx)
+        {
+            case 0: SaveKey("fanout_max_total", s); break;
+            case 1: SaveKey("fanout_max_active", s); break;
+            case 2: SaveKey("fanout_max_turns", s); break;
+            case 3: SaveKey("fanout_max_wall_min", s); break;
+        }
+    }
+    void PaintFanoutBudget()
+    {
+        bool ja = _lang == 0;
+        if (_fbLbl != null) { _fbLbl.Text = FanoutBudgetView.GroupLabel(ja); _fbLbl.Foreground = Muted; }
+        for (int i = 0; i < 4; i++)
+        {
+            if (_fbCap[i] != null)
+            {
+                _fbCap[i].Text = FanoutBudgetView.ShortLabel(i, ja); _fbCap[i].Foreground = Muted;
+            }
+            TextBox tb = _fbBox[i];
+            if (tb == null) continue;
+            tb.ToolTip = FanoutBudgetView.Help(i, ja) + "\n" + FanoutBudgetView.TakeEffectTip(ja);
+            // assign only when different and not being typed in, so a repaint never fights the operator
+            if (!tb.IsKeyboardFocused && tb.Text != _fbVals[i].ToString()) tb.Text = _fbVals[i].ToString();
+            tb.Background = BtnBg; tb.Foreground = Fg; tb.BorderBrush = Border;
+        }
+        PaintFanoutBudgetInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_budget"), beside the boxes. No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the boxes.
+    void PaintFanoutBudgetInEffect(Dictionary<string, object> root)
+    {
+        if (_fbNow == null || _fbPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fb = root != null ? Obj(root, "fanout_budget") : null;
+        if (fb != null)
+        {
+            bool ok = true;
+            int[] lim = new int[4];
+            for (int i = 0; i < 4; i++)
+            {
+                if (!fb.ContainsKey(FanoutBudgetView.ReportKeys[i]) || fb[FanoutBudgetView.ReportKeys[i]] == null) { ok = false; break; }
+                lim[i] = I(fb, FanoutBudgetView.ReportKeys[i]);
+            }
+            if (ok)
+            {
+                now = FanoutBudgetView.Describe(lim, ja);
+                pend = FanoutBudgetView.PendingText(lim, _fbVals, ja);
+            }
+        }
+        _fbNow.Text = now ?? "";
+        _fbNow.Foreground = Muted;
+        _fbNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fbPending.Text = pend ?? "";
+        _fbPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fbPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Split depth (1|2|3), beside the fan-out selector. Persists through SaveKey only; the runner
+    // re-reads the key at every split (each_gate). What is IN EFFECT comes from status.json
+    // "fanout_depth" (configured + effective), so the screen never claims a depth the coordinator
+    // is not applying; the words and parsing live in FanoutDepthView (EffortPolicy.cs).
+    UIElement FanoutDepthControl()
+    {
+        _fdLbl = new TextBlock(); _fdLbl.VerticalAlignment = VerticalAlignment.Center;
+        _fdLbl.FontSize = 12;
+
+        _fdBox = new ComboBox();
+        _fdBox.ToolTip = FanoutDepthView.Help(_lang == 0) + "\n" + FanoutDepthView.TakeEffectTip(_lang == 0);
+        _fdBox.Cursor = Cursors.Hand; _fdBox.FontSize = 12;
+        _fdBox.FontWeight = FontWeights.SemiBold; _fdBox.MinWidth = 64;
+        _fdBox.Padding = new Thickness(8, 2, 4, 2);
+        _fdBox.VerticalAlignment = VerticalAlignment.Center;
+        var fdHelp = new Dictionary<string, string>();
+        foreach (string m in FanoutDepthView.Modes) fdHelp[m] = FanoutDepthView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_fdBox, FanoutDepthView.Modes, fdHelp, _fdVal.ToString());
+        _fdBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _fdBox.SelectionChanged += delegate
+        {
+            int sel;
+            if (!int.TryParse(ComboVal(_fdBox), out sel)) return;
+            sel = FanoutDepthView.Clamp(sel);
+            if (sel == _fdVal) return;   // unchanged -> no write, no re-fire
+            _fdVal = sel;
+            SaveKey("fanout_max_depth", sel.ToString(System.Globalization.CultureInfo.InvariantCulture));
+            PaintFanoutDepthInEffect(_lastRoot);
+        };
+
+        _fdNow = new TextBlock(); _fdNow.VerticalAlignment = VerticalAlignment.Center;
+        _fdNow.FontSize = 11.5;
+        _fdPending = new TextBlock(); _fdPending.VerticalAlignment = VerticalAlignment.Center;
+        _fdPending.FontSize = 11.5; _fdPending.FontWeight = FontWeights.SemiBold;
+        _fdPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_fdLbl, _fdBox, _fdNow, _fdPending);
+        PaintFanoutDepth();
+        return wrap;
+    }
+    void PaintFanoutDepth()
+    {
+        if (_fdLbl != null) { _fdLbl.Text = FanoutDepthView.Label(_lang == 0); _fdLbl.Foreground = Muted; }
+        if (_fdBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_fdBox), _fdVal.ToString())) ComboSelectVal(_fdBox, _fdVal.ToString());
+        _fdBox.Background = BtnBg; _fdBox.Foreground = Fg; _fdBox.BorderBrush = Border;
+        StyleFlatCombo(_fdBox);
+        PaintFanoutDepthInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_depth"). No report (old runner,
+    // no run yet) -> nothing shown, never a guess from the selection.
+    void PaintFanoutDepthInEffect(Dictionary<string, object> root)
+    {
+        if (_fdNow == null || _fdPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fd = root != null ? Obj(root, "fanout_depth") : null;
+        if (fd != null && fd.ContainsKey("configured") && fd["configured"] != null
+            && fd.ContainsKey("effective") && fd["effective"] != null)
+        {
+            int conf = I(fd, "configured"), eff = I(fd, "effective");
+            now = FanoutDepthView.Describe(conf, eff, S(fd, "reason"), ja);
+            pend = FanoutDepthView.PendingText(conf, _fdVal, ja);
+        }
+        _fdNow.Text = now ?? "";
+        _fdNow.Foreground = Muted;
+        _fdNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _fdPending.Text = pend ?? "";
+        _fdPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _fdPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Hierarchical merge (off|on), beside the split depth. Persists through SaveKey only; the
+    // runner re-reads the key at every split (each_gate). On lets a split depth above 1 take
+    // effect; what is IN EFFECT comes from status.json "fanout_depth".hierarchical_merge. The
+    // words and parsing live in HierarchicalMergeView (EffortPolicy.cs).
+    UIElement HierarchicalMergeControl()
+    {
+        _hmLbl = new TextBlock(); _hmLbl.VerticalAlignment = VerticalAlignment.Center;
+        _hmLbl.FontSize = 12;
+
+        _hmBox = new ComboBox();
+        _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
+        _hmBox.Cursor = Cursors.Hand; _hmBox.FontSize = 12;
+        _hmBox.FontWeight = FontWeights.SemiBold; _hmBox.MinWidth = 64;
+        _hmBox.Padding = new Thickness(8, 2, 4, 2);
+        _hmBox.VerticalAlignment = VerticalAlignment.Center;
+        var hmHelp = new Dictionary<string, string>();
+        foreach (string m in HierarchicalMergeView.Modes) hmHelp[m] = HierarchicalMergeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_hmBox, HierarchicalMergeView.Modes, hmHelp, _hmVal);
+        _hmBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _hmBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_hmBox);
+            if (!HierarchicalMergeView.IsMode(sel) || sel == _hmVal) return;   // unchanged -> no write, no re-fire
+            _hmVal = sel;
+            SaveKey(HierarchicalMergeView.Key, _hmVal);
+            PaintHierarchicalMergeInEffect(_lastRoot);
+        };
+
+        _hmNow = new TextBlock(); _hmNow.VerticalAlignment = VerticalAlignment.Center;
+        _hmNow.FontSize = 11.5;
+        _hmPending = new TextBlock(); _hmPending.VerticalAlignment = VerticalAlignment.Center;
+        _hmPending.FontSize = 11.5; _hmPending.FontWeight = FontWeights.SemiBold;
+        _hmPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_hmLbl, _hmBox, _hmNow, _hmPending);
+        PaintHierarchicalMerge();
+        return wrap;
+    }
+    void PaintHierarchicalMerge()
+    {
+        if (_hmLbl != null) { _hmLbl.Text = HierarchicalMergeView.Label(_lang == 0); _hmLbl.Foreground = Muted; }
+        if (_hmBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_hmBox), _hmVal)) ComboSelectVal(_hmBox, _hmVal);
+        _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
+        _hmBox.Background = BtnBg; _hmBox.Foreground = Fg; _hmBox.BorderBrush = Border;
+        StyleFlatCombo(_hmBox);
+        PaintHierarchicalMergeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_depth".hierarchical_merge). No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintHierarchicalMergeInEffect(Dictionary<string, object> root)
+    {
+        if (_hmNow == null || _hmPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> fd = root != null ? Obj(root, "fanout_depth") : null;
+        if (fd != null && fd.ContainsKey("hierarchical_merge") && fd["hierarchical_merge"] != null)
+        {
+            string rep = S(fd, "hierarchical_merge");
+            now = HierarchicalMergeView.Describe(rep, ja);
+            pend = HierarchicalMergeView.PendingText(rep, _hmVal, ja);
+        }
+        _hmNow.Text = now ?? "";
+        _hmNow.Foreground = Muted;
+        _hmNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _hmPending.Text = pend ?? "";
+        _hmPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _hmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Merge conversation (fresh|parent), in the Fan-out section. Persists through SaveKey only; the
+    // runner re-reads the key at every split and every merge (each_gate). Parent runs the merge in
+    // the splitting worker's own conversation; what is IN EFFECT, and the savings so far, come from
+    // status.json "conversation_saving". The words and parsing live in MergeConversationView.
+    UIElement MergeConversationControl()
+    {
+        _mcLbl = new TextBlock(); _mcLbl.VerticalAlignment = VerticalAlignment.Center;
+        _mcLbl.FontSize = 12;
+
+        _mcBox = new ComboBox();
+        _mcBox.ToolTip = MergeConversationView.Help(_lang == 0) + "\n" + MergeConversationView.TakeEffectTip(_lang == 0);
+        _mcBox.Cursor = Cursors.Hand; _mcBox.FontSize = 12;
+        _mcBox.FontWeight = FontWeights.SemiBold; _mcBox.MinWidth = 64;
+        _mcBox.Padding = new Thickness(8, 2, 4, 2);
+        _mcBox.VerticalAlignment = VerticalAlignment.Center;
+        var mcHelp = new Dictionary<string, string>();
+        foreach (string m in MergeConversationView.Modes) mcHelp[m] = MergeConversationView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_mcBox, MergeConversationView.Modes, mcHelp, _mcVal);
+        _mcBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _mcBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_mcBox);
+            if (!MergeConversationView.IsMode(sel) || sel == _mcVal) return;   // unchanged -> no write, no re-fire
+            _mcVal = sel;
+            SaveKey(MergeConversationView.Key, _mcVal);
+            PaintMergeConversationInEffect(_lastRoot);
+        };
+
+        _mcNow = new TextBlock(); _mcNow.VerticalAlignment = VerticalAlignment.Center;
+        _mcNow.FontSize = 11.5; _mcNow.TextWrapping = TextWrapping.Wrap; _mcNow.MaxWidth = 300;
+        _mcPending = new TextBlock(); _mcPending.VerticalAlignment = VerticalAlignment.Center;
+        _mcPending.FontSize = 11.5; _mcPending.FontWeight = FontWeights.SemiBold;
+        _mcPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_mcLbl, _mcBox, _mcNow, _mcPending);
+        PaintMergeConversation();
+        return wrap;
+    }
+    void PaintMergeConversation()
+    {
+        if (_mcLbl != null) { _mcLbl.Text = MergeConversationView.Label(_lang == 0); _mcLbl.Foreground = Muted; }
+        if (_mcBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_mcBox), _mcVal)) ComboSelectVal(_mcBox, _mcVal);
+        _mcBox.ToolTip = MergeConversationView.Help(_lang == 0) + "\n" + MergeConversationView.TakeEffectTip(_lang == 0);
+        _mcBox.Background = BtnBg; _mcBox.Foreground = Fg; _mcBox.BorderBrush = Border;
+        StyleFlatCombo(_mcBox);
+        PaintMergeConversationInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies and has saved (status.json "conversation_saving"). No
+    // report (old runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintMergeConversationInEffect(Dictionary<string, object> root)
+    {
+        if (_mcNow == null || _mcPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> cs = root != null ? Obj(root, "conversation_saving") : null;
+        if (cs != null && cs.ContainsKey("merge_conversation") && cs["merge_conversation"] != null)
+        {
+            string rep = S(cs, "merge_conversation");
+            int saved = cs.ContainsKey("aggregators_saved") && cs["aggregators_saved"] != null ? I(cs, "aggregators_saved") : 0;
+            int unsent = cs.ContainsKey("unsent_created") && cs["unsent_created"] != null ? I(cs, "unsent_created") : 0;
+            now = MergeConversationView.Describe(rep, saved, unsent, ja);
+            pend = MergeConversationView.PendingText(rep, _mcVal, ja);
+        }
+        _mcNow.Text = now ?? "";
+        _mcNow.Foreground = Muted;
+        _mcNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _mcPending.Text = pend ?? "";
+        _mcPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _mcPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Sibling write scope (off|shadow), beside the split depth. Persists through SaveKey only; the
+    // coordinator re-reads the key at every sweep (each_gate). SHADOW ONLY: it records overlapping
+    // sibling writes and blocks nothing, and there is no enforcing option. What is IN EFFECT comes
+    // from status.json "fanout_write_scope"; the words and parsing live in WriteScopeView.
+    UIElement WriteScopeControl()
+    {
+        _wsLbl = new TextBlock(); _wsLbl.VerticalAlignment = VerticalAlignment.Center;
+        _wsLbl.FontSize = 12;
+
+        _wsBox = new ComboBox();
+        _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
+        _wsBox.Cursor = Cursors.Hand; _wsBox.FontSize = 12;
+        _wsBox.FontWeight = FontWeights.SemiBold; _wsBox.MinWidth = 78;
+        _wsBox.Padding = new Thickness(8, 2, 4, 2);
+        _wsBox.VerticalAlignment = VerticalAlignment.Center;
+        var wsHelp = new Dictionary<string, string>();
+        foreach (string m in WriteScopeView.Modes) wsHelp[m] = WriteScopeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_wsBox, WriteScopeView.Modes, wsHelp, _wsVal);
+        _wsBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _wsBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_wsBox);
+            if (!WriteScopeView.IsMode(sel) || sel == _wsVal) return;   // unchanged -> no write, no re-fire
+            _wsVal = sel;
+            SaveKey(WriteScopeView.Key, _wsVal);
+            PaintWriteScopeInEffect(_lastRoot);
+        };
+
+        _wsNow = new TextBlock(); _wsNow.VerticalAlignment = VerticalAlignment.Center;
+        _wsNow.FontSize = 11.5;
+        _wsPending = new TextBlock(); _wsPending.VerticalAlignment = VerticalAlignment.Center;
+        _wsPending.FontSize = 11.5; _wsPending.FontWeight = FontWeights.SemiBold;
+        _wsPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_wsLbl, _wsBox, _wsNow, _wsPending);
+        PaintWriteScope();
+        return wrap;
+    }
+    void PaintWriteScope()
+    {
+        if (_wsLbl != null) { _wsLbl.Text = WriteScopeView.Label(_lang == 0); _wsLbl.Foreground = Muted; }
+        if (_wsBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_wsBox), _wsVal)) ComboSelectVal(_wsBox, _wsVal);
+        _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
+        _wsBox.Background = BtnBg; _wsBox.Foreground = Fg; _wsBox.BorderBrush = Border;
+        StyleFlatCombo(_wsBox);
+        PaintWriteScopeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_write_scope"). No report (old
+    // runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintWriteScopeInEffect(Dictionary<string, object> root)
+    {
+        if (_wsNow == null || _wsPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> ws = root != null ? Obj(root, "fanout_write_scope") : null;
+        if (ws != null && ws.ContainsKey("mode") && ws["mode"] != null)
+        {
+            string rep = S(ws, "mode");
+            now = WriteScopeView.Describe(rep, ws.ContainsKey("overlaps_seen") && ws["overlaps_seen"] != null ? I(ws, "overlaps_seen") : 0, ja);
+            pend = WriteScopeView.PendingText(rep, _wsVal, ja);
+        }
+        _wsNow.Text = now ?? "";
+        _wsNow.Foreground = Muted;
+        _wsNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _wsPending.Text = pend ?? "";
+        _wsPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _wsPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Auto-resume of an interrupted run (off|on), in its own Recovery section. Persists through
+    // SaveKey only; the supervisor re-reads the key every cycle (each_gate). What is IN EFFECT comes
+    // from status.json "auto_resume" {setting, last_decision, pending_snapshots}; the words and
+    // parsing live in AutoResumeView (EffortPolicy.cs).
+    UIElement AutoResumeControl()
+    {
+        _arLbl = new TextBlock(); _arLbl.VerticalAlignment = VerticalAlignment.Center;
+        _arLbl.FontSize = 12;
+
+        _arBox = new ComboBox();
+        _arBox.ToolTip = AutoResumeView.Help(_lang == 0) + "\n" + AutoResumeView.TakeEffectTip(_lang == 0);
+        _arBox.Cursor = Cursors.Hand; _arBox.FontSize = 12;
+        _arBox.FontWeight = FontWeights.SemiBold; _arBox.MinWidth = 64;
+        _arBox.Padding = new Thickness(8, 2, 4, 2);
+        _arBox.VerticalAlignment = VerticalAlignment.Center;
+        var arHelp = new Dictionary<string, string>();
+        foreach (string m in AutoResumeView.Modes) arHelp[m] = AutoResumeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_arBox, AutoResumeView.Modes, arHelp, _arVal);
+        _arBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _arBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_arBox);
+            if (!AutoResumeView.IsMode(sel) || sel == _arVal) return;   // unchanged -> no write, no re-fire
+            _arVal = sel;
+            SaveKey(AutoResumeView.Key, _arVal);
+            PaintAutoResumeInEffect(_lastRoot);
+        };
+
+        _arNow = new TextBlock(); _arNow.VerticalAlignment = VerticalAlignment.Center;
+        _arNow.FontSize = 11.5; _arNow.TextWrapping = TextWrapping.Wrap; _arNow.MaxWidth = 300;
+        _arPending = new TextBlock(); _arPending.VerticalAlignment = VerticalAlignment.Center;
+        _arPending.FontSize = 11.5; _arPending.FontWeight = FontWeights.SemiBold;
+        _arPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_arLbl, _arBox, _arNow, _arPending);
+        PaintAutoResume();
+        return wrap;
+    }
+    void PaintAutoResume()
+    {
+        if (_arLbl != null) { _arLbl.Text = AutoResumeView.Label(_lang == 0); _arLbl.Foreground = Muted; }
+        if (_arBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_arBox), _arVal)) ComboSelectVal(_arBox, _arVal);
+        _arBox.ToolTip = AutoResumeView.Help(_lang == 0) + "\n" + AutoResumeView.TakeEffectTip(_lang == 0);
+        _arBox.Background = BtnBg; _arBox.Foreground = Fg; _arBox.BorderBrush = Border;
+        StyleFlatCombo(_arBox);
+        PaintAutoResumeInEffect(_lastRoot);
+    }
+    // What the SUPERVISOR/COORDINATOR report (status.json "auto_resume"). No report (old runner, no
+    // run yet) -> nothing shown, never a guess from the selection.
+    void PaintAutoResumeInEffect(Dictionary<string, object> root)
+    {
+        if (_arNow == null || _arPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> ar = root != null ? Obj(root, "auto_resume") : null;
+        if (ar != null && ar.ContainsKey("setting") && ar["setting"] != null)
+        {
+            string rep = S(ar, "setting");
+            Dictionary<string, object> ld = Obj(ar, "last_decision");
+            string dec = ld != null ? S(ld, "decision") : null;
+            string rsn = ld != null ? S(ld, "reason") : null;
+            int pc = ar.ContainsKey("pending_snapshots") && ar["pending_snapshots"] != null ? I(ar, "pending_snapshots") : 0;
+            now = AutoResumeView.Describe(rep, dec, rsn, pc, ja);
+            pend = AutoResumeView.PendingText(rep, _arVal, ja);
+        }
+        _arNow.Text = now ?? "";
+        _arNow.Foreground = Muted;
+        _arNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _arPending.Text = pend ?? "";
+        _arPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _arPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Supervisor self-restart (off|on), in the Recovery section under the auto-resume control. The
+    // supervisor is a PowerShell script loaded once, so it can run older code than the checkout;
+    // it publishes that in .fleet/supervisor_state.json and this note words it (SupervisorCodeView).
+    // Persists through SaveKey only; the supervisor reads the key only once it is stale (each_gate).
+    UIElement SupervisorSelfRestartControl()
+    {
+        _srLbl = new TextBlock(); _srLbl.VerticalAlignment = VerticalAlignment.Center;
+        _srLbl.FontSize = 12;
+
+        _srBox = new ComboBox();
+        _srBox.ToolTip = SupervisorCodeView.Help(_lang == 0) + "\n" + SupervisorCodeView.TakeEffectTip(_lang == 0);
+        _srBox.Cursor = Cursors.Hand; _srBox.FontSize = 12;
+        _srBox.FontWeight = FontWeights.SemiBold; _srBox.MinWidth = 64;
+        _srBox.Padding = new Thickness(8, 2, 4, 2);
+        _srBox.VerticalAlignment = VerticalAlignment.Center;
+        var srHelp = new Dictionary<string, string>();
+        foreach (string m in SupervisorCodeView.Modes) srHelp[m] = SupervisorCodeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_srBox, SupervisorCodeView.Modes, srHelp, _srVal);
+        _srBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _srBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_srBox);
+            if (!SupervisorCodeView.IsMode(sel) || sel == _srVal) return;   // unchanged -> no write, no re-fire
+            _srVal = sel;
+            SaveKey(SupervisorCodeView.Key, _srVal);
+        };
+
+        _srNow = new TextBlock(); _srNow.VerticalAlignment = VerticalAlignment.Center;
+        _srNow.FontSize = 11.5; _srNow.TextWrapping = TextWrapping.Wrap; _srNow.MaxWidth = 300;
+        _srNow.FontWeight = FontWeights.SemiBold;
+        _srNow.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_srLbl, _srBox, _srNow, new TextBlock());
+        PaintSupervisorSelfRestart();
+        return wrap;
+    }
+    void PaintSupervisorSelfRestart()
+    {
+        if (_srLbl != null) { _srLbl.Text = SupervisorCodeView.Label(_lang == 0); _srLbl.Foreground = Muted; }
+        if (_srBox == null) return;
+        if (!Equals(ComboVal(_srBox), _srVal)) ComboSelectVal(_srBox, _srVal);
+        _srBox.ToolTip = SupervisorCodeView.Help(_lang == 0) + "\n" + SupervisorCodeView.TakeEffectTip(_lang == 0);
+        _srBox.Background = BtnBg; _srBox.Foreground = Fg; _srBox.BorderBrush = Border;
+        StyleFlatCombo(_srBox);
+        _srReadAt = DateTime.MinValue;   // repaint the note in the new language / theme
+        PaintSupervisorCodeNote();
+    }
+    // The plain message "supervisor is running older code: restart needed", from the supervisor's own
+    // report. Nothing is shown when the file is missing, unreadable, names a dead process, or says
+    // the code is current. Re-read at most every 5 s (this runs on every status refresh).
+    void PaintSupervisorCodeNote()
+    {
+        if (_srNow == null) return;
+        if ((DateTime.UtcNow - _srReadAt).TotalSeconds >= 5.0)
+        {
+            _srReadAt = DateTime.UtcNow;
+            _srText = null;
+            try
+            {
+                string path = Path.Combine(RepoRootForSettings(), ".fleet", "supervisor_state.json");
+                if (File.Exists(path))
+                {
+                    var raw = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                    bool alive = false;
+                    if (raw != null && raw.ContainsKey("pid") && raw.ContainsKey("start_ts"))
+                    {
+                        // a PID alone can be reused after the supervisor dies: it must also have been born
+                        // when the file says
+                        int pid = Convert.ToInt32(raw["pid"], System.Globalization.CultureInfo.InvariantCulture);
+                        double born = Convert.ToDouble(raw["start_ts"], System.Globalization.CultureInfo.InvariantCulture);
+                        try
+                        {
+                            var p = System.Diagnostics.Process.GetProcessById(pid);
+                            if (!p.HasExited)
+                            {
+                                double actual = new DateTimeOffset(p.StartTime.ToUniversalTime()).ToUnixTimeSeconds();
+                                alive = born > 0.0 && Math.Abs(actual - born) <= 2.0;
+                            }
+                        }
+                        catch (Exception) { alive = false; }
+                    }
+                    _srText = SupervisorCodeView.Describe(raw, alive, _lang == 0);
+                }
+            }
+            catch (Exception) { _srText = null; }
+        }
+        _srNow.Text = _srText ?? "";
+        _srNow.Foreground = Theme.Br(Theme.Warning(_dark));
+        _srNow.Visibility = _srText != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Tool-call check interval (0|15|30|60 min), in the Recovery section. Persists through SaveKey
+    // only; the bridge re-reads the key about every 5 minutes (each_gate). What is IN EFFECT comes
+    // from the bridge's own account (.fleet/tool_probe_state.json, the same dict as its /status
+    // "probe"); the words and parsing live in ToolProbeView (EffortPolicy.cs).
+    UIElement ToolProbeControl()
+    {
+        _tpLbl = new TextBlock(); _tpLbl.VerticalAlignment = VerticalAlignment.Center;
+        _tpLbl.FontSize = 12;
+
+        _tpBox = new ComboBox();
+        _tpBox.ToolTip = ToolProbeView.Help(_lang == 0) + "\n" + ToolProbeView.TakeEffectTip(_lang == 0);
+        _tpBox.Cursor = Cursors.Hand; _tpBox.FontSize = 12;
+        _tpBox.FontWeight = FontWeights.SemiBold; _tpBox.MinWidth = 64;
+        _tpBox.Padding = new Thickness(8, 2, 4, 2);
+        _tpBox.VerticalAlignment = VerticalAlignment.Center;
+        var tpHelp = new Dictionary<string, string>();
+        foreach (string m in ToolProbeView.Choices) tpHelp[m] = ToolProbeView.ChoiceLabel(m, _lang == 0);
+        FillComboWithHelp(_tpBox, ToolProbeView.Choices, tpHelp, _tpVal);
+        _tpBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _tpBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_tpBox);
+            if (!ToolProbeView.IsChoice(sel) || sel == _tpVal) return;   // unchanged -> no write, no re-fire
+            _tpVal = sel;
+            SaveKey(ToolProbeView.Key, _tpVal);
+            PaintToolProbeInEffect();
+        };
+
+        _tpNow = new TextBlock(); _tpNow.VerticalAlignment = VerticalAlignment.Center;
+        _tpNow.FontSize = 11.5; _tpNow.TextWrapping = TextWrapping.Wrap; _tpNow.MaxWidth = 300;
+        _tpPending = new TextBlock(); _tpPending.VerticalAlignment = VerticalAlignment.Center;
+        _tpPending.FontSize = 11.5; _tpPending.FontWeight = FontWeights.SemiBold;
+        _tpPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_tpLbl, _tpBox, _tpNow, _tpPending);
+        PaintToolProbe();
+        return wrap;
+    }
+    void PaintToolProbe()
+    {
+        if (_tpLbl != null) { _tpLbl.Text = ToolProbeView.Label(_lang == 0); _tpLbl.Foreground = Muted; }
+        if (_tpBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_tpBox), _tpVal)) ComboSelectVal(_tpBox, _tpVal);
+        _tpBox.ToolTip = ToolProbeView.Help(_lang == 0) + "\n" + ToolProbeView.TakeEffectTip(_lang == 0);
+        _tpBox.Background = BtnBg; _tpBox.Foreground = Fg; _tpBox.BorderBrush = Border;
+        StyleFlatCombo(_tpBox);
+        PaintToolProbeInEffect();
+    }
+    // The bridge's decision state, re-read only when the file changed. No report (old bridge, no
+    // bridge yet) -> null, and the screen shows nothing rather than a guess from the selection.
+    Dictionary<string, object> ReadToolProbeState()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRoot(), ".fleet", "tool_probe_state.json");
+            if (!File.Exists(path)) { _tpState = null; _tpStateMtimeTicks = -1; return null; }
+            double ticks = (double)File.GetLastWriteTimeUtc(path).Ticks;
+            if (ticks != _tpStateMtimeTicks)
+            {
+                _tpState = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+                _tpStateMtimeTicks = ticks;
+            }
+            return _tpState;
+        }
+        catch (Exception) { return null; }   // mid-write or unreadable: show nothing this time
+    }
+    void PaintToolProbeInEffect()
+    {
+        if (_tpNow == null || _tpPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> st = ReadToolProbeState();
+        if (st != null && st.ContainsKey("enabled") && st["enabled"] != null)
+        {
+            bool enabled = Convert.ToBoolean(st["enabled"]);
+            double iv = Dbl(st, "interval_min");
+            string src = S(st, "source");
+            now = ToolProbeView.Describe(true, enabled, iv, src, Dbl(st, "last_sent"), S(st, "last_skipped_reason"),
+                                         Dbl(st, "last_skipped_ts"), I(st, "skipped_since_start"), Dbl(st, "evidence_ts"),
+                                         I(st, "backoff_failures"), NowUnix(), ja);
+            pend = ToolProbeView.PendingText(true, enabled, iv, src, _tpVal, ja);
+        }
+        _tpNow.Text = now ?? "";
+        _tpNow.Foreground = Muted;
+        _tpNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _tpPending.Text = pend ?? "";
+        _tpPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _tpPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     void PaintEffort()
     {
@@ -7205,9 +10365,9 @@ class CockpitWindow : Window
         }
     }
 
-    // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both write into commands.json
-    // via WriteCommands, merging with ReadCommands first so a queued close/steer/add isn't
-    // clobbered. fleet_runner._drain_commands consumes {"pause":bool}/{"stop":true} each sweep.
+    // Fleet-wide controls: Pause/Resume toggle + Stop-all. Both send their own single-key
+    // command file through FleetCommands.Write, so neither can clobber a queued close/steer/add.
+    // fleet_runner._drain_commands consumes {"pause":bool}/{"stop":true} each sweep.
     UIElement FleetControls()
     {
         var group = new StackPanel(); group.Orientation = Orientation.Horizontal;
@@ -7236,13 +10396,11 @@ class CockpitWindow : Window
         _pauseBtn.Click += delegate
         {
             // Pause only means something to a LIVE fleet. With no live consumer the command would
-            // sit unread in commands.json while the label lied "Resume" -- so do nothing then (the
+            // sit unread in commands.d/ while the label lied "Resume" -- so do nothing then (the
             // button is also disabled per-tick by RefreshPauseEnabled, this is belt-and-suspenders).
             if (!RunIsLive()) { if (_paused) { _paused = false; PaintPause(); } return; }
             _paused = !_paused;
-            var cmd = ReadCommands();
-            cmd["pause"] = _paused;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("pause", _paused));
             PaintPause();
         };
         group.Children.Add(_pauseBtn);
@@ -7268,9 +10426,7 @@ class CockpitWindow : Window
         }
         _stopBtn.Click += delegate
         {
-            var cmd = ReadCommands();
-            cmd["stop"] = true;
-            WriteCommands(cmd);
+            SendCommand(Cmd1("stop", true));
             // FIX B: immediate optimistic feedback -- don't wait for the ~700ms sweep to show
             // anything changed. Flip the button into its "stopping" state and dim every
             // non-terminal card NOW; RefreshStoppingState (called each OnTick) clears this the
@@ -7455,7 +10611,7 @@ class CockpitWindow : Window
     }
 
     // true iff a run is currently LIVE: running, not idle, AND its status is fresh enough that the
-    // fleet_runner is provably still consuming commands.json (so steer/retry/pause actually land).
+    // fleet_runner is provably still consuming commands.d/ (so steer/retry/pause actually land).
     bool RunIsLive()
     {
         try { return Liveness(ReadStatus()) == 1; }
@@ -7482,7 +10638,7 @@ class CockpitWindow : Window
         SaveKey("maxtabs", _maxtabs.ToString());
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
         // FIX D: the same stepper gesture must behave the same whether autoscale is ON or OFF.
-        // RequestSetMaxtabs writes into commands.json via the SAME live-apply mechanism
+        // RequestSetMaxtabs writes a command file via the SAME live-apply mechanism
         // RequestSetAutoscale (and the old "Apply now" banner button) already used -- there is no
         // technical reason the non-autoscale path needs a separate negotiation banner, so both
         // paths now apply immediately and show the identical lightweight auto-dismissing toast
@@ -7559,6 +10715,13 @@ class CockpitWindow : Window
     ScrollViewer _gateScroll;           // bounds the banner so it cannot starve the rest of the window
     StackPanel _gateCardsPanel;         // holds one card per pending gate (or first gate + count)
     string _gateSig = "";               // last rendered gate set (by token); rebuild only on change
+    // COLLAPSED BY DEFAULT. Expanded, three Skill cards -- each carrying a question, a path, a
+    // digest and an Approve/Deny row -- measured taller than the run list they sit above, so the
+    // window was mostly approval and the work underneath was unreadable. Capping the height was
+    // not enough: the cap is a fraction of the window, so it scales with it and still crowds out
+    // the list. The banner now opens as one summary line and shows cards only when asked.
+    bool _gateExpanded = false;
+    Dictionary<string, object> _gateRootCache;   // so the toggle can repaint without waiting a tick
 
     // RAM admission headroom (mirrors relay_fleet.auto_concurrency headroom_mb=2048): when free
     // physical RAM is around/under this the runner can't open another tab. We additionally surface
@@ -7598,6 +10761,76 @@ class CockpitWindow : Window
         dp.Children.Add(_capBannerLbl);
         _capBanner.Child = dp;
         return _capBanner;
+    }
+
+    // ── command_rejections banner ─────────────────────────────────────────────────────────
+    // status.json's `command_rejections` (relay/fleet_runner.py, e822fb6): every fleet command
+    // (from this cockpit, CopilotChat, or a stale/foreign writer) that validate_command refused
+    // is recorded here, newest last, up to MAX_REJECTIONS_KEPT=20. Before this the only place a
+    // refusal was visible was the fleet's own console log and a landing receipt nobody watching
+    // the cockpit would think to open -- an operator could send a bad set_disk_floor_gb or
+    // add_goal and see nothing happen, with no clue why. Plain, one line, not a modal: this is
+    // information about something that already happened and needs no decision from the operator.
+    Border _rejBanner;
+    TextBlock _rejBannerLbl;
+
+    UIElement BuildRejectionBanner()
+    {
+        _rejBanner = new Border();
+        _rejBanner.Visibility = Visibility.Collapsed;
+        _rejBanner.CornerRadius = new CornerRadius(Theme.RadPopover);
+        _rejBanner.BorderThickness = new Thickness(1);
+        _rejBanner.Padding = new Thickness(16, 8, 12, 8);
+        _rejBanner.Margin = new Thickness(24, 0, 16, 6);
+        DockPanel.SetDock(_rejBanner, Dock.Top);
+        _rejBannerLbl = new TextBlock();
+        _rejBannerLbl.VerticalAlignment = VerticalAlignment.Center; _rejBannerLbl.FontSize = 13;
+        _rejBannerLbl.TextWrapping = TextWrapping.Wrap;
+        _rejBanner.Child = _rejBannerLbl;
+        return _rejBanner;
+    }
+
+    // Reactively show the NEWEST rejection each tick (rows are append-only, newest last -- see
+    // record_command_rejection). Hides when the array is empty or unreadable. `keys`/`errors`
+    // are exactly what relay/fleet_runner.py's record_command_rejection recorded: the refused
+    // command's KEYS and validate_command's reasons, deliberately never the values a steer or a
+    // goal carried.
+    void UpdateRejectionBanner(Dictionary<string, object> root)
+    {
+        if (_rejBanner == null) return;
+        object ro;
+        object[] rows = (root != null && root.TryGetValue("command_rejections", out ro) && ro is object[])
+                        ? (object[])ro : null;
+        Dictionary<string, object> last = null;
+        if (rows != null)
+            for (int i = rows.Length - 1; i >= 0 && last == null; i--)
+                last = rows[i] as Dictionary<string, object>;
+        if (last == null)
+        {
+            _rejBanner.Visibility = Visibility.Collapsed;
+            return;
+        }
+        string keys = "";
+        object ko;
+        if (last.TryGetValue("keys", out ko) && ko is object[])
+            keys = string.Join(",", Array.ConvertAll((object[])ko, x => x == null ? "" : x.ToString()));
+        string errs = "";
+        object eo;
+        if (last.TryGetValue("errors", out eo) && eo is object[])
+            errs = string.Join("; ", Array.ConvertAll((object[])eo, x => x == null ? "" : x.ToString()));
+        string when = "";
+        if (last.ContainsKey("ts"))
+        {
+            try { when = AgeMinutesText((NowUnix() - Convert.ToDouble(last["ts"])) / 60.0); }
+            catch (Exception) { }
+        }
+        string msg = L(
+            "コマンドが拒否されました" + (when.Length == 0 ? "" : "（" + when + "）") + "：" +
+            (keys.Length == 0 ? "(キーなし)" : keys) + (errs.Length == 0 ? "" : " — " + errs),
+            "Command rejected" + (when.Length == 0 ? "" : " (" + when + ")") + ": " +
+            (keys.Length == 0 ? "(no keys)" : keys) + (errs.Length == 0 ? "" : " — " + errs));
+        _rejBannerLbl.Text = msg;
+        _rejBanner.Visibility = Visibility.Visible;
     }
 
     // Reactively show/hide the capacity-wait banner each tick. Condition: a LIVE run with at least
@@ -7672,16 +10905,14 @@ class CockpitWindow : Window
     }
 
     // 強制開始: disable the disk gate live. Capture the current floor first so 床を戻す can restore
-    // it. Writes {"set_disk_floor_gb":0.0} via the SAME merge-with-existing WriteCommands path Pause
-    // uses, so a queued close/steer/set_maxtabs isn't clobbered. Consumed by fleet_runner.py ~L561.
+    // it. Writes {"set_disk_floor_gb":0.0} via the SAME one-file-per-command writer Pause uses, so a
+    // queued close/steer/set_maxtabs isn't clobbered. Consumed by fleet_runner.py ~L561.
     void ForceStart()
     {
         if (!RunIsLive()) return;     // nothing alive to consume the command
         var root = ReadStatus();
         _diskFloorPrev = Dbl(root ?? new Dictionary<string, object>(), "disk_floor_gb");
-        var cmd = ReadCommands();
-        cmd["set_disk_floor_gb"] = 0.0;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_disk_floor_gb", 0.0));
         _diskFloorForced = true;
         UpdateCapBanner(root);
     }
@@ -7689,20 +10920,40 @@ class CockpitWindow : Window
     // 床を戻す: write the previously-captured floor back, re-arming the disk gate.
     void RestoreFloor()
     {
-        var cmd = ReadCommands();
-        cmd["set_disk_floor_gb"] = _diskFloorPrev;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_disk_floor_gb", _diskFloorPrev));
         _diskFloorForced = false;
         UpdateCapBanner(ReadStatus());
     }
 
     // ── APPROVAL CENTER: durable gates, available even while the fleet is idle ───────────
-    string GateDirectory()
+    //
+    // ONE RESOLUTION, USED BY BOTH CLASSES. ApprovalPromptWindow cannot call an instance method
+    // of CockpitWindow, so it had its own rule -- "the gate's folder must be named
+    // .companion_gates" -- while the WRITER (tools/gate_ops.py) resolves
+    // `MCP_GATE_DIR or ALLOWED_BASE/.companion_gates`. Whenever MCP_GATE_DIR pointed elsewhere
+    // the two disagreed, the prompt threw "invalid approval-gate path", and the window closed
+    // itself in `Loaded` before painting anything: the operator clicked a notification and
+    // nothing happened, with no message anywhere. Two places deciding where gates live, in one
+    // file, because one of them could not reach the other's method.
+    string GateDirectory() { return ResolveGateDirectory(EnvValue("MCP_ALLOWED_BASE"),
+                                                         EnvValue("MCP_GATE_DIR")); }
+
+    //: `fileBase` / `fileGateDir` are what the .env says; the process environment wins, exactly
+    //: as it does in gate_ops.py. Static so the approval window can ask the same question.
+    internal static string ResolveGateDirectory(string fileBase, string fileGateDir)
     {
         try
         {
+            // MCP_GATE_DIR FIRST, because that is the order the writer uses. It is what the
+            // test suite sets to keep its gates out of the operator's queue, and a cockpit that
+            // ignores it can never open a gate written under it.
+            string over = Environment.GetEnvironmentVariable("MCP_GATE_DIR") ?? "";
+            if (string.IsNullOrWhiteSpace(over)) over = fileGateDir ?? "";
+            over = (over ?? "").Trim().Trim('"');
+            if (over.Length > 0) return Path.GetFullPath(over);
+
             string raw = Environment.GetEnvironmentVariable("MCP_ALLOWED_BASE") ?? "";
-            if (string.IsNullOrWhiteSpace(raw)) raw = EnvValue("MCP_ALLOWED_BASE");
+            if (string.IsNullOrWhiteSpace(raw)) raw = fileBase ?? "";
             raw = (raw ?? "").Trim();
             string basePath;
             if (raw.Length == 0 || raw == "*")
@@ -7870,6 +11121,7 @@ class CockpitWindow : Window
     void UpdateGateBanner(Dictionary<string, object> root)
     {
         if (_gateBanner == null || _gateCardsPanel == null) return;
+        _gateRootCache = root;
 
         // Read the durable gate directory directly.  This is deliberately independent of
         // status.json so Skill/import approvals remain visible before and after a fleet run.
@@ -7883,7 +11135,10 @@ class CockpitWindow : Window
         {
             double zoom = (_rootScale != null && _rootScale.ScaleY > 0.1) ? _rootScale.ScaleY : 1.0;
             double usable = (ActualHeight > 0 ? ActualHeight : 760) / zoom;
-            _gateScroll.MaxHeight = Math.Max(150, usable * 0.45);
+            // Collapsed the banner is a single summary line, so it needs no fraction of the
+            // window at all. Expanded, a quarter -- 0.45 left the run list at a few dozen px on
+            // a 760-tall window once the header, health strip and composer took their share.
+            _gateScroll.MaxHeight = _gateExpanded ? Math.Max(150, usable * 0.25) : 72;
         }
         if (_approvalCenterWindow != null && _approvalCenterWindow.IsVisible)
             RefreshApprovalCenter();
@@ -7891,6 +11146,9 @@ class CockpitWindow : Window
         // Build a signature from the current token set (order-insensitive for stability).
         var sb2 = new StringBuilder();
         foreach (var g in gates) sb2.Append(S(g, "token")).Append(';');
+        // The expand state is part of what is rendered, so it belongs in the signature -- without
+        // it the toggle changes a bool and the sig check returns before anything is redrawn.
+        sb2.Append(_gateExpanded ? "|open" : "|shut");
         string newSig = sb2.ToString();
         if (newSig == _gateSig) return;   // nothing changed; skip rebuild to avoid flicker
         _gateSig = newSig;
@@ -7903,17 +11161,64 @@ class CockpitWindow : Window
             return;
         }
 
-        // Heading row: "承認が必要です / Approval needed"  (amber/warning, not red/error)
+        // Heading row: a single line carrying the count and the expand toggle. Collapsed, this row
+        // IS the whole banner -- the count is what the owner needs at a glance, and the cards are
+        // one click away either here or in the Approval Center.
         bool ja3 = _lang == 0;
+        var headRow = new StackPanel();
+        headRow.Orientation = Orientation.Horizontal;
+        headRow.Margin = new Thickness(0, 0, 0, _gateExpanded ? 8 : 0);
+
         var headTb = new TextBlock();
         headTb.Text = ja3
-            ? "承認が必要です / Approval needed"
-            : "Approval needed / 承認が必要です";
+            ? ("承認待ち " + gates.Count + " 件 / Approval needed")
+            : ("Approval needed: " + gates.Count + " / 承認待ち");
         headTb.FontSize = 13;
         headTb.FontWeight = FontWeights.SemiBold;
         headTb.Foreground = Theme.Br(Theme.Warning(_dark));
-        headTb.Margin = new Thickness(0, 0, 0, 8);
-        _gateCardsPanel.Children.Add(headTb);
+        headTb.VerticalAlignment = VerticalAlignment.Center;
+        headRow.Children.Add(headTb);
+
+        var toggleBtn = new Button();
+        toggleBtn.Cursor = Cursors.Hand;
+        toggleBtn.FontSize = 11;
+        toggleBtn.BorderThickness = new Thickness(0);
+        toggleBtn.Background = Brushes.Transparent;
+        toggleBtn.Foreground = Theme.Br(Theme.Warning(_dark));
+        toggleBtn.Padding = new Thickness(0);
+        toggleBtn.Margin = new Thickness(12, 0, 0, 0);
+        toggleBtn.VerticalAlignment = VerticalAlignment.Center;
+        toggleBtn.Content = _gateExpanded ? (ja3 ? "たたむ" : "Collapse") : (ja3 ? "開く" : "Expand");
+        toggleBtn.Click += delegate (object s3, RoutedEventArgs e3)
+        {
+            e3.Handled = true;
+            _gateExpanded = !_gateExpanded;
+            // Repaint now rather than on the next 700ms tick, so the click feels like it did
+            // something. The cached root is the one this method was last called with.
+            if (_gateRootCache != null) UpdateGateBanner(_gateRootCache);
+        };
+        headRow.Children.Add(toggleBtn);
+
+        var centerBtn = new Button();
+        centerBtn.Cursor = Cursors.Hand;
+        centerBtn.FontSize = 11;
+        centerBtn.BorderThickness = new Thickness(0);
+        centerBtn.Background = Brushes.Transparent;
+        centerBtn.Foreground = Theme.Br(Theme.Muted(_dark));
+        centerBtn.Padding = new Thickness(0);
+        centerBtn.Margin = new Thickness(12, 0, 0, 0);
+        centerBtn.VerticalAlignment = VerticalAlignment.Center;
+        centerBtn.Content = ja3 ? "承認センター" : "Approval Center";
+        centerBtn.Click += delegate (object s3, RoutedEventArgs e3) { e3.Handled = true; ShowApprovalCenter(); };
+        headRow.Children.Add(centerBtn);
+
+        _gateCardsPanel.Children.Add(headRow);
+
+        if (!_gateExpanded)
+        {
+            _gateBanner.Visibility = Visibility.Visible;
+            return;
+        }
 
         // Show first gate (or all). If more than 1, show a count note below.
         int showCount = gates.Count > 3 ? 3 : gates.Count;
@@ -8131,10 +11436,14 @@ class CockpitWindow : Window
 
         var selector = new ComboBox(); selector.MinWidth = 230; selector.HorizontalAlignment = HorizontalAlignment.Left;
         selector.Margin = new Thickness(0, 12, 0, 0); selector.Background = CardBg; selector.Foreground = Fg;
+        // SAME ORDER AND SAME LABELS AS ApprovalPromptWindow's list. This is the second
+        // selector for one setting, each with its own hard-coded array, and a test caught the
+        // two disagreeing about which mode is recommended after only one was changed -- on
+        // the surface an operator actually opens to change it.
         var labels = _lang == 0
-            ? new string[] { "確認（推奨）", "自動", "バイパス" }
-            : new string[] { "Confirm (recommended)", "Auto", "Bypass" };
-        var values = new string[] { "default", "auto", "bypass" };
+            ? new string[] { "自動（推奨）", "バイパス", "毎回確認（非推奨）" }
+            : new string[] { "Auto (recommended)", "Bypass", "Confirm every time (not recommended)" };
+        var values = new string[] { "auto", "bypass", "default" };
         string current = ApprovalPromptWindow.ReadPolicy();
         for (int i = 0; i < values.Length; i++)
         {
@@ -8148,7 +11457,7 @@ class CockpitWindow : Window
         Action updateHelp = delegate
         {
             var selected = selector.SelectedItem as ComboBoxItem;
-            string mode = selected == null ? "default" : selected.Tag as string;
+            string mode = selected == null ? "auto" : selected.Tag as string;
             if (mode == "auto") help.Text = _lang == 0
                 ? "安全な操作は自動実行、要確認は承認待ち、禁止判定は拒否。"
                 : "Safe operations run automatically; risky ones ask; prohibited ones are denied.";
@@ -8156,8 +11465,8 @@ class CockpitWindow : Window
                 ? "手動確認を省略。常時有効な安全境界は解除しません。"
                 : "Skip manual confirmations. Always-on safety boundaries remain.";
             else help.Text = _lang == 0
-                ? "初回クラスを確認し、承認後も危険な内容は毎回確認。"
-                : "Confirm first-seen classes; risky payloads still ask every time.";
+                ? "初回クラスを毎回確認。非推奨: 確認が多すぎると内容が読まれなくなります。"
+                : "Asks about every first-seen class. Not recommended: an approval that is always there stops being read.";
         };
         updateHelp();
         bool reverting = false;
@@ -8207,9 +11516,29 @@ class CockpitWindow : Window
         _approvalPendingHost.Children.Clear(); _approvalRecentHost.Children.Clear();
         var pending = new List<Dictionary<string, object>>();
         var recent = new List<Dictionary<string, object>>();
+        // RECENT DECISIONS ARE DE-DUPLICATED BY CONTENT, NOT DELETED FROM DISK. A gate answered
+        // under `auto`/`bypass` job policy (see task_router.job_gate) never reaches this list to
+        // begin with -- those modes return ALLOW without ever writing a gate file, so there is
+        // nothing here to hide for them. What DOES flood this list in practice is the SAME
+        // decision recorded over and over: an external Skill's approval expires (APPROVAL_TTL in
+        // relay/skills.py) and gets re-approved against the identical, unchanged bundle, or a
+        // background loop repeats the identical request. Measured on one machine: 2169 of 2175
+        // gate files were Skill approvals, and 2167 of those were the SAME skill at the SAME
+        // content digest -- one signature, answered thousands of times, burying everything else
+        // under the 20-card cap below.
+        //
+        // `all` is sorted newest-first (ReadAllGates), so keeping the FIRST occurrence of a key
+        // keeps the MOST RECENT instance of that decision as the list's representative. A Skill's
+        // first-ever approval, or its re-approval after the bundle CHANGED, carries a different
+        // digest and therefore a different question string -- a different key -- so it is never
+        // folded away here. Nothing is written back to the gate file or deleted: the on-disk
+        // gate_*.json is the durable log this collapsing must not touch.
+        var seenRecentKeys = new HashSet<string>(StringComparer.Ordinal);
         foreach (var gate in all)
         {
-            if (GateAnswered(gate)) recent.Add(gate); else pending.Add(gate);
+            if (!GateAnswered(gate)) { pending.Add(gate); continue; }
+            string recentKey = GateKind(gate) + "" + S(gate, "question") + "" + S(gate, "answer");
+            if (seenRecentKeys.Add(recentKey)) recent.Add(gate);
         }
         if (_approvalCenterSummary != null)
             _approvalCenterSummary.Text = _lang == 0 ? (pending.Count + " 件 未処理") : (pending.Count + " pending");
@@ -8469,6 +11798,9 @@ class CockpitWindow : Window
         string label = _lang == 0 ? ("タブ " + open + "/" + cap) : ("Tabs " + open + "/" + cap);
         _workerChip.Text = label;
         _workerChip.Foreground = Theme.Br(Theme.Muted(_dark));
+        string hint = T("tabs_chip_hint");
+        _workerChip.ToolTip = hint;
+        if (_workerChipBorder != null) _workerChipBorder.ToolTip = hint;
     }
 
     void PaintWorkerChipBorder(Border b)
@@ -8504,6 +11836,8 @@ class CockpitWindow : Window
         PaintAutoToggle();
         UpdateAutoEnabled();
         PaintEffort();
+        PaintEffortPolicy();
+        PaintFanout();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -8558,6 +11892,13 @@ class CockpitWindow : Window
         }
         if (_capForceBtn != null) { _capForceBtn.Background = Brushes.Transparent; _capForceBtn.Foreground = warn; _capForceBtn.BorderBrush = warn; }
         if (_capRestoreBtn != null) { _capRestoreBtn.Background = Brushes.Transparent; _capRestoreBtn.Foreground = Fg; _capRestoreBtn.BorderBrush = Border; }
+        if (_rejBanner != null)
+        {
+            _rejBanner.Background = CardBg;
+            _rejBanner.BorderThickness = new Thickness(1);
+            _rejBanner.BorderBrush = warn;
+            if (_rejBannerLbl != null) _rejBannerLbl.Foreground = Fg;
+        }
         Relabel();
     }
 
@@ -8568,6 +11909,8 @@ class CockpitWindow : Window
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         PaintAutoToggle();
         PaintEffort();
+        PaintEffortPolicy();
+        PaintFanout();
         PaintApproval();
         PaintApprovalCenterButton(PendingGates(ReadStatus()).Count);
         PaintPause();
@@ -8626,6 +11969,13 @@ class CockpitWindow : Window
                     bool d0 = _dark; int l0 = _lang; double s0 = _uiScale;
                     bool a0 = _uiAuto; double t0 = _scaleTarget;
                     LoadSettings();
+                    // The fan-out / effort-policy controls live in the gear popup, which may not
+                    // exist yet (every Paint* is null-safe) and is rebuilt on each open. Repaint
+                    // whatever is there so an external settings.txt edit shows without reopening.
+                    // Paint* only assigns when different, so SelectionChanged does not re-fire.
+                    PaintEffort();
+                    PaintEffortPolicy();
+                    PaintFanout();
                     if (d0 != _dark) { ApplyThemeBrushes(); PaintChrome(); _lastSig = ""; }
                     else if (l0 != _lang) { RebuildChrome(); }
                     // External ui_scale edit (e.g. the chat app zoomed / switched to auto): apply it live
@@ -8652,10 +12002,14 @@ class CockpitWindow : Window
         catch (Exception) { }
 
         Dictionary<string, object> root = ReadStatus();
+        RefreshSubmitted(root);             // the "submitted, not picked up yet" group (top of the list)
         RefreshPauseEnabled(root);          // Pause is only meaningful for a live run; grey it out otherwise
         RefreshStoppingState(root);         // FIX B: resolve the optimistic "stopping" state once the sweep confirms it
         UpdateGateBanner(root);             // Bucket C TASK 2: show pending approval gates (blocks worker until answered)
         UpdateCapBanner(root);              // TASK 1: surface the admission-gate wait reactively each tick
+        UpdateRejectionBanner(root);        // show the newest refused fleet command (SEC-08, e822fb6)
+        // (the re-unlock receipt used to be turned into a panel note here; the harness now
+        //  delivers unlocks itself and the receipt is read from status.json by status.py)
         bool idle = root == null || I(root, "total") == 0
                     || (root.ContainsKey("idle") && Convert.ToBoolean(root["idle"]));
         if (idle)
@@ -8681,11 +12035,16 @@ class CockpitWindow : Window
             string resumeSig = resumeN > 0 ? ResumeStateSignature() : "";
             bool resumeDismissed = resumeN > 0 && ResumeStateDismissed(resumeSig);
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang + "|q" + (_histQuery ?? "")
-                          + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0");
+                          + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0")
+                          + "|s" + _submittedSig;
             if (_lastSig != isig)
             {
                 _lastRoot = null;
                 var rows = new List<object>();
+                // FIRST, in the idle state too: a submission made while nothing runs (StartFleet
+                // before the run's first snapshot, fleet_submit, a for_fleet hand-off) is on top.
+                AppendSubmittedRows(rows);
+                int beforeRest = rows.Count;
                 if (resumeN > 0 && !resumeDismissed)
                 {
                     var rd = new Dictionary<string, object>();
@@ -8693,7 +12052,8 @@ class CockpitWindow : Window
                     rows.Add(MkRow(8, null, rd));   // resume affordance (idle + N>0 only)
                 }
                 AppendHistoryRows(rows, null);   // idle: no live run on board -> show all history
-                if (rows.Count == 0) rows.Add(MkRow(5, null, null));   // empty state when nothing to show
+                // empty state when nothing but (possibly) submitted rows is shown
+                if (rows.Count == beforeRest) rows.Add(MkRow(5, null, null));
                 SetRows(rows);
                 _lastSig = isig;
             }
@@ -8741,7 +12101,7 @@ class CockpitWindow : Window
         // PaintComposerMode: show "steer" surface while run is live.
         RefreshSpine(root, false);
         PaintComposerMode(runningNow);
-        string sig = Sig(root);
+        string sig = Sig(root) + "|s" + _submittedSig;
         if (sig == _lastSig) return;
         _lastSig = sig;
         RenderCards(root);
@@ -8766,6 +12126,7 @@ class CockpitWindow : Window
         {
             var w = o as Dictionary<string, object>;
             if (w == null) continue;
+            if (IsInterruptedWorker(w)) continue;              // resumable: never archived, never blocks
             if (!IsTerminalWorker(w)) return;                  // not fully finished yet -> wait
         }
         // _toolbarShown is populated by the last RenderCards; on the finished tick it holds this
@@ -8806,12 +12167,17 @@ class CockpitWindow : Window
             //
             // So the fan-out was not broken. It ran, it split, it merged, and then this
             // line threw the answer away.
-            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
+            if (!IsRetryableWorker(w)) continue;
             string goal = S(w, "goal");
             if (string.IsNullOrEmpty(goal)) continue;
             int n = 0;
             if (_autoRetryCount.ContainsKey(goal)) n = _autoRetryCount[goal];
             if (n >= _autoRetryMax) continue;          // budget spent -> never loop
+            // ONE RE-QUEUE PER WORKER. The terminal worker stays terminal, so without this every
+            // tick re-queued the same STUCK worker until the per-goal budget ran out (2026-10-01:
+            // two extra copies on top of the runner's own retry).
+            if (RetryAlreadyCovered(root, w)) continue;
+            _autoRetriedWorkers.Add(RetryWorkerKey(w));
             _autoRetryCount[goal] = n + 1;             // count BEFORE re-queue (idempotent per tick)
             RetryGoal(w);
         }
@@ -8829,7 +12195,36 @@ class CockpitWindow : Window
             if (string.IsNullOrEmpty(text)) return null;
             return (Dictionary<string, object>)_js.DeserializeObject(text);
         }
-        catch (Exception) { return null; }
+        catch (Exception ex) { NoteStatusReadFailure(ex); return null; }
+    }
+
+    bool _statusReadFailLogged;
+
+    // A SWALLOWED EXCEPTION WITH NO TRACE IS WHY THE BUG ABOVE TOOK TWENTY HOURS TO FIND.
+    // The catch itself has to stay -- a cockpit that dies on a half-written status.json is
+    // worse than one that skips a tick -- but "returns null on any failure" and "logs
+    // nothing on any failure" are separate decisions, and only the first one was wanted.
+    // Recording the FIRST failure per process is enough: the failure is structural, so the
+    // thousandth line would say what the first one says, and an unbounded log on a
+    // per-tick path is its own disk problem. Size is recorded because it is the field that
+    // identifies this failure at a glance.
+    void NoteStatusReadFailure(Exception ex)
+    {
+        if (_statusReadFailLogged) return;
+        _statusReadFailLogged = true;
+        try
+        {
+            long size = -1;
+            try { size = new FileInfo(_statusPath).Length; } catch (Exception) { }
+            string line = "{\"ts\":" + DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                        + ",\"what\":\"status_read_failed\""
+                        + ",\"bytes\":" + size
+                        + ",\"type\":\"" + ex.GetType().Name + "\""
+                        + ",\"detail\":\"" + (ex.Message ?? "").Replace("\\", "/").Replace("\"", "'") + "\"}";
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "ui_errors.jsonl");
+            File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
+        }
+        catch (Exception) { }   // a trace that can break the cockpit is worse than no trace
     }
 
     static string S(Dictionary<string, object> d, string k)
@@ -8854,6 +12249,19 @@ class CockpitWindow : Window
     static double Dbl(Dictionary<string, object> d, string k)
     { try { if (d.ContainsKey(k) && d[k] != null) return Convert.ToDouble(d[k]); } catch (Exception) { } return 0; }
 
+    static Dictionary<string, object> Obj(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return null;
+        return d[k] as Dictionary<string, object>;
+    }
+
+    static int ArrCount(Dictionary<string, object> d, string k)
+    {
+        if (d == null || !d.ContainsKey(k) || d[k] == null) return 0;
+        var a = d[k] as object[];
+        return a != null ? a.Length : 0;
+    }
+
     string Sig(Dictionary<string, object> root)
     {
         var sb = new StringBuilder();
@@ -8872,6 +12280,13 @@ class CockpitWindow : Window
                 // changes need to force a re-render. Collapsed cards stay put while their
                 // worker streams -- that's what keeps a 164-task fleet from thrashing.
                 if (_expanded.Contains(nm)) sb.Append('#').Append(StableShortHash(S(w, "last")));
+                var ex = Obj(w, "execution");
+                if (ex != null)
+                    sb.Append("|x").Append(S(ex, "state"))
+                      .Append(':').Append(S(ex, "current_step_index"))
+                      .Append(':').Append(S(ex, "completed_count"))
+                      .Append(':').Append(StableShortHash(S(ex, "last_progress")))
+                      .Append(':').Append(S(ex, "last_progress_at"));
                 sb.Append(';');
             }
         return sb.ToString();
@@ -8892,7 +12307,7 @@ class CockpitWindow : Window
         _header.Text = "Fleet";
 
         // Compute running/queued/done counts from the workers array.
-        int cntRunning = 0, cntQueued = 0, cntDoneW = 0;
+        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0;
         object wo2;
         if (root.TryGetValue("workers", out wo2) && wo2 is object[])
         {
@@ -8902,6 +12317,7 @@ class CockpitWindow : Window
                 if (ww == null) continue;
                 string wst = S(ww, "status");
                 if (IsTerminalWorker(ww)) cntDoneW++;
+                else if (IsInterruptedWorker(ww)) cntIntr++;   // not running, not done, not a failure
                 else if (wst == "pending") cntQueued++;
                 else cntRunning++;
             }
@@ -8924,9 +12340,8 @@ class CockpitWindow : Window
                 {
                     var ww2 = ow2 as Dictionary<string, object>;
                     if (ww2 == null) continue;
-                    if (!IsTerminalWorker(ww2)) { allTerminal = false; }
-                    string wst2 = S(ww2, "status");
-                    if (wst2 == "stuck" || wst2 == "maxturns" || wst2 == "error") cntAttn++;
+                    if (!IsTerminalWorker(ww2) && !IsInterruptedWorker(ww2)) { allTerminal = false; }
+                    if (IsOperatorAttention(ww2)) cntAttn++;
                 }
             }
         }
@@ -8937,11 +12352,11 @@ class CockpitWindow : Window
             // Run-ended header: "{done} done · {attn} needs attention · run ended"
             if (ja2)
             {
-                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · 終了";
+                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · " + (cntIntr > 0 ? cntIntr + " 中断 · " : "") + "終了";
             }
             else
             {
-                triple = cntDoneW + " done · " + cntAttn + " needs attention · run ended";
+                triple = cntDoneW + " done · " + cntAttn + " needs attention · " + (cntIntr > 0 ? cntIntr + " interrupted · " : "") + "run ended";
             }
         }
         else
@@ -9015,6 +12430,8 @@ class CockpitWindow : Window
                 _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
                 _subChips.Children.Add(ChipMargin(Pill(cntAttn + " " + (ja2 ? "要対応" : "needs attention"),
                     cntAttn > 0 ? "warning" : "neutral")));
+                if (cntIntr > 0)
+                    _subChips.Children.Add(ChipMargin(Pill(cntIntr + " " + (ja2 ? "中断" : "interrupted"), "warning")));
                 _subChips.Children.Add(ChipMargin(Pill(ja2 ? "終了" : "run ended", "neutral")));
             }
             else
@@ -9375,6 +12792,16 @@ class CockpitWindow : Window
     void RenderCards(Dictionary<string, object> root)
     {
         _lastRoot = root;               // cache for single-card toggles
+        PaintEffortPolicyInEffect(root);   // what the runner reports is in effect (effort policy)
+        PaintFanoutInEffect(root);         // what the coordinator was started with (fan-out)
+        PaintFanoutBudgetInEffect(root);   // the per-tree limits the coordinator applies
+        PaintFanoutDepthInEffect(root);    // the split depth the coordinator applies
+        PaintHierarchicalMergeInEffect(root);   // the hierarchical-merge state the coordinator applies
+        PaintMergeConversationInEffect(root);   // the merge-conversation state and the savings so far
+        PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
+        PaintAutoResumeInEffect(root);     // the auto-resume setting and the gate's last decision
+        PaintSupervisorCodeNote();         // "supervisor is running older code" (supervisor_state.json)
+        PaintToolProbeInEffect();          // why the tool-call check did or did not send a message
         // Preserve scroll position across the rebuild. Without this, every worker update
         // (status/turn change) reset the list and snapped the view back to the TOP -- which is
         // exactly why scrolling "didn't work" while tasks were live: the user scrolled down, a
@@ -9443,7 +12870,7 @@ class CockpitWindow : Window
         string g = (_dark ? "D" : "L") + _lang.ToString();
         string sig = "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                      + "|all" + tc[0] + ":act" + tc[1] + ":need" + tc[2] + ":done" + tc[3]
-                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7]
+                     + ":max" + tc[5] + ":bad" + tc[6] + ":hid" + tc[7] + ":int" + tc[8]
                      + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
         _pinnedToolbarHost.Visibility = Visibility.Visible;
         if (sig == _pinnedToolbarSig && _pinnedToolbarHost.Child != null) return;   // unchanged -> keep as-is
@@ -9479,15 +12906,27 @@ class CockpitWindow : Window
             string oc = S(w, "outcome");
             string st = S(w, "status");
             // Tab 1 = Active: non-terminal AND not pending (actively working statuses)
-            if (_cardFilter == 1 && (IsTerminalWorker(w) || st == "pending")) continue;
+            if (_cardFilter == 1 && (IsTerminalWorker(w) || IsInterruptedWorker(w) || st == "pending")) continue;
             // Tab 2 = Needs input: awaiting only
             if (_cardFilter == 2 && st != "awaiting") continue;
             // Tab 3 = Done: outcome == DONE
             if (_cardFilter == 3 && oc != "DONE") continue;
+            // Tab 4 = Interrupted (coordinator died, resumable); the tab only exists while one is on the board
+            if (_cardFilter == 4 && !IsInterruptedWorker(w)) continue;
             shown.Add(w);
         }
-        // All tabs use display-rank order (active->pending->terminal). Tab 0 partitions below.
-        shown = StableByDisplayRank(shown);
+        // THE LIST'S ORDER, decided in one place (SubmittedTasks.Compose, executed by
+        // ui/test_a_submitted_task_is_on_top_at_once.py): the "submitted, not picked up yet"
+        // group first, then fresh pending workers (the newest tasks), active, older pending,
+        // terminal. The submitted group is shown on the All and Active tabs -- a task that was
+        // just sent is new work, not an approval request or a finished result.
+        List<SubmittedView> subs = (_cardFilter == 0 || _cardFilter == 1)
+            ? ReadQueuedJobs() : new List<SubmittedView>();
+        List<SubmittedDisplayItem> order = SubmittedTasks.Compose(subs, shown, NowUnix(),
+                                                                  IsTerminalForOrder);
+        shown = new List<Dictionary<string, object>>();
+        foreach (SubmittedDisplayItem it in order)
+            if (it.Worker != null) shown.Add(it.Worker);
 
         // stash for the converter (it rebuilds the toolbar row from these when a container recycles)
         _toolbarAll = workers;
@@ -9496,11 +12935,15 @@ class CockpitWindow : Window
         var rows = new List<object>();
         // Empty state (spec): no run yet and no history -> a calm centered suggestion block instead
         // of a blank workspace (the big top textarea is already gone -- it's the bottom composer now).
+        // Anything submitted still goes ABOVE it.
         if (workers.Count == 0 && _history.Count == 0)
         {
+            AppendSubmittedRows(rows, order);
             rows.Add(MkRow(5, null, null));
             return rows;
         }
+        // The submitted group: the first rows of the list, above the directive band.
+        AppendSubmittedRows(rows, order);
         // NOTE: the toolbar (すべて/実行中/承認待ち/完了 filter) is NO LONGER a scrolling row. It is
         // pinned in _pinnedToolbarHost above the list (see RefreshPinnedToolbar, called from
         // RenderCards). Row kind 0 is retained in the converter for safety but never emitted here.
@@ -9529,7 +12972,7 @@ class CockpitWindow : Window
                    : (Dbl(root, "updated") > 0 && dbStarted > 0 ? Dbl(root, "updated") - dbStarted : 0));
             int dbActive = 0;
             foreach (Dictionary<string, object> dw in onBoard)
-                if (!IsTerminalWorker(dw) && S(dw, "status") != "pending") dbActive++;
+                if (!IsTerminalWorker(dw) && !IsInterruptedWorker(dw) && S(dw, "status") != "pending") dbActive++;
             bool dbJa = _lang == 0;
             var dbMeta = new StringBuilder();
             if (dbStarted > 0)
@@ -9626,7 +13069,8 @@ class CockpitWindow : Window
             filtered = new List<Dictionary<string, object>>();
             foreach (Dictionary<string, object> e in visible)
             {
-                string hay = (CardTitle(S(e, "conv_title"), S(e, "goal")) + " "
+                string hay = ((string.IsNullOrEmpty(S(e, "goal_summary"))
+                    ? CardTitle(S(e, "conv_title"), S(e, "goal")) : S(e, "goal_summary")) + " "
                               + S(e, "goal") + " " + S(e, "display_result") + " "
                               + S(e, "last") + " " + S(e, "outcome")).ToLowerInvariant();
                 if (hay.IndexOf(ql, StringComparison.Ordinal) >= 0) filtered.Add(e);
@@ -9696,7 +13140,7 @@ class CockpitWindow : Window
                 int[] tc0 = ToolbarCounts(_toolbarAll);
                 return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                        + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
-                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7]
+                       + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7] + ":int" + tc0[8]
                        + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
             case 2: return "HH|" + g;                          // history header (static chrome; search box preserved across renders)
             case 7:                                            // date-group subheader: keyed on its label
@@ -9704,8 +13148,15 @@ class CockpitWindow : Window
             case 8:                                            // resume affordance: keyed on N
                 return "RA|" + g + "|" + (hist != null ? I(hist, "n") : 0)
                        + "|" + (hist != null ? S(hist, "signature") : "");
+            case 9:                                            // submitted, not picked up yet: key + label + dismiss
+            {
+                var sv = hist != null && hist.ContainsKey("view") ? hist["view"] as SubmittedView : null;
+                if (sv == null) return "SB|" + g;
+                return "SB|" + g + "|" + StableShortHash(sv.Key) + "|" + SubmittedTasks.Label(sv, _lang == 0)
+                       + "|" + (sv.Dismissable ? "x" : "-");
+            }
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
-            case 5: return "ES|" + g;                          // empty state (static chrome)
+            case 5: return "ES|" + g + "|" + ReadQueuedJobs().Count;   // empty state: its headline counts the submitted group
             case 6:                                            // directive band: keyed on first-worker goal + started
                 return "DB|" + g + "|" + (w != null ? S(w, "goal") + "|" + S(w, "name") : "")
                        + "|tc" + (_toolbarAll.Count) + "|" + _directiveBandMeta;
@@ -9738,6 +13189,20 @@ class CockpitWindow : Window
                   .Append(':').Append(StableShortHash(S(w, "conv_title")));
                 // TASK 3 (Bucket C): track next_step + self_confidence so the collapsed row re-renders.
                 sb.Append('|').Append(S(w, "next_step").Length).Append(':').Append(S(w, "self_confidence"));
+                // effort badge fields: re-render when the level/source/last switch change
+                sb.Append("|ef:").Append(S(w, "effort_level")).Append(S(w, "effort_source"))
+                  .Append(StableShortHash(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "reason")))
+                  .Append(S(Obj(w, "effort_last_switch") ?? new Dictionary<string, object>(), "turn"));
+                var ex = Obj(w, "execution");
+                if (ex != null)
+                    sb.Append("|exec:").Append(S(ex, "state"))
+                      .Append(':').Append(S(ex, "current_step_index"))
+                      .Append(':').Append(S(ex, "total_steps"))
+                      .Append(':').Append(S(ex, "completed_count"))
+                      .Append(':').Append(ArrCount(ex, "artifacts"))
+                      .Append(':').Append(StableShortHash(S(ex, "current_step")))
+                      .Append(':').Append(StableShortHash(S(ex, "last_progress")))
+                      .Append(':').Append(S(ex, "last_progress_at"));
                 // FIX B: _stopping dims non-terminal cards -- track it so a Stop click (or its
                 // resolution) re-templates this card instead of reusing the old realized element.
                 sb.Append('|').Append(_stopping ? "1" : "0");
@@ -9754,6 +13219,7 @@ class CockpitWindow : Window
                 bool hasDraft = _steerDraft.TryGetValue(nm, out draftSt) && !string.IsNullOrEmpty(draftSt);
                 bool hasFocus = _steerFocusWorker == nm;
                 sb.Append('|').Append(hasDraft ? "d1" : "d0").Append(hasFocus ? "f1" : "f0");
+                sb.Append("|grp:").Append(StableShortHash(GroupLineText(w) + GroupExtraSig(w) + "|" + S(w, "display_label")));
                 return sb.ToString();
         }
     }
@@ -9802,7 +13268,9 @@ class CockpitWindow : Window
         return null;
     }
 
-    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row, 4=completed-divider.
+    // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row, 4=completed-divider,
+    // 5=empty state, 6=directive band, 7=date-group header, 8=resume affordance,
+    // 9=submitted-not-picked-up-yet (Hist["view"] is its SubmittedView).
     class Row
     {
         public int Kind;
@@ -9835,6 +13303,8 @@ class CockpitWindow : Window
             if (r.Kind == 5) return _w.EmptyState();
             if (r.Kind == 6) return _w.DirectiveBand(r.Worker);
             if (r.Kind == 7) return _w.HistoryGroupHeader(r.Hist != null ? S(r.Hist, "label") : "");
+            if (r.Kind == 9) return _w.SubmittedRow(
+                r.Hist != null && r.Hist.ContainsKey("view") ? r.Hist["view"] as SubmittedView : null);
             if (r.Kind == 8) return _w.ResumeAffordance(
                 r.Hist != null ? I(r.Hist, "n") : 0,
                 r.Hist != null ? S(r.Hist, "signature") : "");
@@ -9856,26 +13326,85 @@ class CockpitWindow : Window
     }
 
     // Default-view order: what is HAPPENING now floats to the top, finished work sinks to the
-    // bottom. Active (running/verifying/sending/...) -> pending (queued) -> terminal (done/freed/
-    // failed). Stable within each bucket so a worker keeps its place (and its W-name identity)
+    // bottom. Stable within each bucket so a worker keeps its place (and its W-name identity)
     // and cards do not jump around as unrelated workers tick. status.json lists workers in launch
     // order, so without this the earliest-launched (now-completed) workers stay pinned at the top.
-    static List<Dictionary<string, object>> StableByDisplayRank(List<Dictionary<string, object>> src)
+    //
+    // The order itself now lives in SubmittedTasks.Compose, where a test executes it: submitted
+    // (not picked up yet) -> fresh pending worker (the newest task; FRESH_PENDING_S says what
+    // "fresh" is) -> active -> older pending -> terminal. A pending worker used to sort below
+    // every active card however new it was, so the task just submitted was never the one on top.
+    // This is the terminal test that order uses; "freed" sinks with the finished ones, as before.
+    static bool IsTerminalForOrder(Dictionary<string, object> w)
     {
-        var outp = new List<Dictionary<string, object>>();
-        for (int rank = 0; rank <= 2; rank++)
-            foreach (Dictionary<string, object> w in src)
-                if (DisplayRank(w) == rank) outp.Add(w);
-        return outp;
+        return IsTerminalWorker(w) || S(w, "status") == "freed";
     }
 
-    // 0 = active (currently working), 1 = pending (queued, not yet started), 2 = terminal (done/
-    // freed/failed). Drives the default card order so the live worker is first and history sinks.
-    static int DisplayRank(Dictionary<string, object> w)
+    void AppendSubmittedRows(List<object> rows)
     {
-        if (IsTerminalWorker(w) || S(w, "status") == "freed") return 2;
-        if (S(w, "status") == "pending") return 1;
-        return 0;
+        AppendSubmittedRows(rows, SubmittedTasks.Compose(ReadQueuedJobs(), null, NowUnix(),
+                                                         IsTerminalForOrder));
+    }
+
+    // One row per submitted entry, in the order Compose gave them.
+    void AppendSubmittedRows(List<object> rows, List<SubmittedDisplayItem> order)
+    {
+        if (order == null) return;
+        foreach (SubmittedDisplayItem it in order)
+        {
+            if (it.Submitted == null) continue;
+            var d = new Dictionary<string, object>();
+            d["view"] = it.Submitted;
+            rows.Add(MkRow(9, null, d));
+        }
+    }
+
+    // A "submitted, not picked up yet" row: the label (state + age + where it is), then the goal
+    // on one line, trimmed like a card title. Drawn as a quiet bordered row, not a card: there is
+    // no worker behind it yet, so there is nothing to expand, steer or retry. The only action is
+    // the person's own dismiss, offered once SubmittedTasks says the entry may be dismissed (no
+    // file behind it, past the unconfirmed threshold) -- never on a fresh entry that the fleet
+    // may still pick up, and never on a timer.
+    UIElement SubmittedRow(SubmittedView v)
+    {
+        bool ja = _lang == 0;
+        var row = new Border {
+            BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
+            CornerRadius = new CornerRadius(Theme.RadCard),
+            Padding = new Thickness(16, 8, 16, 8), Margin = new Thickness(8, 8, 8, 4) };
+        var dp = new DockPanel { LastChildFill = true };
+        if (v != null && v.Dismissable)
+        {
+            var close = IconButton("close", 14, ja ? "この投入済みタスクの表示を消す" : "Dismiss this submitted task");
+            close.Width = 28; close.Height = 28; close.Margin = new Thickness(8, 0, 0, 0);
+            close.Padding = new Thickness(0); close.BorderThickness = new Thickness(0);
+            close.Background = Brushes.Transparent; close.Foreground = Muted;
+            close.Template = FlatButtonTemplate();
+            close.ToolTip = ja ? "消す（フリートの作業は取り消しません）"
+                               : "Dismiss (does not cancel anything in the fleet)";
+            string key = v.Key;
+            close.Click += delegate (object sender, RoutedEventArgs e)
+            {
+                e.Handled = true;
+                if (_submitted.Dismiss(key, NowUnix())) ForceRender();
+            };
+            DockPanel.SetDock(close, Dock.Right); dp.Children.Add(close);
+        }
+        var stack = new StackPanel();
+        stack.Children.Add(new TextBlock {
+            Text = SubmittedTasks.Label(v, ja),
+            // Full-strength text once an unconfirmed entry is stale: that is the one worth a look.
+            Foreground = (v != null && v.Unconfirmed && v.Stale) ? Fg : Muted,
+            FontSize = 11.5, FontWeight = FontWeights.SemiBold,
+            TextTrimming = TextTrimming.CharacterEllipsis });
+        stack.Children.Add(new TextBlock {
+            Text = OneLine(v != null ? v.Goal : "", 140),
+            Foreground = Fg, FontSize = 13, Margin = new Thickness(0, 2, 0, 0),
+            TextTrimming = TextTrimming.CharacterEllipsis,
+            ToolTip = v != null ? v.Goal : "" });
+        dp.Children.Add(stack);
+        row.Child = dp;
+        return row;
     }
 
     // Feature B/C toolbar: filter selector + outcome summary + bulk-retry. Rebuilt each
@@ -9884,19 +13413,48 @@ class CockpitWindow : Window
     // no run and no history. Suggestions just pre-fill the bottom composer -- they don't launch.
     UIElement EmptyState()
     {
-        var outer = new Border { Margin = new Thickness(0, 80, 0, 0) };
+        // A SUBMITTED JOB IS NOT "NO TASKS". status.json describes workers, and a job that has
+        // been queued has none until a coordinator starts -- so this said "no fleet tasks"
+        // while the queue held work, and an operator could not tell a submission that landed
+        // from one that went nowhere. The list is the merged "submitted" group, the same one
+        // the rows above this block are drawn from.
+        var queued = ReadQueuedJobs();
+        // Closer to the rows when there are submitted rows above it to read with.
+        var outer = new Border { Margin = new Thickness(0, queued.Count > 0 ? 24 : 80, 0, 0) };
         var block = new StackPanel { MaxWidth = 520, HorizontalAlignment = HorizontalAlignment.Center };
 
-        block.Children.Add(new TextBlock {
-            Text = _lang == 0 ? "タスクはまだありません" : "No fleet tasks",
-            Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
-            HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
-        block.Children.Add(new TextBlock {
-            Text = _lang == 0 ? "複数のタスクを並行で走らせ、ここで進捗を確認します。"
-                              : "Run several tasks in parallel, then monitor progress here.",
-            Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
-            TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
-            Margin = new Thickness(0, 0, 0, 16) });
+        if (queued.Count > 0)
+        {
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0
+                    ? string.Format("投入済み {0} 件 — まだどのワーカーも受け取っていません", queued.Count)
+                    : string.Format("{0} submitted — no worker has picked them up yet", queued.Count),
+                Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0
+                    ? "キューには入っています。コーディネータが起動すると進捗がここに出ます。"
+                    : "They are on the queue. Progress appears here once a coordinator starts.",
+                Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 12) });
+            // The entries themselves are NOT listed again here: they are the rows directly
+            // above this block (AppendSubmittedRows), drawn from this same list, so the count
+            // in the headline and the rows on screen cannot disagree.
+        }
+        else
+        {
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0 ? "タスクはまだありません" : "No fleet tasks",
+                Foreground = Fg, FontSize = 15, FontWeight = FontWeights.SemiBold,
+                HorizontalAlignment = HorizontalAlignment.Center, Margin = new Thickness(0, 0, 0, 6) });
+            block.Children.Add(new TextBlock {
+                Text = _lang == 0 ? "複数のタスクを並行で走らせ、ここで進捗を確認します。"
+                                  : "Run several tasks in parallel, then monitor progress here.",
+                Foreground = Muted, FontSize = 12.5, TextWrapping = TextWrapping.Wrap,
+                TextAlignment = TextAlignment.Center, HorizontalAlignment = HorizontalAlignment.Center,
+                Margin = new Thickness(0, 0, 0, 16) });
+        }
 
         string[] suggestions = _lang == 0
             ? new string[] { "失敗テストを修正", "UIの問題をレビュー", "READMEを更新", "フォルダのタスクを実行" }
@@ -9995,12 +13553,15 @@ class CockpitWindow : Window
         // Gather goal texts from the ON-BOARD workers (History-cleared lanes excluded, set in
         // BuildRows) to determine single vs multi-goal.
         var goalTexts = new List<string>();
+        var goalDisplays = new List<string>();
         var dbSrc = _directiveBandWorkers != null && _directiveBandWorkers.Count > 0 ? _directiveBandWorkers : _toolbarAll;
         foreach (Dictionary<string, object> tw in dbSrc)
         {
-            string g = S(tw, "goal");
-            if (!string.IsNullOrEmpty(g) && !goalTexts.Contains(g))
-                goalTexts.Add(g);
+            string fullGoal = S(tw, "goal");
+            if (string.IsNullOrEmpty(fullGoal) || goalTexts.Contains(fullGoal)) continue;
+            goalTexts.Add(fullGoal);
+            string displayGoal = S(tw, "goal_summary");
+            goalDisplays.Add(!string.IsNullOrEmpty(displayGoal) ? displayGoal : CardTitle("", fullGoal));
         }
 
         // Section label: "DIRECTIVE" / "指示" when a single goal; "Goals (N)" / "ゴール (N)" for multiple.
@@ -10009,14 +13570,15 @@ class CockpitWindow : Window
             ? (ja ? ("ゴール (" + goalTexts.Count + ")") : ("Goals (" + goalTexts.Count + ")"))
             : (ja ? "指示" : "DIRECTIVE");
 
-        // Goal text: first goal + "(+N more lanes)" indicator for multi-goal.
-        string primaryGoal = goalTexts.Count > 0 ? goalTexts[0] : "";
-        string goalDisplay = primaryGoal;
-        if (multiGoal && goalTexts.Count > 1)
-        {
-            int extras = goalTexts.Count - 1;
-            goalDisplay = primaryGoal + (ja ? (" (他 " + extras + " lane)") : (" (+" + extras + " more lanes)"));
-        }
+        // EVERY GOAL, ONE PER LINE. This used to render goalTexts[0] and summarise the rest as
+        // "(他 N lane)" -- so with two goals in flight the band showed one of them and a count,
+        // and WHICH one it showed depended on the order the worker list happened to arrive in.
+        // Every refresh could pick a different first element, so the panel flickered between
+        // goals as lanes progressed, and the operator saw the view "move" on its own.
+        //
+        // The list was already complete here; only the rendering threw it away. Concurrent
+        // lanes are concurrent: they belong side by side, not behind a number.
+        string goalDisplay = string.Join("\n", goalDisplays.ToArray());
 
         // Meta line: "started HH:MM · {elapsed} · {active}/{total} lanes active" [COMPUTED]
         string metaLine = _directiveBandMeta;
@@ -10083,7 +13645,7 @@ class CockpitWindow : Window
     int[] ToolbarCounts(List<Dictionary<string, object>> all)
     {
         int cntAll = 0, cntActive = 0, cntNeeds = 0, cntDone = 0;
-        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0;
+        int doneN = 0, maxN = 0, badN = 0, hiddenTerminal = 0, intN = 0;
         string startedRootTb = _lastRoot != null ? S(_lastRoot, "started") : "";
         if (all != null)
         {
@@ -10106,10 +13668,11 @@ class CockpitWindow : Window
                 else if (oc == "STUCK" || oc == "ERROR" || oc == "CANCELLED"
                          || oc == "EVIDENCE_CONTRADICTED") badN++;
                 if (st == "awaiting") cntNeeds++;
-                if (!IsTerminalWorker(w) && st != "pending") cntActive++;
+                if (IsInterruptedWorker(w)) intN++;   // own counter: resumable, not a failure of the goal
+                if (!IsTerminalWorker(w) && !IsInterruptedWorker(w) && st != "pending") cntActive++;
             }
         }
-        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal };
+        return new int[] { cntAll, cntActive, cntNeeds, cntDone, doneN, maxN, badN, hiddenTerminal, intN };
     }
 
     UIElement BuildCardToolbar(List<Dictionary<string, object>> all,
@@ -10123,7 +13686,7 @@ class CockpitWindow : Window
         // the render and RowSig can never diverge.
         int[] tc = ToolbarCounts(all);
         int cntAll = tc[0], cntActive = tc[1], cntNeeds = tc[2], cntDone = tc[3];
-        int doneN = tc[4], maxN = tc[5], badN = tc[6];
+        int doneN = tc[4], maxN = tc[5], badN = tc[6], cntIntr = tc[8];
 
         var bar = new Border();
         bar.BorderThickness = new Thickness(1); bar.BorderBrush = Border;
@@ -10145,7 +13708,7 @@ class CockpitWindow : Window
         foreach (Dictionary<string, object> rw in shown)
         {
             if (!IsTerminalWorker(rw)) continue;
-            if (!IsRetryableOutcome(S(rw, "outcome"))) continue;
+            if (!IsRetryableWorker(rw)) continue;
             retryTargets++;
         }
         if (retryTargets > 0)
@@ -10161,8 +13724,20 @@ class CockpitWindow : Window
             List<Dictionary<string, object>> shownCap = shown;
             retryAll.Click += delegate
             {
-                RetryAllShown(shownCap);
-                if (_toolbarNote != null) _toolbarNote.Text = RunIsLive() ? "" : T("retry_note");
+                int skipped;
+                int queued = RetryAllShown(shownCap, out skipped);
+                if (_toolbarNote != null)
+                {
+                    string note = RunIsLive() ? "" : T("retry_note");
+                    if (skipped > 0)
+                    {
+                        // Say how many of the shown targets were refused and why. Without this
+                        // the press looks like a no-op and gets repeated.
+                        string cap = skipped + "/" + (queued + skipped) + " " + T("retry_capped");
+                        note = string.IsNullOrEmpty(note) ? cap : cap + " — " + note;
+                    }
+                    _toolbarNote.Text = note;
+                }
             };
             rightCl.Children.Add(retryAll);
         }
@@ -10195,7 +13770,13 @@ class CockpitWindow : Window
         segRow.Children.Add(SegDivider());
         segRow.Children.Add(SegFilterButton(needsLabel, 2, true, cntNeeds, false, false));
         segRow.Children.Add(SegDivider());
-        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, true));
+        bool showIntr = cntIntr > 0 || _cardFilter == 4;
+        segRow.Children.Add(SegFilterButton(doneLabel, 3, false, 0, false, !showIntr));
+        if (showIntr)
+        {
+            segRow.Children.Add(SegDivider());
+            segRow.Children.Add(SegFilterButton(T("flt_intr") + " " + cntIntr, 4, false, 0, false, true));
+        }
 
         seg.Child = segRow;
         left.Children.Add(seg);
@@ -10571,6 +14152,7 @@ class CockpitWindow : Window
     Border HistoryRow(Dictionary<string, object> e)
     {
         string status = S(e, "status");
+        bool internalControl = IsLocalLoopControlGoal(S(e, "goal"));
         string ck = ColorKey(status);
         string conv = S(e, "conv_url");
         // Default COLLAPSED, exactly like a live card: a terminal worker that scrolls down into
@@ -10596,7 +14178,9 @@ class CockpitWindow : Window
             dp.Children.Add(chev);
         }
         string hcanon = status == "ready" ? "waiting" : status;
-        var pill = Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
+        var pill = internalControl
+            ? Pill(_lang == 0 ? "内部制御" : "Internal control", "neutral")
+            : Pill(Theme.StatusLabel(hcanon, _lang), Theme.StatusKind(hcanon));
         pill.Margin = new Thickness(0, 0, 5, 0);
         DockPanel.SetDock(pill, Dock.Left);
         dp.Children.Add(pill);
@@ -10611,7 +14195,9 @@ class CockpitWindow : Window
         // ellipsis-trimmed -- so History matches the live collapsed card instead of dumping the
         // full goal text. The long goal only appears when this row is explicitly expanded.
         var head = new TextBlock();
-        head.Text = CardTitle(S(e, "conv_title"), S(e, "goal"));
+        string histSummary = S(e, "goal_summary");
+        head.Text = !string.IsNullOrEmpty(histSummary)
+            ? histSummary : CardTitle(S(e, "conv_title"), S(e, "goal"));
         head.Foreground = Fg; head.FontSize = 13;
         head.VerticalAlignment = VerticalAlignment.Center;
         head.TextTrimming = TextTrimming.CharacterEllipsis;
@@ -10630,6 +14216,10 @@ class CockpitWindow : Window
             g.Margin = new Thickness(0, 6, 0, 2);
             SwallowMouseUp(g);
             col.Children.Add(g);
+            if (!string.IsNullOrEmpty(S(e, "submitter")))
+                col.Children.Add(new TextBlock { Text = (_lang == 0 ? "提出者: " : "Submitted by: ") + S(e, "submitter"),
+                                                 Foreground = Muted, FontSize = 11.5, Margin = new Thickness(0, 2, 0, 0) });
+            if (!string.IsNullOrEmpty(S(e, "transcript"))) col.Children.Add(ReviewerLedgerPanel(S(e, "transcript")));
 
             // "続ける" (Continue): send a FOLLOW-UP instruction to this finished task, carrying its
             // prior context. Launches a FRESH fleet run whose goal PREPENDS the prior goal + a note
@@ -10653,7 +14243,7 @@ class CockpitWindow : Window
             {
                 string fu = PromptFollowup();
                 if (string.IsNullOrEmpty(fu)) return;
-                string goalText = BuildContinueGoal(contPrior, fu);
+                string goalText = ContinueText(contPrior, fu, contConv);
                 // The continuation goal is MULTI-LINE; SpawnFleet's GoalsToJsonl now escapes a
                 // plain multi-line goal string safely on its own, so no manual serialization is
                 // needed for the common case. Only pre-serialize here when there's an EXTRA key
@@ -10679,7 +14269,7 @@ class CockpitWindow : Window
                         : "Started a continuation of the prior task (it re-reads the saved outputs, then runs the follow-up).";
                 }
             };
-            col.Children.Add(contBtn);
+            if (!internalControl) col.Children.Add(contBtn);
         }
 
         row.Child = col;
@@ -10702,6 +14292,74 @@ class CockpitWindow : Window
     static bool IsAttentionStatus(string status)
     {
         return status == "stuck" || status == "maxturns" || status == "error";
+    }
+
+    static bool IsAgentSetupRuntimeWait(string reason)
+    {
+        if (string.IsNullOrWhiteSpace(reason)) return false;
+        return reason.IndexOf("Agent Instructions are missing or stale", StringComparison.OrdinalIgnoreCase) >= 0
+            && reason.IndexOf("browser answered RUN without a SQLite commit", StringComparison.OrdinalIgnoreCase) >= 0;
+    }
+
+    static bool IsLocalLoopControlGoal(string goal)
+    {
+        string norm = (goal ?? "").Replace("\r", " ").Replace("\n", " ").Replace("\t", " ").Trim().ToLowerInvariant();
+        while (norm.Contains("  ")) norm = norm.Replace("  ", " ");
+        return norm.StartsWith("local_loop run ")
+            || norm.StartsWith("local_loop bootstrap ")
+            || norm.StartsWith("local_loop protocol ")
+            || norm.StartsWith("execute local_loop job ")
+            || norm.StartsWith("run local_loop job ");
+    }
+
+    static bool IsOperatorAttention(Dictionary<string, object> w)
+    {
+        return w != null
+            && !IsLocalLoopControlGoal(S(w, "goal"))
+            && !IsInfraStuck(w)
+            && IsAttentionStatus(S(w, "status"));
+    }
+
+    static bool IsRetryableWorker(Dictionary<string, object> w)
+    {
+        if (w == null) return false;
+        // The worker's own verdict beats the outcome-wide rule: `retryable: false` is written when
+        // re-running could duplicate work (e.g. an ambiguous fresh submit, outcome STUCK).
+        object rv;
+        if (w.TryGetValue("retryable", out rv) && rv is bool && !(bool)rv) return false;
+        return !IsLocalLoopControlGoal(S(w, "goal"))
+            && IsRetryableOutcome(S(w, "outcome"));
+    }
+
+    // One key per worker instance (jid when the runner minted one, else name + run_id), so a
+    // terminal STUCK worker is re-queued at most once per cockpit session.
+    static string RetryWorkerKey(Dictionary<string, object> w)
+    {
+        string jid = S(w, "jid");
+        if (!string.IsNullOrEmpty(jid)) return "jid:" + jid;
+        return "w:" + S(w, "name") + "|" + S(w, "run_id");
+    }
+
+    // True when this terminal worker has already been re-queued (by us, or by the runner), or an
+    // identical goal is queued/running now -- i.e. another copy exists and must not be added.
+    bool RetryAlreadyCovered(Dictionary<string, object> root, Dictionary<string, object> w)
+    {
+        if (_autoRetriedWorkers.Contains(RetryWorkerKey(w))) return true;
+        object rq;
+        if (w.TryGetValue("retry_queued", out rq) && rq is bool && (bool)rq) return true;
+        string goal = S(w, "goal");
+        object wo;
+        if (root != null && root.TryGetValue("workers", out wo) && wo is object[])
+        {
+            foreach (object o in (object[])wo)
+            {
+                var x = o as Dictionary<string, object>;
+                if (x == null || object.ReferenceEquals(x, w)) continue;
+                if (IsTerminalWorker(x)) continue;
+                if (S(x, "goal") == goal) return true;
+            }
+        }
+        return false;
     }
 
     // P0: an INFRA_STUCK worker is NOT a task failure — the engine parked it because the infra
@@ -10761,10 +14419,120 @@ class CockpitWindow : Window
         catch (Exception) { ShowScaleToast(T("copy_result_fail")); }
     }
 
+    // ── Split group (分割グループ) line on a fan-out parent card ─────────────────────────────
+    // `groups` in status.json is written by relay/family_view.py (contract in its docstring).
+    // OWNER RULES: never the long goal text -- only the capped `ledger` strings it carries;
+    // plain Japanese wording; one small line, no popup, no toast. Read-only.
+    Dictionary<string, object> GroupOfParent(Dictionary<string, object> w)
+    {
+        if (w == null || _lastRoot == null) return null;
+        object go;
+        if (!_lastRoot.TryGetValue("groups", out go) || !(go is object[])) return null;
+        string nm = S(w, "name");
+        if (nm.Length == 0) return null;
+        foreach (object o in (object[])go)
+        {
+            var g = o as Dictionary<string, object>;
+            var par = g != null ? Obj(g, "parent") : null;
+            if (par != null && S(par, "name") == nm) return g;
+        }
+        return null;
+    }
+
+    static string GroupCount(Dictionary<string, object> ch, string key, string label)
+    {
+        int n = I(ch, key);
+        return n > 0 ? label + " " + n : "";
+    }
+
+    // One line: 分割グループ 子N件: 待機 a · 実行中 b · ... / 統合: <label> [/ 下位グループ n件]
+    // The words live in GroupTreeView (EffortPolicy.cs, tested by a compiled harness).
+    string GroupLineText(Dictionary<string, object> w)
+    {
+        return GroupTreeView.Line(GroupOfParent(w), _lang == 0);
+    }
+
+    // The second line of a root group: tree usage + the depth-cap note. "" when not reported.
+    string GroupExtraText(Dictionary<string, object> w, out int level)
+    {
+        level = 0;
+        var g = GroupOfParent(w);
+        if (g == null || _lastRoot == null) return "";
+        return GroupTreeView.ExtraText(_lastRoot, g, _lang == 0, out level) ?? "";
+    }
+
+    string GroupExtraSig(Dictionary<string, object> w)
+    {
+        int lv;
+        string x = GroupExtraText(w, out lv);
+        return x.Length == 0 ? "" : "|x" + lv + x;
+    }
+
+    // Cards whose usage line the person collapsed (click the group line). Not persisted.
+    readonly HashSet<string> _groupExtraHidden = new HashSet<string>();
+
+    UIElement BuildGroupLine(Dictionary<string, object> w)
+    {
+        string text = GroupLineText(w);
+        if (text.Length == 0) return null;
+        var g = GroupOfParent(w);
+        var row = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 3, 0, 0) };
+        int xLevel;
+        string extra = GroupExtraText(w, out xLevel);
+        TextBlock extraTb = null;
+        string cardName = S(w, "name");
+        row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2)
+        {
+            e2.Handled = true;
+            if (extraTb == null) return;
+            bool hide = extraTb.Visibility == Visibility.Visible;
+            extraTb.Visibility = hide ? Visibility.Collapsed : Visibility.Visible;
+            if (hide) _groupExtraHidden.Add(cardName); else _groupExtraHidden.Remove(cardName);
+        };
+        row.Children.Add(new TextBlock {
+            Text = text, Foreground = Muted, FontSize = 12,
+            VerticalAlignment = VerticalAlignment.Center, TextTrimming = TextTrimming.CharacterEllipsis,
+            TextWrapping = TextWrapping.NoWrap, MaxWidth = 560 });
+        // Constraint tokens (dates, quoted names, amounts) from the capped ledger: small chips.
+        var led = Obj(g, "ledger");
+        int shown = 0;
+        var tip = new List<string>();
+        if (led != null)
+        {
+            if (S(led, "task").Length > 0) tip.Add(S(led, "task"));
+            object co, to;
+            if (led.TryGetValue("constraints", out co) && co is object[])
+                foreach (object c in (object[])co) tip.Add("- " + (c != null ? c.ToString() : ""));
+            if (led.TryGetValue("tokens", out to) && to is object[])
+                foreach (object t in (object[])to)
+                {
+                    string ts = t != null ? t.ToString() : "";
+                    if (ts.Length == 0 || shown >= 4) continue;
+                    var chip = Pill(ts, "neutral");
+                    chip.Margin = new Thickness(8, 0, 0, 0);
+                    row.Children.Add(chip);
+                    shown++;
+                }
+        }
+        if (tip.Count > 0) row.ToolTip = string.Join("\n", tip.ToArray());
+        if (extra.Length == 0) return row;
+        extraTb = new TextBlock {
+            Text = extra, FontSize = 12, Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 1, 0, 0),
+            Foreground = xLevel >= 2 ? Theme.Br(Theme.Danger(_dark))
+                         : xLevel == 1 ? Theme.Br(Theme.Warning(_dark)) : Muted,
+            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap, MaxWidth = 560,
+            Visibility = _groupExtraHidden.Contains(cardName) ? Visibility.Collapsed : Visibility.Visible };
+        var both = new StackPanel { Orientation = Orientation.Vertical };
+        both.Children.Add(row);
+        both.Children.Add(extraTb);
+        return both;
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
         string goal = S(w, "goal");
+        string goalSummary = S(w, "goal_summary");
         string rawStatus = S(w, "status");
         string status = rawStatus == "ready" ? "waiting" : rawStatus;   // canonical (runner emits fine states)
         string reason = S(w, "reason");
@@ -10778,13 +14546,23 @@ class CockpitWindow : Window
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
         bool isOpen = _expanded.Contains(name);
+        bool internalControl = IsLocalLoopControlGoal(goal);
         // P0: INFRA_STUCK is an infra pause (Edge/sign-in/connector broke), NOT a task failure. It
         // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
         // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
-        bool isInfra = !closed && IsInfraStuck(w);
+        bool isInfra = !closed && !internalControl && IsInfraStuck(w);
+        bool isLocalRuntimeWait = !closed
+            && status == "waiting_runtime"
+            && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
+            && string.Equals(S(w, "runtime_resume_allowed"), "True", StringComparison.OrdinalIgnoreCase);
+        bool isAgentSetupWait = isLocalRuntimeWait && IsAgentSetupRuntimeWait(reason);
+        bool isLocalLoop = string.Equals(
+            S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+        bool localSteerBlocked = isLocalLoop && (status == "waiting_user"
+            || status == "waiting_external" || status == "needs_routing");
         // Attention lane: stuck/maxturns/error and NOT yet expanded -- gets recovery surface treatment.
         // INFRA_STUCK is carved out of the red attention lane (handled by its own infra branch).
-        bool isAttention = !closed && !isInfra && IsAttentionStatus(status);
+        bool isAttention = !closed && IsOperatorAttention(w);
 
         // The chip carries the status. There used to be a 3px coloured rail down the left edge of
         // every row as well, and removing it cost nothing measurable: the chip sits at a nearly
@@ -10792,7 +14570,18 @@ class CockpitWindow : Window
         // chip, not the rail thirty pixels to its left. The rail restated what the chip already
         // said, in the one shape the operator has objected to for months.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
-        string chipKind = isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status));
+        string chipKind = internalControl ? "neutral"
+            : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
+        // Fan-out PARENT: its real status is done/FANOUT on purpose, which reads as "finished"
+        // while its children still run. The coordinator-side derived display_label (waiting etc.)
+        // replaces the chip text only; status/outcome are untouched.
+        string parentLabel = internalControl ? "" : S(w, "display_label");
+        if (parentLabel.Length > 0)
+        {
+            string pds = S(w, "display_state");
+            chipKind = pds == "merge_failed" ? "danger"
+                     : (pds == "interrupted" ? "warning" : (pds == "done" ? "success" : "info"));
+        }
 
         // Pass A2-1 TASK 1: demote the collapsed row to a LEDGER ROW.
         // - No rounded corners, no card background fill, no full border.
@@ -10837,7 +14626,21 @@ class CockpitWindow : Window
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; FlashOpen(card); OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
-        if (closed || terminal)
+        if (isLocalRuntimeWait)
+        {
+            var runtimeResume = AttentionBtn(_lang == 0 ? "再開" : "Resume");
+            runtimeResume.ToolTip = _lang == 0
+                ? "実行環境を修復した後、同じ永続タスクを再開します"
+                : "Resume the same durable task after repairing the runtime";
+            Dictionary<string, object> runtimeWaitWorker = w;
+            runtimeResume.Click += delegate (object s2, RoutedEventArgs e2)
+            {
+                e2.Handled = true;
+                ResumeLocalLoopRuntime(runtimeWaitWorker);
+            };
+            right.Children.Add(runtimeResume);
+        }
+        else if (closed || terminal)
         {
             // Completed/released Fleet card menu: keep the kebab available after its agent tab is
             // released. The result and artifacts remain useful, and the same goal can be run again.
@@ -10861,8 +14664,11 @@ class CockpitWindow : Window
                 });
             }
 
-            menuLabels.Add(T("rerun_same"));
-            menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+            if (!IsLocalLoopControlGoal(goal))
+            {
+                menuLabels.Add(T("rerun_same"));
+                menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
+            }
 
             menuLabels.Add(null);
             menuActions.Add(null);
@@ -10896,14 +14702,22 @@ class CockpitWindow : Window
         var left = new DockPanel { LastChildFill = true };
         var chev = ChevronToggle(name, isOpen); DockPanel.SetDock(chev, Dock.Left); left.Children.Add(chev);
         // INFRA_STUCK -> distinct ORANGE インフラ待ち pill; otherwise the normal status label.
-        var chip = Pill(isInfra ? T("infra_wait") : Theme.StatusLabel(status, _lang), chipKind);
+        var chip = Pill(internalControl
+            ? (_lang == 0 ? "内部制御" : "Internal control")
+            : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
+                : (isInfra ? T("infra_wait") : (parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
+        if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
         if (agentBadge != null) { DockPanel.SetDock(agentBadge, Dock.Left); left.Children.Add(agentBadge); }
-        string headline = CardTitle(convTitle, goal);
+        // EFFORT BADGE: only when the runner sent effort_level (policy not off); absent = none.
+        var effBadge = BuildEffortBadge(w);
+        if (effBadge != null) { DockPanel.SetDock(effBadge, Dock.Left); left.Children.Add(effBadge); }
+        string headline = !string.IsNullOrEmpty(goalSummary)
+            ? goalSummary : CardTitle(convTitle, goal);
         var ht = new TextBlock {
             Text = headline, Foreground = Fg, FontSize = 13.5, FontWeight = FontWeights.SemiBold,
             VerticalAlignment = VerticalAlignment.Center,
@@ -10912,11 +14726,29 @@ class CockpitWindow : Window
         left.Children.Add(ht);
         Grid.SetColumn(left, 0); top.Children.Add(left);
         col.Children.Add(top);
+        UIElement groupLine = BuildGroupLine(w);
+        if (groupLine != null) col.Children.Add(groupLine);
 
         if (!isOpen)
         {
             // ── COLLAPSED ROW body (ledger row, not expanded drawer) ──────────────────────────
-            if (isInfra)
+            if (isLocalRuntimeWait)
+            {
+                if (!string.IsNullOrEmpty(reason))
+                {
+                    var runtimeReason = new TextBlock
+                    {
+                        Text = (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち: " : "Agent setup required: ")
+                            : (_lang == 0 ? "実行環境待ち: " : "Runtime paused: ")) + OneLine(reason),
+                        Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(runtimeReason);
+                }
+            }
+            else if (isInfra)
             {
                 // P0 INFRA_STUCK collapsed row: the reason text is actionable (e.g. "sign-in
                 // required" / "default-Copilot fallback"), so render it verbatim, then offer a
@@ -11054,6 +14886,37 @@ class CockpitWindow : Window
             {
                 // ── Normal collapsed ledger row: line 2 + line 3 ────────────────────────────
                 // Line 2: latest human-readable progress. Precedence: display_result > last > fallback.
+                var execution = Obj(w, "execution");
+                if (execution != null)
+                {
+                    string currentStep = S(execution, "current_step");
+                    int currentIndex = I(execution, "current_step_index");
+                    int totalSteps = I(execution, "total_steps");
+                    // Open-ended LOCAL_LOOP has no turn_plan, so current_step is initially the
+                    // authoritative goal itself. The headline already shows its compact task
+                    // identity; repeating the full (often English, multi-kilobyte) goal here makes
+                    // the collapsed card look like progress when it is only the original request.
+                    bool currentStepRepeatsGoal = string.Equals(
+                        (currentStep ?? "").Trim(), (goal ?? "").Trim(), StringComparison.Ordinal);
+                    if (!string.IsNullOrEmpty(currentStep) && !currentStepRepeatsGoal)
+                    {
+                        string stepPrefix = totalSteps > 0
+                            ? (currentIndex + "/" + totalSteps + "  ")
+                            : (currentIndex + "  ");
+                        var stepLine = new StackPanel { Orientation = Orientation.Horizontal,
+                            Margin = new Thickness(24, 4, 0, 0) };
+                        stepLine.Children.Add(MakeIcon("play_arrow", 13, Fg));
+                        stepLine.Children.Add(new TextBlock
+                        {
+                            Text = stepPrefix + OneLine(currentStep),
+                            Foreground = Fg, FontSize = 12.5, FontWeight = FontWeights.SemiBold,
+                            TextTrimming = TextTrimming.CharacterEllipsis, TextWrapping = TextWrapping.NoWrap,
+                            Margin = new Thickness(4, 0, 0, 0)
+                        });
+                        col.Children.Add(stepLine);
+                    }
+                }
+
                 string collapsedDisplayResult = S(w, "display_result");
                 string resultText;
                 if (!string.IsNullOrEmpty(collapsedDisplayResult))
@@ -11103,7 +14966,7 @@ class CockpitWindow : Window
                     col.Children.Add(rl);
                 }
 
-                // Line 3: meta — worker name · turn N · alive {freshness} ago · ✓verified [COMPUTED].
+                // Line 3: meta — worker name · turn N · alive {freshness} ago · verified [COMPUTED].
                 var meta = new StringBuilder();
                 string transcriptPath = S(w, "transcript");
                 double startTs = ReadTranscriptStartTs(transcriptPath);
@@ -11117,6 +14980,23 @@ class CockpitWindow : Window
                 if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
                 if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
                 if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
+                if (execution != null)
+                {
+                    int completed = I(execution, "completed_count");
+                    int totalSteps = I(execution, "total_steps");
+                    int artifactCount = ArrCount(execution, "artifacts");
+                    meta.Append(" · ").Append(_lang == 0 ? "完了 " : "done ").Append(completed);
+                    if (totalSteps > 0) meta.Append('/').Append(totalSteps);
+                    if (artifactCount > 0)
+                        meta.Append(" · ").Append(artifactCount).Append(_lang == 0 ? " 成果物" : " artifacts");
+                    double progressTs = Dbl(execution, "last_progress_at");
+                    if (progressTs > 0)
+                    {
+                        double progressAge = Math.Max(0, NowUnix() - progressTs);
+                        meta.Append(" · ").Append(_lang == 0 ? "進捗 " : "progress ")
+                            .Append(Fmt(progressAge)).Append(_lang == 0 ? " 前" : " ago");
+                    }
+                }
                 var ml = new TextBlock
                 {
                     Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
@@ -11177,7 +15057,7 @@ class CockpitWindow : Window
             // Feature 1: always-visible steer affordance -- reachable WITHOUT expanding the card.
             // Same terminal gate the expanded drawer's SteerRow/RetryRow/ContinueRow switch uses
             // (below): a terminal card (done/stuck/maxturns/error/cancelled) gets nothing here.
-            if (!terminal) col.Children.Add(CollapsedSteerRow(name));
+            if (!terminal && !localSteerBlocked) col.Children.Add(CollapsedSteerRow(name));
         }
         else
         {
@@ -11187,8 +15067,8 @@ class CockpitWindow : Window
             // dump onto the surface at once. Heavy content is built ONLY when expanded.
             col.Children.Add(BuildCardTabs(w, name, goal, last, reason, terminal));
             // Actions live BELOW the tabs (not inside one) so steer/retry are always reachable.
-            if (!terminal) col.Children.Add(SteerRow(name));
-            else if (S(w, "outcome") != "DONE") col.Children.Add(RetryRow(w));
+            if (!terminal && !localSteerBlocked) col.Children.Add(SteerRow(name));
+            else if (IsRetryableWorker(w)) col.Children.Add(RetryRow(w));
             else col.Children.Add(ContinueRow(name, goal, S(w, "conv_url")));
         }
 
@@ -11229,8 +15109,8 @@ class CockpitWindow : Window
 
         var panels = new UIElement[] {
             TabOverview(goal, last, outcome, terminal, reviews, verifiedOk, tpath, w),
-            TabConversation(tpath),
-            TabReview(reason, done, terminal, reviews),
+            TabConversation(tpath, S(w, "name"), S(w, "conv_url")),
+            TabReview(reason, done, terminal, reviews, tpath),
             TabLogs(w, reason)
         };
         string[] labels = _lang == 0 ? new string[] { "概要", "会話", "レビュー", "ログ" }
@@ -11477,10 +15357,102 @@ class CockpitWindow : Window
         return t;
     }
 
+    UIElement ExecutionOverview(Dictionary<string, object> w)
+    {
+        var execution = Obj(w, "execution");
+        if (execution == null) return null;
+
+        var sp = new StackPanel();
+        string state = S(execution, "state");
+        string current = S(execution, "current_step");
+        int currentIndex = I(execution, "current_step_index");
+        int total = I(execution, "total_steps");
+        int completed = I(execution, "completed_count");
+        string lastProgress = S(execution, "last_progress");
+        string next = S(execution, "next_step");
+        string waiting = S(execution, "waiting_reason");
+
+        string head = (total > 0 ? (currentIndex + "/" + total) : currentIndex.ToString());
+        if (!string.IsNullOrEmpty(state)) head += " · " + state;
+        if (!string.IsNullOrEmpty(current)) head += " · " + current;
+        var headLine = new StackPanel { Orientation = Orientation.Horizontal };
+        headLine.Children.Add(MakeIcon("play_arrow", 13, Fg));
+        headLine.Children.Add(new TextBlock { Text = head, Foreground = Fg, FontSize = 12.5,
+            FontWeight = FontWeights.SemiBold, TextWrapping = TextWrapping.Wrap,
+            Margin = new Thickness(4, 0, 0, 0) });
+        sp.Children.Add(headLine);
+
+        if (!string.IsNullOrEmpty(lastProgress))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "進捗: " : "Progress: ") + lastProgress,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 3, 0, 0), TextWrapping = TextWrapping.Wrap });
+        if (!string.IsNullOrEmpty(waiting))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "待機理由: " : "Waiting: ") + waiting,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 3, 0, 0), TextWrapping = TextWrapping.Wrap });
+
+        object doneRaw;
+        if (execution.TryGetValue("completed_steps", out doneRaw) && doneRaw is object[])
+        {
+            var done = (object[])doneRaw;
+            if (done.Length > 0)
+            {
+                sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "完了 " : "Completed ") + completed,
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5, Margin = new Thickness(0, 5, 0, 1) });
+                foreach (object obj in done)
+                {
+                    var step = obj as Dictionary<string, object>;
+                    if (step == null) continue;
+                    string instruction = S(step, "instruction");
+                    string summary = S(step, "summary");
+                    string line = instruction;
+                    if (!string.IsNullOrEmpty(summary) && summary != instruction) line += " — " + summary;
+                    var doneLine = new StackPanel { Orientation = Orientation.Horizontal,
+                        Margin = new Thickness(8, 1, 0, 1) };
+                    doneLine.Children.Add(MakeIcon("check", 12, Muted));
+                    doneLine.Children.Add(new TextBlock { Text = line, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(4, 0, 0, 0), TextWrapping = TextWrapping.Wrap });
+                    sp.Children.Add(doneLine);
+                }
+            }
+        }
+
+        if (!string.IsNullOrEmpty(next))
+            sp.Children.Add(new TextBlock { Text = (_lang == 0 ? "次: " : "Next: ") + next,
+                Foreground = Muted, FontSize = 12.5, Margin = new Thickness(0, 5, 0, 0), TextWrapping = TextWrapping.Wrap });
+
+        object artsRaw;
+        if (execution.TryGetValue("artifacts", out artsRaw) && artsRaw is object[])
+        {
+            var arts = (object[])artsRaw;
+            if (arts.Length > 0)
+            {
+                sp.Children.Add(new TextBlock { Text = _lang == 0 ? "成果物" : "Artifacts",
+                    Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 11.5, Margin = new Thickness(0, 5, 0, 1) });
+                foreach (object obj in arts)
+                {
+                    var artifact = obj as Dictionary<string, object>;
+                    if (artifact == null) continue;
+                    string label = S(artifact, "path");
+                    if (string.IsNullOrEmpty(label)) label = S(artifact, "name");
+                    if (string.IsNullOrEmpty(label)) label = S(artifact, "uri");
+                    if (string.IsNullOrEmpty(label)) label = _lang == 0 ? "成果物" : "artifact";
+                    sp.Children.Add(new TextBlock { Text = "• " + label, Foreground = Muted, FontSize = 12,
+                        Margin = new Thickness(8, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
+                }
+            }
+        }
+        return sp;
+    }
+
     UIElement TabOverview(string goal, string last, string outcome, bool terminal, int reviews,
                           bool verifiedOk, string tpath, Dictionary<string, object> w)
     {
         var sp = new StackPanel();
+        UIElement execView = ExecutionOverview(w);
+        if (execView != null)
+        {
+            sp.Children.Add(SectLabel(_lang == 0 ? "実行" : "Execution"));
+            sp.Children.Add(execView);
+        }
         sp.Children.Add(SectLabel(_lang == 0 ? "結果" : "Result"));
         // Precedence: display_result (cleaned final answer from runner) > last > OutcomeLabel fallback.
         string displayResult = (w != null) ? S(w, "display_result") : "";
@@ -11519,9 +15491,9 @@ class CockpitWindow : Window
         // Prefer phase_events (same source as Evidence Spine) when available; fall back to transcript.
         sp.Children.Add(SectLabel(_lang == 0 ? "タイムライン" : "Timeline"));
         var tsEvents = BuildTimelineEvents(tpath, outcome, terminal, reviews, w);
-        foreach (string ev in tsEvents)
+        foreach (var ev in tsEvents)
             sp.Children.Add(new TextBlock {
-                Text = "・" + ev, Foreground = Muted, FontSize = 12,
+                Text = "・" + ev.Item1, Foreground = Theme.Br(ev.Item2), FontSize = 12,
                 Margin = new Thickness(0, 1, 0, 1), TextWrapping = TextWrapping.Wrap });
 
         sp.Children.Add(SectLabel(_lang == 0 ? "指示" : "Goal"));
@@ -11532,7 +15504,7 @@ class CockpitWindow : Window
     // Build the ordered event list for the Timeline section.
     // Prefers phase_events from the worker dict (same source as Evidence Spine) when present.
     // Falls back to transcript-derived timestamps when phase_events is absent.
-    List<string> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
+    List<Tuple<string, string>> BuildTimelineEvents(string tpath, string outcome, bool terminal, int reviews,
                                      Dictionary<string, object> w)
     {
         bool ja = _lang == 0;
@@ -11556,7 +15528,7 @@ class CockpitWindow : Window
                 object[] peArr = (object[])peRaw;
                 if (peArr.Length > 0)
                 {
-                    var evs2 = new List<string>();
+                    var evs2 = new List<Tuple<string, string>>();
                     foreach (object peObj in peArr)
                     {
                         var pe = peObj as Dictionary<string, object>;
@@ -11569,8 +15541,8 @@ class CockpitWindow : Window
                         object peEvRaw;
                         if (pe.TryGetValue("event", out peEvRaw) && peEvRaw != null)
                             peEvent = peEvRaw.ToString();
-                        // Use same label vocab as the Spine (Theme.StatusLabel)
-                        string localLabel = Theme.StatusLabel(peEvent, _lang);
+                        // Use the same event-history vocabulary as the Spine (Theme.TimelineLabel)
+                        string localLabel = Theme.TimelineLabel(peEvent, _lang);
                         if (string.IsNullOrEmpty(localLabel) || localLabel == peEvent)
                         {
                             object peLblRaw;
@@ -11580,7 +15552,7 @@ class CockpitWindow : Window
                         }
                         if (string.IsNullOrEmpty(localLabel)) localLabel = peEvent;
                         string timePrefix = peTs > 0 ? fmtTs(peTs) : "";
-                        evs2.Add(timePrefix + localLabel);
+                        evs2.Add(new Tuple<string, string>(timePrefix + localLabel, Theme.TimelineColor(peEvent, _dark)));
                     }
                     if (evs2.Count > 0) return evs2;
                 }
@@ -11621,27 +15593,31 @@ class CockpitWindow : Window
         }
         catch { }
 
-        var evs = new List<string>();
+        var evs = new List<Tuple<string, string>>();
         string queuedTs = hasTs ? fmtTs(metaTs) : "";
-        evs.Add(queuedTs + (ja ? "投入" : "Queued"));
+        evs.Add(new Tuple<string, string>(queuedTs + (ja ? "投入" : "Queued"), Theme.TimelineColor("pending", _dark)));
         string startTs = (firstTurnTs > 0) ? fmtTs(firstTurnTs) : "";
-        evs.Add(startTs + (ja ? "開始" : "Started"));
+        evs.Add(new Tuple<string, string>(startTs + (ja ? "開始" : "Started"), Theme.TimelineColor("ready", _dark)));
         if (reviews > 0)
-            evs.Add(ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"));
-        if (terminal)
+            evs.Add(new Tuple<string, string>(
+                ja ? ("レビュー (" + reviews + "x)") : ("Reviewed (" + reviews + "x)"),
+                Theme.TimelineColor("refuting", _dark)));
+        if (terminal || outcome == "INTERRUPTED")
         {
             string outcomeEv;
+            string outcomeKey;
             switch (outcome)
             {
-                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; break;
-                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; break;
-                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; break;
-                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; break;
-                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; break;
-                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; break;
-                default:          outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; break;
+                case "DONE":      outcomeEv = ja ? "完了" : "Completed"; outcomeKey = "done"; break;
+                case "MAXTURNS":  outcomeEv = ja ? "ターン上限" : "Max turns reached"; outcomeKey = "maxturns"; break;
+                case "STUCK":     outcomeEv = ja ? "停滞" : "Stuck"; outcomeKey = "stuck"; break;
+                case "ERROR":     outcomeEv = ja ? "エラー" : "Error"; outcomeKey = "error"; break;
+                case "CANCELLED": outcomeEv = ja ? "停止" : "Cancelled"; outcomeKey = "cancelled"; break;
+                case "INTERRUPTED": outcomeEv = ja ? "中断" : "Interrupted"; outcomeKey = "interrupted"; break;
+                case "EVIDENCE_CONTRADICTED": outcomeEv = ja ? "記録と矛盾" : "Contradicted"; outcomeKey = "stuck"; break;
+                default:           outcomeEv = string.IsNullOrEmpty(outcome) ? (ja ? "終了" : "Ended") : outcome; outcomeKey = "cancelled"; break;
             }
-            evs.Add(outcomeEv);
+            evs.Add(new Tuple<string, string>(outcomeEv, Theme.TimelineColor(outcomeKey, _dark)));
         }
         return evs;
     }
@@ -11675,18 +15651,18 @@ class CockpitWindow : Window
         return 0;
     }
 
-    UIElement TabConversation(string tpath)
+    UIElement TabConversation(string tpath, string workerName, string convUrl)
     {
         if (!string.IsNullOrEmpty(tpath))
         {
-            var mini = MiniThread(tpath);
+            var mini = MiniThread(tpath, workerName, convUrl);
             if (mini != null) return mini;
         }
         return new TextBlock { Text = _lang == 0 ? "（会話の履歴はまだありません）" : "(No conversation yet)",
                                Foreground = Muted, FontSize = 12.5 };
     }
 
-    UIElement TabReview(string reason, bool done, bool terminal, int reviews)
+    UIElement TabReview(string reason, bool done, bool terminal, int reviews, string transcriptPath = null)
     {
         var sp = new StackPanel();
         if (done)
@@ -11712,7 +15688,156 @@ class CockpitWindow : Window
                 Text = _lang == 0 ? "（レビュー記録はまだありません）" : "(No review notes yet)",
                 Foreground = Muted, FontSize = 12.5 });
         }
+        // The reviewer's own conversation, read from the sqlite ledger (full text, every reply).
+        if (!string.IsNullOrEmpty(transcriptPath)) sp.Children.Add(ReviewerLedgerPanel(transcriptPath));
         return sp;
+    }
+
+    // ── REVIEWER RECORD (from the sqlite ledger) ───────────────────────────────────────────────
+    // The full text the reviewer was sent and every reply, with lens, time and verdict, read from
+    // sessions.sqlite3 (fleet_turns, key <worker key>__refuter_<lens>) through scripts\ledger_dump.py
+    // -- the UI cannot open sqlite itself. Loaded on demand (the button), windowless, bounded by a
+    // timeout; a run from before the reviewer was recorded says so instead of showing nothing.
+    UIElement ReviewerLedgerPanel(string transcriptPath)
+    {
+        bool ja = _lang == 0;
+        var host = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
+        string wkey = "";
+        try { wkey = Path.GetFileNameWithoutExtension(transcriptPath ?? ""); } catch (Exception) { }
+        if (string.IsNullOrEmpty(wkey)) return host;
+        host.Children.Add(SectLabel(ja ? "反証者の記録(台帳 sqlite)" : "Reviewer record (sqlite ledger)"));
+        var body = new StackPanel();
+        var btn = new Button();
+        btn.Content = ja ? "反証の入力全文と全返答を表示" : "Show reviewer prompts and replies";
+        btn.Cursor = Cursors.Hand; btn.FontSize = 12; btn.Padding = new Thickness(12, 3, 12, 3);
+        btn.HorizontalAlignment = HorizontalAlignment.Left; btn.BorderThickness = new Thickness(1);
+        btn.Background = BtnBg; btn.BorderBrush = Border; btn.Foreground = Fg;
+        btn.Template = FlatButtonTemplate();
+        string stateDir = "";
+        try { stateDir = Path.GetDirectoryName(Path.GetFullPath(_statusPath)); } catch (Exception) { }
+        string repo = RepoRoot();
+        btn.Click += delegate (object s, RoutedEventArgs ev)
+        {
+            ev.Handled = true;
+            btn.IsEnabled = false;
+            body.Children.Clear();
+            body.Children.Add(new TextBlock { Text = ja ? "台帳を読み込み中…" : "Reading the ledger...",
+                                              Foreground = Muted, FontSize = 12 });
+            var t = new Thread(new ThreadStart(delegate
+            {
+                string json = RunLedgerDump(repo, wkey, stateDir);
+                try
+                {
+                    Dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        btn.IsEnabled = true;
+                        body.Children.Clear();
+                        RenderReviewerLedger(body, json);
+                    }));
+                }
+                catch (Exception) { }
+            })) { IsBackground = true };
+            t.Start();
+        };
+        host.Children.Add(btn);
+        host.Children.Add(body);
+        return host;
+    }
+
+    // Runs scripts\ledger_dump.py windowless and returns its single JSON line ("" on any failure).
+    string RunLedgerDump(string repo, string key, string stateDir)
+    {
+        try
+        {
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "\"" + Path.Combine(repo, "scripts", "ledger_dump.py") + "\" --key \"" + key + "\""
+                + (string.IsNullOrEmpty(stateDir) ? "" : " --store-dir \"" + Path.Combine(stateDir, "sessions") + "\"");
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false; psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            var sbOut = new StringBuilder();
+            using (var p = System.Diagnostics.Process.Start(psi))
+            {
+                p.OutputDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e)
+                { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); };
+                p.ErrorDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+                p.BeginOutputReadLine(); p.BeginErrorReadLine();
+                if (!p.WaitForExit(30000)) { try { p.Kill(); } catch (Exception) { } return ""; }
+                p.WaitForExit();
+            }
+            lock (sbOut) return sbOut.ToString().Trim();
+        }
+        catch (Exception) { return ""; }
+    }
+
+    void RenderReviewerLedger(StackPanel body, string json)
+    {
+        bool ja = _lang == 0;
+        Dictionary<string, object> d = null;
+        try { if (!string.IsNullOrEmpty(json)) d = _js.Deserialize<Dictionary<string, object>>(json); } catch (Exception) { }
+        if (d == null)
+        {
+            body.Children.Add(new TextBlock { Text = ja ? "台帳を読めませんでした(ledger_dump の出力なし)。" : "Could not read the ledger (no output from ledger_dump).",
+                                              Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+            return;
+        }
+        var turns = d.ContainsKey("turns") ? d["turns"] as System.Collections.IEnumerable : null;
+        bool any = false;
+        if (turns != null)
+        {
+            foreach (object o in turns)
+            {
+                var tr = o as Dictionary<string, object>;
+                if (tr == null) continue;
+                any = true;
+                string role = S(tr, "role");
+                string label;
+                switch (role)
+                {
+                    case "refuter_user": label = ja ? "反証者への入力(全文)" : "Sent to the reviewer (full)"; break;
+                    case "refuter_wire": label = ja ? "実際に送信された全文" : "Payload actually sent"; break;
+                    case "refuter_assistant": label = ja ? "反証者の返答(全文)" : "Reviewer reply (full)"; break;
+                    case "refuter_verdict": label = ja ? "判定" : "Verdict"; break;
+                    default: label = role; break;
+                }
+                string when = "";
+                try
+                {
+                    double ts = Dbl(tr, "ts");
+                    if (ts > 0) when = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+                }
+                catch (Exception) { }
+                string lens = S(tr, "lens");
+                string meta = "[" + (string.IsNullOrEmpty(lens) ? "-" : lens) + "] " + label
+                    + (when.Length > 0 ? "  " + when : "")
+                    + (S(tr, "route").Length > 0 ? "  " + S(tr, "route") : "")
+                    + (S(tr, "sha16").Length > 0 ? "  sha16:" + S(tr, "sha16") : "")
+                    + (string.Equals(S(tr, "truncated"), "True", StringComparison.OrdinalIgnoreCase)
+                        ? (ja ? "  (上限で切詰め済み)" : "  (cut at the size cap)") : "");
+                body.Children.Add(new TextBlock { Text = meta, Foreground = role == "refuter_verdict" ? Fg : Muted,
+                                                  FontSize = 11.5, FontWeight = FontWeights.SemiBold,
+                                                  Margin = new Thickness(0, 8, 0, 2), TextWrapping = TextWrapping.Wrap });
+                var tb = new TextBox();
+                tb.Text = S(tr, "text");
+                tb.Foreground = Muted; tb.FontSize = 12; tb.FontFamily = new FontFamily(Theme.CodeFont);
+                tb.IsReadOnly = true; tb.TextWrapping = TextWrapping.Wrap;
+                tb.BorderThickness = new Thickness(0); tb.Background = QuoteBg; tb.Padding = new Thickness(8);
+                tb.MaxHeight = 280; tb.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+                SwallowMouseUp(tb);
+                body.Children.Add(tb);
+            }
+        }
+        if (!any)
+        {
+            body.Children.Add(new TextBlock {
+                Text = ja ? "この実行には反証の全文が台帳にありません(反証の記録を始める前の実行、または反証が走っていません)。"
+                          : "The ledger holds no reviewer text for this run (it predates reviewer recording, or no review ran).",
+                Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+        }
     }
 
     UIElement TabLogs(Dictionary<string, object> w, string reason)
@@ -11720,7 +15845,9 @@ class CockpitWindow : Window
         var sb = new StringBuilder();
         sb.Append("status=").Append(S(w, "status")).Append("  outcome=").Append(S(w, "outcome"));
         sb.Append("  turn=").Append(S(w, "turn")).Append("  verify_attempts=").Append(S(w, "verify_attempts"));
-        sb.Append("  verified=").Append(S(w, "verified")).Append('\n');
+        sb.Append("  verified=").Append(S(w, "verified"));
+        if (!string.IsNullOrEmpty(S(w, "submitter"))) sb.Append("  submitter=").Append(S(w, "submitter"));
+        sb.Append('\n');
         if (!string.IsNullOrEmpty(reason)) sb.Append("\nreason:\n").Append(reason).Append('\n');
         var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(12, 12, 12, 12) };
         var t = RoText(sb.ToString(), Muted, 12);
@@ -11740,6 +15867,7 @@ class CockpitWindow : Window
             case "STUCK": return ja ? "停滞して終了" : "Stuck";
             case "ERROR": return ja ? "エラーで終了" : "Error";
             case "CANCELLED": return ja ? "停止されました" : "Cancelled";
+            case "INTERRUPTED": return ja ? "中断されました(コーディネータ停止)" : "Interrupted (coordinator died)";
             // The worker said it was finished; the recorded tool calls say otherwise -- the
             // acceptance command was never run, or nothing was written. NOT an error and NOT a
             // completion: a claim that could not be believed. DONE is a self-report measured at
@@ -11749,37 +15877,166 @@ class CockpitWindow : Window
         }
     }
 
-    // #14 mini-chat: the last few turns of a worker's disk transcript, as a compact scrollable
-    // thread inside the EXPANDED card -- read recent context + steer from the cockpit without
-    // switching to the chat window. Null when the transcript is empty/missing. Only expanded cards
-    // call this, so the I/O is bounded to the one or two cards the user opened.
-    UIElement MiniThread(string transcriptPath)
+    //: How many recent entries the card lists. Three is the starting value, not a measurement --
+    //: it is what fits beside the state and the controls without the card becoming the reading
+    //: surface again. The rest are reachable by count and a link, never by scrolling here.
+    const int MINI_THREAD_ENTRIES = 3;
+
+    //: How much of an entry is shown so a reader can decide whether to open it. A line, not a
+    //: paragraph: the question this answers is "is this worth reading", and a paragraph answers
+    //: "what does it say", which is the other screen's job.
+    const int MINI_THREAD_SUMMARY_CHARS = 110;
+
+    // WHAT THE CARD SHOWS OF A CONVERSATION: enough to choose what to read, and no reading
+    // surface of its own.
+    //
+    // THE DEFECT THIS REPLACES. Each turn was a TextBox capped at MaxHeight 90 with its own
+    // scrollbar, inside a ScrollViewer capped at 240 with another, inside the card list's
+    // scroller. Three scroll regions stacked in the same direction: to reach the second turn you
+    // scrolled the first one to its end, then the panel, and the card moved under you while you
+    // did it. Reported as 「開いてしまえば一番下までスクロールしないと次のが見られない」 --
+    // read-shaped, not readable. An external review put the principle exactly: 「問題はスクロールの
+    // 存在ではなく、同じ操作方向に異なる本文領域が重なっていること」.
+    //
+    // Raising the caps does not fix it and lowering them is the same thing smaller: a monitoring
+    // card cannot host hundreds of lines without becoming the thing it was meant to summarise,
+    // and one long-running worker would push every other card off the screen. So the card lists
+    // WHAT HAPPENED and the full text opens where reading belongs -- the chat window, positioned
+    // on the entry, which the review recommended over an in-card expansion (the card jumps),
+    // a modal (it covers the monitor) and an unbounded body (one lane eats the view).
+    //
+    // Null when the transcript is empty or missing, as before.
+    UIElement MiniThread(string transcriptPath, string workerName, string convUrl)
     {
-        var turns = ReadLastTurns(transcriptPath, 4);
+        var turns = ReadLastTurns(transcriptPath, MINI_THREAD_ENTRIES);
         if (turns.Count == 0) return null;
-        var panel = new StackPanel();
+        bool ja = _lang == 0;
+        var panel = new StackPanel { Margin = new Thickness(0, 6, 0, 6) };
+
+        int total = CountTurns(transcriptPath);
+        // The listed entries are the LAST few, so the first of them sits at this offset in the
+        // whole transcript. Clicking one has to name the entry the reader chose, not the n-th
+        // of the three shown.
+        int firstIndex = Math.Max(0, total - turns.Count);
+        int shown = 0;
         foreach (var t in turns)
         {
             bool user = t.Item1 == "U";
-            var b = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadSmall),
-                                 Padding = new Thickness(12, 7, 12, 7), Margin = new Thickness(0, 0, 0, 5) };
-            var sp = new StackPanel();
-            var who = new TextBlock { Text = user ? (_lang == 0 ? "指示 / あなた" : "Instruction / You") : (_lang == 0 ? "エージェント" : "Agent"), FontSize = 11,
-                                      FontWeight = FontWeights.SemiBold, Margin = new Thickness(0, 0, 0, 3) };
-            who.Foreground = user ? Accent : Muted;
-            sp.Children.Add(who);
-            var tb = new TextBox { Text = t.Item2, FontSize = 12, IsReadOnly = true,
-                                   BorderThickness = new Thickness(0), Background = Brushes.Transparent,
-                                   Padding = new Thickness(0), IsTabStop = false, TextWrapping = TextWrapping.Wrap,
-                                   MaxHeight = 90, VerticalScrollBarVisibility = ScrollBarVisibility.Auto };
-            tb.Foreground = Fg;
-            SwallowMouseUp(tb);
-            sp.Children.Add(tb);
-            b.Child = sp;
-            panel.Children.Add(b);
+            string body = (t.Item2 ?? "").Replace("\r", "");
+            int lines = body.Length == 0 ? 0 : body.Split('\n').Length;
+            string summary = FirstMeaningfulLine(body, MINI_THREAD_SUMMARY_CHARS);
+
+            var row = new StackPanel { Margin = new Thickness(0, 0, 0, 8) };
+            var head = new TextBlock
+            {
+                Text = user ? (ja ? "指示 / あなた" : "Instruction / You") : (ja ? "エージェント" : "Agent"),
+                FontSize = 11,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = user ? Accent : Muted,
+                Margin = new Thickness(0, 0, 0, 2),
+            };
+            row.Children.Add(head);
+
+            // ONE LINE, AND IT DOES NOT SCROLL. TextTrimming rather than a height cap: a clipped
+            // line is honest about being clipped, a scrollbox invites reading and then refuses.
+            var line = new TextBlock
+            {
+                Text = summary,
+                FontSize = 12,
+                Foreground = Fg,
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                TextWrapping = TextWrapping.NoWrap,
+            };
+            row.Children.Add(line);
+
+            // THE SIZE IS THE REASON TO OPEN IT, so it is stated rather than implied by a
+            // scrollbar the reader has to discover.
+            if (lines > 1)
+            {
+                var size = new TextBlock
+                {
+                    Text = ja ? ("本文 " + lines + " 行") : (lines + " lines"),
+                    FontSize = 11,
+                    Foreground = Muted,
+                    Margin = new Thickness(0, 2, 0, 0),
+                };
+                row.Children.Add(size);
+            }
+
+            // THE ENTRY IS THE CHOOSER. Clicking it opens the conversation in the chat window
+            // AT THIS ENTRY -- the card decides what to read, the chat window is where reading
+            // happens. Opening at the end would hand the reader the job of finding again what
+            // they had just picked.
+            int idx = firstIndex + shown;
+            string wn = workerName, cu = convUrl;
+            var hit = new Border
+            {
+                Child = row,
+                Background = Brushes.Transparent,
+                Cursor = Cursors.Hand,
+                Padding = new Thickness(0, 4, 0, 4),
+            };
+            hit.ToolTip = ja ? "この発言をメインチャットで開く" : "Open this entry in the chat window";
+            hit.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e)
+            {
+                e.Handled = true;
+                OpenWorker(wn, cu, idx);
+            };
+            panel.Children.Add(hit);
+            shown++;
         }
-        return new ScrollViewer { MaxHeight = 240, VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
-                                  Content = panel, Margin = new Thickness(0, 6, 0, 6) };
+
+        if (total > turns.Count)
+        {
+            var more = new TextBlock
+            {
+                Text = ja ? ("ほか " + (total - turns.Count) + " 件") : ((total - turns.Count) + " more"),
+                FontSize = 11,
+                Foreground = Muted,
+                Margin = new Thickness(0, 0, 0, 0),
+            };
+            panel.Children.Add(more);
+        }
+        return panel;
+    }
+
+    // The first line worth showing: skips blanks and a lone markdown heading marker, and trims to
+    // `max`. Not a summary -- a label. Producing a real summary is the agent's job, not the
+    // card's, and a card that paraphrases would be inventing.
+    static string FirstMeaningfulLine(string body, int max)
+    {
+        if (string.IsNullOrEmpty(body)) return "";
+        foreach (string raw in body.Split('\n'))
+        {
+            string ln = raw.Trim();
+            if (ln.Length == 0) continue;
+            int h = 0; while (h < ln.Length && ln[h] == '#') h++;
+            if (h > 0 && h < ln.Length && ln[h] == ' ') ln = ln.Substring(h + 1).Trim();
+            ln = ln.Replace("**", "").Replace("`", "");
+            if (ln.Length == 0) continue;
+            return ln.Length > max ? ln.Substring(0, max) + "…" : ln;
+        }
+        return "";
+    }
+
+    // How many turns the transcript holds, so "ほか N 件" is a fact rather than a guess. Counts
+    // the same lines ReadLastTurns keeps (meta and guid markers skipped); 0 on any failure,
+    // which renders as no line at all rather than as a wrong number.
+    int CountTurns(string transcriptPath)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(transcriptPath) || !File.Exists(transcriptPath)) return 0;
+            int n = 0;
+            foreach (string ln in File.ReadLines(transcriptPath))
+            {
+                if (ln.Length == 0) continue;
+                if (ln.IndexOf("\"role\"", StringComparison.Ordinal) < 0) continue;
+                n++;
+            }
+            return n;
+        }
+        catch (Exception) { return 0; }
     }
 
     // Last `n` (role, text) turns from a jsonl transcript (skips meta / guid marker lines).
@@ -11854,8 +16111,8 @@ class CockpitWindow : Window
         tb.FontSize = 12; tb.Padding = new Thickness(4, 2, 4, 2);
         tb.BorderThickness = new Thickness(0, 0, 0, 1); tb.BorderBrush = Border;
         tb.Background = Brushes.Transparent; tb.Foreground = Fg; tb.CaretBrush = Fg;
-        tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
-                                : "Inject a steering instruction (applied on the next turn)";
+        tb.ToolTip = _lang == 0 ? "このタスクへ追加指示（長時間タスクでは次の安全なターン境界で反映）"
+                                : "Add an operator instruction (durable tasks apply it at the next safe turn boundary)";
         string draft;
         tb.Text = _steerDraft.TryGetValue(nm, out draft) ? draft : "";
         _steerBoxRef[nm] = tb;   // newest realized instance for this worker (used by the focus-restore pass)
@@ -11883,7 +16140,18 @@ class CockpitWindow : Window
             return true;
         };
         send.Click += delegate { trySend(); };
-        tb.KeyDown += delegate (object s2, KeyEventArgs e2)
+        // PreviewKeyDown (tunnel), NOT KeyDown (bubble) -- matches _goalInput's own Enter
+        // handling (line ~4358). MEASURED BUG: the operator typed a steer into a running
+        // job's box and pressing Enter minimised the whole cockpit window instead of (or as
+        // well as) sending it. This box used a bubbling KeyDown, so this control's own
+        // Handled=true only stops OTHER BUBBLE handlers -- it can never run early enough to
+        // stop a tunnel-phase handler above it, and it cannot stop a class handler anywhere
+        // in the ancestor chain that listens with handledEventsToo=true (WPF's IsDefault-button
+        // mechanism is exactly that shape). Handling it in Preview, at the box itself, marks
+        // Handled during the tunnel pass -- before the bubble pass (and anything hooked to it)
+        // ever runs -- which is the earliest point this control can act and the same guarantee
+        // the composer already relies on.
+        tb.PreviewKeyDown += delegate (object s2, KeyEventArgs e2)
         {
             if (e2.Key == Key.Return) { trySend(); e2.Handled = true; }
         };
@@ -11956,8 +16224,11 @@ class CockpitWindow : Window
         tb.FontSize = 12.5; tb.Padding = new Thickness(4, 3, 4, 3);
         tb.BorderThickness = new Thickness(0); tb.Background = Brushes.Transparent; tb.Foreground = Fg;
         tb.CaretBrush = Fg;
-        tb.ToolTip = _lang == 0 ? "回答待ち中でも割り込み指示を送れます（次のターンに最優先で反映）"
-                                : "Inject a steering instruction (applied on the next turn)";
+        tb.ToolTip = _lang == 0 ? "このタスクへ追加指示（長時間タスクでは次の安全なターン境界で反映）"
+                                : "Add an operator instruction (durable tasks apply it at the next safe turn boundary)";
+        string savedDraft;
+        tb.Text = _steerDraft.TryGetValue(name, out savedDraft) ? savedDraft : "";
+        _steerBoxRef[name] = tb;
         // placeholder watermark text (hides when text is present)
         var placeholder = new TextBlock();
         placeholder.Text = _lang == 0 ? "このタスクに追加指示..." : "Add instruction to this task...";
@@ -11984,18 +16255,22 @@ class CockpitWindow : Window
                 return false;
             }
             tb.Text = "";
+            _steerDraft.Remove(nm);
             // Task 6: updated post-send wording
             note.Text = _lang == 0 ? "次のターンに送信しました" : "Queued for the next turn";
             return true;
         };
         send.Click += delegate { trySteer(); };
-        tb.KeyDown += delegate (object s, KeyEventArgs e)
+        // PreviewKeyDown, not KeyDown -- see the matching note on CollapsedSteerRow's box
+        // above (same control family, same fix, same reason).
+        tb.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
             if (e.Key == Key.Return) { trySteer(); e.Handled = true; }
         };
         tb.TextChanged += delegate
         {
             bool hasText = tb.Text != null && tb.Text.Length > 0;
+            _steerDraft[nm] = tb.Text;
             placeholder.Visibility = hasText ? Visibility.Collapsed : Visibility.Visible;
             if (note.Text.Length > 0 && hasText) note.Text = "";
         };
@@ -12064,7 +16339,7 @@ class CockpitWindow : Window
         {
             string t = (tb.Text ?? "").Trim();
             if (t.Length == 0) return false;
-            string goalText = BuildContinueGoal(g, t);
+            string goalText = ContinueText(g, t, c);
             // SpawnFleet's GoalsToJsonl escapes a plain multi-line goal string safely on its
             // own; only pre-serialize here to carry the EXTRA resume_conv key (GoalsToJsonl
             // detects an already-JSON goal string and passes it through as-is).
@@ -12086,7 +16361,8 @@ class CockpitWindow : Window
             return true;
         };
         send.Click += delegate { tryContinue(); };
-        tb.KeyDown += delegate (object s, KeyEventArgs e)
+        // PreviewKeyDown, not KeyDown -- see the matching note on CollapsedSteerRow's box.
+        tb.PreviewKeyDown += delegate (object s, KeyEventArgs e)
         {
             if (e.Key == Key.Return) { tryContinue(); e.Handled = true; }
         };
@@ -12150,43 +16426,57 @@ class CockpitWindow : Window
         item["checks"] = checks;
         item["cwd"] = S(w, "cwd");
         item["priority"] = true;
+        item["retry"] = true;   // the runner refuses a retry whose goal is already live
         return item;
     }
 
     // Re-run the worker's goal. TWO honest paths, picked by whether a run is LIVE:
-    //  * LIVE  -> append to commands.json's add_goal list (MERGE writer); the running fleet
+    //  * LIVE  -> send an add_goal command of its own (one file per command); the running fleet
     //            consumes it on its next sweep and re-runs it WITH its acceptance gate (checks+cwd).
     //  * FINISHED/stale -> nothing alive would ever drain add_goal, so instead SPAWN a fresh fleet
     //            for this goal text (SpawnFleet). The relaunched run picks it up and re-runs it.
     // The auto-retry scanner only calls this while live, so its add_goal path is unchanged.
     void RetryGoal(Dictionary<string, object> w)
     {
-        if (RunIsLive())
-        {
-            var cmd = ReadCommands();
-            var adds = new List<object>();
-            if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
-                foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
-            adds.Add(RetryEntry(w));
-            cmd["add_goal"] = adds;
-            WriteCommands(cmd);
-            return;
-        }
         string goal = S(w, "goal");
         if (string.IsNullOrEmpty(goal)) return;
+        if (IsLocalLoopControlGoal(goal))
+        {
+            if (_startNote != null) _startNote.Text = _lang == 0
+                ? "これはLOCAL_LOOPの内部制御記録です。通常Fleetとして再実行せず、耐久タスクのカードから再開してください。"
+                : "This is a LOCAL_LOOP control record. Do not rerun it as Fleet work; resume the durable task card instead.";
+            return;
+        }
+        if (RunIsLive())
+        {
+            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+            var adds = new List<object>();
+            adds.Add(RetryEntry(w));
+            SendCommand(Cmd1("add_goal", adds));
+            NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline);
+            return;
+        }
         try { SpawnFleet(new List<string> { goal }, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
     }
 
     // Feature C bulk: re-run EVERY currently-shown terminal non-DONE worker (respecting the active
-    // filter). LIVE -> one merged add_goal list; FINISHED/stale -> ONE relaunched fleet carrying
+    // filter). LIVE -> ONE add_goal command carrying every retried entry; FINISHED/stale -> ONE
+    // relaunched fleet carrying
     // all the retried goal texts (mirrors RetryGoal's live/finished split).
-    void RetryAllShown(List<Dictionary<string, object>> shown)
+    // THE RETRY BUDGET IS SHARED WITH AutoRetryScan, DELIBERATELY. This button had no cap of
+    // any kind, so _autoRetryMax bounded only the automatic path. One submitted goal reached
+    // 891 workers, 575 of them stuck: each press re-queued every still-stuck goal again, and
+    // nothing on screen said the press had done anything -- so it was pressed again.
+    //
+    // Counting against the same per-goal counter stops the amplification. RETURNING the
+    // skipped count is what stops the re-pressing, and matters just as much: a skip nobody
+    // can see is indistinguishable from a button that did not work, which is the behaviour
+    // that produced the pile in the first place.
+    int RetryAllShown(List<Dictionary<string, object>> shown, out int skippedAtCap)
     {
+        skippedAtCap = 0;
         bool live = RunIsLive();
-        var cmd = ReadCommands();
         var adds = new List<object>();
-        if (cmd.ContainsKey("add_goal") && cmd["add_goal"] is object[])
-            foreach (object o in (object[])cmd["add_goal"]) adds.Add(o);
         var goalTexts = new List<string>();
         int n = 0;
         foreach (Dictionary<string, object> w in shown)
@@ -12195,22 +16485,36 @@ class CockpitWindow : Window
             // Same closed set as AutoRetryScan and as relay/outcomes.py. "Retry all" used to
             // mean "everything that is not DONE", which swept up fan-out parents and threw
             // away the merged answers they carried.
-            if (!IsRetryableOutcome(S(w, "outcome"))) continue;
-            adds.Add(RetryEntry(w));
+            if (!IsRetryableWorker(w)) continue;
+            // Already re-queued once (by us or by the runner): never a second copy of this worker.
+            if (RetryAlreadyCovered(null, w)) continue;
             string g = S(w, "goal");
+            // Same counter, same key (goal text), same ceiling as AutoRetryScan, so the auto
+            // and manual paths cannot each spend a full allowance on the same goal.
+            if (!string.IsNullOrEmpty(g))
+            {
+                int used = 0;
+                if (_autoRetryCount.ContainsKey(g)) used = _autoRetryCount[g];
+                if (used >= _autoRetryMax) { skippedAtCap++; continue; }
+                _autoRetryCount[g] = used + 1;   // count BEFORE queueing, as AutoRetryScan does
+            }
+            _autoRetriedWorkers.Add(RetryWorkerKey(w));
+            adds.Add(RetryEntry(w));
             if (!string.IsNullOrEmpty(g)) goalTexts.Add(g);
             n++;
         }
-        if (n == 0) return;
+        if (n == 0) return 0;
         if (live)
         {
-            cmd["add_goal"] = adds;
-            WriteCommands(cmd);
+            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+            SendCommand(Cmd1("add_goal", adds));
+            NoteSubmitted(goalTexts, submitBaseline);
         }
         else if (goalTexts.Count > 0)
         {
             try { SpawnFleet(goalTexts, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
         }
+        return n;
     }
 
     // MIRRORS relay/outcomes.py RETRYABLE. A copy, and copies drift -- so a test fails if
@@ -12237,6 +16541,15 @@ class CockpitWindow : Window
                || status == "content_refused";
     }
 
+    // relay/fleet_reaper.py writes status "interrupted" into the sidecars of a coordinator that
+    // DIED (crash, kill, disk full). It is NOT terminal (never add it to IsTerminalWorker: the
+    // work is resumable and must not be archived or counted as finished) and it is NOT running
+    // and NOT a failure of the goal. Mirrors relay/outcomes.py STATUS_OF["INTERRUPTED"].
+    static bool IsInterruptedWorker(Dictionary<string, object> w)
+    {
+        return w != null && S(w, "status") == "interrupted";
+    }
+
     // Severity rank for the "unfinished only" sort: failures first, then max-turns, then
     // cancelled, then still-running/other (stable within a rank).
     static int SeverityRank(Dictionary<string, object> w)
@@ -12245,6 +16558,7 @@ class CockpitWindow : Window
         if (oc == "STUCK" || oc == "ERROR") return 0;
         if (oc == "MAXTURNS") return 1;
         if (oc == "CANCELLED") return 2;
+        if (oc == "INTERRUPTED") return 2;
         return 3;   // still-running / other
     }
 
@@ -12313,6 +16627,20 @@ class CockpitWindow : Window
             ? (_lang == 0 ? "既定Copilotの会話（MCPコネクタ無し）。エージェントに接続し直してください。"
                           : "Default-Copilot conversation (no MCP connector). Reconnect to the agent.")
             : (_lang == 0 ? "この会話はエージェントに接続されています" : "This conversation is bound to the agent");
+        return b;
+    }
+
+    // Per-worker effort pill from the additive status.json fields (EffortPolicyView words it).
+    Border BuildEffortBadge(Dictionary<string, object> w)
+    {
+        bool ja = _lang == 0;
+        Dictionary<string, object> last = Obj(w, "effort_last_switch");
+        string level = S(w, "effort_level"), src = S(w, "effort_source");
+        string text = EffortPolicyView.BadgeText(level, src, last, ja);
+        if (text == null) return null;
+        var b = Pill(text, "neutral");
+        b.Margin = new Thickness(0, 0, 5, 0);
+        b.ToolTip = EffortPolicyView.BadgeTip(level, src, last, ja);
         return b;
     }
 
@@ -12513,75 +16841,199 @@ class CockpitWindow : Window
                 s2.ScrollToVerticalOffset(t);
             }), System.Windows.Threading.DispatcherPriority.Background);
         }
-        _lastSig = Sig(_lastRoot);
+        _lastSig = Sig(_lastRoot) + "|s" + _submittedSig;   // the same shape OnTick compares
     }
 
     // ── cockpit -> fleet control channel ─────────────────────────────────────────
-    // Merge into the pending command file so concurrent commands don't clobber each
-    // other before the fleet (polling ~1s) consumes them.
-    Dictionary<string, object> ReadCommands()
+    // ONE COMMAND PER FILE, written through the shared FleetCommands.Write (ui/FleetCommands.cs).
+    // The old ReadCommands/WriteCommands pair read all of commands.json, added this caller's key
+    // and wrote the whole file back; CopilotChat.exe -- a SEPARATELY BUILT PROCESS -- did the same
+    // thing to the same file, so whichever wrote second deleted the other's queued command. See
+    // FleetCommands.cs for the full account. Each method below now sends ONLY its own key.
+    Dictionary<string, object> Cmd1(string key, object val)
     {
-        try
-        {
-            if (File.Exists(_commandsPath))
-            {
-                var ex = _js.DeserializeObject(File.ReadAllText(_commandsPath, Encoding.UTF8)) as Dictionary<string, object>;
-                if (ex != null) return ex;
-            }
-        }
-        catch (Exception) { }
-        return new Dictionary<string, object>();
+        var d = new Dictionary<string, object>();
+        d[key] = val;
+        return d;
     }
-    void WriteCommands(Dictionary<string, object> cmd)
+    bool SendCommand(Dictionary<string, object> patch)
     {
-        try { File.WriteAllText(_commandsPath, _js.Serialize(cmd), new UTF8Encoding(false)); }
-        catch (Exception) { }
+        return FleetCommands.Write(_fleetDir, patch);
+    }
+    bool SendTrackedCommand(Dictionary<string, object> patch, out string path)
+    {
+        return FleetCommands.WriteTracked(_fleetDir, patch, out path);
     }
 
+    // THE DEDUPE WENT WITH THE MERGE, DELIBERATELY. This used to read the pending `close` list
+    // and skip a name already in it. With one command per file there is no pending list to
+    // consult -- and reintroducing one would reintroduce the read-modify-write race that cost a
+    // goal. It is acceptable here because the fleet applies closes idempotently: closing a
+    // worker that is already closed is a no-op, so a duplicate close changes nothing.
     void RequestClose(string name)
     {
-        var cmd = ReadCommands();
         var closes = new List<object>();
-        if (cmd.ContainsKey("close") && cmd["close"] is object[])
-            foreach (object o in (object[])cmd["close"]) closes.Add(o);
-        if (!closes.Contains(name)) closes.Add(name);
-        cmd["close"] = closes;
-        WriteCommands(cmd);
+        closes.Add(name);
+        SendCommand(Cmd1("close", closes));
     }
 
     void RequestSetMaxtabs(int n)
     {
-        var cmd = ReadCommands();
-        cmd["set_maxtabs"] = n;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_maxtabs", n));
     }
 
-    // Live autoscale control: {"set_autoscale":{"on":0|1,"default":N,"max":M}}. Merged into
-    // commands.json via the SAME writer RequestSetMaxtabs uses, so concurrent commands
-    // (close/steer/set_maxtabs) aren't clobbered before the fleet (polling ~1s) consumes them.
+    // Live autoscale control: {"set_autoscale":{"on":0|1,"default":N,"max":M}}, sent as its own
+    // command file through the SAME writer RequestSetMaxtabs uses, so it cannot clobber a
+    // concurrent close/steer/add_goal from this window or from CopilotChat.exe.
     void RequestSetAutoscale(bool on, int def, int max)
     {
-        var cmd = ReadCommands();
         var sa = new Dictionary<string, object>();
         sa["on"] = on ? 1 : 0;
         sa["default"] = def;
         sa["max"] = max;
-        cmd["set_autoscale"] = sa;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("set_autoscale", sa));
+    }
+
+    Dictionary<string, object> WorkerByName(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return null;
+        try
+        {
+            foreach (Dictionary<string, object> w in WorkersOf(_lastRoot))
+                if (string.Equals(S(w, "name"), name, StringComparison.Ordinal)) return w;
+            Dictionary<string, object> root = ReadStatus();
+            foreach (Dictionary<string, object> w in WorkersOf(root))
+                if (string.Equals(S(w, "name"), name, StringComparison.Ordinal)) return w;
+        }
+        catch (Exception) { }
+        return null;
+    }
+
+    static bool IsLocalLoopWorker(Dictionary<string, object> w)
+    {
+        return w != null && string.Equals(
+            S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase);
+    }
+
+    bool QueueLocalLoopSteer(Dictionary<string, object> w, string text, out string failReason)
+    {
+        failReason = null;
+        string steerFile = null;
+        System.Diagnostics.Process proc = null;
+        try
+        {
+            if (w == null) { failReason = "LOCAL_LOOP worker metadata is unavailable."; return false; }
+            if (!DurableRuntimeEnabled())
+            {
+                failReason = _lang == 0 ? "長時間実行が無効です。" : "Durable runtime is disabled.";
+                return false;
+            }
+            string jobId = S(w, "name").Replace("\"", "");
+            string db = S(w, "local_job_db").Replace("\"", "");
+            if (string.IsNullOrWhiteSpace(jobId) || string.IsNullOrWhiteSpace(db))
+            {
+                failReason = _lang == 0 ? "長時間タスクの識別情報が不足しています。"
+                                        : "Durable task identity is incomplete.";
+                return false;
+            }
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string token = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + "_"
+                         + Guid.NewGuid().ToString("N").Substring(0, 8);
+            steerFile = Path.Combine(stateDir, "durable_steer_" + token + ".txt");
+            File.WriteAllText(steerFile, text ?? "", new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.local_loop_controller --operator-steer-job-id \"" + jobId
+                          + "\" --operator-steer-file \"" + steerFile
+                          + "\" --state-dir \"" + stateDir + "\" --db \"" + db + "\"";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) throw new InvalidOperationException("LOCAL_LOOP steer process did not start");
+            WatchLocalLoopSteer(proc, jobId, steerFile, text ?? "");
+            return true;
+        }
+        catch (Exception ex)
+        {
+            try { if (!string.IsNullOrEmpty(steerFile) && File.Exists(steerFile)) File.Delete(steerFile); }
+            catch (Exception) { }
+            try { if (proc != null) proc.Dispose(); } catch (Exception) { }
+            failReason = (_lang == 0 ? "追加指示を保存できませんでした: " : "Could not save operator update: ") + ex.Message;
+            return false;
+        }
+    }
+
+    void WatchLocalLoopSteer(System.Diagnostics.Process proc, string jobId,
+                             string steerFile, string text)
+    {
+        var timer = new System.Windows.Threading.DispatcherTimer();
+        timer.Interval = TimeSpan.FromMilliseconds(200);
+        timer.Tick += delegate
+        {
+            try
+            {
+                proc.Refresh();
+                if (!proc.HasExited) return;
+                timer.Stop();
+                int code = -1;
+                try { code = proc.ExitCode; } catch (Exception) { }
+                if (code == 0)
+                {
+                    _steerDraft.Remove(jobId);
+                    try { if (!string.IsNullOrEmpty(steerFile) && File.Exists(steerFile)) File.Delete(steerFile); }
+                    catch (Exception) { }
+                    ShowScaleToast(_lang == 0 ? "追加指示を長時間タスクへ保存しました"
+                                               : "Operator update saved to the durable task");
+                    _lastSig = "";
+                }
+                else
+                {
+                    _steerDraft[jobId] = text;
+                    TextBox box;
+                    if (_steerBoxRef.TryGetValue(jobId, out box) && box != null)
+                    {
+                        try { if (string.IsNullOrEmpty(box.Text)) box.Text = text; } catch (Exception) { }
+                    }
+                    try { if (!string.IsNullOrEmpty(steerFile) && File.Exists(steerFile)) File.Delete(steerFile); }
+                    catch (Exception) { }
+                    ShowScaleToast((_lang == 0 ? "追加指示を保存できませんでした。入力を復元しました。終了コード "
+                                                   : "Operator update failed; input restored. Exit code ") + code);
+                    _lastSig = "";
+                }
+                try { proc.Dispose(); } catch (Exception) { }
+            }
+            catch (Exception ex)
+            {
+                timer.Stop();
+                _steerDraft[jobId] = text;
+                TextBox box;
+                if (_steerBoxRef.TryGetValue(jobId, out box) && box != null)
+                {
+                    try { if (string.IsNullOrEmpty(box.Text)) box.Text = text; } catch (Exception) { }
+                }
+                ShowScaleToast((_lang == 0 ? "追加指示の確認に失敗しました。入力を復元しました。 "
+                                               : "Could not confirm operator update; input restored. ") + ex.Message);
+                try { proc.Dispose(); } catch (Exception) { }
+                _lastSig = "";
+            }
+        };
+        timer.Start();
     }
 
     void RequestSteer(string name, string text)
     {
         if (string.IsNullOrEmpty(text)) return;
-        var cmd = ReadCommands();
-        var steers = new List<object>();
-        if (cmd.ContainsKey("steer") && cmd["steer"] is object[])
-            foreach (object o in (object[])cmd["steer"]) steers.Add(o);
         var item = new Dictionary<string, object>();
         item["worker"] = name; item["text"] = text;
+        var steers = new List<object>();
         steers.Add(item);
-        cmd["steer"] = steers;
-        WriteCommands(cmd);
+        SendCommand(Cmd1("steer", steers));
     }
 
     // Feature 1: the ONE steer-send code path, shared by SteerRow (expanded drawer) and
@@ -12594,6 +17046,9 @@ class CockpitWindow : Window
         failReason = null;
         string t = (text ?? "").Trim();
         if (t.Length == 0) return false;
+        Dictionary<string, object> worker = WorkerByName(name);
+        if (IsLocalLoopWorker(worker))
+            return QueueLocalLoopSteer(worker, t, out failReason);
         if (!RunIsLive()) { failReason = T("steer_dead"); return false; }
         RequestSteer(name, t);
         return true;
@@ -12648,13 +17103,26 @@ class CockpitWindow : Window
     // Open a worker in the main chat by NAME (robust click target). The chat polls open.json;
     // it resolves the worker by name in status.json and shows its live snapshot, and uses url
     // for /history when a real Copilot conv_url was captured.
-    void OpenWorker(string name, string url)
+    void OpenWorker(string name, string url) { OpenWorker(name, url, -1); }
+
+    // `turnIndex` is which entry the reader clicked, 0-based over the transcript's turns, or -1
+    // for "just open it".
+    //
+    // WHY THE INDEX TRAVELS. The card lists what happened and holds no body; the full text opens
+    // in the chat window. Opening it at the END would make the reader hunt for the entry they
+    // had just chosen -- the review asked about this said so plainly: 「単に会話の末尾を開く
+    // 設計では、対象を探し直す負担が残る」. Carrying the position is what makes the card a
+    // chooser rather than a teaser.
+    void OpenWorker(string name, string url, int turnIndex)
     {
         try
         {
             _openSeq++;
             var o = new Dictionary<string, object>();
             o["worker"] = name ?? ""; o["url"] = url ?? ""; o["ts"] = _openSeq;
+            // Written only when there is one, so a reader of open.json can tell "no position
+            // was asked for" from "position 0" -- which are different requests.
+            if (turnIndex >= 0) o["turn_index"] = turnIndex;
             File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
@@ -12677,9 +17145,62 @@ class CockpitWindow : Window
         catch (Exception) { }
     }
 
-    // A concise card/conversation title: the Copilot-generated conv_title when present, else the
-    // issue heading derived from the goal (the first real line after the "== ... issue ==" marker,
-    // else the first non-boilerplate line), trimmed so long goal text never wrecks readability.
+    // Markers that open scaffolding WE compose and append to an operator's own instruction --
+    // fanout range headers, fan-in aggregation notes, subtask separators, continuation notes.
+    // Mirrors tools/skill_lessons.py's _COMPOSED_FROM exactly (same list, same "cut at the
+    // earliest one" rule) so a card headline and a generated Skill proposal agree on where an
+    // operator's own words end. MEASURED without this: 69 stored goals render, verbatim, as one
+    // of these markers and nothing else -- e.g. a card headlined only "【前回タスクの続き】" or
+    // "【この会話が担当する範囲 — 全体の 1/9】". Both are literally true and completely useless:
+    // every unrelated fanout run's first card says the same thing.
+    static readonly string[] _ComposedFrom = new string[] {
+        "【この会話が担当する範囲", "【分割実行の結果をまとめてください】",
+        "--- サブタスク ", "【前回タスクの続き】"
+    };
+
+    // The fixed per-turn protocol preamble (relay/copilot_autopilot_relay.py's PROTOCOL) that is
+    // prepended ahead of the operator's own goal for every turn sent to a worker. Anchored on its
+    // literal opening and literal closing sentence -- both constants -- rather than the whole
+    // block, because the text between them (OUTPUT_DISCIPLINE) is loaded from a file and can
+    // change length without notice. A goal that doesn't start with this preamble is untouched.
+    const string _PreambleStart = "【最重要】使えるツールは";
+    const string _PreambleEndMark = "まず最初のステップを実行。";
+
+    // The part of `goal` a person actually typed: composed scaffolding, then the fixed protocol
+    // preamble, stripped. Mirrors tools/skill_lessons.py's operator_instruction() -- conservative
+    // in the same direction: a goal carrying neither is returned unchanged, never emptied.
+    string OperatorInstruction(string goal)
+    {
+        string text = goal ?? "";
+        int cut = text.Length;
+        foreach (string mark in _ComposedFrom)
+        {
+            int i = text.IndexOf(mark, StringComparison.Ordinal);
+            if (i >= 0 && i < cut) cut = i;
+        }
+        string outp = text.Substring(0, cut).Trim();
+        if (outp.Length == 0) outp = text.Trim();
+        if (outp.StartsWith(_PreambleStart, StringComparison.Ordinal))
+        {
+            int endIdx = outp.IndexOf(_PreambleEndMark, StringComparison.Ordinal);
+            if (endIdx >= 0)
+            {
+                int rest = endIdx + _PreambleEndMark.Length;
+                if (rest < outp.Length && outp[rest] == '\n') rest++;
+                if (rest + 5 <= outp.Length && outp.Substring(rest, 5) == "Goal:") rest += 5;
+                while (rest < outp.Length && (outp[rest] == ' ' || outp[rest] == '\n')) rest++;
+                if (rest < outp.Length) outp = outp.Substring(rest).Trim();
+            }
+        }
+        return outp;
+    }
+
+    // A concise card/conversation title, in order of preference: the Copilot-generated conv_title
+    // when present and not generic; else the issue heading derived from the goal (the first real
+    // line after a "== ... issue ==" marker -- SWE-bench-shaped goals only); else the first
+    // non-boilerplate line of the OPERATOR'S OWN instruction (composed scaffolding + the fixed
+    // protocol preamble stripped via OperatorInstruction, above); else the raw goal. Trimmed so
+    // long goal text never wrecks readability.
     string CardTitle(string convTitle, string goal)
     {
         // A generic Copilot auto-title ("会話" / "Chat" / "新しいチャット") carries no information,
@@ -12704,14 +17225,20 @@ class CockpitWindow : Window
                 }
             }
         }
-        foreach (string l in lines)
+        // From here on, work off the operator's own instruction rather than the raw goal, so a
+        // fanout/continuation goal's headline names the job instead of the scaffolding we glued
+        // onto it.
+        string opGoal = OperatorInstruction(goal);
+        if (string.IsNullOrEmpty(opGoal)) opGoal = goal;
+        string[] opLines = opGoal.Replace("\r", "").Split('\n');
+        foreach (string l in opLines)
         {
             string t = l.Trim();
             if (t.Length > 0 && !t.StartsWith("==") && !t.StartsWith("あなたは")
                 && !t.StartsWith("対象") && !t.StartsWith("この"))
                 return Trunc(t, 90);
         }
-        foreach (string l in lines) { string t = l.Trim(); if (t.Length > 0) return Trunc(t, 90); }
+        foreach (string l in opLines) { string t = l.Trim(); if (t.Length > 0) return Trunc(t, 90); }
         return "";
     }
 
@@ -12722,14 +17249,35 @@ class CockpitWindow : Window
     }
 
     // ── persistent history: finished/released tasks stack until cleared ───────────
+    // "COULD NOT READ IT" AND "THERE IS NOTHING TO READ" ARE NOT THE SAME ANSWER, and this pair
+    // of methods treated them as one. LoadHistory emptied _history first and swallowed every
+    // failure, so a load that failed was indistinguishable from a first run -- and the next
+    // SaveHistory then wrote the empty list over the file it had just failed to read.
+    //
+    // MEASURED 2026-09-08. The cockpit started at 18:21:10 with an empty _history. No worker
+    // reached a terminal state for the next 24 minutes, so nothing saved and the file still held
+    // its 44 rows at 18:44. At 18:45 a run archived its first worker, SaveHistory fired, and 44
+    // rows became 1. Nothing reported anything. Set against 218 runs' worth of transcripts on
+    // disk, the 44 rows that survived were themselves the remains of earlier rounds of this --
+    // the oldest was from 03:40 the same morning.
+    //
+    // The trigger for that particular failed load is not established, and this does not pretend
+    // to fix it. What it fixes is the consequence: a load that fails now refuses to let the
+    // save destroy the evidence, and the unreadable file is kept under a dated name rather than
+    // overwritten, so the next reader still has something to look at.
+    bool _historyLoaded;          // false = the last LoadHistory could not read the file
+
     void LoadHistory()
     {
         _history = new List<object>();
         _archivedKeys = new System.Collections.Generic.HashSet<string>();
+        _historyLoaded = false;
         try
         {
-            if (!File.Exists(_historyPath)) return;
+            // Absent is a legitimately empty history -- a first run. That is a successful load.
+            if (!File.Exists(_historyPath)) { _historyLoaded = true; return; }
             var arr = _js.DeserializeObject(File.ReadAllText(_historyPath, Encoding.UTF8)) as object[];
+            // Present but not an array is CORRUPT, not empty: do not claim it loaded.
             if (arr == null) return;
             foreach (object o in arr)
             {
@@ -12737,11 +17285,33 @@ class CockpitWindow : Window
                 var d = o as Dictionary<string, object>;
                 if (d != null && d.ContainsKey("key")) _archivedKeys.Add(S(d, "key"));
             }
+            _historyLoaded = true;
+        }
+        catch (Exception) { }
+        if (!_historyLoaded) PreserveUnreadableHistory();
+    }
+
+    // Keep what could not be read. Renaming rather than copying means the next save writes a new
+    // file instead of appending to a damaged one, and the original bytes are still on disk for
+    // whoever asks what went wrong.
+    void PreserveUnreadableHistory()
+    {
+        try
+        {
+            if (!File.Exists(_historyPath)) return;
+            string kept = _historyPath + ".unreadable-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+            if (!File.Exists(kept)) File.Move(_historyPath, kept);
         }
         catch (Exception) { }
     }
+
     void SaveHistory()
     {
+        // A SAVE AFTER A FAILED LOAD IS A DELETION. _history holds only what this session
+        // archived, so writing it over a file whose contents were never read replaces every
+        // earlier row with the handful from this run. Refusing costs the current session's rows
+        // until the next clean start; writing costs every row ever recorded.
+        if (!_historyLoaded) return;
         try { File.WriteAllText(_historyPath, _js.Serialize(_history), new UTF8Encoding(false)); }
         catch (Exception) { }
     }
@@ -12777,8 +17347,46 @@ class CockpitWindow : Window
 
     void ClearHistory()
     {
+        // RECORD THE DECISION BEFORE TOUCHING THE DATA. Renaming the file aside protects the
+        // BYTES; it does not protect the CHOICE, and those are not the same thing. .fleet/
+        // socket_route.jsonl is append-only and still holds every conversation this button
+        // discards, so a rebuild from it reconstructs exactly what was cleared -- which is what
+        // happened on 2026-09-13: 3,469 rows the operator had deleted came back, perfectly, and
+        // the tool that did it had no way to know it was undoing an instruction rather than
+        // repairing a loss. This line is the way to know. tools/rebuild_history.py reads it as a
+        // watermark and withholds everything at or before it.
+        //
+        // FIRST, not last: a clear interrupted between the rename and the log would leave the
+        // history gone and the reason unrecorded, which is precisely the state this prevents.
+        int clearedRows = _history.Count;
+        try
+        {
+            File.AppendAllText(_clearedLogPath,
+                _js.Serialize(new Dictionary<string, object> {
+                    { "ts", NowUnix() },
+                    { "iso", DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") },
+                    { "rows", clearedRows },
+                    { "by", "cockpit/clear_history" },
+                }) + "\n", new UTF8Encoding(false));
+        }
+        catch (Exception) { }
         _history.Clear(); _archivedKeys.Clear();
-        try { if (File.Exists(_historyPath)) File.Delete(_historyPath); } catch (Exception) { }
+        // RENAMED, NOT DELETED -- the same rule PreserveUnreadableHistory already applies to
+        // this exact file. The button still clears the history; the bytes are still on disk for
+        // whoever asks what went wrong. .fleet/history.json went missing once and the only code
+        // that could have removed it was this line, with no confirmation in front of it and
+        // nothing left behind to read. An absent history is indistinguishable from a first run
+        // by design (see LoadHistory), so nothing would have reported it either.
+        try
+        {
+            if (File.Exists(_historyPath))
+            {
+                string kept = _historyPath + ".cleared-" + DateTime.Now.ToString("yyyyMMdd-HHmmss");
+                if (File.Exists(kept)) File.Delete(_historyPath);
+                else File.Move(_historyPath, kept);
+            }
+        }
+        catch (Exception) { }
         try
         {
             var st = ReadStatus();
@@ -12870,6 +17478,7 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = status;
+            e["goal_summary"] = S(w, "goal_summary");
             e["conv_title"] = S(w, "conv_title");
             e["outcome"] = S(w, "outcome"); e["conv_url"] = conv;
             // Carry the disk transcript path + worker name so a HISTORY row can still show the
@@ -12877,6 +17486,31 @@ class CockpitWindow : Window
             // without these a completed conversation strands on "本文はまだ取得できません" even
             // though the jsonl transcript exists on disk.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            e["submitter"] = S(w, "submitter");
+            // CARRY THE VERDICT, NOT JUST THE STATUS. relay_fleet.py warns beside its own
+            // panel ledger that anything reaching an analysis only through history.json is
+            // "hostage to a second program choosing to carry the field" -- this is that
+            // program, and it was not carrying this one.
+            //
+            // The worker keeps a three-state answer: null = never checked, false = the
+            // acceptance check ran and failed, true = it passed. `status` cannot express
+            // that: "done" covers both "proved" and "never asked". Dropping it here is why
+            // the self-improvement dashboard reports verify_rate 0.0 -- it reads this file,
+            // and the field has never been in it. Measured: 44 archived rows, none carrying
+            // `verified`, while the live snapshot for the same worker carries it.
+            //
+            // run_id names the run so a row joins to its transcripts and to the other
+            // ledgers; `key` is "<epoch>#<worker>", unique per row and joining to nothing.
+            // BOTH ARCHIVE SITES GET THIS. Fixing one and leaving the other is the exact
+            // shape of the misses this file already records.
+            e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;
+            e["verify_attempts"] = I(w, "verify_attempts");
+            e["run_id"] = S(w, "run_id");
+            // THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09). Not the same thing as
+            // run_id just above -- run_id names the SWEEP this worker ran in, jid names the
+            // ADMITTED GOAL, unique per submission. BOTH ARCHIVE SITES GET THIS, same rule
+            // as run_id's own comment: fixing one and leaving the other repeats the miss.
+            e["jid"] = S(w, "jid");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             CarryTimeline(e, w, started);
@@ -12913,7 +17547,7 @@ class CockpitWindow : Window
     }
 
     // Client-side archive of ONE worker into the persisted history + hide its card. Unlike the
-    // per-worker 解放 (which writes commands.json and needs a LIVE fleet to consume it), this works
+    // per-worker 解放 (which writes a command file and needs a LIVE fleet to consume it), this works
     // with the fleet stopped -- so a finished or stale card can be moved to history any time.
     void _archiveOne(Dictionary<string, object> w)
     {
@@ -12925,11 +17559,24 @@ class CockpitWindow : Window
             _archivedKeys.Add(key);
             var e = new Dictionary<string, object>();
             e["key"] = key; e["goal"] = S(w, "goal"); e["status"] = S(w, "status");
+            e["goal_summary"] = S(w, "goal_summary");
             e["conv_title"] = S(w, "conv_title"); e["outcome"] = S(w, "outcome");
             e["conv_url"] = S(w, "conv_url");
             // see _archiveTerminal: carry transcript path + name so the history row can show the
             // full disk transcript even when conv_url is empty.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            e["submitter"] = S(w, "submitter");
+            // Same three fields as the terminal-archive path above, and for the same
+            // reason -- a row archived by hand must not be poorer than one archived
+            // automatically, or the history depends on which route retired the worker.
+            e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;
+            e["verify_attempts"] = I(w, "verify_attempts");
+            e["run_id"] = S(w, "run_id");
+            // THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09). Not the same thing as
+            // run_id just above -- run_id names the SWEEP this worker ran in, jid names the
+            // ADMITTED GOAL, unique per submission. BOTH ARCHIVE SITES GET THIS, same rule
+            // as run_id's own comment: fixing one and leaving the other repeats the miss.
+            e["jid"] = S(w, "jid");
             e["turn"] = I(w, "turn"); e["seq"] = _history.Count;
             e["ts"] = NowUnix();   // P2: archived-at timestamp -> date-group subheaders in History
             CarryTimeline(e, w, started);
@@ -12952,7 +17599,7 @@ class CockpitWindow : Window
     // Bulk-clear EVERY shown worker -- used by Stop-all when the run has gone STALE (no live fleet to
     // consume a stop command). Unlike ArchiveAllTerminal this clears non-terminal cards too, because a
     // stale run's "running" workers are frozen leftovers, not actually executing. Makes Stop-all do
-    // something visible even with the driver dead, instead of silently writing an unread commands.json.
+    // something visible even with the driver dead, instead of silently writing an unread command file.
     void ArchiveAllStale()
     {
         if (_toolbarShown == null) return;

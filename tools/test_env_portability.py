@@ -136,6 +136,7 @@ def test_an_undecryptable_password_is_replaced_with_one_this_machine_can_use(tmp
     got = EP.repair_unlock_password(env_path, env)
 
     assert got["acted"] is True, got
+    assert "password" not in got, "fresh plaintext must not escape the repair function"
     text = open(env_path, encoding="utf-8").read()
     assert "dpapi:AAAAfromanotherpc==" not in text, "the unusable value was left in place"
     assert "MCP_API_KEY=keep-me" in text, "an unrelated secret was lost"
@@ -186,3 +187,8 @@ def test_a_stale_plain_value_does_not_survive_the_repair(tmp_path, monkeypatch):
     EP.repair_unlock_password(env_path, {"MCP_UNLOCK_PASSWORD_PROTECTED": "dpapi:AAAAforeign=="})
     text = open(env_path, encoding="utf-8").read()
     assert "MCP_UNLOCK_PASSWORD=" not in text.replace("MCP_UNLOCK_PASSWORD_PROTECTED=", "")
+
+
+def test_protected_bearer_is_machine_bound():
+    from tools import env_portability as E
+    assert E.classify("MCP_API_KEY_PROTECTED") == "machine_bound"

@@ -279,3 +279,64 @@ def report(path, max_k=5, min_attempts=2, eval_path=None, slice_path=None):
             "were retried, and a goal is retried because its first attempt failed. Compare "
             "the MARGINAL column, which holds the same goals fixed across k."),
     }
+
+
+def main(argv=None) -> int:
+    """`python -m bench.retry_floor` -- the floor every mechanism has to beat.
+
+    A NUMBER NOBODY PRINTS IS A NUMBER NOBODY COMPARES AGAINST. This module's header argues
+    that this is the FIRST number, and until 2026-09-14 the only way to obtain it was to import
+    `report` from a test.
+    """
+    import argparse
+
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    # THE SAME PATH IDIOM THE MODULE ALREADY USES for .fleet/swe/work, rather than a second
+    # way of finding the repository root.
+    _repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    ap.add_argument("--history", default=os.path.join(_repo, ".fleet", "history.json"),
+                    help="the fleet ledger (default: this machine's)")
+    ap.add_argument("--max-k", type=int, default=5)
+    ap.add_argument("--min-attempts", type=int, default=2)
+    ap.add_argument("--eval", dest="eval_path", default=None,
+                    help="graded verdicts, to report the second floor beside the first")
+    ap.add_argument("--slice", dest="slice_path", default=None,
+                    help="the slice those verdicts belong to")
+    a = ap.parse_args(argv)
+
+    r = report(a.history, max_k=a.max_k, min_attempts=a.min_attempts,
+               eval_path=a.eval_path, slice_path=a.slice_path)
+    if not r.get("ledger_rows"):
+        print("no ledger rows at %s -- nothing to measure" % a.history)
+        return 1
+
+    print("ledger rows   %d" % r["ledger_rows"])
+    print("goals retried %d" % r["goals_retried"])
+    p = r.get("per_attempt") or {}
+    if p.get("attempts"):
+        print("per attempt   %d/%d = %.3f" % (p["succeeded"], p["attempts"], p["rate"]))
+    print()
+    print("%-3s %-9s %-8s %-8s %s" % ("k", "eligible", "solved", "rate", "marginal"))
+    for row in r.get("curve") or []:
+        print("%-3d %-9d %-8d %-8.3f %s"
+              % (row["k"], row["eligible"], row["solved"], row["rate"],
+                 ("%+.3f" % row["marginal"]) if row["marginal"] is not None else "-"))
+    if r.get("graded_curve"):
+        print()
+        print("graded (the grader, not the worker's DONE):")
+        for row in r["graded_curve"]:
+            print("%-3d %-9d %-8d %-8.3f" % (row["k"], row["eligible"], row["solved"],
+                                             row["rate"]))
+
+    # THE CAVEATS ARE PART OF THE ANSWER, not an appendix. Printing the curve alone would
+    # manufacture the overclaim this module's header exists to prevent: these are COMPLETION
+    # rates, and k=1 is conditioned on goals that were retried at all.
+    print()
+    print("read this first: %s" % r["read_this_first"])
+    print("measures       : %s" % r["measures"])
+    print("not an accuracy floor: %s" % r["not_an_accuracy_floor"])
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

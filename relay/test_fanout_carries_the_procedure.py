@@ -93,10 +93,24 @@ def test_the_procedure_comes_before_the_instruction_to_split():
 
 
 def test_an_ordinary_worker_is_unchanged():
-    """The non-fan-out path already carried the procedure and must keep doing so."""
-    w = F.RelayWorker(MAIL_GOAL, "w0")
+    """The non-fan-out path already carried the procedure and must keep doing so.
+
+    `fanout=False` IS NOW SAID OUT LOUD. It used to be the parameter's default, so omitting it
+    meant "ordinary"; since 2026-09-13 the capability defaults on and omitting it means
+    "capable, ask the judge". The test is about the worker that is NOT splitting, so it has to
+    name that now.
+    """
+    w = F.RelayWorker(MAIL_GOAL, "w0", fanout=False)
     assert w.fanout is False
-    assert "MARKER-SLICING-RULE" in w.job
+    # CHANGED 2026-09-16: it used to get the whole body and this line asserted that. The
+    # operator pointed at a live turn where a goal whose entire task was "press the Windows
+    # key, then Win+R" carried 2,251 characters of keyboard manual, inside a 7,850-character
+    # turn sent FOUR TIMES byte-identically while exactly one reply came back -- named as the
+    # same failure the tool catalogue had, and fixed the same way. Measured on that goal:
+    # 2,310 characters become 345. The fan-out case keeps the body, and its own test says why.
+    assert "MARKER-SLICING-RULE" not in w.job, "the whole body is being pushed again"
+    assert "mail-split-drill" in w.job, "the procedure was not named at all"
+    assert "skill_load" in w.job, "named a procedure without saying how to open it"
 
 
 def test_the_match_is_not_run_twice_per_worker():
@@ -106,9 +120,9 @@ def test_the_match_is_not_run_twice_per_worker():
     calls = []
     real = F._with_matched_skill
 
-    def counted(goal_text):
+    def counted(goal_text, want_body=True):
         calls.append(goal_text)
-        return real(goal_text)
+        return real(goal_text, want_body=want_body)
 
     F._with_matched_skill = counted
     try:

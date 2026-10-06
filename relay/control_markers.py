@@ -143,3 +143,28 @@ def split(text: str):
 def has_marker(text: str) -> bool:
     """Whether the turn ended with a protocol marker. The completion detector's question."""
     return parse(text) is not None
+
+
+#: THE SENTENCE THAT ASKS FOR WHAT parse() READS, kept next to it so the two cannot drift.
+#:
+#: They had drifted. parse() takes the marker from the LAST NON-EMPTY LINE -- the comment above
+#: _TRAILING justifies widening the grammar on the grounds that "the protocol prompt itself says
+#: 最後の行に DONE" -- while every continuation prompt in the fleet said only:
+#:
+#:     完了したら DONE、無理なら FAIL と理由を書いてください。
+#:
+#: No placement, and an invitation to write the reason AFTER the marker.
+#:
+#: MEASURED on run r6aa597a8_a0: turn 3 answered FAIL at character 428 and wrote 1,098 more
+#: characters of reasons. No marker on the last line, so the reply fell to the MARKERLESS settle
+#: requirement (more samples, longer dwell), never settled inside the turn budget, and the full
+#: 7,890-character goal was re-sent three times. Turns 7 and 8 ended with DONE as their last four
+#: characters and settled in 22 s and 100 s. The agent was complying with what it was asked.
+#:
+#: The reason goes FIRST because a FAIL without one is not actionable, and the marker goes last
+#: because that is where it is read from. Both halves are load-bearing.
+CLOSING_INSTRUCTION = (
+    "完了したら DONE、無理なら FAIL としてください。"
+    "理由は DONE / FAIL より前に書き、返信の最後の行は "
+    "DONE か FAIL: <一行の理由> だけにしてください。"
+)

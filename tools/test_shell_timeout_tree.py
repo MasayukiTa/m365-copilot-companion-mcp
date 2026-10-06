@@ -30,8 +30,8 @@ pytestmark = pytest.mark.skipif(os.name != "nt", reason="the tree-kill path meas
 
 
 def _alive(pid):
-    out = subprocess.run(["tasklist", "/FI", "PID eq %d" % pid],
-                         capture_output=True, text=True, timeout=20).stdout
+    from tools.childproc import run as _run_child
+    out = _run_child(["tasklist", "/FI", "PID eq %d" % pid], timeout=20).stdout
     return str(pid) in out
 
 

@@ -23,6 +23,27 @@ param([int]$Port = 9222,
 
 $ErrorActionPreference = "SilentlyContinue"
 
+# SINGLE SOURCE OF THE PROFILE LIST. The default above is a hand-written copy of
+# relay/edge_recover.py's MANAGED_EDGE_PROFILES, and the comment above it asks a person to
+# keep the two in step. That promise has already been broken once: copilot-eval-edge (:9224)
+# was added on the Python side and not here, and the symptom was the one this loop exists to
+# prevent. keeper_profile_marker() exists to end that, and nothing was calling it.
+#
+# The literal stays as the FALLBACK on purpose: a keeper that stops watching because Python
+# was unavailable is a worse failure than the drift. tests/test_edge_keeper_coverage.py
+# asserts the fallback equals keeper_profile_marker(), so a stale fallback fails CI.
+#
+# Only when the caller did not pass one -- an explicit -ProfileMarker is an operator's choice
+# and is not second-guessed.
+if (-not $PSBoundParameters.ContainsKey('ProfileMarker')) {
+    $py = Join-Path $repoRootForMarker ".venv\Scripts\python.exe"
+    if (-not (Test-Path $py)) { $py = "python" }
+    $fromPython = & $py -c "from relay.edge_recover import keeper_profile_marker as k; print(k())" 2>$null
+    if ($LASTEXITCODE -eq 0 -and $fromPython) {
+        $ProfileMarker = ($fromPython | Select-Object -First 1).Trim()
+    }
+}
+
 # The pause file lives at <repo-root>\.fleet\edge_keep_pause, written by
 # edge_recover.surface()/touch_pause(). This script is at <repo-root>\scripts\win,
 # so resolve the repo root by walking TWO directories up from $PSScriptRoot.
@@ -155,9 +176,30 @@ while ($true) {
         # sees a handle. Hiding and re-showing is what makes the shell re-evaluate membership;
         # the bit alone never does. After that first pass the handle is known to have been
         # shown while marked, and the cheap bit test is enough to keep the loop quiet.
+        #
+        # ...BUT NOT ON A WINDOW THAT WAS NEVER SHOWN. The sequence ends in
+        # ShowWindow(SW_MINIMIZE), and this file says twenty lines above what that does to a
+        # window with WS_VISIBLE clear: Windows SETS WS_VISIBLE and shows it minimized. The
+        # first minimize is guarded against exactly that; this one ran UNCONDITIONALLY on a
+        # handle's first sighting, so the keeper's own taskbar treatment was what revealed a
+        # headless Edge. Measured 2026-09-08: :9222 (copilot-companion-edge) and :9223
+        # (copilot-bridge-edge), both launched --headless=new, both sitting at
+        # visible=True iconic=True TOOLWINDOW=True -- window-less instances turned into
+        # minimized windows by the code whose job was to keep them out of sight, one of them
+        # titled "about:blank".
+        #
+        # A window that has never been shown has no taskbar membership to re-evaluate, so it
+        # needs no dance at all: set the bit and leave it alone. The shell reads the style at
+        # FIRST show, so a bit set now is the bit that will be read if it is ever shown.
         $ex = [K]::GetWindowLong($h, -20)
         $key = [string]$h
-        if (-not $script:HandledWindows.ContainsKey($key) -or ($ex -band 0x80) -eq 0) {
+        if (-not [K]::IsWindowVisible($h)) {
+            if (($ex -band 0x80) -eq 0) {
+                [K]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+            }
+            $script:HandledWindows[$key] = $true
+        }
+        elseif (-not $script:HandledWindows.ContainsKey($key) -or ($ex -band 0x80) -eq 0) {
             [K]::ShowWindow($h, 0) | Out-Null
             [K]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
             [K]::ShowWindow($h, 6) | Out-Null

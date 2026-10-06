@@ -1,7 +1,9 @@
-"""会話の保持設定 UI。既定が『消さない』であることと、効果を言葉で出すこと。
+"""会話の保持設定 UI。既定が90日であることと、効果を言葉で出すこと。
 
-この保存層は履歴が失われるのを直すために在る。届いた日から削除を始める既定は、
-同じ損失が予定表に載るだけになる。だから 0 が既定で、0 は「消さない」を意味する。
+この保存層は履歴が失われるのを直すために在る。0(消さない)が既定だった時期は、
+この画面を一度も開かなかった端末で履歴が無期限に積み上がった。オーナー判断
+(2026-09-24)により、未設定(=設定ファイルに行が無い)の既定は90日になった。
+0 は既定ではなくなったが意味は変わらない -- 明示的に選べば今でも「消さない」。
 """
 import pathlib
 import re
@@ -10,11 +12,19 @@ SRC = (pathlib.Path(__file__).resolve().parent / "FleetCockpit.cs").read_text(
     encoding="utf-8-sig", errors="replace")
 
 
-def test_both_limits_default_to_keeping_everything():
-    """既定で削除が始まってはいけない。ここが 0 でなくなったら、
-    更新しただけの端末が起動時に履歴を捨てる。"""
-    assert re.search(r"int _retDays = 0;", SRC), "保持日数の既定が 0 でない"
-    assert re.search(r"int _retMb = 0;", SRC), "上限サイズの既定が 0 でない"
+def test_the_day_default_is_ninety_and_the_size_default_is_still_off():
+    """2026-09-24 オーナー判断: 未設定の既定は90日。サイズ上限のほうは対象外で、
+    今までどおり 0 (無効)のまま -- 別の設定で、別の判断。"""
+    assert re.search(r"int _retDays = 90;", SRC), "保持日数の既定が 90 でない"
+    assert re.search(r"int _retMb = 0;", SRC), "上限サイズの既定が 0 でない(対象外のはず)"
+
+
+def test_an_explicit_zero_still_means_keep_everything():
+    """既定が90日に変わっても、鍵に明示的に 0 と書いてあれば LoadSettings が上書きする
+    -- クランプは Math.Max(0, ...) で 0 を弾いていない。"""
+    i = SRC.index('ln.StartsWith("session_retention_days=")')
+    line = SRC[i:i + 200]
+    assert "Math.Max(0," in line, "0 を弾くクランプに変わっている"
 
 
 def test_zero_is_shown_as_keep_all_not_as_a_number():
@@ -25,16 +35,14 @@ def test_zero_is_shown_as_keep_all_not_as_a_number():
     assert SRC.count('_retMb == 0 ? T("ret_keep")') >= 1
 
 
-def test_the_effect_is_spelled_out_before_it_happens():
-    """2つの数字から効果を推測させる設定は、一度入れて後悔するものになる。
-    何が消えるのかを文章で出し、無効時と色を変える。"""
-    assert "PaintRetentionNote" in SRC
-    i = SRC.index("void PaintRetentionNote()")
-    body = SRC[i:i + 2200]
-    assert "ret_off" in body, "無効時の説明が無い"
-    assert "Theme.Warning" in body, "有効時に警告色へ変えていない"
-    assert "より古い会話" in body and "起動時に削除" in body, "何がいつ消えるか書いていない"
-    assert "ret_whole" in body, "会話単位であることを伝えていない"
+def test_the_orange_explainer_note_is_gone():
+    """2026-09-24 オーナー判断: 保持設定の下にあったオレンジ色の説明文
+    (PaintRetentionNote / _retNote) は丸ごと削除。短くした文言に置き換えるのではなく、
+    行自体を無くす -- ステッパーの2行(保持日数・上限サイズ)だけが残る。"""
+    assert "PaintRetentionNote" not in SRC
+    assert "_retNote" not in SRC
+    assert '"ret_whole"' not in SRC
+    assert '"ret_off"' not in SRC
 
 
 def test_it_uses_the_existing_settings_controls():
@@ -94,7 +102,7 @@ def test_the_auto_retry_note_sits_with_its_own_fields():
 
 # ── 実行タイムライン ────────────────────────────────────────────────────────
 
-def test_the_timeline_follows_the_worker_being_inspected():
+def test_content_details_follow_the_worker_being_inspected():
     """タイムラインは workers[0] だけを描いていた。
 
     5ゴールの走行で w0 が 17:50 に完了した後、実行中の w1 を開いても、左の
@@ -111,9 +119,9 @@ def test_the_timeline_follows_the_worker_being_inspected():
     assert "return workers[0]" in body, "何も展開されていないときの既定が無い"
 
 
-def test_changing_the_selection_repaints_the_timeline():
+def test_changing_the_selection_repaints_content_details():
     """署名に載せなければ、選択を変えても『変化なし』と判断されて描き直されない。"""
     i = SRC.index("string spineSig = ")
     sig = SRC[max(0, i - 700):i + 400]
     assert "SpineFocusWorker(spineWorkers)" in sig, "署名が workers[0] を見ている"
-    assert 'S(primaryW, "name")' in sig, "署名にワーカー名が入っていない"
+    assert 'SpineDetailSignature(primaryW)' in sig, "内容詳細の再描画署名が選択ワーカーを追っていない"

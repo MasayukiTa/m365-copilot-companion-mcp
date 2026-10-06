@@ -33,9 +33,35 @@ from relay.relay_fleet import (
 results = []
 
 
+class AdmissionCheckFailed(AssertionError):
+    """A named admission property did not hold.
+
+    AN AssertionError SUBCLASS so pytest reports it as an ordinary failing assertion, with the
+    file and line of the `check` that failed.
+    """
+
+
 def check(name, cond):
+    """Record a named property, and RAISE if it does not hold.
+
+    IT USED TO ONLY RECORD, and `results` is read in exactly one place: `main()`, for the
+    `python relay\test_admission.py` invocation at the bottom of this file. pytest never calls
+    `main()`, and pytest collects 19 test functions from here (ci.yml:253). So a failing check
+    printed FAIL, the test function returned normally, and CI recorded PASS.
+
+    Measured 2026-09-13 by replacing `disk_admission_ok` with `lambda **k: True` -- the
+    admission predicate broken outright: 5 of 20 checks printed FAIL and
+    `test_disk_floor_predicate()` returned normally. Under CI that is a green run, for the
+    floor that stops a fleet filling C:.
+
+    Raising fixes both callers rather than either: pytest gets a real failure at the real line,
+    and `main()` keeps its run-everything-report-all behaviour by catching per test function
+    below -- explicitly now, where before it was implicit and was the defect.
+    """
     results.append(bool(cond))
     print("[%s] %s" % ("PASS" if cond else "FAIL", name))
+    if not cond:
+        raise AdmissionCheckFailed(name)
 
 
 class FakeContext:
@@ -188,12 +214,33 @@ def _restore_worker(orig):
     RelayWorker.attach = orig["attach"]
     RelayWorker.poll = orig["poll"]
     RelayWorker.close = orig["close"]
+    if "tab_weight" in orig:
+        RelayWorker.tab_weight = orig["tab_weight"]
 
 
 # ── (b) continuous admission: completion frees a slot -> next admitted, no barrier ───────────
 def test_continuous_admission_no_barrier():
     rf.avail_phys_mb = lambda: 64000.0       # RAM never the constraint here
     rf.free_disk_gb = lambda path=None: 500.0  # disk never the constraint here
+
+    # THIS TEST IS ABOUT THE TAB CAP. Socket workers deliberately bypass worker-count/tab
+    # admission and are paced at the generative send instead (test_socket_admission_no_pending).
+    # Force the route closed here so fake_attach's page sentinel represents the route the
+    # production admission loop actually budgeted.
+    class _NoSocketRoute:
+        closed_reason = ""
+        def open(self):
+            return False
+        def needs_refresh(self):
+            return False
+        def record(self, *a, **k):
+            pass
+
+    orig_route = rf._socket_route
+    orig_due = rf.admission_is_due
+    rf._socket_route = lambda: _NoSocketRoute()
+    rf.admission_is_due = lambda now=None: True
+
     state = {"control": {}}
     orig = _install_fake_worker(state)
     try:
@@ -201,13 +248,26 @@ def test_continuous_admission_no_barrier():
         # must complete (continuous re-admission as slots free, not "batch of 2 barrier").
         goals = ["g0", "g1", "g2", "g3", "g4"]
         max_open_seen = {"v": 0}
-        sweeps = {"n": 0}
+        # TRANSITIONS OF THE OPEN SET, NOT POLLING ITERATIONS. This counted `on_tick` calls
+        # against a limit of 12, and on_tick fires once per POLL -- with poll_s=0 that measures
+        # how fast the CPU span the loop. Measured 2026-09-13: 12304 iterations at 0908531 and
+        # 13455 after that day's changes, for the same five goals. Three orders of magnitude
+        # out, in both trees, and invisible because `check` only recorded.
+        #
+        # What the original wanted is in its own comment -- "a continuous flow finishes in ~5-7
+        # sweeps", i.e. no batch barrier -- and five goals at a cap of two is five admissions
+        # and five completions. Counting changes to the set of open tabs says exactly that, and
+        # says it independently of poll_s and of how fast the machine is.
+        opens = {"seen": frozenset(), "transitions": 0}
 
         def on_tick(workers):
-            open_now = sum(1 for w in workers
-                           if getattr(w, "page", None) is not None and w.status not in TERMINAL)
-            max_open_seen["v"] = max(max_open_seen["v"], open_now)
-            sweeps["n"] += 1
+            open_names = frozenset(w.name for w in workers
+                                   if getattr(w, "page", None) is not None
+                                   and w.status not in TERMINAL)
+            max_open_seen["v"] = max(max_open_seen["v"], len(open_names))
+            if open_names != opens["seen"]:
+                opens["transitions"] += 1
+                opens["seen"] = open_names
             # complete the OLDEST currently-open worker each sweep so a slot frees and the
             # next queued goal must be admitted on the following sweep (the continuous flow).
             for w in workers:
@@ -220,10 +280,15 @@ def test_continuous_admission_no_barrier():
         all_done = all(r["outcome"] == "DONE" for r in res)
         check("continuous_all_complete", len(res) == 5 and all_done)
         check("continuous_cap_never_exceeded", max_open_seen["v"] <= 2)
-        # if there were a "finish all then next batch" barrier with 5 goals / cap 2, we'd need
-        # far more idle sweeps; a continuous flow finishes in ~5-7 sweeps. Just assert progress.
-        check("continuous_made_progress", sweeps["n"] <= 12)
+        # A "finish all, then the next batch" barrier would show up here: five goals at a cap
+        # of two is five admissions and five completions, so ten changes to the open set plus
+        # the final empty one. A batched flow performs the same admissions but cannot interleave
+        # them, so the bound is what distinguishes the two -- and unlike a sweep count it does
+        # not move with poll_s or with the speed of the machine.
+        check("continuous_made_progress", opens["transitions"] <= 12)
     finally:
+        rf._socket_route = orig_route
+        rf.admission_is_due = orig_due
         _restore_worker(orig)
 
 
@@ -775,6 +840,203 @@ def test_tab_load_accounting():
     check("tabload_pending_uncounted", w.tab_load() == 2)
 
 
+def test_soft_shrink_does_not_close_running_tabs():
+    """2026-09-24 OWNER: cockpit tab chip showed "3/1" -- 3 real browser tabs open against a
+    cap the fleet's own autoscale had just driven down to 1. Traced to `ram_target_cap`'s own
+    docstring: "A lower cap is SOFT: running tabs are not killed, we just stop opening new
+    ones until some finish (natural drain)." `mc_box[0]` (what the cockpit shows as the
+    denominator) is a LIVE ADMISSION ceiling, not a hard concurrent-tab limit -- it only gates
+    the NEXT open. This is BY DESIGN (confirmed: no worker.close() call anywhere gets fired by
+    a cap change, only by a worker going terminal -- see the sweep loop in run_relay_fleet).
+
+    This test proves the property end-to-end, not just the pure ram_target_cap math already
+    covered by test_hysteresis_no_thrash: start 2 workers under cap=2, shrink mc_box to 1
+    WHILE both are still open, and confirm (a) neither running worker is torn down by the
+    shrink, so open tab count can sit above the live cap for a while -- exactly the cockpit's
+    "N/M with N>M" reading -- and (b) admission of the 3rd goal stays blocked until enough
+    drains to fit the new, lower budget. Nothing here is a bug to fix; the fix for the
+    2026-09-24 report is the tooltip (ui/FleetCockpit.cs "tabs_chip_hint") explaining this,
+    plus this test so the property stays pinned."""
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_worker(state)
+    try:
+        goals = ["g0", "g1", "g2"]
+        mc_box = [2]                      # start admitting up to 2 concurrently
+        observed = {
+            "shrunk": False,
+            "open_exceeded_cap_after_shrink": False,
+            "third_admitted_while_over_cap": False,
+        }
+        # EXPLICIT PHASES, NOT RE-DERIVED FROM WORKER STATE EACH TICK. An earlier version of
+        # this test inferred "what to do next" from the live worker statuses and had a hole:
+        # once the two started workers were both terminal, nothing told it to also drain w2,
+        # so the fleet sat at open_now==1==cap forever and the test hung (a live python.exe
+        # spinning at poll_s=0, found and killed by pid during review). A phase counter that
+        # only ever advances is easy to prove terminates; state re-derived from live objects
+        # is not, once a THIRD actor (w2) exists that the earlier branches didn't plan for.
+        phase = {"n": 0, "ticks": 0}
+
+        def on_tick(workers):
+            phase["ticks"] += 1
+            by = {w.name: w for w in workers}
+            w0, w1, w2 = by.get("w0"), by.get("w1"), by.get("w2")
+            open_now = sum(1 for w in workers
+                           if getattr(w, "page", None) is not None and w.status not in TERMINAL)
+
+            if phase["n"] == 0:
+                # wait for both g0/g1 to be admitted and running, then shrink the live cap to
+                # 1 -- the RAM-autoscale event the owner's report traced ("RAM-adjust 1..1
+                # tab(s)") -- WITHOUT touching either running worker.
+                if w0 is not None and w1 is not None \
+                        and w0.status == "waiting" and w1.status == "waiting":
+                    mc_box[0] = 1
+                    observed["shrunk"] = True
+                    phase["n"] = 1
+                return
+
+            if phase["n"] == 1:
+                # the tick right after the shrink: both tabs are still open, over the new cap.
+                observed["open_exceeded_cap_after_shrink"] = open_now > mc_box[0]
+                # the property under test: the 2 already-open tabs are NOT force-closed by the
+                # lower cap -- both must still be genuinely open, not merely uncounted.
+                check("shrink_keeps_both_running_workers_open",
+                      w0.status == "waiting" and w1.status == "waiting"
+                      and w0.page is not None and w1.page is not None)
+                if w2 is not None and getattr(w2, "page", None) is not None:
+                    observed["third_admitted_while_over_cap"] = True
+                state["control"]["w0"] = "done"     # drain one
+                phase["n"] = 2
+                return
+
+            if phase["n"] == 2:
+                # w0 has (or will next sweep have) closed; w1 must still be running solo, and
+                # the 3rd goal must not have snuck in while the fleet was over its new budget.
+                if w1 is not None and getattr(w1, "page", None) is not None \
+                        and w2 is not None and getattr(w2, "page", None) is not None:
+                    observed["third_admitted_while_over_cap"] = True
+                if w1 is not None and w1.status == "waiting":
+                    state["control"]["w1"] = "done"
+                    phase["n"] = 3
+                return
+
+            # phase 3+: unconditionally drain whatever is open (w2, once admitted under the
+            # active_open==0 bootstrap) so the run reaches completion.
+            for w in workers:
+                if getattr(w, "page", None) is not None and w.status == "waiting":
+                    state["control"][w.name] = "done"
+            # safety net: this loop is proven to terminate by construction (each phase only
+            # ever finishes MORE workers), but a future edit that breaks that invariant should
+            # fail loudly here rather than spin the CPU forever.
+            if phase["ticks"] > 200:
+                for w in workers:
+                    state["control"][w.name] = "done"
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=2,
+                              mc_box=mc_box, poll_s=0, on_tick=on_tick,
+                              notify=lambda *a, **k: None)
+        check("soft_shrink_all_goals_complete",
+              len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
+        check("soft_shrink_actually_shrank", observed["shrunk"] is True)
+        check("soft_shrink_open_count_did_exceed_live_cap",
+              observed["open_exceeded_cap_after_shrink"] is True)
+        # the 3rd goal must NOT have been squeezed in while the fleet sat above its new,
+        # lower budget -- the shrink is soft on what's RUNNING, not a hole for NEW admission.
+        check("soft_shrink_no_new_admission_while_over_cap",
+              observed["third_admitted_while_over_cap"] is False)
+    finally:
+        _restore_worker(orig)
+
+
+def _install_fake_socket_worker(monkey_state):
+    """Like _install_fake_worker, but attach() takes a SOCKET (page stays None, self.socket =
+    True) -- the tab_weight()==0 case that admits_another_tab's tab-weight math cannot bound,
+    since projected_peak sums tab_weight and a socket always contributes 0. `_holds_slot` (the
+    unit `_active_open()` counts) is True for a socket worker precisely so this fixture can
+    stand in for the production socket-route path without opening a browser."""
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
+            "tab_weight": RelayWorker.tab_weight}
+
+    def fake_attach(self, context, agent_url):
+        self.socket = True
+        self.status = "waiting"
+        return True
+
+    def fake_poll(self):
+        if self.status in TERMINAL:
+            return True
+        cmd = monkey_state["control"].get(self.name, "waiting")
+        if cmd == "done":
+            self.status, self.outcome = "done", "DONE"
+            self.verified = True
+            return True
+        self.status = "waiting"
+        return False
+
+    def fake_close(self):
+        self.closed = True
+        self.socket = False
+        self.drv = None
+
+    def fake_tab_weight(self, assume_socket=None):
+        # DETERMINISTIC 0, regardless of the real (unopened, in this test) socket route --
+        # production's `assume_socket=_socket_open_now()` resolves the same way once the route
+        # is actually captured, and this fixture exists to exercise that state without one.
+        return 0
+
+    RelayWorker.attach = fake_attach
+    RelayWorker.poll = fake_poll
+    RelayWorker.close = fake_close
+    RelayWorker.tab_weight = fake_tab_weight
+    return orig
+
+
+def test_socket_workers_respect_the_live_cap():
+    """2026-09-25 OWNER: autoscale held mc_box[0] at 1 ("RAM-adjust 1..1 tab(s)") and the fleet
+    still grew to 41 workers with more than 10 running at once. Root cause: a socket worker's
+    tab_weight() is 0 (relay_fleet.py:4545, `main = 0 if self.socket ... else 1`) and stays 0
+    for as long as it runs, so `_projected_peak()` (the sum admission reserves against) never
+    grows past 0 once the fleet is on sockets -- `admits_another_tab` says yes to the entire
+    pending queue regardless of mc_box[0]. RAM was never the binding resource for these workers;
+    Microsoft's per-Dataverse-environment 100 RPM Copilot quota (quota_meter.py) is, and it does
+    not care whether a turn came over a socket or a tab -- concurrent socket workers still spend
+    it one at a time and 10+ at once is exactly how a burst of refusals happens.
+
+    This proves the fix (relay_fleet.py's admission loop ANDs a `_active_open() < max(1,
+    mc_box[0])` count gate onto the existing tab-weight gate -- _active_open() already counts
+    sockets, per _holds_slot's own docstring): with mc_box[0]==1 and three goals that all take
+    sockets, only ONE may be concurrently admitted at a time, and all three still complete."""
+    rf.avail_phys_mb = lambda: 64000.0
+    rf.free_disk_gb = lambda path=None: 500.0
+    state = {"control": {}}
+    orig = _install_fake_socket_worker(state)
+    try:
+        goals = ["g0", "g1", "g2"]
+        mc_box = [1]
+        observed = {"max_concurrent_sockets": 0}
+
+        def on_tick(workers):
+            open_now = sum(1 for w in workers
+                           if getattr(w, "socket", False) and w.status not in TERMINAL)
+            observed["max_concurrent_sockets"] = max(observed["max_concurrent_sockets"], open_now)
+            # finish whichever socket worker is open so the run can make progress
+            for w in workers:
+                if getattr(w, "socket", False) and w.status == "waiting":
+                    state["control"][w.name] = "done"
+                    break
+
+        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=1,
+                              mc_box=mc_box, poll_s=0, on_tick=on_tick,
+                              notify=lambda *a, **k: None)
+        check("socket_admission_all_goals_complete",
+              len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
+        check("socket_admission_never_exceeded_cap_of_one",
+              observed["max_concurrent_sockets"] <= 1)
+    finally:
+        _restore_worker(orig)
+
+
 def test_tab_budget_admission():
     # A worker that fans out to 3 tabs consumes the whole 3-tab budget, so a 2nd worker waits --
     # "3 open tabs == parallelism 3", reactive, no human cap. All goals still complete (continuous).
@@ -841,9 +1103,20 @@ def test_lock_detector_ignores_security_review_prose():
     rf2._unlock_password = lambda: "test-password-123"
     try:
         w = RelayWorker("do the thing", "wlock")
+        # THE DELTA, NOT THE ABSOLUTE. This asserted `== 1` and measured 2, because
+        # `_initial_job_with_unlock` does a PROACTIVE unlock whenever a local password exists
+        # and the constructor charges it to the same budget on purpose ("Count the proactive
+        # attempt against the same bounded budget used by reactive re-unlocks"). So the counter
+        # starts at 1 and the reactive injection takes it to 2.
+        #
+        # Which also made the check ENVIRONMENT-DEPENDENT: CI has no password file, so there is
+        # no preflight, the counter starts at 0, and `== 1` held on the runner while failing on
+        # a developer's machine -- for a reason having nothing to do with the property named.
+        # One reactive injection is the property; the baseline is not.
+        _before = w._unlock_attempts
         w._decide(real_err_ip)
         check("real_lock_error_triggers_unlock_injection",
-              w._unlock_attempts == 1 and "unlock" in (w.job or "").lower()
+              w._unlock_attempts == _before + 1 and "unlock" in (w.job or "").lower()
               and w.status != "stuck")
     finally:
         rf2._unlock_password = orig_pw
@@ -874,9 +1147,18 @@ def test_lock_detector_ignores_security_review_prose():
     rf2._unlock_password = lambda: calls.__setitem__("n", calls["n"] + 1) or "test-password-123"
     try:
         w2 = RelayWorker("review the security module", "wreview")
+        # THE DELTA ACROSS `_decide`, for the same reason as the positive check above:
+        # constructing a worker performs the PROACTIVE unlock when a local password exists,
+        # which calls `_unlock_password` once and sets `_unlock_attempts` to 1 before this
+        # reply is seen at all. Measured 2026-09-13: calls=1, _unlock_attempts=1 straight out
+        # of the constructor. Asserting 0 tested the preflight, not the false positive this
+        # test is named for -- and passed on CI, which has no password file, while failing on
+        # any machine that does.
+        _before_attempts, _before_calls = w2._unlock_attempts, calls["n"]
         w2._decide(review)
         check("review_prose_does_not_trigger_unlock",
-              w2._unlock_attempts == 0 and calls["n"] == 0 and w2.status != "stuck")
+              w2._unlock_attempts == _before_attempts and calls["n"] == _before_calls
+              and w2.status != "stuck")
     finally:
         rf2._unlock_password = orig_pw2
 
@@ -1105,25 +1387,38 @@ def test_stuck_noprogress_early_exit():
 
 
 def main():
-    test_disk_floor_predicate()
-    test_tab_load_accounting()
-    test_tab_budget_admission()
-    test_hysteresis_no_thrash()
-    test_continuous_admission_no_barrier()
-    test_verifying_counts_in_cap()
-    test_disk_floor_blocks_in_loop()
-    test_stop_cancels_running_fleet()
-    test_pause_freezes_then_resumes()
-    test_fleet_research_nonblocking()
-    test_research_session_ram_gated_open()
-    test_dead_agent_detector()
-    test_tool_unreachable_infra()
-    test_transient_outage_window()
-    test_consent_detector()
-    test_lock_detector_ignores_security_review_prose()
-    test_renav_first_on_consent_and_dead_agent()
-    test_unfinished_excludes_stuck_keeps_infra_stuck()
-    test_stuck_noprogress_early_exit()
+    """Run every check and report them all, as the script invocation always did.
+
+    EXPLICITLY CATCHING NOW. `check` raises, so an unguarded call list would stop at the first
+    failing property and the script would no longer say which of the others hold -- which is
+    the whole reason this file has a `results` list. The failure is still recorded by `check`
+    before it raises, so the tally below is unchanged.
+    """
+    for _fn in (test_disk_floor_predicate,
+                test_tab_load_accounting,
+                test_tab_budget_admission,
+                test_socket_workers_respect_the_live_cap,
+                test_soft_shrink_does_not_close_running_tabs,
+                test_hysteresis_no_thrash,
+                test_continuous_admission_no_barrier,
+                test_verifying_counts_in_cap,
+                test_disk_floor_blocks_in_loop,
+                test_stop_cancels_running_fleet,
+                test_pause_freezes_then_resumes,
+                test_fleet_research_nonblocking,
+                test_research_session_ram_gated_open,
+                test_dead_agent_detector,
+                test_tool_unreachable_infra,
+                test_transient_outage_window,
+                test_consent_detector,
+                test_lock_detector_ignores_security_review_prose,
+                test_renav_first_on_consent_and_dead_agent,
+                test_unfinished_excludes_stuck_keeps_infra_stuck,
+                test_stuck_noprogress_early_exit):
+        try:
+            _fn()
+        except AdmissionCheckFailed:
+            pass          # already recorded by `check`; keep going so the tally is complete
     print("\n=== %d/%d admission checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1
 

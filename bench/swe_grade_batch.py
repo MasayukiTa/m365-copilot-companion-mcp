@@ -28,6 +28,9 @@ import swe_check_remote as R   # reuse the proven SSH/scp/wsl plumbing
 import verdicts as _V          # the one definition of "this row is not a measurement"
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+from relay.bestofn_run import load_candidate_dir  # the directory loader, not a hand-rolled copy
 SWEDIR = os.path.join(REPO, ".fleet", "swe")
 PREDS = os.path.join(SWEDIR, "preds_solve")
 RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
@@ -92,13 +95,20 @@ def launch_grade(inst, diff, runid):
     remote_wsl = "%s/%s.patch" % (R.REMOTE_DIFFS_WSL, runid)
     if not R._scp(lp, remote_win):
         return False
-    # fresh unit (nonce in runid) -> never collides; reset-failed is belt-and-suspenders.
-    launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc "
-              "'systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/grade_" + runid + ".log; "
-              "systemd-run --no-block --unit=" + runid + " bash " + R.RUNNER_WSL
-              + " " + inst + " " + remote_wsl + " " + runid + "' 2>$null) -join '' }; "
-              "if(Wait-Job $j -Timeout 25){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    R._ssh_ps(launch, 55)
+    # RUN IT INSIDE A HELD SESSION, NOT DETACHED. Measured 2026-09-10: on this eval host
+    # `systemd-run --no-block` work is STOPPED after 44-51s having produced nothing (journal:
+    # "Stopping ... Deactivated successfully", no error, no OOM, no timeout; dmesg shows
+    # journald re-initialising as the distro's systemd is torn down once no wsl session holds
+    # it). `setsid nohup` dies the same way and periodic touches do not rescue it. The identical
+    # command run synchronously inside the session finished in 107s with a real verdict. Swept
+    # here too even though this module has no callers, because leaving one copy of a fixed
+    # failure class behind is how it comes back wearing a different name.
+    hold_s = max(120, int(R.POLL_SECONDS * R.POLL_MAX))
+    body = "bash " + R.RUNNER_WSL + " " + inst + " " + remote_wsl + " " + runid
+    run_ps = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + body + "\" 2>$null)"
+              " -join '' }; if(Wait-Job $j -Timeout " + str(hold_s) + "){ Receive-Job $j } else { 'TIMEOUT' };"
+              " Remove-Job $j -Force")
+    R._ssh_ps(run_ps, hold_s + 60)
     return True
 
 
@@ -138,6 +148,31 @@ def _tail_reason(content, limit=300):
     return (" | ".join(lines[-4:]))[:limit] or "(the verdict file was empty)"
 
 
+def load_preds(preds_dir, want=None):
+    """instance_id -> model_patch for every capture in preds_dir, via load_candidate_dir.
+
+    load_candidate_dir already packages "sorted directory listing, .json filter, tolerant of
+    unreadable/malformed files, one-element-list-of-dict capture" -- swe_solve_decoupled.py and
+    swe_check.py both write exactly that shape (filename == instance_id, one record, a
+    "model_patch" key always present). The KeyError/TypeError guard below matches the old
+    hand-rolled loop's blanket `except Exception: pass` for any record that does NOT have that
+    shape (skip it), rather than letting a malformed record crash the batch.
+
+    `want`, when given, is the set of instance_ids to keep (mirrors --instances/--targets-file).
+    """
+    preds = {}
+    for rec in load_candidate_dir(preds_dir):
+        try:
+            inst = rec["instance_id"]
+            patch = rec["model_patch"]
+        except (KeyError, TypeError):
+            continue
+        if want is not None and inst not in want:
+            continue
+        preds[inst] = patch
+    return preds
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--preds-dir", default=PREDS)
@@ -156,17 +191,7 @@ def main():
     elif a.targets_file:
         p = a.targets_file if os.path.isabs(a.targets_file) else os.path.join(SWEDIR, a.targets_file)
         want = [l.strip() for l in open(p, encoding="utf-8") if l.strip()]
-    preds = {}
-    for fn in sorted(os.listdir(a.preds_dir)):
-        if not fn.endswith(".json"):
-            continue
-        inst = fn[:-5]
-        if want is not None and inst not in want:
-            continue
-        try:
-            preds[inst] = json.load(open(os.path.join(a.preds_dir, fn), encoding="utf-8"))[0]["model_patch"]
-        except Exception:
-            pass
+    preds = load_preds(a.preds_dir, want)
 
     done = load_results(a.results)
     todo = [i for i in preds if i not in done]
@@ -247,7 +272,7 @@ def _summary(results_path, insts):
     d = load_results(results_path)
     sub = {i: d[i] for i in insts if i in d}
     n = len(sub)
-    resolved = sum(1 for r in sub.values() if r.get("verdict") == "RESOLVED")
+    resolved = sum(1 for r in sub.values() if _V.is_resolved(r.get("verdict")))
     notr = sum(1 for r in sub.values() if r.get("verdict") == "not")
     # EVERY non-measurement, named. Counting only EVALERR left NOPATCH invisible: the rows
     # were correctly kept out of `graded`, and a reader had no way to see they existed.

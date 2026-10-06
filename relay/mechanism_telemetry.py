@@ -42,7 +42,75 @@ LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
 
 #: Every mechanism that claims to improve accuracy. Named here so a mechanism that never
 #: reports is visible as a gap rather than as an absence nobody noticed.
-MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill", "effort")
+MECHANISMS = ("fanout", "refuter", "panel", "veto", "retry", "bestofn", "skill", "effort",
+              # supervisor_verify's step 4, wired live 2026-09-11: did the working tree
+              # move between the acceptance checks passing and the worker settling.
+              # REGISTERED, because summarise() walks this tuple -- an unregistered
+              # mechanism still gets written (record() says so deliberately) but never
+              # appears in any summary, which is an instrument with no reader.
+              "tree_moved_after_verify",
+              # The chat window's `/goal ` verb, which turns what would have been a steer into
+              # a new task in the same conversation. Registered 2026-09-22 because the standing
+              # question about it -- has anyone ever used it -- had no answer anywhere: the
+              # command is consumed and deleted, and once the item is gone a `/goal` submission
+              # is indistinguishable from any other goal. Measured while asking: 6 of 2,041
+              # recorded goals carry the follow-up framing, so the neighbouring path IS used,
+              # which is what made "and this one?" worth being able to answer.
+              "new_task_escape",
+              # The refusal-recovery diagnosis. Registered 2026-09-22 as a TRIP-WIRE, not as a
+              # reader: measured 2026-09-20, every recovery_cause/result/state on this machine
+              # is empty and every fresh_replay_count is 0, and the standing decision is to
+              # build a reader when the first non-empty value appears. Nothing was going to
+              # announce that, because those fields land in a snapshot no UI or script opens.
+              # A row here is how the day gets noticed.
+              "refusal_recovery",
+              # The two-consecutive-turns stop for tool calls that never reach the gateway.
+              # Registered 2026-09-22 on the same footing as refusal_recovery: scanned across
+              # 78 durable worker records and 470 status rows and never seen to fire. It
+              # declares an INFRASTRUCTURE fault rather than a task failure, so the first time
+              # it is right about that should not land only in a status field the next sweep
+              # overwrites.
+              "unlanded_calls",
+              # Phase 1 of the per-goal effort policy: SHADOW rows only (what it would have
+              # done). Registered so summarise() reads it; see relay/effort_policy.py.
+              "effort_policy",
+              # The first message of a fresh conversation was not absorbed (the reply is a
+              # greeting / ask-for-the-goal / empty-message / canned refusal) and was sent
+              # again. Registered so the redelivery RATE can be read from one place.
+              "first_message_not_absorbed",
+              # A split reply whose list numbers were lost in transit, parsed from the plain
+              # lines above SUBTASKS_READY (relay/fanout.py). One row per rescued split, so
+              # the rate of this path is readable rather than inferred.
+              "fanout_unnumbered_fallback",
+              # A finished child whose answer was missing from the campaign ledger: recovered
+              # from a durable source or re-queued once, and the merge-queue stall detector
+              # that notices a family waiting forever on such a child.
+              "child_result_recovery",
+              "merge_stalled_missing_child_result",
+              # Two siblings of one campaign wrote the same path, or one wrote a path another's
+              # step names. SHADOW only (relay/write_scope.py): recorded, never acted on.
+              "scope_overlap",
+              # A NESTED split refused because its root's usage could not be read (fail closed),
+              # and the campaigns ledger passing the size where it should have been compacted
+              # (relay/fleet_retention.py). Registered so a fan-out that is silently refusing
+              # splits shows up in a summary instead of only in a console line.
+              "fanout_budget_usage_unknown",
+              "campaigns_ledger_large",
+              # A lock refusal landed while several workers had a turn in flight and could not be
+              # attributed to this one, so no unlock steer was sent (relay_fleet._looks_locked).
+              "unlock_refusal_unattributed",
+              # MCP_JUDGE_BACKEND=sampling was configured but the backend is gone (fastmcp 4
+              # removed Context.sample); one row per process (tools/judge_backend.py).
+              "judge_backend_sampling_removed",
+              # The bridge's tool-call probe failed (or a probe turn never ran) and the next one
+              # was pushed back (interval x 2^failures, capped) instead of re-asked at once.
+              # One row per backed-off probe (bridge/copilot_bridge.py _record_probe_backoff).
+              "tool_probe_backoff",
+              # A conversation was opened for a worker and no message went out within a minute,
+              # and the merge's conversation choice (relay/conversation_saving.py). Registered so
+              # the unsent RATE and the aggregator inputs are readable from one place.
+              "conversation_created_unsent",
+              "aggregator_conversation")
 
 
 def patch_hash(text):
@@ -132,6 +200,22 @@ def funnel(rows, mechanism=None):
         trig = [r for r in elig if r.get("triggered")]
         exe = [r for r in trig if r.get("executed")]
         chg = [r for r in exe if r.get("changed_decision")]
+        # NOT REACHED IS NOT THE SAME AS ANSWERED NO, AND THIS FUNCTION USED TO SAY IT WAS.
+        # `record`'s own docstring sets the rule -- None means the step above stopped and the
+        # step was never reached, False means it was reached and the answer was no -- and adds
+        # that "collapsing those two is how a mechanism that is switched off comes to look
+        # like one that ran and did nothing". Every line above collapses them, because a None
+        # is falsy, and `stops_at` then reported the wrong stop.
+        #
+        # Measured on the live ledger 2026-09-22: `effort` had configured=416 and eligible=0,
+        # which read as "solving a problem that does not occur here". It is not. All 416 of
+        # those rows carry eligible=None -- eligibility was never determined, because that
+        # block records what was CONFIGURED at run start and nothing later writes the step.
+        # Same for refuter and fanout: 416 each, undetermined, exactly the same number,
+        # because one call site records all three the same way. Half of every "ineligible"
+        # row in the ledger is this.
+        undet = len([r for r in conf if r.get("eligible") is None])
+        said_no = len([r for r in conf if r.get("eligible") is False])
         out[m] = {
             "records": len(rs),
             "configured": len(conf),
@@ -139,10 +223,20 @@ def funnel(rows, mechanism=None):
             "triggered": len(trig),
             "executed": len(exe),
             "changed_decision": len(chg),
+            # The two halves of what used to be one number. A reader that only sees
+            # "eligible: 0" cannot tell a mechanism that never gets an opportunity from one
+            # whose opportunity is never assessed, and those call for opposite work: the
+            # first is a mechanism to retire, the second is an instrument to finish.
+            "eligibility_undetermined": undet,
+            "eligibility_said_no": said_no,
             # Where it stops is the finding. A mechanism with configured=0 was never given a
-            # chance; one with eligible=0 is solving a problem that does not occur here; one
-            # with changed_decision=0 ran and made no difference.
+            # chance; one with eligible=0 AND eligibility_said_no>0 is solving a problem that
+            # does not occur here; one with changed_decision=0 ran and made no difference.
+            #
+            # "not assessed" is its own stop and was previously reported as "no opportunity",
+            # which is a claim about the world made out of a gap in the record.
             "stops_at": ("never configured" if not conf else
+                         "not assessed" if not elig and not said_no else
                          "no opportunity" if not elig else
                          "did not trigger" if not trig else
                          "did not execute" if not exe else

@@ -71,8 +71,24 @@ def test_an_unknown_language_is_costed_as_expensive():
     assert C.concurrency_for(["fortran"], 5.0) <= C.concurrency_for(["python"], 5.0)
 
 
-def test_a_mixed_batch_pays_the_heaviest_price():
-    assert C.concurrency_for(["python", "js"], 5.0) == C.concurrency_for(["js"], 5.0)
+def test_a_mixed_batch_pays_the_heaviest_price(monkeypatch):
+    """THIS ASSERTED THE OPPOSITE OF ITS OWN NAME AND WAS GREEN FOR IT.
+
+    It compared the mixed batch against `["js"]` -- the LIGHTER member. "Pays the heaviest
+    price" means it must match the HEAVIEST, which is python. The two comparisons give the
+    same answer only when both saturate at the same width, and at the floor this was written
+    against (3.0 GiB) both came out 1, so the wrong comparison passed.
+
+    THE FLOOR IS PINNED HERE, WHICH IS WHY THIS SURFACED AT ALL. `FLEET_FLOOR_GIB` is read
+    live from the operator's settings (`settings_disk_floor`), so a test that leaves it alone
+    is asserting a property of THIS MACHINE'S CONFIGURATION, not of the batching rule -- the
+    same defect as a wall-clock assertion on a shared machine. Measured 2026-09-20: the live
+    setting is 1.0, the fallback in the code is 3.0, and at 1.0 the two sides differ (2 vs 3)
+    and the test finally said so.
+    """
+    monkeypatch.setattr(C, "FLEET_FLOOR_GIB", 3.0)
+    assert C.concurrency_for(["python", "js"], 5.0) == C.concurrency_for(["python"], 5.0)
+    assert C.concurrency_for(["python", "js"], 5.0) != C.concurrency_for(["js"], 8.0),         "the mixed batch is being costed at the lighter member"
 
 
 # -- the grouping ------------------------------------------------------------------------
@@ -466,6 +482,16 @@ def test_the_check_runs_after_staging_not_before():
 
 # -- the units, which did not agree across a module boundary -------------------------------
 
+#: THE TWO TESTS IN THIS FILE WHOSE SUBJECT IS THIS MACHINE, marked so the other sixty-five
+#: can be watched by CI. They are not weaker -- they are the only ones here asking about the
+#: host rather than about the batching rule -- but leaving them unmarked kept the WHOLE FILE
+#: out of the hermetic suite, and three rules-about-the-code tests rotted red in that blind
+#: spot until a local full run found them on 2026-09-20.
+_WINDOWS_ONLY = pytest.mark.skipif(
+    os.name != "nt", reason="reads C:/ and a Windows toolchain path; the subject is this host")
+
+
+@_WINDOWS_ONLY
 def test_free_space_is_read_in_the_same_unit_the_fleet_uses():
     """THE DEFECT THAT STAGED TWO UNRUNNABLE BATCHES TONIGHT. This module divided by 1e9 and
     the fleet's predicate divides by 1024**3, so the same disk read 3.10 here and 2.89 there --
@@ -506,9 +532,23 @@ def test_a_disk_just_above_the_fleet_floor_yields_one_at_a_time():
     assert C.concurrency_for(["python"], C.FLEET_FLOOR_GIB + 0.2) == 1
 
 
-def test_heavy_languages_go_serial_at_the_disk_this_machine_actually_has():
+def test_heavy_languages_go_serial_at_the_disk_the_measurement_was_taken_on(monkeypatch):
     """Measured on this machine: ~4.2 GiB free after a clean discard. Two teleport worktrees
-    did not fit, twice."""
+    did not fit, twice.
+
+    THE FLOOR IS PART OF THE MEASUREMENT AND WAS NOT PINNED. That observation was taken while
+    the fleet floor was 3.0 GiB; `FLEET_FLOOR_GIB` is read live from the operator's settings,
+    which now say 1.0, and at 1.0 this same function answers 2 for go and js. So the test was
+    not wrong about the disk -- it was silently re-asked against a different configuration
+    every time it ran, which is the same failure shape as a wall-clock bound on a shared
+    machine.
+
+    WHAT THE LIVE SETTING IMPLIES IS NOT THIS TEST'S TO DECIDE, and is recorded rather than
+    acted on: at floor 1.0 the batcher will stage two go/js worktrees at 4.24 GiB free, and
+    the sentence above this one is the record of two of them not fitting. Changing a disk
+    floor is an operator decision and goes through the GUI.
+    """
+    monkeypatch.setattr(C, "FLEET_FLOOR_GIB", 3.0)
     free = 4.24
     # EVERYTHING is serial at this disk now, python included. The line that expected python to
     # run three-wide here came from costing it at 120 MB; openlibrary was then measured at
@@ -521,6 +561,7 @@ def test_heavy_languages_go_serial_at_the_disk_this_machine_actually_has():
 
 # -- the reclaim that did not reclaim ------------------------------------------------------
 
+@_WINDOWS_ONLY
 def test_the_go_toolchain_is_actually_found():
     """THE DEFECT THAT MADE THE RECLAIM A NO-OP. The fallback path was written with
     backslashes and the file ended up holding a control byte where the "b" of "bin" belonged,
@@ -860,7 +901,11 @@ def test_batch_width_follows_the_disk_as_it_changes(monkeypatch):
     ids = ["i%d" % n for n in range(5)]
     sizes = [len(g) for g in C.batches(ids, 0)]
     assert sizes[0] == 1, "the first batch is sized by the disk at the time: %r" % sizes
-    assert 2 in sizes[1:], (
+    # WIDER, NOT EXACTLY TWO. The property this pins is that a later batch RE-READS the disk;
+    # how wide it then goes is a function of the floor, which is read live from the operator's
+    # settings. Pinning the literal 2 made this test fail at floor 1.0 (it got 3) for being
+    # MORE right about the thing it was checking.
+    assert max(sizes[1:]) > sizes[0], (
         "later batches must re-read the disk; got %r, which is the defect this pins" % sizes)
 
 

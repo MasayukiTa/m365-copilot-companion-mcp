@@ -33,8 +33,12 @@ MCP_IMPL_AGENT_URL / MCP_FLEET_AGENT_URL in .env (gitignored).
 from __future__ import annotations
 
 import argparse
+from functools import lru_cache
+import io
 import json
+import math as _math
 import os
+import re as _re
 import sys
 
 from relay import outcomes as _outcomes
@@ -64,12 +68,16 @@ try:
 except Exception:
     pass
 
+from relay.acceptance import MalformedCheck  # noqa: E402
 from relay.relay_fleet import (  # noqa: E402
     EVAL_STALL_CEILING_S, TERMINAL, VERIFY_STATUSES, auto_concurrency, avail_phys_mb,
     goal_fields, run_relay_fleet,
 )
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
+from relay.fanout import fanout_family_view  # noqa: E402
+from relay.control_markers import CLOSING_INSTRUCTION  # noqa: E402
+from relay.control_envelopes import is_local_loop_control_submission  # noqa: E402
 
 
 # ── COORDINATOR OUTPUT CAPTURE (TEE) ────────────────────────────────────────────
@@ -118,6 +126,8 @@ class _Tee:
         return getattr(self._real, name)
 
 
+from relay.conversation_lineage import merge_transcript_chains, with_transcript_lineage
+
 def _setup_coordinator_log(state_dir):
     """TEE sys.stdout/sys.stderr to a timestamped log under state_dir so a future
     incident (crash, reboot, kill) leaves a record of the coordinator's own output,
@@ -149,14 +159,147 @@ STATUS_PILL = {
     "verifying": ("検証中", "good"),     # spec 3-3: running the acceptance check locally
     "refuting":  ("反証中", "good"),     # spec 4B: an independent reviewer is checking it
     "researching": ("外部調査中", "good"),  # non-blocking deep-research side-agent is running
+    # operator E, wired in: relay_fleet.py raised a HITL gate (converged STUCK / unlock
+    # exhausted / retry budget -- see GATE_AFTER_STUCK_RETRIES) instead of settling STUCK.
+    # Non-blocking like 'researching' -- the sweep keeps stepping every other worker -- and
+    # the gate itself (question + answer path) is already surfaced via status.json's
+    # pending_gates / the cockpit's existing Bucket C banner; this pill is just this worker's
+    # own card saying the same thing.
+    "awaiting_gate": ("人間の判断待ち", "muted"),
     "done":      ("完了",   "done"),     # finished cleanly
     "stuck":     ("停滞",   "bad"),       # B_BAD red
     "maxturns":  ("上限",   "bad"),
     "error":     ("エラー", "bad"),
     "cancelled": ("停止",   "muted"),    # user released it from the cockpit
+    "interrupted": ("中断", "warn"),     # coordinator died; reaper-written, resumable, not a stop
     "fresh_replay": ("新規会話", "good"),
     "content_refused": ("内容拒否", "bad"),
 }
+
+def _run_id_of(worker, started) -> str:
+    """The run this worker belongs to: `r<hex>_a<attempt>`, as the transcripts spell it.
+
+    READ, NEVER INVENTED. The transcript file is named `<run_id>_<name>.jsonl` and that name is
+    the only run identity in this system that survives a restart and is shared by every worker
+    of the same run. Deriving it from the path the worker already carries keeps one source of
+    truth; minting a second one here would add a fifth notion of "run" to the four that already
+    fail to join.
+
+    Falls back to `r<hex of started>` when there is no transcript yet (a worker that has not
+    written a turn). That is the same shape and the same run, minus the attempt number, so it
+    still groups the run's rows together rather than leaving them anonymous.
+    """
+    path = str(getattr(worker, "transcript", "") or "")
+    if path:
+        # NOT os.path.basename: it splits on the HOST's separator. These paths are recorded on
+        # Windows and read wherever the code runs -- a Linux CI runner sees no separator in
+        # `C:\x\...\r6a9f9ad6_a0_w0.jsonl` and hands back the whole string as the run id.
+        # The id is data that travels; it must not depend on who is parsing it.
+        base = path.replace("\\", "/").rsplit("/", 1)[-1]
+        for suffix in (".jsonl.gz", ".jsonl", ".json"):
+            if base.endswith(suffix):
+                base = base[: -len(suffix)]
+                break
+        # `<run_id>_<name>` -- the worker name is the last segment, so the rest is the run id.
+        head = base.rsplit("_", 1)[0]
+        if head and head != base:
+            return head
+    try:
+        return "r%x" % int(started or 0)
+    except Exception:
+        return ""
+
+
+def merge_conv_rows(existing, entries, now=None):
+    """Merge fleet conversation rows into the shared registry. PURE: list in, list out.
+
+    Lives at module level, not inside _register_convs, because the version that lived in the
+    closure could not be tested and was wrong in two ways for an unknown length of time:
+
+      (1) It registered a worker ONLY once `conv_url` was known (`if u and ...`), so a worker
+          whose url had not been captured yet produced no row at all -- while its transcript
+          was already on disk and growing. Measured 2026-09-08: two runs writing 71KB and 86KB
+          of transcript at 13:47-13:48, and the newest fleet row in the file was from 10:19.
+      (2) When a run reused a conversation url already present, `u not in urls` skipped it, so
+          the row kept the PREVIOUS run's transcript path. Transcripts are keyed
+          `<run_id>_<name>` exactly because w0 is reused across runs, so the stale pointer was
+          not an older version of the same conversation -- it was a different one. Opening the
+          row in the chat showed an empty conversation while the work was running.
+
+    `existing` -- rows read from conversations.json; non-dict items are dropped, foreign rows
+    (other sources, e.g. the bridge's "chat" rows) are preserved untouched.
+    `entries`  -- desired rows in the registry's shape. Matched to an existing row by "url"
+    first, then by "transcript"; a match is UPDATED IN PLACE, otherwise the row is appended.
+
+    On update only the pointer fields move (transcript / name / url-once-known). The title is
+    deliberately NOT recomputed: it is how the owner recognises the row in the sidebar, and
+    rewriting it on every tick would rename rows under the cursor. "ts" is stamped only when
+    something actually changed, for the same reason -- it orders the sidebar.
+
+    Returns (rows, changed) so the caller can skip the write when nothing moved."""
+    rows = [e for e in (existing or []) if isinstance(e, dict)]
+    changed = len(rows) != len(existing or [])   # dropping a corrupt row is itself a change
+    by_url, by_tr = {}, {}
+    for idx, e in enumerate(rows):
+        u0 = e.get("url") or ""
+        if u0:
+            by_url[u0] = idx
+        t0 = e.get("transcript") or ""
+        if t0:
+            by_tr[t0] = idx
+    for entry in (entries or []):
+        if not isinstance(entry, dict):
+            continue
+        u = entry.get("url") or ""
+        tr = entry.get("transcript") or ""
+        if not u and not tr:
+            continue   # nothing to point at yet; a later tick will carry one
+        hit = by_url.get(u) if u else None
+        if hit is None and tr:
+            hit = by_tr.get(tr)
+        if hit is not None:
+            row = rows[hit]
+            fresh = {}
+            _chain = merge_transcript_chains(row, entry)
+            if _chain and row.get("transcripts") != _chain:
+                fresh["transcripts"] = _chain
+            if tr and row.get("transcript") != tr:
+                fresh["transcript"] = tr
+            nm = entry.get("name") or ""
+            if nm and row.get("name") != nm:
+                fresh["name"] = nm
+            if u and not row.get("url"):
+                fresh["url"] = u     # the url arrived after the row was made from a transcript
+            # Backfill only -- a row written before "goal" existed, or one whose goal write
+            # raced the read, must not stay permanently unaddressable. Never overwrites a goal
+            # already recorded (it cannot change for a given worker/attempt lineage anyway).
+            g = entry.get("goal") or ""
+            if g and not row.get("goal"):
+                fresh["goal"] = g
+            elif g and row.get("goal_cut") and g != row.get("goal"):
+                # A row compacted by fleet_retention.conversations keeps only the head of its
+                # goal; a live worker carries the whole text and addresses follow-ups with it.
+                fresh["goal"] = g
+                row.pop("goal_cut", None)
+            if fresh:
+                row.update(fresh)
+                row["ts"] = time.time() if now is None else now
+                if tr:
+                    by_tr[tr] = hit
+                if u:
+                    by_url[u] = hit
+                changed = True
+            continue
+        row = with_transcript_lineage(entry)
+        row.setdefault("ts", time.time() if now is None else now)
+        rows.append(row)
+        if u:
+            by_url[u] = len(rows) - 1
+        if tr:
+            by_tr[tr] = len(rows) - 1
+        changed = True
+    return rows, changed
+
 
 def report_unused_steers(workers, reported=None, log=None):
     """Name every steering message a worker took to its grave.
@@ -203,7 +346,22 @@ def report_unused_steers(workers, reported=None, log=None):
 FOLLOW_UP_PROMPT = ("【ユーザーからの追加指示】%s\n"
                     "直前までの作業内容を踏まえ、この追加指示に対してだけ答えてください。"
                     "最初からやり直す必要はありません。"
-                    "完了なら DONE、無理なら FAIL と理由を書いてください。")
+                    + CLOSING_INSTRUCTION)
+
+#: Same follow-up mechanics, but honest about authorship for the ONE case this channel also
+#: carries that is not a human steer: relay_fleet._inject_unlock's own recovery payload,
+#: redelivered here because the worker it was meant for had already gone TERMINAL (stuck) by
+#: the time it was ready to resume. FOLLOW_UP_PROMPT's "【ユーザーからの追加指示】" ("additional
+#: instruction FROM THE USER") is true for a real steer and false for that payload -- and a
+#: false "from the user" label wrapped around text that hands over a password and directs a
+#: tool call is exactly what a safety-aligned model should treat as an injection and refuse.
+#: See relay_fleet.is_recovery_payload / SYSTEM_RECOVERY_PREFIX for the same distinction made
+#: on the sibling channel (steer_msgs); this is the follow-up channel's copy of it.
+SYSTEM_RECOVERY_FOLLOW_UP_PROMPT = (
+    "【システムからの運用連絡(このマシン上の自動復旧機構が生成した内容。ユーザー発言ではありません)】%s\n"
+    "直前までの作業内容を踏まえ、上記の運用上の指示にだけ従ってください。"
+    "最初からやり直す必要はありません。"
+    + CLOSING_INSTRUCTION)
 
 def _follow_up(worker, text, enqueue, say):
     """Queue the message as a new goal continuing `worker`'s conversation. True if queued.
@@ -224,7 +382,24 @@ def _follow_up(worker, text, enqueue, say):
             % worker.name)
         return False
     try:
-        enqueue({"text": FOLLOW_UP_PROMPT % text,
+        from relay.relay_fleet import is_recovery_payload as _is_recovery
+        from relay.relay_fleet import fill_recovery_goal as _fill_goal
+    except Exception:
+        _is_recovery = None
+        _fill_goal = None
+    if _fill_goal is not None:
+        # The recovery payload ends at the goal heading; without the goal the new worker's
+        # whole task would be the unlock text.
+        text = _fill_goal(text, goal)
+    template = FOLLOW_UP_PROMPT
+    if _is_recovery is not None:
+        try:
+            if _is_recovery(text):
+                template = SYSTEM_RECOVERY_FOLLOW_UP_PROMPT
+        except Exception:
+            pass
+    try:
+        enqueue({"text": template % text,
                  "follow_up_to": goal,
                  "priority": True,
                  "cwd": getattr(worker, "cwd", "") or ""})
@@ -328,6 +503,243 @@ def deliver_steers(items, workers, log=None, enqueue=None):
             say("[steer] DROPPED: %s: %s" % (type(exc).__name__, str(exc)[:120]))
     return delivered
 
+
+#: How long a refusal has to sit unclaimed before the harness MAY act on it. Age alone is not
+#: sufficient: while a candidate worker is still `waiting`, its reply has not landed yet and
+#: _looks_locked has had literally no chance to classify/recover it. The old sweep ignored that
+#: fact and raced normal recovery at 45s; measured 2026-09-26 unlock grants took median 68.3s
+#: and up to 172.4s, so healthy in-flight turns were routinely given duplicate re-unlock steers.
+#: We keep 45s as the post-settlement backstop, but NEVER intervene in an in-flight turn.
+UNCLAIMED_REFUSAL_GRACE_S = 45.0
+
+#: Refusals already acted on by the fallback sweep, keyed individually rather than by a single
+#: monotonic timestamp. A later worker's refusal must never watermark away an older refusal that
+#: was deliberately deferred while its own turn was still in flight. Pruned to the server's fresh
+#: refusal window on every sweep, so this cannot grow without bound.
+_HANDLED_UNCLAIMED = set()
+
+
+def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
+    """Re-unlock workers for a refusal that NOBODY CLASSIFIED. Replaces the fallback button.
+
+    THERE USED TO BE A BUTTON. The panel carried a "re-unlock" control with a worker-name box,
+    for the case its own tooltip described: a worker stopped by a lock that automatic recovery
+    had not noticed. That is the harness handing its own failure to a person, and the person
+    is the part of this system least able to know WHICH worker, if any, is the stuck one.
+
+    THE HOLE IT COVERED IS REAL, AND MEASURED. Twice on 2026-09-15 a worker was refused for
+    lock, no recovery fired, and the run carried on regardless -- once producing a deliverable
+    that claimed to have verified content it had never been able to read. Automatic recovery
+    is driven by the REPLY (_looks_locked on the text that comes back), so a refusal that never
+    produces a recognisable reply is invisible to it.
+
+    WHAT THIS ASKS INSTEAD, using only records the server already writes: the server logs every
+    refusal; readers log every classification. A refusal with no classification consuming that exact row and no later grant for its
+    session, past the grace period, was picked up by nobody. relay/turn_windows says which workers had a turn
+    open at that instant, and those are the ones told to unlock.
+
+    THE COST IS ASYMMETRIC AND THE BIAS FOLLOWS IT. Unlocking a worker that was not locked
+    costs one turn. Not unlocking one that was costs a deliverable that is confidently wrong
+    about work it never did. So an ambiguous window delivers to every candidate rather than
+    guessing between them -- the same broadcast the button offered as an empty target, chosen
+    for a reason rather than typed by someone who could not tell either.
+
+    Returns the list of receipts it produced, newest last. Never raises: a recovery that fell
+    over while recovering would be the failure it exists to prevent, wearing its own clothes.
+    """
+    say = log or (lambda m: print(m, flush=True))
+    send = deliver or apply_reunlock
+    t = float(now if now is not None else time.time())
+    out = []
+    try:
+        from tools import lock_state as _ls
+        from relay import turn_windows as _tw
+        from relay.relay_fleet import NO_CONTEXT_REFUSAL, is_recovery_payload as _is_recovery_payload
+
+        since = t - float(getattr(_ls, "DEFAULT_FRESH_SEC", 180.0))
+        claims = _ls.classifications(since, now=t)
+        grants = _ls.granted_records(since, now=t)
+        refusals = [r for r in _ls.matching_records(since, now=t)
+                    if not str(r.get("detail") or "").startswith(NO_CONTEXT_REFUSAL)]
+
+        def _refusal_key(refusal):
+            """Stable identity for one refusal row within the fresh window."""
+            try:
+                ts = float((refusal or {}).get("ts") or 0.0)
+            except (TypeError, ValueError):
+                ts = 0.0
+            return (
+                ts,
+                str((refusal or {}).get("session") or ""),
+                str((refusal or {}).get("client_ip") or ""),
+                str((refusal or {}).get("site") or ""),
+                str((refusal or {}).get("detail") or "")[:160],
+            )
+
+        # Keep only keys that still exist in the same freshness window we are about to inspect.
+        # This bounds memory while preserving deferred older refusals independently of newer ones.
+        fresh_keys = {_refusal_key(r) for r in refusals}
+        _HANDLED_UNCLAIMED.intersection_update(fresh_keys)
+
+        live = {getattr(w, "name", ""): w for w in (workers or [])
+                if getattr(w, "status", "") not in ("done", "stuck", "cancelled",
+                                                      "content_refused", "maxturns", "error")}
+
+        def _claim_consumed_refusal(claim, refusal):
+            """True only when this classification names THIS refusal as its evidence.
+
+            A classification timestamp is not a global acknowledgement: under concurrency one
+            worker can classify its own refusal after a different worker's refusal. The ledger
+            already stores `consumed`; use the join it was written to provide.
+            """
+            consumed = (claim or {}).get("consumed") or {}
+            try:
+                cts = float(consumed.get("ts") or 0.0)
+                rts = float((refusal or {}).get("ts") or 0.0)
+            except (TypeError, ValueError):
+                return False
+            if cts <= 0.0 or rts <= 0.0 or abs(cts - rts) > 1e-6:
+                return False
+            cs = str(consumed.get("session") or "")
+            rs = str((refusal or {}).get("session") or "")
+            return not (cs and rs and cs != rs)
+
+        def _grant_resolved_refusal(grant, refusal):
+            """A successful unlock resolves only an earlier refusal from the same MCP session."""
+            rs = str((refusal or {}).get("session") or "")
+            gs = str((grant or {}).get("session") or "")
+            if not rs or gs != rs:
+                return False
+            try:
+                return float(grant.get("ts") or 0.0) >= float(refusal.get("ts") or 0.0)
+            except (TypeError, ValueError):
+                return False
+
+        for rec in refusals:
+            ts = float(rec.get("ts") or 0.0)
+            key = _refusal_key(rec)
+            if key in _HANDLED_UNCLAIMED or (t - ts) < UNCLAIMED_REFUSAL_GRACE_S:
+                continue
+            # A classification only claims the refusal row it actually consumed. The old
+            # timestamp-only rule let worker B's later classification hide worker A's unhandled
+            # refusal. Conversely, a later grant for this exact session means recovery already
+            # succeeded even if no classification row was written, so do not send another unlock.
+            if any(_claim_consumed_refusal(c, rec) for c in claims):
+                continue
+            if any(_grant_resolved_refusal(g, rec) for g in grants):
+                continue
+            cands = []
+            for n in _tw.candidates(ts):
+                w = live.get(n)
+                if w is None:
+                    continue
+                # A refusal occurring inside an in-flight turn is expected to be unclassified:
+                # classification runs on the reply, and the reply does not exist yet. Queueing a
+                # steer here races the worker's own recovery and was the main source of duplicate
+                # unlock prompts in the 2026-09-25/26 logs. Wait for the turn to settle first.
+                if getattr(w, "status", "") == "waiting":
+                    continue
+                if _is_recovery_payload(getattr(w, "job", "")):
+                    continue
+                if any(_is_recovery_payload(x) for x in (getattr(w, "steer_msgs", []) or [])):
+                    continue
+                cands.append(n)
+            if not cands:
+                # No worker had a turn open then: this refusal belongs to something else on
+                # this machine. Delivering to everyone on no evidence is how a recovery starts
+                # causing the noise it was built to quieten.
+                continue
+            # Mark only THIS refusal handled. Do it before delivery, matching the old one-shot
+            # behaviour even if delivery itself reports a missing password or other terminal
+            # inability; retrying that every tick would be a new spam loop.
+            _HANDLED_UNCLAIMED.add(key)
+            for name in cands:
+                say("[reunlock] nobody classified the refusal at %.0f; %s had a turn open "
+                    "then -- sending unlock" % (ts, name))
+                out.append(send(name, workers, log=log))
+    except Exception as exc:
+        say("[reunlock] unclaimed-refusal sweep skipped: %s: %s"
+            % (type(exc).__name__, exc))
+    return out
+
+
+def apply_reunlock(target, workers, enqueue=None, log=None):
+    """THE FALLBACK BUTTON. Automatic recovery already exists: relay_fleet's
+    `_inject_unlock` injects `UNLOCK_PREFIX % password` REACTIVELY, once a reply LOOKS
+    like a lock refusal (see `_looks_locked`). (Before 2026-09-25, `_initial_job_with_unlock`
+    also injected it proactively into a fresh worker's FIRST turn whenever a local password
+    was found; that was removed because M365 Copilot's own safety/DLP filter refused that
+    exact "call unlock with this password" turn-1 shape deterministically, so the proactive
+    send could never succeed -- see `_initial_job_with_unlock`'s docstring.) The reactive
+    heuristic can still miss -- it is deliberately loose and gated on a matching record, and
+    it never runs at all for a refusal that arrives and never gets recognised as one.
+    Measured twice in one day (2026-09-15): a worker refused for lock, no recovery fired,
+    and the run continued regardless -- once producing a deliverable that claimed to have
+    verified content it had never been able to read. There was no button for the operator
+    to press.
+
+    This is that button, and it is DELIBERATELY the same delivery path as a steer: the
+    unlock instruction is a turn like any other, and `deliver_steers` already carries the
+    hard-won rule that every rejection must be named rather than swallowed (see its
+    docstring and tests/test_steer_delivery.py). Re-deriving that here would risk
+    re-introducing the empty-name-drops-silently defect that file exists to prevent.
+
+    THE PASSWORD IS READ HERE, ON THIS MACHINE, FROM THIS MACHINE'S .env -- and goes
+    NOWHERE but into the one transient turn handed to `deliver_steers`. It is never
+    written to `.fleet/commands.d/*.json` (plain text, read by several processes) and
+    never appears in the dict this function returns: that dict is built only from the
+    LOG LINES `deliver_steers` emits about names and statuses, which by construction
+    never echo the turn text (see its own say() calls -- none of them format `text`).
+
+    `target` is a worker name, or "" / "*" for every live worker (mirrors deliver_steers'
+    own empty-name-means-broadcast rule -- "*" is accepted too because a command typed by
+    a person reaches for the wildcard before the empty string).
+
+    Returns a dict meant to be written straight into status.json so the operator can see
+    what happened without guessing: {"ts", "target", "ok", "delivered", "reason"}. `ok`
+    is False both when nothing was delivered AND when there was no password to try --
+    "I pressed the button and nothing happened" is exactly the failure this exists to end,
+    so a missing password is reported, not swallowed.
+    """
+    say = log or (lambda m: print(m, flush=True))
+    name = (target or "").strip()
+    if name == "*":
+        name = ""
+
+    from relay.relay_fleet import UNLOCK_PREFIX, _unlock_password
+    pw = _unlock_password()
+    if not pw:
+        try:
+            from tools.secret_store import (PROBLEM_UNDECRYPTABLE,
+                                            unlock_password_problem)
+            problem = unlock_password_problem()
+        except Exception:
+            problem = ""
+        if problem == PROBLEM_UNDECRYPTABLE:
+            reason = ("local unlock password is set but could not be decrypted on this "
+                      "machine -- nothing delivered")
+        else:
+            reason = "no local unlock password configured (.env unset) -- nothing delivered"
+        say("[reunlock] REFUSED for %r: %s" % (name or "*", reason))
+        return {"ts": time.time(), "target": name or "*", "ok": False,
+                "delivered": 0, "reason": reason}
+
+    msgs = []
+
+    def _capture(m):
+        msgs.append(m)
+        say(m)
+
+    item = {"worker": name, "text": UNLOCK_PREFIX % pw}
+    delivered = deliver_steers(item, workers, log=_capture, enqueue=enqueue)
+    ok = delivered > 0
+    reason = "; ".join(msgs)[-400:]
+    if not reason:
+        reason = "delivered" if ok else "not delivered (see fleet console log)"
+    return {"ts": time.time(), "target": name or "*", "ok": ok,
+            "delivered": delivered, "reason": reason}
+
+
 def report_status(o):
     """The reported status for an outcome, from the closed set in relay/outcomes.py.
 
@@ -351,6 +763,12 @@ def report_status(o):
               "error. Add it there with the status it should mean." % (o,), flush=True)
         return "error"
 
+from tools.settings_keys import default as _settings_default
+
+#: THE default RAM floor, declared in tools/settings_keys.py and shared with the panel and the
+#: admission gates. It had three owners until 2026-09-17; see that module.
+RAM_FLOOR_DEFAULT_MB = float(_settings_default("ram_floor_mb"))
+
 DEFAULT_MAX_CONCURRENT = 3
 
 #: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
@@ -361,7 +779,11 @@ AUTOSCALE_CEILING_DEFAULT = 100
 
 
 def _settings_path():
-    return os.path.join(os.environ.get("APPDATA", ""), "copilot-bridge", "settings.txt")
+    # ONE RESOLVER, because this path had five copies that did not agree -- and because
+    # the file is moving into the repository, where every context resolves it identically.
+    # See tools/settings_path.py for the 2026-09-16 incident this closes.
+    from tools.settings_path import settings_file
+    return settings_file()
 
 
 def _settings_int(key, default):
@@ -422,6 +844,83 @@ def settings_autoretry():
     return (on and cap > 0), cap
 
 
+def build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=None, log=None):
+    """Wire the settings file to the live boxes a running fleet reads.
+
+    NAMED RATHER THAN INLINE so it can be exercised. It lived inside run(), which is 700 lines
+    and cannot be called in a test, so the only available check was to read the source for a
+    `.watch(` -- and source cannot catch a callback that writes into a box nothing reads.
+    gpt-6-astra named that gap while reviewing tools/settings_keys.py. With this callable, the
+    file-to-box half is a behavioural test; box-to-decision stays source-level, because
+    relay_fleet indexes these same list objects at the moment it decides.
+
+    The boxes are the live values themselves, shared with run_relay_fleet -- not copies. That
+    is the whole mechanism: the sweep reads disk_box[0] each time it admits, so writing here
+    changes the next decision without anything restarting.
+
+    BOUNDED THE SAME WAY THE COMMAND CHANNEL IS, WHICH THIS DID NOT DO (gap left by e822fb6).
+    That commit gave the cockpit -> running-fleet command channel a strict schema -- a
+    set_disk_floor_gb outside [0, 100] GB, a set_ram_floor_mb outside [0, 65536] MB, or a
+    set_maxtabs outside [1, 100] is refused (validate_command) -- but this follower reads the
+    SAME THREE KEYS out of the SAME settings.txt by a completely different path (the cockpit's
+    own live-push button vs. its "save the panel to disk, a running fleet notices next sweep"
+    path) and applied only a floor, no ceiling: `max(0.0, float(v))` accepted a disk floor of
+    1e9 GB or a NaN RAM floor from a hand-edited or foreign-written settings.txt. Two admission
+    paths into the same running fleet that disagree about what a valid number is would have
+    reopened exactly the hole SEC-08 closed for the other one.
+
+    CLAMPED, NOT IGNORED, MATCHING THE PANEL'S OWN CHOICE. ui/FleetCockpit.cs never refuses a
+    number outside range: SetDiskFloor/SetRamFloor/SetMaxTabs clamp with Math.Max/Math.Min
+    before writing settings.txt, and LoadSettings clamps AGAIN on the way back in with the
+    identical bounds -- so from the panel's own operator-facing behaviour, "this control does
+    not go past its ends" rather than "an out-of-range value is refused" is the whole design.
+    Silently dropping the update instead (as validate_command does for the command channel) would
+    make this follower behave differently from the panel it exists to mirror, for a file the
+    panel is the primary writer of. A value actually forced into range is worth one log line --
+    it means something wrote settings.txt outside what the panel itself can produce.
+    """
+    from relay.settings_follow import Follower
+
+    say = log or (lambda m: print(m, flush=True))
+
+    def _clamp_and_log(key, v, bounds, whole=False):
+        clamped = clamp_to_bounds(v, bounds, whole=whole)
+        if clamped is None:
+            say("[settings] %s=%r is not a finite number; ignored" % (key, v))
+            return None
+        if clamped != v:
+            say("[settings] %s=%r is outside [%s, %s]; clamped to %s"
+                % (key, v, bounds[0], bounds[1], clamped))
+        return clamped
+
+    def _set_disk_floor(v):
+        clamped = _clamp_and_log("disk_floor_gb", v, DISK_FLOOR_GB_BOUNDS)
+        if clamped is not None:
+            disk_box[0] = clamped
+
+    def _set_ram_floor(v):
+        clamped = _clamp_and_log("ram_floor_mb", v, RAM_FLOOR_MB_BOUNDS)
+        if clamped is not None:
+            ram_box[0] = clamped
+
+    def _set_maxtabs(v):
+        clamped = _clamp_and_log("maxtabs", v, TABS_BOUNDS, whole=True)
+        if clamped is None:
+            return
+        # Same split the cockpit's set_maxtabs command makes: under autoscale this knob
+        # is the ceiling, otherwise it is the fixed cap.
+        if asc_box[0]:
+            asc_box[1] = clamped
+        else:
+            mc_box[0] = clamped
+
+    return (Follower(path_fn or _settings_path)
+            .watch("disk_floor_gb", _set_disk_floor)
+            .watch("ram_floor_mb", _set_ram_floor)
+            .watch("maxtabs", _set_maxtabs)
+            .prime())
+
+
 def settings_maxtabs(default=DEFAULT_MAX_CONCURRENT):
     """The user's chosen concurrency from settings.txt (`maxtabs=N`). Under autoscale this is
     the DEFAULT/start cap; with autoscale off it's the fixed cap. Falls back to `default`."""
@@ -455,16 +954,42 @@ def settings_effort(default="auto"):
     return default
 
 
+#: What the LAST _settings_float call actually did, per key. Not a second read -- the read
+#: that decides is the read that records, because the cockpit rewrites this file in place and
+#: a confirming read is an observation of a different moment.
+SETTINGS_READ_TRACE = {}
+
+
 def _settings_float(key, default):
-    """Read a float `key=N` from the shared settings.txt (cockpit-written). Falls back."""
+    """Read a float `key=N` from the shared settings.txt (cockpit-written). Falls back.
+
+    Records what it saw in SETTINGS_READ_TRACE[key] so a caller can say WHERE its number came
+    from without opening the file again.
+    """
+    p = "?"
     try:
         p = _settings_path()
-        if os.path.isfile(p):
-            for ln in open(p, encoding="utf-8-sig").read().splitlines():
-                if ln.startswith(key + "="):
-                    return float(ln.split("=", 1)[1].strip())
-    except Exception:
-        pass
+        if not os.path.isfile(p):
+            SETTINGS_READ_TRACE[key] = "no file at %s" % p
+            return default
+        for ln in open(p, encoding="utf-8-sig").read().splitlines():
+            if ln.startswith(key + "="):
+                raw = ln.split("=", 1)[1].strip()
+                try:
+                    val = float(raw)
+                except ValueError:
+                    SETTINGS_READ_TRACE[key] = "unparsable line %r in %s" % (ln, p)
+                    return default
+                try:
+                    _st = os.stat(p)
+                    _id = " [size=%d mtime=%.0f]" % (_st.st_size, _st.st_mtime)
+                except Exception:
+                    _id = " [stat failed]"
+                SETTINGS_READ_TRACE[key] = "read %r from %s%s" % (raw, p, _id)
+                return val
+        SETTINGS_READ_TRACE[key] = "no %s= line in %s" % (key, p)
+    except Exception as exc:
+        SETTINGS_READ_TRACE[key] = "%s reading %s: %s" % (type(exc).__name__, p, exc)
     return default
 
 
@@ -482,6 +1007,34 @@ def _quota_snapshot():
         return {}
 
 
+def settings_fanout():
+    """The operator's fan-out switch from settings.txt (`fanout=on|off`), or None if unset.
+
+    None is a real answer and not a default: "the operator has not chosen" has to be
+    distinguishable from "the operator chose off", or the caller cannot tell which of its own
+    fallbacks to apply. The cockpit writes this key and honours it for launches from its own
+    button; nothing on the autostart path read it, so the switch did nothing for goals that
+    arrive from the tunnel -- which is most of them.
+    """
+    raw = _settings_text("fanout")
+    if raw is None:
+        return None
+    return raw.strip().lower() in ("1", "on", "true", "yes")
+
+
+def _settings_text(key):
+    """The raw string for `key`, or None when the file has no such line. Never raises."""
+    try:
+        p = _settings_path()
+        if os.path.isfile(p):
+            for ln in open(p, encoding="utf-8-sig").read().splitlines():
+                if ln.startswith(key + "="):
+                    return ln.split("=", 1)[1]
+    except Exception:
+        pass
+    return None
+
+
 def settings_disk_floor(default=None):
     """The user's reserved C: free-space floor in GB (`disk_floor_gb=N` in settings.txt).
     This is the 'always keep N GB free on C:' admission reserve -- a new eval-bearing tab is
@@ -491,6 +1044,27 @@ def settings_disk_floor(default=None):
         from relay.relay_fleet import DEFAULT_DISK_FLOOR_GB
         default = DEFAULT_DISK_FLOOR_GB
     return _settings_float("disk_floor_gb", default)
+
+
+def operator_set_a_disk_floor():
+    """Has the operator chosen a disk floor, or is there nothing to respect?
+
+    `settings_disk_floor` substitutes a default when the key is absent, so it cannot answer
+    this on its own: a sentinel default is passed and a negative result means "no line in
+    settings.txt". ANY real choice counts, including 0 -- the cockpit clamps that control to
+    0..100 and therefore offers 0, so treating it as "unset" would substitute a number for one
+    the operator picked.
+
+    Callers use this to decide whether to pass --disk-floor-gb at all, because passing the
+    flag BEATS the file (CLI > settings > env) and a run that ignores the panel while the panel
+    keeps displaying its number is the defect class this repository has spent a week removing.
+
+    Never raises. An unreadable settings file reads as "nothing chosen".
+    """
+    try:
+        return float(settings_disk_floor(default=-1.0)) >= 0
+    except Exception:
+        return False
 
 
 def settings_ram_floor(default=2048.0):
@@ -647,6 +1221,81 @@ def _read_goals_file(path):
     return goals
 
 
+#: A CLI SUBMISSION USED TO LEAVE NO TRACE UNTIL IT HAD ALREADY SUCCEEDED.
+#:
+#: tools/fleet_submit writes .fleet/tasks/pending/<id>.json BEFORE anything runs, which is why
+#: the cockpit can show a queued job the moment it is submitted. `fleet_runner.py -g "..."`
+#: wrote nothing until the run was under way: no queue entry, no history row, and -- if it died
+#: before argparse, on a bad path or the wrong interpreter -- not even a coordinator log. From
+#: the screen and from every record on disk, a submission that failed early was indistinguish-
+#: able from a command nobody typed.
+#:
+#: Reported 2026-09-18: a goal was submitted through the CLI, was not on the fleet, was not in
+#: the history, and could not be found anywhere. The contract in docs/agent_contract.md says
+#: work that cannot be confirmed in the GUI does not count as working -- and this route could
+#: not be confirmed at all, by construction.
+#:
+#: So the goals are written into the SAME channel fleet_submit uses, at the first moment they
+#: are known, and removed when the run actually starts and the goals ledger takes over. A run
+#: that never starts leaves them behind, which is the point: an unclaimed entry on the screen
+#: is the difference between "refused" and "never happened".
+def _record_cli_submission(state_dir, goals, argv):
+    """Write one visible queue entry per CLI goal. Returns their paths. Never raises."""
+    import json as _j
+    import time as _t
+
+    out = []
+    try:
+        pend = os.path.join(state_dir, "tasks", "pending")
+        os.makedirs(pend, exist_ok=True)
+        stamp = int(_t.time())
+        for n, g in enumerate(goals or []):
+            text = " ".join(str(g if isinstance(g, str) else (g or {}).get("text", "")).split())
+            if not text:
+                continue
+            jid = "cli%d_%d_%d" % (stamp, os.getpid(), n)
+            rec = {
+                "id": jid,
+                "type": "fleet_goal",
+                "payload": {"goal": text},
+                "created": _t.time(),
+                # SAME SHAPE AS fleet_submit's, so one reader serves both routes and the
+                # difference in authority stays legible.
+                "origin": {"via": "cli", "source": " ".join(str(a) for a in (argv or [])[:6])[:300]},
+                # WHOSE ENTRY THIS STILL IS. These land in tasks/pending/, which is not a
+                # display surface -- it is task_router's inbox, and dispatch_once claims every
+                # .json in it. So writing one here to make the submission VISIBLE also offered
+                # it for dispatch, and the window is everything between this line and
+                # _clear_cli_submission: reading goals, bringing Edge up, the whole startup.
+                # The router polls every couple of seconds. Measured artifact in the tree:
+                # cli1789703602_14000_0.delivered.json, a CLI entry the router delivered.
+                #
+                # The distinction that was missing is "still mine" versus "abandoned", and
+                # this pid is it. The router skips an entry whose owner is alive and takes one
+                # whose owner is gone -- which is the recovery the comment above this function
+                # actually wanted: a run that never starts must not leave the goal stranded.
+                "owner_pid": os.getpid(),
+            }
+            p = os.path.join(pend, "%s.json" % jid)
+            tmp = p + ".tmp"
+            with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+                _j.dump(rec, fh, ensure_ascii=False, indent=1)
+            os.replace(tmp, p)
+            out.append(p)
+    except Exception:
+        pass
+    return out
+
+
+def _clear_cli_submission(paths):
+    """Drop the queue entries once the run has really started. Never raises."""
+    for p in paths or []:
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+
+
 def _read_goals(args):
     """Goals come from -g flags and/or a goals file. See _read_goals_file() for
     the goals-file line format and the fragmented-prompt guard it applies."""
@@ -654,6 +1303,134 @@ def _read_goals(args):
     if args.goals_file:
         goals.extend(_read_goals_file(args.goals_file))
     return goals
+
+
+def reject_local_loop_control_goals(goals):
+    """Return launch-admission errors for internal LOCAL_LOOP envelopes in ordinary Fleet goals."""
+    errors = []
+    for i, item in enumerate(goals or []):
+        text = item.get("text", "") if isinstance(item, dict) else str(item or "")
+        if is_local_loop_control_submission(text):
+            errors.append("goal %d: LOCAL_LOOP control envelope is not Fleet work" % (i + 1))
+    return errors
+
+
+def _effort_policy_block():
+    """{"effort_policy": {mode, source, conflict}} for the snapshot, or {} on any failure."""
+    try:
+        from relay import effort_policy as _ep
+        m, src, conflict = _ep.mode_info()
+        return {"effort_policy": {"mode": m, "source": src, "conflict": bool(conflict)}}
+    except Exception:
+        return {}
+
+
+#: What THIS coordinator was started with for fan-out: {"enabled": bool, "source": "flag"|"default"}.
+#: Set once after argument parsing. status.json carries it so the cockpit shows what is really in
+#: effect (including "started with --no-fanout"), not what its own switch currently says.
+_RUN_FANOUT = {}
+
+
+def _record_run_fanout(enabled, argv=None):
+    """Remember the coordinator's resolved fan-out flag; `source` says whether argv named it."""
+    named = any(a in ("--fanout", "--no-fanout") for a in (sys.argv[1:] if argv is None else argv))
+    _RUN_FANOUT.clear()
+    _RUN_FANOUT.update({"enabled": bool(enabled), "source": "flag" if named else "default"})
+
+
+def _fanout_run_block():
+    """{"fanout_run": {enabled, source}} for the snapshot, or {} before the flag is known."""
+    return {"fanout_run": dict(_RUN_FANOUT)} if _RUN_FANOUT else {}
+
+
+def _effort_worker_fields(w):
+    """Per-worker effort badge fields (see effort_policy.status_fields); {} on any failure."""
+    try:
+        from relay import effort_policy as _ep
+        return _ep.status_fields(w)
+    except Exception:
+        return {}
+
+
+def _tree_worker_fields(w):
+    """Task-tree root id for a worker row (additive); {} when the worker has none."""
+    try:
+        rid = (getattr(getattr(w, "task_envelope", None), "metadata", None) or {}).get("root_id")
+        return {"root_id": str(rid)} if rid else {}
+    except Exception:
+        return {}
+
+
+def _tree_budget_block(worker_rows):
+    """`fanout_budget` (the limits in force) and `tree_budget` (per-root usage), additive.
+
+    The production caller of relay.fanout_budget.usage_from_status. Rows are the snapshot's own
+    worker rows (they carry root_id). The campaign ledger is read only when some worker belongs
+    to a tree; {} on any failure.
+    """
+    try:
+        from relay import fanout_budget as _fb
+        if not any(isinstance(r, dict) and r.get("root_id") for r in worker_rows):
+            return {"fanout_budget": _fb.limits_from_settings(), "tree_budget": {}}
+        # The same streaming reader the split decision uses: a ledger past 2 MB used to read
+        # as [] here and the export silently lost every tree's wall clock. None (unreadable
+        # or past the 50 MB CPU bound) exports {} = "not reported", never a comfortable zero.
+        return _fb.status_block(worker_rows, _fb.read_campaign_rows(
+            os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl")) if _ACTIVE_STATE_DIR else [])
+    except Exception:
+        return {}
+
+
+def _write_scope_block():
+    """`fanout_write_scope`: {mode, overlaps_seen}, additive. The production caller of
+    relay.write_scope.status_block (and so of the mode reader). {} on any failure."""
+    try:
+        from relay import write_scope as _ws
+        return _ws.status_block()
+    except Exception:
+        return {}
+
+
+def _write_scope_tick(workers):
+    """Once per sweep: in shadow, record sibling write overlaps (never raises, never blocks)."""
+    try:
+        from relay import write_scope as _ws
+        _ws.shadow_tick(workers)
+    except Exception:
+        pass
+
+
+def _auto_resume_block():
+    """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
+    of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
+    waiting and what the resume gate last decided. {} on any failure."""
+    try:
+        from relay import fleet_resume as _fres
+        return {"auto_resume": _fres.auto_resume_report(_ACTIVE_STATE_DIR or os.path.join(_repo_root(), ".fleet"))}
+    except Exception:
+        return {}
+
+
+def _conversation_saving_block():
+    """`conversation_saving`: {merge_conversation, aggregators_saved, unsent_created}, additive.
+    The production caller of relay.conversation_saving.status_block. {} on any failure."""
+    try:
+        from relay import conversation_saving as _cs
+        return _cs.status_block()
+    except Exception:
+        return {}
+
+
+def _fanout_depth_block():
+    """`fanout_depth`: the split depth asked for and the one in force, additive.
+
+    The production caller of relay.fanout.effective_max_depth. {} on any failure.
+    """
+    try:
+        from relay import fanout as _fo
+        return {"fanout_depth": _fo.depth_report()}
+    except Exception:
+        return {}
 
 
 def _pending_gates(started=0.0):
@@ -806,7 +1583,9 @@ def _launch_blockers():
             "checkpoint", os.path.join(_repo_root(), "scripts", "win", "checkpoint.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
-        verdicts, _extras = mod.verdicts_now()
+        # memory=False: the gate reads verdicts, never extras["memory"], and that figure is
+        # a 4-5 s PowerShell query per browser -- 9.3 s of every launch, measured 2026-09-24.
+        verdicts, _extras = mod.verdicts_now(memory=False)
         return [(name, detail) for name, ok, detail in verdicts
                 if not ok and name in BLOCKING_INVARIANTS]
     except Exception as exc:
@@ -885,8 +1664,77 @@ def _close_idle_copilot_pages(context) -> int:
         return 0
 
 
+
+@lru_cache(maxsize=4096)
+def _goal_summary(goal):
+    """Compact, deterministic task identity for UI only; never replaces the execution goal."""
+    text = str(goal or "")
+    if not text.strip():
+        return ""
+    try:
+        from relay import conv_title as _ct
+        return _ct.make_title(text, key=text)
+    except Exception:
+        # Display metadata must never break a run. Keep the fallback extractive and bounded.
+        one = " ".join(text.split())
+        return one if len(one) <= 64 else one[:63].rstrip() + "…"
+
+
+# FREE-SPACE RING (design section 3). One fixed-size, pre-allocated file per coordinator, so a
+# full disk cannot make the write fatal and the last minutes before a death survive it. Only
+# REPORTS; the floor shown is whatever the run resolved, never a value of its own.
+_FREE_RING = None
+_LAST_DISK = {}
+
+
+def _start_forensics(state_dir):
+    """Open the free-space ring and the faulthandler log. Best-effort, never raises."""
+    global _FREE_RING
+    try:
+        from relay import fleet_resume as _fr
+        _FREE_RING = _fr.FreeSpaceRing(os.path.join(state_dir, _fr.RING_FILE))
+        _fr.enable_fault_log(state_dir)
+    except Exception as e:
+        sys.stderr.write("[forensics] WARN: ring/fault log unavailable: %s\n" % e)
+
+
+def _sample_free_space(state_dir, floor_gb, now=None, force=False):
+    """Take a free-space sample at most every RING_SAMPLE_S. Never raises."""
+    try:
+        from relay import fleet_resume as _fr
+        now = time.time() if now is None else now
+        if not force and (now - _LAST_DISK.get("sampled_ts", 0.0)) < _fr.RING_SAMPLE_S:
+            return
+        import shutil
+        u = shutil.disk_usage(state_dir)
+        floor = floor_gb if (isinstance(floor_gb, (int, float)) and floor_gb > 0) else None
+        _LAST_DISK.update({"free_bytes": u.free, "total_bytes": u.total,
+                           "floor_gb": floor, "sampled_ts": now})
+        if _FREE_RING is not None:
+            _FREE_RING.sample(u.free, u.total, floor, now=now)
+    except Exception:
+        pass
+
+
+def _disk_block(disk_floor_gb):
+    from relay import fleet_resume as _fr
+    return _fr.disk_status(_LAST_DISK.get("free_bytes"), _LAST_DISK.get("total_bytes"),
+                           disk_floor_gb, _LAST_DISK.get("sampled_ts"),
+                           _FREE_RING.failures if _FREE_RING is not None else 0)
+
+
+def _submitter_of(jid):
+    """task_router.submitter_for_jid, never raising into the status snapshot."""
+    try:
+        from relay.task_router import submitter_for_jid
+        return submitter_for_jid(jid)
+    except Exception:
+        return ""
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
-              ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0):
+              ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
+              reunlock=None, command_rejections=None):
     from relay.relay_fleet import free_disk_gb
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
@@ -896,7 +1744,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     # shows as up to 3 tabs. Falls back to the main-tab count if tab_load isn't available.
     open_tabs = sum((w.tab_load() if hasattr(w, "tab_load") else
                      (1 if getattr(w, "page", None) is not None else 0)) for w in workers)
-    return {
+    _snap = {
         "started": started,
         "updated": time.time(),
         "total": total,
@@ -918,6 +1766,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # disk admission reserve + current C: free, so the cockpit can show the disk gate.
         "disk_floor_gb": round(disk_floor_gb, 1),
         "free_disk_gb": round(free_disk_gb(), 1),
+        "disk": _disk_block(disk_floor_gb),
         # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
         "ram_floor_mb": round(ram_floor_mb),
         # THE THIRD GATE, and the one that was invisible. Disk and RAM have been on this panel
@@ -928,18 +1777,32 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # environment and downstream services may impose lower ones, so refusals arriving under
         # the line mean the line is the wrong line, not that the gauge is broken.
         "quota": _quota_snapshot(),
+        # THE FALLBACK BUTTON'S OWN RECEIPT. None until a {"reunlock":...} command has been
+        # applied at least once this run; after that,
+        # {"ts","target","ok","delivered","reason"} from apply_reunlock -- so "I pressed the
+        # button and nothing happened" has an answer on this same screen instead of nowhere.
+        # NEVER a password: apply_reunlock builds "reason" only from deliver_steers' own log
+        # lines, which never format the turn text.
+        "reunlock": reunlock,
+        # COMMANDS THIS RUN REFUSED (SEC-08), newest last, at most MAX_REJECTIONS_KEPT:
+        # {"ts","keys","errors"} from record_command_rejection. A command that fails the
+        # channel's schema is not applied at all, and without this a refused pause or floor
+        # change would look exactly like one the fleet ignored. Keys and reasons only.
+        "command_rejections": list(command_rejections or []),
         # Fleet-level directive (Bucket B): the single authoritative goal text when this run
         # was started from exactly one goal; "" when there are multiple independent goals (the
         # UI already handles multi-goal honestly and should NOT fabricate a summary). Only
         # populated when there is a genuinely single directive -- never fabricated for multi-goal.
         "directive": directive,
-        # FIX 3 (P2): human-readable run label (verbatim first line of first goal, <=60 chars)
-        # and total goal count for the UI header.  run_label is NEVER synthesised -- verbatim only.
+        "directive_summary": _goal_summary(directive) if directive else "",
+        # Human-readable, display-only task identity plus total goal count. ``run_label`` is
+        # extractive/redacted metadata; authoritative instructions remain in goal/directive.
         "run_label": run_label,
         "goal_count": goal_count,
         "workers": [{
             "name": w.name,
             "goal": w.goal,
+            "goal_summary": _goal_summary(w.goal),
             "status": w.status,
             "pill": STATUS_PILL.get(w.status, (w.status, "muted"))[0],
             "color": STATUS_PILL.get(w.status, (w.status, "muted"))[1],
@@ -952,6 +1815,36 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "conv_title": getattr(w, "conv_title", ""),
             "verified": getattr(w, "verified", None),
             "verify_attempts": getattr(w, "verify_attempts", 0),
+            # THE ADMISSION-TIME ID (codex-plan item 1, 2026-09-09) -- NOT run_id below.
+            # run_id names the fleet SWEEP; jid names the ADMITTED GOAL, minted once by
+            # task_router.py at submission and carried through add_goal_to_live_fleet /
+            # goals_from_command / autostart_fleet into Worker.jid. This is what lets
+            # .fleet/tasks/done/<jid>.json (admission), .fleet/acks/<jid>.ack (delivery --
+            # written by read_commands below and read by task_router.fleet_landing_confirmed;
+            # NOT .fleet/acked/, which this comment used to name and which nothing in the tree
+            # writes: its 18 files are 32-hex names from before 2026-09-08, a different id
+            # shape from jid's 12, and a reader sent there finds a dead end),
+            # and this worker's own verified/verify_attempts above be joined on ONE id, which
+            # is exactly the evidence bar the plan named: "同一run IDで受付・発火・実行・
+            # 検証・終了を結ぶ". Empty for goals that never passed through admission.
+            "jid": getattr(w, "jid", None) or "",
+            # WHO SUBMITTED IT (origin.via:source of the job), so a person looking for tonight's
+            # run can tell their own from the fleet's other work. Empty when unknown.
+            "submitter": _submitter_of(getattr(w, "jid", None) or ""),
+            # THE NAME OF THE RUN THIS WORKER BELONGS TO, stated rather than left implicit.
+            #
+            # Four notions of "run" exist in the ledgers and none of them join: ownership.jsonl
+            # keys on a process id, mechanisms.jsonl on an epoch, history.json on
+            # "<epoch>#<worker>", and the transcripts on "<run_id>_<name>" -- while judge.jsonl
+            # (5,712 verdicts) and skill_use.jsonl carry no identity at all. Measured across
+            # every ledger: no two share a value under any identity-shaped key, so not one of
+            # those verdicts can be attached to the work that provoked it.
+            #
+            # The transcripts hold the only identity that names a run rather than a process or
+            # a moment, and every worker already carries its transcript path -- so the id is
+            # present, spelled into a filename, where nothing can join on it. Lift it out and
+            # publish it under its own name; the file name stays the source of truth.
+            "run_id": _run_id_of(w, started),
             # epoch by which an in-progress BLOCKING acceptance eval must finish (0 = idle).
             # The watchdog reads this from a frozen status.json: a future value means the main
             # thread is legitimately busy in a bounded eval, NOT a wedged Edge -> don't reset.
@@ -980,7 +1873,12 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "campaign_id": getattr(getattr(w, "task_envelope", None), "campaign_id", ""),
             "role": getattr(getattr(w, "task_envelope", None), "role", ""),
             "depth": getattr(getattr(w, "task_envelope", None), "depth", 0),
+            "subtask_index": getattr(w, "subtask_index", None),
             "goal_hash": getattr(w, "original_goal_hash", ""),
+            # None = outcome-wide rule; False = this worker's end is not safe to re-run
+            # (the cockpit's retry predicate honours it). retry_queued = runner re-queued it.
+            "retryable": getattr(w, "retryable_override", None),
+            "retry_queued": bool(getattr(w, "retry_queued", False)),
             "fresh_replay_count": getattr(w, "fresh_replay_count", 0),
             "refusal_count": getattr(w, "refusal_count", 0),
             "refusal_history": list(getattr(w, "refusal_history", [])),
@@ -988,6 +1886,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "recovery_result": getattr(w, "recovery_result", ""),
             "recovery_state": getattr(w, "recovery_state", ""),
             "attempt_transcripts": list(getattr(w, "attempt_transcripts", [])),
+            # Effort-policy badge data (additive; absent when the policy is off). Status,
+            # outcome and pill above are untouched: this is display only, and shadow is record-only.
+            **_effort_worker_fields(w),
+            **_tree_worker_fields(w),
         } for w in workers],
         # Pending HITL gates from the autonomy contract gate (contract_gate.py).
         # Each entry: {"token": str, "question": str, "context": str, "ts": float, "path": str}
@@ -997,14 +1899,100 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # Set {"answered": true, "answer": "approved"}  to approve
         # Set {"answered": true, "answer": "denied"}    to deny
         "pending_gates": _pending_gates(started=started),
+        # What the effort policy is REALLY set to (env > settings > off) so the cockpit shows
+        # the truth, not its own combo. Additive; absent if it cannot be resolved.
+        **_effort_policy_block(),
+        # What this coordinator was started with for fan-out (additive; absent until known).
+        **_fanout_run_block(),
     }
+    # Derived fan-out family markers (parent / child / aggregator / stalled) so the
+    # cockpit can render the split-and-merge structure the lineage already implies.
+    _fv = fanout_family_view(_snap["workers"])
+    for _w in _snap["workers"]:
+        _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
+    _attach_split_groups(_snap)
+    _snap.update(_tree_budget_block(_snap["workers"]))
+    _snap.update(_fanout_depth_block())
+    _snap.update(_write_scope_block())
+    _snap.update(_auto_resume_block())
+    _snap.update(_conversation_saving_block())
+    return _snap
+
+
+#: Most split groups status.json carries. build_groups already clips every ledger string; this
+#: bounds the COUNT so a run with hundreds of campaigns cannot bloat the file the cockpit polls.
+_MAX_SPLIT_GROUPS = 50
+
+
+def _campaign_lines(workers=None):
+    """The campaigns.jsonl lines the split-group view needs, from the active state dir.
+
+    Never [] because of the file's SIZE (it was, past 2 MB, and the nesting vanished from
+    status.json): family_view.read_campaign_lines streams it and keeps the campaigns that have a
+    row in `workers` plus their ancestors' headers. [] when absent or unreadable.
+    """
+    if not _ACTIVE_STATE_DIR:
+        return []
+    try:
+        from relay import family_view as _fvw
+        cids = {str(w.get("campaign_id")) for w in (workers or []) if isinstance(w, dict) and w.get("campaign_id")}
+        return _fvw.read_campaign_lines(os.path.join(_ACTIVE_STATE_DIR, "campaigns.jsonl"), cids)
+    except Exception:
+        return []
+
+
+def _attach_split_groups(snap):
+    """Add the owner-facing split-group ledger to `snap`, DERIVED READ-ONLY from its workers.
+
+    `groups` is relay.family_view.build_groups over the workers already in the snapshot, and each
+    fan-out parent's row gains a separate `display_state` key (annotate_display_state returns
+    copies and never touches status / outcome / pill, which the cockpit and the reaper read).
+    ANY failure only omits the additions: the snapshot is the liveness signal of the whole
+    fleet and must never be lost to a display feature.
+    """
+    try:
+        from relay import family_view as _fvw
+        lines = _campaign_lines(snap["workers"])
+        groups = _fvw.build_groups(snap["workers"], lines)[:_MAX_SPLIT_GROUPS]
+        annotated = _fvw.annotate_display_state(snap["workers"], lines)
+        snap["groups"] = groups
+        snap["workers"] = annotated
+    except Exception:
+        snap.pop("groups", None)
+
+
+#: How long to keep trying to replace a status file a reader is holding open. The cockpit
+#: polls status.json about once a second and holds it for a few milliseconds; a second of
+#: retries covers that by a wide margin without turning a real permission problem into a hang.
+_REPLACE_DEADLINE_S = 1.0
 
 
 def _write_atomic(path, payload):
+    """Write `payload` as JSON, replacing `path` atomically.
+
+    RETRIED, BECAUSE A READER CAN REFUSE THE REPLACEMENT. os.replace is atomic on Windows and
+    POSIX both -- and on Windows it is also DENIED while another process holds the destination
+    open without FILE_SHARE_DELETE. The cockpit reads this file about once a second, so the
+    collision is not bad luck; it is a reader that is always there. Measured 2026-09-17: a
+    coordinator died before its first turn on WinError 5 replacing status.json, and the queue
+    recorded the run as started.
+
+    The deadline is short and the exception is re-raised after it. A status file that truly
+    cannot be written is a real failure -- a fleet with no status is a fleet the panel shows
+    as dead -- so this turns a lost race into a delay, never into a silent skip.
+    """
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
-    os.replace(tmp, path)   # atomic on Windows + POSIX
+    deadline = time.time() + _REPLACE_DEADLINE_S
+    while True:
+        try:
+            os.replace(tmp, path)   # atomic on Windows + POSIX
+            return
+        except PermissionError:
+            if time.time() >= deadline:
+                raise
+            time.sleep(0.05)
 
 
 # ── RUN-RESUME ledger ──────────────────────────────────────────────────────────
@@ -1031,14 +2019,37 @@ LAST_RUN_GOALS = "last_run_goals.json"
 LAST_RUN_DONE = "last_run_done.json"
 # outcome strings that count as a goal being genuinely finished (don't re-queue on resume)
 _RESUME_SUCCESS_OUTCOMES = ("DONE",)
+# A FANOUT parent ended on purpose when it split (its children carry the work). It is recorded
+# in the done-map so resume can tell "split" from "never ran", but it is NOT a success outcome:
+# it counts as finished only if its campaign header is on disk (see _resume_goal_is_done).
+_RESUME_FANOUT_OUTCOME = "FANOUT"
 
 
 def _goal_key(text):
-    """Stable key for a goal from its NORMALIZED text. Same text -> same key across
-    process restarts (unlike Python's per-process hash()). Used to join the done-map
-    onto the goals ledger when resuming."""
+    """Stable TEXT key used by legacy / jid-less goals.
+
+    Admission-aware goals have a stronger identity (`jid`) and use `_goal_resume_key` instead.
+    Keep this hash unchanged for backwards compatibility with old ledgers/done maps and CLI goals.
+    """
     import hashlib
     return hashlib.sha1((text or "").strip().encode("utf-8")).hexdigest()[:16]
+
+
+def _goal_resume_key(goal):
+    """Durable identity for resume/done-map joins: jid first, text hash only as fallback.
+
+    `jid` names one admitted request. Two users may intentionally submit identical instructions,
+    so text equality cannot collapse two different jids without losing work after a crash. Goals
+    that predate admission identity (plain CLI / legacy records) retain the historical text key.
+    """
+    if isinstance(goal, dict):
+        jid = str(goal.get("jid") or "").strip()
+        if jid:
+            return "jid:" + jid
+        text = goal.get("text") or goal.get("goal") or ""
+    else:
+        text = str(goal or "")
+    return _goal_key(text)
 
 
 def _normalize_goal_for_ledger(goal):
@@ -1050,7 +2061,7 @@ def _normalize_goal_for_ledger(goal):
     if isinstance(goal, dict):
         out = dict(goal)
         out.update({"text": text, "checks": checks, "cwd": cwd,
-                    "priority": priority, "key": _goal_key(text)})
+                    "priority": priority, "key": _goal_resume_key(out)})
         return out
     return {"text": text, "checks": checks, "cwd": cwd,
             "priority": priority, "key": _goal_key(text)}
@@ -1067,15 +2078,65 @@ def _ledger_to_goal(entry):
     return g
 
 
-def _write_goals_ledger(state_dir, goals, started):
-    """Write the durable goals ledger ONCE at run start. Best-effort: on any failure,
-    log once to stderr and return -- never raise (a sidecar must not take down the run)."""
+def _write_goals_ledger(state_dir, goals, started, raise_on_error=False):
+    """Write the durable goals ledger once at run start.
+
+    Normal launches keep the historical best-effort behaviour. ``raise_on_error=True`` is used
+    when adopting a pending command, because that command must not be committed away until the
+    ledger is known durable.
+    """
     try:
         payload = {"started": started,
                    "goals": [_normalize_goal_for_ledger(g) for g in goals]}
         _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+        return True
     except Exception as e:
+        if raise_on_error:
+            raise
         sys.stderr.write("[resume] WARN: could not write goals ledger: %s\n" % e)
+        return False
+
+
+def _append_goals_ledger(state_dir, goals, started, raise_on_error=False, return_new=False):
+    """Durably append live ``add_goal`` items to the current run ledger.
+
+    The original ledger was written only once at launch, which meant every task accepted
+    later through the live command channel vanished from ``--resume`` after a crash. Re-delivery
+    of the SAME admitted goal (same jid) is idempotent, while identical text under different jids
+    remains two tasks. Jid-less legacy/CLI goals retain text-key idempotency.
+    Returns the number of newly persisted entries. Best-effort, matching the run-start writer.
+    """
+    if not goals:
+        return [] if return_new else 0
+    try:
+        existing_started, existing = _read_goals_ledger(state_dir)
+        if existing_started is None:
+            raise RuntimeError("goals ledger is missing or corrupt; refusing to replace unknown run state")
+        out = list(existing or [])
+        seen = set()
+        for e in out:
+            if isinstance(e, dict):
+                seen.add(_goal_resume_key(e))
+        newly_admitted = []
+        for goal in goals:
+            e = _normalize_goal_for_ledger(goal)
+            key = _goal_resume_key(e)
+            if key in seen:
+                continue
+            out.append(e)
+            seen.add(key)
+            newly_admitted.append(goal)
+        if newly_admitted:
+            payload = {"started": existing_started, "goals": out}
+            _write_atomic(os.path.join(state_dir, LAST_RUN_GOALS), payload)
+        return newly_admitted if return_new else len(newly_admitted)
+    except Exception as e:
+        if raise_on_error:
+            raise
+        if not getattr(_append_goals_ledger, "_warned", False):
+            sys.stderr.write("[resume] WARN: could not append live goal to ledger: %s\n" % e)
+            _append_goals_ledger._warned = True
+        return [] if return_new else 0
 
 
 def _read_goals_ledger(state_dir):
@@ -1097,7 +2158,7 @@ def _read_goals_ledger(state_dir):
 
 
 def _read_done_map(state_dir):
-    """Read last_run_done.json tolerantly: {goal_key: outcome}. Missing/corrupt -> {}."""
+    """Read last_run_done.json tolerantly: {resume_key: outcome}. Missing/corrupt -> {}."""
     path = os.path.join(state_dir, LAST_RUN_DONE)
     try:
         if not os.path.isfile(path):
@@ -1110,23 +2171,72 @@ def _read_done_map(state_dir):
 
 
 def _update_done_map(state_dir, workers):
-    """Rewrite last_run_done.json from the live workers: map goal_key -> outcome for
-    every worker that reached a successful terminal outcome (DONE). Best-effort: a
+    """Merge live successful workers into last_run_done.json: resume_key -> outcome.
+    Existing success keys are monotonic across reconnect chunks. Best-effort: a
     failure logs once to stderr and is swallowed (never crashes the snapshot hook).
 
     Cheap: called on the snapshot tick, iterates the in-memory workers, atomic write."""
     try:
-        done = {}
+        done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
-            if outcome in _RESUME_SUCCESS_OUTCOMES:
-                done[_goal_key(getattr(w, "goal", "") or "")] = outcome
+            if outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME:
+                _k = _goal_resume_key({
+                    "text": getattr(w, "goal", "") or "",
+                    "jid": getattr(w, "jid", None),
+                })
+                # monotonic: a later FANOUT never downgrades a recorded DONE
+                if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
+                    done[_k] = outcome
         _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     except Exception as e:
         # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
         if not getattr(_update_done_map, "_warned", False):
             sys.stderr.write("[resume] WARN: could not write done map: %s\n" % e)
             _update_done_map._warned = True
+
+
+def _merge_final_done_map(state_dir, results):
+    """Merge successful outcomes from one final chunk into the durable done-map.
+
+    ``run_relay_fleet`` may return only the workers from the last reconnect chunk, and a
+    graceful stop can return just the workers active at stop time. Replacing the file from
+    that partial ``results`` list erases DONE outcomes from earlier chunks and makes
+    ``--resume`` replay work that already succeeded. Existing DONE keys are therefore
+    monotonic for the life of the ledger.
+    """
+    done = _read_done_map(state_dir)
+    for r in results or []:
+        try:
+            outcome = r.get("outcome")
+            goal = r.get("goal") or ""
+        except Exception:
+            continue
+        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME) and goal:
+            _k = _goal_resume_key({"text": goal, "jid": r.get("jid")})
+            if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
+                done[_k] = outcome
+    _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
+    return done
+
+
+def _resume_goal_is_done(entry, key, done_map, state_dir):
+    """Did this ledger goal finish? DONE, or FANOUT whose campaign header is on disk.
+
+    G1: the FANOUT parent ends `done/FANOUT` at the split and used to be re-queued on every
+    resume (one wasted turn, nothing queued). It counts as finished only when the header line
+    for its campaign exists in campaigns.jsonl; without one (that write is best-effort) the
+    parent is re-queued so the work is not lost."""
+    outcome = done_map.get(key)
+    if outcome in _RESUME_SUCCESS_OUTCOMES:
+        return True
+    if outcome == _RESUME_FANOUT_OUTCOME:
+        try:
+            from relay import fleet_resume
+            return fleet_resume.has_campaign_header(state_dir, entry.get("text", ""))
+        except Exception:
+            return False
+    return False
 
 
 def _resume_goals(state_dir):
@@ -1137,11 +2247,25 @@ def _resume_goals(state_dir):
     if not ledger:
         return [], 0, 0
     done_map = _read_done_map(state_dir)
+
+    # Migration from the pre-jid resume ledger. Old entries may contain a jid but still store the
+    # text hash in `key`. That legacy DONE key is safe to reuse only when exactly one ledger row
+    # owns it. If two jids share the same old text key, the old map cannot tell which request
+    # finished; resume both rather than silently discard unfinished work.
+    legacy_key_counts = {}
+    for entry in ledger:
+        stored = entry.get("key") or _goal_key(entry.get("text", ""))
+        legacy_key_counts[stored] = legacy_key_counts.get(stored, 0) + 1
+
     remainder = []
     for entry in ledger:
-        key = entry.get("key") or _goal_key(entry.get("text", ""))
-        if done_map.get(key) in _RESUME_SUCCESS_OUTCOMES:
-            continue                       # already finished successfully -- skip
+        primary = _goal_resume_key(entry)
+        if _resume_goal_is_done(entry, primary, done_map, state_dir):
+            continue                       # already finished successfully (or split) -- skip
+        stored = entry.get("key") or _goal_key(entry.get("text", ""))
+        if (primary != stored and legacy_key_counts.get(stored) == 1
+                and done_map.get(stored) in _RESUME_SUCCESS_OUTCOMES):
+            continue                       # unambiguous pre-jid ledger migration
         remainder.append(_ledger_to_goal(entry))
     return remainder, len(remainder), len(ledger)
 
@@ -1156,11 +2280,12 @@ def _resume_goals(state_dir):
 # relaunch it with --resume. Best-effort throughout: a marker read/write/remove failure
 # is logged (write) or silently tolerated (read/clear) and never takes down the run.
 ACTIVE_MARKER = "fleet_run_active.json"
+RUN_LOCK_FILE = "fleet_runner.lock"
 
 
 def _resume_argv(argv):
-    """Strip goal-specifying flags (-g/--goal VALUE, --goals-file VALUE) and any existing
-    --resume from an argv list, returning the remainder suitable for relaunching with a
+    """Strip goal-specifying flags (-g/--goal, --goals-file, --adopt-command) and any
+    existing --resume from an argv list, returning the remainder suitable for relaunching with a
     single --resume appended. --resume alone reconstructs the goal set from the durable
     ledger (last_run_goals.json); replaying the ORIGINAL -g/--goals-file on top would
     duplicate goals (both the already-finished and the unfinished ones get re-added
@@ -1172,10 +2297,13 @@ def _resume_argv(argv):
         if skip_next:
             skip_next = False
             continue
-        if a in ("-g", "--goal", "--goals-file"):
+        if a in ("-g", "--goal", "--goals-file", "--adopt-command",
+                  "--wait-for-state-dir-seconds"):
             skip_next = True
             continue
-        if a.startswith("--goal=") or a.startswith("--goals-file="):
+        if (a.startswith("--goal=") or a.startswith("--goals-file=")
+                or a.startswith("--adopt-command=")
+                or a.startswith("--wait-for-state-dir-seconds=")):
             continue
         if a == "--resume":
             continue
@@ -1183,19 +2311,35 @@ def _resume_argv(argv):
     return out
 
 
-def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None):
+def _write_active_marker(state_dir, argv=None, pid=None, start_ts=None, raise_on_error=False):
     """Best-effort: record this run as ACTIVE (pid, start_ts, argv, and a precomputed
     resume_argv) so a supervisor can detect an interrupted run later. Never raises -- a
     marker failure is logged once to stderr and the run continues untouched."""
     try:
         raw_argv = list(argv if argv is not None else sys.argv[1:])
-        payload = {"pid": int(pid if pid is not None else os.getpid()),
+        owner_pid = int(pid if pid is not None else os.getpid())
+        payload = {"pid": owner_pid,
+                   # Numeric pids are recyclable. Store the process creation-time token when
+                   # available so a later unrelated process that inherits this pid cannot keep
+                   # an interrupted Fleet permanently classified as live. Zero means legacy /
+                   # unavailable and is handled conservatively by marker_owner_alive().
+                   "pid_birth": int(_pid_birth_token(owner_pid) or 0),
                    "start_ts": float(start_ts if start_ts is not None else time.time()),
                    "argv": raw_argv,
                    "resume_argv": _resume_argv(raw_argv)}
+        # WHICH INTERRUPTED RUN THIS ONE RESUMED, set by the resumer in the environment, so a
+        # run that dies again inherits its predecessor's resume count (the loop guard) via
+        # relay.fleet_reaper. Absent for an ordinary run.
+        _lineage = os.environ.get("MCP_FLEET_RESUME_LINEAGE", "").strip()
+        if _lineage:
+            payload["resume_lineage"] = _lineage
         _write_atomic(os.path.join(state_dir, ACTIVE_MARKER), payload)
+        return True
     except Exception as e:
+        if raise_on_error:
+            raise
         sys.stderr.write("[resume] WARN: could not write active-run marker: %s\n" % e)
+        return False
 
 
 def _read_active_marker(state_dir):
@@ -1212,15 +2356,174 @@ def _read_active_marker(state_dir):
         return None
 
 
-def _clear_active_marker(state_dir):
-    """Best-effort removal of the ACTIVE marker on clean completion / explicit user stop.
-    A missing file is fine (nothing to clear); never raises."""
+def marker_owner_alive(marker, pid_alive_fn=None):
+    """Whether an active-run marker still names the SAME live process instance.
+
+    PID existence alone is insufficient on a long-lived Windows workstation because pids are
+    recycled. New markers carry ``pid_birth`` (process create-time ms). Old markers and hosts
+    where birth lookup is unavailable retain the historical fail-closed pid-only behaviour.
+    """
+    if not isinstance(marker, dict):
+        return False
     try:
-        p = os.path.join(state_dir, ACTIVE_MARKER)
-        if os.path.isfile(p):
-            os.remove(p)
+        pid = int(marker.get("pid") or 0)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    alive = pid_alive_fn or _pid_alive
+    try:
+        if not bool(alive(pid)):
+            return False
+    except Exception:
+        return True                 # cannot disprove ownership -> do not start a rival runner
+    try:
+        recorded_birth = int(marker.get("pid_birth") or 0)
+    except Exception:
+        recorded_birth = 0
+    if recorded_birth <= 0:
+        return True                 # old marker: pid is all the evidence available
+    current_birth = _pid_birth_token(pid)
+    if current_birth <= 0:
+        return True                 # lookup unavailable -> preserve fail-closed semantics
+    return current_birth == recorded_birth
+
+
+def _active_run_conflict_pid(state_dir, self_pid=None):
+    """Return the live pid that already owns this state dir, else 0.
+
+    This is the migration guard for runners started before the OS lock existed, and also makes
+    the refusal human-readable. Unknown pid state is treated as alive by `_pid_alive`, on purpose:
+    overwriting another coordinator's ledger/status is worse than refusing one launch.
+    """
+    marker_path = os.path.join(state_dir, ACTIVE_MARKER)
+    if not os.path.isfile(marker_path):
+        return 0
+    marker = _read_active_marker(state_dir)
+    if not marker:
+        return -1                 # fail closed: may belong to a pre-lock legacy coordinator
+    try:
+        pid = int(marker.get("pid") or 0)
+        me = int(os.getpid() if self_pid is None else self_pid)
+    except Exception:
+        return -1
+    if pid <= 0:
+        return -1
+    if pid == me:
+        return 0
+    return pid if marker_owner_alive(marker, _pid_alive) else 0
+
+
+def _acquire_run_lock(state_dir):
+    """Non-blocking OS lock for one fleet coordinator per state directory.
+
+    A marker file is evidence, not exclusion: two launchers can both inspect a missing/stale
+    marker before either writes its own. The kernel byte-range lock closes that race and is
+    automatically released when a killed process dies, so it cannot become a stale lock.
+    Returns the open lock handle on success, None when another coordinator owns it.
+    """
+    os.makedirs(state_dir, exist_ok=True)
+    path = os.path.join(state_dir, RUN_LOCK_FILE)
+    fh = None
+    try:
+        fh = open(path, "a+b", buffering=0)
+        fh.seek(0, os.SEEK_END)
+        if fh.tell() == 0:
+            fh.write(b"\0")
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return fh
+    except (OSError, IOError):
+        if fh is not None:
+            try:
+                fh.close()
+            except Exception:
+                pass
+        return None
+
+
+def _release_run_lock(fh):
+    """Release a handle returned by `_acquire_run_lock`; safe on None/already-gone."""
+    if fh is None:
+        return
+    try:
+        fh.seek(0)
+        if os.name == "nt":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
     except Exception:
         pass
+    try:
+        fh.close()
+    except Exception:
+        pass
+
+
+def _acquire_run_slot(state_dir, *, wait_seconds=0.0, poll_seconds=0.10):
+    """Acquire this Fleet state directory, optionally waiting for a closing prior owner.
+
+    Default wait_seconds=0 preserves strict fail-fast behavior. The Cockpit fresh-Start path
+    opts into a bounded wait because status.json can reach running:false before the old
+    coordinator has completed final persistence and released its OS lock.
+    """
+    wait_seconds = max(0.0, float(wait_seconds or 0.0))
+    poll_seconds = max(0.0, float(poll_seconds or 0.0))
+    deadline = time.monotonic() + wait_seconds
+    last_conflict = 0
+    while True:
+        owner = _active_run_conflict_pid(state_dir)
+        if owner:
+            last_conflict = owner
+        else:
+            lock = _acquire_run_lock(state_dir)
+            if lock is not None:
+                owner = _active_run_conflict_pid(state_dir)
+                if not owner:
+                    return lock, 0
+                last_conflict = owner
+                _release_run_lock(lock)
+            else:
+                last_conflict = 0
+
+        now = time.monotonic()
+        if wait_seconds <= 0.0 or now >= deadline:
+            return None, last_conflict
+        remaining = max(0.0, deadline - now)
+        time.sleep(min(poll_seconds, remaining) if poll_seconds > 0.0 else 0.0)
+
+
+def _clear_active_marker(state_dir, owner_pid=None):
+    """Remove only THIS coordinator's ACTIVE marker.
+
+    The old implementation unconditionally removed the path. Measured 2026-09-26: runner A
+    finished cleanup after runner B had already written its fresh marker, so A deleted B's marker
+    and external resume paths started more coordinators on the same `.fleet`. Ownership is part
+    of the delete now. Missing/corrupt/mismatched marker is a safe no-op. Returns True iff deleted.
+    """
+    owner = int(os.getpid() if owner_pid is None else owner_pid)
+    marker = _read_active_marker(state_dir)
+    try:
+        marker_pid = int((marker or {}).get("pid") or 0)
+    except Exception:
+        return False
+    if marker_pid <= 0 or marker_pid != owner:
+        return False
+    try:
+        p = os.path.join(state_dir, ACTIVE_MARKER)
+        os.remove(p)
+        return True
+    except FileNotFoundError:
+        return False
+    except Exception:
+        return False
 
 
 def should_auto_resume(marker_exists, pid_alive, user_stopped=False):
@@ -1296,112 +2599,750 @@ def _watchdog_should_reset(status, stalled_s, now=None):
 
 COMMANDS_DIR = "commands.d"
 
-#: The receiver's proof of delivery. When a command carrying add_goal items is consumed, the
-#: fleet writes <state_dir>/acked/<ack>.json for each item that has an `ack`. The sender
-#: (task_router.fleet_handoff) waits for this stamp before it records the goal as delivered;
-#: without it, delivery was only ever attested by the sender's own record, which is written
-#: whether or not anything read the command. The stamp is placed just before the command file
-#: is removed, so it appears exactly when the goal has really been taken in -- never earlier.
-ACKED_DIR = "acked"
+#: Where landing receipts go: <state_dir>/acks/<jid>.ack. The same layout relay/task_router's
+#: _ack_path builds on the sending side.
+ACKS_DIR = "acks"
+
+# ---------------------------------------------------------------- the command channel's schema
+#
+# EVERY FIELD IS CHECKED BEFORE ANY OF IT IS APPLIED (SEC-08). _apply_command used to take
+# whatever a file in commands.d/ said: a disk floor of 1e9 GB or -5, a RAM floor of NaN, a
+# steer of any size, an `ack` that named any path on the machine. Each field was coerced where
+# it was used and a bad one was swallowed by a blanket except -- so a malformed command did
+# half of what it said and nobody was told. Now a command either passes whole or is refused
+# whole, and the refusal is recorded where the operator looks (status.json's
+# `command_rejections`, the fleet console, and the landing receipt when there is one).
+#
+# THE NUMERIC BOUNDS ARE THE SETTINGS PANEL'S OWN. ui/FleetCockpit.cs clamps SetDiskFloor to
+# [0, 100] GB, SetRamFloor to [0, 65536] MB, and maxtabs / autoscale_max to [1, 100] (both at
+# load and on every change). A value the panel cannot produce is not one the channel accepts:
+# the file is not a second, wider settings UI. 0 stays legal for the disk floor because the
+# panel's own 強制開始 button sends exactly that.
+
+DISK_FLOOR_GB_BOUNDS = (0.0, 100.0)
+RAM_FLOOR_MB_BOUNDS = (0.0, 65536.0)
+TABS_BOUNDS = (1, 100)
+#: Goal / steer text. Generous: the chat window sends a pasted instruction verbatim.
+MAX_COMMAND_TEXT = 100_000
+#: A worker name, a reunlock target.
+MAX_NAME = 64
+#: A conversation reference or a working directory.
+MAX_REF = 4096
+#: Entries in one list-valued field (close, steer, add_goal).
+MAX_ITEMS = 200
+MAX_CHECKS = 50
+MAX_CHECKS_JSON = 65_536
+
+_COMMAND_KEYS = frozenset({
+    "close", "set_maxtabs", "set_disk_floor_gb", "set_ram_floor_mb", "set_autoscale",
+    "steer", "reunlock", "add_goal", "pause", "stop", "ack",
+})
+_AUTOSCALE_KEYS = frozenset({"on", "max", "default"})
+_STEER_KEYS = frozenset({"worker", "text"})
+#: Exactly the fields goals_from_command carries through.
+_GOAL_KEYS = frozenset({"text", "priority", "checks", "cwd", "jid", "follow_up_to",
+                        "resume_conv", "new_task"})
+
+#: A job id / ack stem: what task_router mints (uuid hex) with room for other callers' ids,
+#: and nothing that can name a different directory or a device.
+_ID_RE = _re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$")
+_WIN_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL"] + ["COM%d" % i for i in range(1, 10)]
+    + ["LPT%d" % i for i in range(1, 10)])
+_CONTROL = _re.compile(r"[\x00-\x1f\x7f]")
 
 
-def _stamp_acks(cmd, state_dir) -> None:
-    """Stamp acked/<ack>.json for every add_goal item in `cmd` that carries an ack nonce.
+def _is_number(v) -> bool:
+    return (isinstance(v, (int, float)) and not isinstance(v, bool)
+            and _math.isfinite(v))
 
-    Best-effort and never raises: a fleet that cannot write the stamp still consumed the goal,
-    and the sender's fallback is to re-park a goal as waiting, which is the safe direction. An
-    item without an ack (an older sender, or the C# cockpit) is simply not stamped -- those
-    callers do not wait on one.
+
+def _is_whole(v) -> bool:
+    return _is_number(v) and float(v).is_integer()
+
+
+def _is_flag(v) -> bool:
+    return isinstance(v, bool) or (isinstance(v, int) and v in (0, 1))
+
+
+def _is_name(v, allow_empty=True) -> bool:
+    return (isinstance(v, str) and len(v) <= MAX_NAME and not _CONTROL.search(v)
+            and (allow_empty or bool(v.strip())))
+
+
+def _is_safe_id(v) -> bool:
+    return (isinstance(v, str) and bool(_ID_RE.match(v))
+            and v.split(".")[0].upper() not in _WIN_DEVICE_NAMES)
+
+
+def _text_ok(v, limit=MAX_COMMAND_TEXT) -> bool:
+    return isinstance(v, str) and len(v) <= limit
+
+
+def _in(v, bounds) -> bool:
+    return bounds[0] <= v <= bounds[1]
+
+
+def clamp_to_bounds(v, bounds, whole=False):
+    """`v` forced into `bounds` (inclusive) -- the SAME numeric range validate_command enforces
+    for this same knob (DISK_FLOOR_GB_BOUNDS / RAM_FLOOR_MB_BOUNDS / TABS_BOUNDS), so the command
+    channel and the settings-file follower cannot silently drift apart into two different
+    answers for "how big may this number be" (see build_settings_follower).
+
+    Returns None when `v` is not a finite number at all (NaN, +/-inf, or something that will
+    not convert to float) -- that is not "out of range", it is not a number, and the caller
+    leaves the live value untouched rather than adopting nonsense. Otherwise always returns a
+    number inside `bounds`, rounded to a whole number first when `whole` is set (mirrors
+    validate_command's _is_whole check for set_maxtabs / set_autoscale).
     """
     try:
-        items = cmd.get("add_goal") if isinstance(cmd, dict) else None
-    except AttributeError:
-        return
-    if not items:
-        return
-    d = os.path.join(state_dir, ACKED_DIR)
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not _math.isfinite(f):
+        return None
+    if whole:
+        f = round(f)
+    lo, hi = bounds
+    clamped = min(max(f, lo), hi)
+    return int(clamped) if whole else clamped
+
+
+def _ack_name(claimed):
+    """The receipt's file name taken from a command's `ack`, or None if it is not one."""
+    if not isinstance(claimed, str) or not claimed or len(claimed) > MAX_REF:
+        return None
+    name = claimed.replace("\\", "/").rsplit("/", 1)[-1]
+    if not name.endswith(".ack") or not _is_safe_id(name[:-len(".ack")]):
+        return None
+    return name
+
+
+def _same_dir(a, b) -> bool:
+    """Whether two paths name ONE directory: by file identity when both exist, else by their
+    fully resolved, case-folded spelling. Spelling alone would be fooled by 8.3 names and
+    junctions; identity alone cannot speak about a directory not created yet."""
     try:
-        os.makedirs(d, exist_ok=True)
-    except OSError:
-        return
-    for item in items:
-        ack = item.get("ack") if isinstance(item, dict) else None
-        if not ack:
-            continue
-        path = os.path.join(d, "%s.json" % ack)
-        tmp = path + ".tmp"
+        if os.path.isdir(a) and os.path.isdir(b):
+            return os.path.samefile(a, b)
+        return (os.path.normcase(os.path.realpath(a))
+                == os.path.normcase(os.path.realpath(b)))
+    except (OSError, ValueError):
+        return False
+
+
+def ack_receipt_path(state_dir, claimed):
+    """Where the landing receipt for a command whose `ack` says `claimed` is written, or None.
+
+    DERIVED HERE, NEVER TAKEN FROM THE FILE (SEC-08). read_commands used to makedirs() and
+    open(..., "w") whatever path the command named, so anything able to drop a JSON file into
+    commands.d/ could create directories and overwrite files anywhere this account can write,
+    including outside a folder the MCP file tools were scoped to. The receipt now always lands
+    in <state_dir>/acks/, under a file name checked to be a plain id; and a command whose
+    `ack` names any OTHER directory is refused rather than quietly redirected, because that is
+    not a sender that knows where this fleet lives.
+    """
+    name = _ack_name(claimed)
+    if name is None:
+        return None
+    acks = os.path.join(state_dir, ACKS_DIR)
+    if not _same_dir(os.path.dirname(claimed) or ".", acks):
+        return None
+    return os.path.join(acks, name)
+
+
+def validate_command(cmd, state_dir=None) -> list:
+    """Every reason `cmd` may not be applied; [] means it may. Never raises.
+
+    Strict on purpose: an unknown key is an error, not something to skip, because the
+    alternative is a command that did half of what its sender meant while reporting nothing.
+    Error strings name keys and limits, never the text a field carried -- a steer or a goal
+    is the operator's words and has no business in status.json. With `state_dir`, an `ack`
+    is also checked to name that state dir's own acks/ directory (see ack_receipt_path).
+    """
+    try:
+        return _validate_command(cmd, state_dir)
+    except Exception as exc:                           # a validator bug refuses, never admits
+        return ["validator error: %s" % type(exc).__name__]
+
+
+def _validate_command(cmd, state_dir):
+    if not isinstance(cmd, dict):
+        return ["command is %s, not an object" % type(cmd).__name__]
+    errs = []
+    if not cmd:
+        errs.append("empty command")
+    for k in cmd:
+        if k not in _COMMAND_KEYS:
+            errs.append("unknown key %r" % _CONTROL.sub("?", str(k))[:40])
+    if "add_goal" in cmd:
+        mixed = sorted(k for k in cmd if k not in ("add_goal", "ack"))
+        if mixed:
+            errs.append("add_goal cannot be combined with control key(s): %s" % mixed[:8])
+
+    # MESSAGE-BEARING CONTROLS ARE THEIR OWN RETRY UNIT. If a command steers a worker and a
+    # later effect in the same claimed file fails, restoring the claim would send the steer a
+    # second time. Settings/close/pause/stop are locally idempotent; user turns and unlock turns
+    # are not. Keep each of these isolated (landing ack is metadata, not an effect).
+    for isolated in ("steer", "reunlock"):
+        if isolated in cmd:
+            mixed = sorted(k for k in cmd if k not in (isolated, "ack"))
+            if mixed:
+                errs.append("%s cannot be combined with other control key(s): %s"
+                            % (isolated, mixed[:8]))
+
+    def _items(key, v):
+        items = v if isinstance(v, list) else [v]
+        if len(items) > MAX_ITEMS:
+            errs.append("%s: %d entries, limit %d" % (key, len(items), MAX_ITEMS))
+            return []
+        return items
+
+    if "close" in cmd:
+        v = cmd["close"]
+        if not isinstance(v, list) or len(v) > MAX_ITEMS:
+            errs.append("close: must be a list of at most %d worker names" % MAX_ITEMS)
+        elif not all(_is_name(n, allow_empty=False) for n in v):
+            errs.append("close: every entry must be a worker name (1-%d chars)" % MAX_NAME)
+    if "set_maxtabs" in cmd:
+        v = cmd["set_maxtabs"]
+        if not (_is_whole(v) and _in(v, TABS_BOUNDS)):
+            errs.append("set_maxtabs: must be a whole number in [%d, %d]" % TABS_BOUNDS)
+    if "set_disk_floor_gb" in cmd:
+        v = cmd["set_disk_floor_gb"]
+        if not (_is_number(v) and _in(v, DISK_FLOOR_GB_BOUNDS)):
+            errs.append("set_disk_floor_gb: must be a number in [%g, %g]" % DISK_FLOOR_GB_BOUNDS)
+    if "set_ram_floor_mb" in cmd:
+        v = cmd["set_ram_floor_mb"]
+        if not (_is_number(v) and _in(v, RAM_FLOOR_MB_BOUNDS)):
+            errs.append("set_ram_floor_mb: must be a number in [%g, %g]" % RAM_FLOOR_MB_BOUNDS)
+    if "set_autoscale" in cmd:
+        v = cmd["set_autoscale"]
+        if not isinstance(v, dict):
+            errs.append("set_autoscale: must be an object")
+        else:
+            extra = sorted(str(k)[:20] for k in v if k not in _AUTOSCALE_KEYS)
+            if extra:
+                errs.append("set_autoscale: unknown key(s) %s" % extra[:5])
+            if "on" in v and not _is_flag(v["on"]):
+                errs.append("set_autoscale.on: must be true/false or 0/1")
+            for sub in ("max", "default"):
+                # None / 0 mean "not given" -- the reader has always skipped a falsy value.
+                if sub in v and v[sub] not in (None, 0) and not (
+                        _is_whole(v[sub]) and _in(v[sub], TABS_BOUNDS)):
+                    errs.append("set_autoscale.%s: must be a whole number in [%d, %d]"
+                                % ((sub,) + TABS_BOUNDS))
+    if "steer" in cmd:
+        for it in _items("steer", cmd["steer"]):
+            if isinstance(it, str):
+                ok = _text_ok(it)
+            elif isinstance(it, dict):
+                ok = (not (set(it) - _STEER_KEYS)
+                      and (it.get("worker") is None or _is_name(it.get("worker")))
+                      and _text_ok(it.get("text", "")))
+            else:
+                ok = False
+            if not ok:
+                errs.append("steer: each entry must be text or {worker, text} "
+                            "(worker <= %d chars, text <= %d chars)" % (MAX_NAME, MAX_COMMAND_TEXT))
+                break
+    if "reunlock" in cmd:
+        v = cmd["reunlock"]
+        if v is not None and not _is_name(v):
+            errs.append("reunlock: must be a worker name, \"\" or \"*\"")
+    if "add_goal" in cmd:
+        for it in _items("add_goal", cmd["add_goal"]):
+            why = _goal_item_error(it)
+            if why:
+                errs.append("add_goal: " + why)
+                break
+    for key in ("pause", "stop"):
+        if key in cmd and not _is_flag(cmd[key]):
+            errs.append("%s: must be true/false" % key)
+    if "ack" in cmd:
+        if _ack_name(cmd["ack"]) is None:
+            errs.append("ack: must name <state>/acks/<id>.ack")
+        elif state_dir is not None and ack_receipt_path(state_dir, cmd["ack"]) is None:
+            errs.append("ack: names a directory other than this fleet's acks/")
+    return errs
+
+
+def _goal_item_error(it):
+    if isinstance(it, str):
+        if is_local_loop_control_submission(it):
+            return "LOCAL_LOOP control envelope is not Fleet work"
+        return "" if _text_ok(it) else "text longer than %d chars" % MAX_COMMAND_TEXT
+    if not isinstance(it, dict):
+        return "an entry is %s, not text or an object" % type(it).__name__
+    extra = sorted(str(k)[:20] for k in it if k not in _GOAL_KEYS)
+    if extra:
+        return "unknown key(s) %s" % extra[:5]
+    if it.get("text") is not None and is_local_loop_control_submission(it.get("text")):
+        return "LOCAL_LOOP control envelope is not Fleet work"
+    if it.get("text") is not None and not _text_ok(it["text"]):
+        return "text must be a string of at most %d chars" % MAX_COMMAND_TEXT
+    if it.get("follow_up_to") is not None and not _text_ok(it["follow_up_to"]):
+        return "follow_up_to must be a string of at most %d chars" % MAX_COMMAND_TEXT
+    for key in ("cwd", "resume_conv"):
+        v = it.get(key)
+        if v is not None and not (_text_ok(v, MAX_REF) and not _CONTROL.search(v)):
+            return "%s must be a string of at most %d chars" % (key, MAX_REF)
+    for key in ("priority", "new_task"):
+        if it.get(key) is not None and not _is_flag(it[key]):
+            return "%s must be true/false" % key
+    if it.get("jid") is not None and not _is_safe_id(it["jid"]):
+        return "jid must be a plain id"
+    checks = it.get("checks")
+    if checks is not None:
+        rows = checks if isinstance(checks, list) else [checks]
+        if not all(isinstance(c, dict) for c in rows) or len(rows) > MAX_CHECKS:
+            return "checks must be an object or a list of at most %d objects" % MAX_CHECKS
         try:
-            with open(tmp, "w", encoding="utf-8", newline="") as fh:
-                json.dump({"ack": ack, "ts": time.time()}, fh, ensure_ascii=False)
-            os.replace(tmp, path)
-        except OSError:
+            size = len(json.dumps(checks, ensure_ascii=False))
+        except (TypeError, ValueError):
+            return "checks are not serialisable"
+        if size > MAX_CHECKS_JSON:
+            return "checks larger than %d bytes" % MAX_CHECKS_JSON
+    return ""
+
+
+#: How many refused commands status.json keeps. Enough to see a pattern, bounded so a flood of
+#: bad files cannot grow the file the cockpit re-reads every second.
+MAX_REJECTIONS_KEPT = 20
+
+
+def record_command_rejection(box, cmd, errors, log=None):
+    """Remember a refused command in `box` (surfaced as status.json's `command_rejections`)
+    and say so on the console. Records the command's KEYS and the reasons, never its values:
+    a steer or a goal is the operator's own words."""
+    say = log or (lambda m: print(m, flush=True))
+    keys = (sorted(_CONTROL.sub("?", str(k))[:40] for k in cmd)[:12]
+            if isinstance(cmd, dict) else [])
+    row = {"ts": time.time(), "keys": keys, "errors": list(errors)[:10]}
+    box.append(row)
+    del box[:-MAX_REJECTIONS_KEPT]
+    say("[command] REJECTED %s: %s" % (",".join(keys) or "(no keys)", "; ".join(row["errors"])))
+    return row
+
+
+def admit_command(cmd, state_dir, rejections, log=None) -> bool:
+    """The gate _apply_command passes every command through before touching anything.
+    True: apply it. False: it was refused and the refusal is already in `rejections`."""
+    errs = validate_command(cmd, state_dir)
+    if errs:
+        record_command_rejection(rejections, cmd, errs, log=log)
+        return False
+    return True
+
+
+def _write_receipt(state_dir, claimed, body) -> bool:
+    """Drop a landing receipt at the derived path. Never follows what already sits there.
+
+    Written to a temp file in acks/ and renamed over the target, so a link or a hard link
+    planted at the receipt's name is REPLACED, not written through. And acks/ itself must
+    resolve to a directory whose parent is the state dir: a junction put in its place would
+    otherwise carry the write somewhere else.
+    """
+    target = ack_receipt_path(state_dir, claimed)
+    if target is None:
+        return False
+    acks = os.path.dirname(target)
+    tmp = None
+    try:
+        os.makedirs(acks, exist_ok=True)
+        if not _same_dir(os.path.dirname(os.path.realpath(acks)), state_dir):
+            print("[command] ack NOT written: %s does not resolve inside the state dir"
+                  % ACKS_DIR, flush=True)
+            return False
+        tmp = "%s.%d.%d.tmp" % (target, os.getpid(), time.time_ns())
+        with open(tmp, "w", encoding="utf-8", newline="\n") as afh:
+            json.dump(body, afh, ensure_ascii=False)
+        os.replace(tmp, target)
+        return True
+    except OSError:
+        if tmp is not None:
             try:
                 os.remove(tmp)
             except OSError:
                 pass
+        return False
 
 
-def read_commands(state_dir) -> list:
-    """Every pending command for this run, oldest first, CONSUMED as it is read.
+def _pid_birth_token(pid):
+    """Stable-enough process identity component in milliseconds since epoch.
 
-    ONE FILE PER COMMAND, WHICH IS WHY THERE IS NO LOCK HERE. The single commands.json was a
-    read-modify-write on every writer: each read the whole file, added its own entry and wrote
-    it back, so whichever replaced second deleted the other's work -- and a lost goal looks
-    exactly like a goal that was never sent. A lock was added for the Python writers, but the
-    cockpit (ui/CopilotChat.cs) writes this file too and takes no lock, and this reader took
-    none either. A uniquely named file per command removes the read-modify-write entirely:
-    nothing merges, so nothing can clobber, and a writer needs no lock at all -- it only has to
-    land its own file atomically.
-
-    The legacy commands.json is still read, and must stay read: the shipped cockpit binaries
-    write it, and they are built separately from this file. With the Python writers moved to
-    commands.d/ the cockpit is its only writer, so its lack of a lock stops mattering -- one
-    writer cannot race itself.
-
-    A file that will not parse is renamed .bad rather than deleted, so it stops being retried
-    forever without the instruction in it being destroyed. `.tmp` files are a writer mid-flight
-    and are skipped.
+    Numeric pids are recyclable. ``create_time`` distinguishes a later unrelated process that
+    inherited the same pid from the coordinator that originally claimed a command. A failure to
+    read it returns 0 and callers fall back to the old conservative pid-only behaviour.
     """
-    out = []
-    legacy = os.path.join(state_dir, "commands.json")
     try:
-        if os.path.isfile(legacy):
-            with open(legacy, encoding="utf-8-sig") as fh:   # tolerate a BOM from the C# cockpit
-                cmd = json.load(fh)
-            out.append(cmd)
-            _stamp_acks(cmd, state_dir)
-            os.remove(legacy)
+        import psutil
+        return int(round(float(psutil.Process(int(pid)).create_time()) * 1000.0))
+    except Exception:
+        return 0
+
+
+def _claim_owner_identity(path):
+    """Return ``(pid, birth_token)`` from ``...claim-PID[-BIRTH]``.
+
+    ``birth_token == 0`` is the legacy pid-only claim format. Committed suffixes such as
+    ``.applied`` are ignored by parsing only the claim owner segment.
+    """
+    name = os.path.basename(path)
+    tag = ".claim-"
+    if tag not in name:
+        return 0, 0
+    owner = name.split(tag, 1)[1].split(".", 1)[0]
+    parts = owner.split("-", 1)
+    try:
+        pid = int(parts[0])
+    except Exception:
+        return 0, 0
+    birth = 0
+    if len(parts) > 1:
+        try:
+            birth = int(parts[1])
+        except Exception:
+            birth = 0
+    return pid, birth
+
+
+def _claim_owner_pid(path):
+    """Backward-compatible pid-only view of :func:`_claim_owner_identity`."""
+    return _claim_owner_identity(path)[0]
+
+
+def _claim_owner_is_live(path):
+    """True only when the claim still belongs to the same live process instance."""
+    pid, birth = _claim_owner_identity(path)
+    if pid <= 0 or not _pid_alive(pid):
+        return False
+    if birth <= 0:
+        return True                 # legacy claim: pid is all the evidence we have
+    now_birth = _pid_birth_token(pid)
+    if now_birth <= 0:
+        return True                 # cannot disprove ownership -> do not steal somebody's work
+    return now_birth == birth
+
+
+def _committed_claim_state(name):
+    """Receipt state encoded in a non-replayable claim tombstone suffix."""
+    if name.endswith(".applied"):
+        return True
+    if name.endswith(".rejected"):
+        return False
+    if name.endswith(".read"):
+        return None
+    return "not-committed"
+
+
+def _recover_committed_claim_receipt(state_dir, path, applied):
+    """Publish a missing receipt from a committed tombstone; delete only after publication.
+
+    The tombstone still contains the original command JSON.  That makes the commit point and
+    receipt publication crash-recoverable without making the command replayable.
+    """
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            cmd = json.load(fh)
+    except Exception:
+        return False                 # preserve evidence; never replay a committed unknown body
+    ack = cmd.get("ack") if isinstance(cmd, dict) else None
+    if isinstance(ack, str) and ack:
+        # Invalid ack paths can never be made durable and validation already rejects them; they
+        # must not pin an applied tombstone forever. A valid path that merely failed to write is
+        # retained and retried next sweep/start.
+        if ack_receipt_path(state_dir, ack) is None:
+            return True
+        name = os.path.basename(path).split(".claim-", 1)[0]
+        body = {"read": True, "ts": time.time(), "file": name}
+        if applied is not None:
+            body["applied"] = bool(applied)
+        if applied is False:
+            # The .rejected tombstone is the durable admission decision. Recovery may happen
+            # after tenant/config/state changes, so re-validating the command now cannot be used
+            # to decide whether the historical receipt was a rejection. Preserve that fact
+            # unconditionally; current validation is only best-effort detail for the error list.
+            try:
+                errs = validate_command(cmd, state_dir)
+            except Exception:
+                errs = []
+            body.update({"rejected": True, "errors": list(errs or [])[:10]})
+        if not _write_receipt(state_dir, ack, body):
+            return False
+    return True
+
+
+def _recover_stale_command_claims(state_dir):
+    """Recover dead owners' claims and finish committed tombstones without replaying them."""
+    roots = [state_dir, os.path.join(state_dir, COMMANDS_DIR)]
+    recovered = 0
+    for root in roots:
+        try:
+            names = list(os.listdir(root))
+        except OSError:
+            continue
+        for name in names:
+            if ".claim-" not in name:
+                continue
+            path = os.path.join(root, name)
+            committed = _committed_claim_state(name)
+            if committed != "not-committed":
+                if _recover_committed_claim_receipt(state_dir, path, committed):
+                    try:
+                        os.remove(path)
+                    except OSError:
+                        pass
+                continue
+            if _claim_owner_is_live(path):
+                continue
+            original = path.split(".claim-", 1)[0]
+            if os.path.exists(original):
+                try:
+                    os.replace(path, path + ".orphan")
+                except OSError:
+                    pass
+                continue
+            try:
+                os.replace(path, original)
+                recovered += 1
+            except OSError:
+                pass
+    return recovered
+
+
+def _claim_one_command(path, display_name=None):
+    """Atomically take one command file for this process, or None if somebody else won."""
+    _me = os.getpid()
+    _birth = _pid_birth_token(_me)
+    claimed = path + (".claim-%d-%d" % (_me, _birth) if _birth > 0 else ".claim-%d" % _me)
+    try:
+        os.replace(path, claimed)
+    except OSError:
+        return None
+    try:
+        with open(claimed, encoding="utf-8-sig") as fh:
+            cmd = json.load(fh)
     except Exception:
         try:
-            os.remove(legacy)
+            os.replace(claimed, path + ".bad")
         except OSError:
             pass
+        return None
+    return {"cmd": cmd, "original": path, "claimed": claimed,
+            "name": display_name or os.path.basename(path)}
+
+
+def claim_next_command(state_dir):
+    """Claim at most one pending fleet command, oldest-first.
+
+    Production draining uses this instead of pre-claiming the whole queue.  Therefore a commit
+    failure on the current command cannot strand later work as live ``.claim-<pid>`` files: later
+    commands have not been renamed yet and remain ordinary ``.json`` input.
+    """
+    _recover_stale_command_claims(state_dir)
+
+    # Legacy single-file command remains first for compatibility with already-shipped UI builds.
+    legacy = os.path.join(state_dir, "commands.json")
+    if os.path.isfile(legacy):
+        c = _claim_one_command(legacy, "commands.json")
+        if c is not None:
+            return c
+
+    d = os.path.join(state_dir, COMMANDS_DIR)
+    try:
+        names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
+    except OSError:
+        return None
+    for name in names:
+        c = _claim_one_command(os.path.join(d, name), name)
+        if c is not None:
+            return c
+    return None
+
+
+def claim_commands(state_dir) -> list:
+    """Claim every pending fleet command, oldest first, WITHOUT deleting it.
+
+    The live runner applies each returned claim and calls :func:`commit_command_claim` only after
+    the command's durable effects are in place.  If the process dies first, the next coordinator
+    recovers the dead pid's ``.claim-*`` file and retries it.  This closes the former
+    read/delete -> apply/ledger crash window.
+    """
+    _recover_stale_command_claims(state_dir)
+    out = []
+
+    # Shipped pre-commands.d cockpit binaries can still write this legacy file. Claim it too so
+    # compatibility does not re-introduce the durability hole.
+    legacy = os.path.join(state_dir, "commands.json")
+    if os.path.isfile(legacy):
+        c = _claim_one_command(legacy, "commands.json")
+        if c is not None:
+            out.append(c)
+
     d = os.path.join(state_dir, COMMANDS_DIR)
     try:
         names = sorted(n for n in os.listdir(d) if n.endswith(".json"))
     except OSError:
         return out
     for name in names:
-        path = os.path.join(d, name)
-        try:
-            with open(path, encoding="utf-8-sig") as fh:
-                cmd = json.load(fh)
-            out.append(cmd)
-        except Exception:
-            try:
-                os.replace(path, path + ".bad")
-            except OSError:
-                pass
-            continue
-        _stamp_acks(cmd, state_dir)
-        try:
-            os.remove(path)
-        except OSError:
-            pass
+        c = _claim_one_command(os.path.join(d, name), name)
+        if c is not None:
+            out.append(c)
     return out
 
 
-def goals_from_command(cmd) -> list:
+def restore_command_claim(claim) -> bool:
+    """Return an uncommitted claim to the input channel so the next sweep can retry it."""
+    try:
+        claimed = claim["claimed"]
+        original = claim["original"]
+    except Exception:
+        return False
+    if not os.path.isfile(claimed):
+        return False
+    if os.path.exists(original):
+        try:
+            os.replace(claimed, claimed + ".orphan")
+        except OSError:
+            pass
+        return False
+    try:
+        os.replace(claimed, original)
+        return True
+    except OSError:
+        return False
+
+
+def commit_command_claim(state_dir, claim, applied=None, rejected_errors=None) -> bool:
+    """Durably commit one claim, then publish its receipt.
+
+    Rename is the non-replayable commit point.  Receipt publication is recoverable from the
+    committed JSON tombstone; a transient receipt failure therefore keeps the tombstone rather
+    than losing both the command and its acknowledgement.
+    """
+    try:
+        claimed = claim["claimed"]
+        cmd = claim["cmd"]
+        name = claim.get("name") or os.path.basename(claim.get("original") or claimed)
+    except Exception:
+        return False
+    suffix = ".applied" if applied is True else (".rejected" if applied is False else ".read")
+    committed = claimed + suffix
+    # Idempotent commit-only retry. The first call may already have crossed the non-replayable
+    # rename boundary and then failed to publish its receipt. In that case ``claimed`` is gone
+    # by design; continue from the durable tombstone instead of reporting a rename failure or
+    # tempting the caller to re-apply command effects.
+    if not os.path.isfile(committed):
+        until = time.time() + 2.0
+        while True:
+            try:
+                os.replace(claimed, committed)
+                break
+            except OSError:
+                if os.path.isfile(committed):
+                    break
+                if time.time() >= until:
+                    return False
+                time.sleep(0.02)
+
+    ack = (cmd or {}).get("ack") if isinstance(cmd, dict) else None
+    receipt_ok = True
+    if isinstance(ack, str) and ack:
+        body = {"read": True, "ts": time.time(), "file": name}
+        if applied is not None:
+            body["applied"] = bool(applied)
+        errs = list(rejected_errors or [])
+        if errs:
+            body.update({"rejected": True, "errors": errs[:10]})
+        if ack_receipt_path(state_dir, ack) is None:
+            receipt_ok = True       # impossible/invalid ack; validation owns this refusal
+        else:
+            receipt_ok = _write_receipt(state_dir, ack, body)
+            if not receipt_ok:
+                print("[command] committed %s; receipt write deferred to tombstone recovery"
+                      % name, flush=True)
+    if receipt_ok:
+        try:
+            os.remove(committed)
+        except OSError:
+            pass
+        return True
+    # Effects are durably committed but the handoff is not complete until the receipt is durable.
+    # False means "retry commit only" to the live drain; the .applied/.rejected tombstone is the
+    # crash-recovery source and must stay in place.
+    return False
+
+
+def retry_pending_command_commits(state_dir, pending) -> int:
+    """Retry commit only, never command effects; mutate ``pending`` to the still-failed set."""
+    keep = []
+    for claim, applied, errors in list(pending or []):
+        if not commit_command_claim(state_dir, claim, applied=applied, rejected_errors=errors):
+            keep.append((claim, applied, errors))
+    pending[:] = keep
+    return len(keep)
+
+
+def claim_specific_command(state_dir, path):
+    """Claim exactly one pending commands.d JSON, but only from this state directory."""
+    if not path:
+        return None
+    command_dir = os.path.join(state_dir, COMMANDS_DIR)
+    full = os.path.abspath(path)
+    if not full.lower().endswith(".json"):
+        return None
+    if not _same_dir(os.path.dirname(full), command_dir):
+        return None
+    _recover_stale_command_claims(state_dir)
+    return _claim_one_command(full, os.path.basename(full))
+
+
+def claim_adopt_command(state_dir, path):
+    """Claim a pending add_goal command for a fresh runner to adopt as initial work.
+
+    Only ``add_goal`` plus its optional landing ``ack`` may be adopted. A control command
+    (stop/steer/settings/close) belongs to the run it addressed and must never become a new run.
+    Invalid commands are restored before returning so a diagnosis never destroys the request.
+    Returns ``(claim_or_none, goals, errors)``.
+    """
+    claim = claim_specific_command(state_dir, path)
+    if claim is None:
+        return None, [], ["adopt command is not a pending file in this fleet's commands.d"]
+    cmd = claim["cmd"]
+    errors = list(validate_command(cmd, state_dir))
+    if isinstance(cmd, dict):
+        extra = sorted(k for k in cmd if k not in ("add_goal", "ack"))
+        if extra:
+            errors.append("adopt command contains live-control key(s): %s" % extra[:8])
+        if "add_goal" not in cmd:
+            errors.append("adopt command has no add_goal")
+    goals = goals_from_command(cmd) if not errors else []
+    if not goals and not errors:
+        errors.append("adopt command contains no usable goals")
+    if errors:
+        restore_command_claim(claim)
+        return None, [], errors
+    return claim, goals, []
+
+
+def read_commands(state_dir) -> list:
+    """Compatibility consumer: return pending commands and commit them as READ.
+
+    Production fleet execution uses ``claim_commands`` directly and commits only AFTER apply.
+    Tests and small seam tools historically call ``read_commands`` as the receiver itself; keep
+    that API and its landing-receipt semantics without putting the live runner back on the old
+    read/delete-before-apply path.
+    """
+    out = []
+    for claim in claim_commands(state_dir):
+        cmd = claim["cmd"]
+        errs = validate_command(cmd, state_dir)
+        commit_command_claim(state_dir, claim, applied=None, rejected_errors=errs)
+        out.append(cmd)
+    return out
+
+def goals_from_command(cmd, submission_id=None) -> list:
     """The `add_goal` entries in a fleet command file, as goals this run can queue.
 
     MODULE LEVEL SO THE SEAM CAN BE TESTED. This was a closure inside main()'s _drain_commands,
@@ -1412,7 +3353,10 @@ def goals_from_command(cmd) -> list:
     `keep` while the policy read `kept`. Both sides passed their own tests throughout.
 
     Accepts a single entry or a list, a dict or a bare string. `checks` and `cwd` are carried
-    through so a RETRY re-runs WITH its acceptance gate rather than the bare prompt;
+    through so a RETRY re-runs WITH its acceptance gate rather than the bare prompt. When a
+    commands.d claim supplies ``submission_id``, jid-less items receive a deterministic 12-hex
+    jid derived from that command file + item index. Thus crash replay of the SAME command is
+    idempotent, while a NEW command intentionally retrying identical text is a new task.
     goal_fields reads them downstream. An entry without text contributes nothing rather than
     raising -- one malformed row must not cost the rest of the file.
     """
@@ -1421,7 +3365,12 @@ def goals_from_command(cmd) -> list:
         return []
     items = add if isinstance(add, list) else [add]
     out = []
-    for it in items:
+    _sid = str(submission_id or "").strip()
+    # Legacy commands.json is a fixed pathname reused for unrelated commands, so its filename
+    # is NOT an idempotency identity. Modern commands.d filenames are unique per submission.
+    if _sid.lower() == "commands.json":
+        _sid = ""
+    for _idx, it in enumerate(items):
         try:
             if isinstance(it, dict) and it.get("text"):
                 g = {"text": it["text"], "priority": bool(it.get("priority"))}
@@ -1429,9 +3378,54 @@ def goals_from_command(cmd) -> list:
                     g["checks"] = it["checks"]
                 if it.get("cwd"):
                     g["cwd"] = it["cwd"]
+                # THE ADMISSION-TIME ID, carried through same as checks/cwd. task_router's
+                # add_goal_to_live_fleet puts it on the item when the sender wants a receipt;
+                # without threading it here it dead-ends at this function exactly the way the
+                # module docstring above already warns a writer/reader mismatch can happen.
+                if it.get("jid"):
+                    g["jid"] = it["jid"]
+                elif _sid:
+                    import hashlib
+                    g["jid"] = hashlib.sha1(((_sid + "\0" + str(_idx))).encode("utf-8")).hexdigest()[:12]
+                # WHICH CONVERSATION TO CONTINUE, carried through for the same reason as the
+                # three above it. _follow_up builds this field and RelayWorker.__init__ reads
+                # it, but until now the only path between them ran inside one live run: a
+                # steer delivered to a worker that had already finished. Anything arriving
+                # through the command channel -- the chat window's fleet rows, task_router's
+                # `entry`, an operator writing the file by hand -- had the field dropped here
+                # and quietly started a fresh conversation instead.
+                if it.get("follow_up_to"):
+                    g["follow_up_to"] = it["follow_up_to"]
+                # THE CONVERSATION'S ID, AND THE COMMENT ABOVE MISSED IT. That paragraph was
+                # written to carry `follow_up_to` through, and `resume_conv` -- the field that
+                # makes `follow_up_to` a fallback rather than the mechanism -- was left out of
+                # the same list. So the chat window read the durable id off the transcript,
+                # put it on the item (ui/CopilotChat.cs, "THE CONVERSATION BY ITS ID"), and
+                # this function dropped it; RelayWorker then matched the conversation by GOAL
+                # TEXT and printed "That is a guess -- the caller should carry resume_conv"
+                # about a caller that was carrying it. Identity by wording is what
+                # docs/incidents/20260912_a_fleet_conversation_could_be_read_and_never_answered.md
+                # was closed on, and the close did not reach this hop.
+                #
+                # The goals-file path never had this bug: it appends the whole dict, so the
+                # cockpit's Continue button worked while the same follow-up typed into the
+                # chat window did not. One feature, two routes, one of them silently guessing.
+                if it.get("resume_conv"):
+                    g["resume_conv"] = it["resume_conv"]
+                # WHICH VERB SENT IT, carried for the same reason as the four above and with
+                # the same hazard in mind: a field set at one end and dropped here is what
+                # made resume_conv a guess for weeks. The chat window sets this only for a
+                # `/goal ` submission, and the fleet records it as a mechanism -- so this is
+                # a field with a reader before it had a writer's second line.
+                if it.get("new_task"):
+                    g["new_task"] = True
                 out.append(g)
             elif isinstance(it, str) and it:
-                out.append({"text": it, "priority": False})
+                g = {"text": it, "priority": False}
+                if _sid:
+                    import hashlib
+                    g["jid"] = hashlib.sha1(((_sid + "\0" + str(_idx))).encode("utf-8")).hexdigest()[:12]
+                out.append(g)
         except Exception:
             pass
     return out
@@ -1462,6 +3456,7 @@ def _print_table(workers, total=None):
 # this file (outside main()'s local scope) knows which state_dir's ACTIVE marker to
 # clear on an explicit Ctrl+C. None until a run actually starts.
 _ACTIVE_STATE_DIR = None
+_ACTIVE_RUN_LOCK = None
 
 
 
@@ -1511,6 +3506,7 @@ def report_duplicate_completions(state_dir, out=print, transcripts=None):
 
 
 def main():
+    global _ACTIVE_STATE_DIR, _ACTIVE_RUN_LOCK
     # cp932 console: goal/reason text can contain chars the legacy codepage cannot
     # encode (a worker once died printing U+26A0); degrade to '?' instead of crashing.
     for _s in (sys.stdout, sys.stderr):
@@ -1525,6 +3521,7 @@ def main():
                                             or os.environ.get("MCP_IMPL_AGENT_URL", "")))
     ap.add_argument("-g", "--goal", action="append", help="a goal (repeatable)")
     ap.add_argument("--goals-file", help="file with one goal per line (# comments ok)")
+    ap.add_argument("--adopt-command", help="rescue one pending commands.d add_goal as this run's initial work; used by the local cockpit when a live run ends during submission")
     ap.add_argument("--force", action="store_true",
                     help="start even when the launch gate's preconditions are unmet; the run still happens and its measurements carry whatever was wrong")
     ap.add_argument("--resume", action="store_true",
@@ -1557,8 +3554,10 @@ def main():
                     help="autoscale START/default tabs. -1 = the cockpit's maxtabs setting")
     ap.add_argument("--autoscale-max", type=int, default=-1,
                     help="autoscale ceiling (上限, max tabs). -1 = cockpit's autoscale_max")
-    ap.add_argument("--autoscale-headroom-mb", type=int, default=1400,
-                    help="free RAM (MB) to keep for the user's other work while autoscaling")
+    ap.add_argument("--autoscale-headroom-mb", type=int, default=-1,
+                    help="free RAM (MB) to keep for the user's other work. -1 = the declared "
+                         "default in tools/settings_keys.py. An ALIAS for the RAM floor: the "
+                         "live autoscale reads ram_box[0], so this only seeds it.")
     ap.add_argument("--autoscale-per-tab-mb", type=int, default=700,
                     help="RAM budget (MB) assumed per Copilot tab when autoscaling")
     ap.add_argument("--autoscale-up-margin-mb", type=int, default=700,
@@ -1594,12 +3593,19 @@ def main():
                     help="per-goal retries for TRANSIENT failures (send/timeout/likely-"
                          "transient STUCK) before giving up, with backoff (default 10, "
                          "like Claude Code retrying a failed network request)")
-    ap.add_argument("--fanout", action="store_true",
-                    help="split each goal into independent sub-goals, run them in parallel, "
-                         "and merge the answers. For work whose SIZE is the problem: a goal "
-                         "that cannot fit in one conversation fails at the conversation, not "
-                         "at the work. Off by default -- a goal that fits should not pay for "
-                         "a split turn and a merge turn.")
+    # ON BY DEFAULT, AND THE OLD HELP TEXT CARRIED THE REASON IT WAS NOT. "a goal that fits
+    # should not pay for a split turn and a merge turn" was true while this flag WAS the
+    # decision. It is not any more: RelayWorker judges every goal separately
+    # (`self.fanout = bool(fanout) and _depth0 and _goal_splittable`), so a goal that fits is
+    # judged NO_SPLIT and pays nothing. The flag only decides whether the question is ever
+    # asked -- and off by default meant it was asked for nobody who did not know to opt in.
+    ap.add_argument("--fanout", action=argparse.BooleanOptionalAction, default=True,
+                    help="split a goal into independent sub-goals, run them in parallel, and "
+                         "merge the answers -- for work whose SIZE is the problem: a goal that "
+                         "cannot fit in one conversation fails at the conversation, not at the "
+                         "work. ON by default; each goal is still judged separately (offline "
+                         "triage, then the agent itself, which may answer NO_SPLIT), so a goal "
+                         "that fits costs nothing. --no-fanout disables the capability.")
     ap.add_argument("--refuter", action="store_true",
                     help="operator B: after a candidate DONE, an INDEPENDENT reviewer "
                          "(non-blocking side chat) tries to refute it before accepting. "
@@ -1630,14 +3636,74 @@ def main():
                          "correctness refuter; accept if upheld (cheap, no over-engineering), "
                          "escalate to research+panel only when it refutes. Beats a uniform ultra "
                          "by not over-engineering the easy tasks (ultra's observed failure mode).")
+    ap.add_argument("--wait-for-state-dir-seconds", type=float, default=0.0,
+                    help="opt-in fresh-start handoff: wait this many seconds for a closing "
+                         "coordinator to release the same state dir (default 0 = fail fast)")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
     args = ap.parse_args()
+    _record_run_fanout(args.fanout)
+
+    # FINAL EXCLUSION LAYER: one state dir may have exactly one coordinator. Do this before
+    # coordinator logs, queue receipts, retention, resume expansion, or any durable run-state
+    # rewrite. External launchers have guards too, but the process that owns the files is the
+    # only layer that can make the invariant unconditional.
+    os.makedirs(args.state_dir, exist_ok=True)
+    _ACTIVE_STATE_DIR = args.state_dir
+    _ACTIVE_RUN_LOCK, _owner = _acquire_run_slot(
+        args.state_dir, wait_seconds=args.wait_for_state_dir_seconds)
+    if _ACTIVE_RUN_LOCK is None:
+        waited = max(0.0, float(args.wait_for_state_dir_seconds or 0.0))
+        prefix = ("TIMED OUT WAITING TO START" if waited > 0.0 else "REFUSING TO START")
+        if _owner < 0:
+            print("%s: fleet state directory has an unreadable active-run marker: %s"
+                  % (prefix, args.state_dir), flush=True)
+        elif _owner > 0:
+            print("%s: fleet state directory is still owned by live pid %d: %s"
+                  % (prefix, _owner, args.state_dir), flush=True)
+        else:
+            print("%s: another fleet coordinator holds the state-dir lock: %s"
+                  % (prefix, args.state_dir), flush=True)
+        return 3
+
+    _adopt_claim = None
+    _adopt_goals = []
+    if args.adopt_command:
+        _adopt_claim, _adopt_goals, _adopt_errors = claim_adopt_command(args.state_dir, args.adopt_command)
+        if _adopt_claim is None:
+            # If the exact pending file vanished after the UI launched this rescuer, another
+            # runner already claimed it. That is success-by-race, not an error; anything still
+            # present but invalid is a real refusal.
+            if not os.path.exists(args.adopt_command):
+                print("ADOPT: command is no longer pending; another runner already took it.", flush=True)
+                _release_run_lock(_ACTIVE_RUN_LOCK)
+                _ACTIVE_RUN_LOCK = None
+                return 0
+            print("ADOPT: refusing pending command: %s" % "; ".join(_adopt_errors), flush=True)
+            _release_run_lock(_ACTIVE_RUN_LOCK)
+            _ACTIVE_RUN_LOCK = None
+            return 4
+
+    _cli_goals = _read_goals(args)
+    _control_errors = reject_local_loop_control_goals(_cli_goals)
+    if _control_errors:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("REFUSING TO START: %s" % "; ".join(_control_errors), flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 4
 
     # Capture the coordinator's own stdout/stderr to a durable log under state_dir, from
     # here (right after argparse) so it covers argparse-error exits too, regardless of
     # which launcher started this process. Best-effort -- never crashes on failure.
     _setup_coordinator_log(args.state_dir)
+
+    # VISIBLE BEFORE ANYTHING CAN REFUSE IT. See _record_cli_submission: until this existed, a
+    # goal given on the command line appeared nowhere until the run was already going, so a run
+    # that died on a precondition left the operator unable to tell it from a command never
+    # typed. Cleared at run start, where the goals ledger takes over.
+    _cli_queue_paths = _record_cli_submission(args.state_dir, _adopt_goals + _cli_goals, sys.argv)
 
     # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER -- the same reasoning as the session
     # store's pass: a sweep that can fire mid-run is a sweep that can delete the transcript
@@ -1657,10 +3723,7 @@ def main():
     except Exception as _exc:                     # never let housekeeping stop a run
         print("fleet retention skipped: %s" % _exc, flush=True)
 
-    # let the KeyboardInterrupt handler at the bottom of this file clear the ACTIVE
-    # marker even though it runs outside main()'s local scope.
-    global _ACTIVE_STATE_DIR
-    _ACTIVE_STATE_DIR = args.state_dir
+    # KeyboardInterrupt already knows this state_dir from the early single-instance gate above.
 
     # ULTRA ACCURACY preset: maximise CLEAN correctness, ignore time. Wires the verified accuracy
     # levers -- the session's failure analysis pinned the bottleneck on edit PRECISION (right file,
@@ -1720,7 +3783,7 @@ def main():
     print("[effort] %s  (refuter=%s lenses=%s refute<=%d research<=%d)"
           % (_eff, args.refuter, args._lenses, args.max_refute, args.max_research))
 
-    goals = _read_goals(args)
+    goals = _adopt_goals + _cli_goals
 
     # THE LENS IS CHOSEN BEFORE THE GOALS ARE READ, AND THE GOALS ARE THE EVIDENCE.
     #
@@ -1763,11 +3826,60 @@ def main():
                   "(no last-run ledger found -- nothing to resume)")
         else:
             print("RESUME: %d of %d goals unfinished -- requeueing." % (n_unfinished, m_total))
+        # G2: campaign children that never finished were only ever queued in memory, so they
+        # are not in the goals ledger. Re-queue every child not DONE for campaigns whose merge
+        # has not finished, skipping any the ledger already carries (a second resume).
+        try:
+            from relay import fleet_resume as _fr
+            _kids, _degraded = _fr.resume_children_goals(args.state_dir)
+            _have = {_goal_resume_key(g) for g in resume_goals}
+            _kids = [k for k in _kids if _goal_resume_key(k) not in _have]
+            if _kids:
+                print("RESUME: %d unfinished campaign child(ren) re-queued from the campaign "
+                      "ledger (%d degraded)." % (len(_kids), _degraded))
+            # HARD SAFETY CAP. Scoping to the interrupted run is the fix; this refuses, loudly
+            # and with the snapshot left pending, anything that would still queue an absurd
+            # number of goals (545 were queued for a 2-goal run before the scoping existed).
+            _cap = _fr.resume_queue_cap(m_total)
+            _would = len(resume_goals) + len(_kids)
+            if _would > _cap:
+                print("REFUSING TO RESUME: it would queue %d goals (%d from the goals ledger, "
+                      "%d campaign children) but the cap is %d (max(%d, %dx the run's %d "
+                      "goals)). State left pending; nothing was queued."
+                      % (_would, len(resume_goals), len(_kids), _cap, _fr.RESUME_CAP_FLOOR,
+                         _fr.RESUME_CAP_FACTOR, m_total), flush=True)
+                _fr.record_resume_refused(
+                    args.state_dir, os.environ.get("MCP_FLEET_RESUME_LINEAGE", "").strip(),
+                    time.time(), _would, _cap)
+                _release_run_lock(_ACTIVE_RUN_LOCK)
+                _ACTIVE_RUN_LOCK = None
+                return 6
+            resume_goals = resume_goals + _kids
+        except Exception as _e:
+            print("RESUME: could not read campaign children: %s: %s" % (type(_e).__name__, _e))
         # resume set goes first so it keeps its original order ahead of any new goals.
         goals = resume_goals + goals
         if not goals:
             # everything finished (and no new -g/--goals-file goals) -> nothing to launch.
             sys.exit(0)
+        # A BY-HAND --resume ADOPTS THE INTERRUPTED RUN'S GOALS HERE, so it is also where the
+        # snapshot must say so (a supervisor/script launch sets the lineage and marks it itself).
+        try:
+            from relay import fleet_resume as _fr_mark
+            _fr_mark.mark_manual_resume(args.state_dir, time.time())
+        except Exception as _e:
+            print("RESUME: could not mark the snapshot resumed: %s" % type(_e).__name__)
+
+    # RESUME IS AN INGRESS TOO. An old run ledger may predate the intake guards above (the
+    # 2026-09-29 incident left LOCAL_LOOP wrapper text in last_run_goals.json). Never let a
+    # supervisor/manual --resume turn that historical protocol artifact back into Fleet work.
+    _control_errors = reject_local_loop_control_goals(goals)
+    if _control_errors:
+        print("REFUSING TO START: %s" % "; ".join(_control_errors), flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 4
+
     if not goals:
         if args.resume:
             ap.error("no goals -- --resume found an empty ledger and no -g/--goals-file given")
@@ -1776,23 +3888,35 @@ def main():
         ap.error("no agent URL -- pass --agent-url or set MCP_FLEET_AGENT_URL in .env")
     # a goal may be a plain string or a dict carrying acceptance checks; gtexts is the
     # display/keying text for each, so dict goals don't break snapshots or result lookup.
-    gtexts = [goal_fields(g)[0] for g in goals]
+    # NAMED, NOT A TRACEBACK. This is the first thing that reads a goal's acceptance spec,
+    # and it runs long before Playwright -- so a malformed check fails here with no browser
+    # open and nothing to reset, which is right. The person who has to fix it is looking at
+    # their own goals file, so say which goal and what is wrong with it rather than unwinding
+    # the stack at them.
+    try:
+        gtexts = [goal_fields(g)[0] for g in goals]
+    except MalformedCheck as _bad:
+        for _i, _g in enumerate(goals, 1):
+            try:
+                goal_fields(_g)
+            except MalformedCheck:
+                _t = (_g.get("text") or _g.get("goal") or "") if isinstance(_g, dict) else str(_g)
+                print("goal %d of %d has an unusable acceptance check:\n  %s\n  goal: %s"
+                      % (_i, len(goals), _bad, _t[:200]))
+                break
+        sys.exit(2)
     nverify = sum(1 for g in goals if goal_fields(g)[1])
     # Fleet-level directive (Bucket B): the single authoritative task description when this
     # run was started from exactly ONE goal. With multiple independent goals there is no single
     # directive, so we set it to "" -- the UI handles multi-goal runs honestly and we never
     # fabricate a summary. Only one goal -> directive = that goal's text.
     directive = gtexts[0] if len(gtexts) == 1 else ""
-    # FIX 3 (P2): run_label = verbatim first line of the first goal, truncated to 60 chars,
-    # with leading list markers / whitespace stripped.  NEVER synthesised.
-    import re as _re
-    _first_goal_text = gtexts[0] if gtexts else ""
-    _first_line = _first_goal_text.splitlines()[0] if _first_goal_text else ""
-    _first_line = _re.sub(r'^[\s\-*#\d.>]+', '', _first_line).strip()
-    run_label = _first_line[:60]
+    # Display-only task identity. The full execution goal remains in workers[].goal / directive.
+    # Reuse the same deterministic, redacting extractor as conversation titles instead of
+    # exposing the first 60 characters of a 2-4k operational prompt.
+    run_label = _goal_summary(gtexts[0]) if gtexts else ""
     goal_count = len(gtexts)
 
-    os.makedirs(args.state_dir, exist_ok=True)
     status_path = os.path.join(args.state_dir, "status.json")
     started = time.time()
     # full-text conversation transcripts (one jsonl per worker, all turns untruncated).
@@ -1804,20 +3928,54 @@ def main():
     except Exception:
         pass
 
-    # RUN-RESUME: write the durable goals ledger ONCE, now, so a crash mid-run leaves a
-    # record `--resume` can relaunch from. Reset the done-map to empty for this run so a
-    # previous run's completions never mask this run's goals. Best-effort (never crashes).
-    _write_goals_ledger(args.state_dir, goals, started)
+    # RUN-RESUME: the ledger is the durable owner of every initial goal. For an adopted live
+    # command this write is REQUIRED, not best-effort: the command may not be committed away
+    # until another durable source can reconstruct it.
     try:
-        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
+        _write_goals_ledger(args.state_dir, goals, started, raise_on_error=True)
+    except Exception as e:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("[resume] could not write the durable goals ledger: %s" % e, flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 5
+    try:
+        # A RESUME KEEPS THE DONE MAP. It is monotonic (DONE keys are only ever added), and the
+        # goals ledger written above holds just the unfinished goals, so wiping the map here
+        # forgot every finished goal -- a second resume could then re-run them. Only a fresh
+        # run starts from {}.
+        if not args.resume:
+            _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), {})
     except Exception as e:
         sys.stderr.write("[resume] WARN: could not reset done map: %s\n" % e)
 
-    # RUN-ACTIVE marker: written now that we know goals are actually going to run (the
-    # early --resume-with-nothing-to-do exit above already returned). Removed on clean
-    # completion / explicit stop below; its survival past this process's death is exactly
-    # what tells a boot-time supervisor the run was interrupted (see should_auto_resume()).
-    _write_active_marker(args.state_dir, start_ts=started)
+    # Write interruption recovery BEFORE committing an adopted command. From the instant the
+    # command disappears, a crash must still leave both its goals ledger and an active marker
+    # that tells the supervisor to resume that ledger.
+    try:
+        _write_active_marker(args.state_dir, start_ts=started,
+                             raise_on_error=bool(_adopt_claim))
+    except Exception as e:
+        if _adopt_claim is not None:
+            restore_command_claim(_adopt_claim)
+        print("[resume] could not durably mark adopted work active: %s" % e, flush=True)
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
+        return 5
+    _start_forensics(args.state_dir)
+    _sample_free_space(args.state_dir, None, force=True)   # floor not resolved yet; ticks carry it
+    if _adopt_claim is not None:
+        if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
+            restore_command_claim(_adopt_claim)
+            _clear_active_marker(args.state_dir, owner_pid=os.getpid())
+            print("ADOPT: durable goal ledger exists but command commit failed; returned command to queue.", flush=True)
+            _release_run_lock(_ACTIVE_RUN_LOCK)
+            _ACTIVE_RUN_LOCK = None
+            return 5
+
+    # The run is now represented by ledger + active marker; optimistic startup queue rows can go.
+    _clear_cli_submission(_cli_queue_paths)
 
     # an EXPLICIT --max-concurrent (>=0) was given on the CLI (not the -1 "ask the cockpit"
     # sentinel). Used for the precedence rule below: CLI wins over settings.txt autoscale.
@@ -1825,9 +3983,14 @@ def main():
     if args.max_concurrent > 0:
         max_conc = args.max_concurrent
     elif args.max_concurrent == 0:
-        max_conc = auto_concurrency(len(goals))           # 0 = auto from free RAM
+        # The run is a long-lived queue: add_goal can add work after launch.  Asking RAM how
+        # many of the *initial* goals fit permanently shrinks a one-goal run to one lane.
+        max_conc = auto_concurrency(AUTOSCALE_CEILING_DEFAULT)  # 0 = auto from free RAM
     else:
-        max_conc = min(settings_maxtabs(), len(goals))    # -1 = the cockpit's setting (default 3)
+        # Do not cap the live capacity by len(goals) at t=0.  The pending queue itself prevents
+        # over-admission when only one goal exists; keeping the configured capacity lets later
+        # add_goal submissions use the idle lanes immediately.
+        max_conc = settings_maxtabs()                    # -1 = cockpit setting (default 3)
 
     # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
     # default, shrink when RAM is tight, grow toward the ceiling when RAM is free.
@@ -1860,7 +4023,9 @@ def main():
         # the fixed cap exactly as before.
         asc_ceiling = AUTOSCALE_CEILING_DEFAULT if autoscale else max(asc_default,
                                                                       settings_maxtabs())
-    asc_ceiling = max(1, min(asc_ceiling, len(goals)))
+    # Same long-lived-queue rule as max_conc above.  The ceiling is machine/operator capacity,
+    # not the number of goals present at startup.  Keep the ordinary tab safety bound instead.
+    asc_ceiling = max(TABS_BOUNDS[0], min(int(asc_ceiling), TABS_BOUNDS[1]))
     asc_default = max(1, min(asc_default, asc_ceiling))      # default never exceeds the ceiling
     autoscale_max = asc_ceiling
     if autoscale:
@@ -1870,19 +4035,61 @@ def main():
     # ── disk-floor admission reserve: keep this many GB free on C: at all times. Resolution
     # chain (most explicit wins): CLI --disk-floor-gb >= 0 -> cockpit settings.txt
     # disk_floor_gb -> env SWE_DISK_FLOOR_GB (default 6). A 0 floor disables the disk gate.
+    # PROVENANCE, NOT JUST THE VALUE. Printing the winning number and not the branch that
+    # produced it is what made this chain un-debuggable from outside: the panel said 1 GB,
+    # runs reserved 4, and every investigation had to re-derive the chain by hand and still
+    # could not say which step was lying. The raw file read is captured separately from the
+    # resolved value so the log can distinguish "the file said 1 and something overrode it"
+    # from "the file was not read at all".
+    # NOT "CLI". This branch means the parsed namespace holds a non-negative value, which an
+    # argparse default or a pre-populated namespace can produce with nothing on the command
+    # line -- so the label says what was actually observed and leaves the cause open.
     if args.disk_floor_gb >= 0:
         disk_floor = args.disk_floor_gb
+        disk_floor_src = ("parsed namespace held %.1f (a typed flag, an argparse default, or "
+                          "a later assignment -- argv is printed below so they can be told "
+                          "apart)" % args.disk_floor_gb)
     else:
         disk_floor = settings_disk_floor()
+        disk_floor_src = SETTINGS_READ_TRACE.get("disk_floor_gb", "(read not traced)")
     disk_box = [disk_floor]                                   # live disk floor (cockpit-settable)
     # ── RAM-floor admission reserve: keep this many MB free for the user. CLI --ram-floor-mb >= 0
-    # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb (default 1400).
+    # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb when given -> the ONE
+    # declared default. That last step used to be --autoscale-headroom-mb's own default of
+    # 1400, which is how this knob came to have three defaults that never had to agree.
     if args.ram_floor_mb >= 0:
         ram_floor = args.ram_floor_mb
+        ram_floor_src = "parsed namespace held %.0f (flag, default, or assignment)" % args.ram_floor_mb
     else:
-        ram_floor = settings_ram_floor(default=float(args.autoscale_headroom_mb))
+        ram_floor = settings_ram_floor(
+            default=(float(args.autoscale_headroom_mb) if args.autoscale_headroom_mb >= 0
+                     else RAM_FLOOR_DEFAULT_MB))
+        ram_floor_src = SETTINGS_READ_TRACE.get("ram_floor_mb", "(read not traced)")
     ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
+
+    # ── THE FILE IS THE SETTING, NOT THE MOMENT WE STARTED. Everything above reads
+    # settings.txt exactly once. A run that outlives the operator's next visit to the
+    # settings panel therefore uses numbers they can no longer see or correct, and the
+    # only channel that could have told it -- a live push from a cockpit that happens to
+    # be running -- is missing whenever the cockpit was restarted, rebuilt, or simply not
+    # open. Measured 2026-09-15: a run started 15:08:26, settings saved 15:15, and the
+    # run reserved 4 GB / 1024 MB for its whole life while the panel said 1 GB / 512 MB.
+    #
+    # The follower adopts a key only when the FILE's value CHANGES, so the cockpit's
+    # live overrides (強制開始 zeroing the disk gate) survive until the operator next
+    # moves that knob, and a run nobody touches behaves exactly as it did before.
+    #
+    # IT FOLLOWS EVEN WHEN A CLI FLAG PINNED THE VALUE, and that is deliberate. The
+    # documented chain is "most explicit wins", but between a flag typed when the run
+    # was launched and a knob the operator is moving right now, the one in front of
+    # them is the more explicit statement -- it is the one they are watching for an
+    # effect. The live cockpit push has always overridden a CLI flag for exactly this
+    # reason; a run that ignored the panel because of a flag from an hour ago would be
+    # the same defect this block exists to remove, wearing a different hat.
+    #
+    # on_tick fires every poll_s (1.0 s), so "the operator changes a setting and the
+    # run changes" is a second, not a restart.
 
     # write an initial 'launching' snapshot so the cockpit shows something at once
     _write_atomic(status_path, {"started": started, "updated": started,
@@ -1913,28 +4120,93 @@ def main():
     else:
         print("       max %d tab(s) open at once (close-on-done frees each); free RAM now %d MB"
               % (max_conc, round(avail_phys_mb())))
-    if disk_floor > 0:
-        from relay.relay_fleet import free_disk_gb
-        print("       disk floor: keep >= %.1f GB free on C: (free now %.1f GB); "
-              "admission gated on disk+RAM, continuous (no batch barrier)"
-              % (disk_floor, free_disk_gb()))
+    # PRINTED WHETHER OR NOT THERE IS A FLOOR. The old guard meant a 0 floor -- the disk gate
+    # disabled entirely -- said nothing at all, so the most dangerous configuration was the
+    # quietest one.
+    from relay.relay_fleet import free_disk_gb
+    # THE WHOLE PROVENANCE, ON THE LINE THAT REPORTS THE NUMBER. A run whose floor disagrees
+    # with the panel has been reported three times and "fixed" once; every investigation had
+    # to re-derive the chain from outside because the log printed only the winner.
+    print("       disk floor: keep >= %.1f GB free on C: -- %s (free now %.1f GB)"
+          % (disk_floor, disk_floor_src, free_disk_gb()))
+    print("       RAM floor:  keep >= %.0f MB free -- %s" % (ram_floor, ram_floor_src))
+    # EVERY KEY THIS PROCESS ACTUALLY SEES. If the fleet is reading a different copy of the
+    # settings file than the cockpit writes, then no setting reaches it -- not just the floor
+    # -- and the only way to know is to print what it read, not what we think it read.
+    try:
+        _sp = _settings_path()
+        _raw = io.open(_sp, encoding="utf-8-sig").read()
+        print("       settings   : %s (%d bytes) ->" % (_sp, len(_raw.encode("utf-8"))))
+        for _ln in _raw.splitlines():
+            if _ln.strip():
+                print("                    %s" % _ln)
+    except Exception as _e:
+        print("       settings   : could not be read: %s" % _e)
+    print("       argv       : %r" % (getattr(sys, "orig_argv", None) or sys.argv,))
+    print("       resolver   : %s" % (getattr(_settings_float, "__module__", "?"),))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
+    # BUILT HERE, AFTER EVERY BOX EXISTS. This used to be an inline block 56 lines up,
+    # where four closures referenced these lists lazily and the ordering never mattered.
+    # Extracting it turned those closures into arguments, and arguments are resolved at
+    # the call: every fleet run died at startup with UnboundLocalError on mc_box, while
+    # the queue recorded each one as started. Order is checkable; deferral was not.
+    settings_follower = build_settings_follower(disk_box, ram_box, mc_box, asc_box)
     add_box = []                       # goals queued mid-run (native chat / cockpit)
     pause_box = [False]                # cockpit pause toggle: freeze the fleet without losing
                                        # state (e.g. across a network switch); resume to continue
     stop_box = [False]                 # cockpit graceful-stop: cancel all workers and end the run
+    reunlock_box = [None]               # last {"reunlock":...} outcome -- see apply_reunlock;
+                                       # surfaced in status.json so the operator can tell whether
+                                       # the button worked rather than watching silence
+    rejections_box = []                # commands refused by validate_command -- surfaced in
+                                       # status.json as command_rejections (SEC-08)
+    _pending_command_commits = []      # effects already applied; retry COMMIT only, never apply
 
     def _drain_commands(workers):
-        # cockpit -> fleet control channel. {"close":["w2"], "set_maxtabs":5}. Consume.
-        # EVERY pending command, oldest first -- see read_commands for why they are separate
-        # files now. One malformed command must not cost the ones behind it, so the body is
-        # per-command and its except is too.
-        for cmd in read_commands(args.state_dir):
-            _apply_command(cmd, workers)
+        # ONE CLAIM -> APPLY -> COMMIT AT A TIME. Never pre-claim the whole queue: if the current
+        # post-apply commit stalls, every later command must remain an ordinary .json that no live
+        # pid owns. Effects already applied to the current claim still use commit-only retry.
+        if _pending_command_commits:
+            retry_pending_command_commits(args.state_dir, _pending_command_commits)
+            if _pending_command_commits:
+                return
+        while True:
+            claim = claim_next_command(args.state_dir)
+            if claim is None:
+                return
+            ok, errs = _apply_command(claim["cmd"], workers, submission_id=claim["name"])
+            if ok is True:
+                if not commit_command_claim(args.state_dir, claim, applied=True):
+                    _pending_command_commits.append((claim, True, []))
+                    print("[command] applied; commit will retry without reapplying %s"
+                          % claim.get("name", "?"), flush=True)
+                    return
+            elif ok is False:        # schema refusal is a terminal, audited consumption
+                if not commit_command_claim(args.state_dir, claim, applied=False, rejected_errors=errs):
+                    _pending_command_commits.append((claim, False, errs))
+                    return
+            else:
+                # Application raised before the claim could commit. add_goal is ledger-idempotent;
+                # steer/reunlock are schema-isolated retry units; remaining controls are local
+                # idempotent assignments/cancellation. Restoring is therefore safe under the
+                # admitted command contract rather than an unqualified "no effect happened" claim.
+                restore_command_claim(claim)
+                return
 
-    def _apply_command(cmd, workers):
+    def _apply_command(cmd, workers, submission_id=None):
+        # WHOLE OR NOT AT ALL (SEC-08). Checked before anything below touches a box. Return an
+        # explicit outcome so _drain_commands knows whether it may commit the claimed file.
+        if not admit_command(cmd, args.state_dir, rejections_box):
+            # The caller needs the errors for the rejected landing receipt. Validation is pure,
+            # so recomputing them here keeps admit_command as the single mutate/log gate.
+            return False, validate_command(cmd, args.state_dir)
         try:
+            _cmd_goals = goals_from_command(cmd, submission_id=submission_id)
+            _new_cmd_goals = []
+            if _cmd_goals:
+                _new_cmd_goals = _append_goals_ledger(
+                    args.state_dir, _cmd_goals, started, raise_on_error=True, return_new=True)
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
@@ -1943,7 +4215,7 @@ def main():
             if "set_maxtabs" in cmd:
                 # under autoscale this knob is the CEILING (上限); otherwise the fixed cap.
                 try:
-                    n = max(1, int(cmd["set_maxtabs"]))
+                    n = max(TABS_BOUNDS[0], min(int(cmd["set_maxtabs"]), TABS_BOUNDS[1]))
                     if asc_box[0]:
                         asc_box[1] = n
                     else:
@@ -1981,9 +4253,35 @@ def main():
             # steering: {"steer": {"worker":"w0","text":"..."}} or a list of such
             if cmd.get("steer") is not None:
                 deliver_steers(cmd["steer"], workers, enqueue=add_box.append)
-            # native chat / cockpit queued a new goal into the running fleet
-            for g in goals_from_command(cmd):
+            # THE FALLBACK BUTTON: {"reunlock": "w0"} (or "" / "*" for every live worker)
+            # re-delivers the unlock turn ON DEMAND, for when the automatic recovery in
+            # relay_fleet (UNLOCK_PREFIX % password injected into a worker's first turn,
+            # plus the lock-refusal heuristic that retries it) never fired or missed a
+            # later refusal. See apply_reunlock's docstring for the incident. The result
+            # is kept for status.json rather than only printed, because a command that
+            # silently did nothing is the exact failure this exists to remove.
+            if "reunlock" in cmd:
+                reunlock_box[0] = apply_reunlock(cmd.get("reunlock"), workers,
+                                                 enqueue=add_box.append)
+            # Only goals that this command newly admitted to the durable ledger enter memory.
+            # A recovered command whose batch was persisted before a crash is therefore a no-op;
+            # --resume already reconstructed that work from the same ledger.
+            for g in _new_cmd_goals:
                 add_box.append(g)
+                # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
+                # deleted the moment it is read, and after that this goal looks like any
+                # other -- which is why "has anyone ever used /goal" was unanswerable rather
+                # than merely unanswered. Recorded where the item arrives, not where the
+                # worker starts, because the verb is a property of the submission.
+                if g.get("new_task"):
+                    try:
+                        from relay import mechanism_telemetry as _mt
+                        _mt.record("new_task_escape", configured=True,
+                                   config_source="chat window `/goal ` prefix",
+                                   eligible=True, triggered=True, executed=True,
+                                   extra={"has_resume_conv": bool(g.get("resume_conv"))})
+                    except Exception:
+                        pass
             # pause / resume the whole fleet: {"pause": true} freezes it in place (no new
             # turns, no new tabs), {"pause": false} resumes. Handy right before a network
             # switch so in-flight work isn't lost. Takes effect on the next sweep.
@@ -1992,14 +4290,21 @@ def main():
             # graceful stop: {"stop": true} cancels every worker and ends the run.
             if cmd.get("stop"):
                 stop_box[0] = True
-        except Exception:
-            pass
+            return True, []
+        except Exception as exc:
+            print("[command] applying a validated command failed part-way: %s"
+                  % type(exc).__name__, flush=True)
+            return None, []
 
     convs_path = os.path.join(args.state_dir, "conversations.json")
 
     def _register_convs(workers):
-        # session-shared conversation registry: every fleet conversation is added so the
-        # native chat can list/read/delete it too (and vice versa). Dedup by url.
+        """Keep the shared conversation registry pointing at THIS run's transcripts.
+
+        The merge itself is merge_conv_rows() at module level -- see the two defects recorded
+        there. This closure's only job is to turn live workers into registry rows: read the
+        file, build one entry per worker, merge, and write only when something moved.
+        Exception-swallowing on purpose: a registry hiccup must never stall the fleet."""
         try:
             existing = []
             if os.path.isfile(convs_path):
@@ -2007,53 +4312,113 @@ def main():
                     existing = json.load(open(convs_path, encoding="utf-8-sig"))  # tolerate C# BOM
                 except Exception:
                     existing = []
-            urls = set(e.get("url") for e in existing if isinstance(e, dict))
-            changed = False
+            entries = []
             for w in workers:
-                u = getattr(w, "conv_url", "")
-                if u and u not in urls:
-                    # THE GOAL, NOT COPILOT'S TITLE. This line preferred `conv_title` and fell
-                    # back to the goal, and Copilot names a conversation from the opening of the
-                    # first message it receives -- which is PROTOCOL, ~1,400 characters shared by
-                    # every task. Measured across 424 stored conversations: 174 named after a
-                    # prompt preamble, 48 "Microsoft Copilot", 39 after the output-discipline
-                    # block. 213 of 424 identical to rows they have nothing to do with, and the
-                    # goal that would have identified each one was sitting right here.
-                    #
-                    # Copilot's own title is kept beside it rather than discarded: it is the
-                    # source record, and a derived value should never overwrite one.
-                    _copilot = (getattr(w, "conv_title", "") or "")[:120]
-                    try:
-                        from relay import conv_title as _ct
-                        title = _ct.make_title(w.goal or "", existing=_copilot, key=u,
-                                               when=time.time())
-                        _tsrc = _ct.SOURCE
-                    except Exception:
-                        title = (w.goal or _copilot or "")[:60]
-                        _tsrc = "fallback"
-                    existing.append({"url": u, "title": title, "source": "fleet",
-                                     "title_source": _tsrc, "copilot_title": _copilot,
-                                     # carry the disk transcript path + worker name so the chat
-                                     # opens this conversation straight from the .jsonl -- no live
-                                     # re-scrape (which fails for any conv whose agent the bridge
-                                     # is not currently connected to).
-                                     "transcript": getattr(w, "transcript", "") or "",
-                                     "name": getattr(w, "name", ""), "ts": time.time()})
-                    urls.add(u); changed = True
+                u = getattr(w, "conv_url", "") or ""
+                tr = getattr(w, "transcript", "") or ""
+                if not u and not tr:
+                    continue
+                # THE GOAL, NOT COPILOT'S TITLE. This line preferred `conv_title` and fell
+                # back to the goal, and Copilot names a conversation from the opening of the
+                # first message it receives -- which is PROTOCOL, ~1,400 characters shared by
+                # every task. Measured across 424 stored conversations: 174 named after a
+                # prompt preamble, 48 "Microsoft Copilot", 39 after the output-discipline
+                # block. 213 of 424 identical to rows they have nothing to do with, and the
+                # goal that would have identified each one was sitting right here.
+                #
+                # Copilot's own title is kept beside it rather than discarded: it is the
+                # source record, and a derived value should never overwrite one.
+                _copilot = (getattr(w, "conv_title", "") or "")[:120]
+                try:
+                    from relay import conv_title as _ct
+                    title = _ct.make_title(w.goal or "", existing=_copilot, key=(u or tr),
+                                           when=time.time())
+                    _tsrc = _ct.SOURCE
+                except Exception:
+                    title = (w.goal or _copilot or "")[:60]
+                    _tsrc = "fallback"
+                entries.append({"url": u, "title": title, "source": "fleet",
+                                "title_source": _tsrc, "copilot_title": _copilot,
+                                # carry the disk transcript path + worker name so the chat
+                                # opens this conversation straight from the .jsonl -- no live
+                                # re-scrape (which fails for any conv whose agent the bridge
+                                # is not currently connected to).
+                                "transcript": tr,
+                                # THE FULL GOAL TEXT, UNTRUNCATED -- NOT `title`, which
+                                # make_title() cuts down for display. Before this field existed
+                                # the registry was the only continuously-updated feed the chat
+                                # window has while it is already open (DiscoverTranscripts only
+                                # scans once, at startup) and it carried no goal at all, so any
+                                # conversation reached through it -- including every interrupt
+                                # sent while the worker was still running -- had nothing for
+                                # DecideFleetSend to identify it by and refused with
+                                # fleet_no_goal even though the worker was live right there.
+                                # See docs/incidents/20260924_fleet_interrupt_no_goal.md.
+                                "goal": w.goal or "",
+                                "name": getattr(w, "name", ""), "ts": time.time()})
+            # SEVEN ROWS, ONE TITLE. `make_title` is called once per row above, in isolation,
+            # so rows whose goals share an opening come out identical -- and every child of a
+            # fan-out carries the parent's goal by design. Measured on a real seven-way split:
+            # 1 distinct title of 7. That is the symptom conv_title.py exists to remove (213 of
+            # 424 stored rows named after identical text), reproduced by a mechanism that
+            # became the default today.
+            #
+            # `repeated` / `salvageable` / `disambiguate` were written for exactly this and had
+            # no caller. WITHIN THIS REGISTRATION ONLY: rewriting a stored title would move a
+            # row under somebody who is looking at it, and what was measured is rows appearing
+            # together.
+            try:
+                from relay import conv_title as _ct2
+                _dupes = _ct2.repeated([e.get("title", "") for e in entries], min_count=2)
+                if _dupes:
+                    _counts = {}
+                    for _e in entries:
+                        _t = (_e.get("title") or "").strip()
+                        if _t in _dupes:
+                            _counts[_t] = _counts.get(_t, 0) + 1
+                    for _e in entries:
+                        _t = (_e.get("title") or "").strip()
+                        if _t not in _dupes:
+                            continue
+                        _k = _e.get("url") or _e.get("transcript") or _e.get("name") or ""
+                        _e["title"] = (_ct2.disambiguate(_t, key=_k, when=_e.get("ts"))
+                                       if _ct2.salvageable(_t, _counts[_t])
+                                       else _ct2.neutral_title(key=_k, when=_e.get("ts")))
+                        _e["title_source"] = _ct2.SOURCE + "+dedupe"
+            except Exception:
+                pass          # a cosmetic title is never worth failing a registration over
+
+            merged, changed = merge_conv_rows(existing, entries)
             if changed:
-                _write_atomic(convs_path, existing)
+                _write_atomic(convs_path, merged)
         except Exception:
             pass
+
 
     _steer_reported = set()
 
     def on_tick(workers):
+        # BEFORE the commands, so that a live cockpit push in this same sweep is the
+        # later word and wins. The operator moving a knob sends both -- the file is
+        # saved and the command is pushed -- and they must not race to a different
+        # answer depending on which the coordinator happened to read first.
+        for _key, _val in settings_follower.poll():
+            print("[settings] %s -> %s (adopted live from the settings panel)"
+                  % (_key, _val), flush=True)
         _drain_commands(workers)
+        # THE BUTTON'S JOB, DONE BY THE HARNESS. A refusal nobody classified used to need a
+        # person to notice and press "re-unlock"; it is asked for here every sweep instead.
+        # See sweep_unclaimed_refusals for the two incidents that bought this.
+        for _receipt in sweep_unclaimed_refusals(workers):
+            if isinstance(_receipt, dict):
+                reunlock_box[0] = _receipt
         report_unused_steers(workers, _steer_reported)
         _register_convs(workers)
         # RUN-RESUME: refresh the completion map so a crash after this sweep can resume
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
         _update_done_map(args.state_dir, workers)
+        _sample_free_space(args.state_dir, disk_box[0])
+        _write_scope_tick(workers)      # shadow: record overlapping sibling writes (off = no-op)
         try:
             _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
@@ -2062,9 +4427,23 @@ def main():
                                                  # goals accepted but not yet workers --
                                                  # a split's children live here until the
                                                  # next sweep admits them.
-                                                 queued=len(add_box or [])))
-        except Exception:
-            pass
+                                                 queued=len(add_box or []),
+                                                 reunlock=reunlock_box[0],
+                                                 command_rejections=rejections_box))
+        except Exception as _status_exc:
+            # SILENT HERE USED TO MEAN INVISIBLE, AND task_router.fleet_is_live() TRUSTED THE
+            # FILE'S MTIME TO MEAN THE PROCESS. `_write_atomic`'s own docstring says a write
+            # that truly cannot land is "a real failure ... never a silent skip" and re-raises
+            # after its retry deadline -- but this bare `except: pass` caught that re-raise and
+            # threw it away, so a run wedged on a losing PermissionError race or a starved disk
+            # kept sweeping with live workers while status.json's mtime simply stopped moving.
+            # Measured 2026-09-25: exactly that let a live 41-worker run go undetected past
+            # FLEET_LIVE_MAX_AGE_S and a second fleet_runner started on top of it. Printing (a)
+            # gives the run's own log a trace of what happened instead of a wordless gap, and
+            # (b) does not change the non-fatal behaviour -- a status write must never be able
+            # to take the run down, so we still swallow and continue.
+            print("[status] WARN: could not write status.json this sweep: %s" % _status_exc,
+                  flush=True)
         _print_table(workers)
 
     from playwright.sync_api import sync_playwright
@@ -2279,7 +4658,10 @@ def main():
                                       autoscale_per_tab_mb=(settings_per_tab(700.0)
                                                             if args.autoscale_per_tab_mb == 700
                                                             else args.autoscale_per_tab_mb),
-                                      autoscale_headroom_mb=args.autoscale_headroom_mb,
+                                      # the RESOLVED floor, never the raw -1 sentinel: the
+                                      # autoscale reads ram_box[0] anyway, so passing anything
+                                      # else here would be a second number for one fact.
+                                      autoscale_headroom_mb=ram_floor,
                                       autoscale_up_margin_mb=args.autoscale_up_margin_mb,
                                       disk_floor_gb=disk_floor, eval_disk_gb=eval_disk,
                                       disk_box=disk_box, ram_box=ram_box,
@@ -2329,6 +4711,16 @@ def main():
                 break
             if not cdp_alive(args.cdp_url):
                 hard_reset(port)
+        except MalformedCheck as e:
+            # A CONFIGURATION ERROR IS NOT A CONNECTION ERROR, whatever route it arrives by.
+            # The generic handler below answers every exception with a browser hard reset and
+            # `max_recover` retries; for a deterministic bad check that is a wrong diagnosis
+            # printed to the operator, a wasted recovery budget, and possibly an Edge reset
+            # that costs every worker currently running. Stop, say what is wrong, change
+            # nothing.
+            print("\n[config] unusable acceptance check -- not a connection problem, so no "
+                  "reset and no retry:\n  %s" % e)
+            raise SystemExit(2)
         except Exception as e:
             attempt += 1
             print("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
@@ -2363,11 +4755,23 @@ def main():
         cleaned = _clean_final_text(raw_last)
         return {
             "name": r["name"], "goal": r["goal"],
+            "goal_summary": _goal_summary(r["goal"]),
             "status": report_status(r["outcome"]),
             "outcome": r["outcome"], "turn": r["turns"],
             "max_turns": max_turns, "reason": r["reason"],
             "verified": r.get("verified"),
             "verify_attempts": r.get("verify_attempts", 0),
+            # Carried through from relay_fleet.run_relay_fleet's final return value (which now
+            # sets it from its own `run_id` parameter). Without this the LIVE snapshot (built by
+            # _snapshot()/_run_id_of() every tick) had run_id, but the FINAL snapshot -- the one
+            # on disk the instant `running` flips to False, which is exactly when the cockpit's
+            # ArchiveTerminal sees every worker terminal at once -- did not. Same defect class as
+            # `verified`/`verify_attempts` above, just in the OTHER snapshot builder.
+            "run_id": r.get("run_id", ""),
+            # THE ADMISSION-TIME ID (see _snapshot()'s matching field for the full story).
+            # Same "final snapshot never got what the live one had" gap as run_id above --
+            # relay_fleet.py's return dict now carries jid too, so this just has to read it.
+            "jid": r.get("jid", ""),
             "conv_url": r.get("conv_url", ""),
             "conv_title": r.get("conv_title", ""),
             "transcript": r.get("transcript", ""),
@@ -2385,7 +4789,10 @@ def main():
             "campaign_id": r.get("campaign_id", ""),
             "role": r.get("role", ""),
             "depth": r.get("depth", 0),
+            **({"root_id": r["root_id"]} if r.get("root_id") else {}),
             "goal_hash": r.get("goal_hash", ""),
+            "retryable": r.get("retryable"),
+            "retry_queued": bool(r.get("retry_queued", False)),
             "fresh_replay_count": r.get("fresh_replay_count", 0),
             "refusal_count": r.get("refusal_count", 0),
             "refusal_history": r.get("refusal_history", []),
@@ -2407,19 +4814,21 @@ def main():
     final = {"started": started, "updated": time.time(), "total": len(results),
              "done_count": done_count, "running": False, "elapsed_s": elapsed,
              "directive": directive,
-             # FIX 3 (P2): also carry run_label / goal_count into the final snapshot.
+             "directive_summary": _goal_summary(directive) if directive else "",
+             # Carry the same compact display identity into the final frozen snapshot.
              "run_label": run_label, "goal_count": goal_count,
              "workers": [_final_worker_entry(r, args.max_turns) for r in results]}
+    _ffv = fanout_family_view(final["workers"])
+    for _fw in final["workers"]:
+        _fw["fanout"] = _ffv.get(_fw["name"], {"kind": "solo", "campaign_id": _fw.get("campaign_id", ""), "label": ""})
     _write_atomic(status_path, final)
-    # RUN-RESUME: write the FINAL completion map from the true per-goal outcomes (the
-    # on_tick map may miss a worker that reached DONE on the very last sweep). A later
-    # --resume then re-queues exactly the goals that did NOT finish successfully.
+    # RUN-RESUME: merge this FINAL CHUNK into the durable completion map. ``results`` is not
+    # necessarily the whole run after reconnects / graceful stop, so replacement here would
+    # erase earlier DONE goals and replay them on --resume.
     try:
-        final_done = {_goal_key(r["goal"]): r["outcome"]
-                      for r in results if r["outcome"] in _RESUME_SUCCESS_OUTCOMES}
-        _write_atomic(os.path.join(args.state_dir, LAST_RUN_DONE), final_done)
+        _merge_final_done_map(args.state_dir, results)
     except Exception as e:
-        sys.stderr.write("[resume] WARN: could not write final done map: %s\n" % e)
+        sys.stderr.write("[resume] WARN: could not merge final done map: %s\n" % e)
     print("\n\n=== fleet complete in %ss ===" % elapsed)
     for r in results:
         print("  %-4s %-8s turns=%d  %s" % (r["name"], r["outcome"], r["turns"],
@@ -2436,17 +4845,21 @@ def main():
     # the cockpit) cancelled everything and the loop above still exited normally. Either
     # way nothing is "interrupted" -- clear the ACTIVE marker so a supervisor never
     # mistakes a normal finish for a crash.
-    _clear_active_marker(args.state_dir)
+    _clear_active_marker(args.state_dir, owner_pid=os.getpid())
+    _release_run_lock(_ACTIVE_RUN_LOCK)
+    _ACTIVE_RUN_LOCK = None
 
 
 if __name__ == "__main__":
     try:
-        main()
+        raise SystemExit(main() or 0)
     except KeyboardInterrupt:
         # Explicit user stop (Ctrl+C). Clear the ACTIVE marker (if a run had started and
         # recorded one) so a supervisor never treats a deliberate interrupt as a crash to
         # auto-resume, then exit with the conventional SIGINT status.
         if _ACTIVE_STATE_DIR:
-            _clear_active_marker(_ACTIVE_STATE_DIR)
+            _clear_active_marker(_ACTIVE_STATE_DIR, owner_pid=os.getpid())
+        _release_run_lock(_ACTIVE_RUN_LOCK)
+        _ACTIVE_RUN_LOCK = None
         print("\n[fleet] interrupted by user -- ACTIVE marker cleared, not auto-resumable.")
         sys.exit(130)

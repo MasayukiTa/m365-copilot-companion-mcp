@@ -102,12 +102,19 @@ def test_the_note_names_the_refusal_that_decided_it(log, monkeypatch):
 
     seen = {}
 
-    def spy(branch, *, resp_len, since, consumed=None):
+    def spy(branch, *, resp_len, since, consumed=None, attribution=None):
         seen["branch"] = branch
         seen["consumed"] = consumed
+        seen["attribution"] = attribution
 
     monkeypatch.setattr(LS, "record_classification", spy)
     assert RF._looks_locked(_resp(), since=99.0) is True
     assert seen["branch"] == "fallback"
+    # HOW SURE IT COULD HAVE BEEN. The fallback uses no identity at all, so the note has to
+    # carry the size of the candidate set or nothing records what was assumed. Here no turn
+    # windows are open, so the honest answer is an empty candidate list and exclusive=False --
+    # which is a different statement from "one worker owned it" and must not read as one.
+    assert seen["attribution"] is not None, "the note dropped its certainty"
+    assert seen["attribution"].get("exclusive") is False
     assert seen["consumed"]["detail"] == REAL, \
         "the note must point at the refusal the branch acted on, not the last one to arrive"

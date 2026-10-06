@@ -10,17 +10,30 @@ REM   rotate_secrets.bat --no-print   do not echo new values to the console
 REM
 REM All arguments are forwarded to scripts/rotate_secrets.py.
 REM ===========================================================================
+setlocal EnableExtensions
 cd /d "%~dp0"
 
 set "VENV_PY=%~dp0.venv\Scripts\python.exe"
-
 if exist "%VENV_PY%" (
-    "%VENV_PY%" "scripts\rotate_secrets.py" %*
+    set "PYEXE=%VENV_PY%"
 ) else (
     echo .venv python not found; falling back to "python" on PATH.
-    python "scripts\rotate_secrets.py" %*
+    set "PYEXE=python"
 )
 
+"%PYEXE%" "scripts\rotate_secrets.py" %*
+set "RC=%ERRORLEVEL%"
 echo.
-echo Done. Review the next-steps above, then restart the server.
+if not "%RC%"=="0" (
+    if "%RC%"=="9009" (
+        echo No Python interpreter found ^(no .venv, and "python" is not on PATH^). Nothing was rotated.
+        echo Run setup.bat or quickstart.bat to install the project's Python environment, then run
+        echo rotate_secrets.bat again.
+    ) else (
+        echo rotate_secrets.py failed ^(exit %RC%^). Secrets were NOT rotated -- see the message above.
+    )
+) else (
+    echo Done. Review the next-steps above, then restart the server.
+)
 pause
+exit /b %RC%

@@ -17,6 +17,7 @@
 # =============================================================================
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import tempfile
@@ -102,7 +103,13 @@ class StateMachineTests(unittest.TestCase):
 
         present = Path(self.tmp.name) / "python.exe"
         present.write_text("", encoding="utf-8")
-        with mock.patch.object(bootstrap, "VENV_PYTHON", present):
+        # A WORKING venv is the premise, so it is stated: since 2026-09-24 (D20) an existing
+        # venv that cannot run is cleared too, and an empty file cannot run. The requirements
+        # hash is stated for the same reason (D5): a stale hash clears install_deps by design.
+        state["install_deps_requirements_sha256"] = bootstrap.requirements_hash()
+        bootstrap.save_state(state, self.state_file)
+        with mock.patch.object(bootstrap, "VENV_PYTHON", present), \
+                mock.patch.object(bootstrap, "_venv_usable", return_value=True):
             rec = RecordingSteps(["ensure_venv", "install_deps", "verify"])
             rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
 
@@ -273,6 +280,19 @@ class DevTunnelNeverBlocksTests(unittest.TestCase):
     (devtunnel CLI absent) it must WARN and return normally so the bootstrap
     keeps going instead of walling the novice."""
 
+    # A TEMPORARY ROOT, ALWAYS (added 2026-09-24). These tests patch _read_env_value and left
+    # ROOT pointing at the checkout; once step_dev_tunnel learned to set aside a carried .env's
+    # tunnel keys (D7), a run of this class REWROTE THE CHECKOUT'S REAL .env -- measured, on the
+    # owner's machine, and put back by hand. Nothing in this class may reach a real .env again.
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self._orig_root = bootstrap.ROOT
+        bootstrap.ROOT = Path(self._tmp.name)
+
+    def tearDown(self):
+        bootstrap.ROOT = self._orig_root
+        self._tmp.cleanup()
+
     def test_missing_devtunnel_returns_done_not_action_needed(self):
         # find_executable -> None (CLI not on PATH), and force the winget-Links
         # fallback path to a location that does not exist.
@@ -307,21 +327,48 @@ class DevTunnelNeverBlocksTests(unittest.TestCase):
             except Exception as e:  # noqa: BLE001
                 self.fail("provision failure was not swallowed: %r" % e)
 
-    def test_short_circuits_when_url_already_present(self):
-        # Signed in and .env already has MCP_TUNNEL_URL -> must NOT re-host.
+    def _run_with_env(self, values):
+        """Run step_dev_tunnel signed in, with .env answering from `values`. Returns whether
+        provisioning ran."""
         called = {"provision": False}
 
-        def _should_not_run(*a, **k):
+        def _mark(*a, **k):
             called["provision"] = True
 
         with mock.patch.object(bootstrap, "find_executable", return_value="devtunnel"), \
              mock.patch.object(bootstrap, "_devtunnel_logged_in", return_value=True), \
-             mock.patch.object(bootstrap, "_read_env_value",
-                               return_value="https://x-8000.jpe1.devtunnels.ms/"), \
-             mock.patch.object(bootstrap, "_provision_dev_tunnel", _should_not_run):
+             mock.patch.object(bootstrap, "_read_env_value", values.get), \
+             mock.patch.object(bootstrap, "_this_host", return_value="pc-new"), \
+             mock.patch.object(bootstrap, "_provision_dev_tunnel", _mark):
             bootstrap.step_dev_tunnel()
-        self.assertFalse(called["provision"],
-                         "provisioning ran even though MCP_TUNNEL_URL was already set")
+        return called["provision"]
+
+    URL = "https://x-8000.jpe1.devtunnels.ms/"
+
+    def test_short_circuits_when_this_machine_minted_the_url(self):
+        # Signed in, and the URL carries this machine's stamp -> must NOT re-host (~30s).
+        ran = self._run_with_env({"MCP_TUNNEL_URL": self.URL, "MCP_TUNNEL_HOST": "pc-new"})
+        self.assertFalse(ran, "re-hosted a tunnel this machine had already provisioned")
+
+    def test_provisions_when_the_url_came_from_another_machine(self):
+        """THE NEW-PC FAILURE (reported 2026-09-08).
+
+        This test used to assert the opposite -- that a non-empty MCP_TUNNEL_URL was enough to
+        skip -- and that is exactly the bug it locked in. Setting up a new PC starts by
+        carrying .env across, so the URL is present and belongs to the OLD machine; setup
+        skipped provisioning, and the address pasted into Copilot Studio pointed at a tunnel
+        this machine does not host. A devtunnel URL is reachable only while a machine hosts
+        that tunnel, so it is a fact about a machine, and .env travels between machines.
+        """
+        ran = self._run_with_env({"MCP_TUNNEL_URL": self.URL, "MCP_TUNNEL_HOST": "pc-old"})
+        self.assertTrue(ran, "trusted a URL minted on a different machine")
+
+    def test_provisions_when_no_machine_is_recorded(self):
+        """A .env written before the stamp existed. Provenance unknown, so do not trust it:
+        re-hosting the same tunnel name yields the same URL, so being wrong costs ~30s once,
+        and the re-host writes the stamp that settles it from then on."""
+        ran = self._run_with_env({"MCP_TUNNEL_URL": self.URL})
+        self.assertTrue(ran, "trusted a URL of unknown provenance")
 
     def test_provision_targets_renamed_tunnel_from_env(self):
         # FIX 3: if the user renamed the tunnel (MCP_TUNNEL_NAME in .env) and
@@ -364,7 +411,7 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
     def test_none_url_preserves_existing_url(self):
         env = self.root / ".env"
         env.write_text(
-            "MCP_API_KEY=abc\r\n"
+            "MCP_API_KEY_PROTECTED=dpapi:opaque\r\n"
             "MCP_TUNNEL_NAME=old-name\r\n"
             "MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/\r\n",
             encoding="utf-8", newline="",
@@ -373,7 +420,7 @@ class WriteTunnelPreservesUrlTests(unittest.TestCase):
         bootstrap._write_tunnel_to_env("m365-copilot-companion", None)
         text = env.read_text(encoding="utf-8-sig")
         self.assertIn("MCP_TUNNEL_URL=https://keep-me-8000.jpe1.devtunnels.ms/", text)
-        self.assertIn("MCP_API_KEY=abc", text)  # other keys preserved
+        self.assertIn("MCP_API_KEY_PROTECTED=dpapi:opaque", text)  # unrelated key preserved
 
     def test_new_url_overwrites_old(self):
         env = self.root / ".env"
@@ -399,6 +446,8 @@ class EnsureVenvInvalidatesDepsTests(unittest.TestCase):
         self.state_file = self.root / "state.json"
         self._orig_root = bootstrap.ROOT
         self._orig_vpy = bootstrap.VENV_PYTHON
+        self._orig_sf = bootstrap.STATE_FILE
+        bootstrap.STATE_FILE = self.root / ".setup" / "state.json"   # the install lock lives beside it
         bootstrap.ROOT = self.root
         # Point VENV_PYTHON at a file we can create/remove inside the temp root.
         self.vpy = self.root / ".venv" / "Scripts" / "python.exe"
@@ -407,6 +456,7 @@ class EnsureVenvInvalidatesDepsTests(unittest.TestCase):
     def tearDown(self):
         bootstrap.ROOT = self._orig_root
         bootstrap.VENV_PYTHON = self._orig_vpy
+        bootstrap.STATE_FILE = self._orig_sf
         self.tmp.cleanup()
 
     def test_broken_venv_recreated_and_install_deps_flag_cleared(self):
@@ -458,6 +508,8 @@ class InstallDepsSentinelTests(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self._orig_root = bootstrap.ROOT
         self._orig_vpy = bootstrap.VENV_PYTHON
+        self._orig_sf = bootstrap.STATE_FILE
+        bootstrap.STATE_FILE = self.root / ".setup" / "state.json"   # the install lock lives beside it
         bootstrap.ROOT = self.root
         self.vpy = self.root / ".venv" / "Scripts" / "python.exe"
         bootstrap.VENV_PYTHON = self.vpy
@@ -468,6 +520,7 @@ class InstallDepsSentinelTests(unittest.TestCase):
     def tearDown(self):
         bootstrap.ROOT = self._orig_root
         bootstrap.VENV_PYTHON = self._orig_vpy
+        bootstrap.STATE_FILE = self._orig_sf
         self.tmp.cleanup()
 
     def test_sentinel_import_failure_raises_step_error(self):
@@ -486,10 +539,10 @@ class InstallDepsSentinelTests(unittest.TestCase):
         self.assertIn("quickstart.bat", msg)
 
     def test_sentinel_import_success_completes(self):
-        # pip succeeds AND the import probe succeeds -> no raise.
+        # pip succeeds AND the verify import of main.py prints a tool count -> no raise.
         with mock.patch.object(bootstrap.subprocess, "call", return_value=0), \
              mock.patch.object(bootstrap.subprocess, "run",
-                               return_value=_completed(returncode=0)):
+                               return_value=_completed(returncode=0, stdout="42")):
             bootstrap.step_install_deps()  # must not raise
 
 
@@ -512,10 +565,19 @@ class LoadDotenvOverrideTests(unittest.TestCase):
             self.assertEqual(bootstrap.os.environ["MCP_TEST_KEY"], "from_dotenv")
 
 
+@unittest.skipUnless(os.name == "nt", "gen_env protects the generated secrets with DPAPI, "
+                                      "which exists only on Windows")
 class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
     """An existing .env that has LOST its required secrets must be repaired by gen_env, not
     left for step_verify to fail on forever. gen_env stays append-only: a secret that is
-    already present (even blank/placeholder) is the user's value and is never overwritten."""
+    already present (even blank/placeholder) is the user's value and is never overwritten.
+
+    SKIPPED OFF WINDOWS, AND RUN ON THE WINDOWS JOB INSTEAD. gen_env calls
+    tools.secret_store.protect_secret, which raises "DPAPI protection is only available on
+    Windows" -- so on the ubuntu runner these were not a failing assertion but a capability
+    that cannot exist there, and they were red for that reason alone. A skip on its own would
+    have retired the coverage silently, so ci.yml's windows-install-smoke job now runs this
+    file: skipping here is only honest because it runs somewhere."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -533,9 +595,9 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
         bootstrap.step_gen_env()
         text = env.read_text(encoding="utf-8-sig")
         # Both secrets now present and non-placeholder.
-        api = bootstrap._read_env_value("MCP_API_KEY")
-        self.assertTrue(api and not api.startswith("replace"),
-                        "MCP_API_KEY was not generated into an existing .env")
+        api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        self.assertTrue(api and api.startswith("dpapi:"),
+                        "protected MCP_API_KEY was not generated into an existing .env")
         prot = bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR)
         self.assertTrue(prot, "protected unlock password was not generated")
         # The pre-existing line is preserved.
@@ -550,13 +612,14 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
         )
         bootstrap.step_gen_env()
         text = env.read_text(encoding="utf-8-sig")
-        # The user's values survive verbatim, and no duplicate key is appended.
-        self.assertEqual(bootstrap._read_env_value("MCP_API_KEY"), "keepme")
-        self.assertEqual(bootstrap._read_env_value("MCP_UNLOCK_PASSWORD"), "keepme_too")
-        self.assertEqual(text.count("MCP_API_KEY="), 1)
-        self.assertEqual(text.count("MCP_UNLOCK_PASSWORD="), 1)
-        # The protected form must NOT be added when a plain unlock password already exists.
-        self.assertNotIn(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=", text)
+        # The user's values survive semantically, but plaintext storage is migrated away.
+        from tools.secret_store import unprotect_secret
+        api_blob = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        unlock_blob = bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR)
+        self.assertEqual(unprotect_secret(api_blob), "keepme")
+        self.assertEqual(unprotect_secret(unlock_blob), "keepme_too")
+        self.assertNotIn("MCP_API_KEY=", text)
+        self.assertNotIn("MCP_UNLOCK_PASSWORD=", text)
 
     def test_only_api_key_missing_generates_only_api_key(self):
         env = self.root / ".env"
@@ -566,8 +629,8 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
             encoding="utf-8",
         )
         bootstrap.step_gen_env()
-        api = bootstrap._read_env_value("MCP_API_KEY")
-        self.assertTrue(api and not api.startswith("replace"))
+        api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        self.assertTrue(api and api.startswith("dpapi:"))
         # The existing protected unlock value is untouched, and no plain unlock line is minted.
         self.assertEqual(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR), "abc123")
 
@@ -582,9 +645,13 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
             bootstrap.step_verify()  # must not raise StepError on the key check
 
 
+@unittest.skipUnless(os.name == "nt", "gen_env protects the generated secrets with DPAPI, "
+                                      "which exists only on Windows")
 class GenEnvFreshStillWritesSecretsTests(unittest.TestCase):
     """Guard the original path: when NO .env exists, gen_env still writes a fresh one carrying
-    both secrets. The backfill branch must not have cannibalised the create branch."""
+    both secrets. The backfill branch must not have cannibalised the create branch.
+
+    Windows-only for the same DPAPI reason as the class above."""
 
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -601,8 +668,8 @@ class GenEnvFreshStillWritesSecretsTests(unittest.TestCase):
         bootstrap.step_gen_env()
         env = self.root / ".env"
         self.assertTrue(env.exists())
-        api = bootstrap._read_env_value("MCP_API_KEY")
-        self.assertTrue(api and not api.startswith("replace"))
+        api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+        self.assertTrue(api and api.startswith("dpapi:"))
         self.assertTrue(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR))
 
 

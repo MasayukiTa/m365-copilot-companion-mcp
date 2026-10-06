@@ -17,7 +17,6 @@ the reply already accepted for the previous turn on the same driver instance.
 Run:  .venv\\Scripts\\python.exe -m pytest relay/test_reply_settle.py -q
 """
 import os
-import subprocess
 import sys
 from pathlib import Path
 
@@ -177,9 +176,9 @@ def test_settle_constants_are_env_overridable():
         "REPLY_SETTLE_INTERVAL_S, REPLY_SETTLE_SAMPLES); "
         "print(REPLY_SETTLE_INTERVAL_S, REPLY_SETTLE_SAMPLES)"
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code], cwd=str(REPO), env=env,
-        capture_output=True, text=True, timeout=30,
+    from tools.childproc import run as _run_child
+    result = _run_child(
+        [sys.executable, "-c", code], cwd=str(REPO), env=env, timeout=30,
     )
     assert result.returncode == 0, result.stderr
     interval_s, samples = result.stdout.split()

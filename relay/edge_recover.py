@@ -36,6 +36,8 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from tools import childproc
+
 try:
     from dotenv import load_dotenv
     load_dotenv()
@@ -73,7 +75,8 @@ def hard_reset(port=9222, wait=True):
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
              "-HardReset", "-Port", str(port)],
             cwd=repo, timeout=120 if wait else 5,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=childproc.headless_creationflags())
         return True
     except Exception:
         return False
@@ -255,9 +258,20 @@ def _surface_launcher_argv(ps1, flag, port, open_url=""):
     path that can actually (re)launch the browser (headless->headed kill+relaunch, or a fresh
     launch), so it is the only path where a target URL means anything. -Surface merely raises
     an already-headed window -- it never navigates -- so -Url would be a no-op there and is
-    deliberately omitted to match the launcher's own -Surface behavior."""
+    deliberately omitted to match the launcher's own -Surface behavior.
+
+    -Profile is ALWAYS passed explicitly, from _profile_for_port(port). start_companion_edge.ps1
+    now infers -Profile from whatever process is already listening on -Port when the caller
+    omits -Profile (see its "THE PROFILE FOLLOWS THE PORT" comment), which fixed the case where
+    surface() called it with no -Profile and it silently fell back to the companion's default
+    profile, aiming a bridge (:9223) sign-in relaunch at the FLEET's Edge (2026-09-24). But that
+    inference only has something to look at when a process is still listening on the port; if
+    the Edge for this port is not running at all (fully dead, not just headless), there is
+    nothing to infer from and it would fall back to the wrong default again. Passing -Profile
+    explicitly here removes that dependency entirely -- the caller already knows the right
+    profile via the same _profile_for_port the launcher's own default mirrors."""
     argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", ps1,
-            flag, "-Port", str(port)]
+            flag, "-Port", str(port), "-Profile", _profile_for_port(port)]
     if open_url and flag == "-Foreground":
         argv += ["-Url", open_url]
     return argv
@@ -306,7 +320,8 @@ def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url=""):
         subprocess.run(
             _surface_launcher_argv(ps1, flag, port, open_url),
             cwd=repo, timeout=60 if flag == "-Foreground" else 15,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=childproc.headless_creationflags())
     except Exception:
         return False
     # Verify the REAL outcome rather than trusting subprocess.run's exit code. A -Foreground
@@ -398,12 +413,22 @@ if ($pids.Count -gt 0) {
   # window WS_EX_TOOLWINDOW takes it out of the taskbar and Alt+Tab while leaving it a
   # live, drivable window. Measured on the bridge Edge: CDP :9223 and the bridge kept
   # answering with the flag set.
+  # A window that was never shown must not be put through the hide/mark/re-show dance: it
+  # ends in ShowWindow(SW_MINIMIZE), and the guard six lines above says what that does to a
+  # WS_VISIBLE-clear window -- Windows sets WS_VISIBLE and shows it minimized. Guarding only
+  # the FIRST minimize and leaving this one unconditional is how a headless Edge acquired a
+  # window anyway. An unshown window has no taskbar membership to re-evaluate, so setting
+  # the bit is the whole job; the shell reads the style at first show.
   if ($h -ne [IntPtr]::Zero) {
     $ex = [RK]::GetWindowLong($h, -20)
     if (($ex -band 0x80) -eq 0) {
-      [RK]::ShowWindow($h, 0) | Out-Null                       # SW_HIDE, momentarily:
-      [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
-      [RK]::ShowWindow($h, 6) | Out-Null                       # back to minimized
+      if ([RK]::IsWindowVisible($h)) {
+        [RK]::ShowWindow($h, 0) | Out-Null                     # SW_HIDE, momentarily:
+        [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+        [RK]::ShowWindow($h, 6) | Out-Null                     # back to minimized
+      } else {
+        [RK]::SetWindowLong($h, -20, ($ex -bor 0x80) -band (-bnot 0x40000)) | Out-Null
+      }
     }
   }
 }
@@ -445,7 +470,8 @@ def rehide(port=None, profile=""):
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
              _REHIDE_PS.replace("__PROFILE__", marker)],
             cwd=repo, timeout=20,
-            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            creationflags=childproc.headless_creationflags())
         return True
     except Exception:
         return False
@@ -606,9 +632,39 @@ def should_recycle(edge_mb, free_mb, edge_cap_mb=None, free_floor_mb=None):
 
 
 def looks_like_login(url):
-    u = (url or "").lower()
-    return ("login.microsoftonline" in u or "login.live.com" in u
-            or "/signin" in u or "oauth2/authorize" in u)
+    """True if `url` is a sign-in wall waiting for a person.
+
+    ONE definition, shared repo-wide: delegates to relay.edge_auth.looks_like_signin_wall,
+    which is generic across identity providers (AD FS, SAML/WS-Fed, Okta, Ping, OneLogin,
+    Google -- not just login.microsoftonline/login.live.com). Before this delegation, THIS
+    function was one of four disagreeing definitions of "on a sign-in page" -- on 2026-09-24
+    a freshly set-up PC's bridge Edge sat on a federated tenant's AD FS page
+    (https://<sts>/adfs/ls/?...) and every :9222-path caller of this function (relay_fleet.py)
+    still called that page "nothing", so nobody surfaced the window. See edge_auth's module
+    docstring for the full story.
+
+    Falls back to the old, narrower login.microsoftonline/login.live.com/\\/signin/
+    oauth2-authorize check only if relay.edge_auth cannot be imported at all -- never
+    raises, matching every other function in this module."""
+    try:
+        from relay.edge_auth import looks_like_signin_wall
+        return looks_like_signin_wall(url)
+    except Exception:
+        from urllib.parse import urlparse
+        try:
+            parsed = urlparse(url or "")
+            host = (parsed.hostname or "").lower().rstrip(".")
+        except Exception:
+            return False
+        # Conservative fallback only. The normal path delegates to edge_auth's generic IdP
+        # classifier; if that module cannot import, do not treat an arbitrary URL containing
+        # an auth hostname in its path/query as a sign-in wall.
+        return host in {
+            "login.microsoftonline.com",
+            "login.microsoft.com",
+            "login.windows.net",
+            "login.live.com",
+        }
 
 
 def close_all_tabs(cdp_url="http://localhost:9222", connect_timeout_ms=8000,

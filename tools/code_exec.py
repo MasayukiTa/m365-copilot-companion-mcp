@@ -5,6 +5,7 @@ import tempfile
 from typing import Optional
 
 from ._subproc import sanitized_child_env
+from . import childproc
 from .file_ops import _validate_path
 from .security import require_unlocked
 from .shell_extra import _gate_detail
@@ -72,8 +73,11 @@ def run_python(
         timeout: Maximum execution time in seconds.
         working_dir: Optional working directory under the allowed base.
 
-    If the script produces an artifact, verify it before declaring success: read_image
-    for a saved plot/image, or verify_python / verify_file_contains for a computed result.
+    If the script produces an artifact, verify it before declaring success. For an IMAGE
+    that means ocr_image for its text, or run_python with PIL for pixel facts -- NOT
+    read_image, which returns base64 text no model in this stack can see (measured
+    2026-09-17: a worker called it and then reported characters that were not there). For a
+    computed result, verify_python / verify_file_contains.
     """
     locked = require_unlocked()
     if locked:
@@ -383,6 +387,7 @@ def _run_with_tree_timeout(command, timeout, cwd):
         stdin=subprocess.DEVNULL,
         cwd=cwd,
         env=sanitized_child_env(),
+        **childproc.tree_popen_kwargs(headless=True),
     )
     try:
         out, err = proc.communicate(timeout=timeout)
@@ -404,20 +409,8 @@ def _run_with_tree_timeout(command, timeout, cwd):
 
 
 def _kill_tree(proc):
-    """Kill a process and everything it started. Best effort, never raises."""
-    try:
-        if os.name == "nt":
-            subprocess.run(["taskkill", "/PID", str(proc.pid), "/T", "/F"],
-                           capture_output=True, timeout=15)
-        else:
-            import signal
-            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
-    except Exception:
-        pass
-    try:
-        proc.kill()
-    except Exception:
-        pass
+    """Compatibility wrapper around the repository-wide process-tree killer."""
+    return childproc.kill_tree(proc, wait_s=5)
 
 
 #: This tool runs caller-supplied code, so the evidence trace cannot see what it did:

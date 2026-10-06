@@ -34,6 +34,45 @@ _SIGNIN_MARKERS = (
     "/common/oauth2",
 )
 
+import re as _re
+
+#: ANY IDENTITY PROVIDER'S SIGN-IN PAGE, not just Microsoft's own.
+#:
+#: THERE WERE FOUR DEFINITIONS OF "ON A SIGN-IN PAGE" AND THEY DISAGREED. On 2026-09-24 a
+#: freshly set-up PC's bridge Edge (:9223) sat on a federated tenant's AD FS page,
+#: https://<corporate STS>/adfs/ls/?... . The doctor (scripts/ensure_m365_signin.py, whose
+#: pattern had "/adfs/") called it a sign-in wall. Everything that could have brought the
+#: window forward -- relay/edge_recover.looks_like_login, _SIGNIN_MARKERS above, and
+#: scripts/start_bridge.ps1's Needs-SignIn -- matched only login.microsoftonline /
+#: login.live.com, so to them the page was nothing, and nobody surfaced it. The person was
+#: told to sign in and given no window to do it in.
+#:
+#: A federated tenant sends the browser from login.microsoftonline to ITS OWN identity provider,
+#: so the wall a person actually faces is on a host this code cannot enumerate. What can be
+#: enumerated is the shape: AD FS (/adfs/, WS-Federation wa=wsignin1.0), SAML (SAMLRequest=,
+#: /saml2/), the Microsoft hosts, and the common hosted IdPs. ONE pattern, here; every caller
+#: that needs the answer asks this function.
+_SIGNIN_WALL_RE = _re.compile(
+    r"login\.microsoftonline\.|login\.microsoft\.com|login\.windows\.net|login\.live\.com"
+    r"|/adfs/|//adfs\.|[?&]wa=wsignin|[?&]samlrequest=|/saml2?/"
+    r"|/oauth2/(?:v2\.0/)?authorize|/common/oauth2|/signin|[?&]login_hint="
+    r"|\.okta(?:preview)?\.com/|\.onelogin\.com/|\.pingone\.[a-z]+/|/as/authorization\.oauth2"
+    r"|/idp/sso|accounts\.google\.com/|\.duosecurity\.com/",
+    _re.I)
+
+
+def looks_like_signin_wall(url: str) -> bool:
+    """True if *url* is an identity provider's sign-in page that is waiting for a PERSON.
+
+    Generic across IdPs (Entra ID, a federated AD FS, SAML/WS-Fed, Okta/Ping/OneLogin/Google).
+    Auth-bounce residue (see AUTH_BOUNCE_RESIDUE_MARKERS) is NOT a wall: it is on an auth host
+    but asks nobody for anything, and counting it pinned a verdict at "sign in" forever once.
+    """
+    u = url or ""
+    if not _SIGNIN_WALL_RE.search(u):
+        return False
+    return not looks_like_auth_bounce_residue(u)
+
 # URL fragments that mean "an auth/SSO redirect is mid-flight" -- transient, the caller
 # should re-navigate and wait for the chat to render, NOT declare expiry.
 _REDIRECT_MARKERS = (
@@ -43,10 +82,42 @@ _REDIRECT_MARKERS = (
 )
 
 
-def _looks_like_signin(url: str) -> bool:
-    """True if *url* looks like an active sign-in / account-pick page (case-insensitive)."""
+#: URL shapes on an auth host that are LEFTOVER, not a page asking anybody for anything.
+#:
+#: relay/relay_fleet.py's residue reaper was written against exactly these two -- "four such
+#: tabs were sitting in the fleet Edge when this was written" -- and its comment states the
+#: rule this module exists to enforce: THE URL IS NOT THE TEST, THE PAGE STATE IS. The reaper
+#: therefore asks classify_page before closing one.
+#:
+#: A CALLER THAT CANNOT ASK THE PAGE STILL NEEDS THIS. scripts/ensure_m365_signin.py reads the
+#: CDP /json tab list, which carries a URL and a title and no DOM, so it cannot probe page
+#: state at all. It was matching login.live.com and declaring a sign-in wall, so ONE piece of
+#: residue pinned its verdict at "sign in" forever -- on 2026-09-23 the operator's new machine
+#: sat in "waiting for sign-in..." against login.live.com/Me.srf and
+#: login.microsoftonline.com/savedusers, and quickstart could not finish.
+#:
+#: WHAT THIS LICENSES AND WHAT IT DOES NOT. Residue is not evidence of a wall. It is not
+#: evidence of being signed in either -- a caller that sees only residue has learned nothing
+#: and must say so. Removing something from the "needs a human" side is safe in a way that
+#: adding something to the "already fine" side is not.
+AUTH_BOUNCE_RESIDUE_MARKERS = (
+    "/me.srf",          # the personal-MSA profile endpoint Edge fetches on its own
+    "/savedusers",      # the "remembered accounts" bounce left behind after a sign-in
+)
+
+
+def looks_like_auth_bounce_residue(url: str) -> bool:
+    """True if *url* is a leftover auth-host tab rather than a page awaiting a human."""
     u = (url or "").lower()
-    return any(m in u for m in _SIGNIN_MARKERS)
+    return any(m in u for m in AUTH_BOUNCE_RESIDUE_MARKERS)
+
+
+def _looks_like_signin(url: str) -> bool:
+    """True if *url* looks like an active sign-in / account-pick page (case-insensitive).
+
+    Includes a federated IdP's page (AD FS etc.) -- see looks_like_signin_wall."""
+    u = (url or "").lower()
+    return any(m in u for m in _SIGNIN_MARKERS) or looks_like_signin_wall(u)
 
 
 def _looks_like_redirect(url: str) -> bool:
@@ -286,15 +357,26 @@ def _surface_with_a_way_back(cdp_url: str, agent_url: str,
         try:
             import os as _os
             repo = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
-            subprocess.run(
-                ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
-                 _os.path.join(repo, "scripts", "start_companion_edge.ps1"),
-                 # -HardReset IS THE POINT. Without it start_companion_edge.ps1 sees :9222 already
-                 # listening and merely parks the existing HEADED instance -- measured: the
-                 # process stayed headed and the taskbar entry remained. Only a hard reset
-                 # replaces it with a headless one.
-                 "-Port", str(port), "-HardReset", "-Headless"],
-                capture_output=True, timeout=180)
+            # THE PROFILE GOES WITH THE PORT. start_companion_edge.ps1 defaults -Profile to the
+            # companion's, so "-Port 9223" alone hard-reset the FLEET's browser and tried to
+            # start it on the bridge's port. The port->profile map has one home.
+            try:
+                from relay.edge_recover import _profile_for_port
+                profile = _profile_for_port(port)
+            except Exception:
+                profile = ""
+            argv = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
+                    _os.path.join(repo, "scripts", "start_companion_edge.ps1"),
+                    # -HardReset IS THE POINT. Without it start_companion_edge.ps1 sees :9222
+                    # already listening and merely parks the existing HEADED instance --
+                    # measured: the process stayed headed and the taskbar entry remained. Only
+                    # a hard reset replaces it with a headless one.
+                    "-Port", str(port), "-HardReset", "-Headless"]
+            if profile:
+                argv += ["-Profile", profile]
+            from tools import childproc
+            subprocess.run(argv, capture_output=True, timeout=180,
+                           creationflags=childproc.headless_creationflags())
         except Exception:
             pass
 

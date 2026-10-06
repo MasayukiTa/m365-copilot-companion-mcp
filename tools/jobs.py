@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from ._subproc import sanitized_child_env
+from . import childproc
 from .file_ops import _validate_path
 from .security import require_unlocked
 from .shell_extra import _gate_detail
@@ -99,11 +100,7 @@ def _watchdog_fire(job: "_Job") -> None:
     # and miss the "killed: exceeded max runtime" note. Setting it here closes that race.
     job.killed_by_watchdog = True
     try:
-        proc.terminate()
-        try:
-            proc.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            proc.kill()
+        childproc.kill_tree(proc, wait_s=5)
     except Exception:
         pass
     finally:
@@ -157,7 +154,11 @@ def _prune_jobs_locked() -> None:
 
 
 def _create_log_paths() -> tuple[str, str]:
-    base = Path(tempfile.gettempdir()) / "m365-copilot-companion-mcp-jobs"
+    # Under the one swept temp home (relay/temp_home.py). The logs' paths are stored on the job
+    # record and read back from there, so nothing depends on the old directory name; logs left
+    # in the old %TEMP%\m365-copilot-companion-mcp-jobs stay readable where they are.
+    from relay.temp_home import temp_dir
+    base = Path(temp_dir("jobs"))
     base.mkdir(parents=True, exist_ok=True)
     stem = uuid.uuid4().hex[:10]
     return str(base / f"{stem}.out.log"), str(base / f"{stem}.err.log")
@@ -211,6 +212,7 @@ def run_in_background(
                 stderr=err_f,
                 cwd=cwd,
                 env=sanitized_child_env(),
+                **childproc.tree_popen_kwargs(headless=True),
             )
         job = _Job("shell", label or command[:60], command)
         job.process = proc
@@ -246,8 +248,9 @@ def run_python_in_background(code: str, label: str = "") -> str:
         if _g is not None:
             return _g
     try:
+        from relay.temp_home import temp_dir
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".py", delete=False, encoding="utf-8"
+            mode="w", suffix=".py", delete=False, encoding="utf-8", dir=temp_dir("jobs")
         ) as f:
             f.write(code)
             script_path = f.name
@@ -262,6 +265,7 @@ def run_python_in_background(code: str, label: str = "") -> str:
                 stdout=out_f,
                 stderr=err_f,
                 env=sanitized_child_env(),
+                **childproc.tree_popen_kwargs(headless=True),
             )
         job = _Job("python", label or "python script", script_path)
         job.process = proc
@@ -383,11 +387,7 @@ def job_kill(job_id: str) -> str:
         # Cancel the watchdog first so it doesn't race this explicit kill and
         # mislabel a human-requested kill as "exceeded max runtime".
         job.cancel_watchdog()
-        job.process.terminate()
-        try:
-            job.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            job.process.kill()
+        childproc.kill_tree(job.process, wait_s=5)
         job.refresh()
         return f"Killed job {job_id}"
     except Exception as e:

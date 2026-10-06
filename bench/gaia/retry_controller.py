@@ -24,6 +24,9 @@ import urllib.request
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+if str(REPO) not in sys.path:
+    sys.path.insert(0, str(REPO))
+from tools.secret_store import api_key_from_env
 PY_VENV = REPO / ".venv" / "Scripts" / "python.exe"
 RETRY_IDS = REPO / ".fleet" / "gaia" / "retry_ids.json"
 OUT_DIR = REPO / ".fleet" / "gaia"
@@ -31,13 +34,13 @@ ENDPOINT_LOG = OUT_DIR / "endpoint.log"
 
 
 def _api_key() -> str:
+    env = {}
     for line in (REPO / ".env").read_text(encoding="utf-8-sig").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
-            if k.strip() == "MCP_API_KEY":
-                return v.strip()
-    return ""
+            env[k.strip()] = v.strip()
+    return api_key_from_env(env)
 
 
 def _looks_like_models_payload(body: bytes) -> bool:
@@ -107,6 +110,21 @@ def _ancestor_pids(max_depth: int = 12) -> set[int]:
     return ids
 
 
+def _win_norm(s: str) -> str:
+    """Fold a Windows path/command line for comparison: lowercase, one separator.
+
+    Deliberately NOT os.path.normcase -- that is a no-op off Windows, and the strings here
+    are Windows command lines no matter which OS is reading them (CI reads them from
+    fixtures; production reads them from the process table)."""
+    return (s or "").replace("/", "\\").lower()
+
+
+def _looks_absolute(p: str) -> bool:
+    """A Windows-absolute path: a drive letter ("c:\\...") or a UNC share ("\\\\host\\share").
+    Checked on the already-folded form, so only lowercase drive letters occur."""
+    return p.startswith("\\\\") or (len(p) > 2 and p[1] == ":" and p[2] == "\\")
+
+
 def _endpoint_pids(rows, my_ancestors, venv_python: str):
     """Select ONLY the python processes that are actually our :8011 endpoint.
 
@@ -122,13 +140,27 @@ def _endpoint_pids(rows, my_ancestors, venv_python: str):
       * our own process and its ancestors are excluded, so the controller can
         never kill the shell that started it.
     """
-    venv_norm = os.path.normcase(os.path.abspath(venv_python)) if venv_python else ""
+    # NORMALISE THE WINDOWS WAY REGARDLESS OF THE HOST OS. This read
+    # `os.path.normcase(os.path.abspath(venv_python))`, and both halves are host-dependent:
+    # off Windows, abspath treats "C:\...\python.exe" as RELATIVE and prepends the cwd, and
+    # normcase is the identity so nothing is lowercased. Either one alone makes every
+    # comparison fail, so the selector returned [] for every row on the Linux CI runner and
+    # five tests in tests/test_endpoint_kill_and_probe.py had been red there -- under a
+    # docstring claiming they "run on the Linux CI runner exactly as on Windows".
+    #
+    # The command lines being matched are Windows command lines whatever the host reading
+    # them, so normalise them as Windows paths explicitly. abspath is kept ONLY for a path
+    # that does not already look absolute: this selector chooses what to KILL, and resolving
+    # a bare relative path against the cwd is narrower than letting it match as a substring.
+    venv_norm = _win_norm(venv_python) if venv_python else ""
+    if venv_norm and not _looks_absolute(venv_norm):
+        venv_norm = _win_norm(os.path.abspath(venv_python))
     selected = []
     for pid, cmd in rows:
         if pid in my_ancestors:
             continue
         cmd = cmd or ""
-        low = os.path.normcase(cmd)
+        low = _win_norm(cmd)
         # 1) must be launched by our venv python (absolute path present on cmdline)
         if venv_norm and venv_norm not in low:
             continue
@@ -151,8 +183,8 @@ def kill_8011():
         "Get-CimInstance Win32_Process -Filter \"Name='python.exe'\" | "
         "Select-Object ProcessId,CommandLine | ConvertTo-Json -Compress"
     )
-    out = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
-                         capture_output=True, text=True).stdout
+    from tools.childproc import run as _run_child
+    out = _run_child(["powershell.exe", "-NoProfile", "-Command", ps]).stdout
     rows = []
     try:
         data = json.loads(out) if out.strip() else []
@@ -167,9 +199,9 @@ def kill_8011():
             continue
         rows.append((pid, item.get("CommandLine") or ""))
     my_ancestors = _ancestor_pids()
+    from tools.childproc import run as _run_child
     for pid in _endpoint_pids(rows, my_ancestors, str(PY_VENV)):
-        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
-                       capture_output=True, text=True)
+        _run_child(["taskkill", "/PID", str(pid), "/F"])
     time.sleep(2)
 
 

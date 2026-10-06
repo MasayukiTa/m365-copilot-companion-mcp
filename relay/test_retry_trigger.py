@@ -36,7 +36,12 @@ def test_the_decision_is_recorded_whether_or_not_it_fires():
     """A funnel that only records firings cannot show a mechanism declining to fire, which is
     the state this one is almost always in."""
     code = _code()
-    assert 'mechanism_telemetry' in code
+    # `_mt.record(`, NOT the module name. This asserted `'mechanism_telemetry' in code`, which
+    # was satisfied only by the LOCAL import that used to sit here -- so it was pinning the
+    # import statement rather than the recording. Two other call sites had no such import, wrote
+    # nothing for 5629 rows, and no test noticed, because none of them asked whether a record
+    # was made. See relay/test_a_swallowed_record_is_no_record.py.
+    assert '_mt.record(' in code
     assert 'not_triggered_reason' in code
 
 

@@ -442,9 +442,10 @@ def run_test_gate(repo_root):
     than inlined in main()) so tests can monkeypatch a canned pass/fail without touching
     subprocess or a real .venv."""
     try:
-        r = subprocess.run(
+        from tools.childproc import run as _run_child
+        r = _run_child(
             [VENVPY, "-m", "relay.selfimprove.run_all_tests"],
-            cwd=repo_root, capture_output=True, text=True, timeout=600,
+            cwd=repo_root, timeout=600,
         )
         result = "PASSED" if r.returncode == 0 else "FAILED"
         tail_lines = [ln for ln in ((r.stdout or "") + (r.stderr or "")).splitlines()

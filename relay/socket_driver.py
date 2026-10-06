@@ -80,6 +80,12 @@ class CopilotSocketDriver:
 
         self._lock = threading.Lock()
         self._thread = None
+        # Last MEANINGFUL activity from the backend for the current turn. Socket pings do not
+        # count: a connection can stay alive forever after the model stopped making progress.
+        # The fleet uses this to distinguish a genuinely long turn from a wedged turn whose
+        # websocket is merely still breathing.
+        self._meaningful_activity_ts = 0.0
+        self._turn_started_ts = 0.0
         self._answers_done = 0
         self._partial = ""
         self._last = ""
@@ -113,6 +119,26 @@ class CopilotSocketDriver:
         t = self._thread
         return bool(t and t.is_alive())
 
+    def generation_idle_s(self) -> float:
+        """Seconds since meaningful output/progress on the running socket turn.
+
+        Pings deliberately do not refresh this clock. A live TCP/WebSocket connection is not
+        evidence that the agent is still doing work. Returns 0 when no turn is running.
+        """
+        if not self._is_generating():
+            return 0.0
+        with self._lock:
+            ts = self._meaningful_activity_ts or self._turn_started_ts
+        return max(0.0, time.time() - ts) if ts else 0.0
+
+    def fail_stalled_turn(self, reason: str) -> None:
+        """Mark a still-live turn unusable and close its socket so normal fallback can run."""
+        self.failed = str(reason or "socket turn stalled")[:240]
+        try:
+            self.conv.close()
+        except Exception:
+            pass
+
     def wait_for_idle(self, timeout_s=180.0, poll_s=0.25) -> bool:
         """Block until the running turn finishes. True if it finished, False on timeout.
 
@@ -136,7 +162,7 @@ class CopilotSocketDriver:
             time.sleep(poll_s)
         return True
 
-    def send(self, text, gen_wait_s=None, **_kw):
+    def send(self, text, gen_wait_s=None, annotations=None, **_kw):
         """Start a turn. Returns as soon as it is running, exactly as the tab driver does.
 
         `gen_wait_s` is accepted and ignored: it exists because the tab driver must not block
@@ -149,6 +175,8 @@ class CopilotSocketDriver:
             raise ChatHubError("this socket route already failed: %s" % self.failed)
         with self._lock:
             self._partial = ""
+            self._turn_started_ts = time.time()
+            self._meaningful_activity_ts = self._turn_started_ts
             # THE PREVIOUS ANSWER IS RETIRED HERE, not left lying around. It used to survive
             # into the next turn: `send` cleared only the partial, so between this call and
             # the first token, "what is the answer" returned the LAST turn's answer -- and if
@@ -157,14 +185,20 @@ class CopilotSocketDriver:
             self._last = ""
             self._turn_seq += 1
             self._turn_answered = False
-        self._thread = threading.Thread(target=self._run_turn, args=(text,),
+        # ANNOTATIONS RIDE WITH THE TEXT. Passed explicitly rather than through **_kw,
+        # which this signature swallows -- a caller that attached an image and had it
+        # silently dropped would get a turn that looks fine and answers about nothing.
+        self._thread = threading.Thread(target=self._run_turn, args=(text, annotations),
                                         name="socket-turn", daemon=True)
         self._thread.start()
 
-    def _run_turn(self, text):
+    def _run_turn(self, text, annotations=None):
         def on_text(sofar):
             with self._lock:
+                changed = sofar != self._partial
                 self._partial = sofar
+                if changed:
+                    self._meaningful_activity_ts = time.time()
 
         # WHAT ELSE ARRIVED, so an empty answer can say what it was instead of only that it
         # was empty. The backend delivers tool authorisation and confirmation as their own
@@ -180,6 +214,10 @@ class CopilotSocketDriver:
                 tag = mt + (("/" + origin) if origin else "")
                 if tag and tag not in seen_types:
                     seen_types.append(tag)
+                # Progress frames are meaningful even when they carry no answer text (search,
+                # tool work, grounding, etc.). Refresh the idle clock for every such item.
+                with self._lock:
+                    self._meaningful_activity_ts = time.time()
             except Exception:
                 pass
 
@@ -232,10 +270,18 @@ class CopilotSocketDriver:
                     if left > 0:
                         os.environ["MCP_SOCKET_FORCE_FAIL"] = "%d:%s" % (left - 1, _why)
                         raise ChatHubError(_why)
+            # OPTIONAL OBSERVER OF THE REAL WIRE PAYLOAD. Passed only when someone installed
+            # one (`driver.payload_sink = fn(payload, round)`), so a conversation object
+            # that predates the parameter is never handed a keyword it does not know.
+            _extra = {}
+            _sink = getattr(self, "payload_sink", None)
+            if _sink is not None:
+                _extra["on_payload"] = _sink
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
+                                   annotations=annotations,
                                    on_progress=on_progress,
                                    catalogue=self._catalogue, protocol=self._protocol,
-                                   run_tool=self._run_tool)
+                                   run_tool=self._run_tool, **_extra)
         except Exception as exc:
             # THE ROUTE FAILING IS NOT THE JOB FAILING. Recorded, not raised: the caller reads
             # `failed`, opens a tab and carries on with the same goal.
@@ -340,8 +386,13 @@ class CopilotSocketDriver:
         """
         try:
             c = self.conv
+            # PEEK, NEVER MINT: a driver that has not sent yet has no conversation to name.
+            # Reading the plain attribute here would create the id (it is lazy) and every
+            # status poll would then record a conversation nobody had spoken in.
+            _peek = getattr(c, "peek_conversation_id", None)
+            _client = _peek() if callable(_peek) else getattr(c, "conversation_id", "")
             return {
-                "client": str(getattr(c, "conversation_id", "") or ""),
+                "client": str(_client or ""),
                 "server": str(getattr(c, "server_conversation_id", "") or ""),
                 "session": str(getattr(c, "session_id", "") or ""),
                 "turns": int(getattr(c, "turns", 0) or 0),

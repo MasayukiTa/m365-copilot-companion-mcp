@@ -1,5 +1,7 @@
+import hmac
 import os
 import time
+from pathlib import Path
 
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -25,6 +27,9 @@ from tools.coding_ops import (
     multi_edit,
     python_check,
     replace_in_file,
+    survey_worktrees,
+    worktree_add,
+    worktree_remove,
 )
 from tools.auto_ops import (edit_and_verify, loop_trajectory, loop_until_verified,
                             restore_point, roll_back)
@@ -103,6 +108,8 @@ from tools.foundry import forge_tool, forge_list, forge_read, forge_delete
 from tools.registry_ops import registry_read, service_status
 from tools.shell_extra import pwsh_exec, pwsh_exec_file, shell_which
 from tools.screenshot_ops import screenshot
+from tools.screen_ops import (screen_look, screen_click, screen_scroll,
+                              screen_type, screen_press, screen_windows)
 from tools.odbc_ops import (
     odbc_columns,
     odbc_connections,
@@ -126,6 +133,7 @@ from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
+from tools.audit_ledger_ops import validity_audit_ledger
 from tools.jobs import (
     job_kill,
     job_list,
@@ -158,15 +166,22 @@ from tools.pptx_ops import (
 )
 from tools.registry import list_my_tools, register
 from tools.search_ops import find_files, glob
-from tools.security import list_unlocked, unlock
+from tools.security import derive_identity, list_unlocked, unlock
 from tools.task_ops import todo_clear, todo_list, todo_write
 from tools.web_ops import github_file, render_page, web_fetch
 
 load_dotenv()
+from tools.secret_store import materialize_api_key
+materialize_api_key()
 
 EXECUTION_PROFILE_TOOLS = (
     claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,
 ) if os.environ.get("MCP_EXECUTION_PROFILES", "0") == "1" else ()
+
+# Optional helper tools are registered only when the operator opts in (default: off).
+EXT_HELPER_TOOLS = (
+    validity_audit_ledger,
+) if os.environ.get("MCP_EXT_HELPER", "0") == "1" else ()
 
 API_KEY = os.environ["MCP_API_KEY"]
 
@@ -193,8 +208,11 @@ mcp = FastMCP(
         # 「この環境にファイルシステムのツールは無い」と断定して拒否した。差はそこだけ
         # だったので、一覧取得を「推奨」ではなく「最初の行動」として書き切る。
         "RULE 1 -- DO THIS FIRST, ALWAYS: call call_tool(name='') and read the returned "
-        "catalogue (about 160 entries) BEFORE answering anything about what you can or "
-        "cannot do. This is not optional and not a fallback. "
+        "index BEFORE answering anything about what you can or cannot do. It is a short "
+        "list of CATEGORIES, not every tool: call_tool(name='<category>') opens one, and "
+        "call_tool(name='<tool>') shows that tool's parameters. A name that is neither "
+        "comes back with the closest matches, so a near miss is one more call rather than "
+        "a dead end. This is not optional and not a fallback. "
         # 実測: 「MT18EX5 RM の期限切れを調べて」の一言を投げたら、承認済みの手順が
         # あるのに skill_match を呼ばず、DB を自分で叩いて別解を作文した。もっともらしいが
         # 問い自体がすり替わっていた（材料の期限切れの話になり、本来の「期限を過ぎてから
@@ -202,11 +220,29 @@ mcp = FastMCP(
         # 一覧取得の直後に上げる。
         "RULE 2 -- DO THIS SECOND: call skill_match with the user's request, before "
         "doing any domain work. If it returns a confident trusted match, call "
-        "skill_load and FOLLOW that procedure as written. Do not re-derive it, do not "
+        "skill_load and FOLLOW that procedure as written. A result marked 'candidate' is "
+        "only a possible match: load it only if the request is for exactly that procedure. "
+        "Do not re-derive a confident one, do not "
         "write your own query, and do not substitute a similar-sounding question: a "
         "matched Skill encodes decisions that were verified against the real data, and "
         "improvising past it has produced confident wrong answers. Skill trust never "
         "grants extra execution rights; unlock and contract gates still apply. "
+        # 実測 2026-09-24: 「社内で使えるパワーポイントのskillsを探してほしい」に対し、
+        # skill_match が空だったことを理由に「このskillは存在しません」で打ち切り、
+        # ユーザーの言う『skills』(汎用語)をこのサーバの登録済みSkill(固有名)へすり替えた。
+        # NO MATCH IS A STATEMENT ABOUT THE LOCAL CATALOGUE, NOT ABOUT THE REQUEST. A
+        # skill_match/skill_list miss means only that no local procedure exists for this --
+        # it is not itself an answer, and it does not mean the thing the user asked about does
+        # not exist. When the user's own word ('skills' here) is broader than this server's
+        # Skill feature, or the request asks you to find/search for something, continue with
+        # your other tools until the request is actually done.
+        "A NO-MATCH RESULT MEANS THE LOCAL CATALOGUE HAS NOTHING FOR THIS -- it is not an "
+        "answer to the request and does not mean the thing the user asked about is "
+        "unavailable. Keep going with your other tools -- including any web or "
+        "external-repository search tool in the catalogue -- until the request is actually "
+        "done. Do not stop at 'no local skill matches' and ask the user whether to proceed "
+        "or whether to create one instead: that is not a completed answer to an explicit "
+        "request to search. "
         # 実測 2026-09-06, twice, and the second run corrected the first reading of the first.
         #
         # 10:49-10:51, from a phone: the agent obeyed RULE 1, then tried to do the work itself.
@@ -224,15 +260,20 @@ mcp = FastMCP(
         "RULE 3 -- TO CHANGE ANYTHING, CALL unlock FIRST. write_file, run_python and shell are "
         "refused until you do, and the refusal names the missing token. READING NEEDS NO "
         "UNLOCK: read_file, list_directory, glob and the rest of the read-only set work "
-        "without one, so do not call unlock before a task that only reads, and never abandon "
+        "without one, so do not call unlock before a plain read -- EXCEPT "
+        "clipboard_get, outlook_inbox, outlook_calendar, odbc_query, odbc_tables, "
+        "odbc_columns, registry_read: gated like a write. And never abandon "
         "a task you could have finished by reading because you could not get the password. "
         "The password is not in "
         ".env and .env is refused on sight: do not go looking for it there. If you do not have "
         "it, say so and stop -- do not fall back to read-only tools and present the result as "
         "though the task were done. For work that is long or multi-step, or that you want "
         "watched and resumable, hand the whole instruction to fleet_submit(goal=..., "
-        "source=<who asked>) instead and say it is queued: it needs no unlock and no gateway, "
-        "and a fleet runs it on the owner's machine under supervision. "
+        "source=<who asked>) and say it is QUEUED, not started. No unlock is needed. TWO "
+        "ROUTES REACH IT: directly if it is in your tool list, otherwise "
+        "call_tool(name=\'fleet_submit\', arguments={...}) -- most clients cap the list, so "
+        "its absence is EXPECTED, and call_tool(name=\'fleet_submit\') with no arguments "
+        "returns its signature. A job id is QUEUED, not landed: see docs/agent_contract.md. "
         "RULE 4: every tool lives BEHIND the call_tool gateway. Names like read_file / "
         "list_directory / run_python / glob are NOT in your own tool list and you will "
         "not find them there. Their absence from your tool list is EXPECTED and proves "
@@ -253,26 +294,27 @@ mcp = FastMCP(
         "directories'. When asked how many, report THAT number verbatim. Never "
         "tally the listing yourself -- hand-counting is where answers drift. To count files of a kind, call glob('*.md', path) or list_directory(path, pattern='*.md') -- both filter first and hand you the number. Never enumerate an UNFILTERED list_directory and pick out the rows you want: every wrong answer measured came from doing that, and each one was low by one. If you want to cross-check, run both and compare the two first lines. Do not re-derive the number by picking rows out of an unfiltered listing: the run that did that had the correct count in hand, discarded it, and answered 15 instead of 16. "
         "RULE 7: read-only tools (glob, list_directory, find_files, read_file, "
-        "search) need no unlock. Only mutating or executing tools (run_python, "
-        "shell, write_file) do. Never refuse a read-only request on the grounds "
-        "that you are not unlocked, and never reach for run_python when a "
-        "read-only tool already answers the question. "
+        "search) need no unlock. Mutating or executing tools (run_python, "
+        "shell, write_file) do, and so does the named exception above "
+        "(clipboard/mail/calendar/database). Never refuse an ordinary read-only "
+        "request on the grounds that you are not unlocked, and never reach for run_python "
+        "when a read-only tool already answers the question. "
         "With that gateway you can read, search, edit and inspect local files; run "
         "bounded Python or shell commands; work with CSV/Excel/JSON; generate PowerPoint "
         "decks and diagrams; manage long-running jobs; verify your own output via "
         "read_image and pptx_export_png; and install Python dependencies. Read-only "
         "tools work after token authentication; mutating or execution tools additionally "
         "require unlock(password), per client IP. "
-        # THE AGENT CANNOT COMPLY WITH A RULE IT WAS NEVER TOLD. The token was added to the
-        # gate, to unlock()'s reply and to call_tool's signature, and none of those is a place
-        # an agent reliably reads BEFORE its first refusal. It goes here, next to the unlock
-        # sentence it modifies, because "carry a value between calls" is only free if the
-        # instruction is in front of the model the whole time.
-        "RULE 8: unlock(password) replies with a line `unlock_token: <value>`. KEEP that "
-        "value for the rest of the conversation and pass it on every mutating or executing "
-        "call: call_tool(name='run_python', arguments={...}, unlock_token='<value>'). It is "
-        "shown once; if you lose it, call unlock again. A refusal mentioning a missing token "
-        "means only that -- add the token, do not retry the identical call. "
+        # UNLOCK IS SESSION-FIRST. A successful unlock records the current Mcp-Session-Id,
+        # which the transport carries automatically. The returned unlock_token is retained as a
+        # fallback for clients without session authorization; making a language model carry it
+        # on every call recreated the exact reliability problem session auth was added to remove.
+        "RULE 8: if a mutating/executing tool says this conversation is locked, call "
+        "unlock(password) ONCE in this same conversation, then retry the blocked tool here. "
+        "A successful unlock authorizes this MCP session automatically. Do NOT try to remember "
+        "or re-attach unlock_token on every call. The returned token is only a fallback: pass "
+        "it explicitly if the refusal says no authorized MCP session is available or session "
+        "authorization is disabled. "
         "Relative user-folder names (Desktop, Documents, Downloads, ...) resolve to the "
         "user's home profile, not the server's working directory. If a file or folder "
         "seems missing, use find_files (recursive name search) before concluding it is "
@@ -288,24 +330,224 @@ mcp = FastMCP(
     ),
 )
 
+def _git_head_sha(repo_root=None):
+    """The commit the checkout is on, read from .git without invoking git.
+
+    A file read rather than a subprocess: /health may be polled every few seconds and must
+    stay non-blocking, which is the property main.py's own docstring protects. Returns "" on
+    anything unexpected -- a detached head, a worktree, no .git at all -- because an empty
+    SHA means "unknown", which classify_staleness already treats as indeterminate rather
+    than as a pass or a failure.
+    """
+    try:
+        root = Path(repo_root) if repo_root else Path(__file__).resolve().parent
+        head = (root / ".git" / "HEAD").read_text(encoding="utf-8").strip()
+        if head.startswith("ref:"):
+            ref = head.split(" ", 1)[1].strip()
+            p = root / ".git" / ref
+            if p.is_file():
+                return p.read_text(encoding="utf-8").strip()
+            # A packed ref: the loose file is absent once git has packed it.
+            packed = root / ".git" / "packed-refs"
+            if packed.is_file():
+                for line in packed.read_text(encoding="utf-8").splitlines():
+                    if line.endswith(" " + ref):
+                        return line.split(" ", 1)[0].strip()
+            return ""
+        return head
+    except Exception:
+        return ""
+
+
+#: Captured once, at import: the commit this process actually started on. Comparing it to the
+#: SHA read at request time is what makes "stale" checkable rather than assumed.
+_BOOT_HEAD = _git_head_sha()
+_BOOT_PID = os.getpid()
+_BOOT_TS = time.time()
+
+
+#: Answer cached for this long. /health is polled about once a second by the cockpit and by
+#: the supervisor, and the answer can only change when a watched file is written -- so asking
+#: the filesystem every time would be work nobody reads.
+_WATCHED_CACHE_S = 5.0
+_watched_cache = {"at": 0.0, "changed": None}
+
+
+def _watched_code_changed():
+    """Has a file THIS SERVER IMPORTS changed since it started?
+
+    tools/deploy_freshness already owns the list -- WATCHED, pinned by its own test against
+    main.py's real imports -- and newer_than() answers with mtimes rather than a subprocess,
+    which is what keeps /health non-blocking (see _git_head_sha for why that matters).
+
+    UNREADABLE MEANS CHANGED. If this cannot be determined, the SHA rule should stand, and the
+    SHA rule's answer here is "stale"; reporting stale when it might be is the conservative
+    side of a question about whether a fix is live.
+    """
+    now = time.time()
+    if _watched_cache["changed"] is not None and (now - _watched_cache["at"]) < _WATCHED_CACHE_S:
+        return _watched_cache["changed"]
+    try:
+        from tools.deploy_freshness import newer_than
+        changed = bool(newer_than(_BOOT_TS))
+    except Exception:
+        changed = True
+    _watched_cache["at"], _watched_cache["changed"] = now, changed
+    return changed
+
+
+#: When this process first observed itself to be stale, or None while it is current.
+#:
+#: WHY A DURATION AND NOT JUST A STATE. Every commit that touches a watched package
+#: makes the running server genuinely stale, so on a machine where an agent is
+#: improving the code all day the dot is amber almost all of the time -- and a dot that
+#: is amber in the normal working state distinguishes nothing. The operator said it
+#: plainly on 2026-09-18: if that is the condition, the colour is a false report.
+#:
+#: The fact is still true and still worth reporting; what was wrong was treating it as
+#: something a PERSON must act on. The supervisor cycles the server itself once the
+#: fleet is idle (scripts/supervisor.ps1, Invoke-StaleServerCycle). So the actionable
+#: condition is not 'stale' -- it is 'stale for longer than the machine should have
+#: needed', which means the cycle could not run or did not work.
+_STALE_SINCE = None
+
+
+def _server_identity():
+    """Which process is answering, and whether its code matches the checkout."""
+    # THE RULE IS INLINE, NOT IMPORTED, AND THAT IS DELIBERATE. The canonical statement of it
+    # is scripts/stale_server_check.classify_staleness, and importing it would be the obvious
+    # move -- but tools/deploy_freshness.WATCHED lists the packages whose changes make this
+    # server stale, and a guard asserts it equals what main.py actually imports. Importing
+    # from scripts/ would force "scripts" into that list, and scripts/ is mostly standalone
+    # files this server never loads: every doctor.ps1 edit would then report the server as
+    # stale. That module already records the same mistake being made with bench/.
+    #
+    # Three lines cannot drift far, and they are not left to trust:
+    # tools/test_deploy_freshness.py asserts this function agrees with classify_staleness on
+    # the same inputs, so the two cannot diverge without a test saying so.
+    _now_head = _git_head_sha()
+    if not _BOOT_HEAD or not _now_head:
+        state = "unknown"
+    elif _BOOT_HEAD == _now_head:
+        state = "current"
+    else:
+        # A DIFFERENT COMMIT IS NOT THE SAME AS DIFFERENT CODE. Until 2026-09-17 it was the
+        # whole rule, so a commit touching only docs, only the cockpit or only tests reported
+        # this server as stale and told the operator its fixes were not live -- while nothing
+        # it imports had changed. Three times in one afternoon, each needing a person to
+        # notice and clear it. A dot amber for a reason its reader knows is irrelevant is a
+        # dot that stops being read.
+        state = "stale" if _watched_code_changed() else "current"
+    # HOW LONG, so a reader can tell a commit that landed a moment ago from a server
+    # nothing has been able to cycle. Stamped on the first observation and cleared the
+    # moment it is current again -- not persisted, because a restart IS the thing that
+    # clears it and a value surviving one would describe the previous process.
+    global _STALE_SINCE
+    now = time.time()
+    if state == "stale":
+        if _STALE_SINCE is None:
+            _STALE_SINCE = now
+    else:
+        _STALE_SINCE = None
+    return {
+        "server_pid": _BOOT_PID,
+        "server_uptime_s": round(time.time() - _BOOT_TS, 1),
+        "server_head": _BOOT_HEAD[:12],
+        "server_code": state,   # current | stale | unknown
+        # None while current. Seconds since this process first saw itself stale.
+        "server_stale_for_s": (None if _STALE_SINCE is None
+                               else round(now - _STALE_SINCE, 1)),
+    }
+
+
+def _health_bearer_ok(request: Request) -> bool:
+    """True iff the caller presented this server's own MCP_API_KEY as a bearer token.
+
+    /health is registered via @mcp.custom_route, which sits OUTSIDE the FastMCP
+    StaticTokenVerifier auth that guards the /mcp mount (that verifier never runs for this
+    route at all -- this is not a duplicate of a check FastMCP already does, it is the
+    only one). Tolerates a raw, unprefixed key the same way _BearerPrefix does for /mcp,
+    since an operator who pastes the key without "Bearer " should not get a confusing
+    partial /health response as the result.
+    """
+    value = (request.headers.get("authorization") or "").strip()
+    if not value:
+        return False
+    if value.lower().startswith("bearer "):
+        value = value[len("bearer "):].strip()
+    return hmac.compare_digest(value, API_KEY)
+
+
 @mcp.custom_route("/health", methods=["GET"])
-async def health(_request: Request) -> JSONResponse:
+async def health(request: Request) -> JSONResponse:
     """Liveness probe that NEVER touches a blocking tool.
 
     This async handler runs directly on the event loop and returns immediately, so the
     supervisor can distinguish "the loop is briefly busy running a heavy tool in a worker
     thread" (this still answers fast, because tool bodies are now offloaded) from "the
-    loop is actually dead". It does no auth and does no blocking I/O on purpose (the
-    auth-failure summary below is an in-memory read of tools.auth_stats' module
-    singleton, not a file read).
+    loop is actually dead". It does no blocking I/O on purpose (the auth-failure summary
+    below is an in-memory read of tools.auth_stats' module singleton, not a file read).
+
+    SEC-20: this route has NO FastMCP auth (see _health_bearer_ok's docstring) and is
+    reachable through the dev tunnel by anyone who can reach the public URL -- it used to
+    hand every such caller server identity, code-staleness, auth-failure counts and
+    tool/fleet probe state with zero authentication. Now: a caller that is neither a
+    genuine local peer (tools.security.derive_identity -- the SAME helper the unlock gate
+    and the auth-failure ASGI observer already use, so "local" means exactly what it means
+    everywhere else in this server) NOR presenting a valid bearer token gets back only
+    {"status": "ok", "server_pid": ...}.
+
+    server_pid stays in that minimal reply on purpose, not by oversight: three existing,
+    unauthenticated callers already hit this exact code path (a round trip out through the
+    dev tunnel and back to this same machine) and compare server_pid against a separate
+    loopback call to catch a tunnel forwarding to the wrong host (D7) --
+    scripts/doctor.ps1's Test-TunnelHealthAnswer, scripts/status.py's section_tunnel, and
+    ui/FleetCockpit.cs's tunnel dot (PollHealthOnce). None of the three send a bearer
+    token today. Dropping server_pid from the unauthenticated reply would silently disable
+    that mismatch check for all three rather than fail loudly, which is worse than the
+    small amount of information server_pid discloses (an OS process id, already exposed
+    today). Everything else this route can say -- code staleness, auth-failure counts,
+    tool/fleet probe state -- stays behind loopback-or-bearer.
 
     Also surfaces auth_fail_10m / auth_fail_last_ts (see tools/auth_stats.py) so a
     burst of 401s -- e.g. Copilot Studio's stored key desyncing from MCP_API_KEY --
     is visible to the supervisor/cockpit without grepping logs. get_summary() never
     raises, so this can't turn a healthy-loop probe into a 500."""
     payload = {"status": "ok"}
+    client = getattr(request, "client", None)
+    peer = client.host if client else ""
+    xff = request.headers.get("x-forwarded-for", "")
+    is_local, _identity_ip = derive_identity(peer, xff)
+    if not is_local and not _health_bearer_ok(request):
+        payload["server_pid"] = _BOOT_PID
+        return JSONResponse(payload)
+    # WHO IS ANSWERING, AND IS IT RUNNING THE CODE ON DISK.
+    #
+    # A server that is already running keeps executing what it imported at startup. A pull
+    # lands new code, /health still answers 200, and every dot stays green while the checkout
+    # and the live process silently disagree -- scripts/doctor.ps1:690 describes exactly this
+    # and checks it, but the cockpit's Server dot never did. On 2026-09-16 the process serving
+    # all morning had started at 20:36 the previous evening, before every fix of that night,
+    # and it was reported as healthy because 200 is all anyone looked at.
+    #
+    # The decision itself is scripts/stale_server_check.classify_staleness -- pure and
+    # pytest-covered -- so this cannot drift from what those tests assert.
+    payload.update(_server_identity())
     payload.update(_auth_stats_summary())
+    # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
+    payload.update(_self_test_summary())
     payload.update(_tool_probe_summary())
+    # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
+    # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
+    # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
+    # tool_ok as "tool access" was reading one path of four. fleet_tool_ok is the other
+    # busy path, derived from the ledger of real calls rather than from a probe, and its
+    # None means "no calls lately", which is not a failure.
+    try:
+        from tools.fleet_tool_health import get_summary as _fleet_tool_summary
+        payload.update(_fleet_tool_summary())
+    except Exception:
+        pass
     return JSONResponse(payload)
 
 
@@ -317,6 +559,8 @@ TOOLS = (
     job_status, job_wait, job_output, job_list, job_kill,
     # the door an agent walks through to hand this machine a goal
     fleet_submit, fleet_queue,
+    # optional helper tools: present only when MCP_EXT_HELPER=1 (see EXT_HELPER_TOOLS)
+    *EXT_HELPER_TOOLS,
     # processes / services / registry (Windows host introspection)
     process_list, process_info, process_kill,
     service_status, registry_read,
@@ -345,6 +589,12 @@ TOOLS = (
     git_status, git_diff, git_log, git_branch, git_blame,
     # git (write)
     git_add, git_commit, git_checkout,
+    # git worktrees -- the isolated-checkout alternative git_checkout's own refusal points
+    # callers at when a branch switch in the shared working tree is not allowed. survey is
+    # read-only; add/remove are the two externally-usable halves of coding_ops.worktree_scope
+    # (an in-process-only context manager -- see its docstring for why it cannot itself be a
+    # tool), gated the same way (require_unlocked + the destructive-op contract gate).
+    survey_worktrees, worktree_add, worktree_remove,
     # web
     web_fetch, render_page, github_file,
     web_search, web_search_news,
@@ -409,6 +659,11 @@ TOOLS = (
     outlook_inbox, outlook_send_mail, outlook_calendar, outlook_create_event,
     # clipboard / screen capture
     clipboard_get, clipboard_set, screenshot,
+    # acting on the screen: screen_look records the coordinate frame the picture
+    # was taken in, so screen_click can convert a pixel of THAT image back to a
+    # desktop point. `screenshot` states no frame and cannot be clicked in.
+    screen_look, screen_click, screen_scroll, screen_type, screen_press,
+    screen_windows,
     # task management
     todo_write, todo_list, todo_clear,
     # orchestration: audit/replay run-log (operator D)
@@ -465,20 +720,22 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         list_directory, find_files) run as-is; only mutating or executing tools need unlock.
 
         UNLOCKING, AND KEEPING THE TOKEN. `unlock(password="...")` replies with a line reading
-        `unlock_token: <value>`. KEEP THAT VALUE for the rest of the conversation and pass it
-        on every mutating or executing call:
+        `unlock_token: <value>`. In the normal MCP path, a successful unlock also authorizes
+        the current Mcp-Session-Id, so keep working in the SAME conversation and retry the
+        blocked tool; the model does not need to remember or re-attach the token on every call.
+
+        The token is a transport fallback. Pass it explicitly when session authorization is
+        unavailable/disabled, or when a refusal specifically says this call has no authorized
+        MCP session:
 
             call_tool(name="run_python", arguments={"code": "..."}, unlock_token="<value>")
-
-        It is shown once and cannot be retrieved afterwards; if it is lost, call unlock again.
-        A refusal that mentions a missing token means exactly this and nothing else -- the
-        remedy is to include it, not to retry the same call.
 
         Args:
             name: the tool's name (e.g. "odbc_query"). Empty or "?" lists every tool.
             arguments: dict of the target tool's keyword arguments.
-            unlock_token: the value from unlock()'s reply. Required for mutating and executing
-                tools once MCP_REQUIRE_UNLOCK_TOKEN is on; harmless to pass at any time.
+            unlock_token: fallback credential returned by unlock(). Usually optional after a
+                successful unlock in the same MCP conversation; required when no authorized
+                MCP session is available.
         """
         def _log_discovery(kind, detail, result):
             """Record a catalogue or signature lookup, which the ledger did not see.
@@ -517,16 +774,46 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             # 4,100. Nothing is removed: 115 tools have never been called, but the ledger is
             # almost all coding runs, so they were never NEEDED rather than found wanting.
             # See tools/tool_catalogue.py.
+            # AND THEN IT BECAME THE THING ITS READERS COULD NOT READ. The flat list grew
+            # to 16,594 characters -- about 6,600 tokens -- and RULE 1 orders every agent to
+            # fetch it first. Measured over six hours of the ledger, 1,716 calls: 112
+            # catalogue fetches (1,858,528 characters into conversations), 76 names guessed
+            # and missed, 78 signature lookups after the fact. 266 calls, 15.4% of
+            # everything, spent working out what to call. One single turn contained
+            # seventeen consecutive unknown names: the agent had read the catalogue and
+            # still could not find what it needed.
+            #
+            # So it is an index now: 12 categories, one line each, keeping the MOST USED
+            # block because the same ledger says round trips are the expensive part. 16,594
+            # characters becomes 4,445, and a category costs 2,270 at its largest.
             from tools import tool_catalogue as _tc
-            _catalogue = _tc.render(_ALL_TOOLS)
+            _catalogue = _tc.render_index(_ALL_TOOLS)
             _log_discovery("call_tool.catalogue",
-                           {"tools": len(_ALL_TOOLS), "with_signatures": len(_tc.HOT)},
+                           {"tools": len(_ALL_TOOLS), "with_signatures": len(_tc.HOT),
+                            "shape": "index"},
                            _catalogue)
             return _catalogue
         fn = _ALL_TOOLS.get(name)
         if fn is None:
-            _unknown = "[call_tool: unknown tool '%s'. Use call_tool(name='') to list all.]" % name
-            _log_discovery("call_tool.unknown", {"name": name}, _unknown)
+            from tools import tool_catalogue as _tc
+            # A CATEGORY IS A LEGITIMATE THING TO ASK FOR. Checked before the unknown-name
+            # path, so `call_tool(name='screen')` opens a category rather than being
+            # refused. A tool and a category cannot collide: every category name is a bare
+            # word and every tool name is already in _ALL_TOOLS, which was tested above.
+            if name in _tc.by_category(_ALL_TOOLS):
+                _listing = _tc.render_category(_ALL_TOOLS, name)
+                _log_discovery("call_tool.category", {"name": name}, _listing)
+                return _listing
+            # A NEAR MISS IS NOT A DEAD END. "no such tool" turns each of the 76 missed
+            # names into a wasted round trip; naming the closest matches and the categories
+            # turns it into the lookup the caller was trying to do.
+            _near = _tc.nearest(_ALL_TOOLS, name)
+            _unknown = ("[call_tool: no tool or category named '%s'.%s Categories: %s. "
+                        "call_tool(name='') for the index.]"
+                        % (name,
+                           (" Closest tools: " + ", ".join(_near) + ".") if _near else "",
+                           ", ".join(sorted(_tc.by_category(_ALL_TOOLS)))))
+            _log_discovery("call_tool.unknown", {"name": name, "suggested": _near}, _unknown)
             return _unknown
         if arguments is None:
             # HELP for ONE tool: signature + doc. To actually run a no-arg tool, pass arguments={}.
@@ -537,11 +824,30 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             _help = "%s%s\n%s" % (name, sig, (getattr(fn, "__doc__", "") or "").strip())
             _log_discovery("call_tool.signature", {"name": name}, _help)
             return _help
-        # REMOVED: the benchmark's tool-population policy, consulted here.
+        # THE FLEET'S TOOL POLICY, CONSULTED HERE AGAIN -- an operator decision taken
+        # 2026-09-14, recorded in docs/unreached_burndown.md.
         #
-        # Which sixteen tools a benchmark worker may reach is a fact about that benchmark,
-        # not about this server, and general dispatch is the wrong place to hold it. The
-        # list is still in relay/fleet_toolset.py for the runner that owns it.
+        # It was removed on 2026-08-31 with the argument that "which sixteen tools a benchmark
+        # worker may reach is a fact about that benchmark, not about this server", and that
+        # general dispatch is the wrong place to hold it. The policy is still not held here --
+        # it lives in relay/fleet_toolset.py and this line only ASKS it. What the removal also
+        # threw away was `_fleet_run_active()`, the mechanism built for the gateway's one real
+        # problem: it cannot tell a worker from the operator. That is why the check can sit in
+        # general dispatch without governing the operator -- it returns allowed unless an
+        # unattended run is in flight, and the runner that owns the list never consulted it
+        # either, so removing the call site did not move the gate anywhere. It disarmed it.
+        #
+        # This is the only point that sees every dispatched call by its real name; the adapter
+        # above sees `call_tool`.
+        try:
+            from relay import fleet_toolset as _toolset
+            _allowed, _why = _toolset.check(name)
+        except Exception:
+            _allowed, _why = True, ""      # a policy that can break dispatch is worse than none
+        if not _allowed:
+            _refused = "[call_tool: refused. %s]" % _why
+            _log_discovery("call_tool.refused", {"name": name}, _refused)
+            return _refused
         # EVIDENCE TRACE. Off unless a runner asked for one, and a no-op in ordinary
         # operation. This is the only point that sees every dispatched call with its real
         # name and arguments -- recording at the adapter would name `call_tool` and nothing
@@ -695,15 +1001,26 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 _trace.record(name, _args, True, _out, fn)
             if _ledger is not None and _cid:
                 try:
-                    _ledger.record_outcome(_cid, ok=True, result=_out,
+                    # `tool=name` so the ledger can tell whether this result is a secret in
+                    # itself. It can also look the id up, but the lookup is a convenience for
+                    # callers that do not know; the gateway does, and the one place that knows
+                    # should say so.
+                    _ledger.record_outcome(_cid, ok=True, result=_out, tool=name,
                                            duration_s=time.time() - _t0)
                 except Exception:
                     pass
             if _note:
                 # The caller guessed a name and we ran it anyway; say so, or it
                 # learns nothing and guesses the same way next time.
+                #
+                # ONLY WHEN THE RESULT IS TEXT. str(_out) on a non-text result turns it into a
+                # repr -- an Image content block would arrive as "<Image object at 0x...>",
+                # which is the same class of defect as the one read_image was just fixed for:
+                # a result that looks like an answer and carries nothing.
+                if not isinstance(_out, str):
+                    return _out
                 try:
-                    return _note + chr(10) + str(_out)
+                    return _note + chr(10) + _out
                 except Exception:
                     return _out
             return _out
@@ -1015,9 +1332,192 @@ def _start_approval_watcher(period: float = 3.0) -> None:
     t.start()
 
 
+#: The header scripts/doctor.ps1 sends on the ONE request it expects to be refused: its negative
+#: probe (POST /mcp with no bearer) proves that auth is enforced at all.
+SELF_TEST_HEADER = b"x-mcp-self-test"
+
+#: Rejections of that probe, counted APART from the mismatch counter.
+#:
+#: THE DOCTOR WAS RAISING THE ALARM IT EXISTS TO READ. auth_fail_10m means "someone presented a
+#: key this server does not accept" -- the Copilot Studio key drifting from MCP_API_KEY -- and
+#: the cockpit turns the server dot amber on it. doctor's section 6 refuses itself on purpose,
+#: every run, and the cockpit's auto-repair runs doctor again and again: measured 2026-09-24,
+#: auth_fail_10m sat at 14-16 with no client misconfigured at all, and the dot said "suspect
+#: MCP_API_KEY mismatch". A self-inflicted alarm teaches people to ignore the real one.
+#:
+#: NOT A WAY TO HIDE A REJECTION. Only a request that is loopback with no forwarding headers
+#: (tools.security.derive_identity -- the same "local" the unlock gate uses -- plus no other
+#: Forwarded / X-Forwarded-* header) AND carries the marker lands here. Anything the tunnel
+#: forwards carries X-Forwarded-For and so still counts as a real rejection, marker or not; and a
+#: local caller that uses the marker is still counted, just under its own name.
+_SELF_TEST_TRACKER = None
+
+
+def _self_test_tracker():
+    global _SELF_TEST_TRACKER
+    if _SELF_TEST_TRACKER is None:
+        from tools.auth_stats import AuthFailureTracker
+        _SELF_TEST_TRACKER = AuthFailureTracker()
+    return _SELF_TEST_TRACKER
+
+
+def _self_test_summary() -> dict:
+    """{"self_test_rejections_10m": n} -- never raises."""
+    try:
+        return {"self_test_rejections_10m":
+                _self_test_tracker().summary()["auth_fail_10m"]}
+    except Exception:
+        return {"self_test_rejections_10m": 0}
+
+
+def _is_local_self_test(scope) -> bool:
+    """True iff this ASGI request is a loopback, unforwarded request carrying the marker."""
+    headers = scope.get("headers") or []
+    marker = False
+    xff_value = ""
+    for (hk, hv) in headers:
+        k = hk.lower()
+        if k == SELF_TEST_HEADER and hv.strip():
+            marker = True
+        elif k == b"x-forwarded-for":
+            xff_value = hv.decode("latin-1")
+        elif k == b"forwarded" or k.startswith(b"x-forwarded-"):
+            # Any other forwarding header also means a proxy handled this request.
+            return False
+    if not marker:
+        return False
+    client = scope.get("client")
+    peer_host = client[0] if client else ""
+    is_local, _ = derive_identity(peer_host, xff_value)
+    return bool(is_local)
+
+
+class _BearerPrefix:
+    """Tolerate an Authorization header that is the RAW API key (no scheme).
+
+    Copilot Studio's MCP connector labels the credential field "API key" (auth
+    type = API key, header name = Authorization), so a novice pastes the raw
+    MCP_API_KEY with NO "Bearer " prefix. StaticTokenVerifier then never sees a
+    valid bearer token and returns 401 with no clue. This middleware normalises
+    the header to "Bearer <value>" when the value does not already start
+    (case-insensitively) with "bearer " -- so both the correct "Bearer <key>"
+    form and the raw "<key>" form authenticate. Safe because this server only
+    uses static tokens: the rewrite just supplies the scheme the verifier wants
+    and the wrong key still fails downstream (401).
+
+    This MUST wrap the finished app as the OUTERMOST ASGI layer: FastMCP inserts
+    the auth (RequireAuth) middleware BEFORE anything passed via http_app(middleware=),
+    so a header rewrite handed to that param would run too late (after auth already
+    401'd). Wrapping the returned app puts the rewrite ahead of auth.
+
+    Being the outermost layer also makes this the one place that sees BOTH the
+    request (already normalised) and the final response status for /mcp -- so it
+    doubles as the observation point for tools.auth_stats: today's incident was
+    Copilot Studio's stored key desyncing from MCP_API_KEY, causing every /mcp
+    call to 401 with zero surfaced signal. record_response_start() below inspects
+    the outgoing "http.response.start" ASGI event for status 401 on the /mcp path
+    and calls tools.auth_stats.record_auth_failure(); everything is wrapped in
+    try/except so a bookkeeping bug can never break the real request/response.
+    doctor's own negative probe is the one exception -- see _SELF_TEST_TRACKER.
+
+    The recorded IP is derived from the raw ASGI `scope` (peer address plus any
+    X-Forwarded-For header) via tools.security.derive_identity() -- the SAME pure
+    helper _parse_request() uses for unlock decisions. This module only has a
+    scope dict, not a Starlette Request, but the derivation itself must not be
+    reimplemented here: if this and the unlock gate ever computed the IP
+    differently, the recorded origin would not match the IP the unlock gate
+    actually saw, making the data useless for anything an operator wants to do
+    with it.
+
+    Module level (it used to be defined inside the __main__ block) so the tests can wrap the
+    real app with it and see what a rejected request is counted as."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        is_mcp_path = False
+        if scope.get("type") == "http":
+            new_hdrs = []
+            changed = False
+            for (k, v) in (scope.get("headers") or []):
+                if k.lower() == b"authorization":
+                    val = v.strip()
+                    # Only rewrite when a value is present and it doesn't already
+                    # carry a bearer scheme (any casing: "Bearer", "bearer", ...).
+                    if val and not val.lower().startswith(b"bearer "):
+                        v = b"Bearer " + val
+                        changed = True
+                new_hdrs.append((k, v))
+            if changed:
+                scope = dict(scope)
+                scope["headers"] = new_hdrs
+            is_mcp_path = (scope.get("path") or "").startswith("/mcp")
+
+        if not is_mcp_path:
+            await self.app(scope, receive, send)
+            return
+
+        async def _send_and_observe(message):
+            # Observe the response status BEFORE forwarding it -- never delay or
+            # alter the real response. Any bookkeeping failure here must not
+            # prevent `send` from being called.
+            try:
+                if message.get("type") == "http.response.start" and message.get("status") == 401:
+                    if _is_local_self_test(scope):
+                        _self_test_tracker().record()
+                    else:
+                        from tools.auth_stats import record_auth_failure
+
+                        # Raw ASGI scope, not a Starlette Request: pull the peer
+                        # host and the raw X-Forwarded-For header value by hand,
+                        # then hand both to the SAME derivation _parse_request()
+                        # uses, rather than guessing at the IP independently here.
+                        client = scope.get("client")
+                        peer_host = client[0] if client else ""
+                        xff_value = ""
+                        for (hk, hv) in (scope.get("headers") or []):
+                            if hk.lower() == b"x-forwarded-for":
+                                xff_value = hv.decode("latin-1")
+                                break
+                        _, identity_ip = derive_identity(peer_host, xff_value)
+                        # AND WHAT DISTINGUISHES ONE CALLER FROM ANOTHER. The IP alone does
+                        # not: the devtunnel host forwards from localhost, so every caller
+                        # that arrives through it reads as 127.0.0.1. Measured 2026-09-17 --
+                        # four rejections raised the dot and left nothing to investigate.
+                        # The Authorization header is deliberately NOT read: a rejected key
+                        # is still a key, and this record is the last place one should land.
+                        _ua = ""
+                        for (hk, hv) in (scope.get("headers") or []):
+                            if hk.lower() == b"user-agent":
+                                _ua = hv.decode("latin-1")
+                                break
+                        record_auth_failure(ip=identity_ip,
+                                            path=(scope.get("path") or ""), agent=_ua)
+            except Exception:
+                pass
+            await send(message)
+
+        await self.app(scope, receive, _send_and_observe)
+
+
 if __name__ == "__main__":
     _install_faulthandler()
     _start_approval_watcher()
+    # THE ONE NUMBER THAT DECIDES A SECURITY SWITCH, SAID OUT LOUD ONCE PER BOOT.
+    # tools/lock_state.py has counted every call that passed the unlock gate on identity alone
+    # since 2026-08-18 so that MCP_REQUIRE_UNLOCK_TOKEN could be turned on with evidence instead
+    # of with an outage. Nothing read the counter. Measured 2026-09-13: 154 calls, the most
+    # recent that morning, 146 of them from one address -- so enforcement would have refused the
+    # live integration, and no one could have known. Silence here is the good case: it means the
+    # gap has stayed quiet for a full grant TTL and the switch is free.
+    try:
+        from tools.lock_state import token_gap_warning
+        _warn = token_gap_warning()
+        if _warn:
+            print(_warn, flush=True)
+    except Exception:
+        pass
     # timeout_graceful_shutdown gives in-flight requests up to 30s to finish on SIGTERM
     # instead of an immediate hard kill (uvicorn default 0 = no grace). Passed through
     # FastMCP.run_http_async -> uvicorn.Config(**uvicorn_config).
@@ -1043,96 +1543,8 @@ if __name__ == "__main__":
                 scope["headers"] = hdrs
             await self.app(scope, receive, send)
 
-    class _BearerPrefix:
-        """Tolerate an Authorization header that is the RAW API key (no scheme).
-
-        Copilot Studio's MCP connector labels the credential field "API key" (auth
-        type = API key, header name = Authorization), so a novice pastes the raw
-        MCP_API_KEY with NO "Bearer " prefix. StaticTokenVerifier then never sees a
-        valid bearer token and returns 401 with no clue. This middleware normalises
-        the header to "Bearer <value>" when the value does not already start
-        (case-insensitively) with "bearer " -- so both the correct "Bearer <key>"
-        form and the raw "<key>" form authenticate. Safe because this server only
-        uses static tokens: the rewrite just supplies the scheme the verifier wants
-        and the wrong key still fails downstream (401).
-
-        This MUST wrap the finished app as the OUTERMOST ASGI layer: FastMCP inserts
-        the auth (RequireAuth) middleware BEFORE anything passed via http_app(middleware=),
-        so a header rewrite handed to that param would run too late (after auth already
-        401'd). Wrapping the returned app puts the rewrite ahead of auth.
-
-        Being the outermost layer also makes this the one place that sees BOTH the
-        request (already normalised) and the final response status for /mcp -- so it
-        doubles as the observation point for tools.auth_stats: today's incident was
-        Copilot Studio's stored key desyncing from MCP_API_KEY, causing every /mcp
-        call to 401 with zero surfaced signal. record_response_start() below inspects
-        the outgoing "http.response.start" ASGI event for status 401 on the /mcp path
-        and calls tools.auth_stats.record_auth_failure(); everything is wrapped in
-        try/except so a bookkeeping bug can never break the real request/response.
-
-        The recorded IP is derived from the raw ASGI `scope` (peer address plus any
-        X-Forwarded-For header) via tools.security.derive_identity() -- the SAME pure
-        helper _parse_request() uses for unlock decisions. This module only has a
-        scope dict, not a Starlette Request, but the derivation itself must not be
-        reimplemented here: if this and the unlock gate ever computed the IP
-        differently, the recorded origin would not match the IP the unlock gate
-        actually saw, making the data useless for anything an operator wants to do
-        with it."""
-
-        def __init__(self, app):
-            self.app = app
-
-        async def __call__(self, scope, receive, send):
-            is_mcp_path = False
-            if scope.get("type") == "http":
-                new_hdrs = []
-                changed = False
-                for (k, v) in (scope.get("headers") or []):
-                    if k.lower() == b"authorization":
-                        val = v.strip()
-                        # Only rewrite when a value is present and it doesn't already
-                        # carry a bearer scheme (any casing: "Bearer", "bearer", ...).
-                        if val and not val.lower().startswith(b"bearer "):
-                            v = b"Bearer " + val
-                            changed = True
-                    new_hdrs.append((k, v))
-                if changed:
-                    scope = dict(scope)
-                    scope["headers"] = new_hdrs
-                is_mcp_path = (scope.get("path") or "").startswith("/mcp")
-
-            if not is_mcp_path:
-                await self.app(scope, receive, send)
-                return
-
-            async def _send_and_observe(message):
-                # Observe the response status BEFORE forwarding it -- never delay or
-                # alter the real response. Any bookkeeping failure here must not
-                # prevent `send` from being called.
-                try:
-                    if message.get("type") == "http.response.start" and message.get("status") == 401:
-                        from tools.auth_stats import record_auth_failure
-                        from tools.security import derive_identity
-
-                        # Raw ASGI scope, not a Starlette Request: pull the peer
-                        # host and the raw X-Forwarded-For header value by hand,
-                        # then hand both to the SAME derivation _parse_request()
-                        # uses, rather than guessing at the IP independently here.
-                        client = scope.get("client")
-                        peer_host = client[0] if client else ""
-                        xff_value = ""
-                        for (hk, hv) in (scope.get("headers") or []):
-                            if hk.lower() == b"x-forwarded-for":
-                                xff_value = hv.decode("latin-1")
-                                break
-                        _, identity_ip = derive_identity(peer_host, xff_value)
-                        record_auth_failure(ip=identity_ip)
-                except Exception:
-                    pass
-                await send(message)
-
-            await self.app(scope, receive, _send_and_observe)
-
+    # _BearerPrefix (the outermost layer: raw-key -> "Bearer <key>", and the 401 observer) is
+    # defined at module level above, so the tests can wrap the real app with it.
     app = mcp.http_app(path="/mcp", transport="streamable-http",
                        json_response=True, middleware=[Middleware(_AcceptBoth)])
 

@@ -51,14 +51,27 @@ def skill_list() -> str:
 
 
 def _invalid_hint(reason: str) -> str:
-    """Turn a parser message into the concrete edit that fixes it."""
+    """Turn a parser message into the concrete edit that fixes it.
+
+    KEYED ON THE MESSAGE relay.skills RAISES FOR EACH FAULT, not on a word several of them
+    share. This used to test for "yaml" first, and the message for a SKILL.md with no
+    frontmatter at all -- "must start with YAML frontmatter delimited by ---", the commonest
+    beginner mistake, plain Markdown -- contains that word too. The author was told to quote a
+    description they had never written instead of to add the --- block. Each branch now names
+    the one message it answers; the delimiter faults are tested before the YAML-syntax one.
+    """
     text = (reason or "").lower()
-    if "yaml" in text or "mapping values" in text:
+    if ("must start with yaml frontmatter" in text
+            or "opening delimiter" in text or "closing delimiter" in text):
+        return ("SKILL.md の先頭に --- だけの行を置き、name: と description: を書いたあと、"
+                "もう一度 --- だけの行で閉じてください（その下に手順本文）。")
+    if "frontmatter must be a mapping" in text:
+        return ("--- と --- の間は「name: ...」「description: ...」のような"
+                "キー: 値 の形で書いてください。")
+    if "invalid skill.md yaml" in text or "mapping values" in text:
         return ("SKILL.md の frontmatter が YAML として壊れています。"
                 "description に ':' や '#' が含まれる場合は "
                 'description: "..." のように引用符で囲んでください。')
-    if "frontmatter" in text:
-        return "SKILL.md の先頭を --- で開き、--- で閉じてください。"
     if "no SKILL.md" in reason:
         return "フォルダ直下に SKILL.md を置いてください。"
     return "SKILL.md を修正してから再度 skill_list を実行してください。"
@@ -93,6 +106,13 @@ def _record_skill_use(kind, query, matched):
             _n = len(_store().list_metadata() or [])
         except Exception:
             _n = 0
+        # NO run_id, DELIBERATELY -- same exemption as relay/bestofn_run.py, different
+        # reason. This runs inside the MCP SERVER process, answering a skill lookup for
+        # whichever caller asked; the fleet run id lives in the fleet coordinator process
+        # and no worker identity crosses the gateway (tool_ledger records the same gap: its
+        # `task` field is empty on essentially every call, which is why attribution there is
+        # by path). Blank is the honest answer until a caller identity actually crosses that
+        # boundary.
         _mt.record("skill", configured=True, config_source="server rule",
                    config_value={"trusted_skills": _n},
                    eligible=(_n > 0),
@@ -130,16 +150,63 @@ def _record_skill_use_inner(kind, query, matched):
         pass
 
 
+#: What skill_match says with each tier. Kept as constants so the tests pin the exact words a
+#: model reads (tests/test_skills_business_mcp.py).
+#: APPLICABILITY CHECK, ADDED 2026-09-24. Measured on a held-out set: 2 of 30 requests that
+#: should have matched nothing instead got a confident hit with the right topic and the wrong
+#: task ("求人票の文章を考えてほしい" matched new-hire-onboarding; a question about how many
+#: paid-leave days carry over matched a leave-application procedure). A lexical matcher cannot
+#: tell "same topic, different task" from the words alone -- the model receiving the Skill's
+#: description can, so the instruction now asks it to check before following what is otherwise
+#: still the same order: when it does apply, follow it as written, do not re-derive it.
+CONFIDENT_INSTRUCTION = (
+    "CONFIDENT trusted match. Call skill_load(name='%s') and follow that procedure as written, "
+    "but only if the request is for that exact task and not merely the same topic.")
+CANDIDATE_INSTRUCTION = (
+    "This is only a POSSIBLE match (confidence: candidate), not a confident one. Read the "
+    "description. Call skill_load(name='%s') only if the user's request is for exactly this "
+    "procedure; otherwise proceed without it, and do not present it as the user's procedure.")
+
+
 def skill_match(text: str) -> str:
-    """Find a confidently matching trusted Skill using metadata only; does not load it."""
+    """Find a trusted Skill for a request using metadata only; does not load it.
+
+    TWO TIERS (see relay.skills._TRUSTED_POLICY). A CONFIDENT match comes from
+    SkillStore.match() -- the same door every automatic caller uses -- and says
+    "confidence": "confident": load it and follow it. When there is none, a CANDIDATE may come
+    from SkillStore.candidate_match(), and this tool is the ONLY caller of that method: the
+    result says "confidence": "candidate" and tells the model, in words, that it is a possible
+    match to be used only if the request is for exactly that procedure.
+
+    THE ORDER, when there is no confident match:
+      1. The unapproved near match (match_unapproved), if there is one, is ALWAYS raised for
+         approval -- whether or not a trusted candidate exists. A plausible trusted candidate
+         says nothing about whether the user's own procedure is sitting unapproved (typically
+         an approved Skill whose text was edited), and not asking is how six Skills once sat
+         unreadable for weeks. Asking grants nothing and is de-duplicated by digest.
+      2. The ANSWER puts a trusted candidate first, because it is the only one that can be
+         loaded now, and names the unapproved near match beside it. With no candidate the
+         answer is the unapproved-near-match message, then the list of Skills waiting for
+         approval, then a plain "no match".
+    """
     try:
         store = _store()
         result = store.match(text)
         if result:
             _record_skill_use("match", text,
                               (result or {}).get("name") if isinstance(result, dict) else "")
-            return json.dumps(result, ensure_ascii=False, indent=2)
+            payload = {"confidence": result.get("confidence", "confident"),
+                       "instruction": CONFIDENT_INSTRUCTION % result["name"]}
+            payload.update(result)
+            return json.dumps(payload, ensure_ascii=False, indent=2)
         _record_skill_use("match", text, "")
+        try:
+            candidate = store.candidate_match(text)
+        except Exception:
+            candidate = None
+        if candidate:
+            # A separate kind, so the funnel of CONFIDENT matches ("match") keeps its meaning.
+            _record_skill_use_inner("candidate", text, candidate.get("name"))
         # 一致なしとだけ返していたとき、呼び出し側は「そんな手順は無い」と読み、
         # 自分でやり方を考え始めた。実際には手順はあって、束を1文字直したせいで
         # 再承認待ちになっていただけだった。照合は信頼済みしか見ないので、
@@ -160,8 +227,9 @@ def skill_match(text: str) -> str:
             near = store.match_unapproved(text)
         except Exception:
             near = None
+        asked = ""
+        state = ""
         if near:
-            asked = ""
             try:
                 review = store.request_approval(near["name"])
                 asked = ("承認待ちとして登録しました（承認センターに表示されます）。"
@@ -177,6 +245,19 @@ def skill_match(text: str) -> str:
             state = ("has changed since it was approved and is waiting for human "
                      "re-approval" if near["trust"] == "changed"
                      else "has never been approved by a human")
+        if candidate:
+            payload = {"confidence": "candidate",
+                       "instruction": CANDIDATE_INSTRUCTION % candidate["name"]}
+            payload.update(candidate)
+            if near:
+                payload["unapproved_near_match"] = {
+                    "name": near["name"], "trust": near["trust"],
+                    "note": ("/%s may also fit this request but it %s, so it cannot be "
+                             "loaded. %sAsk the user to approve it if it is the procedure "
+                             "they mean." % (near["name"], state, asked)),
+                }
+            return json.dumps(payload, ensure_ascii=False, indent=2)
+        if near:
             return ("(no confident Skill match among TRUSTED Skills. "
                     "/%s looks like the right procedure but it %s, so it cannot be matched "
                     "or loaded. %sAsk the user to approve it, or proceed without it -- do not "
@@ -223,15 +304,28 @@ def skill_request_approval(name: str = "") -> str:
         targets = [name] if name else [row["name"] for row in store.unapproved()]
         if not targets:
             return "(every Skill is already approved -- nothing to request)"
-        asked, already, failed = [], [], []
+        asked, already, failed, bypass_skipped = [], [], [], []
         for target in targets:
             try:
                 review = store.request_approval(target)
-            except Exception as exc:
-                failed.append("%s (%s)" % (target, type(exc).__name__))
+            except SkillError as exc:
+                # THE REASON, NOT ONLY ITS CLASS. "(SkillError)" told neither the agent nor
+                # the person it relays to that the SKILL.md lacks a description, or that the
+                # name does not exist -- every other tool here passes the message through.
+                failed.append("%s (%s)" % (target, exc))
                 continue
-            if review.get("status") == "already-trusted":
+            except Exception as exc:
+                failed.append("%s (%s: %s)" % (target, type(exc).__name__, exc))
+                continue
+            status = review.get("status")
+            if status == "already-trusted":
                 already.append(target)
+            elif status == "bypass-not-asked":
+                # job_approval_mode=bypass: request_approval() deliberately raised no gate
+                # and granted no trust either -- see relay/skills.py's comment on this
+                # status. Surface it as its own bucket so this reads as "still untrusted,
+                # nobody was asked", not silently folded into "asked".
+                bypass_skipped.append(target)
             else:
                 asked.append(target)
         lines = []
@@ -240,19 +334,30 @@ def skill_request_approval(name: str = "") -> str:
                          + ", ".join("/" + n for n in asked))
         if already:
             lines.append("すでに承認済み: " + ", ".join("/" + n for n in already))
+        if bypass_skipped:
+            lines.append("job_approval_mode=bypass のため確認は行われず、未承認のままです"
+                         "（bypassはSkill信頼を自動付与しません）: "
+                         + ", ".join("/" + n for n in bypass_skipped))
         if failed:
             lines.append("要求できませんでした: " + ", ".join(failed))
-        lines.append("承認は人の操作です。承認センターで内容(digest とプレビュー)を"
-                     "確認して承認してください。")
+        if asked:
+            lines.append("承認は人の操作です。承認センターで内容(digest とプレビュー)を"
+                         "確認して承認してください。")
         return "\n".join(lines)
     except Exception as exc:
         return f"[skill_request_approval error: {type(exc).__name__}: {exc}]"
 
 
 def skill_load(name: str, arguments: str = "") -> str:
-    """Load and render one trusted Skill. Untrusted or changed bundles are refused."""
+    """Load and render one trusted Skill. Untrusted or changed bundles are refused.
+
+    This is the MODEL's door, so it says so: a Skill whose author set
+    `disable-model-invocation: true` is refused here (the store enforces it for
+    invoker="model"), not only left out of skill_match. The name is visible in skill_list, so
+    hiding it from matching alone let a model load a procedure its author reserved for people.
+    """
     try:
-        rendered = _store().render(name, arguments)
+        rendered = _store().render(name, arguments, invoker="model")
         # LOADING IS THE STRONGER SIGNAL. Matching says the worker looked; loading says it
         # took the procedure. Both are recorded because the difference between them is a
         # finding in its own right -- a worker that matches and then does not load has

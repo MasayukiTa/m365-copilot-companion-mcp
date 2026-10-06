@@ -34,7 +34,11 @@ def server_info_resource() -> str:
 
     tool_map_on = os.environ.get("MCP_TOOL_MAP") == "1"
     if ALLOWED_BASES is None:
-        base_desc = "unrestricted (default-open; MCP_ALLOWED_BASE unset)"
+        # Since 74989c3 (D6 of the new-PC install review) this branch is reachable ONLY by
+        # the explicit opt-in MCP_ALLOWED_BASE=* -- an UNSET/empty value now means "home
+        # directory only" (see file_ops._parse_allowed_bases), the opposite of what this
+        # string used to say.
+        base_desc = "unrestricted (explicit opt-in via MCP_ALLOWED_BASE=*)"
     else:
         base_desc = ", ".join(str(b) for b in ALLOWED_BASES)
 

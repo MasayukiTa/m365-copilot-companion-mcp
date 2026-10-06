@@ -8,7 +8,6 @@ entry point is pinned here along with the invariant that makes it safe to attach
 """
 import ast
 import os
-import subprocess
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -25,9 +24,10 @@ def test_the_module_can_actually_be_run():
 
 def test_running_it_reports_and_exits_cleanly(tmp_path):
     """Report mode must be safe to run anywhere, including where there is no fleet at all."""
-    out = subprocess.run([sys.executable, "-m", "relay.fleet_reaper",
-                          "--fleet-dir", str(tmp_path)],
-                         cwd=ROOT, capture_output=True, text=True, timeout=120)
+    from tools.childproc import run as _run_child
+    out = _run_child([sys.executable, "-m", "relay.fleet_reaper",
+                      "--fleet-dir", str(tmp_path)],
+                     cwd=ROOT, timeout=120)
     assert out.returncode == 0, out.stderr[-400:]
     assert "no active-run marker" in out.stdout
 
@@ -40,9 +40,10 @@ def test_a_live_run_is_never_reaped(tmp_path):
         json.dumps({"pid": os.getpid(), "start_ts": 0}), encoding="utf-8")
     (tmp_path / "status.json").write_text(json.dumps({"running": True, "workers": []}),
                                           encoding="utf-8")
-    out = subprocess.run([sys.executable, "-m", "relay.fleet_reaper",
-                          "--fleet-dir", str(tmp_path), "--reap"],
-                         cwd=ROOT, capture_output=True, text=True, timeout=120)
+    from tools.childproc import run as _run_child
+    out = _run_child([sys.executable, "-m", "relay.fleet_reaper",
+                      "--fleet-dir", str(tmp_path), "--reap"],
+                     cwd=ROOT, timeout=120)
     assert out.returncode == 0, out.stderr[-400:]
     assert "ALIVE" in out.stdout
     assert (tmp_path / "fleet_run_active.json").exists(), "a live run's marker was removed"

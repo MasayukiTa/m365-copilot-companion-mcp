@@ -83,43 +83,87 @@ def end_ts(entry, root, focused_count=1):
     return float((root or {}).get("updated") or 0)
 
 
-@needs_records
+#: THE MEASUREMENT THIS FILE WAS WRITTEN FROM, frozen so the rule can be checked without
+#: reading a file the operator's fleet is still writing to.
+#:
+#: From the module docstring above: "the last eight entries of .fleet/history.json: true ends
+#: 10:53, 10:53, 10:56, 10:57, 10:57, 10:59, 11:01, 11:05 -- every one displayed as 11:05."
+#: The run's `updated` is 11:05, which is why every row printed 11:05 under the old rule.
+#:
+#: Epoch seconds on one arbitrary day; only the differences matter, and they are the measured
+#: ones. 11:05 is the run clock, so seven of the eight are more than a minute away from it --
+#: the "seven of eight wrong" the docstring records.
+_DAY = 1788134400.0                      # 00:00 of the day these were taken
+
+
+def _at(hh, mm):
+    return _DAY + hh * 3600 + mm * 60
+
+
+RECORDED_ENDS = [_at(10, 53), _at(10, 53), _at(10, 56), _at(10, 57),
+                 _at(10, 57), _at(10, 59), _at(11, 1), _at(11, 5)]
+RECORDED_RUN_UPDATED = _at(11, 5)
+RECORDED_HISTORY = [{"name": "task%d" % i, "ts": t} for i, t in enumerate(RECORDED_ENDS, 1)]
+RECORDED_ROOT = {"updated": RECORDED_RUN_UPDATED}
+
+
 def test_the_old_rule_was_wrong_for_most_entries():
-    """Guards against 'fixing' something that was never broken: if the run's clock had matched
-    the tasks, this test fails and the change should be reverted rather than kept."""
-    history, root = _load()
-    entries = [e for e in history if e.get("ts")]
-    if len(entries) < 4:
-        pytest.skip("too few finished tasks recorded to say anything")
-    run_updated = float(root.get("updated") or 0)
-    wrong = [e for e in entries if abs(float(e["ts"]) - run_updated) >= 60.0]
-    assert wrong, "the run clock matched every task; the old rule was not wrong here"
-    assert len(wrong) >= len(entries) // 2, (
-        "expected the run clock to be wrong for most tasks; %d of %d"
-        % (len(wrong), len(entries)))
+    """Guards against 'fixing' something that was never broken.
+
+    AGAINST THE RECORDED MEASUREMENT, not against whatever `.fleet/history.json` holds right
+    now. This read the live file and asserted a property of the operator's data -- so a day on
+    which the fleet ran one task made it fail while the rule was perfectly correct, and the
+    file is rewritten by the cockpit mid-suite in any case.
+    """
+    wrong = [t for t in RECORDED_ENDS if abs(t - RECORDED_RUN_UPDATED) >= 60.0]
+    assert len(wrong) == 7, "計測値が崩れている: %d/8" % len(wrong)
+    assert len(wrong) >= len(RECORDED_ENDS) // 2
 
 
-@needs_records
 def test_the_new_rule_gives_each_task_its_own_end():
-    history, root = _load()
-    entries = [e for e in history if e.get("ts")][-8:]
-    if len(entries) < 4:
-        pytest.skip("too few finished tasks recorded")
-    for e in entries:
-        assert end_ts(e, root) == float(e["ts"]), e.get("name")
-    distinct = {round(end_ts(e, root) / 60) for e in entries}
-    assert len(distinct) > 1, "every task still ends at the same minute; the rule did not bind"
+    for e in RECORDED_HISTORY:
+        assert end_ts(e, RECORDED_ROOT) == float(e["ts"]), e["name"]
+    distinct = {round(end_ts(e, RECORDED_ROOT) / 60) for e in RECORDED_HISTORY}
+    assert len(distinct) > 1, "全タスクが同じ分で終わっている -- 規則が効いていない"
 
 
-@needs_records
+def test_the_old_rule_collapsed_them_all_onto_one_minute():
+    """The symptom as the operator reported it: three rows, same times, 'not matching the
+    actual task'. Stated explicitly so the difference between the two rules is visible here
+    rather than only in prose."""
+    old = {round(RECORDED_RUN_UPDATED / 60) for _ in RECORDED_HISTORY}
+    assert len(old) == 1
+
+
 def test_a_multi_worker_spine_still_uses_the_run_clock():
     """The live run's panel covers every worker at once. There is no single task's end to show,
     and the run's own updated time is the honest answer."""
-    history, root = _load()
-    entries = [e for e in history if e.get("ts")]
-    if not entries:
-        pytest.skip("no finished tasks recorded")
-    assert end_ts(entries[0], root, focused_count=5) == float(root.get("updated") or 0)
+    assert end_ts(RECORDED_HISTORY[0], RECORDED_ROOT, focused_count=5) == RECORDED_RUN_UPDATED
+
+
+@needs_records
+def test_the_live_records_still_look_like_the_measurement():
+    """A CROSS-CHECK THAT CANNOT FAIL THE BUILD, and that is deliberate.
+
+    The rule is pinned above. This only asks whether today's records still have the shape the
+    measurement was taken from -- and when they do not, that is a fact about this week's runs,
+    not a defect in the rule. So it SKIPS. The previous version of this file asserted here and
+    went red whenever the fleet's history changed shape, including mid-suite while the cockpit
+    was rewriting it.
+    """
+    try:
+        history, root = _load()
+    except (OSError, ValueError):
+        pytest.skip("records unreadable right now (the fleet writes them live)")
+    entries = [e for e in history if e.get("ts")] if isinstance(history, list) else []
+    if len(entries) < 4:
+        pytest.skip("too few finished tasks recorded to say anything")
+    run_updated = float((root or {}).get("updated") or 0)
+    wrong = [e for e in entries if abs(float(e["ts"]) - run_updated) >= 60.0]
+    if not wrong:
+        pytest.skip("every task ended within a minute of the run clock in these records")
+    for e in entries:
+        assert end_ts(e, root) == float(e["ts"]), e.get("name")
 
 
 def test_a_missing_task_timestamp_falls_back_rather_than_showing_nothing():

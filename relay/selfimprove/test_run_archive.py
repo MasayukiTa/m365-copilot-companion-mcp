@@ -206,3 +206,60 @@ def test_a_run_recorded_before_the_flag_existed_counts_as_warmed():
           "memory_population": "fleet-edge-tree", "cdp_url": "http://127.0.0.1:9224",
           "null": True, "memory_gain_mb": 1.0, "warmup": True}],
         goals="saturated-v1", max_concurrent=3, cdp_url="http://127.0.0.1:9224")
+
+
+# ─────────────────────── 範囲は人が判断する。判断させるには見せないといけない
+
+def _with_revision(d, exp, rev, *, ts):
+    """`_write` は revision を書かないので、書いてから足す。"""
+    _write(d, "%s-%d" % (exp, ts), null=True, gain=1.0)
+    p = os.path.join(d, "route_campaign_%s-%d.json" % (exp, ts))
+    with open(p, encoding="utf-8") as fh:
+        rec = json.load(fh)
+    rec["revision"] = rev
+    with open(p, "w", encoding="utf-8") as fh:
+        json.dump(rec, fh)
+
+
+def test_the_report_shows_the_revisions_the_archive_spans(tmp_path):
+    """**`revisions` は「範囲を報告して人が判断する」ために書かれ、誰も呼んでいなかった。**
+    人が読む表はこの `report()` だけなので、譲った相手には何も届いていなかった。
+
+    上の行が数えるのは「現在の計器から来た run が何本か」で、**残りが何から来たのかは
+    言わない** — プールしてよいかを決めるのはそちら。"""
+    base = max(RA.INSTRUMENT_EPOCH, RA.WORKLOAD_EPOCH.get("saturated-v1", 0)) + 100
+    _with_revision(str(tmp_path), "route-transport-v1-NULL-ctrlfirst", "aaaaaaaabbbb1111", ts=base)
+    _with_revision(str(tmp_path), "route-transport-v1-NULL-ctrlfirst", "ccccccccdddd2222",
+                   ts=base + 10)
+    out = RA.report(str(tmp_path))
+    assert "spans 2 revisions" in out
+    assert "aaaaaaaabbbb" in out and "ccccccccdddd" in out
+
+
+def test_it_still_refuses_to_split_the_columns_for_you(tmp_path):
+    """`revisions` の docstring が名指ししている境界。**報告であって filter ではない。**
+    黙って列を割ったら、どの変更が計器を変えたのかという判断を機械が代わりにしたことになる。"""
+    base = max(RA.INSTRUMENT_EPOCH, RA.WORKLOAD_EPOCH.get("saturated-v1", 0)) + 100
+    _with_revision(str(tmp_path), "route-transport-v1-NULL-ctrlfirst", "rev-one", ts=base)
+    _with_revision(str(tmp_path), "route-transport-v1-NULL-ctrlfirst", "rev-two", ts=base + 10)
+    out = RA.report(str(tmp_path))
+    assert "does not split the columns for you" in out
+    # 2本とも1つの列に残っている
+    assert "n=2" in out
+
+
+def test_one_revision_says_so_rather_than_going_quiet(tmp_path):
+    """無言だと「範囲を調べていない」と「範囲が1つだった」が同じ見た目になる。"""
+    base = max(RA.INSTRUMENT_EPOCH, RA.WORKLOAD_EPOCH.get("saturated-v1", 0)) + 100
+    _with_revision(str(tmp_path), "route-transport-v1-NULL-ctrlfirst", "only-one-rev", ts=base)
+    out = RA.report(str(tmp_path))
+    assert "one revision throughout: only-one-rev" in out
+
+
+def test_an_archive_that_records_no_revision_claims_nothing(tmp_path):
+    """`revision` が空の run しかないとき、`revisions` は空を返す。そこで
+    「1つだった」と書いたら、記録の不在を測定結果として報告することになる。"""
+    base = max(RA.INSTRUMENT_EPOCH, RA.WORKLOAD_EPOCH.get("saturated-v1", 0)) + 100
+    _write(str(tmp_path), "route-transport-v1-NULL-ctrlfirst-%d" % base, null=True, gain=1.0)
+    out = RA.report(str(tmp_path))
+    assert "revision" not in out

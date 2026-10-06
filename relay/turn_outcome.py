@@ -54,6 +54,14 @@ CODE_CLASS = {
     "OpenAIRateLimitReached": RATE,
     "ContextTokenLimitExceeded": CONTEXT,
     "OpenAIModelTokenLimit": CONTEXT,
+    # BOTH MEASURED, NOT GUESSED -- 5 and 1 occurrences across 1741 stored transcripts, where
+    # they were the whole of the `unknown` bucket. They are size refusals like the two above:
+    # one says our request was too big, the other that the reply was, and both are fixed by
+    # sending or asking for less. Neither is a capacity signal, so neither may become one.
+    # Added here rather than left UNKNOWN because UNKNOWN reaches no branch and these did
+    # reach real workers.
+    "RequestBodyTooLarge": CONTEXT,
+    "AsyncResponsePayloadTooLarge": CONTEXT,
     "AgentBlocked": BLOCKED,
     "InfiniteLoopDetected": LOOP,
     "SystemError": SYSTEM,

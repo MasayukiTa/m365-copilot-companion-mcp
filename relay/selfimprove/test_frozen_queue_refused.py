@@ -132,13 +132,30 @@ def test_an_open_card_is_not_closed_by_a_re_signing():
     assert P.items()[0]["status"] == P.OPEN
 
 
-def test_a_reworded_reason_leaves_the_card_open_rather_than_closing_another():
-    """The safe direction. A stale "waiting" is a visible nuisance; a wrongly-closed card is
-    a lie about a decision having been acted on."""
+def test_a_reworded_reason_no_longer_leaves_the_card_open():
+    """RE-POINTED, NOT DELETED, AND THE REVERSAL WAS MEASURED.
+
+    This asserted the opposite: a reworded reason left the card APPROVED, and that was called
+    "the safe direction -- a stale waiting is a visible nuisance, a wrongly-closed card is a
+    lie". The reasoning was sound about a rare case, and on 2026-09-19 the case stopped being
+    rare. The dashboard's re-signing button became the ordinary way to do this, and it always
+    writes its own reason ("re-signed on the dashboard: ..."), which never equals the reason a
+    card was queued with. The safe direction became the ONLY direction, so every card approved
+    and acted on from the dashboard sat on screen reading "waiting on the agent" forever --
+    the misreport queuing was introduced to end, one transition further along.
+
+    The protection against a wrongly-closed card did not go away; it moved to the key. A card
+    closes only when the files it names were among the files just accepted, which is what
+    "this decision was carried out" actually means. The tests below pin the other side: a
+    different file, a partial cover, and an undecided card all leave it alone.
+    """
     pid = P.add(["tools/security.py"], "the original wording")
     P.resolve(pid, authorization="ok", status=P.APPROVED)
     F._resolve_pending_for(["tools/security.py"], _ArgsFull("a different wording"))
-    assert P.items()[0]["status"] == P.APPROVED
+    # status_of, not items()[0]: items() hides resolved rows by default, so a CLOSED card
+    # makes the list empty and the assertion fails with IndexError -- which reads as
+    # "it did not close" and is the opposite of what happened.
+    assert P.status_of(pid) == P.DONE
 
 
 def test_a_different_file_does_not_close_it():
@@ -157,7 +174,23 @@ def test_closing_can_never_break_a_re_signing(monkeypatch):
 
 
 def test_the_success_path_actually_calls_it():
+    """AND CALLS IT WITH WHAT WAS SIGNED. It used to be handed `excluded` -- the
+    delegation-excluded subset -- so a card queued about any other file could never be closed
+    at all, whatever its wording. The argument is now the files the snapshot actually changed.
+    """
     import inspect
     src = inspect.getsource(F._main)
     after = src[src.index('print("snapshot written: %s" % args.baseline)'):]
-    assert "_resolve_pending_for(excluded, args)" in after[:600]
+    # The window is a proximity check -- the call belongs on the success path, not in some
+    # other branch further down. It was 900 and the call moved past it when the comment
+    # explaining the ordering below was written, so it is sized to the block it is watching
+    # rather than to what happened to fit.
+    assert "_resolve_pending_for(_signed, args)" in after[:2000]
+    # ORDER, NOT JUST PRESENCE. The resolver adds this act up from the authority ledger, so
+    # `_record_rebless` has to have appended its row before it runs -- otherwise a card that
+    # THIS signing completes cannot close until the next one.
+    assert src.index("_record_rebless(args, before, data)") \
+        < src.index("_resolve_pending_for(_signed, args)"), \
+        "the ledger row for this act is written after the resolver reads the ledger"
+    assert "_resolve_pending_for(excluded, args)" not in after, \
+        "back to closing only the delegation-excluded subset"

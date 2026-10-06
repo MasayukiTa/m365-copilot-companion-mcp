@@ -112,3 +112,28 @@ def test_edge_keeper_ps1_removes_the_taskbar_button_not_just_minimizes():
     assert "SetWindowLong" in text, "WS_EX_TOOLWINDOW を立てていない"
     assert "0x80" in text
     assert "GetWindowLong" in text, "既に立っているかを見ずに毎回書き換えている"
+
+
+def test_edge_recovery_powershell_children_are_windowless():
+    """Every PowerShell child in edge_recover is unattended and can run under windowless fleet_runner.
+
+    A console program launched from a console-less parent gets a new visible console on Windows.
+    These recovery helpers redirect/ignore their output and never prompt, so each subprocess.run
+    must explicitly use childproc.headless_creationflags().
+    """
+    import ast
+    src = (REPO / "relay" / "edge_recover.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    runs = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        f = node.func
+        if isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name) and f.value.id == "subprocess" and f.attr == "run":
+            runs.append(node)
+    assert len(runs) == 3, "edge_recover subprocess.run count changed; review console policy"
+    for node in runs:
+        kws = {k.arg: k.value for k in node.keywords if k.arg}
+        assert "creationflags" in kws, ast.get_source_segment(src, node)
+        text = ast.get_source_segment(src, kws["creationflags"]) or ""
+        assert "headless_creationflags" in text, text

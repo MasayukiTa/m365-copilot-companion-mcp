@@ -1,3 +1,4 @@
+import sys
 from pathlib import Path
 
 
@@ -99,8 +100,13 @@ def test_the_crash_log_survives_the_relaunch_that_would_erase_it():
     sixty times an hour -- and an empty file reads as "no error"."""
     sup = (ROOT / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
 
+    # BOTH STREAMS. This test asserted the stderr history alone, which is exactly what the
+    # supervisor did -- and the server has now exited six times in two days leaving nothing
+    # in stderr but the startup banner, so the stream that might have said why was being
+    # truncated unread. A test that pins half a rule lets the other half stay missing.
     assert "server.err.history.log" in sup
-    preserve = sup.index("Add-Content -Path $srvHist")
+    assert "server.out.history.log" in sup
+    preserve = sup.index("Add-Content -Path $hist")
     launch = sup.index("-RedirectStandardOutput $srvOut -RedirectStandardError $srvErr")
     assert preserve < launch, "the previous launch is copied out AFTER it has been truncated"
     # bounded, or an unattended machine fills its disk with the same stack trace
@@ -138,7 +144,7 @@ def test_quickstart_falls_back_to_the_preserved_crash_log():
     assert qs.index("server.err.log") < qs.index("server.err.history.log")
     assert doctor.index("$script:serverErrLog") < doctor.index("$script:serverErrHistory")
     # and quickstart still runs the doctor, or none of its checks reach anyone
-    assert "scripts\doctor.ps1" in qs
+    assert r"scripts\doctor.ps1" in qs
 
 
 def test_a_successful_startup_is_never_reported_as_the_reason_it_died():
@@ -218,12 +224,12 @@ def test_the_first_server_launch_does_not_wait_out_the_debounce():
 
     # and quickstart waits for the server before asking whether it is healthy
     wait = qs.index("Waiting for the MCP server to answer")
-    doctor_call = qs.index("scripts\doctor.ps1")
+    doctor_call = qs.index(r"scripts\doctor.ps1")
     assert wait < doctor_call, "the health check still runs before the wait"
 
 
 def test_every_devtunnel_resolver_knows_both_install_locations():
-    """setup_devtunnel.ps1 installs by winget when it can and DIRECT-DOWNLOADS to
+    r"""setup_devtunnel.ps1 installs by winget when it can and DIRECT-DOWNLOADS to
     %LOCALAPPDATA%\devtunnel when it cannot, appending that directory to the USER PATH -- which
     the already-running cmd cannot see, and that cmd is quickstart, the parent of start_all,
     supervisor and doctor. So on exactly the locked-down machines that needed the fallback, the
@@ -235,7 +241,7 @@ def test_every_devtunnel_resolver_knows_both_install_locations():
 
     for rel in ("scripts/doctor.ps1", "scripts/heal_tunnel.ps1", "scripts/supervisor.ps1"):
         src = (ROOT / rel).read_text(encoding="utf-8")
-        assert 'Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"' in src, rel
+        assert r'Join-Path $env:LOCALAPPDATA "devtunnel\devtunnel.exe"' in src, rel
     boot = (ROOT / "scripts" / "bootstrap.py").read_text(encoding="utf-8")
     assert 'local / "devtunnel" / "devtunnel.exe"' in boot
 
@@ -399,11 +405,21 @@ def test_the_tunnel_access_decision_is_asked_recorded_and_applied():
     assert 'tunnel_access_choice' in qs, "the decision is not recorded"
     # asked BEFORE the tunnel is created, because the grant is part of creating it
     assert qs.index("choice /C ATN") < qs.index("STEP 4/7")
-    # default stays off: the env line is only written on an explicit A
-    assert 'if "!TUNNEL_ACCESS!"=="anonymous" (' in qs
+    # default stays off: the env line is only written on an explicit A. Since 2026-09-24 (D4)
+    # the A branch is a jump to the one place that sets the key, and N/T REMOVE it -- executed,
+    # not read, in scripts/test_install_path_batch.py (test_quickstart_*).
+    assert 'if "!TUNNEL_ACCESS!"=="anonymous" goto :access_anonymous' in qs
+    code = "\n".join(l for l in qs.splitlines() if not l.strip().lower().startswith("rem"))
+    sets = [i for i in range(len(code)) if code.startswith("env_file.py set MCP_TUNNEL_ALLOW_ANONYMOUS", i)]
+    assert len(sets) == 1 and sets[0] > code.index(":access_anonymous"), \
+        "the anonymous opt-in is written somewhere other than the explicit-A branch"
     # and tenant access is applied, not printed
     assert "[string]$TenantId" in dt
-    assert "access create $target --tenant $TenantId" in dt
+    # D16 (2026-09-24, `devtunnel access create --help`): --tenant is a flag and takes no id, so
+    # the GUID must not follow it. Executed with a stub CLI that rejects the GUID form in
+    # scripts/test_setup_devtunnel_access_and_identity.py.
+    assert "Dt access create $target --tenant" in dt
+    assert "--tenant $TenantId" not in dt
     # `set /p` is not inside a parenthesized block: measured, it did not settle before the `if`
     assert "goto :after_tenant_id" in qs
 
@@ -424,19 +440,37 @@ def test_a_fresh_browser_with_no_tab_leads_to_a_sign_in():
     assert "return 1 if ready is False else 2" in signin
 
 
-def test_the_new_unlock_password_reaches_the_operator():
+def test_the_new_unlock_password_reaches_the_operator_without_being_echoed():
     """repair_unlock_password generates a NEW random password -- correctly, the old one is
-    unreadable on this account -- and returned only a reason and a backup path. The operator
-    arrived with a password written down from the machine that produced the .env, and nothing
-    ever told them it no longer works. Everything green; unlock() simply refuses."""
+    unreadable on this account -- and writes it (protected) into .env. The operator arrived with
+    a password written down from the machine that produced the .env, and must be told that one no
+    longer works AND how to read the new one.
+
+    But the value itself must NOT travel back over repair_unlock.py's stdout: start_all captures
+    that stream and it can reach logs, and this repository is public (py/clear-text-logging).
+    So the "repaired:" line carries only a non-secret note, and start_all prints where to read the
+    new value instead of echoing it."""
     ep = (ROOT / "tools" / "env_portability.py").read_text(encoding="utf-8")
     start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
+    repair = (ROOT / "scripts" / "repair_unlock.py").read_text(encoding="utf-8")
 
-    assert '"password": fresh' in ep
+    # The repair helper must NOT return the freshly minted clear-text value. It persists only
+    # the protected value; the interactive PowerShell helper is the sole reveal path.
+    assert '"password": fresh' not in ep
+    assert 'env[UNLOCK_PASSWORD_PROTECTED_VAR] = protected' in ep
+    assert 'return {"acted": True' in ep
     assert (ROOT / "scripts" / "repair_unlock.py").exists()
     assert "repair_unlock.py" in start_all
     assert 'repair -like "repaired:*"' in start_all
-    assert "Write this down" in start_all
+
+    # The operator is still informed and pointed at the value -- just not handed it on stdout.
+    assert "written to .env" in start_all
+    assert "copilot_studio_values.ps1" in start_all
+
+    # The leak is closed on both sides: repair_unlock.py never formats the password into its
+    # verdict line, and start_all no longer slices a secret out of the "repaired:" payload.
+    assert "repaired:%s" not in repair, "the new password must not be printed to stdout"
+    assert "$newPw" not in start_all, "start_all must not extract/echo the password"
 
 
 def test_a_required_check_that_could_not_be_answered_is_not_a_complete_setup():
@@ -492,13 +526,15 @@ def test_the_update_step_reads_its_result_and_stops_after_replacing_itself():
     assert ":do_pull" not in git_block, "a label is back inside a parenthesised block"
 
 
-def test_an_unanswerable_access_prompt_records_the_safe_answer():
+def test_an_unanswerable_access_prompt_stops_instead_of_recording_n():
     """MEASURED: with stdin closed, `choice` prints "ERROR: The file is either empty or does not
-    contain the valid choices" and sets none of the branches, leaving the variable empty. The
-    effect was already safe -- nothing is granted -- but nothing said so, and the recorded
-    decision was a blank. An absent answer is the same answer as N and is written down as one."""
+    contain the valid choices" and sets none of the branches, leaving the variable empty. That
+    was once recorded as N and the run went on to end with a tunnel nothing could connect to
+    (new-PC report 2026-09-24). No answer is not an answer: it stops, recording nothing. Run for
+    real in scripts/test_install_path_batch.py::test_an_unanswered_access_prompt_stops_..."""
     qs = (ROOT / "quickstart.bat").read_text(encoding="utf-8")
-    assert 'if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"' in qs
+    assert 'if "!TUNNEL_ACCESS!"=="" set "TUNNEL_ACCESS=none"' not in qs
+    assert 'if "!TUNNEL_ACCESS!"=="" goto :access_unanswered' in qs
 
 
 def test_start_all_reports_its_failure_count_and_quickstart_reads_it():
@@ -565,7 +601,10 @@ def test_auth_ok_end_to_end_means_more_than_not_401():
 
     auth = doctor[doctor.index('Check "auth_bearer"'):]
     auth = auth[:auth.index("Write-Host")]
-    assert "$noKey = Mcp-Status @{}" in auth, "nothing checks that a missing key is refused"
+    # The no-key probe carries doctor's self-test marker so main.py does not count it as a key
+    # mismatch (tests/test_doctor_self_test_is_not_a_key_mismatch.py); it still sends no key.
+    assert "$noKey = Mcp-Status @{ 'X-MCP-Self-Test' = 'doctor' }" in auth, \
+        "nothing checks that a missing key is refused"
     assert "($noKey -eq 401) -or ($noKey -eq 403)" in auth
     assert "$withKey -ge 200" in auth and "$withKey -lt 500" in auth, "5xx passes again"
     assert "$withKey -ne 404" in auth
@@ -596,7 +635,11 @@ def test_the_chat_backend_is_checked_not_just_the_browser_it_drives():
     block = block[:block.index("# 5b.")]
     assert "-Optional" not in block
     # an HTTP error still means something is serving; a dropped connection does not
-    assert "else { $false }" in block
+    assert "StatusCode.value__ -lt 500" in block and "$bridgeOk = $true" in block
+    # CHANGED 2026-09-25: retried rather than a single 6s shot -- a sign-in-triggered bridge
+    # restart (start_bridge.ps1's supervisor) legitimately holds :8765 down for a stretch
+    # doctor.bat can run straight into. See the Check block's own comment for the incident.
+    assert "for ($bAttempt = 0; $bAttempt -lt 3; $bAttempt++)" in block
 
 
 def test_a_held_but_dead_bridge_port_is_named_rather_than_relaunched_into():
@@ -628,14 +671,14 @@ def test_a_keepalive_process_is_not_a_serving_bridge():
     as the supervisor check that was green whether or not a supervisor was running."""
     start_all = (ROOT / "scripts" / "start_all.ps1").read_text(encoding="utf-8")
 
-    assert "(Proc-Running 'start_bridge\.ps1') -and (Http-Up" in start_all
+    assert r"(Proc-Running 'start_bridge\.ps1') -and (Http-Up" in start_all
     assert "already running and serving" in start_all
     # and the diagnosis below is now reachable when it is running but not serving
     assert start_all.index("already running and serving") < start_all.index("is HELD by pid")
 
 
 def test_the_supervisor_probe_matches_this_checkout_and_not_whoever_mentions_it():
-    """MEASURED while writing this. `CommandLine -match 'supervisor\.ps1'` selected five
+    r"""MEASURED while writing this. `CommandLine -match 'supervisor\.ps1'` selected five
     processes on this machine: the real supervisor, another powershell, and three bash commands
     that contained the string because they were SEARCHING for it. This project already has the
     lesson written down -- a process query matches the process making it.
@@ -652,7 +695,7 @@ def test_the_supervisor_probe_matches_this_checkout_and_not_whoever_mentions_it(
 
     for src, what in ((doctor, "doctor"), (start_all, "start_all")):
         code = "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("#"))
-        assert "$_.CommandLine -match 'supervisor\.ps1'" not in code, \
+        assert r"$_.CommandLine -match 'supervisor\.ps1'" not in code, \
             "%s matches anything that mentions the file again" % what
         assert '$_.Name -match \'^(powershell|pwsh)\'' in code, what
         assert '-notlike "*register-supervisor*"' in code, what
@@ -715,7 +758,7 @@ def test_the_exit_code_has_something_to_count():
         start_all.index('$script:startupFailures += ("unlock password repair failed: ')
 
 
-def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
+def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one(monkeypatch):
     """MEASURED, all three forms:
 
         echo KEY=1 >> f                          -> "KEY=1 \r\n"   the space lands in the VALUE
@@ -732,11 +775,26 @@ def test_appending_to_env_cannot_join_the_new_key_onto_the_last_one():
 
     code = "\n".join(l for l in qs.splitlines() if not l.strip().lower().startswith("rem"))
     assert '>> ".env" echo' not in code, "an append that can join lines is back"
-    assert code.count("[IO.File]::AppendAllText") >= 2
-    assert "$b[$b.Length-1] -ne 10" in code, "nothing checks for the trailing newline"
+    # SINCE 2026-09-24 (D28) quickstart writes .env only through scripts/env_file.py, which
+    # replaces the file atomically; the two PowerShell appends are gone. The property is now
+    # checked by RUNNING the writer on a file whose last line has no newline.
+    assert "[IO.File]::AppendAllText" not in code, "a raw append to .env is back"
+    assert r'scripts\env_file.py set MCP_IMPL_AGENT_URL' in code
+    import tempfile
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import env_file
+    monkeypatch.setattr(env_file, "_protect_secret", lambda value: "dpapi:test-" + value)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / ".env"
+        p.write_bytes(b"MCP_API_KEY=abc")                      # no trailing newline
+        env_file.set_key(p, "MCP_IMPL_AGENT_URL", "https://x.invalid/a")
+        assert p.read_bytes().splitlines() == [
+            b"MCP_API_KEY_PROTECTED=dpapi:test-abc",
+            b"MCP_IMPL_AGENT_URL=https://x.invalid/a",
+        ]
 
 
-def test_the_access_choice_beats_the_file_and_the_environment():
+def test_the_access_choice_beats_the_file_and_the_environment(monkeypatch):
     """Choosing A did not reliably grant anonymous access. Get-AllowAnonymous reads the parent
     environment FIRST and then scans .env taking the FIRST match and breaking -- so appending
     the key at the end had no effect whenever the variable was set in the environment, or .env
@@ -751,17 +809,34 @@ def test_the_access_choice_beats_the_file_and_the_environment():
     dt = (ROOT / "scripts" / "setup_devtunnel.ps1").read_text(encoding="utf-8")
 
     assert "[switch]$ForceAnonymous" in dt
-    assert "$AllowAnonymous = $ForceAnonymous.IsPresent -or (Get-AllowAnonymous)" in dt
+    # D4 (2026-09-24): one access mode per run, -ForceAnonymous first, then -TenantId, then the
+    # standing opt-in -- executed in scripts/test_setup_devtunnel_access_and_identity.py.
+    assert "$AccessMode = Resolve-AccessMode $ForceAnonymous.IsPresent $TenantId $anonSetting" in dt
     assert "-ForceAnonymous" in qs and "ANON_FLAG" in qs
-    # replaced, not appended: an older line further up would otherwise keep winning
-    assert "MCP_TUNNEL_ALLOW_ANONYMOUS\s*=" in qs
+    # replaced, not appended: an older line further up would otherwise keep winning.
     # AND WRITTEN AS UTF-8 ON BOTH SIDES. The rewrite used Set-Content -Encoding ASCII, which
     # replaces every non-ASCII byte with a question mark, and read with a bare Get-Content,
     # which decodes as the ANSI codepage. Measured on a .env carrying one Japanese comment:
     # ASCII write destroyed it, fixing only the write turned it into mojibake, and fixing both
     # round-trips it unchanged. No BOM, because that is what everything here reads back.
-    assert "[IO.File]::WriteAllLines($p, $keep, (New-Object System.Text.UTF8Encoding($false)))" in qs
-    assert "Get-Content $p -Encoding UTF8" in qs
+    # SINCE 2026-09-24 (D28) the writer is scripts/env_file.py; the same three properties are
+    # checked by running it on the .env this docstring describes (=0 further up, a Japanese
+    # comment). quickstart itself is run end to end in scripts/test_install_path_batch.py.
+    assert r'"!QS_PY!" scripts\env_file.py set MCP_TUNNEL_ALLOW_ANONYMOUS 1' in qs
+    import tempfile
+    sys.path.insert(0, str(ROOT / "scripts"))
+    import env_file
+    monkeypatch.setattr(env_file, "_protect_secret", lambda value: "dpapi:test-" + value)
+    with tempfile.TemporaryDirectory() as d:
+        p = Path(d) / ".env"
+        before = "# 日本語のコメント\r\nMCP_TUNNEL_ALLOW_ANONYMOUS=0\r\nMCP_API_KEY=k\r\n"
+        p.write_bytes(before.encode("utf-8"))
+        env_file.set_key(p, "MCP_TUNNEL_ALLOW_ANONYMOUS", "1")
+        raw = p.read_bytes()
+        assert not raw.startswith(b"\xef\xbb\xbf")
+        expected = before.replace("ANONYMOUS=0", "ANONYMOUS=1").replace(
+            "MCP_API_KEY=k", "MCP_API_KEY_PROTECTED=dpapi:test-k")
+        assert raw.decode("utf-8") == expected
     assert "-Encoding ASCII" not in qs, "an ASCII rewrite of .env destroys non-ASCII values"
 
 

@@ -96,8 +96,8 @@ def test_it_reads_both_scopes_and_both_kinds_of_store():
     r"""A proxy chain is commonly a root in LocalMachine\Root with an issuing intermediate in
     LocalMachine\CA. Exporting only roots produces a bundle that cannot complete the chain and
     fails identically to having none."""
-    for store in ("LocalMachine\Root", "LocalMachine\CA",
-                  "CurrentUser\Root", "CurrentUser\CA"):
+    for store in (r"LocalMachine\Root", r"LocalMachine\CA",
+                  r"CurrentUser\Root", r"CurrentUser\CA"):
         assert store in PS1, store
 
 
@@ -141,7 +141,7 @@ def test_the_certificates_are_set_up_for_every_route_not_just_uv():
     inside that branch would be the same 'guard on one path only' shape as the original
     defect -- pip has --trusted-host, but anything else bootstrap.py fetches would not."""
     tls = BAT.index("ca_bundle.ps1")
-    first_route = BAT.index('if exist ".venv\Scripts\python.exe"')
+    first_route = BAT.index(r'if exist ".venv\Scripts\python.exe"')
     assert tls < first_route, "the TLS setup runs after a route can already have been taken"
 
 

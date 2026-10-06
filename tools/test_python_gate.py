@@ -66,6 +66,16 @@ def test_shell_still_works():
 
 def test_bypass_skips_ask_but_never_contract_stop(monkeypatch, tmp_path):
     contract_path = tmp_path / "active_contract.json"
+    # Redirecting _CONTRACT_FILE is now the WHOLE isolation. This test also had to reset a
+    # module global, contract_gate._SEEN, because reading an active contract set it in place
+    # and monkeypatch restored only the FILE -- the flag leaked into later tests, whose
+    # absent real contract then read as tampering and gated every shell_destructive op.
+    #
+    # That global is gone: "seen" and "retired" are sidecar files next to the contract, so
+    # that the fleet-runner process's retirement is visible to the MCP server process, which
+    # is where the gate actually runs. They are derived from _CONTRACT_FILE.parent, so
+    # pointing the contract at tmp_path carries the sidecars into tmp_path with it and the
+    # leak cannot happen -- there is no longer any process-global state to reset here.
     monkeypatch.setattr(contract_gate, "_CONTRACT_FILE", contract_path)
     monkeypatch.setattr(approval_policy, "current_approval_mode", lambda default=None: "bypass")
     contract_path.write_text(json.dumps({

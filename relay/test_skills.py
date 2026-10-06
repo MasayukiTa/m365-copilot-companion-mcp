@@ -1,4 +1,6 @@
 import os
+import sqlite3
+import threading
 from pathlib import Path
 
 import pytest
@@ -233,3 +235,92 @@ def test_anything_that_is_not_an_opt_in_leaves_it_off(monkeypatch, tmp_path, val
     monkeypatch.setenv("MCP_SKILLS_INCLUDE_PERSONAL", value)
     scopes = {scope for scope, _root in SkillStore(str(tmp_path)).roots()}
     assert scopes == {"project"}
+
+
+def test_a_store_opens_one_sqlite_connection_for_its_whole_lifetime(tmp_path, monkeypatch):
+    """A regression guard for the churn behind the "disk I/O error" seen running the full
+    suite (tests/test_skills_business_matching.py::test_matching_quality_on_office_requests):
+    building an 18-Skill trusted store and then running 40 match() queries against it used to
+    open ~230 separate sqlite3 connections (one per statement, via the old _connect() that
+    called sqlite3.connect() every time) against one small WAL-mode file -- each open/close
+    touching the main db plus its -wal/-shm siblings, so 230 chances for a transient Windows
+    I/O error (real-time antivirus scanning the temp directory these files live in) to land
+    mid-operation, in a file that needs none of that churn to hold a few hundred KB of trust
+    rows. _connect() now hands back a `with`-usable wrapper around ONE connection created on
+    first use and kept for the store's life -- this pins that count, not just today's symptom.
+    """
+    calls = []
+    real_connect = sqlite3.connect
+
+    def counted(*a, **k):
+        calls.append(1)
+        return real_connect(*a, **k)
+
+    monkeypatch.setattr(sqlite3, "connect", counted)
+    root = tmp_path / "project"
+    (root / "skills").mkdir(parents=True)
+    _write_skill(root / "skills", name="probe-skill")
+    store = SkillStore(root, tmp_path / "state.sqlite3", tmp_path / "gates")
+    assert len(calls) == 1, "SkillStore() itself should open exactly one connection"
+
+    req = store.request_approval("probe-skill")
+    store.confirm_approval("probe-skill", req["token"])
+    for _ in range(20):
+        store.match("review my python model code")
+    assert len(calls) == 1, (
+        "approving a Skill and matching 20 times opened %d sqlite3 connections; "
+        "expected the store to keep reusing its one connection" % len(calls))
+
+
+def test_one_store_serves_concurrent_threads_without_error(tmp_path, monkeypatch):
+    """The store's one connection is opened with check_same_thread=False and every use is
+    serialized by a lock, because it is NOT only used from the thread that created it:
+    bridge/copilot_bridge.py keeps one process-wide SKILL_STORE serving a
+    ThreadingHTTPServer's worker threads, and fastmcp 3 runs sync tools in a thread pool by
+    default. Without check_same_thread=False, a second thread's first query would raise
+    sqlite3.ProgrammingError ("SQLite objects created in a thread can only be used in that
+    same thread"); without the lock, two threads' statements on the shared connection could
+    interleave mid-transaction. Runs one thread reading (match(), repeatedly, the discover()
+    path) against another writing (request_approval + confirm_approval for distinct Skills,
+    the trust-write path) on the SAME store, and requires both to finish clean.
+    """
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: tmp_path / "home"))
+    root = tmp_path / "project"
+    (root / "skills").mkdir(parents=True)
+    _write_skill(root / "skills", name="model-review")
+    for i in range(5):
+        _write_skill(root / "skills", name="probe-skill-%d" % i,
+                      description="Probe Skill number %d" % i)
+    store = SkillStore(root, tmp_path / "state.sqlite3", tmp_path / "gates")
+
+    errors: list[BaseException] = []
+    errors_lock = threading.Lock()
+
+    def record(exc: BaseException) -> None:
+        with errors_lock:
+            errors.append(exc)
+
+    def reader() -> None:
+        try:
+            for _ in range(30):
+                store.match("review my python model code")
+        except BaseException as exc:  # noqa: BLE001 -- a thread-identity error IS the point
+            record(exc)
+
+    def writer() -> None:
+        try:
+            for i in range(5):
+                req = store.request_approval("probe-skill-%d" % i)
+                store.confirm_approval("probe-skill-%d" % i, req["token"])
+        except BaseException as exc:  # noqa: BLE001
+            record(exc)
+
+    threads = [threading.Thread(target=reader), threading.Thread(target=writer)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a thread hung against the shared connection"
+    assert errors == [], errors
+    for i in range(5):
+        assert store.get("probe-skill-%d" % i).trust == "trusted"

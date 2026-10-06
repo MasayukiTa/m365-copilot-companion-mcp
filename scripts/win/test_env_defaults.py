@@ -6,7 +6,6 @@
 import json
 import os
 import pathlib
-import subprocess
 import tempfile
 
 import pytest
@@ -24,8 +23,9 @@ PS = ROOT / "scripts" / "win" / "env_defaults.ps1"
 def run(root):
     """一時ディレクトリの .env に対して関数を1回走らせる。"""
     cmd = ". '%s'; Ensure-EnvDefaults -Root '%s'" % (PS, root)
-    p = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd],
-                       capture_output=True, text=True, timeout=60)
+    from tools.childproc import run as _run_child
+    p = _run_child(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", cmd],
+                    timeout=60)
     assert p.returncode == 0, p.stdout + p.stderr
     return p
 

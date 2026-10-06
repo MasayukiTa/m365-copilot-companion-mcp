@@ -119,6 +119,9 @@ class SocketRoute:
         #: serves every agent -- but "probably" is not a measurement, and the cost of not
         #: assuming is one extra 40-second capture per agent per token lifetime.
         self._entries = {}
+        #: Monotonic per-agent capture generation. Async helpers remember the generation they
+        #: started from and may install only if nobody else installed a newer capture meanwhile.
+        self._capture_revision = {}
         #: ONE CAPTURE AT A TIME, PER AGENT. `refresh` reads needs_refresh() and then captures,
         #: and nothing stopped two workers passing that check together -- measured on a run of
         #: 24 goals at concurrency 6, where the tab count peaked at 3 instead of 2. Two capture
@@ -209,13 +212,19 @@ class SocketRoute:
         return bool(self.enabled and not self.closed_reason)
 
     def close_route(self, reason: str) -> None:
-        """Stop offering sockets for the rest of this run. There is no reopen, by design."""
-        if self.closed_reason:
-            return
-        self.closed_reason = reason
+        """Stop offering sockets for the rest of this run. There is no reopen, by design.
+
+        Serialize the close decision with capture installation. Otherwise a helper can pass an
+        ``open()`` check just before this method closes the route and then publish credentials
+        into a route that policy already declared unusable.
+        """
+        with self._lock:
+            if self.closed_reason:
+                return
+            self.closed_reason = reason
+            turns, fallbacks = self.turns, self.fallbacks
         self._log("[socket_route] closed: %s -- workers now open tabs" % reason)
-        self.record("route_closed", reason=reason, turns=self.turns,
-                    fallbacks=self.fallbacks)
+        self.record("route_closed", reason=reason, turns=turns, fallbacks=fallbacks)
 
     def note_failure(self, reason: str) -> None:
         """A worker fell back. Counts twice: against the blip guard and the flap guard."""
@@ -258,8 +267,67 @@ class SocketRoute:
         tok = entry.get("token") or ""
         return expires_in(tok, now=self._now()) if tok else 0.0
 
+    def capture_revision(self, agent_url=None) -> int:
+        """Current per-agent capture generation, for optimistic async installation."""
+        key = self._key(agent_url)
+        with self._lock:
+            return int(self._capture_revision.get(key) or 0)
+
     def template_for(self, agent_url=None):
         return (self._entries.get(self._key(agent_url)) or {}).get("template")
+
+    def ready(self, agent_url=None) -> bool:
+        """Whether a worker can take a socket *right now* without any browser capture.
+
+        ``open()`` only says the route has not tripped its breaker. Before async refresh existed
+        admission could treat open==socket because it synchronously captured immediately before
+        attach. Once capture is off the sweep, readiness must also require a live token/template
+        or tab accounting underestimates every fallback.
+        """
+        if not self.open():
+            return False
+        key = self._key(agent_url)
+        with self._lock:
+            entry = dict(self._entries.get(key) or {})
+        token = entry.get("token") or ""
+        return bool(entry.get("template") is not None and token and
+                    expires_in(token, now=self._now()) > 0)
+
+    def install_capture(self, token, template, agent_url=None, expected_revision=None) -> bool:
+        """Install plain capture data produced elsewhere (for example a helper process).
+
+        ``expected_revision`` is the generation observed when an async capture started. If a
+        synchronous caller (Research/Refuter/etc.) installs something newer while that helper is
+        away, the late helper must not roll the route back to older credentials/template data.
+        No Playwright object crosses this boundary.
+        """
+        if not token or template is None:
+            return False
+        key = self._key(agent_url)
+        with self._lock:
+            if not self.enabled or self.closed_reason:
+                return False
+            current = int(self._capture_revision.get(key) or 0)
+            if expected_revision is not None and current != int(expected_revision):
+                return False
+            self._entries[key] = {"token": token, "template": template}
+            self._capture_revision[key] = current + 1
+            if not self.default_agent_url:
+                self.default_agent_url = key
+        self._log("[socket_route] captured: %.0f min of token, agent %s"
+                  % (self.token_life(key) / 60.0, (template.gpt_id or "(none)")[:28]))
+        return True
+
+    def token_for(self, agent_url=None) -> str:
+        """The bearer this route holds, for a caller that must speak HTTP alongside it.
+
+        driver_for() hands the CONVERSATION a supplier rather than a token, because a
+        refresh mid-goal has to reach a conversation that is already running. An
+        attachment upload is not like that: it is one request, made once, before the turn
+        it belongs to -- so it takes the value, and a stale one simply gets an HTTP
+        refusal that relay/socket_attachment turns into a tab.
+        """
+        return (self._entries.get(self._key(agent_url)) or {}).get("token") or ""
 
     def needs_refresh(self, agent_url=None) -> bool:
         if self.template_for(agent_url) is None:
@@ -295,13 +363,7 @@ class SocketRoute:
             self.note_failure("capture failed for %s: %s: %s"
                               % (key[:40] or "(default)", type(exc).__name__, str(exc)[:140]))
             return False
-        with self._lock:
-            self._entries[key] = {"token": token, "template": template}
-            if not self.default_agent_url:
-                self.default_agent_url = key
-        self._log("[socket_route] captured: %.0f min of token, agent %s"
-                  % (self.token_life(key) / 60.0, (template.gpt_id or "(none)")[:28]))
-        return True
+        return self.install_capture(token, template, key)
 
     def driver_for(self, name: str, agent_url=None, model: str = "",
                    turn_timeout_s: float = 600.0, frame_timeout_s: float = 90.0,

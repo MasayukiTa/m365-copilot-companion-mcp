@@ -157,6 +157,17 @@ PANEL_LENSES = ("correctness", "edge", "security")
 #: a different campaign's stock figure; another processed the wrong cinema entirely. Those are
 #: defects in the SEARCH and they stay REFUTED. The change is only that a search which was
 #: actually carried out, and found nothing, is allowed to be finished.
+# EXTENDED 2026-09-24. The bullets above catch a search that was carried out and came up
+# empty; they had nothing for a search that was never carried out. Measured: a goal asking
+# to "探してほしい" (find/search) PowerPoint-design skills was answered from the local Skill
+# catalogue alone (skill_match, skill_list) -- no web/external search tool was ever called --
+# and the worker closed with "該当skillが無いため...指示ください" (no local skill, please advise)
+# instead of continuing the request. refuter#1 UPHELD it: the two bullets that existed did not
+# name "checked one narrow source when the goal implied more" or "asked the user instead of
+# finishing", so a report with exactly those two defects passed the same gate this preamble
+# built for "checked 1 of 9 subjects". Both new bullets are instances of the same principle
+# already stated above (a defect in the SEARCH stays refutable) -- they were missing sub-cases,
+# not a new rule.
 UNVERIFIABLE_PREAMBLE = (
     "【このゴールには機械的な検証条件がありません】調査・情報収集の課題です。コードの変更では"
     "ないので、ファイルやテストを開いて確かめる観点(境界値・例外処理・セキュリティ)は当てはまり"
@@ -171,6 +182,11 @@ UNVERIFIABLE_PREAMBLE = (
     "  - 別の対象・別の項目の情報を流用して判定している\n"
     "  - 報告された対象名と根拠が食い違っている\n"
     "  - 到達できなかった理由が書かれておらず、調べたのか調べていないのか区別できない\n"
+    "  - ゴールが『探して/調べて』のように広く探すことを求めているのに、社内の特定のカタログや"
+    "1つの狭い情報源しか調べておらず、他の一般的な手段(web検索・外部リポジトリ検索等)を試して"
+    "いない、かつ試さない理由も書かれていない\n"
+    "  - すでに明示されている依頼に対して、実行を終える代わりに『進めてよいか』『作成しましょう"
+    "か』とユーザーに次の指示を求めて終わっている(依頼はまだ遂行されていない)\n"
     "・同じ指摘を繰り返さないでください。前回と同じ理由で差し戻すくらいなら UPHELD です。"
 )
 
@@ -196,13 +212,21 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
     )
 
 
-def aggregate_panel(results, min_refute=None):
-    """Aggregate a panel of (lens, kind, reason) verdicts into one (kind, reason).
+def _preamble_id(lens="", unverifiable=False):
+    """A short id of the instruction text a reviewer is given (base + lens + unverifiable framing)."""
+    import hashlib
+    text = REFUTER_INSTRUCTION + (LENS_PROMPTS.get(lens, "") if lens else "")
+    if unverifiable:
+        text = UNVERIFIABLE_PREAMBLE + text
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
-    REFUTED only when at least `min_refute` reviewers refute (default: strict majority),
-    so a lone over-eager reviewer can't block, but a real defect that several lenses see
-    does. The combined reason names which lenses objected. Anything short of the threshold
-    is UPHELD (we never trap the loop on a minority/ambiguous objection).
+
+def aggregate_panel(results, min_refute=None):
+    """Aggregate a panel without renaming "not reviewed" to "reviewed and upheld".
+
+    REFUTED still needs the configured threshold. A genuine UPHELD still preserves the
+    historical non-blocking result when that threshold is not met. If nobody actually
+    upheld the work and every reviewer was UNCLEAR/INCONCLUSIVE, preserve that uncertainty.
     """
     n = len(results)
     if n == 0:
@@ -211,9 +235,14 @@ def aggregate_panel(results, min_refute=None):
     if min_refute is None:
         min_refute = (n // 2) + 1
     if len(refuted) >= min_refute:
-        reason = " / ".join("[%s] %s" % (l, r) for (l, r) in refuted)
-        return ("REFUTED", reason)
-    return ("UPHELD", "")
+        return ("REFUTED", " / ".join("[%s] %s" % (l, r) for (l, r) in refuted))
+    if any(k == "UPHELD" for (_l, k, _r) in results):
+        return ("UPHELD", "")
+    unresolved = ["[%s] %s" % (l, (r or k))
+                  for (l, k, r) in results if k in ("UNCLEAR", "INCONCLUSIVE")]
+    if unresolved:
+        return ("UNCLEAR", " / ".join(unresolved))
+    return ("UNCLEAR", "panel produced no affirmative verdict")
 
 
 #: Lenses whose objection cannot be outvoted, under the aggregation this module does NOT yet
@@ -321,6 +350,57 @@ def parse_verdict(text: str):
     return ("UNCLEAR", "the reply carries no verdict marker")
 
 
+_REVIEW_LOCK_BLOCK_MARKERS = (
+    "[locked:", "no valid unlock token", "session not unlocked", "call unlock(",
+    "未解錠", "解錠が必要", "解錠でき", "ロックされ", "ロックで拒否",
+    "locked by", "was locked", "is locked",
+)
+
+
+def review_verdict_was_lock_blocked(kind: str, reason: str, response: str = "") -> bool:
+    """A non-decisive review explicitly says authorization blocked evidence gathering."""
+    if str(kind or "").upper() not in ("UNCLEAR", "INCONCLUSIVE"):
+        return False
+    text = (str(reason or "") + "\n" + str(response or "")).lower()
+    return any(marker.lower() in text for marker in _REVIEW_LOCK_BLOCK_MARKERS)
+
+
+_REFUTER_RECOVERY_RESUME = (
+    "これは独立レビューのシステム回復手順です。回復後は同じ会話で直前に拒否された確認を再試行し、"
+    "元の独立レビューを最後まで続けてください。最終行は REFUTED: <理由> / UPHELD / "
+    "INCONCLUSIVE: <不足証拠> のいずれかにしてください。"
+)
+
+
+def _blocking_recover_locked_review(drv, verdict, *, timeout_s=600):
+    """Reactive recovery for the blocking refuter path; never used on opening turn 1."""
+    kind, reason = verdict
+    if not review_verdict_was_lock_blocked(kind, reason):
+        return verdict
+    from .relay_fleet import MAX_UNLOCK_ATTEMPTS, build_reactive_unlock_turn
+    attempts = 0
+    while review_verdict_was_lock_blocked(kind, reason):
+        if attempts >= MAX_UNLOCK_ATTEMPTS:
+            return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                    "refuter remained locked after %d reactive recovery attempts" % attempts)
+        turn = build_reactive_unlock_turn(_REFUTER_RECOVERY_RESUME)
+        if not turn:
+            return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                    "refuter was locked and local unlock recovery material is unavailable")
+        attempts += 1
+        try:
+            drv.send(turn)
+            if not drv.wait_for_idle(timeout_s=timeout_s):
+                return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                        "refuter recovery did not settle within %ds" % int(timeout_s))
+            raw = drv.read_last_response()
+            kind, reason = parse_verdict(raw)
+        except Exception as exc:
+            return ("UNCLEAR", HARNESS_REASON_PREFIX +
+                    "refuter recovery raised %s" % type(exc).__name__)
+    return (kind, reason)
+
+
 def agent_base_url(conversation_url: str) -> str:
     """The bare agent URL (a fresh chat) from a conversation URL -- navigating here starts
     an INDEPENDENT conversation, which is what makes the refuter a separate skeptic rather
@@ -359,12 +439,16 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
         drv.send(build_refuter_prompt(goal, final_response, lens=lens,
                                       unverifiable=unverifiable))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
-        verdict = (parse_verdict(drv.read_last_response()) if ok else
+        raw = drv.read_last_response() if ok else ""
+        verdict = (parse_verdict(raw) if ok else
                    ("UNCLEAR", "harness: the reviewer did not settle within %ds" % timeout_s))
+        if ok and review_verdict_was_lock_blocked(verdict[0], verdict[1], raw):
+            verdict = _blocking_recover_locked_review(drv, verdict, timeout_s=timeout_s)
         # the reviewer often answers a preamble first ("I'll check the files") -- nudge it
         # to actually emit the verdict, like the implementer needs a CONTINUE.
         nudges = 0
-        while verdict[0] == "UNCLEAR" and nudges < max_nudges:
+        while (verdict[0] == "UNCLEAR" and not unclear_is_harness_fault(verdict[1])
+               and nudges < max_nudges):
             nudges += 1
             drv.send(_next_refuter_nudge(nudges))
             if not drv.wait_for_idle(timeout_s=timeout_s):
@@ -421,8 +505,15 @@ class RefuterSession:
 
     def __init__(self, context, base_url, goal, final_response,
                  dwell_s=4.0, timeout_s=600, max_nudges=2, lens="",
-                 max_network_reopens=2, unverifiable=False):
+                 max_network_reopens=2, unverifiable=False, recorder=None):
         self.context = context
+        #: Called with one dict per text this session sends or receives (see _note), AS IT
+        #: HAPPENS. The reviewer's own conversation used to be stored nowhere: only its verdict
+        #: kind and a short reason survived. None = nobody is recording (the old behaviour).
+        self.recorder = recorder
+        self.exchanges = []
+        self.last_route = ""
+        self._last_received = None
         self.unverifiable = unverifiable
         self.base_url = base_url
         self.goal = goal
@@ -443,12 +534,65 @@ class RefuterSession:
         self._done = None          # verdict tuple once finished
         self._network_reopens = 0
         self.max_network_reopens = max_network_reopens
+        self._unlock_attempts = 0
         #: True while this review runs over a socket rather than a side page. It passes no RAM
         #: gate, which is what stops a review being SKIPPED on a busy box -- and a skipped
         #: review means the candidate is accepted unreviewed, which is not a smaller review.
         self.socket = False
         #: Asked once. A capture costs a real tab and a real turn.
         self._socket_tried = False
+
+    def _note(self, direction, text, route=None):
+        """Remember one text sent to / received from the reviewer, and hand it to the recorder.
+
+        NEVER RAISES INTO THE REVIEW, never swallows: a recorder failure is written to stderr
+        (a review must not die of a logging fault, but a lost record has to be knowable).
+        """
+        import sys
+        import time
+        ex = {"seq": len(self.exchanges), "direction": direction, "text": str(text or ""),
+              "ts": time.time(),
+              "route": route if route is not None else ("socket" if self.socket else "tab"),
+              "lens": self.lens or "",
+              # WHICH PREAMBLE, and which agent: the instruction text is edited over time and a
+              # stored row has to say which version of it the reviewer was given.
+              "preamble_id": _preamble_id(self.lens, self.unverifiable),
+              "gpt_id": str(getattr(getattr(self.drv, "conv", None), "gpt_id", "") or "")}
+        self.last_route = ex["route"]
+        self.exchanges.append(ex)
+        if self.recorder is None:
+            return
+        try:
+            self.recorder(ex)
+        except Exception as exc:
+            sys.stderr.write("[refuter] recorder failed (%s): %s: %s\n"
+                             % (direction, type(exc).__name__, str(exc)[:160]))
+
+    def _note_reply(self, text):
+        """Record a reply the reviewer settled on. The same text twice in a row is one reply."""
+        if text is None or text == self._last_received:
+            return
+        self._last_received = text
+        self._note("received", text)
+
+    def _wire_sink(self):
+        """The socket driver reports the payload it really sends (protocol preamble and
+        tool catalogue included); stored as `sent_wire` beside the prompt we composed."""
+        def sink(payload, round_no):
+            self._note("sent_wire", payload, route="socket")
+        return sink
+
+    def _send_prompt(self):
+        """Compose the reviewer prompt, send it, and record exactly what was sent."""
+        prompt = build_refuter_prompt(self.goal, self.final, lens=self.lens,
+                                      unverifiable=self.unverifiable)
+        if self.socket:
+            try:
+                self.drv.payload_sink = self._wire_sink()
+            except Exception:
+                pass
+        self.drv.send(prompt)
+        self._note("sent", prompt)
 
     def start(self):
         # Defer the side-page open until poll() sees enough free RAM (ram_room_for_tab) -- the
@@ -483,8 +627,7 @@ class RefuterSession:
             self.drv = CopilotWebDriver(self.page)
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens,
-                                              unverifiable=self.unverifiable))
+            self._send_prompt()
             self._pending_open = False
             self._t_send = time.time()
         except Exception as exc:
@@ -560,8 +703,7 @@ class RefuterSession:
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
             self.drv._count_before = 0
-            self.drv.send(build_refuter_prompt(self.goal, self.final, lens=self.lens,
-                                              unverifiable=self.unverifiable))
+            self._send_prompt()
             self._pending_open = False
             self._t_send = time.time()
             return True
@@ -695,6 +837,10 @@ class RefuterSession:
                 if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
                     return None
                 verdict = parse_verdict(t)
+                if review_verdict_was_lock_blocked(verdict[0], verdict[1], t):
+                    if self._recover_locked_review(verdict[0], verdict[1], t):
+                        return None
+                    return self._done
                 if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
                     # WAIT BEFORE NUDGING, because the measured failure was committing two
                     # seconds early and then asking again. `has_marker` doubles the settle
@@ -713,8 +859,10 @@ class RefuterSession:
                         self._settle_state = _settle.SettleState()
                         self._last, self._stable_since = None, None
                         return None
+                    self._note_reply(t)
                     self._nudge()
                     return None
+                self._note_reply(t)
                 accept = getattr(self.drv, "_accept_new_reply", None)
                 if callable(accept):
                     accept(t)
@@ -735,10 +883,16 @@ class RefuterSession:
                     if getattr(self.drv, "_is_stale_repeat", lambda _t: False)(t):
                         return None
                     verdict = parse_verdict(t)
+                    if review_verdict_was_lock_blocked(verdict[0], verdict[1], t):
+                        if self._recover_locked_review(verdict[0], verdict[1], t):
+                            return None
+                        return self._done
                     # preamble-only answer ("I'll check...") -> nudge for the verdict
                     if verdict[0] == "UNCLEAR" and self._nudges_used < self.max_nudges:
+                        self._note_reply(t)
                         self._nudge()
                         return None
+                    self._note_reply(t)
                     accept = getattr(self.drv, "_accept_new_reply", None)
                     if callable(accept):
                         accept(t)
@@ -751,13 +905,54 @@ class RefuterSession:
             self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "reading the reviewer's reply raised"))
             return self._done
 
+    def _recover_locked_review(self, kind, reason, response=""):
+        """Reactively recover a lock-blocked review in this same independent session."""
+        if not review_verdict_was_lock_blocked(kind, reason, response):
+            return False
+        import time
+        from .relay_fleet import MAX_UNLOCK_ATTEMPTS, build_reactive_unlock_turn
+        if self._unlock_attempts >= MAX_UNLOCK_ATTEMPTS:
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX +
+                          "refuter remained locked after %d reactive recovery attempts" %
+                          self._unlock_attempts))
+            return False
+        turn = build_reactive_unlock_turn(_REFUTER_RECOVERY_RESUME)
+        if not turn:
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX +
+                          "refuter was locked and local unlock recovery material is unavailable"))
+            return False
+        try:
+            self._unlock_attempts += 1
+            self._count_before = self.drv._answers().count()
+            try:
+                self.drv._count_before = self._count_before
+            except Exception:
+                pass
+            self.drv.send(turn)
+            self._t_send = time.time()
+            self._last, self._stable_since = None, None
+            self._settle_state = _settle.SettleState()
+            self._marker_waits = 0
+            return True
+        except Exception as exc:
+            self._finish(("UNCLEAR", HARNESS_REASON_PREFIX +
+                          "refuter recovery raised %s" % type(exc).__name__))
+            return False
+
     def _nudge(self):
         import time
         self._nudges_used += 1
         try:
             self._count_before = self.drv._answers().count()
             self.drv._count_before = self._count_before
-            self.drv.send(_next_refuter_nudge(self._nudges_used))
+            _nudge_text = _next_refuter_nudge(self._nudges_used)
+            if self.socket:
+                try:
+                    self.drv.payload_sink = self._wire_sink()
+                except Exception:
+                    pass
+            self.drv.send(_nudge_text)
+            self._note("sent", _nudge_text)
             self._t_send = time.time()
             self._last, self._stable_since = None, None
             # A nudge is a NEW turn. Carrying stability across it would let the settle

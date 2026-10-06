@@ -23,6 +23,15 @@ SWEDIR = os.path.join(REPO, ".fleet", "swe")
 PREDS = os.path.join(SWEDIR, "preds_solve")
 RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
 RUNNER_LOCAL = os.path.join(REPO, "bench", "evalhost_batch_grade.py")
+
+#: THE INTERPRETER THAT ACTUALLY HAS swebench, which the eval host's system python does not and
+#: cannot easily be given. `pip install --break-system-packages swebench` gets past PEP 668 and
+#: then aborts anyway: it must replace `click 8.1.8`, which Debian installed with no RECORD
+#: file, so pip refuses to uninstall it and the whole transaction rolls back (measured
+#: 2026-09-10). Forcing it with --ignore-installed would shadow an OS package and move the
+#: breakage somewhere later. A dedicated venv stops the eval environment competing with the
+#: OS package manager at all.
+EVAL_PY = os.environ.get("SWE_EVAL_PYTHON", "/opt/swebench-venv/bin/python")
 TMP = os.path.join(SWEDIR, "_grade_batch")
 
 
@@ -93,40 +102,89 @@ def main():
     if not _scp_retry(RUNNER_LOCAL, runner_win):
         log("scp runner failed"); return
 
-    # 2) launch ONE swebench batch eval, detached (survives SSH drops; long build+run)
-    inner = ("systemctl reset-failed " + runid + " 2>/dev/null; rm -f /tmp/gb_" + runid + ".log; "
-             "systemd-run --no-block --unit=" + runid + " bash -lc "
-             "'python3 " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
-             + " " + a.dataset_name
-             + " > /tmp/gb_" + runid + ".log 2>&1'")
-    launch = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + inner + "\" 2>$null)"
-              " -join '' }; if(Wait-Job $j -Timeout 30){ Receive-Job $j } else { 'TO' }; Remove-Job $j -Force")
-    R._ssh_ps(launch, 55)
-    log("launched swebench batch (runid=%s). polling for result..." % runid)
+    # 2) RUN THE BATCH INSIDE A HELD SESSION. Not detached -- detachment does not survive on
+    # this host, and three days of EVALERR were that fact refusing to be noticed.
+    #
+    # MEASURED 2026-09-10, after the grader itself was finally proven correct (a synchronous
+    # run of the identical command finished in 107 seconds and returned a real verdict,
+    # resolved=1). Handed to `systemd-run --no-block` the same command is STOPPED after 44 and
+    # 51 seconds: the journal says "Stopping ... Deactivated successfully" with no error, no
+    # OOM and no timeout, and dmesg shows journald flushing its runtime journal -- the distro's
+    # systemd is re-initialised once no wsl.exe session is holding it, and every unit that
+    # belonged to the previous one goes with it. `setsid nohup` dies the same way. Touching the
+    # distro every 20 seconds does NOT rescue it (measured: two arms, held and unheld, both
+    # died at ~2 heartbeats), because a new session brings up a new systemd rather than
+    # re-adopting the old one's units. dockerd survives here only because a scheduled task
+    # holds a session for it.
+    #
+    # So the work has to run inside a session that stays open for its whole length. The SSH
+    # call therefore blocks for the duration, with --max-wait-min as its ceiling, and the
+    # runner's log goes to the Windows-shared mount rather than /tmp so a run that dies is
+    # still readable afterwards (/tmp here is cleaned within minutes -- the workdir was gone
+    # while the run was still being polled).
+    # ASK WHETHER THE GRADER CAN RUN BEFORE SPENDING A RUN ON IT. Every A/B grade on
+    # 2026-09-09 came back EVALERR, and one of the causes was a single import: swebench was not
+    # installed on the interpreter the runner used. A run that cannot import its grader looks
+    # exactly like a run whose instances all failed, which is why that took days to see. One
+    # cheap question here names it instead.
+    probe = R._wsl_token("%s -c 'import swebench.harness.run_evaluation' >/dev/null 2>&1 "
+                         "&& echo Y || echo N" % EVAL_PY)
+    if probe != "Y":
+        log("%s cannot import swebench.harness.run_evaluation (probe=%r). Nothing was run and "
+            "no verdict was written -- this is an eval-host setup fault, not a graded outcome. "
+            "Fix: python3 -m venv %s && %s/bin/pip install swebench (or point SWE_EVAL_PYTHON "
+            "at an interpreter that has it)."
+            % (EVAL_PY, probe, os.path.dirname(os.path.dirname(EVAL_PY)),
+               os.path.dirname(os.path.dirname(EVAL_PY))))
+        return
 
-    # 3) poll for the .done marker, then pull the result json
+    log_wsl = "/mnt/c/wsl-setup/%s.log" % runid
+    log_win = "%s/%s.log" % (R.REMOTE_DIR, runid)
+    body = (EVAL_PY + " " + runner_wsl + " " + preds_wsl + " " + runid + " " + str(a.max_workers)
+            + " " + a.dataset_name + " > " + log_wsl + " 2>&1")
+    hold_s = max(120, int(a.max_wait_min * 60))
+    run_ps = ("$j = Start-Job { (wsl.exe -d " + R.DISTRO + " -u root -- bash -lc \"" + body + "\" 2>$null)"
+              " -join '' }; if(Wait-Job $j -Timeout " + str(hold_s) + "){ Receive-Job $j } else { 'TIMEOUT' };"
+              " Remove-Job $j -Force")
+    log("grading inside a held session (runid=%s, ceiling %d min). This blocks until it finishes."
+        % (runid, hold_s // 60))
+    t0 = time.time()
+    R._ssh_ps(run_ps, hold_s + 60)
+    log("session returned after %.0fs" % (time.time() - t0))
+
+    # 3) read the result the runner wrote (same durable location it has always used)
     remote_done = "%s/verdicts/%s.batchresult.json.done" % (R.REMOTE_DIR, runid)
     remote_res = "%s/verdicts/%s.batchresult.json" % (R.REMOTE_DIR, runid)
-    local_done = os.path.join(TMP, runid + ".done")
     local_res = os.path.join(TMP, runid + ".batchresult.json")
-    deadline = time.time() + a.max_wait_min * 60
+    local_done = os.path.join(TMP, runid + ".done")
     result = None
-    while time.time() < deadline:
-        time.sleep(a.poll_s)
-        if R._scp_from(remote_done, local_done):
-            if R._scp_from(remote_res, local_res):
-                try:
-                    result = json.load(open(local_res, encoding="utf-8"))
-                    break
-                except Exception:
-                    pass
-        # progress heartbeat from the the eval host eval log
-        tail = R._wsl_token("tail -1 /tmp/gb_" + runid + ".log 2>/dev/null | tr -cd 'A-Za-z0-9:%=/ .' | tail -c 80")
-        if tail:
-            log("  ...the eval host: %s" % tail)
+    if R._scp_from(remote_done, local_done) and R._scp_from(remote_res, local_res):
+        try:
+            result = json.load(open(local_res, encoding="utf-8"))
+        except Exception:
+            result = None
     if result is None:
-        log("TIMEOUT after %d min -- no batch result. Check /tmp/gb_%s.log on the eval host." % (a.max_wait_min, runid))
+        # The run did not produce a result. Say what the remote log says instead of guessing,
+        # and write NO row: an infra fault is not a graded outcome (loop.py reads zero rows as
+        # INFRA_ABORT, which is the honest reading).
+        local_log = os.path.join(TMP, runid + ".log")
+        tail = ""
+        if R._scp_from(log_win, local_log):
+            try:
+                tail = open(local_log, encoding="utf-8", errors="replace").read()[-3000:]
+            except Exception:
+                tail = ""
+        log("no batch result for %s. Nothing was written to the ledger. Remote log tail:"
+            % runid)
+        log(tail or "(the log itself could not be read)")
         return
+    if result.get("stderr_tail"):
+        # evalhost_batch_grade.py only sets this when it produced zero real verdicts -- the run
+        # completed (a result WAS written) but swebench itself never resolved anything, and this
+        # is swebench's own reason why, not a guess. Surfaced here so the caller does not have to
+        # go fetch %s.run.out by hand to find out the batch ran but failed for a real reason.
+        log("swebench produced 0 real verdicts (returncode=%s). stderr tail:\n%s"
+            % (result.get("returncode"), result["stderr_tail"]))
 
     resolved = set(result.get("resolved", []))
     unresolved = set(result.get("unresolved", []))

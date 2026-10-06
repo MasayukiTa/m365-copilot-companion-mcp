@@ -10,6 +10,7 @@
   * ソケット経路が、ページと同じ意味を返すこと。とくに settled が走行中に空であること --
     ここが埋まると、ループは末尾を切り落として完了扱いにする。
 """
+from pathlib import Path
 import pytest
 
 from bridge import copilot_bridge as B
@@ -607,7 +608,9 @@ def test_every_borrowing_endpoint_gives_the_page_back_except_upload():
     """
     import inspect
 
-    src = inspect.getsource(B.Handler.do_GET)
+    # _route is the dispatch table (it was do_GET until every request went through
+    # Handler._dispatch's auth check, 2026-09-24).
+    src = inspect.getsource(B.Handler._route)
     assert src.count("borrow_page") == 5
     assert src.count("return_page") == 4
 
@@ -699,7 +702,7 @@ def test_halting_a_socket_turn_drops_the_driver_not_a_button():
 
     src = inspect.getsource(B.Handler._stream_text)
     i = src.index("except Exception as e:")
-    seg = src[i:i + 900]
+    seg = src[i:i + 2500]
     assert "release_socket_driver" in seg
     assert seg.index("_on_socket()") < seg.index("stop_button")
 
@@ -744,3 +747,8 @@ def test_the_two_reported_sites_are_covered():
     risky = _re.findall(r"logger\.(?:warning|info|error|debug)\([^\n]*?%s[^\n]*?,\s*"
                         r"(sid|url|conv_url)\s*[,)]", src)
     assert not risky, "request-derived values still logged raw: %s" % risky
+
+
+def test_bridge_refusal_detail_is_logsafe_at_the_sink():
+    src = Path(B.__file__).read_text(encoding="utf-8", errors="replace")
+    assert 'logger.warning("bridge refused %s %s: %s", method, logsafe(parsed.path),\n                               logsafe(refusal[2]))' in src

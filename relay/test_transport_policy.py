@@ -45,18 +45,37 @@ def test_v1_preserves_todays_behaviour_rather_than_yesterdays():
 
 # ---- 固定された述語 -------------------------------------------------------------------------------
 
-def test_an_attachment_never_goes_over_a_socket():
-    """socket にファイルの置き場は無い。方針の good/bad ではなく物理。"""
-    assert needs_tab(r"C:\data\sales.csv") is True
-    assert choose("このCSVを分析して", upload_path=r"C:\data\sales.csv") == TAB
+def test_an_attachment_no_longer_forces_a_tab():
+    """2026-09-18 に引退。「socket にファイルの置き場が無い」は物理ではなく未計測だった。
+
+    3つとも実測で埋まった: プロトコルに場所がある(09-17 観測、サーバが
+    messageAnnotationSource "UserAnnotated" でエコー) / 保持トークンで UploadFile が通る
+    (200・Success、ページの要求を再送しトークンのみ差替) / socket 経由の annotation を
+    モデルが**見る**(ランダム生成の語句を画像から読み返した。ファイル名・パス・プロンプト
+    のどこにも無い)。前提が偽と測れた規則は、残しても安全にはならない。"""
+    assert needs_tab(r"C:\data\sales.csv") is False
+    assert choose("このCSVを分析して", upload_path=r"C:\data\sales.csv") == SOCKET
 
 
-def test_the_structural_rule_is_applied_before_the_version_is_even_chosen():
-    """版表は『2つの意見を比べる』ための仕組み。ファイルをどこに置けるかに
-    第2の意見は存在しないので、どの版にも判断させない。"""
+def test_the_structural_veto_still_runs_before_any_version():
+    """今は何も拒否しないが、**順序**は残す。
+
+    価値があるのは規則の中身ではなく形 — どの版にも(将来 evolve された版にも)先んじる
+    拒否点があること。後から本物の構造的制約が見つかったとき、既存の版すべてを縛れる
+    場所がここにある。中身が空になった瞬間に呼び出しごと消すと、その場所が無くなる。"""
     for impl in TRANSPORT_VERSIONS.values():
-        assert impl("このCSVを分析して") == SOCKET      # 版そのものは知らない
-    assert choose("このCSVを分析して", upload_path="x.csv") == TAB
+        assert impl("このCSVを分析して") == SOCKET
+    assert choose("このCSVを分析して", upload_path="x.csv") == SOCKET
+
+    # そして順序そのもの: needs_tab が True を返せば、版が何と言おうと TAB になる。
+    import relay.transport_policy as TP
+
+    real = TP.needs_tab
+    try:
+        TP.needs_tab = lambda upload_path="": True
+        assert TP.choose("このCSVを分析して", upload_path="x.csv") == TAB
+    finally:
+        TP.needs_tab = real
 
 
 def test_workiq_goals_are_no_longer_diverted():
@@ -117,13 +136,25 @@ def test_exploration_can_send_a_tab_prediction_over_a_socket():
     assert _policy_v2("何かする", kind="other", knobs=knobs, explore=True) == SOCKET
 
 
-def test_exploration_never_overrides_the_fixed_rule():
-    """探索が安全なのは誤分類の代償がフォールバックだから。
-    添付はフォールバックにならない -- socket にファイルの置き場が無いのは
-    確率の話ではないので、探索を伸ばす先ではない。"""
+def test_exploration_never_overrides_the_structural_veto():
+    """探索が安全なのは誤分類の代償がフォールバックだから。拒否点が真を返すなら、
+    それは確率の話ではないので探索の対象にしない。添付はもうその対象ではないが、
+    **拒否点と探索の関係**は変わらないので、そこを固定する。"""
+    import relay.transport_policy as TP
+
+    real = TP.needs_tab
+    try:
+        TP.needs_tab = lambda upload_path="": True
+        assert TP.choose("このCSVを分析して", kind="other",
+                         knobs={"transport_eligible_kinds": ["code"]},
+                         explore=True, upload_path=r"C:\d.csv") == TAB
+    finally:
+        TP.needs_tab = real
+
+    # 添付そのものは、もう探索を止めない。
     assert choose("このCSVを分析して", kind="other",
                   knobs={"transport_eligible_kinds": ["code"]},
-                  explore=True, upload_path=r"C:\d.csv") == TAB
+                  explore=True, upload_path=r"C:\d.csv") == SOCKET
 
 
 def test_the_policy_itself_does_not_draw_the_random_number():

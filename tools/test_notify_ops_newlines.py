@@ -39,6 +39,10 @@ def _script(monkeypatch, **kw):
     # deleting it did not stick -- the guard kept firing and nothing was ever captured. An
     # empty value is falsy, which is what the guard actually reads.
     monkeypatch.setenv("PYTEST_CURRENT_TEST", "")
+    # The second switch (e862f8b): conftest sets MCP_SUPPRESS_GUI=1 for the whole session so
+    # that CHILD processes stay quiet too. This test deliberately reaches the real toast
+    # builder with the shell stubbed out, so it lifts that switch as well.
+    monkeypatch.delenv("MCP_SUPPRESS_GUI", raising=False)
     monkeypatch.setattr(N.subprocess, "run", _run)
     monkeypatch.setattr(N.shutil, "which", lambda _n: "powershell.exe")
     _REAL(**kw)

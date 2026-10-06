@@ -72,7 +72,7 @@ FastMCP のエントリポイント。`tools/*.py` の関数を `TOOLS` タプ�
 
 ### bridge（チャット UI・`bridge/copilot_bridge.py`）
 
-Premium / Direct Line を使わず、stdlib の `http.server` だけで自己完結の HTML チャットを配信し、Copilot の応答を差分スクレイピングでトークン単位ストリーミングします。ブラウザで `http://127.0.0.1:8765` にアクセスして使います。bridge は専用プロファイル `copilot-bridge-edge`（CDP `:9223`）で立つので、fleet の Edge（`:9222`）と取り合わず同時に使えます。
+Premium / Direct Line を使わず、stdlib の `http.server` だけで Copilot の応答を差分スクレイピングでトークン単位ストリーミングします。クライアントは CopilotChat ウィンドウと `bridge/session_cli.py`。状態を変える要求とページを読む要求はすべて POST + 起動ごとのトークン（`X-Bridge-Token`、本人のみ読めるファイル）必須で、Origin / Referer / cross-site の Sec-Fetch-Site / loopback 以外の Host を持つ要求は拒否します（`bridge/bridge_auth.py`）。ブラウザ用のチャットページは廃止しました。bridge は専用プロファイル `copilot-bridge-edge`（CDP `:9223`）で立つので、fleet の Edge（`:9222`）と取り合わず同時に使えます。
 
 ネイティブ WPF チャット `ui/CopilotChat.cs` も裏は同じ経路です。
 
@@ -171,8 +171,13 @@ MCP ツールを公開している。
 - クラウド側の作業（メール・予定表・Teams・SharePoint）は、可能なら Copilot Studio の
   純正コネクタを使う。この companion の outlook_* 等はコネクタが使えない時の代替路。
 - 出力ファイルは原則 ~/Desktop/<案件名>/ 配下に保存する。
-- 画像や PowerPoint を生成した直後は read_image / pptx_export_png で自己検証し、
-  画像欠落・豆腐化・レイアウト崩れがあれば最大 3 回まで修正と再エクスポートをループする。
+- 画像や PowerPoint を生成した直後は自己検証し、画像欠落・豆腐化・レイアウト崩れがあれば
+  最大 3 回まで修正と再エクスポートをループする。検証に使うのは pptx_export_png →
+  **ocr_image**（置いたはずの文字が返るか）と **run_python + PIL**（端で切れていないか）。
+  **read_image は使わない** — 戻り値は base64 のテキストで、このスタックのどのモデルも
+  見ていない。2026-09-17 実測: ワーカーが read_image を呼んだ直後、画像に無い文字列を
+  「目視した」と述べた。モデルに実際に見せたいときは、ターンの最終行に
+  `ANALYZE: <絶対パス> | <確認したいこと>` を書く（実ファイル添付が走る唯一の経路）。
 - 重い処理は run_python_in_background + job_wait で投げ、終わったら
   notify_desktop でユーザーに能動通知する。ユーザーをスピナーで待たせない。
 - ユーザーや案件について長期的に役立つ情報を知ったら memory_save する。

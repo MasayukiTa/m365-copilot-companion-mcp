@@ -36,15 +36,38 @@ GRADE_RESULTS = os.path.join(SWEDIR, "grade_results.jsonl")
 
 sys.path.insert(0, REPO)
 from relay.selfimprove import guards as G
+from tools import childproc as _childproc
 
+#: THE ORG MOVED, AND THE OLD NAME NOW FAILS OUTRIGHT. swebench's newer harness expects each
+#: instance to carry an `image` field, which the relocated datasets have and the princeton-nlp
+#: copies do not: grading against the old name dies with `KeyError: 'image'` inside
+#: make_test_spec, after the images have been pulled -- measured 2026-09-10, one of six causes
+#: behind three days of EVALERR verdicts. The harness's own --help now defaults to
+#: SWE-bench/SWE-bench_Lite, which is the upstream telling the same story.
 DATASETS = {
-    "Verified": "princeton-nlp/SWE-bench_Verified",
-    "Lite": "princeton-nlp/SWE-bench_Lite",
+    "Verified": "SWE-bench/SWE-bench_Verified",
+    "Lite": "SWE-bench/SWE-bench_Lite",
 }
 
 
 def log(m):
     print("[%s] %s" % (time.strftime("%H:%M:%S"), m), flush=True)
+
+
+def _spec_ids(spec_path):
+    """Every instance id the spec names, whatever shape it is stored in.
+
+    Split out of select_fresh_slice so the pool can be reported without drawing from it --
+    asking "how much is left" must not have the side effect of taking some.
+    """
+    with open(spec_path, encoding="utf-8") as fh:
+        d = json.load(fh)
+    if isinstance(d, list):
+        return [x if isinstance(x, str) else (x or {}).get("instance_id") for x in d]
+    for key in ("instance_ids", "instances", "ids"):
+        if isinstance(d.get(key), list):
+            return list(d[key])
+    return []
 
 
 def select_fresh_slice(spec_path, n, burned, seed):
@@ -61,11 +84,19 @@ def select_fresh_slice(spec_path, n, burned, seed):
 def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, conc, turns, floor):
     """Run one solve arm to completion as a BLOCKING child of this driver.
 
-    loop.py is itself the durable, detached parent (launched via Start-Process / launch_detached),
-    so the solve orchestrator runs as a normal tracked child here -- the same parent/child shape that
-    survived for hours in the manual runs. (An earlier version launched the arm *detached from this
-    already-detached driver*; the double-detach orphaned it and it was reaped mid-run.) Returns
-    (rc, env_log); rc==0 and a fresh done marker mean the arm finished cleanly.
+    loop.py is itself the durable parent, so the solve orchestrator runs as a normal tracked child
+    here -- the same parent/child shape that survived for hours in the manual runs. (An earlier
+    version launched the arm *detached from this already-detached driver*; the double-detach
+    orphaned it and it was reaped mid-run.) Returns (rc, env_log); rc==0 and a fresh done marker
+    mean the arm finished cleanly.
+
+    THIS USED TO SAY "launched via Start-Process / launch_detached" AND THE SECOND HALF WAS NEVER
+    TRUE. `guards.launch_detached` had no caller anywhere in the repository for as long as it
+    existed and was deleted on 2026-09-19; a reader here would have believed a mechanism was in
+    place that was not. The durability this driver has comes from whatever started it -- the
+    PowerShell supervisor's restart loop when it runs under one -- and NOT from a detach flag.
+    The load-bearing half of this docstring is the sentence in brackets, which is a measured
+    failure and is unchanged: the arm must stay a blocking child of this process.
     """
     env_log = os.path.join(SWEDIR, "solve_decoupled_%s.log" % tag)
     for p in (os.path.join(SWEDIR, "solve_decoupled_%s.lock" % tag),
@@ -82,7 +113,14 @@ def _run_solve_arm(spec_path, targets_file, preds_dir, tag, toggle, on, chunk, c
             "--preds-dir", preds_dir, "--tag", tag, "--chunk", str(chunk),
             "--max-concurrent", str(conc), "--max-turns", str(turns), "--effort", "auto",
             "--floor-gb", str(floor)]
-    r = subprocess.run(args, cwd=REPO, env=env)
+    # HEADLESS BECAUSE THIS DRIVER HAS NO CONSOLE. The nightly task runs
+    # `wscript.exe <launcher.vbs>` (scripts/win/register_selfimprove_nightly.ps1), chosen
+    # precisely so nothing appears on screen -- and a console program started by a parent with
+    # no console allocates its own, which Windows Terminal then shows. So the flag that was
+    # missing here put a black window on an unattended desktop every night, in the one
+    # configuration nobody is watching.
+    r = subprocess.run(args, cwd=REPO, env=env,
+                       creationflags=_childproc.headless_creationflags())
     done = G.done_after_last_start(env_log, "decoupled solve start", "solve done/paused")
     return r.returncode, done
 
@@ -108,7 +146,7 @@ def _grade_arm(preds_dir, targets_file, dataset, run_id, max_wait_min=200):
     args = [VENVPY, GRADER, "--preds-dir", preds_dir, "--targets-file", targets_file,
             "--dataset-name", dataset, "--max-workers", "12", "--run-id", run_id,
             "--max-wait-min", str(max_wait_min)]
-    subprocess.run(args, cwd=REPO)
+    subprocess.run(args, cwd=REPO, creationflags=_childproc.headless_creationflags())
     resolved = set()
     failed = set()
     infra = set()
@@ -157,9 +195,51 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     burned = G.BurnedRegistry(burned_path) if burned_path else G.BurnedRegistry()
     fresh = select_fresh_slice(spec_path, n, burned, seed)
     targets_file = os.path.join(SWEDIR, "_selfimprove_slice.txt")
+    log("fresh slice: %d instances (burned excluded: %d)" % (len(fresh), len(burned)))
+
+    # WHAT THIS CONFIGURATION CAN AND CANNOT PRODUCE, said BEFORE anything is burned --
+    # AND BEFORE ANYTHING IS WRITTEN. The targets file used to be written first and the refusal
+    # checked second, so a refused invocation still overwrote `_selfimprove_slice.txt`, the one
+    # file a validation already in progress reads its instance list from. "Refused, nothing
+    # burned" was true; "refused before doing anything" was not, and the difference is another
+    # run's input. Found 2026-09-24 by the first test to drive this through the real entry point
+    # (relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py), which had to
+    # redirect SWEDIR precisely because a refusal wrote under .fleet/.
+    #
+    # `burned.add(fresh)` runs after grading whatever the verdict was, and that is correct --
+    # the instances have been seen by the system under test, so they are contaminated even by a
+    # run that concluded nothing. The defect was that a configuration which could not reach a
+    # verdict stayed silent until the slice was already gone. Measured 2026-09-11/12: `--n 100`
+    # against `min_n=100`, one chunk of twenty lost to a staging failure, N=80, verdict
+    # `underpowered`, 100 instances burned for nothing.
+    margin = len(fresh) - int(min_n)
+    if margin < 0:
+        log("REFUSING: %d fresh instances cannot reach min_n=%d even if nothing is lost; "
+            "this would burn the slice for a guaranteed `underpowered` verdict. Raise --n, "
+            "lower --min-n, or retire burned instances."
+            % (len(fresh), min_n))
+        return {"status": "refused_underpowered_by_construction", "n": len(fresh),
+                "min_n": min_n, "burned": False, "report": None}
+    if margin == 0:
+        log("WARNING: n == min_n (%d), so a verdict needs ZERO attrition. The run of "
+            "2026-09-11 lost 20 of 100 to one staging failure and burned the slice for an "
+            "`underpowered` verdict. The default --n is 200 for this reason." % min_n)
+
     with open(targets_file, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(fresh) + "\n")
-    log("fresh slice: %d instances (burned excluded: %d) -> %s" % (len(fresh), len(burned), targets_file))
+    log("fresh slice written -> %s" % targets_file)
+
+    # HOW MUCH POOL IS LEFT, in runs rather than in instances. SWE-bench Verified is 500
+    # instances and there is no more of it; "we ran out" should be a number the operator can
+    # plan against before choosing --n, not a discovery made at the end of a night.
+    try:
+        remaining = len(burned.filter_fresh(_spec_ids(spec_path)))
+    except Exception:
+        remaining = None
+    if remaining is not None:
+        log("pool: %d fresh remain after this slice is drawn; at n=%d that is %d more run(s)"
+            % (max(0, remaining - len(fresh)), len(fresh),
+               (remaining - len(fresh)) // max(1, len(fresh))))
 
     plan = {"toggle": toggle, "n": len(fresh), "dataset": dataset_key, "alpha": alpha,
             "min_n": min_n, "min_pp": min_pp, "targets_file": targets_file}
@@ -194,6 +274,23 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
                 pass
         return n
 
+    def _present(pred_dir, instances):
+        """How many of THESE instances already have a prediction, whenever it was written.
+
+        _captured above answers "did this process just write files", which is the right
+        question for "did the solve do work" and the WRONG one for "is there anything to
+        grade". On a resume of a complete arm the solver correctly writes nothing, and reading
+        that as an infrastructure fault makes the resume path -- the one the chunk-skip logic
+        depends on -- impossible to finish.
+        """
+        if not os.path.isdir(pred_dir):
+            return 0
+        n = 0
+        for inst in (instances or []):
+            if os.path.isfile(os.path.join(pred_dir, str(inst) + ".json")):
+                n += 1
+        return n
+
     # ON arm (blocking child; resumable so a transient blip just re-runs the uncaptured chunk)
     # ONE TIMESTAMP FOR BOTH ARMS was not enough: a file touched in the OFF directory while
     # the ON arm was still running predates the OFF arm and still counted as an OFF capture.
@@ -209,10 +306,16 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     # a slice that was never solved would silently consume fresh instances; cf. the disk-floor
     # incident that wrongly burned 200). Return an infra_abort status so the caller retries later.
     on_cap = _captured(on_dir, on_started_at)
-    if on_cap == 0:
-        log("ON solve captured 0 predictions -> INFRA ABORT (disk floor / wedge); NOT burning, NOT gating")
+    # NOTHING NEW **AND** NOTHING THERE. A resume of a complete arm writes nothing and is not a
+    # wedge; measured 2026-09-12, where `0/100 remaining (captured 100)` aborted as infra.
+    on_have = _present(on_dir, fresh)
+    if on_cap == 0 and on_have == 0:
+        log("ON solve captured 0 predictions and none exist for the slice -> INFRA ABORT "
+            "(disk floor / wedge); NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "ON", "reason": "ON solve produced no predictions (infra)",
                 "burned": False, "report": None}
+    log("ON arm has %d/%d predictions for the slice (%d written by this run)"
+        % (on_have, len(fresh), on_cap))
     on_resolved, on_graded, on_failed, on_infra = _grade_arm(
         on_dir, targets_file, dataset, "sion" + time.strftime("%m%d%H%M"))
     log("ON resolved: %d/%d (graded %d)" % (len(on_resolved), len(fresh), on_graded))
@@ -232,10 +335,14 @@ def validate(toggle, spec_path, n, seed, dataset_key, alpha, min_n, min_pp,
     if not done:
         log("OFF solve did not reach its done marker (rc=%s); aborting" % rc); return None
     off_cap = _captured(off_dir, off_started_at)
-    if off_cap == 0:
-        log("OFF solve captured 0 predictions -> INFRA ABORT; NOT burning, NOT gating")
+    off_have = _present(off_dir, fresh)
+    if off_cap == 0 and off_have == 0:
+        log("OFF solve captured 0 predictions and none exist for the slice -> INFRA ABORT; "
+            "NOT burning, NOT gating")
         return {"status": "infra_abort", "arm": "OFF", "reason": "OFF solve produced no predictions (infra)",
                 "burned": False, "report": None}
+    log("OFF arm has %d/%d predictions for the slice (%d written by this run)"
+        % (off_have, len(fresh), off_cap))
     off_resolved, off_graded, off_failed, off_infra = _grade_arm(
         off_dir, targets_file, dataset, "sioff" + time.strftime("%m%d%H%M"))
     log("OFF resolved: %d/%d (graded %d)" % (len(off_resolved), len(fresh), off_graded))

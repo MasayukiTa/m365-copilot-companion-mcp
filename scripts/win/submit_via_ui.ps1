@@ -10,9 +10,9 @@
 # in it; the same rule is how several goals are started together, which is the only way to
 # start several -- see below.
 #
-# CTRL+ENTER STEERS WHILE A RUN IS ACTIVE (FleetCockpit.cs:3488), it does not add a goal. So a
-# second submission during a run does not do what it looks like it does, and this refuses
-# rather than quietly steering something the caller did not mean to touch.
+# THE BOTTOM COMPOSER ADDS TASKS WHILE A RUN IS ACTIVE. Start/Send and Ctrl+Enter share the
+# same current cockpit path: idle starts a run, live enqueues add_goal work. Steering is a
+# per-worker card action and this helper intentionally does not emulate it.
 #
 #   powershell -NoProfile -File scripts/win/submit_via_ui.ps1 -Goal "..." [-Command "/fanout on"]
 #   powershell -NoProfile -File scripts/win/submit_via_ui.ps1 -ReadOnly
@@ -28,6 +28,8 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+$RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+. (Join-Path $PSScriptRoot 'gui_submit_lock.ps1')
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 
 if (-not ('Win32.Wnd' -as [type])) {
@@ -106,7 +108,25 @@ function Get-Edits($window) {
     $cond = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Edit)
-    return $window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
+    # THE LEADING COMMA IS LOAD-BEARING. PowerShell unwraps a collection of exactly one
+    # element as it leaves a function, so with a single Edit on screen this returned the
+    # AutomationElement ITSELF rather than a collection of one, and the caller's
+    # `$edits.Item($i)` died with
+    #     [System.Windows.Automation.AutomationElement] does not contain a method named 'Item'
+    #
+    # WHAT MADE IT HARD TO SEE: `$edits.Count` still says 1 afterwards, because PowerShell
+    # gives every object a synthetic Count. So the line above it prints "editable fields: 1",
+    # which looks like the collection is intact, and the failure lands one line later on a
+    # method call. Two facts that disagree, with the reassuring one printed first.
+    #
+    # WHEN IT FIRES: a cockpit that has just been rebuilt has no history box and no worker
+    # cards, so goalInput is the ONLY Edit in the tree -- exactly one. A freshly started
+    # cockpit therefore hit this every time, while one that had been used did not.
+    #
+    # The same shape is safe at the two other FindAll sites in this file (`$wins`, `$btns`)
+    # because those assign the result to a variable inside the same scope; the unwrap happens
+    # on the way OUT of a function, and only this one returns.
+    return ,$window.FindAll([System.Windows.Automation.TreeScope]::Descendants, $cond)
 }
 
 function Set-Text($element, [string]$text) {
@@ -121,6 +141,9 @@ function Set-Text($element, [string]$text) {
     return $false
 }
 
+$submitLockTimeout = [Math]::Max(90, $TimeoutSeconds + 15)
+$submitLock = Enter-GuiSubmitLock -RepoRoot $RepoRoot -TimeoutSeconds $submitLockTimeout
+try {
 $win = Get-Cockpit
 $name = $win.Current.Name
 Write-Output ("cockpit: {0}" -f $name)
@@ -165,7 +188,7 @@ if ($Goal.Count -gt 0) {
 }
 
 # READONLY IS A DRY RUN, not just a field dump: it prints exactly what would go in.
-if ($ReadOnly) { exit 0 }
+if ($ReadOnly) { return }
 
 # WHICH BOX IS THE GOAL BOX. By AutomationId, which the cockpit now sets. Before it did,
 # the only distinguishing property was WIDTH -- 1008 pixels against the history search
@@ -213,17 +236,55 @@ if ($target) {
 #
 # keybd_event goes through SendInput, which has no hook and no timeout, so a busy machine
 # delays the keystroke instead of failing it. Same keys, same window, no journal.
-function Send-CtrlEnter {
-    $VK_CONTROL = 0x11; $VK_RETURN = 0x0D; $KEYEVENTF_KEYUP = 0x0002
-    [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, 0, [System.UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 40
-    [Win32.KeyInput]::keybd_event($VK_RETURN, 0, 0, [System.UIntPtr]::Zero)
-    Start-Sleep -Milliseconds 40
-    [Win32.KeyInput]::keybd_event($VK_RETURN, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
-    [Win32.KeyInput]::keybd_event($VK_CONTROL, 0, $KEYEVENTF_KEYUP, [System.UIntPtr]::Zero)
+#
+# AND THEN KEYSTROKES WERE DROPPED ENTIRELY (2026-08-30). Submit now invokes the Start/Send
+# button through InvokePattern, which needs no focus and no foreground window at all -- see
+# the comment inside Submit. The Send-CtrlEnter that used to live here was left behind,
+# called from nowhere, for a fortnight: a function that still looks like the way this script
+# works, that a reader would reasonably call, and that would silently reintroduce the
+# focus-dependence the button-invoke exists to avoid. Deleted rather than kept "in case",
+# because the history above is the part worth keeping and it is right here.
+
+function Get-GoalAcceptanceSnapshot([string[]]$goals) {
+    $statusPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) ".fleet/status.json"
+    $started = ""
+    $running = $false
+    $matchCount = 0
+    try {
+        if (Test-Path $statusPath) {
+            $st = Get-Content $statusPath -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($null -ne $st.started) { $started = [string]$st.started }
+            $running = [bool]$st.running
+            $wanted = @{}
+            foreach ($g in @($goals)) {
+                if (-not $wanted.ContainsKey($g)) { $wanted[$g] = 0 }
+                $wanted[$g]++
+            }
+            $seen = @{}
+            foreach ($w in @($st.workers)) {
+                $wg = [string]$w.goal
+                if (-not $wanted.ContainsKey($wg)) { continue }
+                if (-not $seen.ContainsKey($wg)) { $seen[$wg] = 0 }
+                $seen[$wg]++
+            }
+            foreach ($g in $wanted.Keys) {
+                $matchCount += [Math]::Min([int]$wanted[$g], [int]($seen[$g]))
+            }
+        }
+    } catch { }
+    return [PSCustomObject]@{ Started = $started; Running = $running; MatchCount = $matchCount }
 }
 
-function Submit([string]$text) {
+function Test-GoalAccepted($before, $after, [int]$expectedCount) {
+    if ($expectedCount -le 0 -or $null -eq $before -or $null -eq $after) { return $false }
+    $fresh = $after.Running -and -not [String]::IsNullOrEmpty([string]$after.Started) -and
+             ($after.Started -ne $before.Started) -and ($after.MatchCount -ge $expectedCount)
+    $liveGrowth = ($after.Started -eq $before.Started) -and
+                  ($after.MatchCount -ge ($before.MatchCount + $expectedCount))
+    return [bool]($fresh -or $liveGrowth)
+}
+
+function Submit([string]$text, [switch]$ExpectFleetGoal) {
     # CTRL+ENTER, NOT ENTER. The composer sets AcceptsReturn, so a plain Enter inserts a
     # newline and nothing is submitted -- which is exactly what happened the first time
     # this ran: the goal went into the box, the box grew a line, and no run started while
@@ -252,14 +313,23 @@ function Submit([string]$text) {
     # the composer's Return handler the same body -- and InvokePattern needs no focus, no
     # foreground window and no keyboard at all.
     $startBtn = $null
+    # BY AUTOMATION ID FIRST. The button text changes with language AND run state (Start -> Add),
+    # and a localized/corrupted label already made a live add impossible while goalInput was
+    # found correctly. Identity must not depend on presentation text.
+    $startId = New-Object System.Windows.Automation.PropertyCondition(
+        [System.Windows.Automation.AutomationElement]::AutomationIdProperty, 'startButton')
+    $byId = $win.FindFirst([System.Windows.Automation.TreeScope]::Descendants, $startId)
+    if ($byId -and $byId.Current.IsEnabled) {
+        $startBtn = $byId
+        Write-Output 'start button: found by AutomationId'
+    }
+
+    # Compatibility fallback for a cockpit binary that predates startButton.
     $bc = New-Object System.Windows.Automation.PropertyCondition(
         [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
         [System.Windows.Automation.ControlType]::Button)
     $btns = $win.FindAll([System.Windows.Automation.TreeScope]::Descendants, $bc)
-    # BY NAME, in both languages the cockpit ships. The name comes from T("start"), so these
-    # two strings are the whole set -- matching on width instead would pick a different
-    # button the moment the layout changes.
-    $wanted = @("並列実行を開始", "Start parallel run", "送信", "Send")
+    $wanted = @("������s���J�n", "Start parallel run", "���M", "Send", "�ǉ�", "Add")
     for ($i = 0; $i -lt $btns.Count -and -not $startBtn; $i++) {
         $b = $btns.Item($i)
         if ($wanted -contains $b.Current.Name -and $b.Current.IsEnabled) { $startBtn = $b }
@@ -272,26 +342,76 @@ function Submit([string]$text) {
     if (-not $startBtn.TryGetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern, [ref]$ip)) {
         throw "the start button does not support Invoke"
     }
+
+    # FAIL CLOSED ON COMPOSER CORRUPTION. ValuePattern.SetValue() above is supposed to replace
+    # the whole text atomically, but an unattended machine can still receive an external edit
+    # between that write and this button invoke. Measured 2026-09-28: a 645-char READ-ONLY goal
+    # reached goals_input.txt as 646 chars with a leading "3". Re-read the SAME textbox at the
+    # last possible moment and require an ordinal exact match before creating any durable work.
+    $vpVerify = $null
+    if (-not $target.TryGetCurrentPattern(
+            [System.Windows.Automation.ValuePattern]::Pattern, [ref]$vpVerify)) {
+        throw "cannot re-read the composer immediately before submit"
+    }
+    $observed = [string]$vpVerify.Current.Value
+    if (-not [String]::Equals($observed, $text, [StringComparison]::Ordinal)) {
+        $common = [Math]::Min($observed.Length, $text.Length)
+        $at = 0
+        while ($at -lt $common -and $observed[$at] -eq $text[$at]) { $at++ }
+        $expectedCode = if ($at -lt $text.Length) { "U+{0:X4}" -f [int][char]$text[$at] } else { "<end>" }
+        $observedCode = if ($at -lt $observed.Length) { "U+{0:X4}" -f [int][char]$observed[$at] } else { "<end>" }
+        throw ("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
+               "Nothing was submitted and the current composer text was left untouched." -f
+               $at, $expectedCode, $observedCode, $text.Length, $observed.Length)
+    }
+
+    $expectedGoals = @()
+    $baseline = $null
+    if ($ExpectFleetGoal) {
+        $expectedGoals = @($text -split "`r?`n" | ForEach-Object { $_.Trim() } |
+                           Where-Object { $_.Length -gt 0 -and -not $_.StartsWith('#') })
+        if ($expectedGoals.Count -eq 0) { throw "fleet goal submission contains no usable goal lines" }
+        $baseline = Get-GoalAcceptanceSnapshot $expectedGoals
+    }
+
     [Console]::Error.WriteLine(("submit: invoking button '{0}'" -f $startBtn.Current.Name))
     $ip.Invoke()
 
     Start-Sleep -Milliseconds 900
-    # AND VERIFY, because a submit that silently did nothing is the failure mode this
-    # whole script exists to catch. An emptied box is the cockpit acknowledging it.
+    # VERIFY THE HANDOFF, not one historical UI side-effect. Older cockpit builds cleared the
+    # composer immediately. Current fresh-Start deliberately keeps operator text until the new
+    # runner actually owns the state-dir and its goal appears in status.json. A still-filled box
+    # can therefore mean "durably waiting for the closing coordinator", not "nothing happened".
     $after = ""
     $vp2 = $null
     if ($target.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp2)) {
-        $after = $vp2.Current.Value
+        $after = [string]$vp2.Current.Value
     }
-    if ($after.Trim().Length -gt 0) {
-        throw ("the composer still holds text after Ctrl+Enter; nothing was submitted: " +
+    if ($after.Trim().Length -eq 0) {
+        Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
+        return
+    }
+    if (-not $ExpectFleetGoal) {
+        throw ("the composer still holds text after button invoke; command was not accepted: " +
                $after.Substring(0, [Math]::Min(60, $after.Length)))
     }
-    Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
+
+    $acceptDeadline = (Get-Date).AddSeconds([Math]::Max([int]$TimeoutSeconds, 65))
+    while ((Get-Date) -lt $acceptDeadline) {
+        $now = Get-GoalAcceptanceSnapshot $expectedGoals
+        $accepted = Test-GoalAccepted $baseline $now $expectedGoals.Count
+        if ($accepted) {
+            Write-Output ("submitted: {0}" -f ($text.Substring(0, [Math]::Min(70, $text.Length))))
+            return
+        }
+        Start-Sleep -Milliseconds 200
+    }
+    throw ("submission was not accepted before the timeout; composer text was preserved: " +
+           $after.Substring(0, [Math]::Min(60, $after.Length)))
 }
 
-# IS A RUN ALREADY GOING? The cockpit does not say so through automation, so ask the record
-# the fleet keeps. Getting this wrong steers a running goal with the text of a new one.
+# IS A RUN ALREADY GOING? Keep this diagnostic visible because it is useful when a GUI submit
+# misbehaves. It no longer changes Goal semantics: the bottom composer adds tasks in a live run.
 $running = $false
 try {
     $statusPath = Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) ".fleet/status.json"
@@ -305,15 +425,21 @@ Write-Output ("run in flight: {0}" -f $running)
 if ($Command) { Submit $Command }
 
 if ($Goal.Count -gt 0) {
-    if ($running -and -not $Steer) {
-        throw ("a run is in flight, and Ctrl+Enter steers rather than starts while one is. " +
-               "Wait for it, or pass -Steer if steering is what was meant.")
+    if ($Steer) {
+        # The bottom composer is task intake in BOTH idle and live states now. Invoking its
+        # button with -Steer would therefore ADD A TASK, not steer, which is worse than refusing.
+        # Steering remains a per-worker card action until this UIA helper grows a card-targeted
+        # path with an explicit worker identity.
+        throw "-Steer is not supported by the current cockpit bottom composer; steer from the target worker card instead"
     }
-    if ($Steer -and $Goal.Count -gt 1) { throw "steer one message at a time" }
     foreach ($g in $Goal) {
         if ($g -match "`n") { throw "a goal may not contain a newline; the cockpit splits on them" }
     }
-    # SEVERAL GOALS GO IN TOGETHER, one per line, and start as one fleet. Submitting them one
-    # at a time cannot work: the first starts a run, and every later one steers it.
-    Submit ($Goal -join "`n")
+    # The same visible button is Start when idle and Add while a run is live. Multiple goals are
+    # placed in the composer together, one per line; Cockpit splits them into independent add_goal
+    # items and its durable handoff/ack path owns the run-ending race.
+    Submit ($Goal -join "`n") -ExpectFleetGoal
+}
+} finally {
+    Exit-GuiSubmitLock $submitLock
 }

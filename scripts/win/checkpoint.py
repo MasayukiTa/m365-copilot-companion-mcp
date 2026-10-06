@@ -28,16 +28,18 @@ MANAGED = ("copilot-companion-edge", "copilot-bridge-edge", "copilot-eval-edge")
 
 def _ps(script, timeout=40):
     try:
-        return subprocess.run(["powershell", "-NoProfile", "-Command", script],
-                              capture_output=True, text=True, timeout=timeout).stdout
+        sys.path.insert(0, REPO)
+        from tools import childproc
+        # This helper runs from the pre-launch gate, whose parent is commonly a windowless
+        # WPF/wscript/supervisor process. A bare console child in that situation is given a
+        # brand-new visible console by Windows -- the PowerShell flash seen when a fleet/Copilot
+        # agent starts. The query is fully unattended, so it must state the no-console policy
+        # instead of inheriting whatever console its parent happens to have.
+        return childproc.run(["powershell", "-NoProfile", "-Command", script],
+                             timeout=timeout,
+                             creationflags=childproc.headless_creationflags()).stdout
     except Exception:
         return ""
-
-
-def pages(port):
-    """Open page URLs, or None if the port is not answering."""
-    got = targets(port)
-    return None if got is None else [t.get("url", "") for t in got]
 
 
 def _listening(port, timeout_s=0.5):
@@ -77,7 +79,14 @@ def _listening(port, timeout_s=0.5):
 
 
 def targets(port):
-    """Open page targets, ids included, or None. The id is how a claim is matched."""
+    """Open page targets, ids included, or None. The id is how a claim is matched.
+
+    A `pages(port)` sat beside this until 2026-09-14, returning the same list with only the
+    urls. It had no caller and no test: the one reader here needs the ids too, because
+    ownership is matched by id and a url alone cannot answer the question this file exists to
+    ask. Removed rather than kept -- a narrower view of a function the caller needs in full is
+    a row on the unreached list and nothing else.
+    """
     # ASK WHETHER ANYONE IS THERE BEFORE ASKING WHAT THEY HAVE. urlopen against a port with
     # nothing bound waits out its full timeout -- measured 2.03 s for port 9224, the eval
     # Edge, which is not running for most launches. The launch gate calls this once per port,
@@ -122,13 +131,18 @@ def unowned(copilot_targets):
     return ownership.reconcile(observed, _pid_alive)["orphaned"]
 
 
-def edge_state():
+def edge_state(memory=True):
     """Per managed profile: {"mb": resident private MB, "headed": owns a window}.
 
     THE MEMORY FIGURE IS PRIVATE WORKING SET, not the sum of WorkingSetSize this used to
     report. That counter includes SHARED pages and a Chromium browser is fifteen processes
     sharing one binary, so every figure this line printed on 2026-08-27 was 2.4 to 2.9 times
     too large -- 295 MB where the machine, and Task Manager, said 122.
+
+    `memory=False` leaves "mb" at 0 and does not ask. The figure costs a PowerShell CIM query
+    of 4-5 s, and the launch gate -- which runs this before EVERY fleet run -- reads only
+    "headed": measured 2026-09-24, 9.3 of the gate's 12.9 s went on two memory figures that
+    _launch_blockers then discarded, between a goal's submission and its first turn.
     """
     raw = _ps("Get-CimInstance Win32_Process -Filter \"Name='msedge.exe'\" | "
               "Select-Object CommandLine | ConvertTo-Json -Compress -Depth 3")
@@ -146,11 +160,13 @@ def edge_state():
                 rec = out.setdefault(prof, {"mb": 0, "headed": False})
                 if "--type=" not in cmd and "--headless" not in cmd:
                     rec["headed"] = True
+    if not memory or not out:
+        return out
     try:
         sys.path.insert(0, os.path.join(REPO, "scripts", "win"))
-        from edge_memory import private_mb
-        for prof in list(out):
-            out[prof]["mb"] = private_mb(prof) or 0
+        from edge_memory import private_mb_by_profile
+        for prof, mb in private_mb_by_profile(list(out)).items():
+            out[prof]["mb"] = mb or 0
     except Exception:
         pass
     return out
@@ -201,19 +217,22 @@ def run_state():
         return {}
 
 
-def verdicts_now():
+def verdicts_now(memory=True):
     """The invariants and whether each holds, as data. Returns (verdicts, extras).
 
     Split out of main() so a LAUNCH can ask the same question the screen answers. The whole
     lesson of the leaked page was that a breach nobody is obliged to read is worthless: the
     detector wrote it at 22:40 and runs were launched on top of it for nine and a half hours.
     A gate that calls this cannot not-read it.
+
+    `memory=False` skips the per-browser memory figure, which only extras["memory"] carries
+    and no verdict reads; see edge_state.
     """
     today = time.strftime("%Y-%m-%d")
     verdicts = []
 
     # 1. No browser owns a window.
-    edge = edge_state()
+    edge = edge_state(memory=memory)
     headed = [p for p, r in edge.items() if r["headed"]]
     verdicts.append(("no browser window", not headed,
                      "headed: %s" % (", ".join(headed) if headed else "none")))

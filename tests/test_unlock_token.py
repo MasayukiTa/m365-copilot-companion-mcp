@@ -9,10 +9,11 @@ WHAT REPLACES IT. `unlock(password)` issues a random token, stores only its hash
 it once. Mutating and execution tools reach the server through one gateway, so the token is
 presented as an argument there and stripped before dispatch -- 116 tool signatures unchanged.
 
-ENFORCEMENT IS OFF BY DEFAULT and these tests pin that too. Requiring the token before anyone
-has re-unlocked would refuse every live session at once, and an outage is how a security change
-gets reverted wholesale instead of kept. The gap counter is what says when it is safe to turn
-on; `test_a_call_without_a_token_is_counted` is the test that keeps that promise honest.
+ENFORCEMENT IS ON BY DEFAULT since 2026-09-24 (SEC-02), and these tests pin that too. It was
+off until the gap counter said switching it on would break nobody; on the production host
+(.env sets MCP_REQUIRE_UNLOCK_TOKEN=1) it has not moved since 2026-09-13 -- see
+enforce_unlock_token's docstring for the numbers. Only the explicit value "0"
+turns it off, and the record-only behaviour under "0" is still pinned below.
 """
 import hashlib
 import json
@@ -107,23 +108,39 @@ def test_a_token_for_a_different_identity_does_not_transfer(monkeypatch):
     assert S.require_unlocked() is not None
 
 
-# ---- the default is record-only, and it records --------------------------------------
+# ---- the default enforces; only an explicit "0" is record-only -------------------------
 
-def test_enforcement_is_off_by_default(monkeypatch):
+def test_enforcement_is_on_by_default(monkeypatch):
     monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
-    assert S.enforce_unlock_token() is False
+    assert S.enforce_unlock_token() is True
 
 
-def test_a_call_without_a_token_is_allowed_but_counted(monkeypatch):
-    """The counter is what lets the switch be flipped on evidence rather than on hope.
+@pytest.mark.parametrize("value,enforced", [("1", True), ("", True), ("yes", True),
+                                            ("0", False), (" 0 ", False)])
+def test_only_an_explicit_zero_turns_enforcement_off(monkeypatch, value, enforced):
+    """A blank or mistyped value must fail closed -- the old `== "1"` test made every value but
+    one exact spelling mean 'identity alone is enough'."""
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", value)
+    assert S.enforce_unlock_token() is enforced
 
-    Turning enforcement on while live callers still have no token is an outage, and an outage
-    is how the whole change gets reverted. When this stops growing it is safe.
-    """
+
+def test_the_identity_alone_is_refused_by_default(monkeypatch):
+    """THE ATTACK, with no configuration at all: an API key plus the forwarded address of a
+    client that did unlock, and neither its token nor its session."""
     _unlock_with(monkeypatch)
     monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
     S.clear_presented_token()
-    assert S.require_unlocked() is None, "the default must not break a live session"
+    refusal = S.require_unlocked()
+    assert refusal is not None and refusal.startswith("[locked: no valid unlock token")
+    assert lock_state.token_gap().get("count", 0) == 0, "a refusal is not a gap"
+
+
+def test_a_call_without_a_token_is_allowed_but_counted_when_switched_off(monkeypatch):
+    """MCP_REQUIRE_UNLOCK_TOKEN=0 keeps the old record-only behaviour, and still records."""
+    _unlock_with(monkeypatch)
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "0")
+    S.clear_presented_token()
+    assert S.require_unlocked() is None
     gap = lock_state.token_gap()
     assert gap.get("count") == 1
     assert IP in (gap.get("ips") or {})
@@ -132,7 +149,7 @@ def test_a_call_without_a_token_is_allowed_but_counted(monkeypatch):
 def test_a_call_with_a_token_is_not_counted(monkeypatch):
     out = _unlock_with(monkeypatch)
     token = [l.split(": ", 1)[1] for l in out.splitlines() if l.startswith("unlock_token: ")][0]
-    monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "0")
     S.set_presented_token(token)
     assert S.require_unlocked() is None
     assert lock_state.token_gap().get("count", 0) == 0
@@ -217,6 +234,26 @@ def test_the_token_list_is_bounded(monkeypatch):
         _unlock_with(monkeypatch)
     entry = json.loads(S.STATE_FILE.read_text(encoding="utf-8"))[IP]
     assert len(entry["token_hashes"]) == S._MAX_TOKENS_PER_IDENTITY
+
+
+def test_a_shared_identity_survives_the_observed_production_unlock_rate(monkeypatch):
+    """MEASURED 2026-09-09. One identity (the M365 Copilot Studio connector's shared egress
+    IP) issued 56 successful unlock() calls within about an hour -- every fleet worker sharing
+    that address is a different client landing on the same identity. With the old cap (8) the
+    9th of those unlocks silently evicted the 1st worker's still-in-use token, and every
+    following call from that worker was refused for a token that WAS correctly presented and
+    HAD been issued, just no longer kept -- ~4,900 refusals/hour, all "is_unlocked=True, token
+    does not match". This pins the fix at the measured rate: the token from position 0 of a
+    56-unlock run must still be live at the end of it."""
+    tokens = []
+    for _ in range(56):
+        out = _unlock_with(monkeypatch)
+        tokens.append(
+            [l.split(": ", 1)[1] for l in out.splitlines() if l.startswith("unlock_token: ")][0])
+    monkeypatch.setenv("MCP_REQUIRE_UNLOCK_TOKEN", "1")
+    S.set_presented_token(tokens[0])
+    assert S.require_unlocked() is None, \
+        "the first worker's token was evicted before its job could finish"
 
 
 def test_an_entry_written_before_multi_token_still_works(monkeypatch):

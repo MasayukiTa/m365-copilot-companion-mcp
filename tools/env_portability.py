@@ -31,6 +31,8 @@ import os
 MACHINE_BOUND = {
     # DPAPI, CryptProtectData with no LOCAL_MACHINE flag -- see tools/secret_store.protect_secret.
     # Decryptable only by the Windows account that wrote it, on the machine that wrote it.
+    "MCP_API_KEY_PROTECTED":
+        "DPAPI value bound to the Windows account that created it",
     "MCP_UNLOCK_PASSWORD_PROTECTED":
         "DPAPI value bound to the Windows account that created it",
     # A dev tunnel belongs to the account that hosts it and cannot be renamed
@@ -39,6 +41,12 @@ MACHINE_BOUND = {
         "the dev tunnel is owned by the account that hosts it",
     "MCP_TUNNEL_URL":
         "derived from the tunnel this machine hosts",
+    # The stamp that says WHICH machine minted MCP_TUNNEL_URL (bootstrap.py _this_host,
+    # setup_devtunnel.ps1 Get-ThisHost). Carried, it names the old machine beside a URL that
+    # was dropped, i.e. it claims provenance for a value that is no longer there -- the exact
+    # state bootstrap.py refuses to write ("STAMPED ONLY BESIDE A URL").
+    "MCP_TUNNEL_HOST":
+        "names the machine that minted MCP_TUNNEL_URL",
     # Points at a host reachable from the machine it was configured on.
     "SWE_EVAL_HOST":
         "names a host resolved from the original machine",
@@ -101,8 +109,17 @@ def merge_for_new_machine(old_text: str, current_text: str = "") -> dict:
         carried.append(key)
 
     # Whatever this machine already established stays, including its own machine-bound values.
-    for key, value in parse_env(current_text):
-        merged[key] = value
+    #
+    # AN EMPTY LOCAL VALUE IS NOT "ESTABLISHED". The loop above already decided that -- it
+    # carries the old value when the local one is blank (`local[key]` is falsy) and lists the
+    # key in `carried` -- and this loop then overwrote the carried value with the blank one, so
+    # `A=` came out while `carried` said A had been carried. Measured 2026-09-24:
+    # merge_for_new_machine("A=1\n", "A=\n") -> lines ["A=", ...], carried ["A"]. Iterating
+    # `local` (last occurrence wins, as dotenv applies it) and skipping a blank that would
+    # replace a carried value makes the two loops agree with each other and with the docstring.
+    for key, value in local.items():
+        if value or key not in merged:
+            merged[key] = value
 
     for key, value in BEHAVIOURAL_DEFAULTS.items():
         if key not in merged:
@@ -148,21 +165,40 @@ def repair_unlock_password(env_path: str, environ=None) -> dict:
     import shutil
 
     fresh = binascii.hexlify(_os.urandom(8)).decode("ascii")   # same shape setup.ps1 generates
+
+    # THE ONE VALUE NO CALLER CAN SCRUB IS THE ONE THIS FUNCTION INVENTS.
+    #
+    # Every reason string below is built from an exception, and a Python exception routinely
+    # carries the offending value in its message -- `protect_secret(fresh)` most of all, since
+    # `fresh` is its argument. scripts/repair_unlock.py removes .env's values from whatever it
+    # prints, which is the right idea and cannot reach this one: `fresh` was minted here, a
+    # moment ago, and is in no .env anyone parsed. So a failure to protect the new password
+    # could print the new password, on a stream scripts/start_all.ps1 captures into logs, from
+    # a public repository. Flagged as py/clear-text-logging-sensitive-data (alert #32) and it
+    # was not a false positive: the sanitizer downstream was scrubbing the wrong set.
+    #
+    # Redacted here, where the value is known exactly, rather than asking every caller to be
+    # told about a secret it otherwise never sees. No length floor: this is not a guess about
+    # which strings might be secret, it is the secret.
+    def _said(exc):
+        """The exception's text with the new password taken out of it."""
+        return str(exc).replace(fresh, "<redacted:new unlock password>")
+
     try:
         protected = protect_secret(fresh)
     except Exception as exc:
-        return {"acted": False, "reason": "cannot protect a new value here: %s" % exc}
+        return {"acted": False, "reason": "cannot protect a new value here: %s" % _said(exc)}
 
     try:
         with open(env_path, "r", encoding="utf-8-sig") as fh:
             text = fh.read()
     except Exception as exc:
-        return {"acted": False, "reason": "cannot read %s: %s" % (env_path, exc)}
+        return {"acted": False, "reason": "cannot read %s: %s" % (env_path, _said(exc))}
 
     try:
         shutil.copyfile(env_path, env_path + ".before-unlock-repair")
     except Exception as exc:
-        return {"acted": False, "reason": "refusing to edit without a backup: %s" % exc}
+        return {"acted": False, "reason": "refusing to edit without a backup: %s" % _said(exc)}
 
     out, replaced = [], False
     for line in text.splitlines():
@@ -187,13 +223,11 @@ def repair_unlock_password(env_path: str, environ=None) -> dict:
     if environ is None:
         os.environ[UNLOCK_PASSWORD_PROTECTED_VAR] = protected
         os.environ.pop(UNLOCK_PASSWORD_VAR, None)
-    # THE NEW PASSWORD GOES BACK TO THE CALLER. Generating one and telling nobody left the
-    # operator holding a password from the machine that produced the .env -- which no longer
-    # works here -- while every check reported green and unlock() simply refused. Automatic
-    # unlock inside the fleet and bridge is unaffected either way; a person typing
-    # unlock(password) by hand is not, and that is exactly who sets up a new machine.
+    # DO NOT RETURN THE FRESH CLEAR-TEXT PASSWORD. Automatic startup captures repair status,
+    # and a return value propagated into that status path can become a logging leak. The value
+    # is now durable only as the DPAPI-protected .env entry above; the interactive
+    # copilot_studio_values.ps1 reads/decrypts it locally when a person explicitly asks to see it.
     return {"acted": True, "reason": "re-established the unlock password for this machine",
-            "password": fresh,
             "backup": env_path + ".before-unlock-repair"}
 
 
@@ -220,3 +254,47 @@ def problems(environ=None) -> list:
     except Exception:
         pass
     return found
+
+
+def machine_bound_keys_in(text: str) -> "list[str]":
+    """The keys of `text` that merge_for_new_machine would DROP on a move, in file order.
+
+    ONE COPY OF THE RULES. scripts/setup_devtunnel.ps1 has to decide what to set aside when
+    .env was carried from another machine, and it used to carry its own answer ("the URL")
+    while this module -- the classification written for exactly that move -- had no caller
+    (D7 in the 2026-09-24 new-PC review): the tunnel NAME travelled, both PCs hosted one
+    tunnel, and Copilot Studio's calls were split between them. It now asks here instead of
+    keeping a second list. Only key names come back; a value never leaves this function.
+    """
+    out = []
+    for key, _why in merge_for_new_machine(text or "")["dropped"]:
+        if key not in out:
+            out.append(key)
+    return out
+
+
+def _main(argv) -> int:
+    """`python tools/env_portability.py machine-bound <env-file>` -> one `dropped:<KEY>` line
+    per machine-bound key present, then `done:<count>`. Stdlib only and runnable as a plain
+    file, so a PowerShell caller needs any Python 3, not the project's .venv. Values are never
+    printed: this file holds every secret on the machine."""
+    if len(argv) != 3 or argv[1] != "machine-bound":
+        print("error:usage: env_portability.py machine-bound <env-file>")
+        return 2
+    try:
+        with open(argv[2], "r", encoding="utf-8-sig") as fh:
+            text = fh.read()
+    except Exception as exc:                       # noqa: BLE001
+        # The type and the path only. The path is ours; an OSError message is the path too.
+        print("error:cannot read %s (%s)" % (argv[2], type(exc).__name__))
+        return 2
+    keys = machine_bound_keys_in(text)
+    for key in keys:
+        print("dropped:%s" % key)
+    print("done:%d" % len(keys))
+    return 0
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    raise SystemExit(_main(_sys.argv))
