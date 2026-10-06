@@ -65,6 +65,13 @@ class _Session:
         self.socket = False
         self._socket_tried = True
         self.finished = []
+        # the recording state the real session carries (see RefuterSession.__init__)
+        self.recorder = None
+        self.exchanges = []
+        self.last_route = ""
+        self._last_received = None
+        self.lens = ""
+        self.unverifiable = False
 
     def _finish(self, verdict):
         self.finished.append(verdict)
@@ -77,6 +84,8 @@ class _Session:
     # 実物から借りる。束縛し忘れると poll の包括 except が AttributeError を
     # 拾って UNCLEAR に変えるので、器の不備がテストの結論に化ける。
     _nudge = R.RefuterSession._nudge
+    _note = R.RefuterSession._note
+    _note_reply = R.RefuterSession._note_reply
 
 
 def _run(script, *, unified, monkeypatch, polls=6, tick=3.0):

@@ -1126,6 +1126,8 @@ class CockpitWindow : Window
     // writing 26 MB a day.
     int _fleetLogDays = 14;    // settings.txt fleet_log_days=
     int _fleetStoreDays = 30;  // settings.txt fleet_store_days=   (run transcripts)
+    int _sidebarCap = 8;       // settings.txt sidebar_section_cap= (chat sidebar rows per section; 0 = all)
+    TextBlock _sidebarCapValue;
     //: MUST MATCH tools/settings_keys.py's declared defaults, which
     //: test_the_panel_shows_the_same_default_the_fleet_uses pins. relay/fleet_retention.py
     //: read both of these on every run while no control here wrote either, so the panel's
@@ -1682,6 +1684,9 @@ class CockpitWindow : Window
         if (k == "set_fleetret_section") return ja ? "作業ディレクトリの保持" : "Working directory retention";
         if (k == "fleet_log_days") return ja ? "ログ(日)" : "Logs (days)";
         if (k == "fleet_store_days") return ja ? "実行記録(日)" : "Run records (days)";
+        if (k == "set_sidebar_section") return ja ? "チャットのサイドバー" : "Chat sidebar";
+        if (k == "sidebar_section_cap") return ja ? "各節の表示件数(0=すべて)" : "Rows per section (0 = all)";
+        if (k == "sidebar_cap_all") return ja ? "すべて" : "All";
         if (k == "fleet_scratch_days") return ja ? "作業ファイル(日)" : "Scratch files (days)";
         if (k == "fleet_compress_hours") return ja ? "圧縮まで(時間)" : "Compress after (h)";
         if (k == "fleet_ret_note") return ja
@@ -1831,6 +1836,8 @@ class CockpitWindow : Window
                     _rateCeiling = Math.Max(0, Math.Min(10000, v));
                 else if (ln.StartsWith("fleet_log_days=") && int.TryParse(ln.Substring(15).Trim(), out v))
                     _fleetLogDays = Math.Max(1, Math.Min(3650, v));
+                else if (ln.StartsWith("sidebar_section_cap=") && int.TryParse(ln.Substring(20).Trim(), out v))
+                    _sidebarCap = Math.Max(0, Math.Min(500, v));
                 else if (ln.StartsWith("fleet_store_days=") && int.TryParse(ln.Substring(17).Trim(), out v))
                     _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
                 else if (ln.StartsWith("fleet_scratch_days=") && int.TryParse(ln.Substring(19).Trim(), out v))
@@ -8148,6 +8155,13 @@ class CockpitWindow : Window
         if (_fleetLogDaysValue != null) _fleetLogDaysValue.Text = _fleetLogDays.ToString();
     }
 
+    void SetSidebarCap(int v)
+    {
+        _sidebarCap = Math.Max(0, Math.Min(500, v));
+        SaveKey("sidebar_section_cap", _sidebarCap.ToString());
+        if (_sidebarCapValue != null) _sidebarCapValue.Text = _sidebarCap == 0 ? T("sidebar_cap_all") : _sidebarCap.ToString();
+    }
+
     void SetFleetStoreDays(int v)
     {
         _fleetStoreDays = Math.Max(1, Math.Min(3650, v));
@@ -8247,6 +8261,15 @@ class CockpitWindow : Window
         var fsPlus = MiniButton("+"); fsPlus.Click += delegate { SetFleetStoreDays(_fleetStoreDays + 7); };
         _fleetStoreDaysValue = new TextBlock(); _fleetStoreDaysValue.Text = _fleetStoreDays.ToString();
         col.Children.Add(SettingsStepperRow(T("fleet_store_days"), _fleetStoreDaysValue, fsMinus, fsPlus, "fleet_store_days"));
+
+        // -- Chat sidebar: how many conversations each section lists before "+N more" (the Fleet
+        // runs section hid tonight's runs behind the old fixed 8). Lives HERE, in the popup, never
+        // in the header; the chat window re-reads settings.txt and re-renders.
+        col.Children.Add(SectionHeader(T("set_sidebar_section")));
+        var sbMinus = MiniButton("\u2212"); sbMinus.Click += delegate { SetSidebarCap(_sidebarCap - 4); };
+        var sbPlus = MiniButton("+"); sbPlus.Click += delegate { SetSidebarCap(_sidebarCap + 4); };
+        _sidebarCapValue = new TextBlock(); _sidebarCapValue.Text = _sidebarCap == 0 ? T("sidebar_cap_all") : _sidebarCap.ToString();
+        col.Children.Add(SettingsStepperRow(T("sidebar_section_cap"), _sidebarCapValue, sbMinus, sbPlus, "sidebar_section_cap"));
 
         // TWO KEYS THE PANEL READ BUT NEVER WROTE. relay/fleet_retention.py has asked for
         // fleet_scratch_days and fleet_compress_hours on every run since it was written; no
@@ -14193,6 +14216,10 @@ class CockpitWindow : Window
             g.Margin = new Thickness(0, 6, 0, 2);
             SwallowMouseUp(g);
             col.Children.Add(g);
+            if (!string.IsNullOrEmpty(S(e, "submitter")))
+                col.Children.Add(new TextBlock { Text = (_lang == 0 ? "提出者: " : "Submitted by: ") + S(e, "submitter"),
+                                                 Foreground = Muted, FontSize = 11.5, Margin = new Thickness(0, 2, 0, 0) });
+            if (!string.IsNullOrEmpty(S(e, "transcript"))) col.Children.Add(ReviewerLedgerPanel(S(e, "transcript")));
 
             // "続ける" (Continue): send a FOLLOW-UP instruction to this finished task, carrying its
             // prior context. Launches a FRESH fleet run whose goal PREPENDS the prior goal + a note
@@ -15083,7 +15110,7 @@ class CockpitWindow : Window
         var panels = new UIElement[] {
             TabOverview(goal, last, outcome, terminal, reviews, verifiedOk, tpath, w),
             TabConversation(tpath, S(w, "name"), S(w, "conv_url")),
-            TabReview(reason, done, terminal, reviews),
+            TabReview(reason, done, terminal, reviews, tpath),
             TabLogs(w, reason)
         };
         string[] labels = _lang == 0 ? new string[] { "概要", "会話", "レビュー", "ログ" }
@@ -15635,7 +15662,7 @@ class CockpitWindow : Window
                                Foreground = Muted, FontSize = 12.5 };
     }
 
-    UIElement TabReview(string reason, bool done, bool terminal, int reviews)
+    UIElement TabReview(string reason, bool done, bool terminal, int reviews, string transcriptPath = null)
     {
         var sp = new StackPanel();
         if (done)
@@ -15661,7 +15688,156 @@ class CockpitWindow : Window
                 Text = _lang == 0 ? "（レビュー記録はまだありません）" : "(No review notes yet)",
                 Foreground = Muted, FontSize = 12.5 });
         }
+        // The reviewer's own conversation, read from the sqlite ledger (full text, every reply).
+        if (!string.IsNullOrEmpty(transcriptPath)) sp.Children.Add(ReviewerLedgerPanel(transcriptPath));
         return sp;
+    }
+
+    // ── REVIEWER RECORD (from the sqlite ledger) ───────────────────────────────────────────────
+    // The full text the reviewer was sent and every reply, with lens, time and verdict, read from
+    // sessions.sqlite3 (fleet_turns, key <worker key>__refuter_<lens>) through scripts\ledger_dump.py
+    // -- the UI cannot open sqlite itself. Loaded on demand (the button), windowless, bounded by a
+    // timeout; a run from before the reviewer was recorded says so instead of showing nothing.
+    UIElement ReviewerLedgerPanel(string transcriptPath)
+    {
+        bool ja = _lang == 0;
+        var host = new StackPanel { Margin = new Thickness(0, 12, 0, 0) };
+        string wkey = "";
+        try { wkey = Path.GetFileNameWithoutExtension(transcriptPath ?? ""); } catch (Exception) { }
+        if (string.IsNullOrEmpty(wkey)) return host;
+        host.Children.Add(SectLabel(ja ? "反証者の記録(台帳 sqlite)" : "Reviewer record (sqlite ledger)"));
+        var body = new StackPanel();
+        var btn = new Button();
+        btn.Content = ja ? "反証の入力全文と全返答を表示" : "Show reviewer prompts and replies";
+        btn.Cursor = Cursors.Hand; btn.FontSize = 12; btn.Padding = new Thickness(12, 3, 12, 3);
+        btn.HorizontalAlignment = HorizontalAlignment.Left; btn.BorderThickness = new Thickness(1);
+        btn.Background = BtnBg; btn.BorderBrush = Border; btn.Foreground = Fg;
+        btn.Template = FlatButtonTemplate();
+        string stateDir = "";
+        try { stateDir = Path.GetDirectoryName(Path.GetFullPath(_statusPath)); } catch (Exception) { }
+        string repo = RepoRoot();
+        btn.Click += delegate (object s, RoutedEventArgs ev)
+        {
+            ev.Handled = true;
+            btn.IsEnabled = false;
+            body.Children.Clear();
+            body.Children.Add(new TextBlock { Text = ja ? "台帳を読み込み中…" : "Reading the ledger...",
+                                              Foreground = Muted, FontSize = 12 });
+            var t = new Thread(new ThreadStart(delegate
+            {
+                string json = RunLedgerDump(repo, wkey, stateDir);
+                try
+                {
+                    Dispatcher.BeginInvoke(new Action(delegate
+                    {
+                        btn.IsEnabled = true;
+                        body.Children.Clear();
+                        RenderReviewerLedger(body, json);
+                    }));
+                }
+                catch (Exception) { }
+            })) { IsBackground = true };
+            t.Start();
+        };
+        host.Children.Add(btn);
+        host.Children.Add(body);
+        return host;
+    }
+
+    // Runs scripts\ledger_dump.py windowless and returns its single JSON line ("" on any failure).
+    string RunLedgerDump(string repo, string key, string stateDir)
+    {
+        try
+        {
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "\"" + Path.Combine(repo, "scripts", "ledger_dump.py") + "\" --key \"" + key + "\""
+                + (string.IsNullOrEmpty(stateDir) ? "" : " --store-dir \"" + Path.Combine(stateDir, "sessions") + "\"");
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false; psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true; psi.RedirectStandardError = true;
+            psi.StandardOutputEncoding = Encoding.UTF8;
+            var sbOut = new StringBuilder();
+            using (var p = System.Diagnostics.Process.Start(psi))
+            {
+                p.OutputDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e)
+                { if (e.Data != null) lock (sbOut) sbOut.AppendLine(e.Data); };
+                p.ErrorDataReceived += delegate (object _s, System.Diagnostics.DataReceivedEventArgs e) { };
+                p.BeginOutputReadLine(); p.BeginErrorReadLine();
+                if (!p.WaitForExit(30000)) { try { p.Kill(); } catch (Exception) { } return ""; }
+                p.WaitForExit();
+            }
+            lock (sbOut) return sbOut.ToString().Trim();
+        }
+        catch (Exception) { return ""; }
+    }
+
+    void RenderReviewerLedger(StackPanel body, string json)
+    {
+        bool ja = _lang == 0;
+        Dictionary<string, object> d = null;
+        try { if (!string.IsNullOrEmpty(json)) d = _js.Deserialize<Dictionary<string, object>>(json); } catch (Exception) { }
+        if (d == null)
+        {
+            body.Children.Add(new TextBlock { Text = ja ? "台帳を読めませんでした(ledger_dump の出力なし)。" : "Could not read the ledger (no output from ledger_dump).",
+                                              Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+            return;
+        }
+        var turns = d.ContainsKey("turns") ? d["turns"] as System.Collections.IEnumerable : null;
+        bool any = false;
+        if (turns != null)
+        {
+            foreach (object o in turns)
+            {
+                var tr = o as Dictionary<string, object>;
+                if (tr == null) continue;
+                any = true;
+                string role = S(tr, "role");
+                string label;
+                switch (role)
+                {
+                    case "refuter_user": label = ja ? "反証者への入力(全文)" : "Sent to the reviewer (full)"; break;
+                    case "refuter_wire": label = ja ? "実際に送信された全文" : "Payload actually sent"; break;
+                    case "refuter_assistant": label = ja ? "反証者の返答(全文)" : "Reviewer reply (full)"; break;
+                    case "refuter_verdict": label = ja ? "判定" : "Verdict"; break;
+                    default: label = role; break;
+                }
+                string when = "";
+                try
+                {
+                    double ts = Dbl(tr, "ts");
+                    if (ts > 0) when = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc).AddSeconds(ts).ToLocalTime().ToString("yyyy-MM-dd HH:mm:ss");
+                }
+                catch (Exception) { }
+                string lens = S(tr, "lens");
+                string meta = "[" + (string.IsNullOrEmpty(lens) ? "-" : lens) + "] " + label
+                    + (when.Length > 0 ? "  " + when : "")
+                    + (S(tr, "route").Length > 0 ? "  " + S(tr, "route") : "")
+                    + (S(tr, "sha16").Length > 0 ? "  sha16:" + S(tr, "sha16") : "")
+                    + (string.Equals(S(tr, "truncated"), "True", StringComparison.OrdinalIgnoreCase)
+                        ? (ja ? "  (上限で切詰め済み)" : "  (cut at the size cap)") : "");
+                body.Children.Add(new TextBlock { Text = meta, Foreground = role == "refuter_verdict" ? Fg : Muted,
+                                                  FontSize = 11.5, FontWeight = FontWeights.SemiBold,
+                                                  Margin = new Thickness(0, 8, 0, 2), TextWrapping = TextWrapping.Wrap });
+                var tb = new TextBox();
+                tb.Text = S(tr, "text");
+                tb.Foreground = Muted; tb.FontSize = 12; tb.FontFamily = new FontFamily(Theme.CodeFont);
+                tb.IsReadOnly = true; tb.TextWrapping = TextWrapping.Wrap;
+                tb.BorderThickness = new Thickness(0); tb.Background = QuoteBg; tb.Padding = new Thickness(8);
+                tb.MaxHeight = 280; tb.VerticalScrollBarVisibility = ScrollBarVisibility.Auto;
+                SwallowMouseUp(tb);
+                body.Children.Add(tb);
+            }
+        }
+        if (!any)
+        {
+            body.Children.Add(new TextBlock {
+                Text = ja ? "この実行には反証の全文が台帳にありません(反証の記録を始める前の実行、または反証が走っていません)。"
+                          : "The ledger holds no reviewer text for this run (it predates reviewer recording, or no review ran).",
+                Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+        }
     }
 
     UIElement TabLogs(Dictionary<string, object> w, string reason)
@@ -15669,7 +15845,9 @@ class CockpitWindow : Window
         var sb = new StringBuilder();
         sb.Append("status=").Append(S(w, "status")).Append("  outcome=").Append(S(w, "outcome"));
         sb.Append("  turn=").Append(S(w, "turn")).Append("  verify_attempts=").Append(S(w, "verify_attempts"));
-        sb.Append("  verified=").Append(S(w, "verified")).Append('\n');
+        sb.Append("  verified=").Append(S(w, "verified"));
+        if (!string.IsNullOrEmpty(S(w, "submitter"))) sb.Append("  submitter=").Append(S(w, "submitter"));
+        sb.Append('\n');
         if (!string.IsNullOrEmpty(reason)) sb.Append("\nreason:\n").Append(reason).Append('\n');
         var box = new Border { Background = QuoteBg, CornerRadius = new CornerRadius(Theme.RadCard), Padding = new Thickness(12, 12, 12, 12) };
         var t = RoText(sb.ToString(), Muted, 12);
@@ -17308,6 +17486,7 @@ class CockpitWindow : Window
             // without these a completed conversation strands on "本文はまだ取得できません" even
             // though the jsonl transcript exists on disk.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            e["submitter"] = S(w, "submitter");
             // CARRY THE VERDICT, NOT JUST THE STATUS. relay_fleet.py warns beside its own
             // panel ledger that anything reaching an analysis only through history.json is
             // "hostage to a second program choosing to carry the field" -- this is that
@@ -17386,6 +17565,7 @@ class CockpitWindow : Window
             // see _archiveTerminal: carry transcript path + name so the history row can show the
             // full disk transcript even when conv_url is empty.
             e["transcript"] = S(w, "transcript"); e["name"] = S(w, "name");
+            e["submitter"] = S(w, "submitter");
             // Same three fields as the terminal-archive path above, and for the same
             // reason -- a row archived by hand must not be poorer than one archived
             // automatically, or the history depends on which route retired the worker.

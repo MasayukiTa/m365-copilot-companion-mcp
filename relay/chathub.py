@@ -608,7 +608,8 @@ class Conversation:
         return h
 
     def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
-            started=None, on_text=None, on_progress=None, annotations=None):
+            started=None, on_text=None, on_progress=None, annotations=None,
+            on_payload=None):
         """One turn: connect, send, read frames until the turn completes, return the answer.
 
         `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
@@ -627,6 +628,17 @@ class Conversation:
         payload = ST.build_prompt(text, catalogue or [], protocol=protocol) if catalogue             else (protocol or "") + text
         answer, rounds = "", 0
         while True:
+            # THE EXACT STRING ABOUT TO GO ON THE WIRE (protocol preamble + tool catalogue +
+            # request on round 0; the tool-result payload on later rounds). Reported so the
+            # fleet can store what the agent actually received, not the job text it started
+            # from. A failing observer is logged, never allowed to cost the turn.
+            if on_payload is not None:
+                try:
+                    on_payload(payload, rounds)
+                except Exception as exc:
+                    import sys as _sys
+                    _sys.stderr.write("[chathub] on_payload failed: %s: %s\n"
+                                      % (type(exc).__name__, str(exc)[:160]))
             answer = self._one_exchange(payload, connect=connect, started=started,
                                         annotations=annotations,
                                         on_text=on_text, on_progress=on_progress)
