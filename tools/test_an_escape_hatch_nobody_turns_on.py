@@ -59,6 +59,10 @@ ANSWERED_ELSEWHERE = {
         "the constant it defaults into (copilot_autopilot_relay._SETTLE_TRACE_PATH) is already "
         "redirected by conftest.LIVE_RECORD_REDIRECTS, and settle_collect refuses to run at all "
         "without the variable (SystemExit), so neither reader can reach the live file",
+    "MCP_EXT_HELPER_DIR":
+        "names where an optional program is read from, not a store anything is written to; "
+        "the module is inert unless MCP_EXT_HELPER=1, which the suite does not set, and its own "
+        "tests point the variable at a temporary folder",
 }
 
 

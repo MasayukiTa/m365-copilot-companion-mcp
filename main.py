@@ -178,6 +178,11 @@ EXECUTION_PROFILE_TOOLS = (
     claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,
 ) if os.environ.get("MCP_EXECUTION_PROFILES", "0") == "1" else ()
 
+# Optional helper tools are registered only when the operator opts in (default: off).
+EXT_HELPER_TOOLS = (
+    validity_audit_ledger,
+) if os.environ.get("MCP_EXT_HELPER", "0") == "1" else ()
+
 API_KEY = os.environ["MCP_API_KEY"]
 
 auth = StaticTokenVerifier(
@@ -554,8 +559,8 @@ TOOLS = (
     job_status, job_wait, job_output, job_list, job_kill,
     # the door an agent walks through to hand this machine a goal
     fleet_submit, fleet_queue,
-    # the audit ledger of the validity tools (read-only; conversation bound to a claim id)
-    validity_audit_ledger,
+    # optional helper tools: present only when MCP_EXT_HELPER=1 (see EXT_HELPER_TOOLS)
+    *EXT_HELPER_TOOLS,
     # processes / services / registry (Windows host introspection)
     process_list, process_info, process_kill,
     service_status, registry_read,

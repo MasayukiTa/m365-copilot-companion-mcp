@@ -145,6 +145,13 @@ NO_CALLER_BUT_TESTED = {
     # tests/test_unlock_oracle.py, which assert the unlock-state semantics (expiry, revocation)
     # it implements. See docs/unreached_burndown.md.
     "tools/security.py::is_unlocked",                            # 11 lines, 3 test refs
+    # Forged-tool style modules in tools/auto/ are registered by a directory walk, so they have
+    # no static caller (see REASONS). Exercised directly by tools/test_ext_helper.py.
+    "tools/auto/ext_helper.py::validity_explain_reason",
+    "tools/auto/ext_helper.py::validity_judge",
+    "tools/auto/ext_helper.py::validity_list_claims",
+    "tools/auto/ext_helper.py::validity_negative_control",
+    "tools/auto/ext_helper.py::validity_verify_lock",
 }
 
 BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
@@ -187,6 +194,11 @@ REASONS: dict[str, tuple[str, str]] = {
     # way and is a real entry rather than a scanner bug.
     "tools/auto/office_password_recovery.py::office_password_recovery":
         ("dispatch", "docs/unreached_burndown.md"),
+    "tools/auto/ext_helper.py::validity_explain_reason": ("dispatch", "tools/test_ext_helper.py"),
+    "tools/auto/ext_helper.py::validity_judge": ("dispatch", "tools/test_ext_helper.py"),
+    "tools/auto/ext_helper.py::validity_list_claims": ("dispatch", "tools/test_ext_helper.py"),
+    "tools/auto/ext_helper.py::validity_negative_control": ("dispatch", "tools/test_ext_helper.py"),
+    "tools/auto/ext_helper.py::validity_verify_lock": ("dispatch", "tools/test_ext_helper.py"),
     # A REFERENCE COUNT IS NOT A REACHABILITY ANALYSIS, closed 2026-09-14 by iterating the scan
     # to a fixed point (5 rounds, 80 -> 96). Every one of these sixteen was held off the list by
     # a caller that is itself unreached: something named it, and nothing could get there. Three

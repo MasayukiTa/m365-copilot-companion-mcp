@@ -61,6 +61,7 @@ def _catalogue():
     env["MCP_API_KEY"] = "test-only"
     env["MCP_TOOL_MAP"] = "1"
     env["MCP_EXECUTION_PROFILES"] = "1"
+    env["MCP_EXT_HELPER"] = "1"
     out = _child_run(
         [sys.executable, "-c",
          "import json,sys;sys.path.insert(0,'.');import main;"
@@ -158,6 +159,7 @@ def test_the_audited_registry_is_the_widest_one():
     got = set(_catalogue())
     profile_only = {"claim_turn", "heartbeat", "commit_turn", "abort_turn",
                     "read_job_context", "get_job_status"}
+    profile_only |= {"validity_audit_ledger"}      # present only under MCP_EXT_HELPER=1
     missing = sorted(profile_only - got)
     assert not missing, (
         "the audited registry is missing the execution-profile tools %s, so this file is "

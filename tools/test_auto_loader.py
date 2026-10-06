@@ -112,3 +112,47 @@ def test_the_live_package_publishes_no_tests():
     published = _names(auto_loader.load_auto_tools())
     leaked = [n for n in published if n.startswith("test_")]
     assert not leaked, "pytest functions are registered as live MCP tools: %s" % leaked
+
+
+def test_a_module_whose_gate_is_closed_publishes_nothing(auto_pkg):
+    write, load = auto_pkg
+    write("gated", '''
+        def _auto_tools_enabled():
+            return False
+
+        def gated_tool():
+            """One line."""
+            return 1
+    ''')
+    write("plain", '''
+        def plain_tool():
+            """One line."""
+            return 1
+    ''')
+    assert _names(load()) == ["plain_tool"]
+
+
+def test_a_module_whose_gate_is_open_publishes_its_tools_but_not_the_gate(auto_pkg):
+    write, load = auto_pkg
+    write("gated", '''
+        def _auto_tools_enabled():
+            return True
+
+        def gated_tool():
+            """One line."""
+            return 1
+    ''')
+    assert _names(load()) == ["gated_tool"]
+
+
+def test_a_gate_that_raises_counts_as_closed(auto_pkg):
+    write, load = auto_pkg
+    write("gated", '''
+        def _auto_tools_enabled():
+            raise RuntimeError("cannot say")
+
+        def gated_tool():
+            """One line."""
+            return 1
+    ''')
+    assert load() == []
