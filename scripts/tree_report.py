@@ -1,6 +1,6 @@
 """Read-only markdown report on the task tree held in a `.fleet` directory.
 
-    python scripts/tree_report.py [--fleet-dir DIR]
+    python scripts/tree_report.py [--fleet-dir DIR] [--json]
 
 Reads `status.json` and `campaigns.jsonl` and prints a markdown report: tree size, depth,
 descendants and subtree turns per root, retry/duplication rate (workers per goal_hash and per
@@ -46,11 +46,65 @@ def read_quota(fleet_dir):
         return None
 
 
+#: Fewer split trees than this is "direction only": a rate over a handful of trees is not a gate.
+MIN_TREES = 20
+
+
+def gate_summary(workers, campaign_lines, quota=None):
+    """The pre-communication gate numbers as one dict (every figure derived, none invented).
+
+    Keys: split_trees (roots that have at least one descendant), sample_ok (split_trees >=
+    MIN_TREES), max_depth, max_descendants, max_subtree_turns, duplication (goal_hash / jid
+    shared-row counts), merge (finished / non-done), quota (rpm / rph / refusal pressure, or
+    None when status carries no quota object). A rate whose denominator is 0 is None.
+    """
+    tree = build_tree(workers, campaign_lines)
+    shape = tree_shape(tree)
+    split = [r for r in shape["per_root"] if r["descendants"] > 0]
+    dup = {}
+    for key in ("goal_hash", "jid"):
+        n, distinct, missing = _duplication(workers, key)
+        dup[key] = {"rows": n, "shared": n - distinct, "missing": missing}
+    aggs = [n for n in tree["nodes"].values() if n["role"] == "aggregator" and n["state"] in _TERMINAL]
+    q = None
+    if quota:
+        q = {k: quota.get(k) for k in ("rpm", "rph", "pct_rpm", "pct_rph", "refusals_5m")
+             if isinstance(quota.get(k), (int, float)) and not isinstance(quota.get(k), bool)}
+    return {"split_trees": len(split), "sample_ok": len(split) >= MIN_TREES,
+            "max_depth": shape["max_depth"],
+            "max_descendants": max([r["descendants"] for r in split] or [0]),
+            "max_subtree_turns": max([r["subtree_turns"] for r in split] or [0]),
+            "duplication": dup,
+            "merge": {"finished": len(aggs), "not_done": sum(1 for n in aggs if n["state"] != "done")},
+            "quota": q or None}
+
+
+def render_gate(g):
+    """Markdown for `gate_summary`; says plainly when the sample is too small to judge."""
+    out = ["## Gate readout (before lateral communication)", ""]
+    out.append("- split trees: %d (%s)" % (
+        g["split_trees"],
+        "enough to read" if g["sample_ok"]
+        else "fewer than %d: direction only, NOT a judgement" % MIN_TREES))
+    out.append("- deepest tree: %d  largest tree: %d descendants  most subtree turns: %d"
+               % (g["max_depth"], g["max_descendants"], g["max_subtree_turns"]))
+    for key, d in sorted(g["duplication"].items()):
+        out.append("- duplication by %s: %s" % (key, _pct(d["shared"], d["rows"])))
+    m = g["merge"]
+    out.append("- merge failure: %s" % _pct(m["not_done"], m["finished"]))
+    q = g["quota"]
+    out.append("- quota pressure: " + (", ".join("%s=%s" % kv for kv in sorted(q.items()))
+                                       if q else "unknown (no quota in status.json)"))
+    out.append("")
+    return out
+
+
 def build_report(workers, campaign_lines, quota=None):
     tree = build_tree(workers, campaign_lines)
     shape = tree_shape(tree)
     nodes = tree["nodes"]
     out = ["# Task tree report", ""]
+    out += render_gate(gate_summary(workers, campaign_lines, quota))
     out += ["## Size", "",
             "- rows read: %d%s" % (tree["total_input"],
                                    " (TRUNCATED, %d dropped)" % tree["dropped"] if tree["truncated"] else ""),
@@ -110,9 +164,14 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Markdown task-tree report from a .fleet directory.")
     ap.add_argument("--fleet-dir", default=os.path.join(REPO, ".fleet"),
                     help="directory holding status.json / campaigns.jsonl (read only)")
+    ap.add_argument("--json", action="store_true", help="print the gate readout as JSON only")
     args = ap.parse_args(argv)
     workers, lines = read_fleet_dir(args.fleet_dir)
-    print(build_report(workers, lines, read_quota(args.fleet_dir)))
+    quota = read_quota(args.fleet_dir)
+    if args.json:
+        print(json.dumps(gate_summary(workers, lines, quota), ensure_ascii=False, sort_keys=True))
+        return 0
+    print(build_report(workers, lines, quota))
     return 0
 
 
