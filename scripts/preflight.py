@@ -39,7 +39,7 @@ WHAT IS DELIBERATELY NOT HERE, named rather than left as a silent gap:
 So a green preflight still does not mean a green CI. It means the gap is now the four things
 above instead of an unknown number of them, and the rule stands: after pushing, watch the run.
 
-Exit code is the number of failing gates, so `python scripts/preflight.py && git push` is safe.
+Exit code is the number of failing gates, so `python scripts/preflight.py && python scripts/safe_push.py` is safe.
 """
 from __future__ import annotations
 
