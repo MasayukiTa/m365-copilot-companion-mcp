@@ -334,6 +334,17 @@ execution" from "run this goal again" needs a persisted execution id.
 appending its `merged` note causes redelivery; reversing the order would risk losing it. Chosen
 deliberately in that direction — a duplicate answer is visible, a missing one is not.
 
+## 7b. Reading the split trees: the gate readout
+
+`python scripts/tree_report.py [--fleet-dir .fleet] [--json]` reads `status.json` and
+`campaigns.jsonl` (read only) and opens with a "Gate readout": number of split trees, deepest
+tree, largest tree, most subtree turns, duplication by `goal_hash` and `jid`, merge failure rate
+and quota pressure. With fewer than 20 split trees it says "direction only, NOT a judgement" —
+a rate over a handful of trees is not evidence. Unknown values stay unknown (a missing quota
+object prints "unknown", never zero). Run it before deciding to raise `fanout_max_depth` or to
+add any cross-worker communication. It cannot say whether fan-out beats a single worker; that
+needs paired runs.
+
 ## 8. Things deliberately not done
 
 - **A per-slice check derived from the step text.** It would be a guess, and a guessed oracle is
