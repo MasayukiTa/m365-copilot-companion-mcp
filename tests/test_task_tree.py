@@ -209,3 +209,18 @@ def test_header_loop_cannot_hang_materialisation():
 def test_report_without_quota_or_files_says_unavailable(tmp_path):
     rep = tr.build_report([], [], tr.read_quota(str(tmp_path)))
     assert "unavailable" in rep and "n/a (0 rows)" in rep
+
+
+def test_gate_readout_small_sample_is_not_a_judgement_and_unknown_stays_unknown(tmp_path, capsys):
+    ws = _two_level()
+    lines = list(CAMP)
+    g = tr.gate_summary(ws, lines, None)
+    assert g["sample_ok"] is False and g["quota"] is None
+    rep = tr.build_report(ws, lines, None)
+    assert rep.index("## Gate readout") < rep.index("## Size")
+    assert "NOT a judgement" in rep and "quota pressure: unknown" in rep
+    g2 = tr.gate_summary(ws, lines, {"rpm": 3, "refusals_5m": 0, "note": "x"})
+    assert g2["quota"] == {"rpm": 3, "refusals_5m": 0}
+    (tmp_path / "status.json").write_text(json.dumps({"workers": ws}), encoding="utf-8")
+    assert tr.main(["--fleet-dir", str(tmp_path), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["split_trees"] == g["split_trees"]
