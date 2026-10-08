@@ -185,3 +185,49 @@ def test_a_short_sso_bounce_never_reaches_surface(monkeypatch):
 def test_a_login_page_that_stays_is_asked_about_exactly_once(monkeypatch):
     asked = _run_open_fresh(monkeypatch, [LOGIN] * 200, 10 ** 6)
     assert len(asked) == 1
+
+
+# --- a window that got out anyway is put back, not a reason to halt the fleet ---------------
+
+def _restore(tmp_path, **kw):
+    called = []
+    base = dict(fleet_dir=str(tmp_path), headed=True, others=[], tabs=["about:blank"],
+                hard=lambda port: called.append(port) or True, wait_s=0.0)
+    base.update(kw)
+    res = R.restore_headless_if_safe(9222, **base)
+    return res, called
+
+
+def test_a_headed_fleet_edge_with_nothing_in_use_is_reset_headless(tmp_path, monkeypatch):
+    monkeypatch.setattr(R, "_msedge_cmdlines", lambda: [])
+    (restored, why), called = _restore(tmp_path, wait_s=0.0)
+    assert called == [9222], "the reset (headless: no -Foreground) must have been requested"
+    assert (tmp_path / "visible_edge_restored.jsonl").exists()
+
+
+@pytest.mark.parametrize("kw,needle", [
+    (dict(headed=False), "no headed"),
+    (dict(others=[123]), "other fleet run"),
+    (dict(tabs=[LOGIN]), "in use"),
+    (dict(tabs=["https://example.com/"]), "in use"),
+])
+def test_it_leaves_the_window_alone_when_anything_is_in_doubt(tmp_path, kw, needle):
+    (restored, why), called = _restore(tmp_path, **kw)
+    assert restored is False and needle in why and called == []
+
+
+def test_a_fresh_pause_means_a_person_is_signing_in(tmp_path):
+    (tmp_path / "edge_keep_pause").write_text("x")
+    (restored, why), called = _restore(tmp_path)
+    assert restored is False and "signing in" in why and called == []
+
+
+def test_only_automation_ports_are_restored(tmp_path):
+    assert R.restore_headless_if_safe(9223, fleet_dir=str(tmp_path), headed=True)[0] is False
+
+
+def test_the_launch_gate_tries_the_restore_before_refusing():
+    code = _code_only(_src("relay/fleet_runner.py"))
+    i = code.index("restore_headless_if_safe")
+    assert i < code.index("[gate] REFUSING TO START -- the stack"), "restore must run before the refusal"
+    assert "raise FleetContextLost(pending)" in code[i:i + 900]
