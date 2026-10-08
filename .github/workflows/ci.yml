@@ -167,6 +167,7 @@ jobs:
             scripts/test_live_gui_browser_submit_acceptance.py \
             scripts/test_gui_submitter_has_no_nested_console.py \
             scripts/test_gui_submit_lock.py \
+            scripts/test_set_setting_via_ui_ids.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
             tests/test_listing_counts.py \
