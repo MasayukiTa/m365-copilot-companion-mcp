@@ -377,6 +377,87 @@ def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url="", per
         time.sleep(max(0.05, poll_interval_s))
 
 
+#: A person signing in keeps edge_keep_pause fresh (touch_pause, every ~1-2 s); its age is the
+#: only evidence of one that survives the process that surfaced the window.
+PERSON_AT_WINDOW_S = 300.0
+
+
+def restore_headless_if_safe(port=9222, *, fleet_dir=None, now=None, headed=None, others=None,
+                             tabs=None, hard=None, wait_s=30.0):
+    """If the fleet's Edge has a window and nobody is using it, put it back to headless.
+
+    THE BASELINE IS HEADLESS and the launch gate ("no browser window") refuses to start while the
+    fleet Edge has a window. Without this, ONE stray window stopped the whole fleet until a person
+    closed it (2026-10-08: 11:29 and 12:38, about 22 minutes each). Returns (restored, reason).
+
+    Only when ALL of these hold; any doubt keeps the window (and the gate's refusal):
+      * the port is an automation Edge (HIDDEN_ONLY_PORTS) and a HEADED main process exists;
+      * no other fleet run drives that Edge;
+      * edge_keep_pause is older than PERSON_AT_WINDOW_S (nobody is signing in);
+      * every page is blank/new-tab or a chat page that is not a sign-in wall.
+    The reset is start_companion_edge.ps1 -HardReset WITHOUT -Foreground, i.e. headless.
+    The keyword arguments exist so the decision is testable without a browser.
+    """
+    import json
+    import urllib.request
+    try:
+        port = int(port)
+    except Exception:
+        return False, "bad port"
+    if port not in HIDDEN_ONLY_PORTS:
+        return False, "port %s is not an automation Edge" % port
+    profile = _profile_for_port(port)
+    if headed is None:
+        headed = _headed_process_present(profile, _msedge_cmdlines())
+    if not headed:
+        return False, "no headed process"
+    if others is None:
+        others = other_fleet_runs(port)
+    if others:
+        return False, "other fleet run(s) on this Edge: %s" % list(others)
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    fleet = fleet_dir or os.path.join(repo, ".fleet")
+    t = time.time() if now is None else now
+    try:
+        age = t - os.path.getmtime(os.path.join(fleet, "edge_keep_pause"))
+    except OSError:
+        age = None
+    if age is not None and age < PERSON_AT_WINDOW_S:
+        return False, "a person may be signing in (pause %.0fs old)" % age
+    if tabs is None:
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/json/list" % port, timeout=3) as r:
+                tabs = [x.get("url", "") for x in json.loads(r.read().decode("utf-8", "replace"))
+                        if x.get("type") == "page"]
+        except Exception as exc:
+            return False, "could not list tabs (%s)" % type(exc).__name__
+    for u in tabs:
+        ul = (u or "").lower()
+        if ul in ("", "about:blank") or ul.startswith(("chrome://newtab", "edge://newtab")):
+            continue
+        if "m365.cloud.microsoft" in ul and not looks_like_login(u):
+            continue
+        return False, "a page is in use: %s" % u[:80]
+    result = bool((hard or hard_reset)(port))
+    if result:
+        deadline = time.time() + wait_s
+        result = False
+        while time.time() < deadline:
+            try:
+                with urllib.request.urlopen("http://127.0.0.1:%d/json/version" % port, timeout=2):
+                    result = not _headed_process_present(profile, _msedge_cmdlines())
+                    break
+            except Exception:
+                time.sleep(0.5)
+    try:
+        os.makedirs(fleet, exist_ok=True)
+        with open(os.path.join(fleet, "visible_edge_restored.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": t, "port": port, "restored": result, "tabs": tabs}) + "\n")
+    except Exception:
+        pass
+    return result, "restored headless" if result else "hard reset did not bring back a headless Edge"
+
+
 def touch_pause():
     """Create/refresh the <repo>\\.fleet\\edge_keep_pause mtime so the background
     keeper (edge_keeper.ps1) keeps backing off. surface() writes this file ONCE at
