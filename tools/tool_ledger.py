@@ -491,6 +491,31 @@ def _window_identity(session: str, ts: float):
         return "", "", ""
 
 
+def _ambiguous_campaign(ts: float) -> str:
+    """The one campaign every in-flight candidate worker belongs to, or "".
+
+    Used only when `_window_identity` could not choose between several workers whose turn windows
+    overlap. Siblings of one fan-out campaign overlap by construction, so the worker stays
+    unknown but the campaign is not: all candidates share it. Returns "" unless EVERY candidate
+    carries an identity naming the same campaign (a worker with no identity, or two campaigns,
+    gives ""). Never raises; read-only.
+    """
+    try:
+        from tools import turn_context
+        cands = turn_context.candidates(float(ts))
+        if len(cands) < 2:
+            return ""
+        seen = set()
+        for worker, _task in cands:
+            cid = (turn_context.identity_of(worker, float(ts)) or {}).get("campaign_id") or ""
+            if not cid:
+                return ""
+            seen.add(cid)
+        return next(iter(seen)) if len(seen) == 1 else ""
+    except Exception:
+        return ""
+
+
 def _identity_for(tool: str, arguments, session: str, task: str, worker: str, ts: float = None):
     """(task, worker, how) for a call. `how` is "explicit", "session", "window",
     "session-window", "ambiguous" or "" (not attributable).
@@ -595,6 +620,13 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
                     row[_dst] = _id[_k]
         except Exception:
             pass
+    if _how == "ambiguous":
+        # Additive. task/worker stay EMPTY (the worker is unknown); this only says which campaign
+        # every overlapping candidate belongs to, so a sibling report can use the call at
+        # campaign level, labelled as such. Absent when the candidates do not agree.
+        _cc = _ambiguous_campaign(_ts)
+        if _cc:
+            row["campaign_candidate"] = _cc[:120]
     if _sess:
         row["session"] = _sess
     with _LOCK:

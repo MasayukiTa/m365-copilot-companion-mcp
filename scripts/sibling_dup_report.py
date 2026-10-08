@@ -181,6 +181,18 @@ class Roster:
             if not cid:
                 continue
             self.known.add(cid)
+            # status.json holds only the LAST run's workers, so a finished campaign has no worker
+            # rows here. The campaign ledger keeps each slot's outcome and the merge result, so
+            # fall back to it for campaigns status.json no longer knows (status wins when both
+            # name the same child).
+            if r.get("kind") == "child_result" and r.get("task_id") \
+                    and str(r.get("task_id")) not in self.children.get(cid, {}):
+                self.children.setdefault(cid, {}).setdefault(
+                    str(r["task_id"]), str(r.get("outcome") or "").upper())
+            elif r.get("kind") == "merge_done" and cid not in self.merges:
+                self.merges.setdefault(cid, []).append("DONE")
+            elif r.get("kind") == "merge_abandoned" and cid not in self.merges:
+                self.merges.setdefault(cid, []).append("ABANDONED")
             if r.get("kind") == "merged":
                 self.merged_marker.add(cid)
             elif r.get("task_id"):
@@ -213,7 +225,8 @@ class Roster:
 def analyse(events, workers, camp_rows):
     roster = Roster(workers, camp_rows)
     buckets = {"total_calls": 0, "discovery_excluded": 0, "unknown_attribution": 0,
-               "attributed_not_fanout": 0, "sibling_calls": 0, "no_args": 0}
+               "attributed_not_fanout": 0, "sibling_calls": 0, "no_args": 0,
+               "campaign_level_calls": 0}
     per = {}        # campaign -> dict
     for call, outcome in pair_events(events):
         buckets["total_calls"] += 1
@@ -223,6 +236,17 @@ def analyse(events, workers, camp_rows):
             continue
         if call.get("attr") not in ATTRIBUTED_KINDS or not (call.get("task")
                                                             or call.get("worker")):
+            cc = call.get("campaign_candidate")
+            if call.get("attr") == "ambiguous" and cc:
+                # worker unknown, campaign known (every overlapping candidate is in it):
+                # kept apart from the attributed sibling calls and used only for the upper bound.
+                buckets["campaign_level_calls"] += 1
+                p = per.setdefault(str(cc), {"calls": [], "t0": None, "t1": None, "cand": []})
+                ts = call.get("ts")
+                p.setdefault("cand", []).append(
+                    (ts if isinstance(ts, (int, float)) else 0.0, None, _arg_key(call),
+                     _duration(outcome)))
+                continue
             buckets["unknown_attribution"] += 1
             continue
         hit = roster.resolve_call(call)
@@ -262,6 +286,25 @@ def analyse(events, workers, camp_rows):
                 else:
                     dup_t += dur
         wall = (p["t1"] - p["t0"]) if p["t0"] is not None and p["t1"] is not None else None
+        # UPPER BOUND at campaign level: attributed calls plus worker-unknown calls of the same
+        # campaign, in time order. A repeat of an already-seen key counts unless BOTH calls are
+        # known to come from the same child, so one worker repeating itself is included -- hence
+        # an upper bound on sibling duplication, never an estimate of it.
+        allc = sorted([c for c in comparable] + [c for c in p.get("cand", []) if c[2] is not None],
+                      key=lambda c: c[0])
+        seen_u = {}
+        dup_u = 0
+        dup_u_t = 0.0
+        for _ts, child, key, dur in allc:
+            if key not in seen_u:
+                seen_u[key] = child
+                continue
+            prev = seen_u[key]
+            if prev is not None and prev == child:
+                continue            # the same known child repeating itself is not duplication
+            dup_u += 1
+            dup_u_t += dur or 0.0
+        cand_n = len(p.get("cand", []))
         merges = roster.merges.get(cid, [])
         missing = sorted(k for k, o in kids.items() if o not in TERMINAL_OK)
         merge_failed = bool(merges) and (not any(o in TERMINAL_OK for o in merges)
@@ -274,6 +317,9 @@ def analyse(events, workers, camp_rows):
             "merge": bool(merges), "merge_failed": merge_failed,
             "merge_missing": len(missing) if merges else 0,
             "qualifies": completed >= 2 and len(p["calls"]) >= 1,
+            "cand_calls": cand_n, "comparable_upper": len(allc),
+            "dup_upper": dup_u, "dup_time_upper_s": dup_u_t,
+            "qualifies_upper": completed >= 2 and (len(p["calls"]) + cand_n) >= 1,
         })
     return {"buckets": buckets, "rows": rows, "known": len(roster.known),
             "merged_markers": len(roster.merged_marker)}
@@ -283,6 +329,9 @@ def verdict(summary):
     """(verdict line, thresholds explanation) from analyse()'s summary dict."""
     q = summary["m4"]
     if q < MIN_CAMPAIGNS:
+        if summary.get("m4_upper", 0) >= MIN_CAMPAIGNS and summary.get("merges_upper")                 and summary.get("dup_share_upper") is not None                 and summary["dup_share_upper"] < DUP_TIME_SHARE_LIMIT                 and summary["merge_loss_rate_upper"] < MERGE_LOSS_LIMIT:
+            return ("LOW (campaign-level UPPER BOUND: attributed + worker-unknown calls of the "
+                    "same campaign; sibling duplication is at most this)")
         return "INSUFFICIENT (<%d campaigns)" % MIN_CAMPAIGNS
     if summary["merges"] == 0 or summary["dup_share"] is None:
         return "INSUFFICIENT (no merge or wall-clock evidence)"
@@ -302,7 +351,22 @@ def summarise(result):
     merges = sum(1 for r in qual if r["merge"])
     failed = sum(1 for r in qual if r["merge_failed"])
     lost = sum(1 for r in qual if r["merge_failed"] and r["merge_missing"] > 0)
+    qu = [r for r in rows if r.get("qualifies_upper")]
+    comp_u = sum(r["comparable_upper"] for r in qu)
+    dup_u = sum(r["dup_upper"] for r in qu)
+    dup_ut = sum(r["dup_time_upper_s"] for r in qu)
+    # campaign-level wall clock is the span of the campaign's attributed calls; when only
+    # worker-unknown calls exist there is none, so the share stays None (not zero).
+    wall_u = sum(r["wall_s"] for r in qu if r["wall_s"])
+    merges_u = sum(1 for r in qu if r["merge"])
+    lost_u = sum(1 for r in qu if r["merge_failed"] and r["merge_missing"] > 0)
     return {
+        "m4_upper": len(qu), "comparable_upper": comp_u, "dup_upper": dup_u,
+        "dup_rate_upper": (dup_u / comp_u) if comp_u else None,
+        "dup_time_upper_s": dup_ut, "wall_upper_s": wall_u,
+        "dup_share_upper": (dup_ut / wall_u) if wall_u else None,
+        "merges_upper": merges_u,
+        "merge_loss_rate_upper": (lost_u / merges_u) if merges_u else None,
         "m4": len(qual), "known": result["known"],
         "with_2_completed": sum(1 for r in rows if r["completed"] >= 2),
         "with_calls": sum(1 for r in rows if r["calls"] > 0),
@@ -333,6 +397,8 @@ def render(result, summary, top=50, n_transcripts=0):
               "- unknown bucket (no or ambiguous attribution): %d" % b["unknown_attribution"],
               "- attributed but not mapped to a fan-out child: %d" % b["attributed_not_fanout"],
               "- sibling calls (attributed to a campaign child): %d" % b["sibling_calls"],
+              "- worker-unknown calls with a known campaign (upper bound only): %d"
+              % b.get("campaign_level_calls", 0),
               "- sibling calls without comparable args (excluded from M1): %d" % b["no_args"],
               "- transcript files present (not read): %d" % n_transcripts, ""]
     lines += ["## Measures", "",
@@ -342,6 +408,12 @@ def render(result, summary, top=50, n_transcripts=0):
               "the span of attributed calls; %d duplicate calls had no duration)"
               % (_pct(summary["dup_share"]), summary["dup_time_s"], summary["wall_s"],
                  summary["dup_untimed"]),
+              "- M1/M2 campaign-level UPPER BOUND (includes worker-unknown calls and one worker "
+              "repeating itself): %s of %d comparable calls; duplicate time share %s; %d "
+              "campaigns qualify" % (_pct(summary.get("dup_rate_upper")),
+                                     summary.get("comparable_upper", 0),
+                                     _pct(summary.get("dup_share_upper")),
+                                     summary.get("m4_upper", 0)),
               "- M3 merge loss (proxy: merge worker not OK, or ran with >= 1 child slice not "
               "DONE): %d merges, %d failed, %d with missing child information (%s of merges)"
               % (summary["merges"], summary["merge_failed"], summary["merge_lost_info"],

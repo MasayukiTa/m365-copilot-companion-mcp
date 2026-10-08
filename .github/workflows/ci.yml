@@ -841,6 +841,7 @@ jobs:
             tools/test_setup_tls.py \
             tools/test_shell_timeout_tree.py \
             tools/test_tool_ledger.py \
+            tools/test_ambiguous_calls_keep_their_campaign.py \
             tools/test_tool_ledger_timing.py \
             tools/test_turn_window_attribution.py \
             tools/test_job_to_campaign_identity.py \
