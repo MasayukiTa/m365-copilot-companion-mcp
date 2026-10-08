@@ -395,7 +395,7 @@ public static class HierarchicalMergeView
     //: must equal tools/settings_keys.py and relay/fanout.py HIERARCHICAL_SETTING_KEY / _DEFAULT
     //: (tests/test_hierarchical_merge_setting.py compares them).
     public const string Key = "fanout_hierarchical_merge";
-    public const string Default = "off";
+    public const string Default = "on";
 
     public static readonly string[] Modes = { "off", "on" };
 
@@ -459,7 +459,7 @@ public static class WriteScopeView
 {
     //: must equal tools/settings_keys.py and relay/write_scope.py KEY / MODES.
     public const string Key = "fanout_write_scope";
-    public const string Default = "off";
+    public const string Default = "on";
 
     public static readonly string[] Modes = { "off", "shadow" };
 
