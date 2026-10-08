@@ -588,6 +588,11 @@ CONSENT_SURFACE_FORCE_REHIDE_SEC = float(os.environ.get("MCP_FORCE_REHIDE_SEC", 
 CONSENT_CHAIN_MAX = int(os.environ.get("MCP_CONSENT_CHAIN_MAX", "12"))
 
 
+#: Seconds (one poll each) a page must stay on a sign-in host before _open_fresh treats it as a
+#: wall rather than a single-sign-on bounce. 2026-10-08 11:29: a bounce was taken for a wall.
+OPEN_FRESH_LOGIN_DEBOUNCE_S = int(os.environ.get("MCP_OPEN_FRESH_LOGIN_DEBOUNCE_S", "8"))
+
+
 def _schedule_force_rehide(timeout=None):
     """Start a one-shot background timer that force-rehides the dedicated Edge after `timeout`
     seconds (default CONSENT_SURFACE_FORCE_REHIDE_SEC). Safety net for BUG 4a/4b: covers every
@@ -3072,6 +3077,7 @@ def _open_fresh(context, url):
     _maybe_lean(pg)
     surfaced = False
     surface_tried = False
+    login_streak = 0
     force_timer = None
     # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
     # waiting 45s for a composer that will never come just leaves about:blank on screen.
@@ -3100,7 +3106,15 @@ def _open_fresh(context, url):
                 return pg
             try:
                 u = pg.url or ""
-                if looks_like_login(u):
+                # A SIGN-IN-HOST URL IS NOT YET A WALL. A silent single-sign-on bounce passes
+                # through login.microsoftonline.com for a second or two on its way back to the
+                # chat, and the URL alone cannot tell that from a page waiting for a person
+                # (looks_like_login is URL-only). Count consecutive polls on a login URL and
+                # act only once it has STAYED there.
+                login_streak = (login_streak + 1) if looks_like_login(u) else 0
+                if login_streak:
+                    if login_streak < OPEN_FRESH_LOGIN_DEBOUNCE_S:
+                        continue
                     if not surface_tried:
                         # ASK ONCE. surface() REFUSES the fleet's Edge (no person is here: this
                         # is an automatic open, and a sign-in-host URL can be a transient
