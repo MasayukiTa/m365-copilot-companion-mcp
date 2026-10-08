@@ -4629,6 +4629,23 @@ def main():
                 # --force exists because a gate with no way past it is a gate somebody
                 # eventually deletes.
                 _blockers = _launch_blockers()
+                # A WINDOW ON THE FLEET'S EDGE IS PUT BACK, NOT A REASON TO STOP. The baseline is
+                # headless; one stray window used to halt the whole fleet until a person closed
+                # it (2026-10-08, twice, ~22 min each). Only when nobody is using it (see
+                # restore_headless_if_safe); the Edge is relaunched headless, so this process's
+                # context is gone -- go through the ordinary context-lost recovery, which is
+                # bounded by --max-recover.
+                if any(n == "no browser window" and "copilot-companion-edge" in d
+                       for n, d in _blockers):
+                    try:
+                        from relay.edge_recover import restore_headless_if_safe
+                        _restored, _why = restore_headless_if_safe(port)
+                    except Exception as _exc:
+                        _restored, _why = False, "%s: %s" % (type(_exc).__name__, _exc)
+                    print("[gate] fleet Edge has a window: %s" % _why, flush=True)
+                    if _restored:
+                        reset_socket_route()
+                        raise FleetContextLost(pending)
                 if _blockers and not getattr(args, "force", False):
                     print("\n[gate] REFUSING TO START -- the stack is not in a state where "
                           "this run's results would mean anything:", flush=True)
