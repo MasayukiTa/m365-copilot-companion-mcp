@@ -135,3 +135,53 @@ def test_the_launcher_still_defaults_to_headless():
     ps1 = _code_only(_src("scripts/start_companion_edge.ps1"))
     assert "$useHeadless = -not $Foreground" in ps1
     assert '"--headless=new"' in ps1
+
+
+# --- the misjudgement itself: a single-sign-on bounce is not a wall --------------------------
+
+class _FakeLocator:
+    def __init__(self, page): self.page = page
+    def count(self): return 1 if self.page.composer else 0
+
+
+class _FakePage:
+    """url sequence: one entry per poll (wait_for_timeout call); composer appears at the end."""
+    def __init__(self, urls, composer_after):
+        self.urls, self.i, self.composer_after = list(urls), 0, composer_after
+        self.composer = False
+    @property
+    def url(self): return self.urls[min(self.i, len(self.urls) - 1)]
+    def goto(self, *a, **k): pass
+    def wait_for_timeout(self, ms):
+        self.i += 1
+        self.composer = self.i >= self.composer_after
+    def locator(self, sel): return _FakeLocator(self)
+
+
+class _FakeCtx:
+    def __init__(self, page): self.page = page
+    def new_page(self): return self.page
+
+
+def _run_open_fresh(monkeypatch, urls, composer_after):
+    from relay import relay_fleet as F
+    asked = []
+    monkeypatch.setattr(R, "surface", lambda port=9222, open_url="", **kw: asked.append(open_url) or False)
+    monkeypatch.setattr(F, "_claim_page", lambda *a, **k: None)
+    monkeypatch.setattr(F, "_maybe_lean", lambda *a, **k: None)
+    monkeypatch.setattr(F, "OPEN_FRESH_LOGIN_DEBOUNCE_S", 8)
+    F._open_fresh(_FakeCtx(_FakePage(urls, composer_after)), "https://m365.cloud.microsoft/chat/?titleId=T_x")
+    return asked
+
+
+LOGIN = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x"
+
+
+def test_a_short_sso_bounce_never_reaches_surface(monkeypatch):
+    # 3 polls on the login host, then the chat renders: the 2026-10-08 shape.
+    assert _run_open_fresh(monkeypatch, [LOGIN] * 3 + ["https://m365.cloud.microsoft/chat/"], 5) == []
+
+
+def test_a_login_page_that_stays_is_asked_about_exactly_once(monkeypatch):
+    asked = _run_open_fresh(monkeypatch, [LOGIN] * 200, 10 ** 6)
+    assert len(asked) == 1
