@@ -181,6 +181,7 @@ jobs:
             tests/test_grep_memory_bound.py \
             tests/test_bridge_answer_source.py \
             relay/test_sibling_edge_reset.py \
+            relay/test_the_fleet_edge_is_never_surfaced_on_its_own.py \
             tests/test_skill_approval_flow.py \
             tests/test_bridge_recycle.py \
             tests/test_bridge_conversation_length.py \

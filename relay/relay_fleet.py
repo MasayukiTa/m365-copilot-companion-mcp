@@ -3071,6 +3071,7 @@ def _open_fresh(context, url):
     # the capture reaches this function through a frozen signature it cannot extend.
     _maybe_lean(pg)
     surfaced = False
+    surface_tried = False
     force_timer = None
     # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
     # waiting 45s for a composer that will never come just leaves about:blank on screen.
@@ -3100,16 +3101,22 @@ def _open_fresh(context, url):
             try:
                 u = pg.url or ""
                 if looks_like_login(u):
-                    if not surfaced:
-                        # thread the target agent URL through so a headed relaunch (if the
-                        # companion Edge is headless) lands on this conversation, not the
-                        # launcher's default generic top page.
-                        surface(open_url=url); surfaced = True
-                        # BUG 4b safety net, defense-in-depth: if we give up below (or exit
-                        # some other way) without ever calling rehide(), this bounded timer
-                        # still forces the window back down on its own.
-                        force_timer = _schedule_force_rehide()
-                    touch_pause()          # keep the keeper backed off through a long login
+                    if not surface_tried:
+                        # ASK ONCE. surface() REFUSES the fleet's Edge (no person is here: this
+                        # is an automatic open, and a sign-in-host URL can be a transient
+                        # single-sign-on bounce -- 2026-10-08 11:29 a token-capture helper took
+                        # one for a wall, the browser was killed and relaunched with a window).
+                        # If it is refused, `surfaced` stays False and the ordinary 3-attempt
+                        # loop below simply keeps waiting for the composer, hidden.
+                        surface_tried = True
+                        surfaced = bool(surface(open_url=url))
+                        if surfaced:
+                            # BUG 4b safety net, defense-in-depth: if we give up below (or exit
+                            # some other way) without ever calling rehide(), this bounded timer
+                            # still forces the window back down on its own.
+                            force_timer = _schedule_force_rehide()
+                    if surfaced:
+                        touch_pause()      # keep the keeper backed off through a long login
                 elif u == "about:blank" and k >= 3:
                     break                  # stuck on about:blank -> re-navigate
                 elif navigation_failed and k >= 3:
