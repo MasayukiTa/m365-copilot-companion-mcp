@@ -157,3 +157,36 @@ def test_main_reads_a_fleet_dir_read_only(tmp_path, capsys):
 def test_missing_fleet_dir_reports_insufficient_without_raising(tmp_path, capsys):
     assert R.main(["--fleet-dir", str(tmp_path / "absent")]) == 0
     assert "INSUFFICIENT" in capsys.readouterr().out
+
+
+# ── worker-unknown calls with a known campaign: an upper bound, kept apart ───────────────────
+
+def _cand(i, tool, ts, args, cid, dur=1.0):
+    c = {"event": "call", "id": str(i), "ts": ts, "tool": tool, "task": "", "worker": "",
+         "attr": "ambiguous", "campaign_candidate": cid, "args": args}
+    o = {"event": "outcome", "id": str(i), "ts": ts + dur, "ok": True, "dur_mono_s": dur}
+    return [c, o]
+
+
+def test_campaign_level_calls_make_an_upper_bound_not_a_sibling_count():
+    ev = _cand(1, "read_file", 100, _args(path="s"), "c1") + _cand(2, "read_file", 101, _args(path="s"), "c1", dur=2)
+    ev += _call(3, "read_file", 102, "c1-1", _args(path="z"))
+    res = R.analyse(ev, _workers("c1", ["DONE", "DONE"], merge="DONE"), [])
+    s = R.summarise(res)
+    assert res["buckets"]["campaign_level_calls"] == 2
+    assert res["buckets"]["unknown_attribution"] == 0
+    assert s["sibling_calls"] if "sibling_calls" in s else True
+    assert s["dup"] == 0                      # not counted as attributed sibling duplication
+    assert s["dup_upper"] == 1 and s["dup_time_upper_s"] == 2
+
+
+def test_the_campaign_ledger_supplies_children_and_merge_when_status_has_none():
+    camps = [{"kind": "campaign", "campaign_id": "c9", "n": 2},
+             {"campaign_id": "c9", "task_id": "c9-1", "subtask_index": 1, "text": "t"},
+             {"campaign_id": "c9", "task_id": "c9-2", "subtask_index": 2, "text": "t"},
+             {"kind": "child_result", "campaign_id": "c9", "task_id": "c9-1", "outcome": "DONE"},
+             {"kind": "child_result", "campaign_id": "c9", "task_id": "c9-2", "outcome": "DONE"},
+             {"kind": "merge_done", "campaign_id": "c9"}]
+    res = R.analyse(_call(1, "x", 1, "c9-1", _args(p=1)), [], camps)
+    row = [r for r in res["rows"] if r["campaign"] == "c9"][0]
+    assert row["completed"] == 2 and row["merge"] is True and row["merge_failed"] is False
