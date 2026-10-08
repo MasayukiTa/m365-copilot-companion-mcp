@@ -319,7 +319,7 @@ public static class FanoutDepthView
 {
     //: must equal tools/settings_keys.py and relay/fanout.py DEPTH_SETTING_KEY / BOUNDS.
     public const string Key = "fanout_max_depth";
-    public const int Default = 1;
+    public const int Default = 2;
     public const int Low = 1;
     public const int High = 3;
 

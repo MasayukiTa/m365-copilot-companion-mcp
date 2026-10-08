@@ -58,6 +58,9 @@ MAX_DEPTH = 1
 #: Hard bounds of the `fanout_max_depth` setting.
 DEPTH_SETTING_KEY = "fanout_max_depth"
 DEPTH_SETTING_BOUNDS = (1, 3)
+#: What an absent or unparsable `fanout_max_depth` means. The nested merge it needs is a separate
+#: switch (`fanout_hierarchical_merge`, default off), so this default alone changes nothing in force.
+DEPTH_SETTING_DEFAULT = 2
 
 #: Whether nested splits are ENABLED. A worker that ends FANOUT counts as finished, so without
 #: the nested merge its split proposal would be read by its parent's merge as that worker's
@@ -486,7 +489,8 @@ def _record_unnumbered_fallback(n_steps):
 def configured_max_depth():
     """The `fanout_max_depth` setting, read from settings.txt on every call (each_gate).
 
-    1..3, default 1; an absent or unparsable value is 1. Never raises. This is what the
+    1..3, default 2 (DEPTH_SETTING_DEFAULT); an absent value is 2; a read failure is 1
+    (the conservative side). Never raises. This is what the
     operator asked for, not what is in force: see effective_max_depth().
     """
     lo, hi = DEPTH_SETTING_BOUNDS
@@ -496,7 +500,7 @@ def configured_max_depth():
     except Exception:
         return lo
     if v is None:
-        return lo
+        return DEPTH_SETTING_DEFAULT
     return max(lo, min(hi, int(v)))
 
 
