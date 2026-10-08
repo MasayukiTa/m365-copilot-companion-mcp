@@ -7781,6 +7781,7 @@ class CockpitWindow : Window
     {
         _gearBtn = IconButton("settings", 18, _lang == 0 ? "設定" : "Settings");
         _gearBtn.ToolTip = _lang == 0 ? "設定（タブ数・再試行・容量床）" : "Settings (tabs / retry / disk floor)";
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_gearBtn, "settingsButton");
         _settingsPopup = new System.Windows.Controls.Primitives.Popup();
         _settingsPopup.PlacementTarget = _gearBtn;
         _settingsPopup.Placement = System.Windows.Controls.Primitives.PlacementMode.Bottom;
@@ -9541,6 +9542,7 @@ class CockpitWindow : Window
         _fdLbl.FontSize = 12;
 
         _fdBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_fdBox, "fanoutDepthBox");
         _fdBox.ToolTip = FanoutDepthView.Help(_lang == 0) + "\n" + FanoutDepthView.TakeEffectTip(_lang == 0);
         _fdBox.Cursor = Cursors.Hand; _fdBox.FontSize = 12;
         _fdBox.FontWeight = FontWeights.SemiBold; _fdBox.MinWidth = 64;
@@ -9613,6 +9615,7 @@ class CockpitWindow : Window
         _hmLbl.FontSize = 12;
 
         _hmBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_hmBox, "hierarchicalMergeBox");
         _hmBox.ToolTip = HierarchicalMergeView.Help(_lang == 0) + "\n" + HierarchicalMergeView.TakeEffectTip(_lang == 0);
         _hmBox.Cursor = Cursors.Hand; _hmBox.FontSize = 12;
         _hmBox.FontWeight = FontWeights.SemiBold; _hmBox.MinWidth = 64;
