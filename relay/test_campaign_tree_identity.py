@@ -107,6 +107,11 @@ def test_root_id_depth0_is_own_campaign_and_depth1_inherits(monkeypatch):
     assert all(k["parent_campaign_id"] == "" and k["parent_subtask_index"] is None for k in top)
     # synthetic depth-1 parent at function level; the runtime gate itself is untouched
     assert fo.MAX_DEPTH == 1
+    # the merge default is on now (2026-10-08), so the depth-1 refusal needs an explicit off
+    from relay import fleet_runner as FR
+    real_text = FR._settings_text
+    monkeypatch.setattr(FR, "_settings_text", lambda key: "off" if key == fo.HIERARCHICAL_SETTING_KEY
+                        else real_text(key))
     assert fo.child_goals(GOAL, STEPS, parent_task_id="x", depth=1) == []
     monkeypatch.setattr(fo, "HIERARCHICAL_MERGE_READY", True)
     monkeypatch.setattr(fo, "configured_max_depth", lambda: 2)

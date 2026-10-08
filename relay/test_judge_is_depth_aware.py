@@ -45,6 +45,11 @@ def _set_depth(monkeypatch, value, merge):
         return value if key == fo.DEPTH_SETTING_KEY else real(key, default)
     monkeypatch.setattr(FR, "_settings_int", fake)
     monkeypatch.setattr(fo, "HIERARCHICAL_MERGE_READY", merge)
+    if not merge:
+        # the merge default changed to on (2026-10-08): "merge off" must now be explicit
+        real_text = FR._settings_text
+        monkeypatch.setattr(FR, "_settings_text", lambda key: "off" if key == fo.HIERARCHICAL_SETTING_KEY
+                            else real_text(key))
 
 
 def _digest(rows):

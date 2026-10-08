@@ -50,8 +50,9 @@ def test_the_split_request_still_carries_the_whole_goal():
 # `if self.fanout and not self._fanout_done`, which these same tests pin by asserting
 # w.fanout is False.
 
-def test_fanout_is_off_for_a_child_however_it_is_constructed():
+def test_fanout_is_off_for_a_child_however_it_is_constructed(monkeypatch):
     """Structural, not a promise: recursive splitting is how one goal becomes unbounded."""
+    monkeypatch.setattr(fo, "hierarchical_merge_setting", lambda: "off")   # default is now on; this pins the depth-1 cap
     w = _worker(fanout=True, depth=1)
     assert w.fanout is False
     assert fo.SPLIT_JOB not in w.job

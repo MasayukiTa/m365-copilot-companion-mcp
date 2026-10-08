@@ -75,7 +75,7 @@ HIERARCHICAL_MERGE_READY = False
 #: The GUI-controlled switch (tools/settings_keys.py) and its default. Production code must
 #: never make the default "on" (tests/test_hierarchical_merge_setting.py).
 HIERARCHICAL_SETTING_KEY = "fanout_hierarchical_merge"
-HIERARCHICAL_SETTING_DEFAULT = "off"
+HIERARCHICAL_SETTING_DEFAULT = "on"
 
 #: The outcome a parent slot carries when its nested family did not deliver a real answer.
 SLOT_MISSING = "MISSING"
@@ -505,10 +505,11 @@ def configured_max_depth():
 
 
 def hierarchical_merge_setting():
-    """The `fanout_hierarchical_merge` setting: "on" or "off" (default "off").
+    """The `fanout_hierarchical_merge` setting: "on" or "off" (default "on"; a read failure is "off").
 
     Read from settings.txt on every call (each_gate). Only the exact value `on`
-    (case-insensitive) is on; an absent, empty or unrecognised value is off. Never raises.
+    (case-insensitive) is on; an absent value is the default (on); an empty or unrecognised
+    value is off. Never raises.
     """
     try:
         from relay import fleet_runner as fr
@@ -516,7 +517,7 @@ def hierarchical_merge_setting():
     except Exception:
         return "off"
     if raw is None:
-        return "off"
+        return HIERARCHICAL_SETTING_DEFAULT
     return "on" if raw.strip().lower() == "on" else "off"
 
 

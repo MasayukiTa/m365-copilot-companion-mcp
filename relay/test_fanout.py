@@ -182,8 +182,9 @@ def test_the_campaign_id_is_derived_from_the_goal_so_a_resume_rejoins_the_family
     assert c[0]["campaign_id"] != a[0]["campaign_id"]
 
 
-def test_children_do_not_split_again():
+def test_children_do_not_split_again(monkeypatch):
     """Recursive splitting is how one runaway goal becomes an unbounded number of chats."""
+    monkeypatch.setattr(fo, "hierarchical_merge_setting", lambda: "off")   # default is now on; this pins the depth-1 cap
     assert fo.child_goals("親", ["範囲A を取得する", "範囲B を取得する"],
                           depth=fo.MAX_DEPTH) == []
 
