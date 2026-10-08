@@ -179,8 +179,9 @@ def test_the_offer_is_made_once():
         "asking again spends the remaining turns on the question instead of the work")
 
 
-def test_a_child_is_never_offered_a_mid_run_split():
+def test_a_child_is_never_offered_a_mid_run_split(monkeypatch):
     """A child that splits makes grandchildren, which MAX_DEPTH forbids."""
+    monkeypatch.setattr(fo, "hierarchical_merge_setting", lambda: "off")   # default is now on; this pins the depth-1 cap
     w = _worker(depth=1)
     assert w._fanout_capable is False
     assert w._ask_for_a_midrun_split() is False

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The nested-split switch is a GUI-controlled setting, off by default, and never on in code.
+"""The nested-split switch is a GUI-controlled setting, on by default (changed from off on 2026-10-08), and never written by code.
 
 A feature that can only be switched in code or on a command line does not exist for the
 operator: `fanout_hierarchical_merge` is a settings key with a cockpit control. While it is off
@@ -42,18 +42,35 @@ def _settings(tmp_path, monkeypatch, *lines):
 
 # ---- registry ------------------------------------------------------------------------------
 
-def test_the_key_is_declared_each_gate_default_off():
+def test_the_key_is_declared_each_gate_default_on():
+    # the default changed from off to on (2026-10-08); a read failure / junk value is still off
     assert SK.effect(KEY) == SK.EACH_GATE
-    assert SK.default(KEY) == "off"
+    assert SK.default(KEY) == "on"
     assert fo.HIERARCHICAL_SETTING_KEY == KEY
-    assert fo.HIERARCHICAL_SETTING_DEFAULT == "off"
+    assert fo.HIERARCHICAL_SETTING_DEFAULT == "on"
 
 
 # ---- behaviour -----------------------------------------------------------------------------
 
+@pytest.mark.parametrize("configured,allowed", [(1, [0]), (2, [0, 1]), (3, [0, 1, 2])])
+def test_absent_means_on_so_the_configured_depth_takes_effect(tmp_path, monkeypatch, configured, allowed):
+    # default changed to on: with the key absent the configured depth is in force
+    _settings(tmp_path, monkeypatch, "fanout_max_depth=%d" % configured)
+    assert fo.hierarchical_merge_setting() == "on"
+    assert fo.effective_max_depth() == configured
+    assert [d for d in range(5) if fo.may_split_at(d)] == allowed
+
+
+def test_with_no_settings_at_all_the_default_depth_is_two_and_in_force(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch)
+    assert fo.hierarchical_merge_setting() == "on"
+    assert fo.effective_max_depth() == 2
+
+
 @pytest.mark.parametrize("configured", [1, 2, 3])
-@pytest.mark.parametrize("extra", [[], [KEY + "=off"], [KEY + "=junk"], [KEY + "="]])
-def test_off_or_absent_caps_the_depth_at_one(tmp_path, monkeypatch, configured, extra):
+@pytest.mark.parametrize("extra", [[KEY + "=off"], [KEY + "=junk"], [KEY + "="]])
+def test_off_or_unrecognised_caps_the_depth_at_one(tmp_path, monkeypatch, configured, extra):
+    # off must now be explicit (or junk/empty, which still reads as off)
     _settings(tmp_path, monkeypatch, "fanout_max_depth=%d" % configured, *extra)
     assert fo.configured_max_depth() == configured
     assert fo.hierarchical_merge_setting() == "off"
@@ -74,16 +91,23 @@ def test_a_change_is_picked_up_without_a_restart(tmp_path, monkeypatch):
     assert fo.effective_max_depth() == 1
     p.write_text("fanout_max_depth=2\n" + KEY + "=on\n", encoding="utf-8")
     assert fo.effective_max_depth() == 2
-    p.write_text("fanout_max_depth=2\n", encoding="utf-8")
+    p.write_text("fanout_max_depth=2\n" + KEY + "=off\n", encoding="utf-8")
     assert fo.effective_max_depth() == 1
+    # removing the line falls back to the (now on) default
+    p.write_text("fanout_max_depth=2\n", encoding="utf-8")
+    assert fo.effective_max_depth() == 2
 
 
 def test_the_status_report_names_the_setting(tmp_path, monkeypatch):
-    p = _settings(tmp_path, monkeypatch, "fanout_max_depth=3")
+    p = _settings(tmp_path, monkeypatch, "fanout_max_depth=3", KEY + "=off")
     assert FR._fanout_depth_block() == {"fanout_depth": {
         "configured": 3, "effective": 1, "reason": "hierarchical merge setting is off",
         "hierarchical_merge": "off"}}
     p.write_text("fanout_max_depth=3\n" + KEY + "=on\n", encoding="utf-8")
+    assert FR._fanout_depth_block() == {"fanout_depth": {
+        "configured": 3, "effective": 3, "reason": "", "hierarchical_merge": "on"}}
+    # default (absent) is on now
+    p.write_text("fanout_max_depth=3\n", encoding="utf-8")
     assert FR._fanout_depth_block() == {"fanout_depth": {
         "configured": 3, "effective": 3, "reason": "", "hierarchical_merge": "on"}}
     # on, but nothing asked for more than one level: nothing to explain
@@ -99,11 +123,14 @@ def test_the_test_hook_still_forces_the_deeper_behaviour(tmp_path, monkeypatch):
 
 # ---- never on by default in production code -------------------------------------------------
 
-def test_the_default_is_off_everywhere_and_no_code_seeds_it_on():
+def test_the_default_is_on_everywhere_and_no_code_writes_the_key():
+    # default changed off -> on (2026-10-08): Python, settings_keys and the C# cockpit agree on "on".
+    # The test hook stays False, and no production code path writes the key itself (the default
+    # lives in one declared place per language; nothing seeds a settings file).
     assert fo.HIERARCHICAL_MERGE_READY is False
-    assert fo.HIERARCHICAL_SETTING_DEFAULT == "off" and SK.default(KEY) == "off"
+    assert fo.HIERARCHICAL_SETTING_DEFAULT == "on" and SK.default(KEY) == "on"
     cs = _read("ui", "EffortPolicy.cs")
-    assert re.search(r'public const string Default = "off";', cs[cs.index("class HierarchicalMergeView"):])
+    assert re.search(r'public const string Default = "on";', cs[cs.index("class HierarchicalMergeView"):])
     pat = re.compile(r"""["']fanout_hierarchical_merge\s*=\s*on""", re.I)
     bad = []
     out = childproc.run(["git", "ls-files"], cwd=REPO, check=True).stdout

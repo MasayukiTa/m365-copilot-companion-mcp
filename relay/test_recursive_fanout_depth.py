@@ -1,7 +1,9 @@
 # -*- coding: utf-8 -*-
 """Nested fan-out: the depth setting, its guard, and the plumbing behind it.
 
-DEFAULT STAYS DEPTH 1. A child that ends as FANOUT counts as finished, so its split proposal
+NOTE (2026-10-08): the defaults changed to depth 2 with fanout_hierarchical_merge on; the
+"guard is off / depth 1" tests below therefore set `fanout_hierarchical_merge=off` explicitly.
+Original rationale: a child that ends as FANOUT counts as finished, so its split proposal
 would be read by its parent's merge as its answer. Until nested merging exists the setting is
 honoured only up to depth 1 (`fanout.HIERARCHICAL_MERGE_READY` is False and
 `effective_max_depth()` is capped). The tests below prove two things:
@@ -48,6 +50,22 @@ def _set_depth(monkeypatch, value):
     monkeypatch.setattr(FR, "_settings_int", fake)
 
 
+def _set_merge(monkeypatch, value):
+    """Make the settings reader return `value` for fanout_hierarchical_merge (None = key absent).
+
+    The default of that key changed from off to on (2026-10-08), so every test of the
+    "guard is off" behaviour has to say `off` explicitly.
+    """
+    from relay import fleet_runner as FR
+    real = FR._settings_text
+
+    def fake(key):
+        if key == fo.HIERARCHICAL_SETTING_KEY:
+            return value
+        return real(key)
+    monkeypatch.setattr(FR, "_settings_text", fake)
+
+
 def _digest(obj):
     raw = json.dumps(obj, ensure_ascii=False, sort_keys=True, default=str)
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
@@ -82,12 +100,17 @@ GOLDEN = "867e8a3c012cd8a392f662581cfbdfcad1e7fb4289133e6bcfa138fd90c62673"
 
 
 def test_default_outputs_equal_the_previous_implementation(monkeypatch):
-    _set_depth(monkeypatch, None)
+    # the previous implementation is depth 1 / merge off; the defaults are now depth 2 / merge on,
+    # so that configuration is pinned explicitly to keep the byte-for-byte guarantee for it.
+    _set_depth(monkeypatch, 1)
+    _set_merge(monkeypatch, "off")
+    assert fo.effective_max_depth() == 1
     assert _digest(_outputs()) == GOLDEN
 
 
 @pytest.mark.parametrize("configured", [2, 3])
 def test_a_deeper_setting_changes_nothing_while_the_guard_is_off(monkeypatch, configured):
+    _set_merge(monkeypatch, "off")      # default is on now; the guard is off only when asked
     _set_depth(monkeypatch, configured)
     assert fo.HIERARCHICAL_MERGE_READY is False
     assert fo.configured_max_depth() == configured
@@ -103,6 +126,7 @@ def test_the_setting_is_declared_and_clamped(monkeypatch):
 
 
 def test_the_report_says_why_the_effective_depth_is_lower(monkeypatch):
+    _set_merge(monkeypatch, "off")      # default is on now
     _set_depth(monkeypatch, 3)
     assert fo.depth_report() == {"configured": 3, "effective": 1,
                                  "reason": "hierarchical merge setting is off",
@@ -227,6 +251,7 @@ def test_a_merge_worker_never_splits(nested):
 def test_a_child_worker_may_split_only_below_the_effective_depth(monkeypatch, tmp_path):
     spawn = lambda *a, **k: None          # noqa: E731
     _set_depth(monkeypatch, 2)
+    _set_merge(monkeypatch, "off")      # default is on now; "not capable" needs an explicit off
     child = {"text": "g", "role": "subtask", "depth": 1}
     assert rf.RelayWorker(dict(child), "w0", fanout=True, spawn_fn=spawn)._fanout_capable is False
     monkeypatch.setattr(fo, "HIERARCHICAL_MERGE_READY", True)
@@ -370,9 +395,21 @@ def test_the_screen_words_the_runners_report_not_its_own_selection():
     assert "System.Windows" not in ep and "PresentationFramework" not in ep
 
 
-def test_the_default_depth_is_two_but_nothing_is_in_force_until_the_merge_is_on(monkeypatch):
+def test_the_default_depth_is_two_and_in_force(monkeypatch):
+    # the merge default changed to on (2026-10-08): with no settings at all depth 2 is in force
     _set_depth(monkeypatch, None)
+    _set_merge(monkeypatch, None)
     assert fo.DEPTH_SETTING_DEFAULT == 2 == SK.default("fanout_max_depth")
     rep = fo.depth_report()
+    assert rep["configured"] == 2 and rep["effective"] == 2
+    assert fo.effective_max_depth() == 2
+    assert fo.may_split_at(0) and fo.may_split_at(1) and not fo.may_split_at(2)
+
+
+def test_with_the_merge_explicitly_off_the_effective_depth_is_one(monkeypatch):
+    _set_depth(monkeypatch, None)
+    _set_merge(monkeypatch, "off")
+    rep = fo.depth_report()
     assert rep["configured"] == 2 and rep["effective"] == 1
+    assert fo.effective_max_depth() == 1
     assert fo.may_split_at(0) and not fo.may_split_at(1)
