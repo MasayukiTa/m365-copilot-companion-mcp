@@ -827,7 +827,7 @@ class CockpitWindow : Window
     TextBox[] _fbBox = new TextBox[4];
     TextBlock _fbLbl, _fbNow, _fbPending;
     TextBlock[] _fbCap = new TextBlock[4];
-    // split depth 1|2|3 -> settings.txt fanout_max_depth ; absent key = 1 (FanoutDepthView.Default)
+    // split depth 1|2|3 -> settings.txt fanout_max_depth ; absent key = 2 (FanoutDepthView.Default)
     int _fdVal = FanoutDepthView.Default;
     ComboBox _fdBox;
     TextBlock _fdLbl, _fdNow, _fdPending;

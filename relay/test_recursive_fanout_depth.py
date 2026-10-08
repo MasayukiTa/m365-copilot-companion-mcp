@@ -96,8 +96,8 @@ def test_a_deeper_setting_changes_nothing_while_the_guard_is_off(monkeypatch, co
 
 
 def test_the_setting_is_declared_and_clamped(monkeypatch):
-    assert SK.effect("fanout_max_depth") == SK.EACH_GATE and SK.default("fanout_max_depth") == 1
-    for raw, want in ((None, 1), (0, 1), (-4, 1), (1, 1), (2, 2), (3, 3), (9, 3)):
+    assert SK.effect("fanout_max_depth") == SK.EACH_GATE and SK.default("fanout_max_depth") == 2
+    for raw, want in ((None, 2), (0, 1), (-4, 1), (1, 1), (2, 2), (3, 3), (9, 3)):
         _set_depth(monkeypatch, raw)
         assert fo.configured_max_depth() == want, raw
 
@@ -368,3 +368,11 @@ def test_the_screen_words_the_runners_report_not_its_own_selection():
     assert '{"fanout_depth": _fo.depth_report()}' in py
     ep = _read("ui", "EffortPolicy.cs")
     assert "System.Windows" not in ep and "PresentationFramework" not in ep
+
+
+def test_the_default_depth_is_two_but_nothing_is_in_force_until_the_merge_is_on(monkeypatch):
+    _set_depth(monkeypatch, None)
+    assert fo.DEPTH_SETTING_DEFAULT == 2 == SK.default("fanout_max_depth")
+    rep = fo.depth_report()
+    assert rep["configured"] == 2 and rep["effective"] == 1
+    assert fo.may_split_at(0) and not fo.may_split_at(1)
