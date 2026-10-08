@@ -277,8 +277,41 @@ def _surface_launcher_argv(ps1, flag, port, open_url=""):
     return argv
 
 
-def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url=""):
+#: Ports whose Edge is the fleet's (or an evaluation's) AUTOMATION browser. Nobody sits at it, so
+#: no automatic code path may ever put a window of it on the screen. The bridge's :9223 is not
+#: here: its sign-in is a person-facing flow with its own latch and notification
+#: (scripts/ensure_m365_signin.py --bridge-watch).
+HIDDEN_ONLY_PORTS = (9222, 9224)
+
+
+def _record_refused_surface(port, open_url, caller):
+    """Leave a trace that a visible window was asked for and refused. Never raises."""
+    try:
+        import json
+        fleet = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".fleet")
+        os.makedirs(fleet, exist_ok=True)
+        with open(os.path.join(fleet, "visible_edge_refused.jsonl"), "a", encoding="utf-8") as fh:
+            fh.write(json.dumps({"ts": time.time(), "port": port, "pid": os.getpid(),
+                                 "argv": " ".join(sys.argv)[:200], "caller": caller,
+                                 "open_url": (open_url or "")[:200]}) + "\n")
+    except Exception:
+        pass
+
+
+def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url="", person_present=False):
     """Bring the (minimized/background/headless) companion Edge to the foreground --
+
+    THE FLEET'S EDGE IS NEVER SURFACED ON ITS OWN. With the default `person_present=False` a
+    request for :9222 / :9224 is REFUSED (returns False, launches nothing, appends a line to
+    .fleet\\visible_edge_refused.jsonl). Measured 2026-10-08 11:29: a token-capture helper met a
+    sign-in-host URL while the browser was bouncing through single sign-on, called this with
+    -Foreground, and the launcher killed the headless fleet Edge and relaunched it with a
+    window -- in front of the owner, mid-run, and the launch gate then refused every start
+    until someone closed it. A URL is not a person: only a caller that KNOWS a person is
+    present and asked (scripts/ensure_m365_signin.py, run by quickstart / doctor) passes
+    `person_present=True`. Every automatic caller gets False and must take its existing
+    "could not surface -> report and stay hidden" branch.
+
     used when sign-in is required so the user can complete it. Shells out to the
     launcher; no Playwright, thread-safe (swallows errors, never raises).
 
@@ -305,6 +338,13 @@ def surface(port=9222, poll_timeout_s=8.0, poll_interval_s=0.5, open_url=""):
     preserves the old behavior exactly (launcher's own default $Url). Ignored on the plain
     -Surface path (raising an already-headed window never navigates it)."""
     import subprocess
+    try:
+        _port_int = int(port)
+    except Exception:
+        _port_int = 9222
+    if _port_int in HIDDEN_ONLY_PORTS and not person_present:
+        _record_refused_surface(_port_int, open_url, "surface")
+        return False
     repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     ps1 = os.path.join(repo, "scripts", "start_companion_edge.ps1")
     fleet = os.path.join(repo, ".fleet")

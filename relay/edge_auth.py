@@ -347,6 +347,11 @@ def _surface_with_a_way_back(cdp_url: str, agent_url: str,
         ok = bool(surface(port=port, open_url=agent_url))
     except Exception:
         return False
+    if not ok:
+        # NOTHING WAS SURFACED, SO THERE IS NOTHING TO PUT BACK. The timer below ends in a
+        # HardReset of the port's Edge; scheduling it after a refused surface() would kill a
+        # healthy hidden browser fifteen minutes later for no reason.
+        return False
 
     def _back_to_background():
         try:

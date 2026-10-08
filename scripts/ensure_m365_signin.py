@@ -484,7 +484,9 @@ def main(argv=None):
         return 2
 
     try:
-        edge_recover.surface(port=a.port, open_url=SIGNED_IN_URL)
+        # person_present=True: this is the one caller that is run BY a person to sign in
+        # (quickstart / doctor). Every automatic caller is refused for the fleet's Edge.
+        edge_recover.surface(port=a.port, open_url=SIGNED_IN_URL, person_present=True)
     except Exception as exc:
         print("  could not surface the window: %s" % exc)
 
