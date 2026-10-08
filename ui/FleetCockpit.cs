@@ -3450,7 +3450,12 @@ class CockpitWindow : Window
                 if (!bad) continue;
                 // RunFix has a sign-in branch for RED only; a yellow sign-in would burn the
                 // whole budget doing nothing, so it is not a target.
-                if (dot == 3 && st != HealthState.Red) continue;
+                // AND NEVER AN AUTOMATIC TARGET EVEN WHEN RED: the sign-in repair relaunches the
+                // fleet's Edge WITH A WINDOW (start_companion_edge.ps1 -Foreground). That is for
+                // a person who pressed the Fix button; an unattended auto-fix opening a visible
+                // browser mid-run is the incident of 2026-10-08. Red sign-in stays on screen for
+                // the person to act on.
+                if (dot == 3) continue;
                 if (RepairTouchesFleetEdge(dot) && runLive) continue;   // try the next one
                 return dot;
             }
