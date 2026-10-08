@@ -459,7 +459,7 @@ public static class WriteScopeView
 {
     //: must equal tools/settings_keys.py and relay/write_scope.py KEY / MODES.
     public const string Key = "fanout_write_scope";
-    public const string Default = "on";
+    public const string Default = "off";
 
     public static readonly string[] Modes = { "off", "shadow" };
 

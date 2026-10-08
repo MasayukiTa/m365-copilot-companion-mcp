@@ -52,9 +52,11 @@ def test_fanout_true_run_wide_is_necessary_but_not_sufficient():
     assert w.fanout is False
 
 
-def test_depth_still_forbids_a_child_from_splitting_even_with_a_splittable_goal():
+def test_depth_still_forbids_a_child_from_splitting_even_with_a_splittable_goal(monkeypatch):
     """Structural gate, unchanged: a child (depth>0) must not split again, however
     independent its own slice of text looks."""
+    from relay import fanout as _fo
+    monkeypatch.setattr(_fo, "hierarchical_merge_setting", lambda: "off")   # default is now on; this pins the depth-1 cap
     w = _worker("2026年1月〜4月のメールを一覧化してください。", fanout=True, depth=1)
     assert w.fanout is False
 
