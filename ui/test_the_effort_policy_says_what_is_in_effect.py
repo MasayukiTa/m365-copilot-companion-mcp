@@ -341,3 +341,41 @@ def test_the_cockpit_draws_the_group_line_from_the_view_and_never_the_goal():
     assert 'S(led, "task")' in body                              # the capped ledger, as before
     assert 'S(w, "goal")' not in body and "GroupTreeView.Line(" in src
     assert "ShowScaleToast" not in body and "MessageBox" not in body
+
+
+# -- the budget bar under a root group's usage line (display only) --------------------------------
+
+def _gb(root, g, ja=True):
+    return dict(_c("group_bar", root=root, group=g, ja=ja))
+
+
+@pytestmark_nt
+def test_the_budget_bar_says_turns_used_of_the_cap(tmp_path):
+    g = _g(**NESTED)
+    lim = {"total": 24, "active": 3, "turns": 40, "wall_min": 120}
+    r = _run_cases(tmp_path, [_gb(_tb(dict(USE, turns=12), lim), g),
+                              _gb(_tb(dict(USE, turns=12), lim), g, False),
+                              _gb(_tb(dict(USE, turns=32), lim), g),
+                              _gb(_tb(dict(USE, turns=40), lim), g),
+                              _gb(_tb(dict(USE, turns=90), lim), g)])
+    assert r[0]["text"] == "ターン 12 / 40" and r[1]["text"] == "turns 12 / 40"
+    assert [x["level"] for x in r] == [0, 0, 1, 2, 2]
+    assert r[0]["fraction"] == pytest.approx(0.3) and r[4]["fraction"] == 1   # clamped, never overflows
+
+
+@pytestmark_nt
+def test_the_budget_bar_is_absent_without_a_cap_or_a_root_group(tmp_path):
+    g = _g(**NESTED)
+    inner = _g(depth=1, root_id="cmp1", parent_group_id="cmp1")
+    nocap = {"total": 24, "active": 3, "turns": 0, "wall_min": 120}
+    r = _run_cases(tmp_path, [_gb(_tb(USE), inner), _gb(_tb(USE, rid="other"), g),
+                              _gb({"groups": [g]}, g), _gb(_tb(USE, nocap), g),
+                              _gb(_tb({"total": 5}), g)])
+    assert all(x["text"] is None for x in r)
+
+
+def test_the_cockpit_draws_the_bar_from_the_view():
+    src = _cockpit()
+    m = re.search(r"UIElement BuildBudgetBar\(.*?\n    }\n", src, re.S)
+    assert m and "GroupTreeView.BudgetBar(" in m.group(0)
+    assert "BuildBudgetBar(w, " in src

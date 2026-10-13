@@ -639,6 +639,29 @@ public static class GroupTreeView
         return (ja ? "使用量 " : "usage ") + string.Join(" · ", parts.ToArray());
     }
 
+    /// <summary>The bar under a root group's usage line: turns used against the tree's turn cap,
+    /// as text ("turns 12 / 40") plus the filled fraction (0..1, clamped). Display only: it reads
+    /// the same tree_budget entry as BudgetText and decides nothing. null when the group is not a
+    /// root, the tree has no entry, or no turn cap is reported (a bar with no cap would imply one).
+    /// level: 0 normal, 1 at 80% or more, 2 at 100% or more (same thresholds as BudgetText).</summary>
+    public static string BudgetBar(Dictionary<string, object> statusRoot, Dictionary<string, object> g,
+                                   bool ja, out double fraction, out int level)
+    {
+        fraction = 0; level = 0;
+        if (g == null || Depth(g) != 0) return null;
+        var tb = Obj(statusRoot, "tree_budget");
+        var e = tb != null ? Obj(tb, Str(g, "root_id").Length > 0 ? Str(g, "root_id") : Str(g, "campaign_id")) : null;
+        if (e == null || !e.ContainsKey("turns") || e["turns"] == null) return null;
+        var lim = Obj(e, "limits") ?? Obj(statusRoot, "fanout_budget");
+        double used = Num(e, "turns", 0);
+        double max = Num(lim, "turns", 0);
+        if (max <= 0) return null;
+        fraction = Math.Max(0, Math.Min(1, used / max));
+        if (used * 100 >= max * 100) level = 2;
+        else if (used * 100 >= max * 80) level = 1;
+        return FanoutBudgetView.ShortLabel(2, ja) + " " + (long)used + " / " + (long)max;
+    }
+
     /// <summary>The note when the coordinator applies a split depth below the configured one.</summary>
     public static string DepthNote(Dictionary<string, object> statusRoot, bool ja)
     {
