@@ -9763,6 +9763,7 @@ class CockpitWindow : Window
         _wsLbl.FontSize = 12;
 
         _wsBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_wsBox, "writeScopeBox");
         _wsBox.ToolTip = WriteScopeView.Help(_lang == 0) + "\n" + WriteScopeView.TakeEffectTip(_lang == 0);
         _wsBox.Cursor = Cursors.Hand; _wsBox.FontSize = 12;
         _wsBox.FontWeight = FontWeights.SemiBold; _wsBox.MinWidth = 78;

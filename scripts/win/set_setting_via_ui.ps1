@@ -5,6 +5,7 @@
 #   powershell -NoProfile -File scripts/win/set_setting_via_ui.ps1 -ReadOnly
 #   powershell -NoProfile -File scripts/win/set_setting_via_ui.ps1 -Setting fanout_max_depth -Value 2
 #   powershell -NoProfile -File scripts/win/set_setting_via_ui.ps1 -Setting fanout_hierarchical_merge -Value on
+#   powershell -NoProfile -File scripts/win/set_setting_via_ui.ps1 -Setting fanout_write_scope -Value shadow
 #
 # Needs a cockpit built with the AutomationIds below (ui/FleetCockpit.cs). ASCII only on purpose.
 
@@ -23,6 +24,7 @@ Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes
 $Boxes = @{
     'fanout_max_depth'          = 'fanoutDepthBox'
     'fanout_hierarchical_merge' = 'hierarchicalMergeBox'
+    'fanout_write_scope'        = 'writeScopeBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]
