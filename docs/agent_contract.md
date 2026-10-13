@@ -112,6 +112,19 @@ over the tunnel by an agent is not the same authority as one a person typed into
 and the consumer is entitled to treat them differently. Measured 2026-09-18: a job that ran at
 03:33 was traced to its requester **only** because this field had been filled in.
 
+### Two server-side logs for "did the instruction arrive?"
+
+Both are append-only JSONL in `.fleet/` (next to `tool_events.jsonl`), capped at 20 MB (the
+newest half is kept), and never contain arguments, bodies, tokens or passwords:
+
+- `.fleet/mcp_inbound.jsonl` — one line per `/mcp` request: `ts`, `at`, `method`
+  (`initialize`, `tools/list`, `ping`, `tools/call`, ...), `tool` (name only, for `tools/call`),
+  `session` (the same hash as `session` in `tool_events.jsonl`), `client_ip`, `ua` (80 chars).
+  A request refused before its body was read appears as `(body-unread status=NNN)`.
+- `.fleet/fleet_submit_refusals.jsonl` — one line per refused `fleet_submit`: `reason`
+  (`missing_goal`, `too_long`, `local_loop`, `similar`, `pending_full`, `other`), `goal_len`,
+  `goal_head` (80 chars), `source` (80 chars) and, for `similar`, `similar_to` (the job id).
+
 ---
 
 ## 3. Reading a picture, and which tool sees what
