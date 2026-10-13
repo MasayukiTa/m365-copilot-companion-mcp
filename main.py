@@ -1392,6 +1392,78 @@ def _is_local_self_test(scope) -> bool:
     return bool(is_local)
 
 
+def _observe_inbound(scope, receive):
+    """Return a `receive` that passes every message through untouched while noting the JSON-RPC
+    method of the request (tools.obs_log -> .fleet/mcp_inbound.jsonl). Only method names and the
+    tools/call tool name are kept; no body, argument or header value other than a hashed
+    Mcp-Session-Id, the derived client IP and a 80-char user-agent. Any failure in here is
+    swallowed: the request must behave exactly as without it."""
+    state = {"buf": bytearray(), "over": False, "done": False}
+
+    def _ctx():
+        sid = ua = xff = ""
+        for (hk, hv) in (scope.get("headers") or []):
+            k = hk.lower()
+            if k == b"mcp-session-id":
+                sid = hv.decode("latin-1")
+            elif k == b"user-agent":
+                ua = hv.decode("latin-1")
+            elif k == b"x-forwarded-for":
+                xff = hv.decode("latin-1")
+        client = scope.get("client")
+        _, ip = derive_identity(client[0] if client else "", xff)
+        return sid, ip, ua
+
+    def _finish(methods):
+        if state["done"]:
+            return
+        state["done"] = True
+        from tools import obs_log
+        sid, ip, ua = _ctx()
+        obs_log.log_inbound(methods, sid, ip, ua)
+
+    try:
+        http_method = str(scope.get("method") or "")
+        if http_method != "POST":
+            _finish([("HTTP " + http_method, "")])
+            return receive
+    except Exception:
+        return receive
+
+    async def _receive():
+        message = await receive()
+        try:
+            if not state["done"] and message.get("type") == "http.request":
+                chunk = message.get("body") or b""
+                if not state["over"]:
+                    from tools import obs_log
+                    if len(state["buf"]) + len(chunk) > obs_log.MAX_PEEK_BYTES:
+                        state["over"] = True
+                        state["buf"] = bytearray()
+                    else:
+                        state["buf"].extend(chunk)
+                if not message.get("more_body"):
+                    from tools import obs_log
+                    _finish([("(oversize)", "")] if state["over"]
+                            else obs_log.methods_from_body(bytes(state["buf"])))
+            elif not state["done"] and message.get("type") == "http.disconnect":
+                _finish([("(disconnect-before-body)", "")])
+        except Exception:
+            pass
+        return message
+
+    def _flush_unread(status):
+        # A response started although the body was never read (auth rejected it first): still
+        # worth one line, so "client reached us and was refused" is distinguishable from silence.
+        try:
+            _finish([("(body-unread status=%s)" % status, "")])
+        except Exception:
+            pass
+
+    _receive.flush_unread = _flush_unread
+    return _receive
+
+
 class _BearerPrefix:
     """Tolerate an Authorization header that is the RAW API key (no scheme).
 
@@ -1458,10 +1530,19 @@ class _BearerPrefix:
             await self.app(scope, receive, send)
             return
 
+        receive = _observe_inbound(scope, receive)
+
         async def _send_and_observe(message):
             # Observe the response status BEFORE forwarding it -- never delay or
             # alter the real response. Any bookkeeping failure here must not
             # prevent `send` from being called.
+            try:
+                if message.get("type") == "http.response.start":
+                    _fl = getattr(receive, "flush_unread", None)
+                    if _fl is not None:
+                        _fl(message.get("status"))
+            except Exception:
+                pass
             try:
                 if message.get("type") == "http.response.start" and message.get("status") == 401:
                     if _is_local_self_test(scope):

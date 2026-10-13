@@ -863,6 +863,8 @@ jobs:
             relay/test_task_router_exact_approval.py \
             scripts/test_update_from_release.py \
             tests/test_health_route.py \
+            tests/test_mcp_inbound_log.py \
+            tests/test_fleet_submit_refusal_log.py \
             tests/test_launch_gate_asks_only_what_it_reads.py \
             tools/test_notify_ops_gate_reachability.py \
             tools/test_no_toast_that_nobody_can_answer.py \

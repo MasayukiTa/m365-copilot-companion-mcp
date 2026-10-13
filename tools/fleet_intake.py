@@ -311,6 +311,16 @@ def _duplicate_of(text: str):
     return best
 
 
+def _log_refusal(reason: str, text: str, source: str, similar_to: str = "") -> None:
+    """Record a refusal in .fleet/fleet_submit_refusals.jsonl. Never raises, never alters the
+    reply the caller gets."""
+    try:
+        from tools import obs_log
+        obs_log.log_refusal(reason, text, source, similar_to=similar_to)
+    except Exception:
+        pass
+
+
 def fleet_submit(goal: str, note: str = "", source: str = "",
                  priority: bool = False) -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
@@ -327,11 +337,14 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     """
     text = " ".join(str(goal or "").split())
     if not text:
+        _log_refusal("missing_goal", text, source)
         return "[fleet_submit: refused -- an empty goal is not an instruction]"
     if len(text) > MAX_GOAL_CHARS:
+        _log_refusal("too_long", text, source)
         return ("[fleet_submit: refused -- the goal is %d characters, over the %d limit. "
                 "Send the instruction, not the document.]" % (len(text), MAX_GOAL_CHARS))
     if TR.is_local_loop_control_submission(text, source):
+        _log_refusal("local_loop", text, source)
         return (
             "[fleet_submit: refused -- LOCAL_LOOP control messages are not Fleet goals. "
             "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
@@ -340,12 +353,14 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     dup = _duplicate_of(text)
     if dup is not None:
         dup_jid, sim = dup
+        _log_refusal("similar", text, source, similar_to=dup_jid)
         return ("[fleet_submit: refused -- this reads as the goal already queued or running "
                 "as %s (%d%% word overlap). If it is genuinely different work, say specifically "
                 "how; if you meant to check on that job, use fleet_queue() instead of "
                 "resubmitting it.]" % (dup_jid, round(sim * 100)))
     n = _pending_count()
     if n >= MAX_PENDING:
+        _log_refusal("pending_full", text, source)
         return ("[fleet_submit: refused -- %d jobs are already waiting and nothing is "
                 "draining the queue. Ask the owner to look before sending more.]" % n)
 
@@ -375,6 +390,7 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
             json.dump(job, fh, ensure_ascii=False, indent=1)
         os.replace(tmp, path)
     except Exception as exc:
+        _log_refusal("other", text, source)
         return "[fleet_submit: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
 
     # COUNTED AFTER THE WRITE, NOT BEFORE. Four devices submitting at the same instant each
