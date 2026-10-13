@@ -14488,6 +14488,7 @@ class CockpitWindow : Window
         int xLevel;
         string extra = GroupExtraText(w, out xLevel);
         TextBlock extraTb = null;
+        UIElement barRow = null;
         string cardName = S(w, "name");
         row.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2)
         {
@@ -14495,6 +14496,7 @@ class CockpitWindow : Window
             if (extraTb == null) return;
             bool hide = extraTb.Visibility == Visibility.Visible;
             extraTb.Visibility = hide ? Visibility.Collapsed : Visibility.Visible;
+            if (barRow != null) barRow.Visibility = extraTb.Visibility;
             if (hide) _groupExtraHidden.Add(cardName); else _groupExtraHidden.Remove(cardName);
         };
         row.Children.Add(new TextBlock {
@@ -14533,7 +14535,36 @@ class CockpitWindow : Window
         var both = new StackPanel { Orientation = Orientation.Vertical };
         both.Children.Add(row);
         both.Children.Add(extraTb);
+        barRow = BuildBudgetBar(w, extraTb.Visibility);
+        if (barRow != null) both.Children.Add(barRow);
         return both;
+    }
+
+    // Turns used against the tree's turn cap: a thin bar and "turns 12 / 40". Display only; the
+    // words and the fraction come from GroupTreeView.BudgetBar. null when no cap is reported.
+    UIElement BuildBudgetBar(Dictionary<string, object> w, Visibility vis)
+    {
+        var g = GroupOfParent(w);
+        if (g == null || _lastRoot == null) return null;
+        double frac; int level;
+        string text = GroupTreeView.BudgetBar(_lastRoot, g, _lang == 0, out frac, out level);
+        if (text == null) return null;
+        var fill = level >= 2 ? Theme.Br(Theme.Danger(_dark))
+                   : level == 1 ? Theme.Br(Theme.Warning(_dark)) : Theme.Br(Theme.Info(_dark));
+        const double width = 120;
+        var track = new Grid { Width = width, Height = 6, VerticalAlignment = VerticalAlignment.Center };
+        track.Children.Add(new Border { Background = Theme.Br(Theme.Border(_dark)), CornerRadius = new CornerRadius(3) });
+        track.Children.Add(new Border {
+            Background = fill, CornerRadius = new CornerRadius(3),
+            Width = Math.Max(frac > 0 ? 3 : 0, width * frac), HorizontalAlignment = HorizontalAlignment.Left });
+        var bar = new StackPanel {
+            Orientation = Orientation.Horizontal, Visibility = vis,
+            Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 2, 0, 0) };
+        bar.Children.Add(track);
+        bar.Children.Add(new TextBlock {
+            Text = text, FontSize = 12, Margin = new Thickness(8, 0, 0, 0), Foreground = Muted,
+            VerticalAlignment = VerticalAlignment.Center });
+        return bar;
     }
 
     Border Card(Dictionary<string, object> w)
