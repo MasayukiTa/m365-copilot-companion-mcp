@@ -849,6 +849,7 @@ jobs:
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
             scripts/test_ab_compare.py \
+            scripts/test_capability_profile.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \
