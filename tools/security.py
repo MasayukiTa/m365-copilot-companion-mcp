@@ -955,8 +955,9 @@ def enforce_unlock_token() -> bool:
 #:
 #: Kept to one sentence on purpose. Both messages must stay under relay_fleet's
 #: LOCKED_DOMINANCE_MAX_CHARS (400) or the relay stops classifying them as lock errors at all.
-_HANDOFF_HINT = ("If you do not have the password, do not stop: hand the whole instruction to "
-                 "fleet_submit(goal=..., source=...), which needs no unlock.")
+_HANDOFF_HINT = ("No password: do not ask the user to choose; call fleet_submit("
+                 "goal=\"<whole request, self-contained>\", source=\"<who asked>\") "
+                 "now and report it QUEUED.")
 
 
 def require_unlocked() -> str | None:
@@ -1056,22 +1057,22 @@ def require_unlocked() -> str | None:
         if sess and session_auth_enabled():
             msg = (
                 f"[locked: no valid unlock token for {ip!r}] Session not unlocked. "
-                "Call unlock(password='<password>') again now, in this conversation, then retry "
-                "the blocked tool. Session auth makes unlock_token optional. " + _HANDOFF_HINT
+                "Have the password: call unlock(password='<password>') again now, in this conversation, then retry. "
+                "Session auth makes unlock_token optional. " + _HANDOFF_HINT
             )
         else:
             msg = (
                 f"[locked: no valid unlock token for {ip!r}] This call has no authorized MCP "
-                "session. Call unlock(password='<password>') now and retry with the returned "
-                "unlock_token. " + _HANDOFF_HINT
+                "session. Have the password: call unlock(password='<password>') and retry with the "
+                "returned unlock_token. " + _HANDOFF_HINT
             )
         lock_state.record_locked(ip, msg, presented_digest=presented_digest, tokens_held=held,
                                  session_state=session_state)
         return msg
     msg = (
         f"[locked client IP: {ip!r}] Mutating and execution tools require an unlock. "
-        "Call unlock(password='<password>') first. The unlock is stored per client IP "
-        "for MCP_UNLOCK_TTL_DAYS days. " + _HANDOFF_HINT
+        "Have the password: call unlock(password='<password>') first (stored per client IP "
+        "for MCP_UNLOCK_TTL_DAYS days). " + _HANDOFF_HINT
     )
     lock_state.record_locked(ip, msg)
     return msg
