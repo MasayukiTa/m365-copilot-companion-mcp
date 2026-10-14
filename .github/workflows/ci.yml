@@ -446,6 +446,15 @@ jobs:
             relay/test_canned_nonanswer_cause.py \
             relay/test_fleet_self_retry.py \
             relay/test_autoscale_ceiling_default.py \
+            relay/test_lanes_default_and_send_bucket.py \
+            relay/test_no_goal_path_opens_a_tab.py \
+            relay/test_socket_capacity.py \
+            relay/test_sweep_hot_path.py \
+            relay/test_the_cockpit_retry_is_accepted.py \
+            relay/test_token_provider.py \
+            relay/test_watchdog_blocking_aware.py \
+            tests/test_gui_submit_idempotency.py \
+            tools/test_resplit_cockpit_patch.py \
             scripts/test_diag_report.py \
             scripts/test_diag_warmup_bias.py \
             scripts/test_recycle_report.py \

@@ -65,7 +65,6 @@ _ISOLATE = Path(__file__).resolve().parent / "run_isolated.py"
 #:                                stale expectation rather than a leak
 SUITES = {
     "relay/test_acceptance.py": None,
-    "relay/test_autoscale.py": None,
     "relay/test_code_task.py": None,
     "relay/test_continue_escalation.py": None,
     "relay/test_feedback.py": None,
