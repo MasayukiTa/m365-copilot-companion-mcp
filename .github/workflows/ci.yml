@@ -263,6 +263,7 @@ jobs:
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
+            ui/test_clear_history_never_drops_unfinished_work.py \
             ui/test_the_effort_policy_says_what_is_in_effect.py \
             ui/test_content_details_spine.py \
             ui/test_submitted_history_reconciliation.py \
