@@ -187,74 +187,7 @@ def test_with_a_cached_template_the_light_path_is_used(tmp_path, monkeypatch):
     assert token and template.gpt_id
 
 
-def test_without_a_cached_template_a_full_capture_runs_and_the_template_is_saved(tmp_path,
-                                                                                monkeypatch):
-    """Tier 3 is not a failure mode, it is where a template comes from. The next refresh is
-    tier 2 precisely because this one ran."""
-    monkeypatch.setattr(PT, "token_via_light_page",
-                        lambda *a, **k: pytest.fail("the light path cannot work without a template"))
-    import relay.socket_route as SR
-    monkeypatch.setattr(SR, "capture_via_tab", lambda ctx, url: (_jwt(), _Template()))
-    token, template = PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
-    assert token and template.gpt_id
-    assert PT.load_template("agent-1", str(tmp_path)) is not None, "the template was not cached"
-
-
-def test_a_failing_light_path_falls_through_to_the_full_capture(tmp_path, monkeypatch):
-    """THE WHOLE FALLBACK STRUCTURE. Nothing here may fail a capture that the ordinary path
-    would have completed: a light path that cannot produce a token costs five seconds and then
-    the run proceeds exactly as it always did."""
-    PT.save_template(_Template(), "agent-1", str(tmp_path))
-
-    def refuse(*a, **k):
-        raise PT.NoLightToken("nothing seen")
-
-    monkeypatch.setattr(PT, "token_via_light_page", refuse)
-    import relay.socket_route as SR
-    monkeypatch.setattr(SR, "capture_via_tab", lambda ctx, url: (_jwt(), _Template()))
-    token, template = PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
-    assert token and template.gpt_id
-
-
-def test_an_unexpected_error_in_the_light_path_also_falls_through(tmp_path, monkeypatch):
-    """Not just NoLightToken. A browser that went away mid-probe raises something else entirely,
-    and the answer is the same: run the capture that has always worked."""
-    PT.save_template(_Template(), "agent-1", str(tmp_path))
-
-    def explode(*a, **k):
-        raise RuntimeError("target closed")
-
-    monkeypatch.setattr(PT, "token_via_light_page", explode)
-    import relay.socket_route as SR
-    monkeypatch.setattr(SR, "capture_via_tab", lambda ctx, url: (_jwt(), _Template()))
-    token, _template = PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
-    assert token
-
-
-def test_a_failing_full_capture_still_raises(tmp_path, monkeypatch):
-    """The route's circuit breaker has to see the same events it always saw. Swallowing a
-    capture failure here would leave it counting successes that did not happen."""
-    import relay.socket_route as SR
-
-    def boom(ctx, url):
-        raise RuntimeError("capture failed")
-
-    monkeypatch.setattr(SR, "capture_via_tab", boom)
-    with pytest.raises(RuntimeError):
-        PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
-
-
 # ---- the switch --------------------------------------------------------------------------------
-
-def test_it_is_off_unless_the_flag_says_otherwise(monkeypatch):
-    monkeypatch.delenv("MCP_CAPTURE_LIGHT", raising=False)
-    assert PT.capture_fn().__name__ == "capture_via_tab"
-    for off in ("0", "false", "no", "off", ""):
-        monkeypatch.setenv("MCP_CAPTURE_LIGHT", off)
-        assert PT.capture_fn().__name__ == "capture_via_tab", off
-    monkeypatch.setenv("MCP_CAPTURE_LIGHT", "1")
-    assert PT.capture_fn().__name__ == "capture_via_profile"
-
 
 def test_the_route_asks_which_capture_rather_than_naming_one():
     """socket_route.py is frozen, so a policy about cost is applied by its caller."""
@@ -358,19 +291,6 @@ def test_the_memo_holds_the_template_that_came_with_the_token(tmp_path, monkeypa
     _t1, first = PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
     _t2, second = PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
     assert first.gpt_id == second.gpt_id == "T_only.z"
-
-
-def test_a_full_capture_is_memoised_too(tmp_path, monkeypatch):
-    """Tier 3 is the expensive one, so it is the one that most needs not to be repeated when the
-    route asks again a second later."""
-    PT.forget_memo()
-    import relay.socket_route as SR
-    calls = []
-    monkeypatch.setattr(SR, "capture_via_tab",
-                        lambda ctx, url: calls.append(url) or (_jwt(), _Template()))
-    PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
-    PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
-    assert len(calls) == 1
 
 
 def test_the_spin_is_explained_once_not_every_time(tmp_path, monkeypatch, capsys):
@@ -520,3 +440,40 @@ def test_an_unusable_template_is_not_evicted_on_a_guess(tmp_path):
     path = PT.template_path("agent-1", str(tmp_path))
     PT.load_template("agent-1", str(tmp_path))
     assert os.path.exists(path)
+
+
+# ---- no tier 3: a capture never sends a turn (owner rule 2026-10-14) ---------------------------
+
+def test_without_a_cached_template_the_capture_refuses_instead_of_running_a_turn(tmp_path,
+                                                                                monkeypatch):
+    """There is no full capture any more, so a missing template is a refusal the caller backs
+    off from -- the goal keeps waiting -- and the light path is not even tried."""
+    PT.forget_memo()
+    monkeypatch.setattr(PT, "token_via_light_page",
+                        lambda *a, **k: pytest.fail("the light path cannot work without a template"))
+    with pytest.raises(PT.NoTemplateWithoutTurn):
+        PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
+
+
+def test_a_failing_light_path_raises_and_never_falls_through_to_a_turn(tmp_path, monkeypatch):
+    """Both the expected failure (NoLightToken) and an unexpected one (a browser that went away
+    mid-probe) reach the caller unchanged, so the route's circuit breaker sees them."""
+    PT.forget_memo()
+    PT.save_template(_Template(), "agent-1", str(tmp_path))
+    for exc in (PT.NoLightToken("nothing seen"), RuntimeError("target closed")):
+        def refuse(*a, _exc=exc, **k):
+            raise _exc
+
+        monkeypatch.setattr(PT, "token_via_light_page", refuse)
+        with pytest.raises(type(exc)):
+            PT.capture_via_profile(object(), "agent-1", directory=str(tmp_path))
+
+
+def test_the_capture_is_always_the_no_turn_one(monkeypatch):
+    """MCP_CAPTURE_LIGHT is no longer read: there is no other capture to switch to."""
+    for value in (None, "0", "false", "", "1"):
+        if value is None:
+            monkeypatch.delenv("MCP_CAPTURE_LIGHT", raising=False)
+        else:
+            monkeypatch.setenv("MCP_CAPTURE_LIGHT", value)
+        assert PT.capture_fn() is PT.capture_via_profile, value

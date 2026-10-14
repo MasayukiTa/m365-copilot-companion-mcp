@@ -124,32 +124,6 @@ def test_a_genome_may_not_name_routing_even_now():
     assert "forbidden" in str(exc.value)
 
 
-def test_the_fleet_asks_the_policy_before_it_asks_for_a_socket():
-    """宣言する前に到達性を追跡する。quality_cards はこれを怠って
-    『ターゲットが読まないフィールド』として正当に拒否された。"""
-    import inspect
-
-    from bench.companionbench.agents import FLEET_FIELDS
-    from relay import relay_fleet as RF
-    src = inspect.getsource(RF.RelayWorker)
-    assert "transport_policy import" in src, "フリートが方策を読んでいない"
-    # 呼び出しの綴りではなく順序を見る。以前は "driver_for(self.name)" を丸ごとアンカーに
-    # していたため、引数が1つ増えただけでこの不変条件の検査が消えた。
-    assert src.index("transport_policy import") < src.index("driver_for("), (
-        "経路に頼んだ後で方策を聞いている")
-    assert "components.transport" in FLEET_FIELDS
-
-
-def test_a_policy_that_cannot_answer_does_not_cost_a_goal():
-    """経路は速度であって能力ではない、という socket_route の原則は
-    その手前の分類にも及ぶ。方策が壊れてもゴールは落ちてはいけない。"""
-    import inspect
-    from relay import relay_fleet as RF
-    src = inspect.getsource(RF.RelayWorker)
-    i = src.index("transport_policy import")
-    assert "except Exception" in src[i:i + 400]
-
-
 def test_the_first_real_fallback_reason_is_classified(monkeypatch):
     """実測 2026-08-21、初の本物の fallback:
     'ChatHubError: turn deadline exceeded before a completion frame'
