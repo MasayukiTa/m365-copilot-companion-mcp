@@ -4,9 +4,12 @@ Two defects this module removes (design review 2026-10-14, ledger items 3 and 7)
 
 1. A goal admitted while no token was in hand fell through to a SYNCHRONOUS tab open on the one
    sweep thread (up to ~210 s), froze status.json, and the watchdog then killed the Edge. Here a
-   goal that would use a socket is HELD in the pending queue ("waiting for token") instead,
-   with its reason visible in status.json. Nothing is opened and nothing blocks. A hold has a
-   ceiling after which the historical tab path applies, so capability is never lost.
+   goal is HELD in the pending queue ("waiting for token", or "socket route unavailable" when
+   the route is shut) instead, with its reason visible in status.json. Nothing is opened and
+   nothing blocks. THE HOLD HAS NO CEILING: Copilot never runs in a browser tab (owner rule,
+   relay/no_tab.py), so there is no tab path to fall back to after any amount of waiting. The
+   capture keeps being retried, paced by CapturePolicy; the route is reopened by
+   relay/route_reopen.py.
 
 2. Captures were launched every ~2 minutes and mostly re-read the SAME old token (43 captures in
    2.5 h). A token's `exp` is known, so a capture that returned the same `exp` as the last one
@@ -30,9 +33,9 @@ BASE_INTERVAL_S = float(os.environ.get("MCP_TOKEN_BASE_INTERVAL_S", "120"))
 MAX_INTERVAL_S = float(os.environ.get("MCP_TOKEN_MAX_INTERVAL_S", "600"))
 #: Ceiling of the backoff when NO usable token is in hand (workers are waiting on us).
 MAX_INTERVAL_NO_TOKEN_S = float(os.environ.get("MCP_TOKEN_MAX_INTERVAL_NO_TOKEN_S", "300"))
-#: How long a goal may be held waiting for a token before the tab path applies.
-MAX_HOLD_S = float(os.environ.get("MCP_TOKEN_MAX_HOLD_S", "600"))
-#: Own timeout for one capture helper (covers tier 2 plus the tier 3 worst case).
+#: Own timeout for one capture helper: a page load plus the wait for the page's own token
+#: request (profile_token.LIGHT_TIMEOUT_S, 30 s), with room for a cold Edge (a cold capture was
+#: measured at 77-134 s on 2026-10-14). There is no longer a real-turn stage in a capture.
 CAPTURE_TIMEOUT_S = float(os.environ.get("MCP_SOCKET_CAPTURE_TIMEOUT_S", "180"))
 
 
@@ -113,38 +116,52 @@ class CapturePolicy:
                 "next_capture_in_s": max(0, int(st["next_at"] - now)), "why": st["why"]}
 
 
-class TokenHold:
-    """Decides whether a pending goal should wait for a token instead of opening a tab."""
+def wait_reason(route, agent_url) -> str:
+    """Why a goal cannot be bound to a socket right now, as the text status.json shows.
 
-    def __init__(self, max_hold_s=None, now=time.time):
-        self.max_hold_s = MAX_HOLD_S if max_hold_s is None else float(max_hold_s)
+    "socket route unavailable" when the route is shut or switched off; "waiting for token" when
+    the route is open but holds no usable token/template yet. There is no third answer: a tab is
+    never an option (relay/no_tab.py)."""
+    try:
+        if not route.enabled:
+            return ("socket route unavailable -- disabled (MCP_FLEET_SOCKET); no tab is ever "
+                    "opened for a goal")
+        if not route.open():
+            return "socket route unavailable -- %s; retrying, no tab is opened" % (
+                str(getattr(route, "closed_reason", "") or "closed")[:100])
+    except Exception:
+        pass
+    return "waiting for token"
+
+
+class TokenHold:
+    """Decides whether a pending goal must wait because the socket cannot serve it yet.
+
+    No ceiling and no tab: a goal waits here for as long as it takes the capture / the route
+    repair to succeed. `since` is kept per goal only so status.json can show how long."""
+
+    def __init__(self, now=time.time):
         self._now = now
         self._lock = threading.Lock()
         self._since = {}      # goal name -> first time held
         self._last = {}       # summary for status.json
 
     def hold_reason(self, name, route, agent_url, wants_socket=True) -> str:
-        """'' = proceed (socket is ready, or a tab is legitimately needed); else the reason."""
+        """'' = proceed (the route can serve a socket now); else why the goal waits.
+
+        `wants_socket` is accepted for old callers and ignored: every goal is a socket goal."""
         now = float(self._now())
         try:
-            if not wants_socket or not route.open():
+            if route.open() and route.ready(agent_url):
                 self.release(name)
                 return ""
-            if route.ready(agent_url):
-                self.release(name)
-                return ""
+            base = wait_reason(route, agent_url)
         except Exception:
             return ""
         with self._lock:
             since = self._since.setdefault(name, now)
             waited = now - since
-            if waited > self.max_hold_s:
-                self._last = {"waiting": len(self._since), "expired": name,
-                              "reason": "token wait exceeded %.0fs; tab path allowed"
-                                        % self.max_hold_s}
-                self._since.pop(name, None)
-                return ""
-            reason = "waiting for token (%.0fs)" % waited
+            reason = "%s (%.0fs)" % (base, waited)
             self._last = {"waiting": len(self._since), "oldest_s": int(
                 now - min(self._since.values())), "reason": reason}
             return reason
@@ -160,17 +177,11 @@ class TokenHold:
             return dict(self._last)
 
 
-def goal_wants_socket(worker, resume_is_url=False) -> bool:
-    """Mirror of the transport decision in RelayWorker.attach: a goal bound to a page URL, or
-    one the transport policy sends to a tab, must not be held for a token."""
-    if resume_is_url:
-        return False
-    try:
-        from relay.transport_policy import SOCKET, choose
-        return choose(getattr(worker, "goal", ""),
-                      kind=getattr(worker, "task_kind", "") or "") == SOCKET
-    except Exception:
-        return True
+def goal_wants_socket(worker=None, resume_is_url=False) -> bool:
+    """Always True. Kept for callers of the old tab/socket split: there is no tab path, so
+    every goal -- including one resuming a page URL, which is reduced to its conversation id
+    in RelayWorker.attach -- waits for a socket."""
+    return True
 
 
 _HOLD = None

@@ -769,33 +769,32 @@ from tools.settings_keys import default as _settings_default
 #: admission gates. It had three owners until 2026-09-17; see that module.
 RAM_FLOOR_DEFAULT_MB = float(_settings_default("ram_floor_mb"))
 
-#: EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause design
-#: (socket-route resource accounting, token bucket under rate ceiling, watchdog blocking-call
-#: awareness). The 1000-lane default, the ignoring of stale settings.txt lane values and the RAM
-#: bypass in relay_fleet (RAM_GOVERNS_CONCURRENCY) are ONE emergency override, not the finished fix.
-EMERGENCY_OVERRIDE = "EMERGENCY 2026-10-14 (owner order)"
-
-#: HOW MANY GOALS RUN AT ONCE, BY DEFAULT: 1000, and RAM does not lower it (owner decision
-#: 2026-10-14). The real limits are the cloud rate (the send bucket in relay_fleet), the disk
-#: floor and the watchdog -- not a lane count derived from free memory.
-LANES_DEFAULT = 1000
+#: HOW MANY GOALS MAY RUN AT ONCE (the "lane ceiling"): DERIVED, NOT A LITERAL. It is the number
+#: of goals the cloud rate can feed at once, with headroom -- ceil(100 RPM x 60 s per turn / 60 x
+#: 2) = 200 -- computed in tools/settings_keys.derive_lane_ceiling and declared there as the
+#: default of the `maxtabs` and `autoscale_max` keys, so the panel, the settings table and this
+#: module share one owner. It replaces the literal 1000 of 2026-10-14. The ceiling is not
+#: what limits throughput (the send token bucket in relay_fleet does, rate = min(100,
+#: rate_ceiling_rpm)); and free RAM never shrinks or stops a running goal -- it only prices the
+#: next admission (relay/socket_capacity.py). No term in this number is a browser tab.
+LANES_DEFAULT = _settings_default("maxtabs")
 DEFAULT_MAX_CONCURRENT = LANES_DEFAULT
 
 #: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
-#: `_autoMax` default (ui/FleetCockpit.cs). Same figure as the lane default: the ceiling is not
-#: a second, lower cap.
-AUTOSCALE_CEILING_DEFAULT = LANES_DEFAULT
+#: `_autoMax` default (ui/FleetCockpit.cs). Same derived figure as the lane default.
+AUTOSCALE_CEILING_DEFAULT = _settings_default("autoscale_max")
 
-#: SETTINGS.TXT DOES NOT SET THE STARTING LANE COUNT unless the operator says so on the command
-#: line. `maxtabs` and `autoscale_max` persist in settings.txt from whenever somebody last
-#: touched the stepper (a stale 3, 30, ...), and the fleet used to read them as the cap on every
-#: later run, silently re-imposing a limit nobody was looking at. Precedence now, highest first:
+#: DOCUMENTED PRECEDENCE FOR THE LANE CEILING, highest first:
 #:   1. a live command in this run (cockpit stepper -> set_maxtabs / set_autoscale), or the
-#:      settings follower seeing the FILE CHANGE while the run is up -- an operator acting now;
+#:      settings follower seeing the settings.txt FILE CHANGE while the run is up -- an operator
+#:      acting now;
 #:   2. an explicit command-line --max-concurrent N / --autoscale-max N / --autoscale-default N;
-#:   3. LANES_DEFAULT.
-#: The stale file value is IGNORED at start-up and the run says so. MCP_FLEET_HONOR_SETTINGS_LANES=1
-#: restores "settings.txt supplies the start-up value" for a host that wants it.
+#:   3. the derived default above.
+#: A settings.txt `maxtabs` / `autoscale_max` found at START-UP is not on this list: those keys
+#: persist from whenever somebody last touched the stepper (a stale 3, 30, ... from the tab era,
+#: when the number counted browser tabs) and used to silently cap every later run. They are
+#: IGNORED at start-up and the run says so on one line. MCP_FLEET_HONOR_SETTINGS_LANES=1 makes
+#: settings.txt supply the start-up value, for a host whose operator wants exactly that.
 HONOR_SETTINGS_LANES = os.environ.get("MCP_FLEET_HONOR_SETTINGS_LANES", "0") == "1"
 
 
@@ -4364,14 +4363,14 @@ def main():
     print("       disk floor: keep >= %.1f GB free on C: -- %s (free now %.1f GB)"
           % (disk_floor, disk_floor_src, free_disk_gb()))
     print("       RAM floor:  keep >= %.0f MB free -- %s" % (ram_floor, ram_floor_src))
-    from relay.relay_fleet import (RAM_GOVERNS_CONCURRENCY as _ram_governs,
-                                   SOCKET_SEND_BURST as _burst, SOCKET_SEND_RPM as _rpm)
-    print(_stamp("[emergency] emergency override active (%s -- temporary): lanes default %d, "
-                 "free RAM %s concurrency (floor shown above is a metric), socket sends paced "
-                 "by a token bucket %.0f/min burst %.0f under rate_ceiling_rpm; stale settings "
-                 "lane values %s" % (EMERGENCY_OVERRIDE, LANES_DEFAULT,
-                                     "GOVERNS" if _ram_governs else "does NOT govern", _rpm, _burst,
-                                     "honoured" if HONOR_SETTINGS_LANES else "ignored")),
+    from relay.relay_fleet import SOCKET_SEND_BURST as _burst, SOCKET_SEND_RPM as _rpm
+    from relay import socket_capacity as _sc
+    print(_stamp("       capacity  : lane ceiling %d (derived from the cloud rate); RAM safeguard "
+                 "prices %.0f MB per socket goal and gates NEW admissions only; sends paced by a "
+                 "token bucket %.0f/min burst %.0f, capped by rate_ceiling_rpm; lane values in "
+                 "settings.txt at start-up %s"
+                 % (LANES_DEFAULT, _sc.goal_cost_mb(), _rpm, _burst,
+                    "honoured" if HONOR_SETTINGS_LANES else "ignored (live changes apply)")),
           flush=True)
     # EVERY KEY THIS PROCESS ACTUALLY SEES. If the fleet is reading a different copy of the
     # settings file than the cockpit writes, then no setting reaches it -- not just the floor

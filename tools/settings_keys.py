@@ -41,7 +41,27 @@ is exactly the property that stops a disagreement from being detectable.
 """
 from __future__ import annotations
 
+import math
 from collections import OrderedDict
+
+# ---- THE LANE CEILING IS DERIVED, NOT A MAGIC NUMBER ------------------------------------
+# How many goals may run at once is bounded by the cloud rate, not by RAM or tabs: a goal sends
+# about one request per turn, so by Little's law the goals the rate can feed at once are
+#     concurrent goals ~= rate (requests/min) x seconds per turn / 60.
+# Past that point extra goals only queue READY behind the send token bucket. The ceiling is
+# that figure with headroom, so it is high enough never to be the binding limit and low enough
+# to mean something. Replaces the 2026-10-14 emergency literal of 1000.
+CLOUD_RPM = 100.0            # the published per-environment limit (relay/quota_meter.LIMIT_RPM)
+TYPICAL_TURN_S = 60.0        # measured: median 37 s (other runs) to 57 s (the 189-goal run)
+LANE_HEADROOM = 2.0          # goals beyond what the rate can feed, so turn-time swings never starve it
+
+
+def derive_lane_ceiling(rpm=CLOUD_RPM, turn_s=TYPICAL_TURN_S, headroom=LANE_HEADROOM) -> int:
+    """Lane ceiling from the cloud rate: ceil(rpm * turn_s / 60 * headroom). 200 by default."""
+    return int(math.ceil(float(rpm) * float(turn_s) / 60.0 * float(headroom)))
+
+
+LANE_CEILING_DEFAULT = derive_lane_ceiling()
 
 #: THE BOUNDARY A CHANGE CROSSES, not a rough class of it. The first version of this table
 #: used "live" for both the follower and the per-decision reads, which are different promises:
@@ -94,7 +114,7 @@ KEYS = OrderedDict([
        "relay/fleet_runner.py:settings_ram_floor + Follower.watch",
        "A running fleet adopts a new floor within a second."),
 
-    _k("maxtabs", LIVE, 1000,
+    _k("maxtabs", LIVE, LANE_CEILING_DEFAULT,
        "relay/fleet_runner.py:settings_maxtabs + Follower.watch",
        "Live, but it means different things: with autoscale ON this moves the CEILING, "
        "with autoscale off it is the fixed cap."),
@@ -103,6 +123,12 @@ KEYS = OrderedDict([
     _k("rate_ceiling_rpm", EACH_GATE, 100.0,
        "relay/relay_fleet.py:rate_ceiling (every admission check)",
        "Read fresh on every admission decision."),
+
+    _k("socket_goal_mb", EACH_GATE, 25.0,
+       "relay/socket_capacity.py:goal_cost_mb (every admission sweep)",
+       "Price in MB of one held socket conversation, used for the RAM safeguard on admitting "
+       "new goals: cap = active + (free RAM - ram_floor_mb) / this. Measured cost is a few MB "
+       "(1.9 MB per conversation), so 25 is conservative. Running goals are never stopped."),
 
     _k("job_approval_mode", EACH_GATE, "auto",
        "tools/approval_policy.py:current_approval_mode (every gate check)",
@@ -114,7 +140,7 @@ KEYS = OrderedDict([
        "Takes effect on the NEXT run. Toggling it mid-run does nothing, although it sits "
        "beside knobs that are live."),
 
-    _k("autoscale_max", SWEEP_START, 1000,
+    _k("autoscale_max", SWEEP_START, LANE_CEILING_DEFAULT,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",
        "Takes effect on the NEXT run -- while maxtabs, next to it, moves the same ceiling "
        "live when autoscale is on."),

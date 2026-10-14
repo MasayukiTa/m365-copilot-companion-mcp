@@ -100,7 +100,7 @@ class AsyncCaptureManager:
             with self._lock:
                 self._failed += 1
             try:
-                route.note_failure("async capture launch failed: %s: %s" %
+                route.note_capture_failure("async capture launch failed: %s: %s" %
                                    (type(exc).__name__, str(exc)[:160]))
             except Exception:
                 pass
@@ -180,7 +180,7 @@ class AsyncCaptureManager:
             except Exception:
                 pass
             try:
-                route.note_failure("async capture failed for %s: %s: %s" %
+                route.note_capture_failure("async capture failed for %s: %s: %s" %
                                    (key[:40] or "(default)", type(exc).__name__, str(exc)[:180]))
             except Exception:
                 pass

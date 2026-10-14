@@ -795,13 +795,13 @@ class CockpitWindow : Window
 
     bool _dark = true;
     int _lang = 0;          // 0 = Japanese, 1 = English
-    int _maxtabs = 1000;
+    int _maxtabs = 200;
     bool _autoscale = false;   // RAM-aware autoscale on/off (NEW)
-    int _autoMax = 1000;      // ceiling (上限) tabs may grow to under autoscale. High by design:
-                               // autoscale (ram_target_cap) self-limits to what free RAM allows
-                               // (~3 on a 16 GB box, far more on a big-RAM machine), so this is the
-                               // upper RAIL, not a hardware bound. Real limiters: free RAM + M365
-                               // Copilot per-user fair-use/rate limits.
+    int _autoMax = 200;       // lane ceiling (上限): goals that may run at once. DERIVED, not a literal:
+                               // ceil(100 RPM x 60 s per turn / 60 x 2) = 200, the same value as
+                               // tools/settings_keys.py (maxtabs / autoscale_max). Throughput is bounded by
+                               // the send token bucket (rate_ceiling_rpm); free RAM only prices NEW
+                               // admissions and never stops a running goal. No browser tab is involved.
     double _diskFloor = 6.0;   // admission disk floor (GB) -> settings.txt disk_floor_gb=; user-editable
                                // in the settings panel. Persisted via SaveKey AND pushed live to a
                                // running fleet via {"set_disk_floor_gb":N} (fleet_runner.py ~L561).

@@ -47,6 +47,7 @@ from .copilot_autopilot_relay import (
     conversation_start_label,
 )
 from relay import settle as _settle
+from relay import socket_capacity
 from relay import fanout as fanout_mod
 from relay import fanout_budget as fanout_budget_mod
 from relay import fleet_resume as resume_mod
@@ -315,10 +316,9 @@ def note_admitted(now=None):
 
 # ── SOCKET SEND PACING: A RATE, NOT A GAP ─────────────────────────────────────────────────
 #
-# EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause design
-# (socket-route resource accounting, token bucket under rate ceiling, watchdog blocking-call
-# awareness). The conservative defaults below (30/min, burst 8) are a first cut to be measured,
-# not a tuned design.
+# THE DESIGN: the cloud rate is the bound on throughput, and it is enforced HERE, where it is
+# spent -- a token bucket with rate = min(100, rate_ceiling_rpm) and burst 8. The number of
+# concurrent goals (relay/socket_capacity.py) does not need to throttle anything.
 #
 # WHAT PRODUCED THE LONG WAITS (2026-10-14, goals sitting at turn 0 with the reason "socket send
 # pacing -- waiting for next send slot"): RelayWorker._begin_send asked admission_is_due() before
@@ -335,9 +335,9 @@ def note_admitted(now=None):
 # goals as there are tokens go out in the same sweep. The burst is bounded by the measured safe
 # figure (eight sends; twenty at once were refused).
 #
-# STARTING CONSERVATIVE, ON PURPOSE. The default rate is well under the cloud limit, and the
-# operator's `rate_ceiling_rpm` (read live from settings, never written here) is a hard maximum
-# on top of it: the rate used is min(SOCKET_SEND_RPM, ceiling). After a throttle the rate drops
+# THE RATE IS THE PUBLISHED LIMIT AND THE OPERATOR'S CEILING IS A HARD MAXIMUM ON TOP OF IT:
+# the rate used is min(SOCKET_SEND_RPM (100), rate_ceiling_rpm), the latter read live from
+# settings and never written here. After a throttle the rate drops
 # by ADMIT_THROTTLED_FACTOR and the burst to one for ADMIT_THROTTLE_MEMORY_S, the same widening
 # the old gap had. The measured trailing-minute check (rate_headroom_ok) still applies.
 SOCKET_SEND_RPM = float(os.environ.get("MCP_SOCKET_SEND_RPM", "100") or 100)   # still min() with rate_ceiling_rpm
@@ -2310,19 +2310,6 @@ FLEET_MEASURED_TABS_ARM_MB = 564.1
 FLEET_MEASURED_SOCKET_ARM_MB = 428.8
 FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "400"))
 
-#: EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause design
-#: (socket-route resource accounting, token bucket under rate ceiling, watchdog blocking-call
-#: awareness). Not the finished fix.
-#:
-#: DOES FREE RAM DECIDE HOW MANY GOALS RUN? NO, BY DEFAULT (owner decision 2026-10-14: "ignore
-#: RAM entirely for concurrency"). With this False the live cap is the configured ceiling
-#: (ram_target_cap is not consulted), the automatic lane count is not derived from free RAM
-#: (fleet_runner), and the side-page gate ram_room_for_tab() does not hold a research or
-#: refuter page back. Free RAM remains a reported metric. Set MCP_FLEET_RAM_GOVERNS=1 to restore
-#: the old behaviour (a bench host whose RAM genuinely bounds it); the functions themselves are
-#: unchanged and still tested.
-RAM_GOVERNS_CONCURRENCY = os.environ.get("MCP_FLEET_RAM_GOVERNS", "0") == "1"
-
 
 def ram_room_for_tab(floor_mb=None) -> bool:
     """True iff there is enough free physical RAM to open ANOTHER browser tab without crowding
@@ -2336,8 +2323,6 @@ def ram_room_for_tab(floor_mb=None) -> bool:
     the tab about to be opened. The 2000 that used to sit here was neither of those.
     """
     if floor_mb is None:
-        if not RAM_GOVERNS_CONCURRENCY:
-            return True          # RAM is a metric, not a gate (see RAM_GOVERNS_CONCURRENCY)
         floor_mb = FLEET_RAM_FLOOR_MB + FLEET_PER_TAB_MB
     return avail_phys_mb() >= floor_mb
 
@@ -2408,7 +2393,8 @@ def _holds_slot(w):
     tab_weight. Conflating the two lets sockets over-admit against a disk floor that has
     nothing to do with browsers -- which is silent until the disk is full.
     """
-    return ((getattr(w, "page", None) is not None or getattr(w, "socket", False))
+    return ((getattr(w, "page", None) is not None or getattr(w, "socket", False)
+             or getattr(w, "_needs_socket_rebind", False))
             and w.status not in TERMINAL)
 
 
@@ -2761,20 +2747,19 @@ def _commit_subject_from_goal(goal):
     return " ".join(m.group(1).split()).strip() or None
 
 
-def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=1000):
-    """How many heavy M365 tabs we can afford open at once, given free RAM right now.
-    Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
-    `hard_cap` is a high upper RAIL (100), NOT a hardware bound: the RAM term (free//per_tab)
-    is the real limiter, so a 16 GB box self-limits to ~3 while a big-RAM machine scales up.
-    A modest run is still wise for M365 Copilot per-user fair-use, but that's a policy choice
-    the operator makes via settings, not a hardcoded ceiling baked in here."""
-    if not RAM_GOVERNS_CONCURRENCY:
-        # RAM-blind by default: the lane count is the goals present, capped by the rail.
-        return max(1, min(n_goals, hard_cap))
-    per_tab_mb = FLEET_PER_TAB_MB if per_tab_mb is None else per_tab_mb
-    headroom_mb = FLEET_RAM_FLOOR_MB if headroom_mb is None else headroom_mb
-    fit = int((avail_phys_mb() - headroom_mb) / per_tab_mb)
-    return max(1, min(n_goals, fit, hard_cap))
+def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=None):
+    """The start-up lane count for `--max-concurrent 0` (auto): the goals present, capped by the
+    lane ceiling (derived from the cloud rate, tools/settings_keys.derive_lane_ceiling).
+
+    FREE RAM IS NOT IN THIS NUMBER. It used to be (free RAM // per-TAB cost), a budget for browser
+    tabs that a socket goal does not hold, and it was bypassed wholesale on 2026-10-14. The RAM
+    safeguard is now applied where it belongs, at each admission, priced from the measured cost
+    of a socket conversation: relay/socket_capacity.py. `per_tab_mb` and `headroom_mb` are kept
+    only so existing callers' signatures still bind; they are unused."""
+    if hard_cap is None:
+        from tools.settings_keys import LANE_CEILING_DEFAULT
+        hard_cap = LANE_CEILING_DEFAULT
+    return max(1, min(n_goals, hard_cap))
 
 
 # ── Disk-floor admission (capacity-aware continuous admission, 2026-06-14) ────────────────
@@ -3168,117 +3153,17 @@ def _maybe_lean(page):
 
 
 def _open_fresh(context, url):
-    """Open a NEW tab on a fresh chat of the agent -- DECLARED AS A BLOCKING CALL.
+    """REMOVED. Copilot never runs in a browser tab (owner rule, 2026-10-14).
 
-    This holds the calling thread (the fleet sweep, from attach and the fresh replay) for up to
-    ~210s, longer behind a sign-in page, with status.json frozen the whole time. The stall
-    watchdog cannot tell that from a wedged Edge, and on 2026-10-14 it killed the browser under
-    this very call. The declaration lives HERE, in the one function every tab open goes through,
-    rather than at each call site: attach() and the fresh replay never declared it, only the
-    mid-run fallback did. relay/blocking_calls.py has the register; its entry expires on its own
-    ceiling, so a real wedge inside this call is still recovered."""
-    from relay import blocking_calls
-    with blocking_calls.blocking("tab_open", blocking_calls.TAB_OPEN_CEILING_S):
-        return _open_fresh_unguarded(context, url)
-
-
-def _open_fresh_unguarded(context, url):
-    """Open a NEW tab on a fresh chat of the agent. Tolerant of slow navigation
-    (a busy Edge can miss the 30s domcontentloaded) -- we proceed and wait for the
-    composer to render either way. If a sign-in page appears, the background Edge is
-    surfaced once so the user can authenticate."""
-    from .edge_recover import surface, looks_like_login, touch_pause, rehide
-    pg = context.new_page()
-    # Claimed the moment it exists, before any navigation can fail: an unclaimed page
-    # is one a concurrently starting run is entitled to close.
-    _claim_page(pg, note="open_fresh")
-    # NO-OP UNLESS THIS THREAD ASKED FOR A LEAN PAGE. It has to be here rather than
-    # in the caller: interception must be installed before the navigation below, and
-    # the capture reaches this function through a frozen signature it cannot extend.
-    _maybe_lean(pg)
-    surfaced = False
-    surface_tried = False
-    login_streak = 0
-    force_timer = None
-    # Up to 3 navigation attempts: a failed goto leaves the tab on about:blank, and
-    # waiting 45s for a composer that will never come just leaves about:blank on screen.
-    # Detect about:blank early (~4s) and RE-navigate instead of staring at it.
-    #
-    # When a sign-in page appears we surface() the hidden Edge ONCE. From then on the
-    # user may be mid-MFA, so: (a) touch_pause() every ~1s while the login page is up so
-    # the keeper's 180s backoff never expires and re-minimizes the window under them, and
-    # (b) allow a much longer total wait (up to ~300s) for the composer -- the default
-    # 3x25s aborts a slow login. As soon as the composer renders after we surfaced,
-    # rehide() drops the window back to the background immediately.
-    attempt = 0
-    while True:
-        attempt += 1
-        navigation_failed = False
-        try:
-            pg.goto(url, wait_until="domcontentloaded", timeout=45000)
-        except Exception:
-            navigation_failed = True
-        for k in range(25):
-            pg.wait_for_timeout(1000)
-            if pg.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-                if surfaced:
-                    _cancel_force_rehide(force_timer)  # real rehide now; drop the safety net
-                    rehide()               # auth done -> back to background at once
-                return pg
-            try:
-                u = pg.url or ""
-                # A SIGN-IN-HOST URL IS NOT YET A WALL. A silent single-sign-on bounce passes
-                # through login.microsoftonline.com for a second or two on its way back to the
-                # chat, and the URL alone cannot tell that from a page waiting for a person
-                # (looks_like_login is URL-only). Count consecutive polls on a login URL and
-                # act only once it has STAYED there.
-                login_streak = (login_streak + 1) if looks_like_login(u) else 0
-                if login_streak:
-                    if login_streak < OPEN_FRESH_LOGIN_DEBOUNCE_S:
-                        continue
-                    if not surface_tried:
-                        # ASK ONCE. surface() REFUSES the fleet's Edge (no person is here: this
-                        # is an automatic open, and a sign-in-host URL can be a transient
-                        # single-sign-on bounce -- 2026-10-08 11:29 a token-capture helper took
-                        # one for a wall, the browser was killed and relaunched with a window).
-                        # If it is refused, `surfaced` stays False and the ordinary 3-attempt
-                        # loop below simply keeps waiting for the composer, hidden.
-                        surface_tried = True
-                        surfaced = bool(surface(open_url=url))
-                        if surfaced:
-                            # BUG 4b safety net, defense-in-depth: if we give up below (or exit
-                            # some other way) without ever calling rehide(), this bounded timer
-                            # still forces the window back down on its own.
-                            force_timer = _schedule_force_rehide()
-                    if surfaced:
-                        touch_pause()      # keep the keeper backed off through a long login
-                elif u == "about:blank" and k >= 3:
-                    break                  # stuck on about:blank -> re-navigate
-                elif navigation_failed and k >= 3:
-                    # A timed-out navigation can report the requested URL while the
-                    # target still has an about:blank document. Do not spend another
-                    # 25s waiting for a composer that cannot exist; retry the navigation.
-                    break
-            except Exception:
-                pass
-        # Non-surfaced path unchanged: give up after 3 navigation attempts (~75s).
-        # Surfaced path: keep polling for the composer up to ~300s total before giving
-        # up, so a slow interactive/MFA sign-in is not aborted out from under the user.
-        if surfaced:
-            if attempt * 25 >= 300:
-                break
-        elif attempt >= 3:
-            break
-    if surfaced:
-        # Giving up without ever seeing the composer -- rehide right now instead of relying
-        # solely on the bounded timer (BUG 4a: a failed/abandoned sign-in must not leave the
-        # window stuck in the foreground either).
-        _cancel_force_rehide(force_timer)
-        try:
-            rehide()
-        except Exception:
-            pass
-    return pg
+    This used to open a NEW tab on a fresh chat of the agent, holding the sweep thread for up to
+    ~210 s with status.json frozen -- the call under which the watchdog killed the Edge. Every
+    caller (goal attach, fresh replay, the mid-run socket->tab fallback, a token capture that
+    ran a real turn) is a path the rule forbids, so the function now refuses. It stays as a name
+    so that a stale caller fails loudly with CopilotTabForbidden instead of with a NameError that
+    reads like a typo. relay/test_no_goal_path_opens_a_tab.py keeps it that way.
+    """
+    from relay.no_tab import forbid_copilot_tab
+    forbid_copilot_tab("_open_fresh(%s)" % (str(url or "")[:60],))
 
 
 #: Turn cap for a goal that carries NO acceptance check.
@@ -3460,6 +3345,10 @@ class RelayWorker:
         #: `socket`, which is False afterwards and so cannot answer "which route did this
         #: goal actually need" -- the one question the classifier will be built to predict.
         self._socket_fell_back = False
+        # No tab path exists. A worker that lost its socket mid-goal waits for a new driver:
+        # `_needs_socket_rebind` marks it, `_socket_conv_id` is the conversation to continue.
+        self._needs_socket_rebind = False
+        self._socket_conv_id = ""
         self.goal_record = freeze_goal_dict(goal) if isinstance(goal, dict) else {"text": str(goal)}
         #: Which slice of a split this worker owns, so the merge can label its report. Read
         #: from the goal because that is where child_goals put it; absent for ordinary goals.
@@ -4044,14 +3933,11 @@ class RelayWorker:
         if self.transcript:
             self.attempt_transcripts.append(self.transcript)
 
-        try:
-            self.page = _open_fresh(self._context, self._agent_url)
-            self.drv = CopilotWebDriver(self.page)
-            self._attached_ts = time.time()
-        except Exception as e:
-            self.status, self.outcome = "error", "ERROR"
-            self.reason = "fresh replay open failed: %s: %s" % (type(e).__name__, e)
-            return False
+        # A FRESH CONVERSATION ON THE SOCKET, never a tab. The driver is bound by _begin_send
+        # (_rebind_socket), which waits -- with a reason -- if the route has none to give.
+        self._needs_socket_rebind = True
+        self._socket_conv_id = ""
+        self._attached_ts = time.time()
 
         # This is the same initial payload as the original non-plan review task.
         try:
@@ -4070,9 +3956,14 @@ class RelayWorker:
         self._agent_err_ts = 0.0
 
     def attach(self, context, agent_url):
-        """Open this worker's tab and make it ready to send. On failure -> error.
-        A resume_conv worker opens its EXISTING conversation URL (carrying prior context)
-        instead of a fresh agent chat; re-navs then return to that conversation too."""
+        """Bind this worker to a socket conversation and make it ready to send.
+
+        THERE IS NO TAB PATH (owner rule, 2026-10-14: Copilot never runs in a browser tab). When
+        the route offers no driver -- no token yet, the route shut -- this returns False and the
+        worker STAYS `pending` with the reason, and the admission loop puts it back at the head
+        of the queue. It never becomes an error and never opens a page. A resume target that is
+        a page URL is reduced to the conversation id inside it, or, when it carries none, starts
+        a fresh conversation (said out loud: the earlier context is not carried)."""
         self._context = context
         open_url = self.resume_conv or agent_url
         # A SOCKET IF ONE IS ON OFFER, A TAB OTHERWISE. Nothing downstream branches on this:
@@ -4095,77 +3986,38 @@ class RelayWorker:
         # of being read, by someone who then measured the opposite and did not notice the
         # contradiction. A comment that outlives its premise is worse than no comment: it is
         # evidence, and it is wrong.
-        want_socket = True
-        try:
-            from relay.transport_policy import SOCKET, choose
-            want_socket = choose(self.goal, kind=getattr(self, "task_kind", "") or "") == SOCKET
-        except Exception:
-            pass                      # a policy that cannot answer must not cost a goal
-        # A RESUME TARGET IS EITHER A PAGE OR A CONVERSATION. The tab path needs a URL to
-        # open; the socket path needs the conversation id, and nothing else -- measured with a
-        # control arm, at one hour and across a fresh token. Until now `resume_conv` could only
-        # be a URL, so every context-carrying follow-up forced a tab, and since the id was
-        # never recorded there was nothing to put here anyway.
         #
-        # The unlock is unaffected by which branch is taken: self.job was already built through
-        # _initial_job_with_unlock above, on the resume path as well as the fresh one. That is
-        # the single generation point this repository has been moving towards, and a resume
-        # that quietly bypassed it is exactly the fault just fixed in the bridge.
+        # THE TRANSPORT IS ALWAYS THE SOCKET. transport_policy.choose() once sent some goals to
+        # a tab; that branch is gone (relay/no_tab.py), so its answer is not consulted here.
         resume_id = _conversation_id_or_empty(self.resume_conv)
-        # WHAT A LATER FALLBACK SHOULD REOPEN, decided before either branch is taken. A socket
-        # worker can still fall back mid-run, and it returns below without touching this -- so
-        # a socket resume left _agent_url at "", which means "a fresh independent chat". The
-        # fallback would then silently drop the very context the follow-up was for.
-        self._agent_url = agent_url if resume_id else open_url
-        if want_socket and (not self.resume_conv or resume_id):
-            drv = _socket_route().driver_for(self.name, conversation_id=resume_id,
-                                             turn_timeout_s=SOCKET_TURN_TIMEOUT_S)
-            if drv is not None:
-                self.page, self.drv, self.socket = None, drv, True
-                self.status = "ready"
-                self._attached_ts = time.time()
-                return True
-
-        # A CONVERSATION ID IS NOT A URL, and everything below opens one. `open_url` is
-        # resume_conv, so a conversation-id resume that could not get a socket -- policy chose
-        # a tab, the route is closed, the token expired -- would hand a bare guid to goto(),
-        # fail all three attempts and lose the goal. The same value is kept as _agent_url, so
-        # a mid-run fallback would have opened the same nonsense.
-        #
-        # The route's standing invariant is that losing it costs speed, never capability. So
-        # the tab opens the agent surface instead. What that DOES cost is the context the
-        # follow-up existed for, and that is said out loud rather than discovered later in an
-        # answer that reads as though the earlier conversation never happened.
-        if resume_id:
-            print("[fleet] %s: no socket for a conversation-id resume; opening a fresh tab "
-                  "instead -- this follow-up will NOT see the earlier conversation"
-                  % self.name, flush=True)
-            open_url = agent_url
-
+        if self.resume_conv and not resume_id:
+            # A page URL: the tab path reopened that page. The socket needs the conversation id,
+            # which a conversation URL carries.
+            _m = _CONV_GUID_RE.search(str(self.resume_conv))
+            if _m:
+                resume_id = _m.group(1)
+            else:
+                print("[fleet] %s: resume target is not a conversation (%s); starting a fresh "
+                      "conversation -- this follow-up will NOT see the earlier one"
+                      % (self.name, str(self.resume_conv)[:60]), flush=True)
+        self._agent_url = agent_url
+        route = _socket_route()
+        drv = None
         try:
-            self.page = _open_fresh(context, open_url)
-            self.drv = CopilotWebDriver(self.page)
-            self.status = "ready"
-            self._attached_ts = time.time()
-            # BUG 4d fix: proactively run the EXISTING auto-consent click-through once, right
-            # after the composer has rendered (_open_fresh only returns once it has), instead
-            # of ONLY reactively from _decide after a real reply already contained consent
-            # markers. This makes a connection-manager card that appears immediately after
-            # first open get auto-clicked instead of being left for the (much more disruptive)
-            # last-resort surface() in _decide. Reuses self._auto_consent's existing three
-            # tiers unchanged -- no click logic reimplemented here; each tier no-ops safely
-            # when there is nothing to click, so this is safe to call unconditionally.
-            # Best-effort: never let a consent-probe failure fail the attach.
-            try:
-                if self._auto_consent():
-                    print("[relay_fleet] %s: startup proactive auto-consent succeeded" % self.name)
-            except Exception:
-                pass
-            return True
-        except Exception as e:
-            self.status, self.outcome = "error", "ERROR"
-            self.reason = "open failed: " + type(e).__name__ + ": " + str(e)
+            drv = route.driver_for(self.name, conversation_id=resume_id,
+                                   turn_timeout_s=SOCKET_TURN_TIMEOUT_S)
+        except Exception:
+            drv = None
+        if drv is None:
+            # NOT AN ERROR AND NOT A TAB: the goal waits where it is.
+            from relay import token_provider
+            self.status = PENDING
+            self.reason = token_provider.wait_reason(route, agent_url)
             return False
+        self.page, self.drv, self.socket = None, drv, True
+        self.status = "ready"
+        self._attached_ts = time.time()
+        return True
 
     def _note_conversation_unsent(self, where):
         """Write the `conversation_created_unsent` row, once, when a conversation was opened for
@@ -4730,6 +4582,9 @@ class RelayWorker:
                 self.reason = "autonomy contract: turn budget %d reached" % self._contract_budget
             else:
                 self.status, self.outcome, self.reason = "maxturns", "MAXTURNS", "reached max_turns"
+            return
+        # A WORKER THAT LOST ITS SOCKET WAITS HERE for a new driver. There is no tab to fall back to.
+        if getattr(self, "_needs_socket_rebind", False) and not self._rebind_socket():
             return
         # SOCKET WORKERS DO NOT SPEND A TAB SLOT, but their generative turns still spend the
         # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
@@ -5604,44 +5459,12 @@ class RelayWorker:
         pg = self.page
         if pg is None:
             return False
-        from .edge_reconnect import (
-            click_through_consent, fix_all_stale_connections, load_conn_url,
-        )
+        from .edge_reconnect import click_through_consent
         # Tier 0: variant (a) -- 許可/Allow directly on the card.
         if not skip_tier0 and self._consent_tier0_allow():
             return True
-        # Tier 1: DIRECT-HIT a cached connection-manager URL.
-        try:
-            url = load_conn_url()
-            if url:
-                from .edge_recover import looks_like_login
-                np = None
-                from relay import blocking_calls as _bc
-                try:
-                    # A second tab opened and driven on the sweep thread: declared for the
-                    # same reason _open_fresh is (45s goto + 6s wait + the fix-all clicks).
-                    with _bc.blocking("consent_tab", 150):
-                        np = pg.context.new_page()
-                        np.goto(url, wait_until="domcontentloaded", timeout=45000)
-                        np.wait_for_timeout(6000)
-                        if not looks_like_login(np.url or ""):
-                            res = fix_all_stale_connections(np)
-                            if res.get("submitted", 0) > 0 or not res.get("stale_left", True):
-                                try:
-                                    pg.bring_to_front()
-                                except Exception:
-                                    pass
-                                return True
-                    # cached URL 404'd / redirected to login -> fall through to Tier 2 (which
-                    # refreshes the cache). Deliberately do NOT clear the cache here.
-                finally:
-                    if np is not None:
-                        try:
-                            np.close()
-                        except Exception:
-                            pass
-        except Exception:
-            pass
+        # Tier 1 (a second tab on a cached connection-manager URL) was REMOVED: no tab is opened
+        # beside a Copilot page (relay/no_tab.py).
         # Tier 2: popup flow (also (re)caches the URL and fixes ALL rows).
         try:
             return bool(click_through_consent(pg))
@@ -8096,39 +7919,52 @@ class RelayWorker:
                      socket_retries=getattr(self, "_socket_retries", 0),
                      token_seconds_left=int(route.token_life()),
                      reason=reason[:300])
+        # NO TAB. The conversation id is kept so the next driver continues the same conversation,
+        # and the worker WAITS for the route to give it one (see _rebind_socket).
+        try:
+            ids = self.drv.conversation_ids() or {}
+        except Exception:
+            ids = {}
+        self._socket_conv_id = ids.get("server") or ids.get("client") or ""
         try:
             self.drv.close()
         except Exception:
             pass
         self.socket, self.drv = False, None
-        # DECLARED BEFORE THE BLOCKING CALL, because after it there is no sweep left to declare
-        # anything with. _open_fresh can hold this thread for 210s (three 45s navigations with a
-        # 25s composer wait each) and up to ~300s behind a sign-in page, all of it with
-        # status.json frozen -- which the watchdog read as a wedged Edge four times in one run.
-        self._declare_blocking(FALLBACK_OPEN_CEILING_S)
-        try:
-            self.page = _open_fresh(self._context, self._agent_url)
-            self.drv = CopilotWebDriver(self.page)
-        except Exception as e:
-            self.status, self.outcome = "error", "ERROR"
-            self.reason = "socket fell back but the tab would not open: %s: %s" % (
-                type(e).__name__, e)
-            return False
-        finally:
-            # ALWAYS, including the failure path above: a window left open on a worker that has
-            # already given up would vouch for the browser for another five minutes.
-            self._end_blocking()
-        try:
-            # The commonest reason a socket turn carries no text is a card only a tab can
-            # show. Now there is a tab, so click it before re-sending into the same wall.
-            self._auto_consent()
-        except Exception:
-            pass
+        self._needs_socket_rebind = True
+        # BACKOFF, because nothing ends this wait but the route recovering: 4, 8 ... 60 s.
+        self._socket_rebinds = getattr(self, "_socket_rebinds", 0) + 1
+        self._cooldown_until = time.time() + min(60.0, 2.0 * (2 ** min(self._socket_rebinds, 5)))
         # Re-send the same job: 'ready' is the state that sends self.job, which still holds it.
         self.status = "ready"
         self._last_text, self._stable_since = None, None
         self._count_before = 0
-        print("[relay_fleet] %s: socket -> tab (%s)" % (self.name, reason[:120]))
+        self.reason = "socket route unavailable -- waiting, no tab is opened (%s)" % reason[:100]
+        print("[relay_fleet] %s: socket lost; waiting for the route (%s)" % (self.name, reason[:120]))
+        return True
+
+    def _rebind_socket(self):
+        """Give a worker that lost its socket a new driver, or leave it waiting. NEVER a tab.
+
+        Returns True when the worker has a driver and may send. Otherwise it stays `ready`, with
+        a reason in status.json and a short cooldown so the sweep does not spin on it; the
+        route is repaired elsewhere (token capture with backoff, relay/route_reopen.py)."""
+        route = _socket_route()
+        drv = None
+        try:
+            drv = route.driver_for(self.name, conversation_id=self._socket_conv_id,
+                                   turn_timeout_s=SOCKET_TURN_TIMEOUT_S)
+        except Exception:
+            drv = None
+        if drv is None:
+            from relay import token_provider
+            self.reason = token_provider.wait_reason(route, self._agent_url)
+            self._cooldown_until = time.time() + 2.0
+            return False
+        self.drv, self.socket = drv, True
+        self._needs_socket_rebind = False
+        self._socket_turns_seen = 0
+        self.reason = ""
         return True
 
     def poll(self):
@@ -9996,125 +9832,63 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 else:
                     pending.append(nw)
 
-        # RAM-aware autoscale: recompute the live cap from free RAM each loop, ramping up
-        # gently and draining down softly (see ram_target_cap). When on, this drives mc_box.
-        # asc_box (if given) is the live [on, ceiling] control the cockpit can flip mid-run;
-        # otherwise the launch-time `autoscale`/`autoscale_max` apply. The START cap is
-        # whatever mc_box was initialized to (the user's DEFAULT) -- autoscale grows/shrinks
-        # from there toward the ceiling.
+        # CAPACITY OF THE SOCKET ROUTE -- the cap on concurrent goals. It is the lane ceiling
+        # (the operator's live `maxtabs` stepper, or the autoscale ceiling when autoscale is on;
+        # default derived from the cloud rate, see tools/settings_keys.derive_lane_ceiling),
+        # reduced by a RAM safeguard priced from what a held socket conversation really costs
+        # (relay/socket_capacity.py). The safeguard only gates NEW admissions: it never drains a
+        # running goal and never stops the last one. Throughput is bounded where the rate is
+        # spent -- the send token bucket in _begin_send -- not here. No tab is involved: a goal
+        # holds none, and a goal that cannot get a socket waits (relay/no_tab.py).
         asc_on = autoscale
         ceiling = autoscale_max
         if asc_box:
             asc_on = bool(asc_box[0])
             ceiling = asc_box[1] or autoscale_max
-        if asc_on and not RAM_GOVERNS_CONCURRENCY:
-            # EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause
-            # design (socket-route resource accounting by real per-goal cost, ...).
-            # RAM DOES NOT SHRINK OR HOLD THE CAP (owner decision 2026-10-14). The cap is the
-            # configured ceiling and nothing else; free RAM stays a displayed metric
-            # (status.json) but no longer moves this number. RAM_GOVERNS_CONCURRENCY=True
-            # restores the ram_target_cap behaviour below for a bench host that wants it.
-            mc_box[0] = max(1, int(ceiling))
-        elif asc_on:
-            # Drive the cap off ACTUAL tabs (main + sub-agent side-pages), so the cap is a TABS
-            # budget and an auto/ultra worker mid-fan-out (3 tabs) is felt as 3 tabs of pressure.
-            mc_box[0] = ram_target_cap(_active_tabs(), mc_box[0], max(1, ceiling),
-                                       per_tab_mb=autoscale_per_tab_mb,
-                                       headroom_mb=ram_box[0],   # live, cockpit-settable RAM floor
-                                       up_margin_mb=autoscale_up_margin_mb)
+        _lane_ceiling = max(1, int(ceiling)) if asc_on else max(1, int(mc_box[0]))
+        _socket_cap = socket_capacity.ram_safeguard_cap(
+            _active_open(), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
+            _lane_ceiling)
+        if asc_on:
+            mc_box[0] = _socket_cap          # shown as the live cap; the ceiling is separate
 
-        # fill free tab slots from the pending queue. ADMISSION is gated on BOTH (a) the live
-        # RAM cap (mc_box / autoscale) and (b) the DISK floor: open a new eval-bearing tab only
-        # if C: free will stay above the reserved floor after this job's eval (disk_admission_ok
-        # looks ahead by eval_disk_gb). If disk is tight we STOP admitting this sweep and let
-        # running jobs finish + release their disk (swe_check cleanup), then re-admit -- the
-        # continuous-flow drain. A non-positive floor disables the disk gate (normal use).
-        # ADMISSION gates on the TAB budget (mc_box[0] is in tabs), RESERVING each worker's PEAK
-        # fan-out (tab_weight) so the fleet's worst-case tab count never exceeds the budget -- "an
-        # auto task == ~3 tabs" is accounted for at admission, automatically, with no human cap.
-        # EXCEPTION: when the fleet is empty always admit ONE worker even if its peak exceeds the
-        # budget (a lone auto task needs 3 tabs while maxtabs=1) -- it runs solo and the per-tab
-        # ram_room gate defers its side-pages if RAM is genuinely tight, rather than deadlocking.
-        # Sub-agent tabs don't run evals, so the DISK gate below still counts main tabs only
-        # (_active_open). With no side-pages tab_weight==1, reducing EXACTLY to the old worker cap.
-        # Weigh the pending worker as what it is ABOUT to become, not as what it is now: with the
-        # route open it will take a socket and hold no tab. If the capture then fails it opens a
-        # tab after all and the fleet is one tab over budget for the rest of this sweep -- the
-        # next iteration reads the real weight, so it cannot compound.
-        # THE TAB BUDGET CANNOT BOUND A ROUTE THAT HOLDS NO TAB. `_projected_peak()` sums
-        # tab_weight, and a socket worker's is zero, so on a socket-first fleet the tab test is
-        # `0 + 0 <= budget` -- true for every pending worker, forever. A socket worker is not
-        # free: measured 2026-08-25 at 428.8 MB of browser growth plus 258.2 MB in this
-        # process. Sixteen at once is about 11 GB.
-        #
-        # NO SECOND GATE, BECAUSE THE COST IT WOULD CHARGE DOES NOT EXIST. Two were tried here
-        # and both were withdrawn: a fixed worker cap, and then a per-worker RAM projection of
-        # the form `active + (avail - floor) // per_worker`. Both assume a socket worker has a
-        # marginal price. Measured across nineteen cold runs on 2026-08-25 it does not:
-        #
-        #     one worker at a time    browser 478.9 MB   fleet process 244.0 MB
-        #     three at a time         browser 467.9 MB   fleet process 237.7 MB
-        #
-        # Tripling the workers did not raise either number -- the fleet-process figure barely
-        # moves at all, which is what a fixed residency looks like. What tracks the cost is how
-        # long an arm runs, not how many run: the one-at-a-time arms lasted ~190 s against ~110 s
-        # for three, and paid about the same. So "428.8 MB per socket worker", quoted earlier in
-        # this file's history, was an ARM total read as a per-worker price. There is no per-worker
-        # price to reserve.
-        #
-        # Tabs are different -- a tab is a real allocation -- and they are already governed:
-        # tab_weight charges 1 for a tab and 0 for a socket, ram_room_for_tab gates each lazy
-        # side-page at the moment it opens, and the autoscale sets mc_box from free RAM.
-        #
-        # SOCKET ATTACHMENT IS NOT THE QUOTA-SPENDING OPERATION. A socket worker reserves zero
-        # tabs (tab_weight==0), so it may become READY without sitting behind the browser/RAM
-        # cap. The shared request ceiling is enforced in RelayWorker._begin_send immediately
-        # before each generative socket send. Tabs keep the historical attach pacing below.
-        # This separates three different resources instead of pretending one integer is all of
-        # them: browser tabs/RAM at admission, disk at eval admission, request rate at send.
         while pending:
             # A refresh may take 5-60s of sync Playwright browser work. It runs in an independent
             # helper PROCESS with its own CDP connection; this sweep only launches it and returns.
-            # If no usable token exists yet, admission honestly budgets this candidate as a tab.
             try:
                 route = _socket_route()
                 if route.open() and route.needs_refresh(agent_url):
                     _consider_socket_refresh(route, agent_url)
             except Exception:
                 pass
-            _candidate_socket = _socket_open_now()
-            # NO TOKEN YET: HOLD THE GOAL, DO NOT OPEN A TAB ON THE SWEEP THREAD. A socket-bound
-            # goal waits (reason shown in status.json) while the off-thread capture runs; the
-            # tab path applies only after relay.token_provider.MAX_HOLD_S. See that module.
-            if not _candidate_socket:
+            # NO TOKEN YET / ROUTE SHUT: HOLD THE GOAL. There is no tab to fall back to (owner
+            # rule, relay/no_tab.py), so the goal waits in the queue -- with its reason in
+            # status.json -- for as long as the off-thread capture and the route repair take.
+            if not _socket_open_now():
                 try:
                     from relay import token_provider
                     _head = pending[0]
-                    _rc = getattr(_head, "resume_conv", "") or ""
                     _hold = token_provider.hold().hold_reason(
-                        _head.name, _socket_route(), agent_url,
-                        wants_socket=token_provider.goal_wants_socket(
-                            _head, bool(_rc) and not _conversation_id_or_empty(_rc)))
+                        _head.name, _socket_route(), agent_url)
                     if _hold:
                         for _p in pending:
                             _r = getattr(_p, "reason", "") or ""
-                            if not _r or _r.startswith("waiting for token"):
+                            if (not _r or _r.startswith("waiting for token")
+                                    or _r.startswith("socket route unavailable")):
                                 _p.reason = _hold
                         break
-                    if str(getattr(_head, "reason", "") or "").startswith("waiting for token"):
-                        _head.reason = ""
+                except Exception:
+                    break
+            else:
+                try:
+                    from relay import token_provider
+                    token_provider.hold().release(pending[0].name)
+                    _r = str(getattr(pending[0], "reason", "") or "")
+                    if _r.startswith("waiting for token") or _r.startswith("socket route unavailable"):
+                        pending[0].reason = ""
                 except Exception:
                     pass
-            # A SOCKET GOAL HOLDS NO TAB, SO THE TAB BUDGET DOES NOT APPLY TO IT. The test used
-            # to run for it too with weight 0 -- `open_tabs + 0 <= cap` -- which is false the
-            # moment the cap sits below the tabs other goals hold, and then socket goals queued
-            # behind a number that measures a resource they do not use. Socket goals are bounded
-            # by the cloud rate (the send bucket in _begin_send) and the disk floor below.
-            if not _candidate_socket and not admits_another_tab(
-                    _active_open(), _projected_peak(),
-                    pending[0].tab_weight(assume_socket=_candidate_socket), mc_box[0]):
-                break
-            if not _candidate_socket and not admission_is_due():
+            if not socket_capacity.admits_another_goal(_active_open(), _socket_cap):
                 break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
@@ -10161,15 +9935,18 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            if not _candidate_socket:
-                note_admitted()
             ok = w.attach(context, agent_url)
+            if not ok and w.status == PENDING:
+                # NO SOCKET AVAILABLE (it went away between the readiness check above and the
+                # attach): the goal goes back to the head of the queue and waits, with the
+                # reason attach() set. Never a tab, never an error.
+                pending.insert(0, w)
+                break
             if not ok:
-                # attach failed. If the WHOLE Edge/context died mid-open (e.g. the
+                # attach failed for another reason. If the WHOLE Edge/context died (e.g. the
                 # watchdog hard-reset it), don't burn this goal as a terminal ERROR --
                 # probe the context, and if it's truly dead bail so the runner reconnects
-                # and RESUMES every unfinished goal (this one included). A live context
-                # means a one-off open failure -> leave the worker ERROR as before.
+                # and RESUMES every unfinished goal (this one included).
                 try:
                     context.cookies()
                 except Exception:
