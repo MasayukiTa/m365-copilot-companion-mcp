@@ -78,6 +78,9 @@ from tools.agent_memory_ops import (
 from tools.data_discovery import find_db_objects
 from tools.data_memory_hook import data_memory_status
 from tools.data_aliases import data_aliases_add, data_aliases_list
+from tools.semantic.ops import (
+    semantic_resolve, metric_sql, catalog_search, catalog_describe, catalog_joins,
+)
 from tools.data_report import data_report_plan, data_report_run, data_report_explain
 from tools.notify_ops import notify_desktop
 from tools.outlook_ops import (
@@ -649,6 +652,9 @@ TOOLS = (
     # execute + provenance + report_manifest.json) -> explain (always-present
     # provenance block). Gateway-only, reachable only via call_tool.
     data_report_plan, data_report_run, data_report_explain,
+    # semantic layer: glossary/metric lookup, SQL with bind variables, table catalogue
+    # (gateway-only; all gated by require_unlocked, read-only, never execute SQL).
+    semantic_resolve, metric_sql, catalog_search, catalog_describe, catalog_joins,
     # notifications
     notify_desktop,
     # scheduling (Windows Task Scheduler)
