@@ -58,7 +58,7 @@ def test_timeline_status_lookup_normalizes_protocol_event_case():
 
 def test_left_spine_reuses_the_execution_timeline_contract():
     helper = COCKPIT[COCKPIT.index('void AddSpineTimeline('):COCKPIT.index('UIElement BuildSpineContent(')]
-    spine = COCKPIT[COCKPIT.index('UIElement BuildSpineContent('):COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents', COCKPIT.index('UIElement BuildSpineContent('))]
+    spine = cockpit_source.member(COCKPIT, 'UIElement BuildSpineContent(')
     assert '"Content details"' in spine
     assert 'AddSpineTimeline(outer, primaryWorker);' in spine
     assert '"Execution timeline"' in helper

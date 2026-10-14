@@ -68,8 +68,7 @@ def test_cockpit_passes_history_to_both_submission_merge_boundaries():
     refresh = src[src.index("void RefreshSubmitted("):src.index("static string StartedOf", src.index("void RefreshSubmitted("))]
     capture = src[src.index("SubmissionBaseline CaptureSubmissionBaseline()"):
                   src.index("void NoteSubmitted(IEnumerable<string> goals)")]
-    note = src[src.index("void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)"):
-               src.index("static string OneLine", src.index("void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)"))]
+    note = cockpit_source.member(src, "void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)")
     assert "HistoryWorkers()" in refresh
     assert "HistoryWorkers()" in capture
     assert "WorkersOf(root)" in capture

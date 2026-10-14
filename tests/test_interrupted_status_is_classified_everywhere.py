@@ -119,8 +119,8 @@ def test_cockpit_shows_the_split_group_line_and_parent_display_label():
     assert 'Obj(g, "children")' in view and 'GroupTreeView.Line(' in src
     assert '"分割グループ 子"' in view and '" / 統合: "' in view
     # never the long goal: the group line reads only the capped ledger keys, not a goal field
-    j = src.index("UIElement BuildGroupLine")
-    body = src[j:src.index("Border Card(Dictionary", j)]
+    from tools import cockpit_source
+    body = cockpit_source.member(src, "UIElement BuildGroupLine")
     assert 'S(w, "goal")' not in body and 'S(g, "goal")' not in body
     assert 'S(led, "task")' in body and '"constraints"' in body and '"tokens"' in body
     # the derived strings the UI relies on exist on the Python side of the contract

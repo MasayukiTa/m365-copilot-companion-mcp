@@ -170,6 +170,6 @@ def test_the_green_line_says_no_action_is_needed():
     """The point of the change: the fact is still reported, and it is reported as something the
     machine is handling."""
     code = _cs()
-    i = code.index('"hs_srv_detail_stale_recent"')
+    i = code.index('k == "hs_srv_detail_stale_recent"')  # the T() table entry, not the SetDot call site
     line = code[i:code.index("\n", i)]
     assert "自動" in line or "automatic" in line.lower()

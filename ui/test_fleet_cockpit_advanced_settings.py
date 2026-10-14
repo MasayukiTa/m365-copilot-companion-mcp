@@ -200,7 +200,10 @@ def test_remaining_validity_is_shown_in_days():
 def test_new_advanced_settings_strings_are_bilingual_via_L():
     """Every new user-visible string in the 詳細設定/Advanced section goes through the shared
     L(ja, en) helper with both languages present, never a bare literal."""
-    section_body = _body("UIElement BuildAdvancedSettingsSection()", "\n    UIElement BuildConnectedClientsControls()")
+    # Originally one span (the section builder, then the access/clients code up to the clients
+    # control); the builder and the access code now live in different parts.
+    section_body = cockpit_source.member(SOURCE, "UIElement BuildAdvancedSettingsSection()")
+    section_body += _body("string FolderAccessPath()", "\n    UIElement BuildConnectedClientsControls()")
     section_body += _body("UIElement BuildConnectedClientsControls()", "\n    ")
     expected_pairs = [
         ("アクセス範囲", "Access scope"),
@@ -224,10 +227,12 @@ def test_new_advanced_settings_strings_are_bilingual_via_L():
 def test_cockpit_window_has_its_own_L_helper():
     """L() previously only existed on ApprovalPromptWindow; CockpitWindow (where the settings
     panel lives) needed its own instance-scoped copy since _lang is per-class state."""
-    cockpit_window_start = SOURCE.index("class CockpitWindow : Window")
-    approval_prompt_start = SOURCE.index("class ApprovalPromptWindow : Window")
-    assert approval_prompt_start < cockpit_window_start
-    cockpit_body = SOURCE[cockpit_window_start:]
+    assert "class CockpitWindow : Window" in SOURCE
+    assert "class ApprovalPromptWindow : Window" in SOURCE
+    # every part except the one that holds ApprovalPromptWindow is CockpitWindow
+    cockpit_body = "\n".join(
+        open(p, encoding="utf-8").read() for p in cockpit_source.paths()
+        if not p.endswith("FleetCockpit.ApprovalPrompt.cs"))
     assert 'string L(string ja, string en) { return _lang == 0 ? ja : en; }' in cockpit_body
 
 

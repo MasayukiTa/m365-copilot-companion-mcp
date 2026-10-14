@@ -35,6 +35,66 @@ def paths(ui_dir=None):
     return ([main] if os.path.isfile(main) else []) + rest
 
 
+def member(src, signature, start=0):
+    """The text of the member whose declaration contains `signature`: from the signature to the
+    brace that closes its body (strings, verbatim strings, char literals and comments skipped).
+
+    For tests that used to cut `src[a:b]` between two methods: that only worked while the two
+    were neighbours in ONE file. After the split neighbours may live in different parts, and the
+    concatenation order of `read()` is by file name, not by the original member order."""
+    i = src.index(signature, start)
+    n = len(src)
+    j = i
+    depth = 0
+    seen_open = False
+    while j < n:
+        c = src[j]
+        d = src[j + 1] if j + 1 < n else ""
+        if c == "/" and d == "/":
+            j = src.find("\n", j)
+            j = n if j < 0 else j
+            continue
+        if c == "/" and d == "*":
+            j = src.find("*/", j + 2)
+            j = n if j < 0 else j + 2
+            continue
+        if c == "@" and d == '"':
+            j += 2
+            while j < n:
+                if src[j] == '"':
+                    if src[j + 1:j + 2] == '"':
+                        j += 2
+                        continue
+                    break
+                j += 1
+            j += 1
+            continue
+        if c == '"':
+            j += 1
+            while j < n and src[j] != '"' and src[j] != "\n":
+                j += 2 if src[j] == "\\" else 1
+            j += 1
+            continue
+        if c == "'":
+            k = j + 1
+            if src[k:k + 1] == "\\":
+                k += 2
+            else:
+                k += 1
+            if src[k:k + 1] == "'":
+                j = k + 1
+                continue
+        if c == "{":
+            depth += 1
+            seen_open = True
+        elif c == "}":
+            depth -= 1
+            if seen_open and depth == 0:
+                return src[i:j + 1]
+        j += 1
+    raise ValueError("no closing brace after %r" % signature)
+
+
 def read(encoding="utf-8-sig", errors="strict", ui_dir=None):
     """The concatenated text of every part (joined by a newline).
 
