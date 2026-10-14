@@ -1634,4 +1634,13 @@ if __name__ == "__main__":
     # straight through, so the inner Starlette startup/shutdown still runs under uvicorn.
     app = _BearerPrefix(app)
 
-    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30)
+    # Durable, timestamped copy of uvicorn's access/error log (tools/access_log.py): server.log
+    # is recreated on every launch and has no timestamps, so a restart erased the request record.
+    try:
+        import uvicorn.config as _uvicorn_config
+        from tools.access_log import prepare as _prepare_access_log
+        _log_config = _prepare_access_log(_uvicorn_config.LOGGING_CONFIG)
+    except Exception:
+        _log_config = None
+    _run_kwargs = {"log_config": _log_config} if _log_config is not None else {}
+    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
