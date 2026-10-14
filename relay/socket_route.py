@@ -223,7 +223,8 @@ class SocketRoute:
                 return
             self.closed_reason = reason
             turns, fallbacks = self.turns, self.fallbacks
-        self._log("[socket_route] closed: %s -- workers now open tabs" % reason)
+        self._log("[socket_route] closed: %s -- goals wait (no tab is ever opened); the route is "
+                  "probed for reopening without spending a turn" % reason)
         self.record("route_closed", reason=reason, turns=turns, fallbacks=fallbacks)
 
     def note_failure(self, reason: str) -> None:
@@ -348,8 +349,8 @@ class SocketRoute:
     def refresh(self, context, agent_url=None) -> bool:
         """Open a tab, capture the token and the request shape, CLOSE THE TAB.
 
-        Returns False rather than raising: a capture that fails means workers open tabs, which
-        is exactly what they did before this route existed.
+        Returns False rather than raising: a capture that fails means goals keep waiting for a
+        token (there is no tab fallback) and the capture is retried with backoff.
         """
         if not self.open() or self._capture_fn is None:
             return False

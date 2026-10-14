@@ -454,6 +454,36 @@ def collect_progress(frame) -> list:
     return out
 
 
+def collect_activity(frame) -> list:
+    """Non-answer messages that carry NO text -- tool / search / grounding status markers.
+
+    `collect_progress` keeps a message only when it has text, so a status marker with an empty
+    body ("the agent is running a tool") was invisible to the idle clock: a server-side tool
+    call that takes minutes (an SQL query through an MCP tool) looked like a stalled turn after
+    60 s and the socket was closed under it (2026-10-14: seven "made no meaningful progress for
+    61s" closes, three of them closing the whole route). Pings are NOT activity (type 6 is
+    handled by the caller); only a message of a non-Chat type from the assistant is.
+
+    Returns [{"type", "origin", "text": ""}] for the text-less ones only; the ones with text are
+    already returned by `collect_progress`."""
+    out = []
+    for payload in _payloads(frame):
+        for msg in (payload.get("messages") or []):
+            if not isinstance(msg, dict):
+                continue
+            mt = msg.get("messageType")
+            if mt in (None, "", "Chat"):
+                continue
+            if msg.get("author") not in (None, "", "bot", "assistant"):
+                continue
+            text = msg.get("text") or msg.get("hiddenText") or ""
+            if isinstance(text, str) and text:
+                continue                      # collect_progress has it
+            out.append({"type": str(mt), "origin": str(msg.get("contentOrigin") or ""),
+                        "text": ""})
+    return out
+
+
 def collect_delta(frame) -> str:
     """Incremental text. Concatenating these across a turn rebuilds the answer."""
     return "".join(_delta_from_payload(p) for p in _payloads(frame))
@@ -575,6 +605,8 @@ class Conversation:
         #: search queries, chain-of-thought summaries. Not the answer, and kept apart from it
         #: for that reason. Empty for turns that only ever said one thing.
         self.last_progress = []
+        #: {"<type>/<target>": count} of the non-ping frames of the last exchange. Diagnostic.
+        self.frame_kinds = {}
         #: The current connection, held only so a failed turn can drop it. A CONVERSATION IS
         #: NOT A CONNECTION here: the client opens a new socket for every message, and keeping
         #: one open was measured WORSE -- with the connection reused, the second turn was
@@ -679,6 +711,7 @@ class Conversation:
             # answer being counted once per channel it arrives on.
             deltas, final, result, seen = [], "", "", 0
             self.last_progress = []
+            self.frame_kinds = {}
             deadline = time.time() + self.turn_timeout_s
             while time.time() < deadline:
                 # A SILENT SOCKET IS NOT A FINISHED TURN. type-3 says the turn completed; it
@@ -694,12 +727,27 @@ class Conversation:
                     if is_ping(frame):
                         sock.send(json.dumps({"type": 6}) + RS)
                         continue
+                    # What KIND of frames arrive, counted per turn, so a stall can say what the
+                    # stream was doing (see CopilotSocketDriver.fail_stalled_turn).
+                    try:
+                        _kind = "%s/%s" % (frame.get("type"), frame.get("target") or "")
+                        self.frame_kinds[_kind] = self.frame_kinds.get(_kind, 0) + 1
+                    except Exception:
+                        pass
                     result = result_value(frame) or result
                     self.server_conversation_id = (conversation_id_of(frame)
                                                    or self.server_conversation_id)
                     for item in collect_progress(frame):
                         self.last_progress.append(item)
                         if on_progress is not None:
+                            try:
+                                on_progress(item)
+                            except Exception:
+                                pass
+                    # Text-less status markers (a tool is running) refresh the idle clock but
+                    # are not kept in `last_progress`, which callers read as prose.
+                    if on_progress is not None:
+                        for item in collect_activity(frame):
                             try:
                                 on_progress(item)
                             except Exception:
