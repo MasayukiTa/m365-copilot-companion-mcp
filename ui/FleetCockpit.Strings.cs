@@ -143,12 +143,15 @@ partial class CockpitWindow
         // that still reaches this is: route open, no cached binding, no gpt_id anywhere.
         if (k == "hs_agent_bad") return ja ? "実行中ですが、このサーフェスがエージェントに紐付いている証拠がありません（テンプレート未取得または期限切れ）" : "Run is active, but there is no evidence this surface is bound to an agent (no cached template, or it has expired)";
         if (k == "hs_agent_unknown_live") return ja ? "実行中ですが取得記録がまだありません。未確認であって失敗ではありません。" : "Run is active but no capture has been recorded yet. Unverified, not failed.";
-        if (k == "hs_agent_route_unknown") return ja ? "ソケット経路の記録が読めず、タブ利用かどうか判定できません。故障ではなく未確認です。" : "The socket route record could not be read, so whether this run drives tabs is unknown. Unverified, not failed.";
+        if (k == "hs_agent_route_unknown") return ja ? "ソケット経路の記録が読めず、経路が使えるか判定できません。故障ではなく未確認です。" : "The socket route record could not be read, so whether the route is usable is unknown. Unverified, not failed.";
         // hs_agent_gray no longer means "Edge is down": under the socket route the agent dot
         // is grey when no run is in flight, which is the ordinary idle state.
         if (k == "hs_agent_gray") return ja ? "走行なし" : "No run in flight";
         if (k == "hs_agent_canned") return ja ? "（直近の返答が定型の無回答）" : " (the last reply was the canned non-answer)";
-        if (k == "hs_agent_tabs") return ja ? "ソケット経路が閉鎖 — 全ワーカーがタブ（動作するがコスト大）" : "Socket route closed — every worker on a tab (works, costs several times more)";
+        // No tab state exists (Copilot never runs in a tab). A shut route HOLDS goals.
+        if (k == "hs_agent_route_closed_held") return ja ? "ソケット経路が使えず、{n}件のゴールが待機中（修復を再試行中・タブは開きません）: {why}" : "Socket route unavailable: {n} goal(s) held while repair retries (no tab is opened): {why}";
+        if (k == "hs_agent_route_closed_idle") return ja ? "ソケット経路は閉鎖中（修復を再試行中）。待機中のゴールはなく、実行中のワーカーは送信を続けています。" : "Socket route is shut (repair retrying). No goal is held; running workers keep sending.";
+        if (k == "hs_agent_token_wait") return ja ? "トークン待ち — ゴールを保留中（{s}秒、タブは開かず取得を再試行中）" : "Waiting for token: goals held ({s}s); capture retrying, no tab is opened";
         if (k == "hs_signin_gray") return ja ? "捕捉の記録なし（走行なし）" : "No capture on record (no run)";
         // TWO OF THE THREE BRANCHES THAT USED hs_signin_gray DO have a record; it is
         // merely old, or the token has run out. Saying "no capture on record" there is a
