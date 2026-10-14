@@ -4255,9 +4255,11 @@ class RelayWorker:
         # the backfill script and this hook can both cover the same worker. A failure is reported
         # on stderr by the helper, never raised into the close.
         try:
-            from bridge.validity_audit import sync_worker_logged
+            # QUEUED, NEVER INLINE: this is the sweep thread, and the sync scans the tool ledger
+            # and sqlite per worker (39 cancelled workers froze a sweep >150 s on 2026-10-14).
+            from bridge.validity_audit import sync_worker_async
             from tools.tool_ledger import _repo_path
-            sync_worker_logged(
+            sync_worker_async(
                 getattr(self, "_tx_key", ""), ledger_path=_repo_path(),
                 run_id=getattr(self, "run_id", ""), name=self.name, jid=(self.jid or ""),
                 outcome={"outcome": self.outcome, "status": self.status,

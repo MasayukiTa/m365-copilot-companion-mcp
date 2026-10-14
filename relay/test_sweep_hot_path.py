@@ -139,3 +139,33 @@ def test_worker_rows_prefix_query_matches_substr_semantics_and_uses_index():
         "EXPLAIN QUERY PLAN SELECT id FROM fleet_turns WHERE key = ? OR (key >= ? AND key < ?)",
         (key, prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1))))
     assert "fleet_turns_key_idx" in plan and "SCAN" not in plan
+
+
+def test_closing_40_workers_does_not_run_the_audit_sync_on_the_caller(monkeypatch):
+    """close() queues the audit sync; 40 closes cost ~nothing on the sweep thread even when each
+    sync takes 0.3 s, and every sync still runs, once, later."""
+    import threading
+    from bridge import validity_audit as va
+    ran, lock = [], threading.Lock()
+
+    def slow_sync(key, **kw):
+        time.sleep(0.3)
+        with lock:
+            ran.append(key)
+        return {}
+
+    monkeypatch.setattr(va, "sync_worker", slow_sync)
+    t = time.time()
+    for i in range(40):
+        va.sync_worker_async("run_w%d" % i, ledger_path=None)
+        va.sync_worker_async("run_w%d" % i, ledger_path=None)     # duplicate: queued once
+    assert time.time() - t < 1.0
+    assert va.wait_async_idle(60)
+    assert sorted(ran) == sorted("run_w%d" % i for i in range(40))
+
+
+def test_worker_close_never_calls_the_inline_audit_sync():
+    import inspect
+    from relay import relay_fleet
+    src = inspect.getsource(relay_fleet.RelayWorker.close)
+    assert "sync_worker_async" in src and "sync_worker_logged" not in src
