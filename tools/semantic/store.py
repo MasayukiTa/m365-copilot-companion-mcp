@@ -462,6 +462,3 @@ def get_store(directory: Optional[str] = None) -> Store:
         return store
 
 
-def clear_cache() -> None:
-    with _LOCK:
-        _CACHE.clear()

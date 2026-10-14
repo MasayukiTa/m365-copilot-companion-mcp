@@ -95,16 +95,16 @@ def sem(tmp_path, monkeypatch):
     for t in CATALOG:
         _w(d / "catalog" / (t["name"] + ".json"), t)
     monkeypatch.setenv(store.ENV_VAR, str(d))
-    store.clear_cache()
+    store._CACHE.clear()
     yield d
-    store.clear_cache()
+    store._CACHE.clear()
 
 
 # ------------------------------------------------------------------------------- store
 
 def test_unset_is_reported_not_treated_as_empty(monkeypatch):
     monkeypatch.delenv(store.ENV_VAR, raising=False)
-    store.clear_cache()
+    store._CACHE.clear()
     r = resolve.resolve("sales")
     assert r["ok"] is False and "MCP_SEMANTIC_DIR" in r["error"]
     assert r["undefined"] is None            # not "everything is undefined"
@@ -116,7 +116,7 @@ def test_unset_is_reported_not_treated_as_empty(monkeypatch):
 
 def test_folder_that_does_not_exist(tmp_path, monkeypatch):
     monkeypatch.setenv(store.ENV_VAR, str(tmp_path / "nope"))
-    store.clear_cache()
+    store._CACHE.clear()
     assert "not a folder" in resolve.resolve("x")["error"]
 
 
@@ -129,7 +129,7 @@ def test_loads_everything_and_keeps_unknown_keys(sem):
 
 def test_empty_folder_is_configured_but_empty(tmp_path, monkeypatch):
     monkeypatch.setenv(store.ENV_VAR, str(tmp_path))
-    store.clear_cache()
+    store._CACHE.clear()
     s = store.get_store()
     assert s.configured and s.exists and not s.terms and not s.metrics and not s.tables
     r = resolve.resolve("sales")

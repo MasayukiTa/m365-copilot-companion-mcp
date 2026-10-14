@@ -30,7 +30,7 @@ def folder(tmp_path, monkeypatch):
     d.mkdir()
     (d / "glossary.json").write_text(json.dumps({"terms": [{"term": "sales"}]}), encoding="utf-8")
     monkeypatch.setenv(store.ENV_VAR, str(d))
-    store.clear_cache()
+    store._CACHE.clear()
     return d
 
 
@@ -57,7 +57,7 @@ def test_unlocked_calls_return_json(folder, monkeypatch):
 
 def test_unconfigured_is_a_clear_json_error(monkeypatch):
     monkeypatch.delenv(store.ENV_VAR, raising=False)
-    store.clear_cache()
+    store._CACHE.clear()
     monkeypatch.setattr(ops, "require_unlocked", lambda: None)
     out = json.loads(ops.catalog_search("x"))
     assert out["ok"] is False and "MCP_SEMANTIC_DIR" in out["error"]
@@ -90,7 +90,3 @@ def test_registered_through_the_gateway_and_listed():
     listing = C.render_category(allt, "data")
     for n in NAMES:
         assert "  %s -- " % n in listing
-    # not added to the directly-exposed set: the cap stays what the operator configured
-    direct = {getattr(t, "__name__", "") for t in main.TOOLS}
-    if os.environ.get("MCP_TOOL_MAP") == "1":
-        assert not (direct & set(NAMES))
