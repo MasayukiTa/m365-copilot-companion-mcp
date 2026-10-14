@@ -313,12 +313,83 @@ def note_admitted(now=None):
     _LAST_ADMIT_TS = time.time() if now is None else now
 
 
+# ── SOCKET SEND PACING: A RATE, NOT A GAP ─────────────────────────────────────────────────
+#
+# EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause design
+# (socket-route resource accounting, token bucket under rate ceiling, watchdog blocking-call
+# awareness). The conservative defaults below (30/min, burst 8) are a first cut to be measured,
+# not a tuned design.
+#
+# WHAT PRODUCED THE LONG WAITS (2026-10-14, goals sitting at turn 0 with the reason "socket send
+# pacing -- waiting for next send slot"): RelayWorker._begin_send asked admission_is_due() before
+# every socket send, and that was "at least ADMIT_MIN_INTERVAL_S (1.5 s, x4 = 6 s for two minutes
+# after any throttle) since the PREVIOUS send, fleet-wide". The sweep polls every ready worker
+# back to back, within milliseconds, so the first worker took the slot and stamped the time and
+# EVERY other ready worker in that sweep saw "less than 1.5 s ago" and waited for the next
+# sweep. One send per sweep. With a sweep of 15-30 s that is 2-4 sends a minute against a limit
+# of 100 (measured: 2.0 a minute on average, 5 at most; 62 goals ready at once).
+#
+# A gap is a statement about spacing in time, and the sweep has no time between its polls to
+# spend it in. The upstream's limit is a RATE, so the pacing is now a token bucket
+# (relay/send_bucket.py): tokens accrue continuously, each send spends one, and as many ready
+# goals as there are tokens go out in the same sweep. The burst is bounded by the measured safe
+# figure (eight sends; twenty at once were refused).
+#
+# STARTING CONSERVATIVE, ON PURPOSE. The default rate is well under the cloud limit, and the
+# operator's `rate_ceiling_rpm` (read live from settings, never written here) is a hard maximum
+# on top of it: the rate used is min(SOCKET_SEND_RPM, ceiling). After a throttle the rate drops
+# by ADMIT_THROTTLED_FACTOR and the burst to one for ADMIT_THROTTLE_MEMORY_S, the same widening
+# the old gap had. The measured trailing-minute check (rate_headroom_ok) still applies.
+SOCKET_SEND_RPM = float(os.environ.get("MCP_SOCKET_SEND_RPM", "30") or 30)
+SOCKET_SEND_BURST = float(os.environ.get("MCP_SOCKET_SEND_BURST", "8") or 8)
+
+from relay.send_bucket import TokenBucket as _TokenBucket     # noqa: E402
+
+_SEND_BUCKET = _TokenBucket()
+_SOCKET_SENDS_TOTAL = [0]
+
+
+def socket_send_rate_now(now=None):
+    """(rate_per_min, burst) the bucket should use right now."""
+    now = time.time() if now is None else now
+    rate = SOCKET_SEND_RPM
+    ceiling = rate_ceiling()
+    if ceiling and ceiling > 0:
+        rate = min(rate, float(ceiling))
+    burst = SOCKET_SEND_BURST
+    if _LAST_THROTTLE_TS > 0.0 and (now - _LAST_THROTTLE_TS) <= ADMIT_THROTTLE_MEMORY_S:
+        rate = rate / max(1.0, ADMIT_THROTTLED_FACTOR)
+        burst = 1.0
+    return rate, burst
+
+
+def socket_send_due(now=None):
+    """True when a socket send may go out now: the shared quota has headroom (the measured
+    trailing minute is under the ceiling) AND the bucket holds a token. Never blocks."""
+    now = time.time() if now is None else now
+    ok, _why = rate_headroom_ok(now)
+    if not ok:
+        return False
+    rate, burst = socket_send_rate_now(now)
+    return _SEND_BUCKET.available(now, rate, burst) >= 1
+
+
+def note_socket_sent(now=None):
+    """Spend one token for a send that went out."""
+    now = time.time() if now is None else now
+    rate, burst = socket_send_rate_now(now)
+    _SEND_BUCKET.spend(now, rate, burst)
+    _SOCKET_SENDS_TOTAL[0] += 1
+
+
 def _reset_admission_pacing():
     """Test seam. Module state is per-process and a run is one process; two tests sharing it
     would otherwise pass or fail depending on their order."""
     global _LAST_ADMIT_TS, _LAST_THROTTLE_TS
     _LAST_ADMIT_TS = 0.0
     _LAST_THROTTLE_TS = 0.0
+    _SEND_BUCKET.reset()
+    _SOCKET_SENDS_TOTAL[0] = 0
     # The rate cache is per-process module state exactly like the two above, and leaving it
     # behind would let one test's ceiling decision silently answer the next test's question.
     _RATE_CACHE[0], _RATE_CACHE[1] = 0.0, None
@@ -2239,6 +2310,19 @@ FLEET_MEASURED_TABS_ARM_MB = 564.1
 FLEET_MEASURED_SOCKET_ARM_MB = 428.8
 FLEET_PER_TAB_MB = float(os.environ.get("MCP_FLEET_PER_TAB_MB", "400"))
 
+#: EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause design
+#: (socket-route resource accounting, token bucket under rate ceiling, watchdog blocking-call
+#: awareness). Not the finished fix.
+#:
+#: DOES FREE RAM DECIDE HOW MANY GOALS RUN? NO, BY DEFAULT (owner decision 2026-10-14: "ignore
+#: RAM entirely for concurrency"). With this False the live cap is the configured ceiling
+#: (ram_target_cap is not consulted), the automatic lane count is not derived from free RAM
+#: (fleet_runner), and the side-page gate ram_room_for_tab() does not hold a research or
+#: refuter page back. Free RAM remains a reported metric. Set MCP_FLEET_RAM_GOVERNS=1 to restore
+#: the old behaviour (a bench host whose RAM genuinely bounds it); the functions themselves are
+#: unchanged and still tested.
+RAM_GOVERNS_CONCURRENCY = os.environ.get("MCP_FLEET_RAM_GOVERNS", "0") == "1"
+
 
 def ram_room_for_tab(floor_mb=None) -> bool:
     """True iff there is enough free physical RAM to open ANOTHER browser tab without crowding
@@ -2252,6 +2336,8 @@ def ram_room_for_tab(floor_mb=None) -> bool:
     the tab about to be opened. The 2000 that used to sit here was neither of those.
     """
     if floor_mb is None:
+        if not RAM_GOVERNS_CONCURRENCY:
+            return True          # RAM is a metric, not a gate (see RAM_GOVERNS_CONCURRENCY)
         floor_mb = FLEET_RAM_FLOOR_MB + FLEET_PER_TAB_MB
     return avail_phys_mb() >= floor_mb
 
@@ -2365,7 +2451,9 @@ def _socket_route():
                 _SOCKET_ROUTE = SocketRoute(capture_fn=floored(_choose_capture()),
                                             connect_fn=websocket_connect,
                                             refresh_margin_s=SOCKET_REFRESH_MARGIN_S,
-                                            log=lambda m: print(m, flush=True))
+                                            log=lambda m: print(
+                                                __import__("relay.logstamp", fromlist=["stamp"])
+                                                .stamp(m), flush=True))
     return _SOCKET_ROUTE
 
 
@@ -2658,13 +2746,16 @@ def _commit_subject_from_goal(goal):
     return " ".join(m.group(1).split()).strip() or None
 
 
-def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=100):
+def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=1000):
     """How many heavy M365 tabs we can afford open at once, given free RAM right now.
     Keep `headroom_mb` for the user's other work; budget `per_tab_mb` per Copilot tab.
     `hard_cap` is a high upper RAIL (100), NOT a hardware bound: the RAM term (free//per_tab)
     is the real limiter, so a 16 GB box self-limits to ~3 while a big-RAM machine scales up.
     A modest run is still wise for M365 Copilot per-user fair-use, but that's a policy choice
     the operator makes via settings, not a hardcoded ceiling baked in here."""
+    if not RAM_GOVERNS_CONCURRENCY:
+        # RAM-blind by default: the lane count is the goals present, capped by the rail.
+        return max(1, min(n_goals, hard_cap))
     per_tab_mb = FLEET_PER_TAB_MB if per_tab_mb is None else per_tab_mb
     headroom_mb = FLEET_RAM_FLOOR_MB if headroom_mb is None else headroom_mb
     fit = int((avail_phys_mb() - headroom_mb) / per_tab_mb)
@@ -4614,9 +4705,9 @@ class RelayWorker:
         # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
         # actually consumes it, rather than leaving socket workers PENDING behind a tab/worker
         # admission cap. Keep the worker READY and leave steer/job state untouched while waiting.
-        if getattr(self, "socket", False) and not admission_is_due():
+        if getattr(self, "socket", False) and not socket_send_due():
             ok_rate, why_rate = rate_headroom_ok()
-            self.reason = why_rate or "socket send pacing -- waiting for next send slot"
+            self.reason = why_rate or "socket send pacing -- waiting for a send token"
             self._note_conversation_unsent("send_pacing")
             return
 
@@ -4690,7 +4781,7 @@ class RelayWorker:
             self._install_wire_sink()
             self.drv.send(self.job, gen_wait_s=2.0)
             if getattr(self, "socket", False):
-                note_admitted()
+                note_socket_sent()
         except FreshSubmitAmbiguous as e:
             # NEVER transient-retry an ambiguous fresh delivery. The M365 user turn may already
             # exist even though the DOM receipt was missing/mismatched; resending self.job can
@@ -8719,7 +8810,8 @@ def _campaigns_from_disk(transcript_dir):
         if fam.get("nested_missing"):
             out[cid]["missing"] = list(fam["nested_missing"])
     if out:
-        print("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out),
+        from relay.logstamp import stamp as _stamp
+        print(_stamp("[fanout] rehydrated %d unmerged campaign(s) from the ledger" % len(out)),
               flush=True)
     return out
 
@@ -9881,7 +9973,15 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if asc_box:
             asc_on = bool(asc_box[0])
             ceiling = asc_box[1] or autoscale_max
-        if asc_on:
+        if asc_on and not RAM_GOVERNS_CONCURRENCY:
+            # EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause
+            # design (socket-route resource accounting by real per-goal cost, ...).
+            # RAM DOES NOT SHRINK OR HOLD THE CAP (owner decision 2026-10-14). The cap is the
+            # configured ceiling and nothing else; free RAM stays a displayed metric
+            # (status.json) but no longer moves this number. RAM_GOVERNS_CONCURRENCY=True
+            # restores the ram_target_cap behaviour below for a bench host that wants it.
+            mc_box[0] = max(1, int(ceiling))
+        elif asc_on:
             # Drive the cap off ACTUAL tabs (main + sub-agent side-pages), so the cap is a TABS
             # budget and an auto/ultra worker mid-fan-out (3 tabs) is felt as 3 tabs of pressure.
             mc_box[0] = ram_target_cap(_active_tabs(), mc_box[0], max(1, ceiling),
@@ -9949,7 +10049,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             except Exception:
                 pass
             _candidate_socket = _socket_open_now()
-            if not admits_another_tab(
+            # A SOCKET GOAL HOLDS NO TAB, SO THE TAB BUDGET DOES NOT APPLY TO IT. The test used
+            # to run for it too with weight 0 -- `open_tabs + 0 <= cap` -- which is false the
+            # moment the cap sits below the tabs other goals hold, and then socket goals queued
+            # behind a number that measures a resource they do not use. Socket goals are bounded
+            # by the cloud rate (the send bucket in _begin_send) and the disk floor below.
+            if not _candidate_socket and not admits_another_tab(
                     _active_open(), _projected_peak(),
                     pending[0].tab_weight(assume_socket=_candidate_socket), mc_box[0]):
                 break

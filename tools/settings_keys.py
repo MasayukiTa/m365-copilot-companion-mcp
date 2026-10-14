@@ -94,7 +94,7 @@ KEYS = OrderedDict([
        "relay/fleet_runner.py:settings_ram_floor + Follower.watch",
        "A running fleet adopts a new floor within a second."),
 
-    _k("maxtabs", LIVE, 3,
+    _k("maxtabs", LIVE, 1000,
        "relay/fleet_runner.py:settings_maxtabs + Follower.watch",
        "Live, but it means different things: with autoscale ON this moves the CEILING, "
        "with autoscale off it is the fixed cap."),
@@ -114,7 +114,7 @@ KEYS = OrderedDict([
        "Takes effect on the NEXT run. Toggling it mid-run does nothing, although it sits "
        "beside knobs that are live."),
 
-    _k("autoscale_max", SWEEP_START, 100,
+    _k("autoscale_max", SWEEP_START, 1000,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",
        "Takes effect on the NEXT run -- while maxtabs, next to it, moves the same ceiling "
        "live when autoscale is on."),

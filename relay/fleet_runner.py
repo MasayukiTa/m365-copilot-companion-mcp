@@ -769,13 +769,45 @@ from tools.settings_keys import default as _settings_default
 #: admission gates. It had three owners until 2026-09-17; see that module.
 RAM_FLOOR_DEFAULT_MB = float(_settings_default("ram_floor_mb"))
 
-DEFAULT_MAX_CONCURRENT = 3
+#: EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the root-cause design
+#: (socket-route resource accounting, token bucket under rate ceiling, watchdog blocking-call
+#: awareness). The 1000-lane default, the ignoring of stale settings.txt lane values and the RAM
+#: bypass in relay_fleet (RAM_GOVERNS_CONCURRENCY) are ONE emergency override, not the finished fix.
+EMERGENCY_OVERRIDE = "EMERGENCY 2026-10-14 (owner order)"
+
+#: HOW MANY GOALS RUN AT ONCE, BY DEFAULT: 1000, and RAM does not lower it (owner decision
+#: 2026-10-14). The real limits are the cloud rate (the send bucket in relay_fleet), the disk
+#: floor and the watchdog -- not a lane count derived from free memory.
+LANES_DEFAULT = 1000
+DEFAULT_MAX_CONCURRENT = LANES_DEFAULT
 
 #: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
-#: `_autoMax` default (ui/FleetCockpit.cs), which is 100 and documented there as "high by
-#: design": under autoscale the ceiling exists to get out of ram_target_cap's way, not to cap
-#: anything itself. When the two disagreed the screen showed 100 and the fleet ran 3.
-AUTOSCALE_CEILING_DEFAULT = 100
+#: `_autoMax` default (ui/FleetCockpit.cs). Same figure as the lane default: the ceiling is not
+#: a second, lower cap.
+AUTOSCALE_CEILING_DEFAULT = LANES_DEFAULT
+
+#: SETTINGS.TXT DOES NOT SET THE STARTING LANE COUNT unless the operator says so on the command
+#: line. `maxtabs` and `autoscale_max` persist in settings.txt from whenever somebody last
+#: touched the stepper (a stale 3, 30, ...), and the fleet used to read them as the cap on every
+#: later run, silently re-imposing a limit nobody was looking at. Precedence now, highest first:
+#:   1. a live command in this run (cockpit stepper -> set_maxtabs / set_autoscale), or the
+#:      settings follower seeing the FILE CHANGE while the run is up -- an operator acting now;
+#:   2. an explicit command-line --max-concurrent N / --autoscale-max N / --autoscale-default N;
+#:   3. LANES_DEFAULT.
+#: The stale file value is IGNORED at start-up and the run says so. MCP_FLEET_HONOR_SETTINGS_LANES=1
+#: restores "settings.txt supplies the start-up value" for a host that wants it.
+HONOR_SETTINGS_LANES = os.environ.get("MCP_FLEET_HONOR_SETTINGS_LANES", "0") == "1"
+
+
+def lane_setting(key, default=LANES_DEFAULT):
+    """The start-up value of a lane knob (`maxtabs`, `autoscale_max`) under the precedence above."""
+    stale = _settings_int(key, 0)
+    if HONOR_SETTINGS_LANES:
+        return stale if stale > 0 else default
+    if stale > 0 and stale != default:
+        print("[lanes] ignoring settings.txt %s=%d at start-up; using %d (a live change or an "
+              "explicit command-line value still applies)" % (key, stale, default), flush=True)
+    return default
 
 
 def _settings_path():
@@ -2544,6 +2576,69 @@ def should_auto_resume(marker_exists, pid_alive, user_stopped=False):
     return bool(marker_exists) and not pid_alive and not user_stopped
 
 
+from relay.logstamp import stamp as _stamp          # noqa: E402
+
+
+def _write_stall_diagnostic(state_dir, status, stalled_s, will_reset, why, now=None):
+    """Append one record to <state_dir>/stall_diagnostics.log: the stacks of ALL threads, the
+    frozen status.json's `updated` time and the stall length, any worker carrying a blocking
+    deadline, and (when the register exists) which declared blocking call is in progress and for
+    how long. Observation only: it never raises and never touches the browser."""
+    import faulthandler
+    import threading
+    import traceback
+    t = time.time() if now is None else now
+    try:
+        path = os.path.join(state_dir, "stall_diagnostics.log")
+        main_id = threading.main_thread().ident
+        names = {th.ident: th.name for th in threading.enumerate()}
+        lines = []
+        upd = (status or {}).get("updated")
+        lines.append("=== %s  STALL %.0fs  will_reset=%s  (%s)" % (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)), stalled_s, bool(will_reset), why))
+        try:
+            lines.append("status.json updated=%s (%.0fs before this record)" % (
+                time.strftime("%H:%M:%S", time.localtime(float(upd))), t - float(upd)))
+        except Exception:
+            lines.append("status.json updated=%r" % (upd,))
+        for w in (status or {}).get("workers") or []:
+            try:
+                bu = float(w.get("eval_busy_until") or 0.0)
+            except (TypeError, ValueError):
+                bu = 0.0
+            if bu > t or w.get("status") in VERIFY_STATUSES:
+                lines.append("worker %s status=%s eval_busy_until in %.0fs" % (
+                    w.get("name"), w.get("status"), bu - t))
+        try:
+            from relay import blocking_calls as _bc
+            for kind, started, deadline in _bc.active(t):
+                lines.append("BLOCKING CALL IN PROGRESS: %s for %.0fs (ceiling in %.0fs)" % (
+                    kind, t - started, deadline - t))
+        except Exception:
+            lines.append("(no blocking-call register in this build)")
+        try:
+            from relay.relay_fleet import capture_inflight
+            lines.append("token captures in flight: %d" % capture_inflight())
+        except Exception:
+            pass
+        for ident, frame in sys._current_frames().items():
+            lines.append("--- thread %s (%s)%s" % (
+                ident, names.get(ident, "?"), "  <== SWEEP/MAIN THREAD" if ident == main_id else ""))
+            lines.extend(l.rstrip("\n") for l in traceback.format_stack(frame))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+            fh.flush()
+            try:
+                fh.write("--- faulthandler dump\n")
+                fh.flush()
+                faulthandler.dump_traceback(file=fh, all_threads=True)
+            except Exception:
+                pass
+            fh.write("\n")
+    except Exception:
+        pass
+
+
 def _watchdog_should_reset(status, stalled_s, now=None):
     """Pure decision: given a (possibly frozen) status.json dict and how long its `updated`
     field has been unchanged, decide whether the dedicated Edge is genuinely WEDGED and must
@@ -2621,7 +2716,7 @@ ACKS_DIR = "acks"
 
 DISK_FLOOR_GB_BOUNDS = (0.0, 100.0)
 RAM_FLOOR_MB_BOUNDS = (0.0, 65536.0)
-TABS_BOUNDS = (1, 100)
+TABS_BOUNDS = (1, 1000)
 #: Goal / steer text. Generous: the chat window sends a pasted instruction verbatim.
 MAX_COMMAND_TEXT = 100_000
 #: A worker name, a reunlock target.
@@ -3990,7 +4085,7 @@ def main():
         # Do not cap the live capacity by len(goals) at t=0.  The pending queue itself prevents
         # over-admission when only one goal exists; keeping the configured capacity lets later
         # add_goal submissions use the idle lanes immediately.
-        max_conc = settings_maxtabs()                    # -1 = cockpit setting (default 3)
+        max_conc = lane_setting("maxtabs", DEFAULT_MAX_CONCURRENT)   # -1 = no CLI value
 
     # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
     # default, shrink when RAM is tight, grow toward the ceiling when RAM is free.
@@ -4003,11 +4098,14 @@ def main():
     # default/start (and, with autoscale off, the fixed cap as before).
     set_on, set_ceiling = settings_autoscale()
     autoscale = args.autoscale or (set_on and not explicit_mc)
-    asc_default = args.autoscale_default if args.autoscale_default > 0 else settings_maxtabs()
+    asc_default = (args.autoscale_default if args.autoscale_default > 0
+                   else lane_setting("maxtabs", DEFAULT_MAX_CONCURRENT))
     if args.autoscale_max > 0:
         asc_ceiling = args.autoscale_max
-    elif set_ceiling > 0:
+    elif set_ceiling > 0 and HONOR_SETTINGS_LANES:
         asc_ceiling = set_ceiling
+    elif set_ceiling > 0 and autoscale:
+        asc_ceiling = lane_setting("autoscale_max", AUTOSCALE_CEILING_DEFAULT)  # logs + ignores
     else:
         # THE COCKPIT SHOWS 100 AND THE FLEET USED 3. `autoscale_max` is written only when the
         # operator touches the stepper, so on a machine where they never did, the key is absent
@@ -4130,6 +4228,15 @@ def main():
     print("       disk floor: keep >= %.1f GB free on C: -- %s (free now %.1f GB)"
           % (disk_floor, disk_floor_src, free_disk_gb()))
     print("       RAM floor:  keep >= %.0f MB free -- %s" % (ram_floor, ram_floor_src))
+    from relay.relay_fleet import (RAM_GOVERNS_CONCURRENCY as _ram_governs,
+                                   SOCKET_SEND_BURST as _burst, SOCKET_SEND_RPM as _rpm)
+    print(_stamp("[emergency] emergency override active (%s -- temporary): lanes default %d, "
+                 "free RAM %s concurrency (floor shown above is a metric), socket sends paced "
+                 "by a token bucket %.0f/min burst %.0f under rate_ceiling_rpm; stale settings "
+                 "lane values %s" % (EMERGENCY_OVERRIDE, LANES_DEFAULT,
+                                     "GOVERNS" if _ram_governs else "does NOT govern", _rpm, _burst,
+                                     "honoured" if HONOR_SETTINGS_LANES else "ignored")),
+          flush=True)
     # EVERY KEY THIS PROCESS ACTUALLY SEES. If the fleet is reading a different copy of the
     # settings file than the cockpit writes, then no setting reaches it -- not just the floor
     # -- and the only way to know is to print what it read, not what we think it read.
@@ -4539,6 +4646,8 @@ def main():
     # to be finished with it.
     sweep_active = threading.Event()
 
+    _wd_diag_for = [object()]
+
     def _watchdog():
         last_seen, last_change = None, time.time()
         while not stop_wd.is_set():
@@ -4564,9 +4673,17 @@ def main():
                 # a worker in a verify status / with eval_busy_until in the future -- DON'T
                 # hard-reset that (it would discard the eval and resume every goal at attempt 1).
                 should, why = _watchdog_should_reset(d, stalled)
+                # PROVE WHAT THE SWEEP THREAD IS BLOCKED IN, BEFORE ANYTHING IS RESET. Nobody
+                # had shown what the main thread was doing for >150 s; the stack taken now is
+                # the evidence. Written once per freeze (keyed on the frozen `updated`), whether
+                # or not the decision is to reset, so a wait that later ends in a reset has its
+                # stack on file too.
+                if _wd_diag_for[0] != last_seen:
+                    _wd_diag_for[0] = last_seen
+                    _write_stall_diagnostic(args.state_dir, d, stalled, should, why)
                 if should:
-                    print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
-                          % (args.stall_s, why))
+                    print(_stamp("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
+                                 % (args.stall_s, why)), flush=True)
                     hard_reset(port, discretionary=True, escalate=True)
                     last_change = time.time()
                 # else: eval in flight -> wait. Re-checked every 5s; last_change is left intact
@@ -4595,7 +4712,7 @@ def main():
     attempt = 0
     while pending:
         if not cdp_alive(args.cdp_url):
-            print("[recover] Edge unreachable -> hard reset before (re)connecting")
+            print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
             hard_reset(port)
         try:
             with sync_playwright() as p:
@@ -4721,10 +4838,10 @@ def main():
             sweep_active.clear()
             attempt += 1
             pending = e.unfinished
-            print("\n[recover] Edge context lost; resuming %d goal(s) (attempt %d/%d)"
-                  % (len(pending), attempt, args.max_recover))
+            print(_stamp("\n[recover] Edge context lost; resuming %d goal(s) (attempt %d/%d)"
+                         % (len(pending), attempt, args.max_recover)))
             if args.no_auto_recover or attempt > args.max_recover:
-                print("[recover] giving up (auto-recover off or attempts exhausted)")
+                print(_stamp("[recover] giving up (auto-recover off or attempts exhausted)"))
                 break
             if not cdp_alive(args.cdp_url):
                 hard_reset(port)
@@ -4740,8 +4857,8 @@ def main():
             raise SystemExit(2)
         except Exception as e:
             attempt += 1
-            print("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
-                  % (type(e).__name__, attempt, args.max_recover))
+            print(_stamp("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
+                         % (type(e).__name__, attempt, args.max_recover)))
             if args.no_auto_recover or attempt > args.max_recover:
                 break
             # ONLY IF THE BROWSER IS ACTUALLY GONE. A context can be lost because a SIBLING

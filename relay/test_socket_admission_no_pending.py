@@ -145,14 +145,14 @@ def test_socket_rate_pacing_happens_at_send_not_admission(monkeypatch):
     w.status = "ready"
     w.job = "do work"
 
-    monkeypatch.setattr(rf, "admission_is_due", lambda now=None: False)
+    monkeypatch.setattr(rf, "socket_send_due", lambda now=None: False)
     w._begin_send()
     assert w.status == "ready"
     assert w.drv.sent == []
 
     sent_meter = []
-    monkeypatch.setattr(rf, "admission_is_due", lambda now=None: True)
-    monkeypatch.setattr(rf, "note_admitted", lambda now=None: sent_meter.append(time.time()))
+    monkeypatch.setattr(rf, "socket_send_due", lambda now=None: True)
+    monkeypatch.setattr(rf, "note_socket_sent", lambda now=None: sent_meter.append(time.time()))
     w._begin_send()
     assert w.drv.sent == ["do work"]
     assert w.status == "waiting"

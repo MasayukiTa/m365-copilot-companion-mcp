@@ -43,4 +43,8 @@ def test_a_configured_ceiling_still_wins():
     src = (ROOT / "relay" / "fleet_runner.py").read_text(encoding="utf-8", errors="replace")
     i = src.index("if args.autoscale_max > 0:")
     block = src[i:i + 260]
-    assert "elif set_ceiling > 0:" in block, "settings の値より既定が先に来ている"
+    # EMERGENCY 2026-10-14 (owner order): a settings.txt ceiling no longer sets the start-up cap
+    # unless MCP_FLEET_HONOR_SETTINGS_LANES=1; an explicit --autoscale-max still wins (the line
+    # above). Temporary -- see fleet_runner.HONOR_SETTINGS_LANES.
+    assert "elif set_ceiling > 0 and HONOR_SETTINGS_LANES:" in block, \
+        "settings の値より既定が先に来ている"

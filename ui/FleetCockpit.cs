@@ -795,9 +795,9 @@ class CockpitWindow : Window
 
     bool _dark = true;
     int _lang = 0;          // 0 = Japanese, 1 = English
-    int _maxtabs = 3;
+    int _maxtabs = 1000;
     bool _autoscale = false;   // RAM-aware autoscale on/off (NEW)
-    int _autoMax = 100;        // ceiling (上限) tabs may grow to under autoscale. High by design:
+    int _autoMax = 1000;      // ceiling (上限) tabs may grow to under autoscale. High by design:
                                // autoscale (ram_target_cap) self-limits to what free RAM allows
                                // (~3 on a 16 GB box, far more on a big-RAM machine), so this is the
                                // upper RAIL, not a hardware bound. Real limiters: free RAM + M365
@@ -1822,8 +1822,8 @@ class CockpitWindow : Window
                 int v;
                 if (ln.StartsWith("dark=")) _dark = ln.Substring(5).Trim() != "0";
                 else if (ln.StartsWith("lang=") && int.TryParse(ln.Substring(5).Trim(), out v)) _lang = v;
-                else if (ln.StartsWith("maxtabs=") && int.TryParse(ln.Substring(8).Trim(), out v)) _maxtabs = Math.Max(1, Math.Min(100, v));
-                else if (ln.StartsWith("autoscale_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoMax = Math.Max(1, Math.Min(100, v));
+                else if (ln.StartsWith("maxtabs=") && int.TryParse(ln.Substring(8).Trim(), out v)) _maxtabs = Math.Max(1, Math.Min(1000, v));
+                else if (ln.StartsWith("autoscale_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoMax = Math.Max(1, Math.Min(1000, v));
                 else if (ln.StartsWith("autoscale=")) _autoscale = ln.Substring(10).Trim() == "1";
                 else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
                 else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
@@ -10578,7 +10578,7 @@ class CockpitWindow : Window
 
     void SetAutoMax(int v)
     {
-        _autoMax = Math.Max(1, Math.Min(100, v));
+        _autoMax = Math.Max(1, Math.Min(1000, v));
         SaveKey("autoscale_max", _autoMax.ToString());
         if (_autoValue != null) _autoValue.Text = _autoMax.ToString();
         // live-apply only while autoscale is on (ceiling is meaningless otherwise).
@@ -10643,7 +10643,7 @@ class CockpitWindow : Window
     }
     void SetMaxTabs(int v)
     {
-        _maxtabs = Math.Max(1, Math.Min(100, v));
+        _maxtabs = Math.Max(1, Math.Min(1000, v));
         SaveKey("maxtabs", _maxtabs.ToString());
         if (_maxValue != null) _maxValue.Text = _maxtabs.ToString();
         // FIX D: the same stepper gesture must behave the same whether autoscale is ON or OFF.

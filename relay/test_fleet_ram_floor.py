@@ -24,6 +24,9 @@ def test_the_floor_the_operator_set_is_the_floor_the_fleet_uses():
 def test_every_gate_moves_with_the_one_setting(monkeypatch, floor):
     """3つとも同じ設定を読んでいること。1つでも自前の数字に戻れば、
     下限を上げたつもりの操作が一部にしか効かない。"""
+    # EMERGENCY 2026-10-14: RAM governs nothing by default; this test is about the RAM gates
+    # themselves, so it asks for them.
+    monkeypatch.setattr(RF, "RAM_GOVERNS_CONCURRENCY", True)
     monkeypatch.setattr(RF, "FLEET_RAM_FLOOR_MB", floor)
     monkeypatch.setattr(RF, "FLEET_PER_TAB_MB", 700.0)
     monkeypatch.setattr(RF, "avail_phys_mb", lambda: floor + 1400.0)
