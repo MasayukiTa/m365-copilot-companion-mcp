@@ -5,13 +5,14 @@ import argparse
 import sys
 from pathlib import Path
 
-from tools.overnight import env, feedback, report, state as S
-from tools.overnight.common import Clock, JST, Log, fmt_dt, to_epoch
+from tools.overnight import env, feedback, reconcile, report, state as S
+from tools.overnight.common import Clock, Log, fmt_dt, to_epoch
 from tools.overnight.detect import FleetReader
 from tools.overnight.items import DEFAULT_MAX_ITEMS, parse_items
 from tools.overnight.runner import (DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_MINUTES, DEFAULT_POLL_S,
                                     Runner)
-from tools.overnight.submit import DEFAULT_SCRIPT, REPO, Submitter
+from tools.overnight.submit import (DEFAULT_SCRIPT, REPO, QueueSubmitter, Submitter,
+                                    fleet_similarity)
 
 
 def default_out_dir(clock) -> Path:
@@ -27,6 +28,10 @@ def _parser() -> argparse.ArgumentParser:
         sp.add_argument("--fleet-dir", default=str(REPO / ".fleet"),
                         help="fleet state directory (read only); default <repo>/.fleet")
         sp.add_argument("--submit-script", default=str(DEFAULT_SCRIPT))
+        sp.add_argument("--submit-route", choices=("queue", "gui"), default=None,
+                        help="queue (default): write to the fleet's pending queue, works with a "
+                             "locked screen; gui: type into the cockpit like a person (needs an "
+                             "unlocked desktop)")
         sp.add_argument("--poll-seconds", type=float, default=None)
         sp.add_argument("--max-inflight", type=int, default=None,
                         help="items queued but unfinished at once (default %d)" % DEFAULT_MAX_INFLIGHT)
@@ -66,7 +71,10 @@ def _make_runner(st: S.State, args, clock, log) -> Runner:
     cfg.setdefault("max_inflight", DEFAULT_MAX_INFLIGHT)
     out = Path(cfg["out_dir"])
     reader = FleetReader(cfg["fleet_dir"])
-    submitter = Submitter(script=cfg["submit_script"], sleep=clock.sleep, log=log)
+    route = args.submit_route or cfg.get("submit_route") or "queue"
+    cfg["submit_route"] = route
+    gui = Submitter(script=cfg["submit_script"], sleep=clock.sleep, log=log)
+    submitter = QueueSubmitter(log=log) if route == "queue" else gui
 
     def finish(state):
         try:
@@ -74,11 +82,18 @@ def _make_runner(st: S.State, args, clock, log) -> Runner:
             state.save()
         except Exception:
             pass
+        try:  # morning consistency check: always attempted, always recorded
+            state.config["reconcile"] = reconcile.run_check(
+                state, reader, gui.readonly_check, to_epoch(clock.now()))
+            state.save()
+        except Exception as e:
+            state.config["reconcile"] = {"error": "整合検査に失敗しました: %r" % (e,)}
         report.finish(state, out, log=log, toast=env.toast, clock=clock)
 
     return Runner(st, clock=clock, reader=reader, submitter=submitter, log=log,
                   free_gb=lambda: env.free_disk_gb(out), floor_gb=env.disk_floor_gb,
-                  awake=env.keep_awake, finish=finish)
+                  awake=env.keep_awake, finish=finish,
+                  similar=fleet_similarity())
 
 
 def run_batch(args, clock=None) -> int:

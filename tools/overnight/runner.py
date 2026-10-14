@@ -29,7 +29,8 @@ MAX_CONSECUTIVE_LOOP_ERRORS = 50
 
 class Runner:
     def __init__(self, st: State, clock=None, reader=None, submitter=None, log=None,
-                 free_gb=None, floor_gb=None, awake=None, finish=None):
+                 free_gb=None, floor_gb=None, awake=None, finish=None, similar=None):
+        self.similar = similar
         self.st = st
         self.cfg = st.config
         self.clock = clock or Clock()
@@ -167,7 +168,24 @@ class Runner:
             pend = self.st.by_status(S.PENDING)
             if not pend or self._past_deadline():
                 return
-            self._submit_one(pend[0])
+            pick = next((i for i in pend if not self._similar_to_active(i)), None)
+            if pick is None:
+                return  # every waiting request reads like one in flight: try again next poll
+            self._submit_one(pick)
+
+    def _similar_to_active(self, iid: str) -> bool:
+        """Would the fleet door refuse this goal as a copy of one of ours still in flight?"""
+        if self.similar is None:
+            return False
+        try:
+            goal = self._goal_for(self.st.get(iid), 0)
+        except ValueError:
+            return False
+        for other in self.st.by_status(S.SUBMITTING, S.SUBMITTED, S.RUNNING):
+            g = self.st.get(other).get("goal") or ""
+            if g and self.similar(goal, g):
+                return True
+        return False
 
     def _goal_for(self, rec, variant: int) -> str:
         item = Item(id=rec["id"], ask=rec["ask"], tags=rec["tags"], max_minutes=rec["max_minutes"])

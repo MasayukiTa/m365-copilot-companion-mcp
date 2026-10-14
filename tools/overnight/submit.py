@@ -147,3 +147,23 @@ class QueueSubmitter:
 
     def readonly_check(self) -> str:
         return "queue route (no cockpit call)"
+
+
+def fleet_similarity():
+    """The fleet door's own duplicate rule as a function(goal_a, goal_b) -> bool, or None.
+
+    Overnight goals share most of their wording (the same save-folder sentence), so several
+    short requests queued together can read as duplicates of one another. The runner uses this
+    to hold a request back until the similar one in flight has finished, instead of being
+    refused by the door. None when the door's module cannot be loaded (no holding back then).
+    """
+    try:
+        from tools import fleet_intake as FI
+
+        def similar(a: str, b: str) -> bool:
+            wa, wb = FI._dup_words(" ".join(a.split())), FI._dup_words(" ".join(b.split()))
+            return (len(wa) >= FI.DUP_MIN_WORDS and len(wb) >= FI.DUP_MIN_WORDS
+                    and FI._dup_similarity(wa, wb) >= FI.DUP_SIMILARITY)
+        return similar
+    except Exception:
+        return None
