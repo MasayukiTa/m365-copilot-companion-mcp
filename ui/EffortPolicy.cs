@@ -647,19 +647,30 @@ public static class GroupTreeView
     public static string BudgetBar(Dictionary<string, object> statusRoot, Dictionary<string, object> g,
                                    bool ja, out double fraction, out int level)
     {
+        return BudgetBarAt(statusRoot, g, 2, ja, out fraction, out level);
+    }
+
+    /// <summary>The same bar for any one ledger dimension: idx indexes FanoutBudgetView.ReportKeys
+    /// (0 total, 1 active, 2 turns, 3 minutes). Display only; null when the dimension is not
+    /// reported or has no cap. BudgetBar is this with idx 2.</summary>
+    public static string BudgetBarAt(Dictionary<string, object> statusRoot, Dictionary<string, object> g,
+                                     int idx, bool ja, out double fraction, out int level)
+    {
         fraction = 0; level = 0;
         if (g == null || Depth(g) != 0) return null;
+        if (idx < 0 || idx >= FanoutBudgetView.ReportKeys.Length) return null;
+        string key = FanoutBudgetView.ReportKeys[idx];
         var tb = Obj(statusRoot, "tree_budget");
         var e = tb != null ? Obj(tb, Str(g, "root_id").Length > 0 ? Str(g, "root_id") : Str(g, "campaign_id")) : null;
-        if (e == null || !e.ContainsKey("turns") || e["turns"] == null) return null;
+        if (e == null || !e.ContainsKey(key) || e[key] == null) return null;
         var lim = Obj(e, "limits") ?? Obj(statusRoot, "fanout_budget");
-        double used = Num(e, "turns", 0);
-        double max = Num(lim, "turns", 0);
+        double used = Num(e, key, 0);
+        double max = Num(lim, key, 0);
         if (max <= 0) return null;
         fraction = Math.Max(0, Math.Min(1, used / max));
         if (used * 100 >= max * 100) level = 2;
         else if (used * 100 >= max * 80) level = 1;
-        return FanoutBudgetView.ShortLabel(2, ja) + " " + (long)used + " / " + (long)max;
+        return FanoutBudgetView.ShortLabel(idx, ja) + " " + (long)used + " / " + (long)max;
     }
 
     /// <summary>The note when the coordinator applies a split depth below the configured one.</summary>
