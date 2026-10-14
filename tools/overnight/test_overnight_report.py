@@ -13,6 +13,7 @@ from tools.overnight import cli, feedback, report
 from tools.overnight import state as S
 from tools.overnight.common import JST
 from tools.overnight.submit import SubmitResult
+from tools.overnight.submit import SubmitResult
 
 ANSWER = ("調べました。\n解釈: 「先月」は直近の暦月と解釈しました。\n```sql\nSELECT a, COUNT(*) FROM t GROUP BY a\n```\n"
           "要点\n- 件数は10件\n- 最多はX\n- 増加傾向\nDONE")
