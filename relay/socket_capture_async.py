@@ -7,8 +7,10 @@ through CDP, creates its own Playwright connection on its own thread, captures, 
 and returns only plain token/template data through a private stdout pipe.
 
 The fleet sweep never waits for that process.  While a refresh is in flight an already-live token
-may still serve sockets; with no usable token workers take the ordinary tab path.  Capability is
-therefore never conditional on this optimization.
+may still serve sockets; with no usable token goals WAIT (relay/token_provider.py) -- there is no
+tab path, and the capture never sends a Copilot turn.  The sweep kicks this on every lap while any
+goal is unfinished (not only while the admission queue is non-empty), and a failed capture is
+retried with a bounded backoff (30, 60, 120 s ... never longer while a goal is waiting).
 """
 from __future__ import annotations
 
@@ -23,9 +25,15 @@ import time
 from tools import childproc
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-#: Raised from 90 s: the stages inside one capture can add up past it (page load plus the tier 3
-#: real turn), so 90 s timed out a capture that was working.
+#: Raised from 90 s: the stages inside one capture can add up past it (a cold Edge plus the
+#: page's own token request), so 90 s timed out a capture that was working.
 DEFAULT_TIMEOUT_S = float(os.environ.get("MCP_SOCKET_CAPTURE_TIMEOUT_S", "180"))
+
+
+def _cap_state():
+    """The process-wide capture counters that status.json `token_wait` reports."""
+    from relay.token_provider import capture_state
+    return capture_state()
 
 
 class AsyncCaptureManager:
@@ -44,8 +52,9 @@ class AsyncCaptureManager:
         self._now = now
         # Exp-aware pacing: same-exp results and failures lengthen the interval (see
         # relay/token_provider.py). The base is this manager's own interval_s.
-        from relay.token_provider import CapturePolicy
-        self.policy = CapturePolicy(base_s=self.interval_s, now=now)
+        from relay.token_provider import NO_TOKEN_BASE_S, CapturePolicy
+        self.policy = CapturePolicy(base_s=self.interval_s, now=now,
+                                    no_token_base_s=min(self.interval_s, NO_TOKEN_BASE_S))
         self._log = log or (lambda m: print(m, flush=True))
         self._lock = threading.Lock()
         self._inflight = {}       # agent key -> process
@@ -67,16 +76,25 @@ class AsyncCaptureManager:
             return False
         key = str(agent_url or "")
         now = float(self._now())
+        try:
+            have_token = bool(route.ready(key))
+        except Exception:
+            have_token = False
         with self._lock:
             if key in self._inflight:
                 return False
+            # The flat capture floor protects an idle fleet that already has a token. When NO
+            # token is in hand a goal is waiting on this capture, and the policy's own bounded
+            # backoff (30/60/120 s) is the only pacing -- a flat 120 s floor here would make the
+            # first retry after a transient failure four times slower than it needs to be.
             previous = float(self._last_attempt.get(key) or 0.0)
-            if previous and now - previous < self.interval_s:
+            if have_token and previous and now - previous < self.interval_s:
                 return False
-            if not self.policy.allow(key, now):
+            if not self.policy.allow(key, now, held=not have_token):
                 return False
             self._last_attempt[key] = now
             self.policy.on_attempt(key, now)
+        _cap_state().attempt()
 
         # Snapshot the route generation BEFORE process launch. A synchronous Research/Refuter
         # refresh can complete while Popen is constructing the helper; reading the generation
@@ -99,9 +117,11 @@ class AsyncCaptureManager:
         except Exception as exc:
             with self._lock:
                 self._failed += 1
+            why = "launch failed: %s: %s" % (type(exc).__name__, str(exc)[:160])
+            delay = self.policy.on_failure(key, have_token=have_token, why=why)
+            _cap_state().fail(why, delay)
             try:
-                route.note_capture_failure("async capture launch failed: %s: %s" %
-                                   (type(exc).__name__, str(exc)[:160]))
+                route.note_capture_failure("async capture " + why)
             except Exception:
                 pass
             return False
@@ -149,6 +169,7 @@ class AsyncCaptureManager:
                 have = True
             delay = self.policy.on_success(key, token, have_token=have)
             if installed:
+                _cap_state().ok(delay)
                 with self._lock:
                     self._completed += 1
                 try:
@@ -163,6 +184,8 @@ class AsyncCaptureManager:
                 # newer generation while this helper was away. Never roll that state backward.
                 with self._lock:
                     self._discarded += 1
+                _cap_state().done()
+                _cap_state().set_next(delay)
                 self._log("[socket_capture_async] stale/closed capture discarded for %s"
                           % (key[:40] or "(default)"))
         except Exception as exc:
@@ -172,8 +195,9 @@ class AsyncCaptureManager:
                 have = bool(route.ready(key))
             except Exception:
                 have = False
-            self.policy.on_failure(key, have_token=have, why="%s: %s" % (
+            delay = self.policy.on_failure(key, have_token=have, why="%s: %s" % (
                 type(exc).__name__, str(exc)[:120]))
+            _cap_state().fail("%s: %s" % (type(exc).__name__, str(exc)[:160]), delay)
             try:
                 from relay.capture_status import record_failure
                 record_failure(exc, key)
