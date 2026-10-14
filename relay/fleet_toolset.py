@@ -178,7 +178,8 @@ _OFFICE = ("create_docx create_pptx docx_from_markdown docx_info pdf_info read_d
            "chart_render excel_chart_export chart_from_python").split()
 _DATA = ("odbc_columns odbc_connections odbc_drivers odbc_tables sqlite_schema sqlite_tables "
          "find_db_objects data_aliases_add data_aliases_list data_memory_status "
-         "data_report_explain data_report_plan data_report_run verify_table_stat").split()
+         "data_report_explain data_report_plan data_report_run verify_table_stat "
+         "semantic_resolve metric_sql catalog_search catalog_describe catalog_joins").split()
 _MEMORY = ("agent_memory_list agent_memory_read agent_memory_save agent_memory_search "
            "memory_delete memory_list memory_load memory_save procedural_memory_delete "
            "procedural_memory_import_markdown procedural_memory_save procedural_memory_search "
