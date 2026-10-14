@@ -13,13 +13,14 @@ import statistics
 import traceback
 from pathlib import Path
 
-from tools.overnight import classify
+from tools.overnight import classify, reconcile
 from tools.overnight import state as S
 from tools.overnight.common import Clock, fmt_dt, from_epoch
 
 SUMMARY = "サマリ"
 FAILS = "失敗と未完"
 INFO = "実行情報"
+RECONCILE = "整合検査"
 RESULT_LABEL = {S.DONE: "成功", S.FAILED: "失敗", S.TIMEOUT: "時間切れ"}
 UNRUN = "未実施"
 CELL_MAX = 30000
@@ -197,7 +198,18 @@ def build_view(st: S.State) -> dict:
     for w in cfg.get("warnings") or []:
         info.append(("入力の注意", w))
     end = cfg.get("run_ended") or fmt_dt(Clock().now())
-    return {"rows": rows, "info": info, "date": end[:10].replace("-", ""), "counts": counts}
+    info.insert(3, ("投入経路", {"queue": "キュー(fleet_submit)", "gui": "コックピット画面操作"}.get(
+        cfg.get("submit_route", ""), cfg.get("submit_route", "") or "不明")))
+    blocked = sum(1 for r in rows if r["category"] == classify.NOT_SUBMITTABLE)
+    banner = ""
+    if blocked:
+        cause = ("画面ロック、コックピットの未起動" if cfg.get("submit_route") == "gui"
+                 else "キューの満杯・拒否、フリートの停止") if cfg.get("submit_route") else \
+            "画面ロック(GUI経路)、またはキューの満杯・拒否"
+        banner = "%d 件中 %d 件が投入できませんでした。原因候補: %s。" % (len(rows), blocked, cause)
+    return {"rows": rows, "info": info, "date": end[:10].replace("-", ""), "counts": counts,
+            "banner": banner, "stop_reason": cfg.get("stop_reason", ""),
+            "reconcile": reconcile.describe(cfg.get("reconcile"))}
 
 
 # ------------------------------------------------------------------ xlsx
@@ -233,7 +245,7 @@ def _chart_for(ws, table_rows, top_row: int, anchor_col: int):
 def _sheet_name(iid: str, used: set) -> str:
     base = re.sub(r"[\[\]\*\?/\\:]", "_", iid)[:31] or "item"
     name, n = base, 2
-    while name in used or name in (SUMMARY, FAILS, INFO):
+    while name in used or name in (SUMMARY, FAILS, INFO, RECONCILE):
         suffix = "_%d" % n
         name = base[:31 - len(suffix)] + suffix
         n += 1
@@ -253,15 +265,24 @@ def write_xlsx(view: dict, out_dir: Path, path: Path) -> None:
 
     def header(ws, cols, widths):
         ws.append(cols)
-        for i, c in enumerate(ws[1], 1):
+        hdr = ws.max_row
+        for i, c in enumerate(ws[hdr], 1):
             c.fill, c.font, c.alignment = head_fill, head_font, wrap
             ws.column_dimensions[c.column_letter].width = widths[i - 1]
-        ws.freeze_panes = "A2"
+        ws.freeze_panes = "A%d" % (hdr + 1)
+        return hdr
 
     wb = Workbook()
     ws = wb.active
     ws.title = SUMMARY
-    header(ws, ["ID", "依頼文", "結果", "要点(3行)", "所要時間(分)", "成果物", "失敗の分類", "詳細",
+    if view.get("banner"):
+        ws.append([clean(view["banner"])])
+        ws.merge_cells("A1:J1")
+        ws["A1"].font = Font(bold=True, color="FFFFFF")
+        ws["A1"].fill = PatternFill("solid", fgColor="C00000")
+        ws["A1"].alignment = wrap
+        ws.row_dimensions[1].height = 32
+    hdr_row = header(ws, ["ID", "依頼文", "結果", "要点(3行)", "所要時間(分)", "成果物", "失敗の分類", "詳細",
                 "OK/NG", "SQL(参考)"], [8, 40, 10, 60, 12, 28, 18, 8, 8, 30])
     used: set = set()
     names = {}
@@ -290,7 +311,7 @@ def write_xlsx(view: dict, out_dir: Path, path: Path) -> None:
     if view["rows"]:
         dv = DataValidation(type="list", formula1='"○,×"', allow_blank=True)
         ws.add_data_validation(dv)
-        dv.add("I2:I%d" % (len(view["rows"]) + 1))
+        dv.add("I%d:I%d" % (hdr_row + 1, hdr_row + len(view["rows"])))
 
     wf = wb.create_sheet(FAILS)
     header(wf, ["ID", "依頼文", "状態", "原因の分類", "詳細", "翌朝にやること"], [8, 40, 10, 18, 50, 50])
@@ -312,6 +333,12 @@ def write_xlsx(view: dict, out_dir: Path, path: Path) -> None:
     header(wi, ["項目", "値"], [30, 60])
     for k, v in view["info"]:
         wi.append([clean(k), clean(v)])
+
+    wr = wb.create_sheet(RECONCILE)
+    header(wr, ["整合検査(レポートとフリートの突き合わせ)"], [120])
+    for line in view["reconcile"]:
+        wr.append([clean(line)])
+        wr.cell(wr.max_row, 1).alignment = wrap
 
     for r in view["rows"]:
         wsi = wb.create_sheet(names[r["id"]])
@@ -367,6 +394,8 @@ def write_md(view: dict, path: Path) -> None:
     L = ["# 朝レポート %s" % view["date"], ""]
     c = view["counts"]
     L.append("成功 %d / 失敗 %d / 時間切れ %d / 未実施 %d" % (c["成功"], c["失敗"], c["時間切れ"], c[UNRUN]))
+    if view.get("banner"):
+        L[1:1] = ["", "> **" + view["banner"] + "**"]
     L += ["", "## サマリ", "", "| ID | 依頼文 | 結果 | 要点 | 分 | 成果物 | 失敗の分類 | OK/NG |",
           "|---|---|---|---|---|---|---|---|"]
     for r in view["rows"]:
@@ -384,6 +413,7 @@ def write_md(view: dict, path: Path) -> None:
             r["error"][:200], r["next"]))
     L += ["", "## 実行情報", ""]
     L += ["- %s: %s" % (k, v) for k, v in view["info"]]
+    L += ["", "## 整合検査", ""] + ["- " + x for x in view["reconcile"]]
     L += ["", "## 項目ごと", ""]
     for r in view["rows"]:
         L += ["### %s %s (%s)" % (r["id"], r["ask"], r["label"]), ""]
@@ -414,6 +444,7 @@ def write_html(view: dict, path: Path) -> None:
          "<title>朝レポート %s</title><style>%s</style></head><body>" % (e(view["date"]), _CSS),
          "<h1>朝レポート %s</h1>" % e(view["date"]),
          "<p>成功 %d / 失敗 %d / 時間切れ %d / 未実施 %d</p>" % (c["成功"], c["失敗"], c["時間切れ"], c[UNRUN]),
+         ("<p style='background:#C00000;color:#fff;padding:8px;font-weight:bold'>%s</p>" % e(view["banner"])) if view.get("banner") else "",
          "<h2>サマリ</h2><table><tr><th>ID</th><th>依頼文</th><th>結果</th><th>要点</th><th>分</th>"
          "<th>成果物</th><th>失敗の分類</th></tr>"]
     for r in view["rows"]:
@@ -436,7 +467,7 @@ def write_html(view: dict, path: Path) -> None:
         P.append("</ul>")
     P.append("<h2>実行情報</h2><table>")
     P += ["<tr><th>%s</th><td>%s</td></tr>" % (e(str(k)), e(str(v))) for k, v in view["info"]]
-    P.append("</table><h2>項目ごと</h2>")
+    P.append("</table><h2>整合検査</h2><ul>%s</ul><h2>項目ごと</h2>" % "".join("<li>%s</li>" % e(x) for x in view["reconcile"]))
     for r in view["rows"]:
         P.append("<details id='i-%s'><summary>%s %s (%s)</summary>" % (
             e(r["id"]), e(r["id"]), e(r["ask"]), r["label"]))

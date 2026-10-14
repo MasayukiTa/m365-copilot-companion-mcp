@@ -12,6 +12,9 @@ LOCKED = "ロック(解錠不可)"
 TIMED_OUT = "タイムアウト"
 AMBIGUOUS = "依頼が曖昧で保留"
 OTHER = "その他"
+#: The request never reached a worker (GUI route: locked screen / no cockpit; queue route:
+#: the door refused or the queue is not drained). Set by the runner, not by answer text.
+NOT_SUBMITTABLE = "投入不可(画面ロック等)"
 
 TAIL_CHARS = 1500
 
@@ -78,5 +81,6 @@ def next_step_for(category: str) -> str:
         LOCKED: "ツールの解錠状態を確認し、解錠してから再実行してください。",
         TIMED_OUT: "依頼を小さく分けるか、項目ごとの時間を延ばして再実行してください。",
         AMBIGUOUS: "依頼文の曖昧な語(期間・対象・指標)を具体的に書き直して再実行してください。",
+        NOT_SUBMITTABLE: "PCの画面ロックやコックピットの状態、キューの詰まりを確認し、resume --retry-failed で再投入してください。",
         OTHER: "作業者の回答(項目シート)を読み、原因を確認してから再実行してください。",
     }.get(category, "作業者の回答を確認してください。")

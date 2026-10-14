@@ -147,7 +147,7 @@ def test_sheet_names_are_valid_and_unique(tmp_path):
     st.save()
     assert report.finish(st, tmp_path)["errors"] == 0
     names = load_workbook(next(tmp_path.glob("朝レポート_*.xlsx"))).sheetnames
-    assert len(names) == len(set(names)) == 8 and all(len(n) <= 31 for n in names)
+    assert len(names) == len(set(names)) == 9 and all(len(n) <= 31 for n in names)
 
 
 def test_key_points_sql_and_interpretation_extraction():
@@ -239,7 +239,7 @@ def test_cli_run_end_to_end_with_a_fake_fleet_and_resume(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.env, "toast", lambda *a, **k: None)
     monkeypatch.setattr(cli.env, "free_disk_gb", lambda p: 100.0)
     monkeypatch.setattr(cli.env, "disk_floor_gb", lambda: 1.0)
-    rc = cli.batch_main(["run", "--items", str(items), "--out", str(out), "--fleet-dir", str(fleet),
+    rc = cli.batch_main(["run", "--items", str(items), "--out", str(out), "--fleet-dir", str(fleet), "--submit-route", "gui",
                    "--poll-seconds", "0"])
     assert rc == 0
     assert len(sent) == 2 and all("\n" not in g and g.startswith("[") for g in sent)

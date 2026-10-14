@@ -296,3 +296,14 @@ class FleetReader:
             if ob.transcript == "" and path:
                 ob.transcript = str(path)
         return result
+
+    def job_waiting(self, job_id: str) -> bool:
+        """Queue route: is this job still in the fleet's queue directories (not yet running)?"""
+        for sub in ("pending", "for_fleet", "awaiting", "awaiting_ack", "running"):
+            d = self.dir / "tasks" / sub
+            try:
+                if any(n.startswith(job_id) for n in os.listdir(d)):
+                    return True
+            except OSError:
+                continue
+        return False

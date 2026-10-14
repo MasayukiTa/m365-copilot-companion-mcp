@@ -37,13 +37,14 @@ def read_marks(report: Path) -> list:
         wb.close()
     if not rows:
         return []
-    head = [str(h or "").strip() for h in rows[0]]
+    h = next((i for i, row in enumerate(rows[:3]) if "OK/NG" in [str(x or "").strip() for x in row]), 0)
+    head = [str(x or "").strip() for x in rows[h]]
     col = {name: i for i, name in enumerate(head)}
     need = ("ID", "OK/NG")
     if any(n not in col for n in need):
         return []
     out = []
-    for r in rows[1:]:
+    for r in rows[h + 1:]:
         iid = r[col["ID"]]
         v = verdict_of(r[col["OK/NG"]])
         if not iid or not v:
