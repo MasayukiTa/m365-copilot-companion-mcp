@@ -139,7 +139,8 @@ def _git_head() -> str:
     try:
         flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
         out = subprocess.run(["git", "rev-parse", "HEAD"], cwd=str(_REPO_ROOT),
-                             capture_output=True, text=True, timeout=5,
+                             capture_output=True, text=True, encoding="utf-8", errors="replace",
+                             timeout=5,
                              creationflags=flags)
         sha = (out.stdout or "").strip()
         return sha if out.returncode == 0 and sha else "unknown"
