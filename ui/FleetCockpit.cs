@@ -1415,10 +1415,26 @@ class CockpitWindow : Window
         try
         {
             SubmissionBaseline b = baseline ?? CaptureSubmissionBaseline();
-            foreach (string g in goals)
-                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), b.CapturedUnix,
-                                    b.Started, b.Workers, b.History);
-            Dispatcher.BeginInvoke(new Action(ForceRender));
+            var goalList = new List<string>();
+            foreach (string g in goals) goalList.Add(SubmittedTasks.GoalTextOf(g));
+            // Index the baseline ONCE for the whole batch (it used to be rebuilt per goal), and do
+            // it here, before touching _submitted, so a background caller pays for it off the UI thread.
+            var index = SubmittedTasks.BuildBaselineIndex(b.Started, b.Workers, b.History);
+            Action apply = delegate
+            {
+                foreach (string g in goalList)
+                    _submitted.AddLocal(g, b.CapturedUnix, index);
+                ForceRender();
+            };
+            // _submitted belongs to the UI thread. On it: add NOW (the row must be on top before
+            // any file is read back) and re-render next turn; elsewhere: hand the add over.
+            if (Dispatcher.CheckAccess())
+            {
+                foreach (string g in goalList)
+                    _submitted.AddLocal(g, b.CapturedUnix, index);
+                Dispatcher.BeginInvoke(new Action(ForceRender));
+            }
+            else Dispatcher.BeginInvoke(apply);
         }
         catch (Exception) { }
     }
@@ -1514,7 +1530,7 @@ class CockpitWindow : Window
         if (k == "folder") return ja ? "自律コーディング (フォルダ)" : "Autonomous coding (folder)";
         // Feature B: view-filter toolbar (4-tab spec)
         if (k == "flt_all") return ja ? "すべて" : "All";
-        if (k == "flt_active") return ja ? "実行中" : "Active";
+        if (k == "flt_active") return ja ? "進行中" : "In progress";   // ready + running: NOT only "running"
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
         if (k == "flt_intr") return ja ? "中断" : "Interrupted";
@@ -3277,6 +3293,53 @@ class CockpitWindow : Window
             catch (ArgumentException) { return true; }
         }
         catch (Exception) { return false; }   // cannot tell -> assume a run exists
+    }
+
+    // Is the runner PROCESS named by fleet_run_active.json still the same live process? This is
+    // the liveness test for anything destructive. status.json's `updated` age is NOT: a runner
+    // that is wedged or slow (long eval, overloaded machine) stops refreshing it while still
+    // owning every unfinished worker. Mirrors relay/fleet_runner.marker_owner_alive: pid must
+    // exist AND, when the marker carries pid_birth (process create time, ms since epoch), the
+    // process start time must match, so a recycled pid is not mistaken for the runner.
+    // Missing marker or a pid that is gone -> false. Anything unreadable/unprovable -> true
+    // (an unknown state must never authorise discarding work).
+    bool RunnerProcessAlive()
+    {
+        try
+        {
+            string marker = Path.Combine(Path.GetDirectoryName(ResolvePath(null)),
+                                         "fleet_run_active.json");
+            if (!File.Exists(marker)) return false;
+            var m = _js.DeserializeObject(File.ReadAllText(marker, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            object pidObj;
+            if (m == null || !m.TryGetValue("pid", out pidObj) || pidObj == null) return true;
+            int pid = Convert.ToInt32(pidObj);
+            if (pid <= 0) return false;
+            System.Diagnostics.Process p;
+            try { p = System.Diagnostics.Process.GetProcessById(pid); }
+            catch (ArgumentException) { return false; }
+            using (p)
+            {
+                try { if (p.HasExited) return false; } catch (Exception) { return true; }
+                long recorded = 0;
+                object birthObj;
+                if (m.TryGetValue("pid_birth", out birthObj) && birthObj != null)
+                {
+                    try { recorded = Convert.ToInt64(birthObj); } catch (Exception) { recorded = 0; }
+                }
+                if (recorded <= 0) return true;                       // old marker: pid is all we have
+                long actual;
+                try
+                {
+                    actual = (long)(p.StartTime.ToUniversalTime()
+                                    - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                }
+                catch (Exception) { return true; }                    // cannot read start time -> cannot disprove
+                return Math.Abs(actual - recorded) <= 5000;           // psutil vs .NET clocks differ by < 1 s
+            }
+        }
+        catch (Exception) { return true; }
     }
 
     bool FleetRunIsLive()
@@ -6467,17 +6530,22 @@ class CockpitWindow : Window
     }
 
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,
-                    bool waitForClosingRun = false, string submittedText = null)
+                    bool waitForClosingRun = false, string submittedText = null,
+                    SubmissionBaseline preBaseline = null)
     {
         foreach (string rawGoal in (goals ?? new List<string>()))
         {
             if (!IsLocalLoopControlGoal(SubmittedTasks.GoalTextOf(rawGoal))) continue;
-            if (_startNote != null) _startNote.Text = _lang == 0
+            string loopNote = _lang == 0
                 ? "LOCAL_LOOP の内部制御文は通常Fleetとして起動できません。耐久タスクのカードから再開してください。"
                 : "LOCAL_LOOP control text cannot start ordinary Fleet work. Resume the durable task card instead.";
+            // May run on a worker thread (bulk retry): _startNote belongs to the UI thread.
+            Dispatcher.BeginInvoke(new Action(delegate { if (_startNote != null) _startNote.Text = loopNote; }));
             return false;
         }
-        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        // A caller that already captured the baseline on the UI thread (so this body can run
+        // off it) passes it in; the snapshot must still predate the handoff below.
+        SubmissionBaseline submitBaseline = preBaseline ?? CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
         if (!File.Exists(py)) py = "python";
@@ -10447,9 +10515,13 @@ class CockpitWindow : Window
             // No live fleet to consume the stop (status went stale, e.g. a run was killed and its
             // last status froze with workers still shown as "running") -> clear every card NOW so the
             // button is never a no-op. Mirrors the per-card release stale path (search ArchiveAndHide).
+            // The age test alone also matches a wedged-but-alive runner, whose unfinished workers
+            // would be hidden and whose sidecars would be finalized under it. Require the runner
+            // PROCESS to be gone; a live one consumes the stop command above when it recovers.
             if (_lastRoot != null
                 && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
-                && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+                && (NowUnix() - Dbl(_lastRoot, "updated")) > 8
+                && !RunnerProcessAlive())
             {
                 ArchiveAllStale();
                 // ArchiveAllStale only edits the LOCAL _history/_hiddenKeys lists (history.json /
@@ -12316,7 +12388,13 @@ class CockpitWindow : Window
         _header.Text = "Fleet";
 
         // Compute running/queued/done counts from the workers array.
-        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0;
+        // TRUTHFUL PER-STATE COUNTS. `else cntRunning++` used to lump every non-terminal,
+        // non-pending worker into "running": a run with 3 streaming (waiting) and 62 ready
+        // workers read "65 running" although max_concurrent was 2. A worker is RUNNING only while
+        // a turn is actually in flight (STATUS_PILL "実行中"/検証中/反証中/外部調査中/新規会話);
+        // `ready` (準備: tab prepared, waiting for a concurrency slot) and approval gates are
+        // counted on their own, and `pending` stays the queue.
+        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0, cntReady = 0, cntGate = 0;
         object wo2;
         if (root.TryGetValue("workers", out wo2) && wo2 is object[])
         {
@@ -12328,6 +12406,8 @@ class CockpitWindow : Window
                 if (IsTerminalWorker(ww)) cntDoneW++;
                 else if (IsInterruptedWorker(ww)) cntIntr++;   // not running, not done, not a failure
                 else if (wst == "pending") cntQueued++;
+                else if (wst == "ready") cntReady++;
+                else if (wst == "awaiting" || wst == "awaiting_gate") cntGate++;
                 else cntRunning++;
             }
         }
@@ -12371,8 +12451,24 @@ class CockpitWindow : Window
         else
         {
             triple = ja2
-                ? (cntRunning + " 実行中 · " + cntQueued + " 待機 · " + cntDoneW + " 完了")
-                : (cntRunning + " running · " + cntQueued + " queued · " + cntDoneW + " done");
+                ? (cntRunning + " 実行中 · " + cntReady + " 準備"
+                   + (cntGate > 0 ? " · " + cntGate + " 承認待ち" : "")
+                   + " · " + cntQueued + " 待機列 · " + cntDoneW + " 完了")
+                : (cntRunning + " running · " + cntReady + " ready"
+                   + (cntGate > 0 ? " · " + cntGate + " awaiting approval" : "")
+                   + " · " + cntQueued + " queued · " + cntDoneW + " done");
+        }
+        // WHY the rest is not running, when the run says so itself (status.json max_concurrent).
+        string waitReason = "";
+        if (running && (cntReady > 0 || cntQueued > 0) && root.ContainsKey("max_concurrent"))
+        {
+            int mc = (int)Dbl(root, "max_concurrent");
+            if (mc > 0 && cntRunning >= mc)
+                waitReason = ja2 ? ("同時実行の上限 " + mc + " に達しているため、残りは順番待ちです")
+                                 : ("Concurrency limit " + mc + " reached; the rest wait for a free slot");
+            else if (mc > 0)
+                waitReason = ja2 ? ("同時実行の上限 " + mc + "（空き枠を待っている、または枠を確保中）")
+                                 : ("Concurrency limit " + mc + " (waiting for a free slot)");
         }
 
         // Live ETA: project remaining work from the throughput observed SO FAR (done/elapsed).
@@ -12445,8 +12541,15 @@ class CockpitWindow : Window
             }
             else
             {
-                _subChips.Children.Add(ChipMargin(Pill(cntRunning + " " + (ja2 ? "実行中" : "running"), "info")));
-                _subChips.Children.Add(ChipMargin(Pill(cntQueued + " " + (ja2 ? "待機" : "queued"), "neutral")));
+                var runChip = Pill(cntRunning + " " + (ja2 ? "実行中" : "running"), "info");
+                var readyChip = Pill(cntReady + " " + (ja2 ? "準備" : "ready"), "neutral");
+                var queueChip = Pill(cntQueued + " " + (ja2 ? "待機列" : "queued"), "neutral");
+                if (waitReason.Length > 0) { readyChip.ToolTip = waitReason; queueChip.ToolTip = waitReason; }
+                _subChips.Children.Add(ChipMargin(runChip));
+                _subChips.Children.Add(ChipMargin(readyChip));
+                if (cntGate > 0)
+                    _subChips.Children.Add(ChipMargin(Pill(cntGate + " " + (ja2 ? "承認待ち" : "awaiting approval"), "warning")));
+                _subChips.Children.Add(ChipMargin(queueChip));
                 _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
             }
             if (running && updated > 0)
@@ -13526,17 +13629,28 @@ class CockpitWindow : Window
         btn.Template = FlatButtonTemplate();
         btn.Click += delegate
         {
-            try
+            // Acknowledge at once and keep Process.Start (blocking on a loaded machine) off the
+            // UI thread; the result replaces the label/note when it is known.
+            if (!btn.IsEnabled) return;
+            string idle = btn.Content as string;
+            btn.IsEnabled = false;
+            btn.Content = _lang == 0 ? "再開中…" : "Resuming…";
+            if (_startNote != null) _startNote.Text = _lang == 0 ? "前回のランを再開しています…" : "Resuming the last run…";
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                SpawnFleetResume();
-                _lastSig = "";
-                if (_startNote != null)
-                    _startNote.Text = _lang == 0 ? "前回のランを再開しました。" : "Resumed the last run.";
-            }
-            catch (Exception ex)
-            {
-                if (_startNote != null) _startNote.Text = (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + ex.Message;
-            }
+                string err = null;
+                try { SpawnFleetResume(); }
+                catch (Exception ex) { err = ex.Message; }
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    btn.Content = idle; btn.IsEnabled = true;
+                    if (err == null) _lastSig = "";
+                    if (_startNote != null)
+                        _startNote.Text = err == null
+                            ? (_lang == 0 ? "前回のランを再開しました。" : "Resumed the last run.")
+                            : (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + err;
+                }));
+            });
         };
         DockPanel.SetDock(btn, Dock.Right);
         dp.Children.Add(btn);
@@ -13733,19 +13847,49 @@ class CockpitWindow : Window
             List<Dictionary<string, object>> shownCap = shown;
             retryAll.Click += delegate
             {
+                // Immediate, visible acknowledgement: the button is disabled and relabelled before
+                // anything else runs, so a second press cannot queue the same goals twice and the
+                // press never looks like a no-op. The delivery itself runs off the UI thread
+                // (RetryAllShown with a completion callback); the outcome replaces the label.
+                if (!retryAll.IsEnabled) return;
+                string idleLabel = T("retry_all");
+                retryAll.IsEnabled = false;
+                retryAll.Content = _lang == 0 ? "再開中…" : "Resuming…";
+                if (_toolbarNote != null) _toolbarNote.Text = _lang == 0 ? "再開を依頼しています…" : "Requesting resume…";
+                bool wasLive = RunIsLive();
                 int skipped;
-                int queued = RetryAllShown(shownCap, out skipped);
-                if (_toolbarNote != null)
+                var queuedBox = new int[1];   // the callback runs later, after queued is known
+                int queued = RetryAllShown(shownCap, out skipped, delegate (bool ok, string err)
                 {
-                    string note = RunIsLive() ? "" : T("retry_note");
-                    if (skipped > 0)
+                    retryAll.Content = idleLabel;
+                    retryAll.IsEnabled = true;
+                    if (_toolbarNote == null) return;
+                    if (!ok)
                     {
-                        // Say how many of the shown targets were refused and why. Without this
-                        // the press looks like a no-op and gets repeated.
-                        string cap = skipped + "/" + (queued + skipped) + " " + T("retry_capped");
-                        note = string.IsNullOrEmpty(note) ? cap : cap + " — " + note;
+                        _toolbarNote.Text = (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + err;
+                        return;
                     }
-                    _toolbarNote.Text = note;
+                    _toolbarNote.Text = (_lang == 0 ? "再開を依頼しました（" + queuedBox[0] + " 件）"
+                                                    : "Resume requested")
+                                        + (wasLive ? "" : " — " + T("retry_note"));
+                });
+                queuedBox[0] = queued;
+                if (queued == 0)
+                {
+                    // Nothing to deliver, so no callback will come: say so and release the button.
+                    retryAll.Content = idleLabel;
+                    retryAll.IsEnabled = true;
+                    if (_toolbarNote != null)
+                        _toolbarNote.Text = skipped > 0
+                            ? skipped + "/" + skipped + " " + T("retry_capped")
+                            : (_lang == 0 ? "再開できる停止タスクはありません" : "Nothing to resume");
+                    return;
+                }
+                if (skipped > 0 && _toolbarNote != null)
+                {
+                    // Say how many of the shown targets were refused and why. Without this
+                    // the press looks like a no-op and gets repeated.
+                    _toolbarNote.Text = skipped + "/" + (queued + skipped) + " " + T("retry_capped");
                 }
             };
             rightCl.Children.Add(retryAll);
@@ -16550,7 +16694,8 @@ class CockpitWindow : Window
     // skipped count is what stops the re-pressing, and matters just as much: a skip nobody
     // can see is indistinguishable from a button that did not work, which is the behaviour
     // that produced the pile in the first place.
-    int RetryAllShown(List<Dictionary<string, object>> shown, out int skippedAtCap)
+    int RetryAllShown(List<Dictionary<string, object>> shown, out int skippedAtCap,
+                      Action<bool, string> done = null)
     {
         skippedAtCap = 0;
         bool live = RunIsLive();
@@ -16582,16 +16727,43 @@ class CockpitWindow : Window
             n++;
         }
         if (n == 0) return 0;
-        if (live)
+        // The baseline is sampled HERE, on the calling (UI) thread, before the handoff: it reads
+        // UI-owned state (_history) and must predate the command/process the delivery creates.
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        Action deliver = delegate
         {
-            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
-            SendCommand(Cmd1("add_goal", adds));
-            NoteSubmitted(goalTexts, submitBaseline);
-        }
-        else if (goalTexts.Count > 0)
+            if (live)
+            {
+                SendCommand(Cmd1("add_goal", adds));
+                NoteSubmitted(goalTexts, submitBaseline);
+            }
+            else if (goalTexts.Count > 0)
+            {
+                SpawnFleet(goalTexts, "retry_input.txt", false, false, null, submitBaseline);
+            }
+        };
+        if (done == null)
         {
-            try { SpawnFleet(goalTexts, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
+            // Synchronous form (kept for callers that need the result inline).
+            try { deliver(); if (!live) _lastSig = ""; } catch (Exception) { }
+            return n;
         }
+        // Everything below is blocking work: command-file IO with a 2 s rename retry, the goals
+        // file write, Process.Start of the runner, and one index over every worker + history row.
+        // On the UI thread that froze the window with no feedback for as long as it took (about
+        // 85 s on a loaded machine with a few hundred rows). It runs on the thread pool; the
+        // outcome comes back through `done` on the UI thread.
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            string err = null;
+            try { deliver(); }
+            catch (Exception ex) { err = ex.Message; }
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (err == null && !live) _lastSig = "";
+                done(err == null, err);
+            }));
+        });
         return n;
     }
 
@@ -17467,46 +17639,31 @@ class CockpitWindow : Window
         catch (Exception) { }
         try
         {
+            // ONE RULE, whether or not a runner is alive: only TERMINAL cards are retired.
+            // status.json is NEVER rewritten here and non-terminal (ready/waiting/running/
+            // interrupted ...) workers are NEVER hidden. This method used to decide "the run is
+            // dead" from status.json's `updated` age (> 15 s) and then overwrite status.json with an
+            // empty snapshot -- a wedged-but-alive runner looks exactly like that, so its unfinished
+            // workers vanished and looked stopped (2026-10-14 13:54:44, 436 rows). Liveness is a
+            // property of the runner PROCESS (RunnerProcessAlive), not of a file's age, and the
+            // outcome here no longer depends on it at all: hiding terminal cards is correct for a
+            // live, a wedged and a dead run alike, and it cannot lose work.
             var st = ReadStatus();
-            bool runningFlag = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
-                               && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
-            // A LIVE run updates status.json ~once/second. If "running" is true but the
-            // file is STALE (the run crashed / was killed without writing a final snapshot,
-            // e.g. a send failure), it is not actually live -- so allow clearing it.
-            // Otherwise a dead run's card sticks forever and Clear appears to do nothing.
-            double updated = 0;
-            try { if (st != null && st.ContainsKey("updated")) updated = Convert.ToDouble(st["updated"]); }
-            catch (Exception) { }
-            bool stale = updated > 0 && (NowUnix() - updated) > 15;
-            bool live = runningFlag && !stale;
-
-            if (!live)
+            object wo; string started = S(st, "started");
+            if (st != null && st.TryGetValue("workers", out wo) && wo is object[])
             {
-                // Run is finished/dead: a clean reset -- blank the snapshot AND forget hides.
-                File.WriteAllText(_statusPath,
-                    "{\"total\":0,\"done_count\":0,\"running\":false,\"idle\":true,\"workers\":[]}",
-                    new UTF8Encoding(false));
-                _hiddenKeys.Clear();
-                SaveHidden();
-            }
-            else
-            {
-                // Run is LIVE: the runner rewrites status.json each second, so we can't blank it
-                // (it would just reappear, and would clobber running workers). Instead HIDE the
-                // TERMINAL cards persistently -- the runner regenerating them won't un-hide them.
-                // Running (non-terminal) workers are NEVER hidden: a live task vanishing is a hazard.
-                object wo; string started = S(st, "started");
-                if (st != null && st.TryGetValue("workers", out wo) && wo is object[])
+                bool any = false;
+                foreach (object o in (object[])wo)
                 {
-                    bool any = false;
-                    foreach (object o in (object[])wo)
-                    {
-                        var w = o as Dictionary<string, object>;
-                        if (w == null || !IsTerminalWorker(w)) continue;
-                        if (_hiddenKeys.Add(WorkerKey(started, w))) any = true;
-                    }
-                    if (any) SaveHidden();
+                    var w = o as Dictionary<string, object>;
+                    if (w == null || !IsTerminalWorker(w)) continue;
+                    string wk = WorkerKey(started, w);
+                    if (_hiddenKeys.Add(wk)) any = true;
+                    // In-memory only: keep the per-tick archive pass from refilling the history
+                    // that was just cleared from the frozen snapshot these cards still sit in.
+                    _archivedKeys.Add(wk);
                 }
+                if (any) SaveHidden();
             }
         }
         catch (Exception) { }
