@@ -33,12 +33,13 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 SRC = os.path.join(REPO, "ui", "FleetCockpit.cs")
 
 
 def _src():
-    with open(SRC, encoding="utf-8") as fh:
-        return fh.read()
+    return cockpit_source.read(encoding="utf-8")
 
 
 def test_the_cockpit_default_matches_the_runners_default():

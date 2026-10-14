@@ -31,9 +31,8 @@ import time
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
+from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
 from tools import rebuild_history as R  # noqa: E402
-
-COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
 
 
 def _ledger(tmp_path, rows):
@@ -160,7 +159,7 @@ def test_the_clear_markers_are_names_rather_than_paths(tmp_path):
 def _clear_history_body():
     """The text of ClearHistory(), located by its own signature rather than by any line inside
     it -- an anchor on a line that may be edited is an anchor that fails for the wrong reason."""
-    src = io.open(COCKPIT, encoding="utf-8").read()
+    src = cockpit_source.read(encoding="utf-8")
     i = src.index("void ClearHistory()")
     j = src.index("\n    void ", i + 1)
     return src[i:j]

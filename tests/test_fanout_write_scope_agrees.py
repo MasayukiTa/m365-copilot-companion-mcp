@@ -23,6 +23,7 @@ if REPO not in sys.path:
 
 from relay import fleet_runner as FR  # noqa: E402
 from relay import write_scope as WS  # noqa: E402
+from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
 from tools import settings_keys as SK  # noqa: E402
 
 
@@ -57,7 +58,7 @@ def test_no_layer_offers_an_enforcing_value():
 
 
 def test_the_cockpit_loads_persists_paints_and_does_not_refire():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8-sig")
     # lives in the gear popup (BuildSettingsPanel), NOT in the header
     assert "WriteScopeControl()" in src and "col.Children.Add(WriteScopeControl());" in src
     assert "ctrls.Children.Add(WriteScopeControl());" not in src

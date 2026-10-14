@@ -30,8 +30,9 @@ import io
 import os
 import re
 
+from tools import cockpit_source  # the cockpit source is split across partial-class files
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
 STATUS = os.path.join(REPO, "scripts", "status.py")
 CONTRACT = os.path.join(REPO, "docs", "agent_contract.md")
 
@@ -50,7 +51,7 @@ def _cs_code():
     Comments are stripped because the same substring-versus-prose false positive happened three
     times in one day elsewhere: a comment explaining a mistake must not be indistinguishable
     from the mistake."""
-    return "\n".join(l for l in _read(COCKPIT).splitlines()
+    return "\n".join(l for l in cockpit_source.read(encoding="utf-8", errors="replace").splitlines()
                      if not l.lstrip().startswith("//"))
 
 

@@ -2,17 +2,15 @@
 """The left FleetCockpit spine combines live task content with execution history."""
 from pathlib import Path
 
-SRC = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8-sig")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SRC = cockpit_source.read(encoding="utf-8-sig")
 
 
 def _spine():
-    i = SRC.index("UIElement BuildSpineContent(")
-    # The next helper after this method is stable enough for a source-contract boundary.
-    j = SRC.index("\n    ", i + 100)
-    # Find the next method signature after the BuildSpineContent body by looking for the known
-    # expanded-card timeline helper, which must remain separate.
-    k = SRC.index("List<Tuple<string, string>> BuildTimelineEvents", i)
-    return SRC[i:k]
+    # The method body, by brace matching: the neighbours it was once sliced against now live in
+    # other FleetCockpit.*.cs parts.
+    return cockpit_source.member(SRC, "UIElement BuildSpineContent(")
 
 
 def test_left_spine_combines_content_details_and_execution_timeline():

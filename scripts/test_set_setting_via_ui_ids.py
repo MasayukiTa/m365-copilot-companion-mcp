@@ -4,9 +4,10 @@ from __future__ import annotations
 import re
 from pathlib import Path
 
+from tools import cockpit_source  # the cockpit source is split across partial-class files
+
 REPO = Path(__file__).resolve().parents[1]
 SCRIPT = REPO / "scripts" / "win" / "set_setting_via_ui.ps1"
-COCKPIT = REPO / "ui" / "FleetCockpit.cs"
 
 
 def _boxes() -> dict:
@@ -16,7 +17,7 @@ def _boxes() -> dict:
 
 
 def test_every_driven_combo_has_its_automation_id_in_the_cockpit():
-    cs = COCKPIT.read_text(encoding="utf-8")
+    cs = cockpit_source.read(encoding="utf-8")
     boxes = _boxes()
     assert boxes, "no settings are listed in the script"
     for key, aid in boxes.items():

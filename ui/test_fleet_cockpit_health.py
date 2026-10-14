@@ -20,7 +20,9 @@
 """
 from pathlib import Path
 
-RAW = (Path(__file__).with_name("FleetCockpit.cs")).read_text(encoding="utf-8")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+RAW = cockpit_source.read(encoding="utf-8")
 
 
 def _executable(cs):
@@ -81,7 +83,9 @@ def test_an_expired_token_is_not_red_unless_a_run_wants_one():
     走行終了後に何時間も赤いドットは、読まれなくなるドットになる。
     """
     body = _dots_body()
-    assert 'else if (live)' in body and 'T("hs_signin_stale")' in body
+    # RED while a run is live (an expired token means the run cannot send); grey otherwise.
+    assert 'else if (live)' in body
+    assert 'SetDot(3, HealthState.Red, T("hs_signin_stale"), now)' in body
     # The key gained a suffix when hs_signin_gray stopped covering three different
     # situations with one sentence ("No capture on record" was false in two of them).
     # The rule under test is unchanged: expired token, no run, grey rather than red.

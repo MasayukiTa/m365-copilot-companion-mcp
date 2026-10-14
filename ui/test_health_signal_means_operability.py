@@ -8,7 +8,9 @@ color is reserved for impaired/uncertain operation that changes what the operato
 from pathlib import Path
 import re
 
-SRC = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-sig')
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SRC = cockpit_source.read(encoding='utf-8-sig')
 
 
 def _between(start, end):
@@ -55,4 +57,5 @@ def test_fleet_tool_failure_can_still_warn_even_if_bridge_probe_is_green():
     block = _between('void PollToolProbeOnce(DateTime now)', 'string AgeMinutesText(')
     assert 'ok && fleetFailing' in block
     i = block.index('ok && fleetFailing')
-    assert 'HealthState.Yellow' in block[i:i+300]
+    # RED: the fleet path is the one that does the work, so a failing fleet path is broken.
+    assert 'HealthState.Red' in block[i:i+300]

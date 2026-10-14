@@ -38,8 +38,8 @@ POPUP = [
 
 
 def _src():
-    with open(os.path.join(REPO, "ui", "FleetCockpit.cs"), encoding="utf-8") as f:
-        return f.read()
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    return cockpit_source.read(encoding="utf-8")
 
 
 def _code(src):

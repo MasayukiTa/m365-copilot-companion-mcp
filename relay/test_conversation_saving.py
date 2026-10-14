@@ -251,7 +251,8 @@ def test_the_cockpit_constants_equal_the_python_side():
 
 def test_the_cockpit_control_lives_in_the_popup_and_saves_through_savekey_only():
     import re
-    src = _read("ui", "FleetCockpit.cs")
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    src = cockpit_source.read(encoding="utf-8")
     assert "col.Children.Add(MergeConversationControl());" in src
     assert "ctrls.Children.Add(MergeConversationControl());" not in src       # never the header
     assert len(re.findall(r"SaveKey\(MergeConversationView\.Key, _mcVal\)", src)) == 1

@@ -38,6 +38,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
+from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
 from tools import settings_path as SP  # noqa: E402
 
 
@@ -154,7 +155,10 @@ def test_the_settings_path_is_the_same_in_every_language():
     hand and a file added there and forgotten breaks a button silently. Copies are allowed;
     disagreeing copies are not."""
     for cs in ("ui/FleetCockpit.cs", "ui/CopilotChat.cs"):
-        body = io.open(os.path.join(REPO, cs), encoding="utf-8-sig").read()
+        if cs == "ui/FleetCockpit.cs":
+            body = cockpit_source.read(encoding="utf-8-sig")
+        else:
+            body = io.open(os.path.join(REPO, cs), encoding="utf-8-sig").read()
         assert 'Path.Combine(RepoRootForSettings(), ".config", "settings.txt")' in body, cs
         assert "SettingsFileForWrite" in body, "%s still writes to the read path" % cs
         # The old location must remain READABLE -- retiring it is the last step, not this one.

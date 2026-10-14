@@ -10,13 +10,14 @@ import re
 from pathlib import Path
 
 from relay import fleet_runner as FR
+from tools import cockpit_source  # the cockpit source is split across partial-class files
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 def test_the_fleet_default_matches_what_the_cockpit_shows():
     """2箇所に別々の既定があると、片方だけが画面に出て、もう片方が実際に効く。"""
-    ui = (ROOT / "ui" / "FleetCockpit.cs").read_text(encoding="utf-8-sig", errors="replace")
+    ui = cockpit_source.read(encoding="utf-8-sig", errors="replace")
     m = re.search(r"int _autoMax = (\d+);", ui)
     assert m, "cockpit 側の既定が読めない"
     assert FR.AUTOSCALE_CEILING_DEFAULT == int(m.group(1)), (

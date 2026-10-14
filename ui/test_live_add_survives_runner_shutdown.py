@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from tools import cockpit_source  # reads every part of the split cockpit source
 from tools.childproc import run as run_child
 
 REPO = Path(__file__).resolve().parents[1]
@@ -50,7 +51,7 @@ def test_shared_writer_can_return_the_exact_file_it_atomically_landed(tmp_path):
 
 
 def test_live_composer_tracks_receipt_and_rescues_with_adopt_command():
-    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8")
+    src = cockpit_source.read(encoding="utf-8")
     i = src.index("void TryAddGoalsToLiveFleet()")
     block = src[i:i + 5500]
     assert 'patch["ack"] = ackPath' in block
@@ -86,6 +87,6 @@ def test_live_composer_tracks_receipt_and_rescues_with_adopt_command():
 
 
 def test_plain_control_commands_keep_using_untracked_compatibility_writer():
-    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8")
+    src = cockpit_source.read(encoding="utf-8")
     assert "return FleetCommands.Write(_fleetDir, patch);" in src
     assert "return FleetCommands.WriteTracked(_fleetDir, patch, out path);" in src
