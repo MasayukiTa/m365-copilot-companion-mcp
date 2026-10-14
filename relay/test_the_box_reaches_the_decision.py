@@ -140,25 +140,15 @@ def test_the_ram_floor_the_operator_set_reaches_the_autoscale(settings):
 # ---- the one link that is still source, said out loud ------------------------------------------
 
 def test_the_admission_loop_asks_with_the_box_and_not_a_copy():
-    """The live tab budget still reaches the tab admission decision.
-
-    Socket workers intentionally carry zero tab weight and are paced at their generative send,
-    so the loop is no longer shaped as `while pending and admits_another_tab(...)`. What must
-    remain true is narrower and more accurate: the candidate route is measured once, that route
-    chooses the pending worker's tab weight, and the live `mc_box[0]` is the cap passed to the
-    named tab predicate. Tab attaches keep the admission pacing gate; socket sends do not.
-    """
+    """The live lane box (`mc_box[0]`, or the autoscale ceiling) reaches the admission decision
+    through the socket capacity cap, which is the RAM safeguard applied to it."""
     from conftest import code_only
 
     here = os.path.dirname(os.path.abspath(__file__))
     src = code_only(os.path.join(here, "relay_fleet.py"))
-    i = src.index("while pending:")
-    call = src[i:i + 1400]
-    assert "_candidate_socket = _socket_open_now()" in call
-    assert "admits_another_tab(" in call, "the loop stopped asking the named tab predicate"
-    assert "tab_weight(assume_socket=_candidate_socket)" in call, \
-        "the pending worker is no longer weighed for the route it is about to take"
-    assert "mc_box[0]" in call, \
-        "the tab admission loop is no longer passing the live box as the cap"
-    assert "if not _candidate_socket and not admission_is_due():" in call, \
-        "attach-time pacing must remain tab-only; socket pacing belongs at generative send"
+    i = src.index("_lane_ceiling = ")
+    block = src[i:i + 900]
+    assert "mc_box[0]" in block, "the live box is no longer the lane ceiling"
+    assert "socket_capacity.ram_safeguard_cap(" in block
+    j = src.index("while pending:")
+    assert "socket_capacity.admits_another_goal(" in src[j:j + 3000]

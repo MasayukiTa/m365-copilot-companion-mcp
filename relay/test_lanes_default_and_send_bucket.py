@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
-"""1000 lanes by default, RAM as a metric not a gate, and the socket send pacing as a rate.
+"""Lane ceiling (derived), the RAM safeguard on admissions, and the socket send pacing as a rate.
 
 Pure decisions with synthetic inputs; no browser.
 """
-import os
-
 import pytest
 
 from relay import fleet_runner as FR
@@ -21,43 +19,27 @@ def _clean():
     RF._reset_admission_pacing()
 
 
-# ── lanes ─────────────────────────────────────────────────────────────────────────────────
+# -- lanes: derived, settable, documented precedence -----------------------------------------
 
-def test_the_default_lane_count_is_a_thousand_everywhere():
-    assert FR.LANES_DEFAULT == 1000
-    assert FR.DEFAULT_MAX_CONCURRENT == 1000
-    assert FR.AUTOSCALE_CEILING_DEFAULT == 1000
-    assert FR.TABS_BOUNDS[1] >= 1000
-    import inspect
-    assert inspect.signature(RF.auto_concurrency).parameters["hard_cap"].default == 1000
+def test_the_default_lane_count_is_the_derived_ceiling_everywhere():
+    from tools.settings_keys import LANE_CEILING_DEFAULT
+    assert FR.LANES_DEFAULT == FR.DEFAULT_MAX_CONCURRENT == FR.AUTOSCALE_CEILING_DEFAULT
+    assert FR.LANES_DEFAULT == LANE_CEILING_DEFAULT == 200
+    assert FR.TABS_BOUNDS[1] >= 1000                       # the rail is still wide
 
 
-def test_the_automatic_lane_count_ignores_free_ram(monkeypatch):
-    monkeypatch.setattr(RF, "avail_phys_mb", lambda: 10.0)           # nothing free at all
-    assert RF.RAM_GOVERNS_CONCURRENCY is False
-    assert RF.auto_concurrency(1000) == 1000
+def test_the_automatic_lane_count_is_goals_present_capped_by_the_ceiling(monkeypatch):
+    monkeypatch.setattr(RF, "avail_phys_mb", lambda: 10.0)           # RAM does not enter it
+    assert RF.auto_concurrency(1000) == 200
     assert RF.auto_concurrency(5) == 5
-
-
-def test_the_old_ram_arithmetic_is_still_there_when_asked_for(monkeypatch):
-    monkeypatch.setattr(RF, "RAM_GOVERNS_CONCURRENCY", True)
-    monkeypatch.setattr(RF, "avail_phys_mb", lambda: 1372.0)
-    assert RF.auto_concurrency(1000, per_tab_mb=400, headroom_mb=512) == 2
-
-
-def test_side_pages_are_not_held_back_by_ram(monkeypatch):
-    monkeypatch.setattr(RF, "avail_phys_mb", lambda: 10.0)
-    assert RF.ram_room_for_tab() is True
-    monkeypatch.setattr(RF, "RAM_GOVERNS_CONCURRENCY", True)
-    assert RF.ram_room_for_tab() is False
 
 
 def test_a_stale_settings_value_does_not_set_the_start_up_cap(monkeypatch, capsys):
     monkeypatch.setattr(FR, "_settings_int", lambda key, default: {"maxtabs": 3,
                                                                     "autoscale_max": 30}.get(key, default))
     monkeypatch.setattr(FR, "HONOR_SETTINGS_LANES", False)
-    assert FR.lane_setting("maxtabs") == 1000
-    assert FR.lane_setting("autoscale_max") == 1000
+    assert FR.lane_setting("maxtabs") == FR.LANES_DEFAULT
+    assert FR.lane_setting("autoscale_max") == FR.LANES_DEFAULT
     out = capsys.readouterr().out
     assert "ignoring settings.txt maxtabs=3" in out and "autoscale_max=30" in out
 
@@ -68,23 +50,13 @@ def test_settings_can_be_honoured_only_by_opting_in(monkeypatch):
     assert FR.lane_setting("autoscale_max") == 30
 
 
-def test_the_panel_clamp_and_the_command_bounds_allow_a_thousand():
-    assert FR._goal_item_error({"text": "x"}) == ""
-    assert FR.TABS_BOUNDS == (1, 1000)
-
-
-def test_the_cap_follows_the_ceiling_not_free_ram(monkeypatch):
-    """The autoscale branch used to set the cap from ram_target_cap; now it is the ceiling."""
+def test_the_admission_loop_uses_the_ram_safeguard_not_the_tab_budget():
     import inspect
     src = inspect.getsource(RF.run_relay_fleet)
-    assert "asc_on and not RAM_GOVERNS_CONCURRENCY" in src
-    assert "mc_box[0] = max(1, int(ceiling))" in src
+    assert "socket_capacity.ram_safeguard_cap(" in src
+    assert "socket_capacity.admits_another_goal(" in src
+    assert "admits_another_tab(" not in src and "_candidate_socket" not in src
 
-
-def test_socket_goals_skip_the_tab_budget():
-    import inspect
-    src = inspect.getsource(RF.run_relay_fleet)
-    assert "if not _candidate_socket and not admits_another_tab(" in src
 
 
 # ── the send bucket ───────────────────────────────────────────────────────────────────────
@@ -160,18 +132,6 @@ def test_the_pacing_reason_is_the_one_the_cockpit_shows():
     import inspect
     src = inspect.getsource(RF.RelayWorker._begin_send)
     assert "socket_send_due()" in src and "note_socket_sent()" in src
-
-
-def test_the_emergency_override_is_marked_and_announced_at_run_start():
-    """The owner's rule: this is temporary and must say so, in the code and in the run's log."""
-    import inspect
-    assert FR.EMERGENCY_OVERRIDE.startswith("EMERGENCY 2026-10-14 (owner order)")
-    main_src = inspect.getsource(FR.main)
-    assert "emergency override active" in main_src
-    for obj in (RF, FR):
-        text = open(obj.__file__, encoding="utf-8").read()
-        assert text.count("EMERGENCY 2026-10-14 (owner order) -- temporary, must be replaced by the "
-                          "root-cause design") >= 1
 
 
 # ── watchdog evidence and log stamps ──────────────────────────────────────────────────────

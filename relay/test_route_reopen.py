@@ -100,8 +100,8 @@ def test_a_worker_still_gets_a_tab_while_the_transport_is_down():
     assert p.wait_s > p.__class__(now=lambda: 0).wait_s, "待ち時間が伸びていない"
 
 
-def test_a_task_caused_close_stays_shut_even_though_the_socket_answers():
-    """握手は通る。それでも開けてはいけない -- 閉じた理由が transport ではないから。
+def test_a_task_caused_close_is_probed_later_because_there_is_no_tab_to_wait_it_out():
+    """閉じた理由が transport でなくても、タブという逃げ道が無いので閉鎖は停止と同じ。長めの待ちの後に握手(ターンは使わない)で再開する。
 
     握手が証明するのは『繋がる』だけで『backend がこの要求を受ける』ではない。
     ここを reason で止めなければ、片方向ブレーカが書かれた理由そのものを壊す。
@@ -118,8 +118,8 @@ def test_a_task_caused_close_stays_shut_even_though_the_socket_answers():
         clock[0] += 10_000
         _reopen(box, p)
 
-    assert box[0].driver_for("w7") is None, "task 由来の閉鎖を握手の成功で開けてしまった"
-    assert p.probes == 0, "reason で止まるべきところで握手を試している"
+    assert box[0].driver_for("w7") is not None, "task 由来の閉鎖が永久に閉じたまま"
+    assert p.probes >= 1
 
 
 def test_an_unclassified_close_stays_shut():

@@ -100,12 +100,11 @@ def test_an_expired_entry_stops_counting():
     assert [e[0] for e in BC.active(now=1050.0)] == ["new"]
 
 
-def test_every_tab_open_declares_itself(monkeypatch):
-    seen = []
-    monkeypatch.setattr(RF, "_open_fresh_unguarded",
-                        lambda ctx, url: seen.append([e[0] for e in BC.active()]) or "page")
-    assert RF._open_fresh(object(), "u") == "page"
-    assert seen == [["tab_open"]] and BC.active() == []
+def test_a_tab_open_is_refused_and_so_declares_nothing():
+    from relay.no_tab import CopilotTabForbidden
+    with pytest.raises(CopilotTabForbidden):
+        RF._open_fresh(object(), "u")
+    assert BC.active() == []
 
 
 def test_a_synchronous_token_capture_declares_itself():

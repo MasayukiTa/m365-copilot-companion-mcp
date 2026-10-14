@@ -63,7 +63,7 @@ def test_agents_are_independent():
 
 def test_goal_without_token_is_held_not_sent_to_a_tab():
     t = [0.0]
-    h = TokenHold(max_hold_s=600, now=lambda: t[0])
+    h = TokenHold(now=lambda: t[0])
     r = _Route(open_=True, ready=False)
     reason = h.hold_reason("g1", r, "agent")
     assert reason.startswith("waiting for token")
@@ -75,26 +75,28 @@ def test_goal_without_token_is_held_not_sent_to_a_tab():
     assert h.summary() == {}
 
 
-def test_hold_has_a_ceiling_then_tab_path_applies():
+def test_hold_has_no_ceiling_there_is_no_tab_to_fall_back_to():
     t = [0.0]
-    h = TokenHold(max_hold_s=600, now=lambda: t[0])
+    h = TokenHold(now=lambda: t[0])
     r = _Route(ready=False)
     assert h.hold_reason("g", r, "a")
-    t[0] = 601.0
-    assert h.hold_reason("g", r, "a") == ""
-    assert "exceeded" in h.summary()["reason"]
+    t[0] = 10 ** 7
+    assert h.hold_reason("g", r, "a").startswith("waiting for token")
 
 
-def test_closed_route_or_tab_bound_goal_is_never_held():
+def test_closed_route_holds_with_its_own_reason_and_every_goal_wants_a_socket():
     h = TokenHold(now=lambda: 0.0)
-    assert h.hold_reason("g", _Route(open_=False), "a") == ""
-    assert h.hold_reason("g", _Route(ready=False), "a", wants_socket=False) == ""
+    r = _Route(open_=False)
+    r.enabled, r.closed_reason = True, "3 consecutive failures"
+    assert h.hold_reason("g", r, "a").startswith("socket route unavailable")
+    assert h.hold_reason("g", _Route(ready=False), "a", wants_socket=False).startswith(
+        "waiting for token")
 
 
-def test_goal_with_url_resume_is_tab_bound():
+def test_goal_with_url_resume_still_waits_for_a_socket():
     class W:
         goal = "hello"
-    assert goal_wants_socket(W(), resume_is_url=True) is False
+    assert goal_wants_socket(W(), resume_is_url=True) is True
 
 
 def test_manager_backs_off_on_same_exp_and_failure_never_touches_browser(monkeypatch):

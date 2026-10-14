@@ -91,6 +91,11 @@ def _reader_rate():
     return rate_ceiling()
 
 
+def _reader_socket_goal_mb():
+    from relay.socket_capacity import goal_cost_mb
+    return goal_cost_mb()
+
+
 def _reader_effort_policy():
     from relay.effort_policy import mode
     return mode()
@@ -145,6 +150,7 @@ _LIVE_READERS = {
     "ram_floor_mb": (_reader_ram, "512", "3072"),
     "maxtabs": (_reader_maxtabs, "2", "7"),
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
+    "socket_goal_mb": (_reader_socket_goal_mb, "10", "60"),
     "effort_policy": (_reader_effort_policy, "shadow", "on"),
     "fanout_max_depth": (_reader_fanout_depth, "2", "3"),
     "fanout_hierarchical_merge": (_reader_hierarchical_merge, "on", "off"),
@@ -407,3 +413,8 @@ def test_the_panel_never_claims_a_setting_was_applied():
     for claim in ("適用済", "Applied", "applied"):
         assert claim not in block, \
             "TimingBadge says %r -- the panel cannot know the consumer has read the file" % claim
+
+
+def test_the_socket_goal_price_default_is_the_one_the_code_uses():
+    from relay import socket_capacity as SC
+    assert SC.GOAL_MB_DEFAULT == SK.default("socket_goal_mb")

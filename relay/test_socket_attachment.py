@@ -62,7 +62,7 @@ def test_an_exception_anywhere_is_still_a_refusal_not_a_raise(tmp_path, monkeypa
 
     said = []
     assert SA.annotation_for(_Boom(), "https://x/", str(png), "tok", log=said.append) is None
-    assert any("RuntimeError" in m for m in said), "何が起きたか言わずに黙って諦めた"
+    assert any("CopilotTabForbidden" in m for m in said), "何が起きたか言わずに黙って諦めた"
 
 
 def test_the_headers_a_replay_must_not_forward():

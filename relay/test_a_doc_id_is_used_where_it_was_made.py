@@ -175,43 +175,23 @@ def _sample_file(tmp_path, name="pic.png"):
     return str(f)
 
 
-# ── (a) + (b): one attachment, one upload, the returned docId is THAT upload's ─────────────
+# ── the page-driven upload is refused: Copilot never runs in a browser tab ──────────────────
 
-def test_one_attachment_triggers_exactly_one_upload_and_carries_that_uploads_docid(
+def test_an_attachment_upload_is_refused_and_opens_no_page_and_posts_nothing(
         tmp_path, monkeypatch):
     path = _sample_file(tmp_path)
     fake_post = _fake_post(["DOC-FIRST"])
-    monkeypatch.setattr("relay.agent_profiles.upload_file", _fake_upload_file())
     monkeypatch.setattr("requests.post", fake_post)
 
-    result = SA.annotation_for(_FakeContext(), "https://example.test/agent", path, "tok-1")
+    class _NoPage:
+        def new_page(self):
+            raise AssertionError("opened a page for an attachment")
 
-    assert len(fake_post.calls) == 1, "one attachment should cause exactly one upload"
-    assert result is not None, "the fakes were wired to succeed; annotation_for returned None"
-    assert result[0]["id"] == "DOC-FIRST", (
-        "the frame's docId must be the one the upload actually returned")
-    assert result[0]["messageAnnotationType"] == "ImageFile"
-
-
-# ── (c): a second send of the same file uploads again, it does not reuse the first docId ───
-
-def test_a_second_send_of_the_same_file_uploads_again_rather_than_reusing_the_docid(
-        tmp_path, monkeypatch):
-    path = _sample_file(tmp_path)
-    fake_post = _fake_post(["DOC-FIRST", "DOC-SECOND"])
-    monkeypatch.setattr("relay.agent_profiles.upload_file", _fake_upload_file())
-    monkeypatch.setattr("requests.post", fake_post)
-    ctx = _FakeContext()
-
-    first = SA.annotation_for(ctx, "https://example.test/agent", path, "tok-1")
-    second = SA.annotation_for(ctx, "https://example.test/agent", path, "tok-1")
-
-    assert len(fake_post.calls) == 2, (
-        "a second send of the same file must upload again, not reuse the first response")
-    assert first is not None and second is not None
-    assert first[0]["id"] == "DOC-FIRST"
-    assert second[0]["id"] == "DOC-SECOND", (
-        "the second frame reused the first upload's docId instead of using its own")
+    said = []
+    assert SA.annotation_for(_NoPage(), "https://example.test/agent", path, "tok-1",
+                             log=said.append) is None
+    assert fake_post.calls == []
+    assert any("CopilotTabForbidden" in m for m in said)
 
 
 # ── module-level guard: no docId cache anywhere under relay/ ───────────────────────────────

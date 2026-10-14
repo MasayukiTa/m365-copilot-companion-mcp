@@ -24,15 +24,11 @@ def test_the_floor_the_operator_set_is_the_floor_the_fleet_uses():
 def test_every_gate_moves_with_the_one_setting(monkeypatch, floor):
     """3つとも同じ設定を読んでいること。1つでも自前の数字に戻れば、
     下限を上げたつもりの操作が一部にしか効かない。"""
-    # EMERGENCY 2026-10-14: RAM governs nothing by default; this test is about the RAM gates
-    # themselves, so it asks for them.
-    monkeypatch.setattr(RF, "RAM_GOVERNS_CONCURRENCY", True)
     monkeypatch.setattr(RF, "FLEET_RAM_FLOOR_MB", floor)
     monkeypatch.setattr(RF, "FLEET_PER_TAB_MB", 700.0)
     monkeypatch.setattr(RF, "avail_phys_mb", lambda: floor + 1400.0)
 
     # 空きは 下限+1400。1タブ700なので、ちょうど2枚ぶん。
-    assert RF.auto_concurrency(8) == 2
     assert RF.ram_target_cap(0, 1, 8) == 2        # 現在値1から1枚だけ増える
     # RAM が潤沢でも1回に1枚。下限を読んでいなければこの段差は出ない。
     monkeypatch.setattr(RF, "avail_phys_mb", lambda: floor + 700.0 * 20)
@@ -41,7 +37,6 @@ def test_every_gate_moves_with_the_one_setting(monkeypatch, floor):
     assert RF.ram_room_for_tab() is True
 
     monkeypatch.setattr(RF, "avail_phys_mb", lambda: floor + 100.0)
-    assert RF.auto_concurrency(8) == 1            # 下限は割らない
     assert RF.ram_room_for_tab() is False         # 開けば下限を割る
 
 
@@ -90,17 +85,15 @@ def test_a_pending_worker_is_weighed_as_the_route_it_will_take():
     assert sock == tabs - 1, "socket は本体タブの分だけ軽いこと"
 
 
-def test_admission_asks_for_the_route_it_will_take():
-    """候補の経路を一度判定し、その同じ値でタブ重量と送信前pacingを分けること。"""
-    import ast
+def test_admission_holds_without_a_socket_and_never_weighs_a_tab():
+    """Without a ready socket the head goal is HELD (no tab); with one it is gated by the socket
+    capacity (RAM safeguard), not by a tab budget."""
     import inspect
     src = inspect.getsource(RF.run_relay_fleet)
-    assert "_candidate_socket = _socket_open_now()" in src
-    assert "tab_weight(assume_socket=_candidate_socket)" in src
-    assert "if not _candidate_socket and not admission_is_due():" in src
-    tree = ast.parse(src.lstrip())
-    assert any(isinstance(n, ast.FunctionDef) and n.name == "_socket_open_now"
-               for n in ast.walk(tree)), "判定関数が無い"
+    assert "if not _socket_open_now():" in src
+    assert "token_provider.hold().hold_reason(" in src
+    assert "tab_weight(assume_socket" not in src and "admits_another_tab" not in src
+
 
 
 def test_the_per_tab_budget_is_the_fresh_tab_cost_and_says_so():

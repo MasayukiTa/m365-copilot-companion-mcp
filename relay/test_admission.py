@@ -172,13 +172,36 @@ def test_hysteresis_no_thrash():
 
 
 # ── shared harness for the loop-level tests (b) and (c) ─────────────────────────────────────
+class _ReadyRoute:
+    """A socket route that is open and holds a token: admission proceeds (no hold, no tab)."""
+    enabled = True
+    closed_reason = ""
+
+    def open(self):
+        return True
+
+    def ready(self, agent_url=None):
+        return True
+
+    def needs_refresh(self, agent_url=None):
+        return False
+
+    def record(self, *a, **k):
+        pass
+
+    def status(self):
+        return {"open": True, "closed_reason": "", "turns": 0}
+
+
 def _install_fake_worker(monkey_state):
     """Monkeypatch RelayWorker so attach/poll/close are deterministic and browser-free.
 
     Each worker, when attached, gets a sentinel page and goes 'waiting'. Its poll() consults
     a per-name control dict: 'verifying' keeps it busy (non-terminal, holds the tab); 'done'
     flips it terminal. close() just drops the page (frees the slot)."""
-    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close}
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
+            "route": rf._socket_route}
+    rf._socket_route = lambda: _ReadyRoute()
 
     def fake_attach(self, context, agent_url):
         self.page = object()              # sentinel: a non-None page = holds a tab
@@ -214,6 +237,7 @@ def _restore_worker(orig):
     RelayWorker.attach = orig["attach"]
     RelayWorker.poll = orig["poll"]
     RelayWorker.close = orig["close"]
+    rf._socket_route = orig["route"]
     if "tab_weight" in orig:
         RelayWorker.tab_weight = orig["tab_weight"]
 
@@ -223,22 +247,9 @@ def test_continuous_admission_no_barrier():
     rf.avail_phys_mb = lambda: 64000.0       # RAM never the constraint here
     rf.free_disk_gb = lambda path=None: 500.0  # disk never the constraint here
 
-    # THIS TEST IS ABOUT THE TAB CAP. Socket workers deliberately bypass worker-count/tab
-    # admission and are paced at the generative send instead (test_socket_admission_no_pending).
-    # Force the route closed here so fake_attach's page sentinel represents the route the
-    # production admission loop actually budgeted.
-    class _NoSocketRoute:
-        closed_reason = ""
-        def open(self):
-            return False
-        def needs_refresh(self):
-            return False
-        def record(self, *a, **k):
-            pass
-
-    orig_route = rf._socket_route
+    # THIS TEST IS ABOUT THE LANE CAP (the socket capacity). _install_fake_worker installs a ready
+    # socket route so the admission loop admits; fake_attach's page sentinel stands for a held slot.
     orig_due = rf.admission_is_due
-    rf._socket_route = lambda: _NoSocketRoute()
     rf.admission_is_due = lambda now=None: True
 
     state = {"control": {}}
@@ -287,7 +298,6 @@ def test_continuous_admission_no_barrier():
         # not move with poll_s or with the speed of the machine.
         check("continuous_made_progress", opens["transitions"] <= 12)
     finally:
-        rf._socket_route = orig_route
         rf.admission_is_due = orig_due
         _restore_worker(orig)
 
@@ -956,7 +966,8 @@ def _install_fake_socket_worker(monkey_state):
     unit `_active_open()` counts) is True for a socket worker precisely so this fixture can
     stand in for the production socket-route path without opening a browser."""
     orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
-            "tab_weight": RelayWorker.tab_weight}
+            "tab_weight": RelayWorker.tab_weight, "route": rf._socket_route}
+    rf._socket_route = lambda: _ReadyRoute()
 
     def fake_attach(self, context, agent_url):
         self.socket = True
@@ -1033,44 +1044,6 @@ def test_socket_workers_respect_the_live_cap():
               len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
         check("socket_admission_never_exceeded_cap_of_one",
               observed["max_concurrent_sockets"] <= 1)
-    finally:
-        _restore_worker(orig)
-
-
-def test_tab_budget_admission():
-    # A worker that fans out to 3 tabs consumes the whole 3-tab budget, so a 2nd worker waits --
-    # "3 open tabs == parallelism 3", reactive, no human cap. All goals still complete (continuous).
-    rf.avail_phys_mb = lambda: 64000.0
-    rf.free_disk_gb = lambda path=None: 500.0
-    state = {"control": {}}
-    orig = _install_fake_worker(state)
-    try:
-        goals = ["g0", "g1", "g2"]
-        max_tabs = {"v": 0}
-        max_mains = {"v": 0}
-        class _Open: page = object()
-
-        def on_tick(workers):
-            # fan the currently-open worker out to 3 tabs BEFORE completing it
-            cur = [w for w in workers if getattr(w, "page", None) is not None and w.status == "waiting"]
-            for w in cur:
-                if w.tab_load() < 3:
-                    w._research_session = _Open(); w._refuter_session = _Open()
-            max_tabs["v"] = max(max_tabs["v"], sum(w.tab_load() for w in workers))
-            mains = sum(1 for w in workers if getattr(w, "page", None) is not None and w.status not in TERMINAL)
-            max_mains["v"] = max(max_mains["v"], mains)
-            # once it is at full fan-out, complete it so the next can be admitted
-            for w in cur:
-                if w.tab_load() >= 3:
-                    w._research_session = None; w._refuter_session = None
-                    state["control"][w.name] = "done"
-                    break
-
-        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=3,
-                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
-        check("tab_budget_all_complete", len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
-        check("tab_budget_total_tabs_capped", max_tabs["v"] <= 3)     # 3-tab budget held
-        check("tab_budget_one_main_when_fanned", max_mains["v"] == 1)  # a 3-tab worker runs solo
     finally:
         _restore_worker(orig)
 
@@ -1278,7 +1251,9 @@ def test_unfinished_excludes_stuck_keeps_infra_stuck():
     import time as _t
     rf.avail_phys_mb = lambda: 64000.0
     rf.free_disk_gb = lambda path=None: 500.0
-    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close}
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
+            "route": rf._socket_route}
+    rf._socket_route = lambda: _ReadyRoute()
 
     # each goal's TEXT encodes the terminal state its (single) poll() call should reach;
     # "g_running" is deliberately absent from the map so it never goes terminal.
@@ -1349,6 +1324,7 @@ def test_unfinished_excludes_stuck_keeps_infra_stuck():
         RelayWorker.attach = orig["attach"]
         RelayWorker.poll = orig["poll"]
         RelayWorker.close = orig["close"]
+        rf._socket_route = orig["route"]
 
 
 def test_stuck_noprogress_early_exit():
@@ -1396,7 +1372,6 @@ def main():
     """
     for _fn in (test_disk_floor_predicate,
                 test_tab_load_accounting,
-                test_tab_budget_admission,
                 test_socket_workers_respect_the_live_cap,
                 test_soft_shrink_does_not_close_running_tabs,
                 test_hysteresis_no_thrash,

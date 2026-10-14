@@ -35,71 +35,19 @@ class _NeverReopen:
         return False
 
 
-def test_socket_batch_leaves_no_worker_pending_even_when_tab_cap_is_two(monkeypatch):
-    """The measured defect: open_tabs=0, mc_box=2, yet workers 5/6 stayed PENDING."""
+def _run(monkeypatch, route, max_concurrent, n=6, attach_fn=None):
     rf._reset_admission_pacing()
-    monkeypatch.setattr(rf, "_socket_route", lambda: _Route())
+    monkeypatch.setattr(rf, "_socket_route", lambda: route)
     monkeypatch.setattr(rf, "_reopen_policy", lambda: _NeverReopen())
     monkeypatch.setattr(rf, "free_disk_gb", lambda path=None: 500.0)
     monkeypatch.setattr(rf, "avail_phys_mb", lambda: 64000.0)
 
-    attached = []
     first = {}
     stop_box = [False]
 
     def attach(self, context, agent_url):
         self.page = None
         self.socket = True
-        self.drv = object()
-        self.status = "ready"
-        attached.append(self.name)
-        return True
-
-    def poll(self):
-        return False
-
-    def close(self):
-        self.closed = True
-        self.page = None
-        self.drv = None
-
-    monkeypatch.setattr(rf.RelayWorker, "attach", attach)
-    monkeypatch.setattr(rf.RelayWorker, "poll", poll)
-    monkeypatch.setattr(rf.RelayWorker, "close", close)
-
-    def tick(workers):
-        if first:
-            return
-        first["pending"] = [w.name for w in workers if w.status == rf.PENDING]
-        first["ready"] = [w.name for w in workers if w.status == "ready"]
-        first["tab_load"] = sum(w.tab_load() for w in workers)
-        stop_box[0] = True
-
-    rf.run_relay_fleet(_Ctx(), ["g%d" % i for i in range(6)], "http://agent",
-                       max_concurrent=2, poll_s=0, on_tick=tick,
-                       notify=lambda *a, **k: None, stop_box=stop_box,
-                       autoscale=False, disk_floor_gb=0.0)
-
-    assert first["tab_load"] == 0
-    assert first["pending"] == [], first
-    assert len(first["ready"]) == 6
-    assert len(attached) == 6
-
-
-def test_tab_batch_still_obeys_the_same_tab_cap(monkeypatch):
-    """Removing the socket worker-count gate must not remove the real browser-tab budget."""
-    rf._reset_admission_pacing()
-    monkeypatch.setattr(rf, "_socket_route", lambda: type("R", (), {"open": lambda self: False})())
-    monkeypatch.setattr(rf, "admission_is_due", lambda now=None: True)
-    monkeypatch.setattr(rf, "free_disk_gb", lambda path=None: 500.0)
-    monkeypatch.setattr(rf, "avail_phys_mb", lambda: 64000.0)
-
-    first = {}
-    stop_box = [False]
-
-    def attach(self, context, agent_url):
-        self.page = object()
-        self.socket = False
         self.drv = object()
         self.status = "ready"
         return True
@@ -111,15 +59,44 @@ def test_tab_batch_still_obeys_the_same_tab_cap(monkeypatch):
     def tick(workers):
         if first:
             return
-        first["pending"] = sum(w.status == rf.PENDING for w in workers)
-        first["open"] = sum(w.page is not None for w in workers)
+        first["pending"] = [w.name for w in workers if w.status == rf.PENDING]
+        first["ready"] = [w.name for w in workers if w.status == "ready"]
+        first["tab_load"] = sum(w.tab_load() for w in workers)
+        first["reasons"] = [w.reason for w in workers if w.status == rf.PENDING]
         stop_box[0] = True
 
-    rf.run_relay_fleet(_Ctx(), ["g%d" % i for i in range(6)], "http://agent",
-                       max_concurrent=2, poll_s=0, on_tick=tick,
+    rf.run_relay_fleet(_Ctx(), ["g%d" % i for i in range(n)], "http://agent",
+                       max_concurrent=max_concurrent, poll_s=0, on_tick=tick,
                        notify=lambda *a, **k: None, stop_box=stop_box,
                        autoscale=False, disk_floor_gb=0.0)
-    assert first == {"pending": 4, "open": 2}
+    return first
+
+
+def test_socket_batch_is_admitted_up_to_the_lane_ceiling_and_holds_no_tab(monkeypatch):
+    """The lane ceiling (not a tab budget) bounds concurrent socket goals; nothing holds a tab."""
+    first = _run(monkeypatch, _Route(), max_concurrent=2)
+    assert first["tab_load"] == 0
+    assert len(first["ready"]) == 2 and len(first["pending"]) == 4, first
+
+
+def test_a_high_ceiling_admits_the_whole_batch_in_one_sweep(monkeypatch):
+    first = _run(monkeypatch, _Route(), max_concurrent=200)
+    assert first["pending"] == [] and len(first["ready"]) == 6 and first["tab_load"] == 0
+
+
+def test_without_a_token_every_goal_waits_with_a_reason_and_no_tab_opens(monkeypatch):
+    class _NoToken(_Route):
+        enabled = True
+
+        def ready(self, agent_url=None):
+            return False
+
+        def driver_for(self, *a, **k):
+            return None
+
+    first = _run(monkeypatch, _NoToken(), max_concurrent=200)
+    assert len(first["pending"]) == 6 and first["ready"] == [] and first["tab_load"] == 0
+    assert all(r.startswith("waiting for token") for r in first["reasons"]), first
 
 
 class _Answers:
