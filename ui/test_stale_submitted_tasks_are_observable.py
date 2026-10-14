@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pytest
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 REPO = Path(__file__).resolve().parents[1]
 UI = REPO / "ui"
 FW = Path(r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319")
@@ -55,7 +57,7 @@ def test_queue_health_summary_counts_real_stale_and_taken_stale(tmp_path):
 
 
 def test_published_health_strip_contains_stale_queue_metrics():
-    s = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    s = cockpit_source.read(encoding="utf-8-sig")
     i = s.index("void PublishHealthStrip()")
     b = s[i:i + 6500]
     assert "SubmittedTasks.SummarizeHealth(qj)" in b
@@ -65,7 +67,7 @@ def test_published_health_strip_contains_stale_queue_metrics():
 
 
 def test_top_health_strip_warns_about_stale_submitted_work_without_recoloring_a_dot():
-    s = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    s = cockpit_source.read(encoding="utf-8-sig")
     i = s.index("void ApplyHealthToUi()")
     b = s[i:i + 6000]
     assert "SubmittedTasks.SummarizeHealth(ReadQueuedJobs())" in b

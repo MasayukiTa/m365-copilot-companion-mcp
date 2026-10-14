@@ -3,7 +3,9 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SUP = (ROOT / 'scripts' / 'supervisor.ps1').read_text(encoding='utf-8-sig', errors='replace')
-UI = (ROOT / 'ui' / 'FleetCockpit.cs').read_text(encoding='utf-8-sig', errors='replace')
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+UI = cockpit_source.read(encoding='utf-8-sig', errors='replace')
 
 
 def test_supervisor_publishes_and_clears_planned_server_transition():

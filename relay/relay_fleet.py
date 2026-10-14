@@ -4107,9 +4107,11 @@ class RelayWorker:
         # the backfill script and this hook can both cover the same worker. A failure is reported
         # on stderr by the helper, never raised into the close.
         try:
-            from bridge.validity_audit import sync_worker_logged
+            # QUEUED, NEVER INLINE: this is the sweep thread, and the sync scans the tool ledger
+            # and sqlite per worker (39 cancelled workers froze a sweep >150 s on 2026-10-14).
+            from bridge.validity_audit import sync_worker_async
             from tools.tool_ledger import _repo_path
-            sync_worker_logged(
+            sync_worker_async(
                 getattr(self, "_tx_key", ""), ledger_path=_repo_path(),
                 run_id=getattr(self, "run_id", ""), name=self.name, jid=(self.jid or ""),
                 outcome={"outcome": self.outcome, "status": self.status,
@@ -8642,11 +8644,7 @@ def _campaigns_from_disk(transcript_dir):
     path = os.path.join(os.path.dirname(transcript_dir), "campaigns.jsonl")
     if not os.path.isfile(path):
         return {}
-    try:
-        with open(path, encoding="utf-8") as fh:
-            fams = fanout_mod.campaigns_from_ledger(fh)
-    except OSError:
-        return {}
+    fams = resume_mod.read_campaigns(os.path.dirname(transcript_dir))   # indexed, private copies
     out = {}
     done_map = resume_mod.read_done_map(os.path.dirname(transcript_dir))
     # A merge lost twice is written off in the open (ledger + mechanism row; a nested one marks
@@ -8891,7 +8889,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # the parent family left memory (its own merge is done): the ledger is the record
             _have = []
             try:
-                _pfam = resume_mod.read_campaigns(os.path.dirname(transcript_dir)).get(_pc) \
+                _pfam = resume_mod.read_campaigns_view(os.path.dirname(transcript_dir)).get(_pc) \
                     if transcript_dir else None
                 _have = list((_pfam or {}).get("child_results") or [])
             except Exception:
@@ -9050,7 +9048,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             return None
         try:
             return resume_mod.nested_slot_map(
-                resume_mod.read_campaigns(os.path.dirname(transcript_dir))).get((_pc, _pi))
+                resume_mod.read_campaigns_view(os.path.dirname(transcript_dir))).get((_pc, _pi))
         except Exception:
             return None
 
@@ -9251,7 +9249,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             if _cid in _stall_fired or not transcript_dir:
                 return 0
             _sd = os.path.dirname(transcript_dir)
-            _fam = resume_mod.read_campaigns(_sd).get(_cid)
+            _fam = resume_mod.read_campaign(_sd, _cid)   # indexed: O(appended bytes), not a re-parse
             if not _fam:
                 return 0
             _dm = resume_mod.read_done_map(_sd)
@@ -9589,6 +9587,33 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             except Exception:
                 pass
             return False
+
+    # SWEEP LAP TIMING. The watchdog freezes a run whose status.json (written once per lap, by
+    # on_tick) is 150 s old, so the lap duration IS the heartbeat interval; a slow lap is the
+    # thing to see in the log before it becomes a reset. Logged when a lap is slow (>= 5 s) and
+    # every 50th lap otherwise, with the merge-queue share.
+    _lap = {"t0": time.time(), "n": 0, "qrm": 0.0}
+    _queue_ready_merges_raw = _queue_ready_merges
+
+    def _queue_ready_merges():
+        _t = time.time()
+        try:
+            return _queue_ready_merges_raw()
+        finally:
+            _lap["qrm"] += time.time() - _t
+
+    def _lap_done():
+        try:
+            _now = time.time()
+            _lap["n"] += 1
+            _dt = _now - _lap["t0"]
+            if _dt >= 5.0 or _lap["n"] % 50 == 0:
+                from relay.logstamp import stamp as _stamp
+                print(_stamp("[sweep] lap %d took %.2fs (merge-queue %.2fs, workers %d)"
+                             % (_lap["n"], _dt, _lap["qrm"], len(workers))), flush=True)
+            _lap["t0"], _lap["qrm"] = _now, 0.0
+        except Exception:
+            pass
 
     _reap_counter = 0
     while (any(w.status not in TERMINAL for w in workers)
@@ -10013,6 +10038,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 on_tick(workers)
             except Exception:
                 pass
+        _lap_done()
         time.sleep(poll_s)
 
     # make sure no tab is left behind

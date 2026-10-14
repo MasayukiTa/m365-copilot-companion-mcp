@@ -173,9 +173,8 @@ def test_the_runner_calls_it_rather_than_reimplementing_it():
 
 def test_the_cockpit_no_longer_claims_success_unconditionally():
     """The one steer-send path refuses when the run is not live and only queues on success."""
-    import os
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "ui", "FleetCockpit.cs"), encoding="utf-8").read()
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    src = cockpit_source.read(encoding="utf-8")
     i = src.index("bool TrySteerSend(string name, string text, out string failReason)")
     seg = src[i:i + 900]
     assert 'if (!RunIsLive()) { failReason = T("steer_dead"); return false; }' in seg

@@ -3,7 +3,9 @@
 from pathlib import Path
 
 THEME = Path(__file__).with_name('Theme.cs').read_text(encoding='utf-8')
-COCKPIT = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-sig')
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+COCKPIT = cockpit_source.read(encoding='utf-8-sig')
 
 
 def test_timeline_has_four_operator_meaning_colours():
@@ -56,7 +58,7 @@ def test_timeline_status_lookup_normalizes_protocol_event_case():
 
 def test_left_spine_reuses_the_execution_timeline_contract():
     helper = COCKPIT[COCKPIT.index('void AddSpineTimeline('):COCKPIT.index('UIElement BuildSpineContent(')]
-    spine = COCKPIT[COCKPIT.index('UIElement BuildSpineContent('):COCKPIT.index('List<Tuple<string, string>> BuildTimelineEvents', COCKPIT.index('UIElement BuildSpineContent('))]
+    spine = cockpit_source.member(COCKPIT, 'UIElement BuildSpineContent(')
     assert '"Content details"' in spine
     assert 'AddSpineTimeline(outer, primaryWorker);' in spine
     assert '"Execution timeline"' in helper

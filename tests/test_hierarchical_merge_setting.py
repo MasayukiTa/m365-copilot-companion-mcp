@@ -22,6 +22,7 @@ if REPO not in sys.path:
 from relay import fanout as fo               # noqa: E402
 from relay import fleet_runner as FR         # noqa: E402
 from tools import childproc                  # noqa: E402
+from tools import cockpit_source             # noqa: E402  (the cockpit source is split across files)
 from tools import settings_keys as SK        # noqa: E402
 
 KEY = "fanout_hierarchical_merge"
@@ -162,7 +163,7 @@ def test_the_cockpit_constants_equal_the_python_side():
 
 
 def test_the_cockpit_has_a_visible_control_saving_through_savekey_only():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8-sig")
     # lives in the gear popup (BuildSettingsPanel), NOT in the header
     assert "col.Children.Add(HierarchicalMergeControl());" in src
     assert "ctrls.Children.Add(HierarchicalMergeControl());" not in src

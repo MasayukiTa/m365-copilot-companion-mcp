@@ -32,6 +32,8 @@ import re
 
 import pytest
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
 COCKPIT = os.path.join(HERE, "FleetCockpit.cs")
@@ -40,7 +42,7 @@ PROFILE_TOKEN = os.path.join(REPO, "relay", "profile_token.py")
 
 @pytest.fixture(scope="module")
 def src():
-    return io.open(COCKPIT, encoding="utf-8-sig").read()
+    return cockpit_source.read(encoding="utf-8-sig")
 
 
 def test_the_agent_dot_ages_the_template_it_calls_a_binding(src):
@@ -56,7 +58,7 @@ def test_the_cockpits_age_limit_is_not_looser_than_the_routes():
     """A COPY, AND COPIES DRIFT. If the cockpit's cap grows past the route's, the dot goes
     back to reporting bindings the route refuses -- silently, because nothing else compares
     the two numbers."""
-    cs = io.open(COCKPIT, encoding="utf-8-sig").read()
+    cs = cockpit_source.read(encoding="utf-8-sig")
     py = io.open(PROFILE_TOKEN, encoding="utf-8").read()
 
     m_cs = re.search(r"const double TEMPLATE_MAX_AGE_S\s*=\s*([0-9]+)\s*\*\s*([0-9]+)\s*;", cs)

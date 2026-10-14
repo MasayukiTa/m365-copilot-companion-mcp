@@ -32,6 +32,7 @@ if REPO not in sys.path:
 
 from relay import fleet_resume as FRES   # noqa: E402
 from relay import task_router as TR       # noqa: E402
+from tools import cockpit_source          # noqa: E402  (the cockpit source is split across files)
 from tools import settings_keys as SK     # noqa: E402
 from tools import settings_path as SP     # noqa: E402
 
@@ -257,6 +258,8 @@ def test_the_coordinators_status_carries_the_block(state, settings, monkeypatch)
 # -- the cockpit control --------------------------------------------------------------------------
 
 def _cs(name):
+    if name == "FleetCockpit.cs":
+        return cockpit_source.read(encoding="utf-8-sig")
     return io.open(os.path.join(REPO, "ui", name), encoding="utf-8-sig").read()
 
 

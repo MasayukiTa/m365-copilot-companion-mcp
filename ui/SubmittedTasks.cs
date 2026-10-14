@@ -426,11 +426,26 @@ sealed class SubmittedTasks
                          IList<Dictionary<string, object>> workers,
                          IList<Dictionary<string, object>> history)
     {
+        return AddLocal(goal, nowUnix, WorkerKeysByGoal(started, workers, history));
+    }
+
+    /// The worker-by-goal index AddLocal measures a submission against. Build it ONCE per
+    /// batch: AddLocal used to rebuild it (Normalize every worker and history goal) for every
+    /// goal submitted, so "retry all" over N goals cost N x (workers + history) goal
+    /// normalisations on the UI thread. Pure and static, so it may run off the UI thread.
+    public static Dictionary<string, List<string>> BuildBaselineIndex(
+        string started, IList<Dictionary<string, object>> workers,
+        IList<Dictionary<string, object>> history)
+    {
+        return WorkerKeysByGoal(started, workers, history);
+    }
+
+    public bool AddLocal(string goal, double nowUnix, Dictionary<string, List<string>> byGoal)
+    {
         string key = Normalize(goal);
         if (key.Length == 0) return false;
         if (Find(key) != null) return true;          // already on screen
-        NewEntry(key, goal, "local", "", nowUnix, nowUnix,
-                 WorkerKeysByGoal(started, workers, history));
+        NewEntry(key, goal, "local", "", nowUnix, nowUnix, byGoal);
         return true;
     }
 

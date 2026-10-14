@@ -24,18 +24,26 @@ from __future__ import annotations
 import io
 import os
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
 CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")
 
 
+def _read(path):
+    if path == COCKPIT:
+        return cockpit_source.read(encoding="utf-8")
+    return io.open(path, encoding="utf-8").read()
+
+
 def _code(path):
-    return "\n".join(ln for ln in io.open(path, encoding="utf-8").read().splitlines()
+    return "\n".join(ln for ln in _read(path).splitlines()
                      if not ln.strip().startswith("//"))
 
 
 def _method(path, signature, stop="\n    // "):
-    src = io.open(path, encoding="utf-8").read()
+    src = _read(path)
     i = src.index(signature)
     j = src.find(stop, i + 1)
     return src[i:j] if j > 0 else src[i:]

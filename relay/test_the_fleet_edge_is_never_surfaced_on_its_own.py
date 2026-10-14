@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from relay import edge_recover as R
+from tools import cockpit_source  # the cockpit source is split across partial-class files
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -114,7 +115,7 @@ def test_a_refused_surface_schedules_no_headless_relaunch(monkeypatch):
 
 
 def test_the_cockpit_never_auto_fixes_sign_in_with_a_window():
-    src = _src("ui/FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8")
     i = src.index("int AutoFixTargetDot()")
     body = _code_only(src[i:i + 2500])
     assert re.search(r"if \(dot == 3\) continue;", body), \

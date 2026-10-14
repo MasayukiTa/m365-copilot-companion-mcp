@@ -16,8 +16,10 @@ Run: pytest -q ui/test_fleet_cockpit_authority_window.py
 """
 from pathlib import Path
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 UI = Path(__file__).parent
-COCKPIT = (UI / "FleetCockpit.cs").read_text(encoding="utf-8")
+COCKPIT = cockpit_source.read(encoding="utf-8")
 DASH = (UI / "SelfImproveDashboard.cs").read_text(encoding="utf-8")
 
 

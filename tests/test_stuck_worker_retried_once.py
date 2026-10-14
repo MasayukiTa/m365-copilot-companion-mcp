@@ -24,7 +24,8 @@ def _read(*parts):
 
 
 def _cs():
-    return _read("ui", "FleetCockpit.cs")
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    return cockpit_source.read(encoding="utf-8")
 
 
 def _method(src, start, end):
