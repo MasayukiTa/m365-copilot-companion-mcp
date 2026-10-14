@@ -45,8 +45,10 @@ from pathlib import Path
 
 import pytest
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 UI = Path(__file__).resolve().parent
-SOURCES = [UI / "FleetCockpit.cs", UI / "SelfImproveDashboard.cs"]
+SOURCES = [Path(p) for p in cockpit_source.paths()] + [UI / "SelfImproveDashboard.cs"]
 
 #: Case-sensitive Japanese term (case doesn't apply) + case-insensitive English term. Both
 #: named literally, not derived, so a rename of one does not silently stop checking the other.

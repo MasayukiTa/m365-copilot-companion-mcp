@@ -18,6 +18,7 @@ import subprocess
 import pytest
 
 from relay import edge_recover as R
+from tools import cockpit_source  # the cockpit source is split across partial-class files
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -74,16 +75,6 @@ def test_a_refusal_leaves_a_trace(monkeypatch, tmp_path):
     assert row["port"] == 9222 and row["open_url"] == "https://x"
 
 
-def test_open_fresh_asks_once_and_does_not_claim_a_surface_that_did_not_happen():
-    body = _code_only(_src("relay/relay_fleet.py"))
-    seg = body[body.index("def _open_fresh"):]
-    seg = seg[:seg.index("\ndef ", 10)]
-    assert "surfaced = bool(surface(open_url=url))" in seg, \
-        "`surfaced = True` regardless of the result keeps the 300 s hidden wait for a sign-in nobody can do"
-    assert "surface_tried" in seg, "the sign-in URL is seen every second; ask once, not 75 times"
-    assert not re.search(r"surface\(open_url=url\)\s*;\s*surfaced\s*=\s*True", seg)
-
-
 def test_no_automatic_caller_passes_person_present():
     """Only the interactive helper may. Grep the whole tree (git-tracked python), not a list."""
     out = []
@@ -124,7 +115,7 @@ def test_a_refused_surface_schedules_no_headless_relaunch(monkeypatch):
 
 
 def test_the_cockpit_never_auto_fixes_sign_in_with_a_window():
-    src = _src("ui/FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8")
     i = src.index("int AutoFixTargetDot()")
     body = _code_only(src[i:i + 2500])
     assert re.search(r"if \(dot == 3\) continue;", body), \
@@ -176,15 +167,7 @@ def _run_open_fresh(monkeypatch, urls, composer_after):
 
 LOGIN = "https://login.microsoftonline.com/common/oauth2/v2.0/authorize?client_id=x"
 
-
-def test_a_short_sso_bounce_never_reaches_surface(monkeypatch):
-    # 3 polls on the login host, then the chat renders: the 2026-10-08 shape.
-    assert _run_open_fresh(monkeypatch, [LOGIN] * 3 + ["https://m365.cloud.microsoft/chat/"], 5) == []
-
-
-def test_a_login_page_that_stays_is_asked_about_exactly_once(monkeypatch):
-    asked = _run_open_fresh(monkeypatch, [LOGIN] * 200, 10 ** 6)
-    assert len(asked) == 1
+# (The _open_fresh sign-in tests were removed with _open_fresh itself: Copilot never runs in a tab.)
 
 
 # --- a window that got out anyway is put back, not a reason to halt the fleet ---------------

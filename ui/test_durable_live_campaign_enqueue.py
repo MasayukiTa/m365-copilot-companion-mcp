@@ -1,6 +1,8 @@
 ﻿from pathlib import Path
 
-SOURCE = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-sig', errors='replace')
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SOURCE = cockpit_source.read(encoding='utf-8-sig', errors='replace')
 
 
 def test_local_loop_live_add_uses_durable_campaign_enqueue_not_fleet_commands():

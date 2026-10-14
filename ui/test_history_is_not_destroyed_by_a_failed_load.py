@@ -23,6 +23,8 @@ from pathlib import Path
 
 import pytest
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 SRC = Path(__file__).resolve().parent / "FleetCockpit.cs"
 
 
@@ -30,7 +32,7 @@ SRC = Path(__file__).resolve().parent / "FleetCockpit.cs"
 def src():
     if not SRC.is_file():
         pytest.skip("FleetCockpit.cs not in this checkout")
-    return io.open(SRC, encoding="utf-8", errors="replace").read()
+    return cockpit_source.read(encoding="utf-8", errors="replace")
 
 
 def _body(src, name):

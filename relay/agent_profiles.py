@@ -759,8 +759,15 @@ class ResearchSession:
         try:
             if self.context is None:
                 self._fail("no browser context"); return
-            self.page = self.context.new_page()
-            if not open_agent(self.page, self.profile):
+            # DECLARED: a page opened and driven on the sweep thread; see relay/blocking_calls.py.
+            from relay import blocking_calls
+            with blocking_calls.blocking("side_page_open", 150):
+                # Copilot never runs in a browser tab (owner rule, relay/no_tab.py): a side
+                # agent that cannot get a socket fails here instead of opening a page.
+                from relay.no_tab import forbid_copilot_tab
+                forbid_copilot_tab("research/analyst side page")
+                opened = open_agent(self.page, self.profile)
+            if not opened:
                 self._fail("the %s surface did not open" % self.profile.name); return
             if self.upload_path:
                 # THIS IS THE FALLBACK NOW, NOT THE ONLY WAY. It read "and this is why the

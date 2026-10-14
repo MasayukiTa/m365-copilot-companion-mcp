@@ -240,6 +240,17 @@ class SocketRoute:
             self.close_route("%d fallbacks this run: the route is not reliable enough to be "
                              "worth the failed turn plus the tab open" % fallbacks)
 
+    def note_capture_failure(self, reason: str) -> None:
+        """A TOKEN CAPTURE failed. Logged and recorded, but NOT counted against the breaker.
+
+        The breaker exists because a failed route costs a failed turn plus a tab. There is no tab
+        any more (relay/no_tab.py): goals simply wait for a token, and the capture is retried with
+        backoff (relay/token_provider.CapturePolicy). Closing the route over a failed capture would
+        only turn "waiting for token" into a shut route that cannot even be probed -- it has no
+        token to probe with."""
+        self._log("[socket_route] capture failed (goals keep waiting): %s" % reason)
+        self.record("capture_failed", reason=reason[:300])
+
     def note_success(self) -> None:
         with self._lock:
             self.consecutive = 0
@@ -357,10 +368,16 @@ class SocketRoute:
             return self._refresh_locked(context, agent_url, key)
 
     def _refresh_locked(self, context, agent_url, key) -> bool:
+        # A SYNCHRONOUS CAPTURE HOLDS THE CALLER'S THREAD (the fleet sweep, for the research and
+        # refuter side agents) for as long as the page takes, and the stall watchdog reads that
+        # silence as a wedged Edge. Declared here -- the one place every synchronous capture
+        # passes through -- so no caller has to remember to.
+        from relay import blocking_calls
         try:
-            token, template = self._capture_fn(context, agent_url)
+            with blocking_calls.blocking("token_capture", blocking_calls.SYNC_CAPTURE_CEILING_S):
+                token, template = self._capture_fn(context, agent_url)
         except Exception as exc:
-            self.note_failure("capture failed for %s: %s: %s"
+            self.note_capture_failure("capture failed for %s: %s: %s"
                               % (key[:40] or "(default)", type(exc).__name__, str(exc)[:140]))
             return False
         return self.install_capture(token, template, key)
@@ -473,15 +490,9 @@ def websocket_connect(url, headers, timeout_s):
 
 
 def capture_via_tab(context, agent_url):
-    """Open a tab on the agent surface, capture, and close it. The tab is NOT kept."""
-    from relay.chathub_capture import capture
-    from relay.relay_fleet import _open_fresh
-
-    page = _open_fresh(context, agent_url)
-    try:
-        return capture(page)
-    finally:
-        try:
-            page.close()
-        except Exception:
-            pass
+    """REMOVED: this ran one REAL Copilot turn in a tab to read the token and the request
+    template. Copilot never runs in a browser tab and a token capture never sends a turn (owner
+    rule, 2026-10-14). The only capture is relay.profile_token.capture_via_profile, which reads
+    the token from a page's own request headers and the template from the on-disk cache."""
+    from relay.no_tab import forbid_copilot_tab
+    forbid_copilot_tab("token capture with a real turn (capture_via_tab)")

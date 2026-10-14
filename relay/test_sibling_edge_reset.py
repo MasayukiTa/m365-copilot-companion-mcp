@@ -111,7 +111,7 @@ def test_a_lost_context_no_longer_resets_a_healthy_browser():
     """コンテキスト喪失の原因が『兄弟がリセットした』ことなので、
     ここで無条件にリセットすると、1回のリセットが連鎖になる。"""
     src = _runner_source()
-    i = src.index("if args.no_auto_recover or attempt > args.max_recover:")
+    i = src.index("if _give_up:")
     seg = src[i:i + 400]
     assert seg.index("cdp_alive(args.cdp_url)") < seg.index("hard_reset(port)")
 

@@ -39,6 +39,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from scripts import status as ST                        # noqa: E402
+from tools import cockpit_source                        # noqa: E402  (the cockpit source is split across files)
 
 STRIP = os.path.join(REPO, ".fleet", "health_strip.json")
 
@@ -127,16 +128,14 @@ def test_a_missing_strip_is_unknown_not_healthy(tmp_path, monkeypatch):
 def test_the_cockpit_actually_publishes_it():
     """The other half: a reader with no writer is a reader that always says 'not published'.
     Source-level, because the writer is a C# panel that cannot be imported here."""
-    body = io.open(os.path.join(REPO, "ui", "FleetCockpit.cs"),
-                   encoding="utf-8-sig", errors="replace").read()
+    body = cockpit_source.read(encoding="utf-8-sig", errors="replace")
     assert "PublishHealthStrip" in body
     assert "health_strip.json" in body
     assert "PublishHealthStrip();" in body, "defined but never called from the sweep"
 
 
 def _cockpit_source():
-    return io.open(os.path.join(REPO, "ui", "FleetCockpit.cs"),
-                   encoding="utf-8-sig", errors="replace").read()
+    return cockpit_source.read(encoding="utf-8-sig", errors="replace")
 
 
 def _declared_dot_count(body):

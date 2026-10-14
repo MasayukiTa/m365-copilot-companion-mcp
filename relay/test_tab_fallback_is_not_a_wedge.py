@@ -133,20 +133,11 @@ def test_closing_the_window_can_never_fail_the_worker():
     assert w.eval_busy_until == 0.0
 
 
-def test_the_fallback_declares_the_window_around_the_tab_open():
-    """The sweep, not just the helper: the one long blocking call in the fallback has to be
-    inside the window, or the declaration protects nothing."""
+def test_the_fallback_opens_no_tab_so_there_is_no_window_to_declare():
+    """The fallback used to declare a blocking window around a tab open. The tab open is gone
+    (relay/no_tab.py): the fallback only re-binds a socket later, without blocking."""
     import inspect
     raw = inspect.getsource(RF.RelayWorker._fall_back_to_tab)
-    # COMMENTS STRIPPED FIRST. The first draft of this assertion matched the explanatory
-    # comment above the call -- which names _open_fresh to say why the window exists -- and
-    # concluded the call came before the declaration. A source assertion that reads prose is
-    # asserting about prose; this repository has paid for that one before.
     src = chr(10).join(l.split("#", 1)[0] for l in raw.splitlines())
-    assert "_declare_blocking" in src and "_end_blocking" in src, (
-        "the fallback no longer declares its blocking window")
-    open_at = src.index("_open_fresh")
-    declare_at = src.index("_declare_blocking")
-    end_at = src.rindex("_end_blocking")
-    assert declare_at < open_at < end_at, (
-        "_open_fresh is not inside the declared window")
+    assert "_open_fresh" not in src and "new_page" not in src
+    assert "_needs_socket_rebind = True" in src

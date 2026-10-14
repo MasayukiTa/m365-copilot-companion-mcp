@@ -28,6 +28,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from relay import fanout as fo                     # noqa: E402
+from tools import cockpit_source                   # noqa: E402  (the cockpit source is split across files)
 from relay import fanout_budget as fb              # noqa: E402
 from relay import relay_fleet as rf                # noqa: E402
 from relay import fleet_resume as fres             # noqa: E402
@@ -369,7 +370,7 @@ def test_the_cockpit_depth_constants_equal_the_python_side():
 
 
 def test_the_cockpit_depth_box_saves_through_savekey_only_and_does_not_refire():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8")
     # lives in the gear popup (BuildSettingsPanel), NOT in the header
     assert "col.Children.Add(FanoutDepthControl());" in src
     assert "ctrls.Children.Add(FanoutDepthControl());" not in src
@@ -384,7 +385,7 @@ def test_the_cockpit_depth_box_saves_through_savekey_only_and_does_not_refire():
 
 
 def test_the_screen_words_the_runners_report_not_its_own_selection():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8")
     m = re.search(r"void PaintFanoutDepthInEffect\(.*?\n    }\n", src, re.S)
     assert m and 'Obj(root, "fanout_depth")' in m.group(0)
     assert "FanoutDepthView.Describe(conf, eff," in m.group(0)

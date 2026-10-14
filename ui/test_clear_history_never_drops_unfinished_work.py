@@ -11,7 +11,11 @@ Source-level checks (the cockpit is a WPF exe; these pin the decisions that fail
 """
 from pathlib import Path
 
-SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8")
+import sys
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from tools import cockpit_source  # the cockpit source is split across ui/FleetCockpit*.cs
+
+SOURCE = cockpit_source.read(encoding="utf-8")
 SUBMITTED = Path(__file__).with_name("SubmittedTasks.cs").read_text(encoding="utf-8")
 
 
@@ -56,7 +60,7 @@ def test_bulk_resume_acknowledges_at_once_and_delivers_off_the_ui_thread():
 
 def test_submission_index_is_built_once_per_batch():
     note = _block(SOURCE, "void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)",
-                  "static string OneLine")
+                  "\n    }\n")
     assert note.count("BuildBaselineIndex(") == 1
     assert "public bool AddLocal(string goal, double nowUnix, Dictionary<string, List<string>> byGoal)" in SUBMITTED
 

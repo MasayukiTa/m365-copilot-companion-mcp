@@ -41,6 +41,8 @@ import re
 
 import pytest
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 _UI = os.path.dirname(os.path.abspath(__file__))
 _EXE = os.path.join(_UI, "FleetCockpit.exe")
 
@@ -87,8 +89,7 @@ def _utf16_count(blob: bytes, token: str) -> int:
 
 
 def _archive_fields() -> set:
-    with open(os.path.join(_UI, "FleetCockpit.cs"), encoding="utf-8", errors="replace") as fh:
-        return set(_ARCHIVE_FIELD.findall(fh.read())) - _NOT_LITERALS
+    return set(_ARCHIVE_FIELD.findall(cockpit_source.read(encoding="utf-8", errors="replace"))) - _NOT_LITERALS
 
 
 def test_the_source_still_names_the_join_keys():

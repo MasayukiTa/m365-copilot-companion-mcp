@@ -8,13 +8,10 @@ inside a 700-line `run()`. Saying so was right, and it is still an untested half
 assertion cannot catch a cap read from the wrong place, compared the wrong way round, or
 compared against a stale copy.
 
-`relay_fleet.admits_another_tab` now has a name for exactly that reason, so the decision can be
-driven with numbers -- no browser, no clock, no worker. These tests then join the two halves:
-write a settings file, poll the REAL follower, and ask the REAL predicate using the box the
-follower just wrote into.
-
-The disk and RAM knobs already had names (`disk_admission_ok`, `ram_target_cap`), so their
-halves are pinned the same way at the bottom.
+The tab-budget predicate (`admits_another_tab`) and the RAM autoscale (`ram_target_cap`) were
+retired with the tab era; the live box now reaches the decision through the socket capacity
+cap, pinned from source at the bottom. The disk knob still has a name (`disk_admission_ok`),
+so its half is pinned by driving the REAL follower and the REAL predicate.
 """
 from __future__ import annotations
 
@@ -23,7 +20,7 @@ import os
 import pytest
 
 from relay.fleet_runner import build_settings_follower
-from relay.relay_fleet import admits_another_tab, disk_admission_ok, ram_target_cap
+from relay.relay_fleet import disk_admission_ok
 
 
 @pytest.fixture
@@ -39,74 +36,7 @@ def settings(tmp_path):
 from conftest import write_settings as _write
 
 
-# ---- the decision itself ---------------------------------------------------------------------
-
-def test_a_worker_that_fits_the_budget_is_admitted():
-    assert admits_another_tab(active_open=1, projected_peak=1, tab_weight=1, cap=3) is True
-
-
-def test_a_worker_that_would_exceed_the_budget_is_not():
-    assert admits_another_tab(active_open=1, projected_peak=3, tab_weight=1, cap=3) is False
-
-
-def test_exactly_filling_the_budget_is_allowed():
-    """<= not <. Off by one here is a fleet that never reaches its own cap."""
-    assert admits_another_tab(active_open=1, projected_peak=2, tab_weight=1, cap=3) is True
-
-
-def test_a_socket_worker_weighs_nothing_and_still_obeys_the_budget():
-    """tab_weight is 0 for a socket worker, so the sum cannot grow -- which is the documented
-    reason the tab budget alone cannot bound a socket-first fleet. The predicate must not
-    pretend otherwise; it answers about TABS."""
-    assert admits_another_tab(active_open=5, projected_peak=5, tab_weight=0, cap=3) is False
-    assert admits_another_tab(active_open=5, projected_peak=2, tab_weight=0, cap=3) is True
-
-
-def test_with_nothing_open_one_worker_is_always_admitted():
-    """THE ESCAPE HATCH, AND IT IS LOAD-BEARING. The RAM autoscale writes mc_box, and
-    it can genuinely drive the cap to zero; without this the fleet would stop forever with work
-    queued and nothing running."""
-    assert admits_another_tab(active_open=0, projected_peak=0, tab_weight=1, cap=0) is True
-
-
-def test_a_cap_of_zero_still_refuses_a_SECOND_worker():
-    """The hatch is for the first one only. If it applied with something already open, the cap
-    would mean nothing at its most important value."""
-    assert admits_another_tab(active_open=1, projected_peak=1, tab_weight=1, cap=0) is False
-
-
-# ---- and the box the operator moved is the one the decision reads ------------------------------
-
-def test_raising_maxtabs_in_the_file_admits_a_worker_the_old_cap_refused(settings):
-    """THE JOIN. Same follower production builds, same box object, same predicate."""
-    disk_box, ram_box, mc_box, asc_box = [6.0], [512.0], [2], [False, 100]
-    _write(settings, disk_floor_gb=6, ram_floor_mb=512, maxtabs=2)
-    f = build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=lambda: settings)
-
-    # Two tabs open, cap 2: full.
-    assert admits_another_tab(2, 2, 1, mc_box[0]) is False
-
-    _write(settings, disk_floor_gb=6, ram_floor_mb=512, maxtabs=4)
-    f.poll()
-    assert mc_box[0] == 4, "the follower did not move the box"
-    assert admits_another_tab(2, 2, 1, mc_box[0]) is True, \
-        "the box moved and the decision did not follow it"
-
-
-def test_lowering_maxtabs_stops_admitting_without_a_restart(settings):
-    """The direction that matters operationally: an operator turning it DOWN mid-run."""
-    disk_box, ram_box, mc_box, asc_box = [6.0], [512.0], [6], [False, 100]
-    _write(settings, disk_floor_gb=6, ram_floor_mb=512, maxtabs=6)
-    f = build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=lambda: settings)
-    assert admits_another_tab(3, 3, 1, mc_box[0]) is True
-
-    _write(settings, disk_floor_gb=6, ram_floor_mb=512, maxtabs=3)
-    f.poll()
-    assert mc_box[0] == 3
-    assert admits_another_tab(3, 3, 1, mc_box[0]) is False
-
-
-# ---- the other two knobs, whose decisions already had names -----------------------------------
+# ---- the disk knob, whose decision already had a name ------------------------------------------
 
 def test_the_disk_floor_the_operator_set_is_the_one_the_gate_uses(settings):
     disk_box, ram_box, mc_box, asc_box = [6.0], [512.0], [3], [False, 100]
@@ -121,44 +51,18 @@ def test_the_disk_floor_the_operator_set_is_the_one_the_gate_uses(settings):
     assert disk_admission_ok(floor_gb=disk_box[0], eval_gb=1.0, free_gb=10.0) is False
 
 
-def test_the_ram_floor_the_operator_set_reaches_the_autoscale(settings):
-    """ram_box feeds ram_target_cap's headroom. A bigger floor reserves more, so the cap the
-    autoscale is willing to hold cannot be larger than with a smaller floor."""
-    disk_box, ram_box, mc_box, asc_box = [6.0], [512.0], [3], [True, 100]
-    _write(settings, disk_floor_gb=6, ram_floor_mb=512, maxtabs=3)
-    f = build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=lambda: settings)
-    low = ram_target_cap(1, 3, 100, per_tab_mb=500, headroom_mb=ram_box[0], up_margin_mb=0)
-
-    _write(settings, disk_floor_gb=6, ram_floor_mb=32768, maxtabs=3)
-    f.poll()
-    assert ram_box[0] == 32768.0, "the follower did not move the RAM box"
-    high = ram_target_cap(1, 3, 100, per_tab_mb=500, headroom_mb=ram_box[0], up_margin_mb=0)
-    assert high <= low, \
-        "reserving 32 GB allowed at least as many tabs as reserving 512 MB (%r vs %r)" % (high, low)
-
-
 # ---- the one link that is still source, said out loud ------------------------------------------
 
 def test_the_admission_loop_asks_with_the_box_and_not_a_copy():
-    """The live tab budget still reaches the tab admission decision.
-
-    Socket workers intentionally carry zero tab weight and are paced at their generative send,
-    so the loop is no longer shaped as `while pending and admits_another_tab(...)`. What must
-    remain true is narrower and more accurate: the candidate route is measured once, that route
-    chooses the pending worker's tab weight, and the live `mc_box[0]` is the cap passed to the
-    named tab predicate. Tab attaches keep the admission pacing gate; socket sends do not.
-    """
+    """The live lane box (`mc_box[0]`, or the autoscale ceiling) reaches the admission decision
+    through the socket capacity cap, which is the RAM safeguard applied to it."""
     from conftest import code_only
 
     here = os.path.dirname(os.path.abspath(__file__))
     src = code_only(os.path.join(here, "relay_fleet.py"))
-    i = src.index("while pending:")
-    call = src[i:i + 1400]
-    assert "_candidate_socket = _socket_open_now()" in call
-    assert "admits_another_tab(" in call, "the loop stopped asking the named tab predicate"
-    assert "tab_weight(assume_socket=_candidate_socket)" in call, \
-        "the pending worker is no longer weighed for the route it is about to take"
-    assert "mc_box[0]" in call, \
-        "the tab admission loop is no longer passing the live box as the cap"
-    assert "if not _candidate_socket and not admission_is_due():" in call, \
-        "attach-time pacing must remain tab-only; socket pacing belongs at generative send"
+    i = src.index("_lane_ceiling = ")
+    block = src[i:i + 900]
+    assert "mc_box[0]" in block, "the live box is no longer the lane ceiling"
+    assert "socket_capacity.ram_safeguard_cap(" in block
+    j = src.index("while pending:")
+    assert "socket_capacity.admits_another_goal(" in src[j:j + 3000]

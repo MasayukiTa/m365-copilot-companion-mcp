@@ -2,7 +2,9 @@
 """The cockpit must surface durable task progress, not only conversation turns."""
 from pathlib import Path
 
-SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SOURCE = cockpit_source.read(encoding="utf-8")
 
 
 def test_collapsed_card_reads_the_durable_execution_contract():

@@ -40,7 +40,7 @@ import pytest
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-from tools import childproc  # noqa: E402
+from tools import childproc, cockpit_source  # noqa: E402  # reads every part of the split cockpit source
 
 UI = os.path.join(REPO, "ui")
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
@@ -50,8 +50,7 @@ HARNESS = os.path.join(UI, "harness", "EffortPolicyHarness.cs")
 
 
 def _cockpit():
-    with open(os.path.join(UI, "FleetCockpit.cs"), encoding="utf-8-sig") as fh:
-        return fh.read()
+    return cockpit_source.read(encoding="utf-8-sig")
 
 
 # ── source assertions (no csc needed) ─────────────────────────────────────────────────────

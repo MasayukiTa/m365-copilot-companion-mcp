@@ -357,7 +357,6 @@ jobs:
             ui/test_the_last_setting_is_reachable.py \
             ui/test_an_answer_does_not_rewrap_when_it_settles.py \
             ui/test_the_same_decision_does_not_flood_the_approval_history.py \
-            relay/test_a_declared_knob_changes_something.py \
             relay/test_a_kept_for_claim_names_a_real_consumer.py \
             scripts/test_the_audit_sees_the_tree_that_will_be_pushed.py \
             scripts/test_the_loop_has_something_that_starts_it.py \
@@ -447,6 +446,15 @@ jobs:
             relay/test_canned_nonanswer_cause.py \
             relay/test_fleet_self_retry.py \
             relay/test_autoscale_ceiling_default.py \
+            relay/test_lanes_default_and_send_bucket.py \
+            relay/test_no_goal_path_opens_a_tab.py \
+            relay/test_socket_capacity.py \
+            relay/test_sweep_hot_path.py \
+            relay/test_the_cockpit_retry_is_accepted.py \
+            relay/test_token_provider.py \
+            relay/test_watchdog_blocking_aware.py \
+            tests/test_gui_submit_idempotency.py \
+            tools/test_resplit_cockpit_patch.py \
             scripts/test_diag_report.py \
             scripts/test_diag_warmup_bias.py \
             scripts/test_recycle_report.py \

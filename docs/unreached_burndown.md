@@ -1267,3 +1267,19 @@ remain in this document. `tools/unreached.py`'s summary line as of this pass:
 module-level public functions with no reference in non-test code: 77
   of which 66 carry a recorded verdict -- 11 are still questions.
 ```
+
+## 2026-10-14: the tab era's leftovers (owner rule: Copilot never runs in a tab)
+
+The socket-only change left eleven rows with no non-test caller. Nine were tab-era code and
+were DELETED together with the tests that only exercised them: `transport_policy.py::choose`,
+`::needs_tab`, `::evolvable_fields` (the TAB-vs-SOCKET decision and its genome-knob guard),
+`relay_fleet.py::admits_another_tab`, `::ram_target_cap` (the tab budget and RAM autoscale),
+`::admission_is_due`, `::admit_interval_now`, `::note_admitted` (the fixed-gap send pacing that
+the token bucket replaced), and `token_provider.py::goal_wants_socket` (always True).
+
+Two rows are kept, as `deliberate`, because something real still uses them:
+
+| row | verdict | why it stays |
+|---|---|---|
+| `profile_token.py::save_template` | deliberate | the only WRITER of the request-template cache that `load_template` reads; `tests/test_profile_token.py` and `relay/test_no_goal_path_opens_a_tab.py` build their fixtures through it, and a capture never sends a turn any more, so a future template-seeding tool belongs here rather than in a second writer |
+| `bridge/validity_audit.py::wait_async_idle` | deliberate | the synchronisation point for the async audit writer; `relay/test_sweep_hot_path.py` drains the queue through it before reading the log |

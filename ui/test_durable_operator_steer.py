@@ -1,6 +1,8 @@
 from pathlib import Path
 
-SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8-sig")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SOURCE = cockpit_source.read(encoding="utf-8-sig")
 
 
 def _method(start, end):

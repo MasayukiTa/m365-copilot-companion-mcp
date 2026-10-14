@@ -177,30 +177,13 @@ class _BlockingDrv:
         return self.responses[min(len(self.sent) - 1, len(self.responses) - 1)]
 
 
-def test_blocking_refuter_uses_the_same_reactive_unlock_contract(monkeypatch):
-    import relay.relay_fleet as RF
-    import relay.copilot_autopilot_relay as CAR
-    monkeypatch.setattr(RF, "_unlock_password", lambda: "x-test-x")
-    monkeypatch.setattr(RF, "MAX_UNLOCK_ATTEMPTS", 4)
-    _BlockingDrv.instances.clear()
-    monkeypatch.setattr(CAR, "CopilotWebDriver", _BlockingDrv)
-    got = R.run_refuter(_Ctx(), "https://agent/impl/conversation/abc", "goal", "DONE",
-                        timeout_s=30, max_nudges=0)
-    assert got == ("UPHELD", "")
-    drv = _BlockingDrv.instances[-1]
-    assert len(drv.sent) == 2
-    assert "x-test-x" in drv.sent[1]
-    assert "独立レビュー" in drv.sent[1]
+def test_the_blocking_refuter_opens_no_page_and_reports_a_harness_fault(monkeypatch):
+    """The page-based reviewer is gone (Copilot never runs in a browser tab): run_refuter ends
+    UNCLEAR with a harness reason and never asks the context for a page."""
+    class _NoPage:
+        def new_page(self):
+            raise AssertionError("opened a page")
 
-
-def test_blocking_refuter_without_local_recovery_material_is_not_upheld(monkeypatch):
-    import relay.relay_fleet as RF
-    import relay.copilot_autopilot_relay as CAR
-    monkeypatch.setattr(RF, "_unlock_password", lambda: "")
-    _BlockingDrv.instances.clear()
-    monkeypatch.setattr(CAR, "CopilotWebDriver", _BlockingDrv)
-    got = R.run_refuter(_Ctx(), "https://agent/impl/conversation/abc", "goal", "DONE",
+    got = R.run_refuter(_NoPage(), "https://agent/impl/conversation/abc", "goal", "DONE",
                         timeout_s=30, max_nudges=2)
-    assert got[0] == "UNCLEAR"
-    assert got[1].startswith("harness: ")
-    assert len(_BlockingDrv.instances[-1].sent) == 1, "a harness lock failure is not a reviewer preamble to nudge"
+    assert got[0] == "UNCLEAR" and got[1].startswith("harness: ")

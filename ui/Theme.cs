@@ -72,6 +72,12 @@ static class Theme
     public static string Warning(bool d)       { return d ? "#F59E0B" : "#B45309"; }  // needs-attention
     public static string Danger(bool d)        { return d ? "#EF4444" : "#B91C1C"; }  // error
     public static string Info(bool d)          { return d ? "#60A5FA" : "#2563EB"; }  // running / reviewing
+    // HEALTH-STRIP DOTS ONLY. Warning (orange / brown) and Danger (red) sat one hue step apart, so a
+    // 8 px "yellow" dot read as a dim red one. These two are pushed apart on hue AND lightness:
+    // a saturated pure red against a bright yellow-amber, in both themes. The dot also changes
+    // SHAPE (see ApplyHealthToUi), so the difference survives colour-blindness and a screenshot.
+    public static string HealthRed(bool d)     { return d ? "#FF2D2D" : "#D80000"; }
+    public static string HealthAmber(bool d)   { return d ? "#FFD60A" : "#F2B600"; }
 
     // ── fills that carry white text ──────────────────────────────────────────────
     // A FILL IS NOT A MARK, AND THE DARK THEME IS WHERE THAT STOPS BEING PEDANTRY. Accent and

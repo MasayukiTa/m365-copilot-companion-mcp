@@ -27,8 +27,10 @@ import io
 import os
 import re
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 SOURCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "FleetCockpit.cs")
-SOURCE = io.open(SOURCE_PATH, encoding="utf-8", errors="replace").read()
+SOURCE = cockpit_source.read(encoding="utf-8", errors="replace")
 
 
 def _body(start, end):
