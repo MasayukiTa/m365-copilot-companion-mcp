@@ -899,7 +899,8 @@ jobs:
             bridge/test_bridge_unlock_budget_per_conversation.py \
             relay/test_workspace_clone_retention.py \
             scripts/test_bootstrap_pip_tls.py \
-            tests/test_reload_main_leaves_a_restore_behind.py
+            tests/test_reload_main_leaves_a_restore_behind.py \
+            tools/test_reldisc.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
