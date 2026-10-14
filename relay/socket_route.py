@@ -357,8 +357,14 @@ class SocketRoute:
             return self._refresh_locked(context, agent_url, key)
 
     def _refresh_locked(self, context, agent_url, key) -> bool:
+        # A SYNCHRONOUS CAPTURE HOLDS THE CALLER'S THREAD (the fleet sweep, for the research and
+        # refuter side agents) for as long as the page takes, and the stall watchdog reads that
+        # silence as a wedged Edge. Declared here -- the one place every synchronous capture
+        # passes through -- so no caller has to remember to.
+        from relay import blocking_calls
         try:
-            token, template = self._capture_fn(context, agent_url)
+            with blocking_calls.blocking("token_capture", blocking_calls.SYNC_CAPTURE_CEILING_S):
+                token, template = self._capture_fn(context, agent_url)
         except Exception as exc:
             self.note_failure("capture failed for %s: %s: %s"
                               % (key[:40] or "(default)", type(exc).__name__, str(exc)[:140]))

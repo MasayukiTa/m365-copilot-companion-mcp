@@ -613,14 +613,19 @@ class RefuterSession:
             if self.context is None or not self.base_url:
                 self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "no browser context or no agent url: the session was constructed without a target"))
                 return
-            self.page = self.context.new_page()
-            self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
             appeared = False
-            for _ in range(40):
-                self.page.wait_for_timeout(1000)
-                if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
-                    appeared = True
-                    break
+            # DECLARED: this opens and drives a page on the sweep thread for up to ~85s with
+            # status.json frozen, which the stall watchdog reads as a wedged Edge
+            # (relay/blocking_calls.py). The entry expires on its own ceiling.
+            from relay import blocking_calls
+            with blocking_calls.blocking("side_page_open", 150):
+                self.page = self.context.new_page()
+                self.page.goto(self.base_url, wait_until="domcontentloaded", timeout=45000)
+                for _ in range(40):
+                    self.page.wait_for_timeout(1000)
+                    if self.page.locator(COPILOT_SELECTORS["composer"]).count() > 0:
+                        appeared = True
+                        break
             if not appeared:
                 self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "the composer never rendered within 40s of loading the agent page"))
                 return

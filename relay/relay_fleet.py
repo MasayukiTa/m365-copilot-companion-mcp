@@ -340,7 +340,7 @@ def note_admitted(now=None):
 # on top of it: the rate used is min(SOCKET_SEND_RPM, ceiling). After a throttle the rate drops
 # by ADMIT_THROTTLED_FACTOR and the burst to one for ADMIT_THROTTLE_MEMORY_S, the same widening
 # the old gap had. The measured trailing-minute check (rate_headroom_ok) still applies.
-SOCKET_SEND_RPM = float(os.environ.get("MCP_SOCKET_SEND_RPM", "30") or 30)
+SOCKET_SEND_RPM = float(os.environ.get("MCP_SOCKET_SEND_RPM", "100") or 100)   # still min() with rate_ceiling_rpm
 SOCKET_SEND_BURST = float(os.environ.get("MCP_SOCKET_SEND_BURST", "8") or 8)
 
 from relay.send_bucket import TokenBucket as _TokenBucket     # noqa: E402
@@ -2457,6 +2457,21 @@ def _socket_route():
     return _SOCKET_ROUTE
 
 
+def capture_inflight():
+    """Token-capture helper processes running right now (0 when there is no route or manager).
+
+    Read-only and lock-free on purpose: the stall watchdog calls this from its own thread while
+    the sweep thread may hold the route lock, and an answer that waits on the thing being
+    judged is no answer."""
+    try:
+        manager = getattr(_SOCKET_ROUTE, "_async_capture_manager", None)
+        if manager is None:
+            return 0
+        return int(manager.stats().get("inflight") or 0)
+    except Exception:
+        return 0
+
+
 _REOPEN_POLICY = None
 
 
@@ -3153,6 +3168,21 @@ def _maybe_lean(page):
 
 
 def _open_fresh(context, url):
+    """Open a NEW tab on a fresh chat of the agent -- DECLARED AS A BLOCKING CALL.
+
+    This holds the calling thread (the fleet sweep, from attach and the fresh replay) for up to
+    ~210s, longer behind a sign-in page, with status.json frozen the whole time. The stall
+    watchdog cannot tell that from a wedged Edge, and on 2026-10-14 it killed the browser under
+    this very call. The declaration lives HERE, in the one function every tab open goes through,
+    rather than at each call site: attach() and the fresh replay never declared it, only the
+    mid-run fallback did. relay/blocking_calls.py has the register; its entry expires on its own
+    ceiling, so a real wedge inside this call is still recovered."""
+    from relay import blocking_calls
+    with blocking_calls.blocking("tab_open", blocking_calls.TAB_OPEN_CEILING_S):
+        return _open_fresh_unguarded(context, url)
+
+
+def _open_fresh_unguarded(context, url):
     """Open a NEW tab on a fresh chat of the agent. Tolerant of slow navigation
     (a busy Edge can miss the 30s domcontentloaded) -- we proceed and wait for the
     composer to render either way. If a sign-in page appears, the background Edge is
@@ -5586,18 +5616,22 @@ class RelayWorker:
             if url:
                 from .edge_recover import looks_like_login
                 np = None
+                from relay import blocking_calls as _bc
                 try:
-                    np = pg.context.new_page()
-                    np.goto(url, wait_until="domcontentloaded", timeout=45000)
-                    np.wait_for_timeout(6000)
-                    if not looks_like_login(np.url or ""):
-                        res = fix_all_stale_connections(np)
-                        if res.get("submitted", 0) > 0 or not res.get("stale_left", True):
-                            try:
-                                pg.bring_to_front()
-                            except Exception:
-                                pass
-                            return True
+                    # A second tab opened and driven on the sweep thread: declared for the
+                    # same reason _open_fresh is (45s goto + 6s wait + the fix-all clicks).
+                    with _bc.blocking("consent_tab", 150):
+                        np = pg.context.new_page()
+                        np.goto(url, wait_until="domcontentloaded", timeout=45000)
+                        np.wait_for_timeout(6000)
+                        if not looks_like_login(np.url or ""):
+                            res = fix_all_stale_connections(np)
+                            if res.get("submitted", 0) > 0 or not res.get("stale_left", True):
+                                try:
+                                    pg.bring_to_front()
+                                except Exception:
+                                    pass
+                                return True
                     # cached URL 404'd / redirected to login -> fall through to Tier 2 (which
                     # refreshes the cache). Deliberately do NOT clear the cache here.
                 finally:
