@@ -379,3 +379,41 @@ def test_the_cockpit_draws_the_bar_from_the_view():
     m = re.search(r"UIElement BuildBudgetBar\(.*?\n    }\n", src, re.S)
     assert m and "GroupTreeView.BudgetBar(" in m.group(0)
     assert "BuildBudgetBar(w, " in src
+
+
+# -- the same bar for the other ledger dimensions (total / active / minutes), display only --------
+
+def _gba(root, g, idx, ja=True):
+    return dict(_c("group_bar_at", root=root, group=g, idx=idx, ja=ja))
+
+
+@pytestmark_nt
+def test_every_ledger_dimension_gets_a_bar_and_turns_is_unchanged(tmp_path):
+    g = _g(**NESTED)
+    lim = {"total": 24, "active": 3, "turns": 40, "wall_min": 120}
+    root = _tb(dict(USE, total=20, active=3, turns=12, wall_min=30), lim)
+    r = _run_cases(tmp_path, [_gba(root, g, 0), _gba(root, g, 1), _gba(root, g, 2),
+                              _gba(root, g, 3), _gba(root, g, 3, False), _gb(root, g)])
+    assert [x["text"] for x in r[:4]] == ["総数 20 / 24", "同時 3 / 3", "ターン 12 / 40", "分 30 / 120"]
+    assert r[4]["text"] == "min 30 / 120"
+    assert [x["level"] for x in r[:4]] == [1, 2, 0, 0]
+    assert r[2] == r[5]                       # idx 2 is exactly the existing turns bar
+
+
+@pytestmark_nt
+def test_a_dimension_bar_is_absent_without_a_cap_or_a_reading(tmp_path):
+    g = _g(**NESTED)
+    inner = _g(depth=1, root_id="cmp1", parent_group_id="cmp1")
+    nocap = {"total": 0, "active": 3, "turns": 40, "wall_min": 120}
+    r = _run_cases(tmp_path, [_gba(_tb(USE, nocap), g, 0), _gba(_tb({"turns": 4}), g, 1),
+                              _gba(_tb(USE), inner, 0), _gba(_tb(USE), g, 9), _gba(_tb(USE), g, -1)])
+    assert all(x["text"] is None for x in r)
+
+
+def test_the_cockpit_draws_every_bar_with_an_automation_id():
+    src = _cockpit()
+    m = re.search(r"UIElement BuildBudgetBarAt\(.*?\n    }\n", src, re.S)
+    assert m and "GroupTreeView.BudgetBarAt(" in m.group(0)
+    assert 'SetAutomationId(bar, "budgetBar_" + FanoutBudgetView.ReportKeys[idx])' in m.group(0)
+    assert 'SetAutomationId(bar, "budgetBar_turns")' in src
+    assert "BuildBudgetBarAt(w, moreIdx[mi])" in src

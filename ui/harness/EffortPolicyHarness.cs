@@ -83,6 +83,18 @@ static class EffortPolicyHarness
                     r["fraction"] = fr;
                     r["level"] = lv;
                 }
+                else if (op == "group_bar_at")
+                {
+                    int lv;
+                    double fr;
+                    object gobj, robj, iobj;
+                    c.TryGetValue("group", out gobj); c.TryGetValue("root", out robj);
+                    c.TryGetValue("idx", out iobj);
+                    r["text"] = GroupTreeView.BudgetBarAt(robj as Dictionary<string, object>,
+                        gobj as Dictionary<string, object>, Convert.ToInt32(iobj), Bool(c, "ja"), out fr, out lv);
+                    r["fraction"] = fr;
+                    r["level"] = lv;
+                }
                 else return 5;
                 results.Add(r);
             }
