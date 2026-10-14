@@ -169,10 +169,26 @@ partial class CockpitWindow
         try
         {
             SubmissionBaseline b = baseline ?? CaptureSubmissionBaseline();
-            foreach (string g in goals)
-                _submitted.AddLocal(SubmittedTasks.GoalTextOf(g), b.CapturedUnix,
-                                    b.Started, b.Workers, b.History);
-            Dispatcher.BeginInvoke(new Action(ForceRender));
+            var goalList = new List<string>();
+            foreach (string g in goals) goalList.Add(SubmittedTasks.GoalTextOf(g));
+            // Index the baseline ONCE for the whole batch (it used to be rebuilt per goal), and do
+            // it here, before touching _submitted, so a background caller pays for it off the UI thread.
+            var index = SubmittedTasks.BuildBaselineIndex(b.Started, b.Workers, b.History);
+            Action apply = delegate
+            {
+                foreach (string g in goalList)
+                    _submitted.AddLocal(g, b.CapturedUnix, index);
+                ForceRender();
+            };
+            // _submitted belongs to the UI thread. On it: add NOW (the row must be on top before
+            // any file is read back) and re-render next turn; elsewhere: hand the add over.
+            if (Dispatcher.CheckAccess())
+            {
+                foreach (string g in goalList)
+                    _submitted.AddLocal(g, b.CapturedUnix, index);
+                Dispatcher.BeginInvoke(new Action(ForceRender));
+            }
+            else Dispatcher.BeginInvoke(apply);
         }
         catch (Exception) { }
     }
@@ -417,6 +433,16 @@ partial class CockpitWindow
     // The bottom composer is the task intake surface in BOTH idle and live-run states.
     // During a live run, enqueue new work through the same lossless one-command-per-file channel
     // used by retry. Worker-specific steering remains available on each worker card.
+    // goal-set hash -> path of the add_goal command written for it (see TryAddGoalsToLiveFleet).
+    readonly Dictionary<string, string> _pendingAddCommands = new Dictionary<string, string>();
+
+    static string AddGoalSetKey(List<string> goals)
+    {
+        var parts = new List<string>();
+        foreach (string g in goals) parts.Add(GoalKey(g));
+        return string.Join("|", parts.ToArray());
+    }
+
     void TryAddGoalsToLiveFleet()
     {
         if (_goalInput == null) return;
@@ -434,6 +460,25 @@ partial class CockpitWindow
                 ? "LOCAL_LOOP の内部制御文は通常Fleetへ追加できません。耐久タスクのカードから再開してください。"
                 : "LOCAL_LOOP control text cannot be added to ordinary Fleet. Resume the durable task card instead.";
             return;
+        }
+        // ONE UNCONSUMED COMMAND PER GOAL SET. A retry of the same text while its first command is
+        // still sitting in commands.d (the runner's drain lagged 30-190 s on 2026-10-14) used to
+        // write a SECOND command, and the runner admits identical text under a new command as a
+        // new task: 3 goals became 5 workers. The key is the goal-set hash; the first command's
+        // file existing on disk is the proof it has not been consumed yet.
+        string addKey = AddGoalSetKey(goals);
+        string pendingPath;
+        if (_pendingAddCommands.TryGetValue(addKey, out pendingPath))
+        {
+            if (!string.IsNullOrEmpty(pendingPath) && File.Exists(pendingPath))
+            {
+                _goalInput.Text = "";
+                if (_startNote != null)
+                    _startNote.Text = _lang == 0 ? "同じタスクは既にキューに入っています(処理待ち)。重複追加しません。"
+                                                  : "That task is already queued (waiting to be picked up); not adding a duplicate.";
+                return;
+            }
+            _pendingAddCommands.Remove(addKey);
         }
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
 
@@ -464,6 +509,7 @@ partial class CockpitWindow
             return;
         }
 
+        _pendingAddCommands[addKey] = commandPath;
         // Optimistic row first; the runner will replace it with a real worker on the next sweep.
         NoteSubmitted(goals, submitBaseline);
         WatchLiveAddHandoff(commandPath, ackPath);
@@ -518,6 +564,14 @@ partial class CockpitWindow
         var timer = new System.Windows.Threading.DispatcherTimer();
         timer.Interval = TimeSpan.FromMilliseconds(300);
         DateTime lastRescue = DateTime.MinValue;
+        // BOUNDED. This timer used to run until a receipt appeared and spawned a python process
+        // every 2 s whenever the status looked not-live (idle, or stale past 150 s -- which a slow
+        // drain produces), one process per pending command, forever. A losing rescuer only exits 3,
+        // but each costs a venv python start. At most 3 rescuers per command, 30 s apart, and the
+        // watch ends when the command file is gone (the runner claimed it: the runner, not this
+        // timer, owns it from then on) or after 15 minutes.
+        int rescueCount = 0;
+        DateTime watchStart = DateTime.UtcNow;
         timer.Tick += delegate
         {
             try
@@ -525,6 +579,8 @@ partial class CockpitWindow
                 string receiptError;
                 int receiptState = LiveAddReceiptState(ackPath, out receiptError);
                 if (receiptState > 0) { timer.Stop(); return; }
+                if ((DateTime.UtcNow - watchStart).TotalMinutes > 15.0) { timer.Stop(); return; }
+                if (receiptState == 0 && !File.Exists(commandPath)) return; // claimed; receipt follows
                 if (receiptState < 0)
                 {
                     timer.Stop();
@@ -535,8 +591,10 @@ partial class CockpitWindow
                 if (RunIsLive()) return;
                 // Retry, rather than fire once: a dying old coordinator may still own the OS
                 // lock for a moment. A losing rescuer exits 3 before touching commandPath.
-                if ((DateTime.UtcNow - lastRescue).TotalSeconds < 2.0) return;
+                if ((DateTime.UtcNow - lastRescue).TotalSeconds < 30.0) return;
+                if (rescueCount >= 3) return;
                 lastRescue = DateTime.UtcNow;
+                rescueCount++;
                 SpawnFleetAdoptCommand(commandPath);
                 if (_startNote != null)
                     _startNote.Text = _lang == 0
@@ -771,17 +829,22 @@ partial class CockpitWindow
     }
 
     bool SpawnFleet(List<string> goals, string goalsFileName, bool planMode = false,
-                    bool waitForClosingRun = false, string submittedText = null)
+                    bool waitForClosingRun = false, string submittedText = null,
+                    SubmissionBaseline preBaseline = null)
     {
         foreach (string rawGoal in (goals ?? new List<string>()))
         {
             if (!IsLocalLoopControlGoal(SubmittedTasks.GoalTextOf(rawGoal))) continue;
-            if (_startNote != null) _startNote.Text = _lang == 0
+            string loopNote = _lang == 0
                 ? "LOCAL_LOOP の内部制御文は通常Fleetとして起動できません。耐久タスクのカードから再開してください。"
                 : "LOCAL_LOOP control text cannot start ordinary Fleet work. Resume the durable task card instead.";
+            // May run on a worker thread (bulk retry): _startNote belongs to the UI thread.
+            Dispatcher.BeginInvoke(new Action(delegate { if (_startNote != null) _startNote.Text = loopNote; }));
             return false;
         }
-        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        // A caller that already captured the baseline on the UI thread (so this body can run
+        // off it) passes it in; the snapshot must still predate the handoff below.
+        SubmissionBaseline submitBaseline = preBaseline ?? CaptureSubmissionBaseline();
         string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
         string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
         if (!File.Exists(py)) py = "python";

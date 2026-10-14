@@ -732,7 +732,8 @@ partial class CockpitWindow
     // skipped count is what stops the re-pressing, and matters just as much: a skip nobody
     // can see is indistinguishable from a button that did not work, which is the behaviour
     // that produced the pile in the first place.
-    int RetryAllShown(List<Dictionary<string, object>> shown, out int skippedAtCap)
+    int RetryAllShown(List<Dictionary<string, object>> shown, out int skippedAtCap,
+                      Action<bool, string> done = null)
     {
         skippedAtCap = 0;
         bool live = RunIsLive();
@@ -764,16 +765,43 @@ partial class CockpitWindow
             n++;
         }
         if (n == 0) return 0;
-        if (live)
+        // The baseline is sampled HERE, on the calling (UI) thread, before the handoff: it reads
+        // UI-owned state (_history) and must predate the command/process the delivery creates.
+        SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
+        Action deliver = delegate
         {
-            SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
-            SendCommand(Cmd1("add_goal", adds));
-            NoteSubmitted(goalTexts, submitBaseline);
-        }
-        else if (goalTexts.Count > 0)
+            if (live)
+            {
+                SendCommand(Cmd1("add_goal", adds));
+                NoteSubmitted(goalTexts, submitBaseline);
+            }
+            else if (goalTexts.Count > 0)
+            {
+                SpawnFleet(goalTexts, "retry_input.txt", false, false, null, submitBaseline);
+            }
+        };
+        if (done == null)
         {
-            try { SpawnFleet(goalTexts, "retry_input.txt"); _lastSig = ""; } catch (Exception) { }
+            // Synchronous form (kept for callers that need the result inline).
+            try { deliver(); if (!live) _lastSig = ""; } catch (Exception) { }
+            return n;
         }
+        // Everything below is blocking work: command-file IO with a 2 s rename retry, the goals
+        // file write, Process.Start of the runner, and one index over every worker + history row.
+        // On the UI thread that froze the window with no feedback for as long as it took (about
+        // 85 s on a loaded machine with a few hundred rows). It runs on the thread pool; the
+        // outcome comes back through `done` on the UI thread.
+        System.Threading.ThreadPool.QueueUserWorkItem(delegate
+        {
+            string err = null;
+            try { deliver(); }
+            catch (Exception ex) { err = ex.Message; }
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (err == null && !live) _lastSig = "";
+                done(err == null, err);
+            }));
+        });
         return n;
     }
 

@@ -99,9 +99,13 @@ partial class CockpitWindow
             // No live fleet to consume the stop (status went stale, e.g. a run was killed and its
             // last status froze with workers still shown as "running") -> clear every card NOW so the
             // button is never a no-op. Mirrors the per-card release stale path (search ArchiveAndHide).
+            // The age test alone also matches a wedged-but-alive runner, whose unfinished workers
+            // would be hidden and whose sidecars would be finalized under it. Require the runner
+            // PROCESS to be gone; a live one consumes the stop command above when it recovers.
             if (_lastRoot != null
                 && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
-                && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+                && (NowUnix() - Dbl(_lastRoot, "updated")) > 8
+                && !RunnerProcessAlive())
             {
                 ArchiveAllStale();
                 // ArchiveAllStale only edits the LOCAL _history/_hiddenKeys lists (history.json /

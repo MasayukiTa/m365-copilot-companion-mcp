@@ -207,19 +207,49 @@ partial class CockpitWindow
             List<Dictionary<string, object>> shownCap = shown;
             retryAll.Click += delegate
             {
+                // Immediate, visible acknowledgement: the button is disabled and relabelled before
+                // anything else runs, so a second press cannot queue the same goals twice and the
+                // press never looks like a no-op. The delivery itself runs off the UI thread
+                // (RetryAllShown with a completion callback); the outcome replaces the label.
+                if (!retryAll.IsEnabled) return;
+                string idleLabel = T("retry_all");
+                retryAll.IsEnabled = false;
+                retryAll.Content = _lang == 0 ? "再開中…" : "Resuming…";
+                if (_toolbarNote != null) _toolbarNote.Text = _lang == 0 ? "再開を依頼しています…" : "Requesting resume…";
+                bool wasLive = RunIsLive();
                 int skipped;
-                int queued = RetryAllShown(shownCap, out skipped);
-                if (_toolbarNote != null)
+                var queuedBox = new int[1];   // the callback runs later, after queued is known
+                int queued = RetryAllShown(shownCap, out skipped, delegate (bool ok, string err)
                 {
-                    string note = RunIsLive() ? "" : T("retry_note");
-                    if (skipped > 0)
+                    retryAll.Content = idleLabel;
+                    retryAll.IsEnabled = true;
+                    if (_toolbarNote == null) return;
+                    if (!ok)
                     {
-                        // Say how many of the shown targets were refused and why. Without this
-                        // the press looks like a no-op and gets repeated.
-                        string cap = skipped + "/" + (queued + skipped) + " " + T("retry_capped");
-                        note = string.IsNullOrEmpty(note) ? cap : cap + " — " + note;
+                        _toolbarNote.Text = (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + err;
+                        return;
                     }
-                    _toolbarNote.Text = note;
+                    _toolbarNote.Text = (_lang == 0 ? "再開を依頼しました（" + queuedBox[0] + " 件）"
+                                                    : "Resume requested")
+                                        + (wasLive ? "" : " — " + T("retry_note"));
+                });
+                queuedBox[0] = queued;
+                if (queued == 0)
+                {
+                    // Nothing to deliver, so no callback will come: say so and release the button.
+                    retryAll.Content = idleLabel;
+                    retryAll.IsEnabled = true;
+                    if (_toolbarNote != null)
+                        _toolbarNote.Text = skipped > 0
+                            ? skipped + "/" + skipped + " " + T("retry_capped")
+                            : (_lang == 0 ? "再開できる停止タスクはありません" : "Nothing to resume");
+                    return;
+                }
+                if (skipped > 0 && _toolbarNote != null)
+                {
+                    // Say how many of the shown targets were refused and why. Without this
+                    // the press looks like a no-op and gets repeated.
+                    _toolbarNote.Text = skipped + "/" + (queued + skipped) + " " + T("retry_capped");
                 }
             };
             rightCl.Children.Add(retryAll);

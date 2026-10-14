@@ -26,6 +26,104 @@ using System.Runtime.CompilerServices;
 partial class CockpitWindow
 {
 
+    // ---- stale/health verdict (liveness from the runner process, not status.json age) ----
+    // Runner identity = fleet_run_active.json pid + pid_birth (process create time, ms since epoch,
+    // written by relay/fleet_runner.py _pid_birth_token). Alive = the pid exists AND its start time
+    // matches pid_birth (a recycled pid has a different start time). state: 1 alive, 0 dead,
+    // -1 cannot tell. Cached 3 s together with the newest top-level state-dir file write time.
+    DateTime _rlAt = DateTime.MinValue; int _rlState = -1; double _rlActivityAge = -1;
+    void RunnerLiveness(out int state, out double activityAgeS)
+    {
+        if ((DateTime.UtcNow - _rlAt).TotalSeconds < 3.0) { state = _rlState; activityAgeS = _rlActivityAge; return; }
+        int st = -1; double act = -1;
+        try
+        {
+            string dir = Path.GetDirectoryName(ResolvePath(null));
+            string marker = Path.Combine(dir, "fleet_run_active.json");
+            if (File.Exists(marker))
+            {
+                var m = _js.DeserializeObject(File.ReadAllText(marker, Encoding.UTF8)) as Dictionary<string, object>;
+                object pidObj;
+                if (m != null && m.TryGetValue("pid", out pidObj) && pidObj != null)
+                {
+                    int pid = Convert.ToInt32(pidObj);
+                    long birth = 0; object bo;
+                    if (m.TryGetValue("pid_birth", out bo) && bo != null) birth = Convert.ToInt64(bo);
+                    try
+                    {
+                        var proc = System.Diagnostics.Process.GetProcessById(pid);
+                        st = 1;
+                        if (birth > 0)
+                        {
+                            long cur = (long)(proc.StartTime.ToUniversalTime()
+                                       - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                            if (Math.Abs(cur - birth) > 3000) st = 0;   // pid recycled by another process
+                        }
+                    }
+                    catch (ArgumentException) { st = 0; }
+                    catch (Exception) { st = -1; }
+                }
+            }
+            DateTime newest = DateTime.MinValue;
+            foreach (string f in Directory.GetFiles(dir))
+            {
+                DateTime t = File.GetLastWriteTimeUtc(f);
+                if (t > newest) newest = t;
+            }
+            if (newest > DateTime.MinValue) act = (DateTime.UtcNow - newest).TotalSeconds;
+        }
+        catch (Exception) { }
+        _rlAt = DateTime.UtcNow; _rlState = st; _rlActivityAge = act;
+        state = st; activityAgeS = act;
+    }
+
+    // kind: "" (show nothing) or a Pill style. The text names the runner's real state.
+    void StaleVerdict(Dictionary<string, object> root, bool running, double updated,
+                      out string kind, out string text)
+    {
+        const double STALE_SOFT = 45.0;
+        const double STALE_HARD = 90.0;
+        kind = ""; text = "";
+        if (!running || updated <= 0) return;
+        double age = NowUnix() - updated;
+        if (age <= STALE_SOFT) return;
+        bool ja = _lang == 0;
+        int st; double act;
+        RunnerLiveness(out st, out act);
+        if (st == 0)
+        {
+            kind = "danger";
+            text = ja ? "ランナーのプロセスが存在しません（停止）" : "runner process is gone (stopped)";
+            return;
+        }
+        if (st == 1)
+        {
+            // Alive: say what the sweep is waiting for when workers carry a reason.
+            var counts = new Dictionary<string, int>();
+            object wo;
+            if (root.TryGetValue("workers", out wo) && wo is object[])
+                foreach (object ow in (object[])wo)
+                {
+                    var w = ow as Dictionary<string, object>;
+                    if (w == null || IsTerminalWorker(w)) continue;
+                    string r = S(w, "reason");
+                    if (string.IsNullOrEmpty(r)) continue;
+                    int c; counts.TryGetValue(r, out c); counts[r] = c + 1;
+                }
+            string top = ""; int best = 0;
+            foreach (var kv in counts) if (kv.Value > best) { best = kv.Value; top = kv.Key; }
+            if (top.Length > 70) top = top.Substring(0, 70) + "…";
+            string tail = top != "" ? ": " + top : "";
+            kind = (age > STALE_HARD && act > STALE_HARD) ? "warning" : "info";
+            text = ja ? "ランナー稼働中・スイープ処理中 " + (int)age + "秒" + tail
+                      : "runner alive, sweep busy " + (int)age + "s" + tail;
+            return;
+        }
+        // Process state unknown: old wording, but recent file activity vetoes the hard claim.
+        if (age > STALE_HARD && !(act >= 0 && act < STALE_HARD)) { kind = "danger"; text = T("stale"); }
+        else { kind = "warning"; text = T("stale_wait"); }
+    }
+
     void UpdateHeader(Dictionary<string, object> root)
     {
         int total = I(root, "total");
@@ -41,7 +139,13 @@ partial class CockpitWindow
         _header.Text = "Fleet";
 
         // Compute running/queued/done counts from the workers array.
-        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0;
+        // TRUTHFUL PER-STATE COUNTS. `else cntRunning++` used to lump every non-terminal,
+        // non-pending worker into "running": a run with 3 streaming (waiting) and 62 ready
+        // workers read "65 running" although max_concurrent was 2. A worker is RUNNING only while
+        // a turn is actually in flight (STATUS_PILL "実行中"/検証中/反証中/外部調査中/新規会話);
+        // `ready` (準備: tab prepared, waiting for a concurrency slot) and approval gates are
+        // counted on their own, and `pending` stays the queue.
+        int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0, cntReady = 0, cntGate = 0;
         object wo2;
         if (root.TryGetValue("workers", out wo2) && wo2 is object[])
         {
@@ -53,6 +157,8 @@ partial class CockpitWindow
                 if (IsTerminalWorker(ww)) cntDoneW++;
                 else if (IsInterruptedWorker(ww)) cntIntr++;   // not running, not done, not a failure
                 else if (wst == "pending") cntQueued++;
+                else if (wst == "ready") cntReady++;
+                else if (wst == "awaiting" || wst == "awaiting_gate") cntGate++;
                 else cntRunning++;
             }
         }
@@ -96,8 +202,24 @@ partial class CockpitWindow
         else
         {
             triple = ja2
-                ? (cntRunning + " 実行中 · " + cntQueued + " 待機 · " + cntDoneW + " 完了")
-                : (cntRunning + " running · " + cntQueued + " queued · " + cntDoneW + " done");
+                ? (cntRunning + " 実行中 · " + cntReady + " 準備"
+                   + (cntGate > 0 ? " · " + cntGate + " 承認待ち" : "")
+                   + " · " + cntQueued + " 待機列 · " + cntDoneW + " 完了")
+                : (cntRunning + " running · " + cntReady + " ready"
+                   + (cntGate > 0 ? " · " + cntGate + " awaiting approval" : "")
+                   + " · " + cntQueued + " queued · " + cntDoneW + " done");
+        }
+        // WHY the rest is not running, when the run says so itself (status.json max_concurrent).
+        string waitReason = "";
+        if (running && (cntReady > 0 || cntQueued > 0) && root.ContainsKey("max_concurrent"))
+        {
+            int mc = (int)Dbl(root, "max_concurrent");
+            if (mc > 0 && cntRunning >= mc)
+                waitReason = ja2 ? ("同時実行の上限 " + mc + " に達しているため、残りは順番待ちです")
+                                 : ("Concurrency limit " + mc + " reached; the rest wait for a free slot");
+            else if (mc > 0)
+                waitReason = ja2 ? ("同時実行の上限 " + mc + "（空き枠を待っている、または枠を確保中）")
+                                 : ("Concurrency limit " + mc + " (waiting for a free slot)");
         }
 
         // Live ETA: project remaining work from the throughput observed SO FAR (done/elapsed).
@@ -119,16 +241,12 @@ partial class CockpitWindow
         }
 
         // Two-stage stale indicator: soft (45 s) shows a calm wait hint; hard (90 s) shows a stop warning.
-        const double STALE_SOFT = 45.0;
-        const double STALE_HARD = 90.0;
-        if (running && updated > 0)
-        {
-            double staleAge = NowUnix() - updated;
-            if (staleAge > STALE_HARD)
-                triple = triple + " — " + T("stale");
-            else if (staleAge > STALE_SOFT)
-                triple = triple + " — " + T("stale_wait");
-        }
+        // Derived from the runner PROCESS (pid + start time) and real file activity, not from
+        // status.json's `updated` alone: a busy sweep legitimately goes >90 s silent.
+        string staleKind, staleText;
+        StaleVerdict(root, running, updated, out staleKind, out staleText);
+        if (staleKind != "")
+            triple = triple + " — " + staleText;
 
         // TASK 4: evidence freshness — "· evidence {N}s/m ago" from top-level `updated` field [COMPUTED].
         // Omit entirely if updated is missing (zero) — never show "unknown".
@@ -170,18 +288,19 @@ partial class CockpitWindow
             }
             else
             {
-                _subChips.Children.Add(ChipMargin(Pill(cntRunning + " " + (ja2 ? "実行中" : "running"), "info")));
-                _subChips.Children.Add(ChipMargin(Pill(cntQueued + " " + (ja2 ? "待機" : "queued"), "neutral")));
+                var runChip = Pill(cntRunning + " " + (ja2 ? "実行中" : "running"), "info");
+                var readyChip = Pill(cntReady + " " + (ja2 ? "準備" : "ready"), "neutral");
+                var queueChip = Pill(cntQueued + " " + (ja2 ? "待機列" : "queued"), "neutral");
+                if (waitReason.Length > 0) { readyChip.ToolTip = waitReason; queueChip.ToolTip = waitReason; }
+                _subChips.Children.Add(ChipMargin(runChip));
+                _subChips.Children.Add(ChipMargin(readyChip));
+                if (cntGate > 0)
+                    _subChips.Children.Add(ChipMargin(Pill(cntGate + " " + (ja2 ? "承認待ち" : "awaiting approval"), "warning")));
+                _subChips.Children.Add(ChipMargin(queueChip));
                 _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
             }
-            if (running && updated > 0)
-            {
-                double staleAge2 = NowUnix() - updated;
-                if (staleAge2 > STALE_HARD)
-                    _subChips.Children.Add(ChipMargin(Pill(T("stale"), "danger")));
-                else if (staleAge2 > STALE_SOFT)
-                    _subChips.Children.Add(ChipMargin(Pill(T("stale_wait"), "warning")));
-            }
+            if (staleKind != "")
+                _subChips.Children.Add(ChipMargin(Pill(staleText, staleKind)));
             // NOT CHIPS. A chip in this app means a state something is IN -- running, done,
             // needs attention -- and these three are clocks. Drawn in the same outlined pill as
             // the counts they were indistinguishable from them, so "0 needs attention" and

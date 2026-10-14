@@ -56,7 +56,7 @@ partial class CockpitWindow
         if (k == "folder") return ja ? "自律コーディング (フォルダ)" : "Autonomous coding (folder)";
         // Feature B: view-filter toolbar (4-tab spec)
         if (k == "flt_all") return ja ? "すべて" : "All";
-        if (k == "flt_active") return ja ? "実行中" : "Active";
+        if (k == "flt_active") return ja ? "進行中" : "In progress";   // ready + running: NOT only "running"
         if (k == "flt_needs") return ja ? "承認待ち" : "Needs input";
         if (k == "flt_done") return ja ? "完了" : "Done";
         if (k == "flt_intr") return ja ? "中断" : "Interrupted";
@@ -101,6 +101,8 @@ partial class CockpitWindow
         if (k == "hs_unknown") return ja ? "未設定/不明" : "unknown";
         if (k == "hs_checking") return ja ? "確認中…" : "checking…";
         if (k == "hs_lastcheck") return ja ? "最終確認: " : "last check: ";
+        if (k == "hs_level_red") return ja ? "【赤：故障】" : "[RED: broken]";
+        if (k == "hs_level_yellow") return ja ? "【黄：注意・未確認】" : "[YELLOW: caution / unverified]";
         if (k == "hs_never") return ja ? "未確認" : "not checked yet";
         if (k == "hs_srv_detail_ok") return ja ? "ローカルサーバは応答しています (127.0.0.1:8000)" : "Local server responding (127.0.0.1:8000)";
         if (k == "hs_srv_detail_bad") return ja ? "ローカルサーバが応答しません。start_all.bat を実行してください。" : "Local server not responding. Run start_all.bat.";

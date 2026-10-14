@@ -137,7 +137,8 @@ partial class CockpitWindow
             SetDot(3, live ? HealthState.Yellow : HealthState.Gray,
                    T(live ? "hs_signin_old_ok" : "hs_signin_gray_old"), now);
         else if (live)
-            SetDot(3, HealthState.Yellow, T("hs_signin_stale"), now);
+            // RED, not amber: an expired token while a run is live means the run cannot send.
+            SetDot(3, HealthState.Red, T("hs_signin_stale"), now);
         else
             SetDot(3, HealthState.Gray, T("hs_signin_gray_expired"), now);
 
@@ -436,7 +437,7 @@ partial class CockpitWindow
             else if (ok && fleetFailing)
                 // The bridge can call tools and the fleet cannot. Green here would hide the
                 // failure of the path that does the work.
-                SetDot(5, HealthState.Yellow, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
+                SetDot(5, HealthState.Red, ageTxt + " " + T("hs_tool_detail_fleet_down"), now);
             else if (ToolProbeReportedOff())
                 // SWITCHED OFF IN THE SETTINGS (or by the environment): nothing is measured, so
                 // nothing is claimed. Not green (no event behind it) and not red (nothing broke):

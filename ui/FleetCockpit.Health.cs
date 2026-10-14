@@ -267,8 +267,8 @@ partial class CockpitWindow
     Brush HealthBrush(HealthState s)
     {
         if (s == HealthState.Green) return Theme.Br(Theme.Success(_dark));
-        if (s == HealthState.Red) return Theme.Br(Theme.Danger(_dark));
-        if (s == HealthState.Yellow) return Theme.Br(Theme.Warning(_dark));
+        if (s == HealthState.Red) return Theme.Br(Theme.HealthRed(_dark));
+        if (s == HealthState.Yellow) return Theme.Br(Theme.HealthAmber(_dark));
         if (s == HealthState.Checking) return Theme.Br(Theme.Warning(_dark));
         return Theme.Br(Theme.Muted(_dark));   // gray / unknown
     }
@@ -294,6 +294,12 @@ partial class CockpitWindow
             if (_healthDot[i] != null)
             {
                 _healthDot[i].Background = HealthBrush(snap[i].State);
+                // Red = solid circle, yellow = smaller rounded square: distinct by shape as well as
+                // by colour (the 10x10 mark grid fits both).
+                bool isRed = snap[i].State == HealthState.Red;
+                bool isAmber = snap[i].State == HealthState.Yellow;
+                _healthDot[i].Width = _healthDot[i].Height = isRed ? 10 : 8;
+                _healthDot[i].CornerRadius = new CornerRadius(isAmber ? 2 : (isRed ? 5 : 4));
                 _healthDot[i].Visibility = checking ? Visibility.Collapsed : Visibility.Visible;
             }
             if (_healthSpin != null && _healthSpin[i] != null)
@@ -306,7 +312,9 @@ partial class CockpitWindow
                     ? T("hs_never")
                     : snap[i].Checked.ToLocalTime().ToString("HH:mm:ss");
                 string detail = string.IsNullOrEmpty(snap[i].Detail) ? T("hs_checking") : snap[i].Detail;
-                _healthDotWrap[i].ToolTip = T(_healthKeys[i]) + ": " + detail + "\n"
+                string level = snap[i].State == HealthState.Red ? T("hs_level_red") + " "
+                             : snap[i].State == HealthState.Yellow ? T("hs_level_yellow") + " " : "";
+                _healthDotWrap[i].ToolTip = level + T(_healthKeys[i]) + ": " + detail + "\n"
                     + T("hs_lastcheck") + when;
             }
         }
@@ -549,7 +557,7 @@ partial class CockpitWindow
                 SetDot(0, HealthState.Red, T("hs_srv_detail_bad"), now);
         }
         else if (authStorm)
-            SetDot(0, HealthState.Yellow,
+            SetDot(0, HealthState.Red,
                    T("hs_srv_detail_auth") + " (" + authFails + ")", now);
         else if (codeState == "stale" && StaleLongEnoughToMatter(srvBody))
             SetDot(0, HealthState.Yellow,
@@ -888,6 +896,53 @@ partial class CockpitWindow
             catch (ArgumentException) { return true; }
         }
         catch (Exception) { return false; }   // cannot tell -> assume a run exists
+    }
+
+    // Is the runner PROCESS named by fleet_run_active.json still the same live process? This is
+    // the liveness test for anything destructive. status.json's `updated` age is NOT: a runner
+    // that is wedged or slow (long eval, overloaded machine) stops refreshing it while still
+    // owning every unfinished worker. Mirrors relay/fleet_runner.marker_owner_alive: pid must
+    // exist AND, when the marker carries pid_birth (process create time, ms since epoch), the
+    // process start time must match, so a recycled pid is not mistaken for the runner.
+    // Missing marker or a pid that is gone -> false. Anything unreadable/unprovable -> true
+    // (an unknown state must never authorise discarding work).
+    bool RunnerProcessAlive()
+    {
+        try
+        {
+            string marker = Path.Combine(Path.GetDirectoryName(ResolvePath(null)),
+                                         "fleet_run_active.json");
+            if (!File.Exists(marker)) return false;
+            var m = _js.DeserializeObject(File.ReadAllText(marker, Encoding.UTF8))
+                    as Dictionary<string, object>;
+            object pidObj;
+            if (m == null || !m.TryGetValue("pid", out pidObj) || pidObj == null) return true;
+            int pid = Convert.ToInt32(pidObj);
+            if (pid <= 0) return false;
+            System.Diagnostics.Process p;
+            try { p = System.Diagnostics.Process.GetProcessById(pid); }
+            catch (ArgumentException) { return false; }
+            using (p)
+            {
+                try { if (p.HasExited) return false; } catch (Exception) { return true; }
+                long recorded = 0;
+                object birthObj;
+                if (m.TryGetValue("pid_birth", out birthObj) && birthObj != null)
+                {
+                    try { recorded = Convert.ToInt64(birthObj); } catch (Exception) { recorded = 0; }
+                }
+                if (recorded <= 0) return true;                       // old marker: pid is all we have
+                long actual;
+                try
+                {
+                    actual = (long)(p.StartTime.ToUniversalTime()
+                                    - new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)).TotalMilliseconds;
+                }
+                catch (Exception) { return true; }                    // cannot read start time -> cannot disprove
+                return Math.Abs(actual - recorded) <= 5000;           // psutil vs .NET clocks differ by < 1 s
+            }
+        }
+        catch (Exception) { return true; }
     }
 
     bool FleetRunIsLive()

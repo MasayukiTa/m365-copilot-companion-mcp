@@ -57,4 +57,5 @@ def test_fleet_tool_failure_can_still_warn_even_if_bridge_probe_is_green():
     block = _between('void PollToolProbeOnce(DateTime now)', 'string AgeMinutesText(')
     assert 'ok && fleetFailing' in block
     i = block.index('ok && fleetFailing')
-    assert 'HealthState.Yellow' in block[i:i+300]
+    # RED: the fleet path is the one that does the work, so a failing fleet path is broken.
+    assert 'HealthState.Red' in block[i:i+300]

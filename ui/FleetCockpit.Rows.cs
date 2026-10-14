@@ -789,17 +789,28 @@ partial class CockpitWindow
         btn.Template = FlatButtonTemplate();
         btn.Click += delegate
         {
-            try
+            // Acknowledge at once and keep Process.Start (blocking on a loaded machine) off the
+            // UI thread; the result replaces the label/note when it is known.
+            if (!btn.IsEnabled) return;
+            string idle = btn.Content as string;
+            btn.IsEnabled = false;
+            btn.Content = _lang == 0 ? "再開中…" : "Resuming…";
+            if (_startNote != null) _startNote.Text = _lang == 0 ? "前回のランを再開しています…" : "Resuming the last run…";
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                SpawnFleetResume();
-                _lastSig = "";
-                if (_startNote != null)
-                    _startNote.Text = _lang == 0 ? "前回のランを再開しました。" : "Resumed the last run.";
-            }
-            catch (Exception ex)
-            {
-                if (_startNote != null) _startNote.Text = (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + ex.Message;
-            }
+                string err = null;
+                try { SpawnFleetResume(); }
+                catch (Exception ex) { err = ex.Message; }
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    btn.Content = idle; btn.IsEnabled = true;
+                    if (err == null) _lastSig = "";
+                    if (_startNote != null)
+                        _startNote.Text = err == null
+                            ? (_lang == 0 ? "前回のランを再開しました。" : "Resumed the last run.")
+                            : (_lang == 0 ? "再開に失敗: " : "Resume failed: ") + err;
+                }));
+            });
         };
         DockPanel.SetDock(btn, Dock.Right);
         dp.Children.Add(btn);

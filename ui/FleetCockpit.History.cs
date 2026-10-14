@@ -449,46 +449,31 @@ partial class CockpitWindow
         catch (Exception) { }
         try
         {
+            // ONE RULE, whether or not a runner is alive: only TERMINAL cards are retired.
+            // status.json is NEVER rewritten here and non-terminal (ready/waiting/running/
+            // interrupted ...) workers are NEVER hidden. This method used to decide "the run is
+            // dead" from status.json's `updated` age (> 15 s) and then overwrite status.json with an
+            // empty snapshot -- a wedged-but-alive runner looks exactly like that, so its unfinished
+            // workers vanished and looked stopped (2026-10-14 13:54:44, 436 rows). Liveness is a
+            // property of the runner PROCESS (RunnerProcessAlive), not of a file's age, and the
+            // outcome here no longer depends on it at all: hiding terminal cards is correct for a
+            // live, a wedged and a dead run alike, and it cannot lose work.
             var st = ReadStatus();
-            bool runningFlag = st != null && st.ContainsKey("running") && Convert.ToBoolean(st["running"])
-                               && !(st.ContainsKey("idle") && Convert.ToBoolean(st["idle"]));
-            // A LIVE run updates status.json ~once/second. If "running" is true but the
-            // file is STALE (the run crashed / was killed without writing a final snapshot,
-            // e.g. a send failure), it is not actually live -- so allow clearing it.
-            // Otherwise a dead run's card sticks forever and Clear appears to do nothing.
-            double updated = 0;
-            try { if (st != null && st.ContainsKey("updated")) updated = Convert.ToDouble(st["updated"]); }
-            catch (Exception) { }
-            bool stale = updated > 0 && (NowUnix() - updated) > 15;
-            bool live = runningFlag && !stale;
-
-            if (!live)
+            object wo; string started = S(st, "started");
+            if (st != null && st.TryGetValue("workers", out wo) && wo is object[])
             {
-                // Run is finished/dead: a clean reset -- blank the snapshot AND forget hides.
-                File.WriteAllText(_statusPath,
-                    "{\"total\":0,\"done_count\":0,\"running\":false,\"idle\":true,\"workers\":[]}",
-                    new UTF8Encoding(false));
-                _hiddenKeys.Clear();
-                SaveHidden();
-            }
-            else
-            {
-                // Run is LIVE: the runner rewrites status.json each second, so we can't blank it
-                // (it would just reappear, and would clobber running workers). Instead HIDE the
-                // TERMINAL cards persistently -- the runner regenerating them won't un-hide them.
-                // Running (non-terminal) workers are NEVER hidden: a live task vanishing is a hazard.
-                object wo; string started = S(st, "started");
-                if (st != null && st.TryGetValue("workers", out wo) && wo is object[])
+                bool any = false;
+                foreach (object o in (object[])wo)
                 {
-                    bool any = false;
-                    foreach (object o in (object[])wo)
-                    {
-                        var w = o as Dictionary<string, object>;
-                        if (w == null || !IsTerminalWorker(w)) continue;
-                        if (_hiddenKeys.Add(WorkerKey(started, w))) any = true;
-                    }
-                    if (any) SaveHidden();
+                    var w = o as Dictionary<string, object>;
+                    if (w == null || !IsTerminalWorker(w)) continue;
+                    string wk = WorkerKey(started, w);
+                    if (_hiddenKeys.Add(wk)) any = true;
+                    // In-memory only: keep the per-tick archive pass from refilling the history
+                    // that was just cleared from the frozen snapshot these cards still sit in.
+                    _archivedKeys.Add(wk);
                 }
+                if (any) SaveHidden();
             }
         }
         catch (Exception) { }
