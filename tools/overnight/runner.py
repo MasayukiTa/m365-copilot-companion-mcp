@@ -192,7 +192,8 @@ class Runner:
             res = self.submitter.submit(goal, probe=lambda i=iid: self._in_fleet(i))
             if res.ok:
                 self.st.set_status(iid, S.SUBMITTED, submitted_ts=to_epoch(self._now()),
-                                   result_dir=str(self.out_dir / iid))
+                                   result_dir=str(self.out_dir / iid),
+                                   job_id=getattr(res, "job_id", "") or "")
                 self.log("%s: submitted (%d attempt(s)); cockpit: %s"
                          % (iid, res.attempts, self.submitter.readonly_check()))
                 return
@@ -206,7 +207,7 @@ class Runner:
                                    category=classify.OTHER, finished_ts=to_epoch(self._now()))
             else:
                 self.st.set_status(iid, S.FAILED, error="投入失敗: " + res.output[-300:],
-                                   category=classify.OTHER, finished_ts=to_epoch(self._now()))
+                                   category=classify.NOT_SUBMITTABLE, finished_ts=to_epoch(self._now()))
             self.log("%s: not queued (%s)" % (iid, rec["error"][:120]))
             return
 
@@ -236,10 +237,11 @@ class Runner:
                                worker=ob.worker)
         elif ob is not None and ob.state == RUNNING and ob.started_ts and not rec["started_ts"]:
             self.st.update(iid, started_ts=ob.started_ts)
-        if ob is not None and ob.state == UNSEEN and rec["status"] == S.SUBMITTED:
+        if ob is not None and ob.state == UNSEEN and rec["status"] == S.SUBMITTED \
+                and not self._job_waiting(rec):
             waited = now_ts - (rec["submitted_ts"] or now_ts)
             if waited > self.cfg.get("unseen_grace_min", UNSEEN_GRACE_MIN) * 60:
-                self.st.set_status(iid, S.FAILED, finished_ts=now_ts, category=classify.OTHER,
+                self.st.set_status(iid, S.FAILED, finished_ts=now_ts, category=classify.NOT_SUBMITTABLE,
                                    error="the fleet never showed this goal after %d min" % (waited // 60))
                 self.log("%s: never appeared in the fleet" % iid)
                 return
@@ -257,6 +259,15 @@ class Runner:
                                error="time budget %d min exceeded; the worker was not stopped"
                                      % (budget // 60))
             self.log("%s: timeout recorded" % iid)
+
+    def _job_waiting(self, rec) -> bool:
+        """Queue route: the job file is still in the fleet's queue directories (not yet picked up)."""
+        jid = rec.get("job_id") or ""
+        waiting = getattr(self.reader, "job_waiting", None)
+        try:
+            return bool(jid and waiting and waiting(jid))
+        except Exception:
+            return False
 
     def _store_answer(self, iid: str, answer: str) -> None:
         answer = answer or ""
@@ -308,6 +319,12 @@ class Runner:
                                        error="not run (%s)" % reason)
                 except Exception:
                     pass
+        recs = [self.st.get(i) for i in self.st.ids()]
+        runnable = [r for r in recs if r["status"] != S.SKIPPED or r.get("attempts")]
+        if not self.stop_reason and runnable and not any(r["status"] == S.DONE for r in recs):
+            blocked = sum(1 for r in recs if r.get("category") == classify.NOT_SUBMITTABLE)
+            reason = ("no item succeeded: %d of %d could not be submitted" % (blocked, len(recs))
+                      if blocked else "no item succeeded")
         self.cfg["run_ended"] = fmt_dt(self._now())
         self.cfg["stop_reason"] = reason
         try:

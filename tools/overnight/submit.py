@@ -29,6 +29,7 @@ class SubmitResult:
     duplicate: bool = False
     landed_anyway: bool = False
     attempts: int = 0
+    job_id: str = ""
     output: str = ""
 
 
@@ -101,3 +102,48 @@ class Submitter:
             return "rc=%s %s" % (rc, (out or "")[-400:].replace("\n", " | "))
         except Exception as e:  # never let a diagnostic stop the batch
             return "readonly check failed: %s" % e
+
+
+_QUEUED_RE = re.compile(r"^queued\s+([0-9a-f]{6,32})\b")
+
+
+class QueueSubmitter:
+    """Night route: write the goal into the fleet's pending queue through fleet_submit().
+
+    Same interface as Submitter. Nothing here needs the screen: a locked desktop, which stops
+    the GUI route, does not matter. fleet_submit's own refusals (duplicate, too long, queue
+    full) come back as text and are mapped here: a similar-goal refusal is a duplicate (the
+    runner rewords once), everything else is a failure with the door's message kept.
+    """
+
+    def __init__(self, fn=None, log=None, source="overnight batch"):
+        self._fn = fn
+        self.log = log or (lambda m: None)
+        self.source = source
+
+    def _submit_fn(self):
+        if self._fn is None:
+            from tools.fleet_intake import fleet_submit  # heavy import: only when used
+            self._fn = fleet_submit
+        return self._fn
+
+    def submit(self, goal: str, probe=None) -> SubmitResult:
+        check_goal(goal)
+        res = SubmitResult(attempts=1)
+        try:
+            text = str(self._submit_fn()(goal, note="overnight batch", source=self.source))
+        except Exception as e:  # the door must never stop the batch
+            res.output = "fleet_submit raised %s: %s" % (type(e).__name__, e)
+            return res
+        res.output = text[-2000:]
+        m = _QUEUED_RE.match(text.strip())
+        if m:
+            res.ok, res.job_id = True, m.group(1)
+        elif "reads as the goal already queued" in text or "word overlap" in text:
+            res.duplicate = True
+        else:
+            self.log("queue refused: %s" % text[:300])
+        return res
+
+    def readonly_check(self) -> str:
+        return "queue route (no cockpit call)"
