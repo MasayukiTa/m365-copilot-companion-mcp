@@ -48,7 +48,8 @@ function Build($name, $sources) {
 # kept free of WPF so ui/test_the_chat_window_sends_what_was_typed.py can compile and run it.
 # BridgeClient.cs is the chat's only way to the bridge (authenticated POST + X-Bridge-Token),
 # kept free of WPF so ui/test_the_bridge_client_sends_the_token.py can run it against a bridge.
-Build "FleetCockpit" @("FleetCockpit.cs","SelfImproveDashboard.cs","Theme.cs","FleetCommands.cs","WindowSelfTest.cs","SubmittedTasks.cs","FleetConvIdentity.cs","EffortPolicy.cs")
+# FleetCockpit.cs is the main part of `partial class CockpitWindow`; the FleetCockpit.<Theme>.cs files are its other parts and must all be listed here (this is the one list: bench/ui_build_check.py and the CI build read it).
+Build "FleetCockpit" @("FleetCockpit.cs","FleetCockpit.ApprovalPrompt.cs","SelfImproveDashboard.cs","Theme.cs","FleetCommands.cs","WindowSelfTest.cs","SubmittedTasks.cs","FleetConvIdentity.cs","EffortPolicy.cs")
 Build "CopilotChat"  @("CopilotChat.cs","Markdown.cs","Theme.cs","FleetCommands.cs","ChatSend.cs","WindowSelfTest.cs","BridgeClient.cs","FleetConvIdentity.cs")
 
 # 3) Launch both fresh (cockpit first; it will not relaunch a stale chat because we launch the new one).
