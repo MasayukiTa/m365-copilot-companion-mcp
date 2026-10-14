@@ -8,7 +8,10 @@ driven by this suite).
 import io
 import os
 import re
+import shutil
 import tempfile
+
+import pytest
 
 from tools import childproc
 
@@ -23,6 +26,8 @@ def _ps(script):
     return r.stdout.strip()
 
 
+@pytest.mark.skipif(shutil.which("powershell") is None,
+                    reason="runs the real PowerShell ledger; Windows PowerShell is not on this runner")
 def test_unconfirmed_invocation_blocks_retry_until_confirmed():
     with tempfile.TemporaryDirectory() as d:
         p = os.path.join(d, "gui_submissions.json")

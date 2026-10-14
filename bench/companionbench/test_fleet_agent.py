@@ -322,7 +322,7 @@ def test_an_unreadable_settings_file_does_not_yield_the_default_three(monkeypatc
     import relay.fleet_runner as fr
     import relay.relay_fleet as rf
     monkeypatch.setattr(fr, "_settings_path", lambda: str(tmp_path / "nope.txt"))
-    assert fr.settings_maxtabs() == 3, "前提が変わったらこのテストの意味も変わる"
+    assert fr.settings_maxtabs() == fr.DEFAULT_MAX_CONCURRENT, "前提が変わったらこのテストの意味も変わる"
     monkeypatch.setattr(fr, "settings_autoscale", lambda: (False, 0))
     monkeypatch.setattr(rf, "auto_concurrency", lambda n: 1)   # 2GB free box
     assert _plain_agent().max_concurrent_episodes == 1, "余裕の無い機械で3を返した"

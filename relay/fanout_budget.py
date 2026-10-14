@@ -46,8 +46,9 @@ KEY_TURNS = "fanout_max_turns"
 KEY_WALL = "fanout_max_wall_min"
 
 DEFAULT_MAX_TOTAL = 24
-#: Equal to relay/fleet_runner.py DEFAULT_MAX_CONCURRENT (the maxtabs default), compared by a
-#: test. When the key is absent the reader follows the operator's maxtabs instead.
+#: Equal to the registry's fanout_max_active default (tools/settings_keys.py), compared by a
+#: test. It is the fallback for an unreadable settings file; when the key is absent the reader
+#: follows the operator's maxtabs instead (bounded by BOUNDS), which is no longer 3.
 DEFAULT_MAX_ACTIVE = 3
 DEFAULT_MAX_TURNS = 400
 DEFAULT_MAX_WALL_MIN = 120

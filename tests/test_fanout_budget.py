@@ -321,7 +321,12 @@ def settings(tmp_path, monkeypatch):
 def test_absent_keys_mean_the_registry_defaults(settings):
     settings("dark=0")
     got = fb.limits_from_settings()
-    assert got == {"total": SK.default("fanout_max_total"), "active": SK.default("fanout_max_active"),
+    # THE ACTIVE LIMIT FOLLOWS THE OPERATOR'S maxtabs WHEN ITS KEY IS ABSENT (that is what keeps
+    # it from ever being lower than the concurrency the fleet runs at), bounded by the key's own
+    # range. With the lane default now far above that range the result is the range's top, not
+    # the registry's own fanout_max_active default.
+    assert got == {"total": SK.default("fanout_max_total"),
+                   "active": min(fb.BOUNDS[fb.KEY_ACTIVE][1], SK.default("maxtabs")),
                    "turns": SK.default("fanout_max_turns"), "wall_min": SK.default("fanout_max_wall_min")}
 
 
@@ -349,7 +354,11 @@ def test_the_keys_are_declared_each_gate_with_the_python_defaults():
 
 
 def test_the_active_default_is_the_fleets_own_concurrency_cap():
-    assert fb.DEFAULT_MAX_ACTIVE == FR.DEFAULT_MAX_CONCURRENT == SK.default("maxtabs")
+    # The module's own fallback is the registry's fanout_max_active default; what an absent key
+    # follows is the operator's maxtabs (FR.DEFAULT_MAX_CONCURRENT), which is a different, much
+    # larger number since the lane default was raised -- so the two are no longer equal.
+    assert fb.DEFAULT_MAX_ACTIVE == SK.default("fanout_max_active")
+    assert FR.DEFAULT_MAX_CONCURRENT == SK.default("maxtabs")
 
 
 def test_the_terminal_statuses_match_the_fleets():

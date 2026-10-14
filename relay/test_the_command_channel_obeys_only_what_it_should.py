@@ -170,7 +170,7 @@ def test_a_rejected_command_with_a_good_ack_gets_a_receipt_that_says_so(state):
 @pytest.mark.parametrize("cmd", [
     {"set_disk_floor_gb": 100.0}, {"set_disk_floor_gb": 0}, {"set_disk_floor_gb": 6.5},
     {"set_ram_floor_mb": 65536}, {"set_ram_floor_mb": 0.0}, {"set_ram_floor_mb": 512.0},
-    {"set_maxtabs": 1}, {"set_maxtabs": 100}, {"set_maxtabs": 4.0},
+    {"set_maxtabs": 1}, {"set_maxtabs": 1000}, {"set_maxtabs": 4.0},   # 1000 = TABS_BOUNDS[1]
 ])
 def test_values_the_settings_panel_can_produce_are_admitted(cmd, state):
     ok, box, _ = _admit(cmd, state)
@@ -191,8 +191,8 @@ def test_maxtabs_apply_layer_reclamps_to_the_same_bound():
     {"set_disk_floor_gb": math.nan}, {"set_disk_floor_gb": math.inf},
     {"set_disk_floor_gb": "8"}, {"set_disk_floor_gb": True}, {"set_disk_floor_gb": None},
     {"set_ram_floor_mb": 65537}, {"set_ram_floor_mb": -0.5}, {"set_ram_floor_mb": [512]},
-    {"set_maxtabs": 0}, {"set_maxtabs": 101}, {"set_maxtabs": 2.5}, {"set_maxtabs": True},
-    {"set_autoscale": {"on": 1, "max": 1000}}, {"set_autoscale": {"on": "yes"}},
+    {"set_maxtabs": 0}, {"set_maxtabs": 1001}, {"set_maxtabs": 2.5}, {"set_maxtabs": True},
+    {"set_autoscale": {"on": 1, "max": 1001}}, {"set_autoscale": {"on": "yes"}},
     {"set_autoscale": {"on": 1, "evil": 1}}, {"set_autoscale": [1]},
     {"close": "w0"}, {"close": [""]}, {"close": ["w" * 65]}, {"close": [{"n": 1}]},
     {"steer": [{"worker": "w0", "text": "x" * (FR.MAX_COMMAND_TEXT + 1)}]},
