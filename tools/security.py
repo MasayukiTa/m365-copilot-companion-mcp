@@ -1057,7 +1057,7 @@ def require_unlocked() -> str | None:
         if sess and session_auth_enabled():
             msg = (
                 f"[locked: no valid unlock token for {ip!r}] Session not unlocked. "
-                "Have the password: call unlock(password='<password>') now, then retry. "
+                "Have the password: call unlock(password='<password>') again now, in this conversation, then retry. "
                 "Session auth makes unlock_token optional. " + _HANDOFF_HINT
             )
         else:
