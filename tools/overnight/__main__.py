@@ -1,6 +1,6 @@
 import sys
 
-from tools.overnight.cli import main
+from tools.overnight.batch_cli import batch_main
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(batch_main())

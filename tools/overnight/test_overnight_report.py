@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 from openpyxl import Workbook, load_workbook
 
-from tools.overnight import cli, feedback, report
+from tools.overnight import batch_cli as cli, feedback, report
 from tools.overnight import state as S
 from tools.overnight.common import JST
 from tools.overnight.submit import SubmitResult
@@ -201,7 +201,7 @@ def test_feedback_on_a_broken_file_is_reported_not_raised(tmp_path):
     bad.parent.mkdir()
     bad.write_bytes(b"not an xlsx")
     assert feedback.ingest_siblings(tmp_path / "other") == 0
-    assert cli.main(["feedback", "--report", str(bad)]) == 2
+    assert cli.batch_main(["feedback", "--report", str(bad)]) == 2
 
 
 # ------------------------------------------------------------------ cli
@@ -239,7 +239,7 @@ def test_cli_run_end_to_end_with_a_fake_fleet_and_resume(tmp_path, monkeypatch):
     monkeypatch.setattr(cli.env, "toast", lambda *a, **k: None)
     monkeypatch.setattr(cli.env, "free_disk_gb", lambda p: 100.0)
     monkeypatch.setattr(cli.env, "disk_floor_gb", lambda: 1.0)
-    rc = cli.main(["run", "--items", str(items), "--out", str(out), "--fleet-dir", str(fleet),
+    rc = cli.batch_main(["run", "--items", str(items), "--out", str(out), "--fleet-dir", str(fleet),
                    "--poll-seconds", "0"])
     assert rc == 0
     assert len(sent) == 2 and all("\n" not in g and g.startswith("[") for g in sent)
@@ -248,13 +248,13 @@ def test_cli_run_end_to_end_with_a_fake_fleet_and_resume(tmp_path, monkeypatch):
     rows = [(wb["サマリ"].cell(r, 1).value, wb["サマリ"].cell(r, 3).value) for r in range(2, wb["サマリ"].max_row + 1)]
     assert ("I001", "成功") in rows and ("I002", "成功") in rows and any(v == "未実施" for _, v in rows)
     # running it again over the same folder is refused; resume sends nothing new
-    assert cli.main(["run", "--items", str(items), "--out", str(out)]) == 2
+    assert cli.batch_main(["run", "--items", str(items), "--out", str(out)]) == 2
     n = len(sent)
-    assert cli.main(["resume", "--out", str(out), "--fleet-dir", str(fleet), "--poll-seconds", "0"]) == 0
+    assert cli.batch_main(["resume", "--out", str(out), "--fleet-dir", str(fleet), "--poll-seconds", "0"]) == 0
     assert len(sent) == n
 
 
 def test_cli_rejects_a_file_with_nothing_to_run(tmp_path):
     p = tmp_path / "items.txt"
     p.write_text("# nothing\n", encoding="utf-8")
-    assert cli.main(["run", "--items", str(p), "--out", str(tmp_path / "o")]) == 2
+    assert cli.batch_main(["run", "--items", str(p), "--out", str(tmp_path / "o")]) == 2

@@ -81,7 +81,7 @@ def _make_runner(st: S.State, args, clock, log) -> Runner:
                   awake=env.keep_awake, finish=finish)
 
 
-def cmd_run(args, clock=None) -> int:
+def run_batch(args, clock=None) -> int:
     clock = clock or Clock()
     parsed = parse_items(args.items, args.max_items)
     out = Path(args.out) if args.out else default_out_dir(clock)
@@ -125,7 +125,7 @@ def cmd_run(args, clock=None) -> int:
     return 0
 
 
-def cmd_resume(args, clock=None) -> int:
+def resume_batch(args, clock=None) -> int:
     clock = clock or Clock()
     out = Path(args.out)
     path = out / "state.json"
@@ -153,7 +153,7 @@ def cmd_resume(args, clock=None) -> int:
     return 0
 
 
-def cmd_feedback(args) -> int:
+def record_feedback(args) -> int:
     try:
         n = feedback.ingest(args.report)
     except Exception as e:
@@ -163,10 +163,10 @@ def cmd_feedback(args) -> int:
     return 0
 
 
-def main(argv=None) -> int:
+def batch_main(argv=None) -> int:
     args = _parser().parse_args(argv)
     if args.cmd == "run":
-        return cmd_run(args)
+        return run_batch(args)
     if args.cmd == "resume":
-        return cmd_resume(args)
-    return cmd_feedback(args)
+        return resume_batch(args)
+    return record_feedback(args)
