@@ -148,6 +148,7 @@ jobs:
             tools/overnight/test_overnight_runner.py \
             tools/overnight/test_overnight_detect.py \
             tools/overnight/test_overnight_report.py \
+            tools/overnight/test_overnight_queue.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_git_shared_guard.py \

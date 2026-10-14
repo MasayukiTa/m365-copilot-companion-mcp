@@ -2,9 +2,23 @@
 
 Queue a list of short requests before going to bed; in the morning there is one report.
 
-The module never queries a database itself. It hands each request to the fleet through the
-cockpit route (`scripts/win/submit_via_ui.ps1`, one call per item), reads the fleet's own state
-files to see what finished, and compiles the answers.
+The module never queries a database itself. It hands each request to the fleet, reads the
+fleet's own state files to see what finished, and compiles the answers.
+
+## Submit route
+
+`--submit-route queue|gui` (default `queue`, meant for the night).
+
+- `queue`: each goal is written to the fleet's pending queue through `fleet_submit`
+  (`tools/fleet_intake.py`). It does not need the screen, so a locked desktop does not stop it.
+  The door's own rules apply: a refusal as a near-duplicate (word overlap 0.5) is reworded once and
+  retried; requests that read like one still in flight are held back until it finishes.
+- `gui`: the way a person does it, `scripts/win/submit_via_ui.ps1`, one call per item (the daytime
+  route). It types into the cockpit window, so it needs an unlocked interactive desktop and has no
+  lock detection: on a locked screen it fails (after retries), and every item ends up as
+  `投入不可(画面ロック等)`. Do not use it for an unattended night unless the screen stays unlocked.
+
+Neither route changes any setting or power/screen-lock behaviour.
 
 ## Use (one command at night)
 
@@ -69,8 +83,18 @@ the report is built from what exists. Free disk close to the owner's `disk_floor
 ## Failure classes
 
 Decided from the end of the worker's answer: `DB接続不可`, `ロック(解錠不可)`, `タイムアウト`,
-`依頼が曖昧で保留`, `その他`. A "done" answer whose ending looks like a connection/lock failure is
+`依頼が曖昧で保留`, `その他`; plus `投入不可(画面ロック等)` for a request that never reached a worker.
+When any item could not be submitted, the report starts with a banner such as
+"N 件中 M 件が投入できませんでした。原因候補: ..." (xlsx summary sheet, md, html), and the run is
+not reported as `finished` when no item succeeded. A "done" answer whose ending looks like a connection/lock failure is
 flagged for review rather than silently counted as a success.
+
+## Morning consistency check
+
+At the end of the run the report gets a mandatory section/sheet `整合検査`: the cockpit's own
+view (`submit_via_ui.ps1 -ReadOnly`, a dry run; if it cannot be read, e.g. locked screen, the reason
+is written) and a comparison of the fleet's `status.json` worker list with the report's items
+(for example "report says time-out, worker has since finished"). Every gap is one sentence.
 
 ## Feedback
 
@@ -81,7 +105,8 @@ parent of the run folder.
 ## Safety
 
 Read-only toward the fleet state; no database access; no process is ever killed; goals go in
-only through the GUI route; settings are never edited; nothing needs an approval dialog.
+only through the queue door (night) or the cockpit GUI route (day); settings are never edited;
+nothing needs an approval dialog.
 
 ## Limits
 
@@ -90,7 +115,8 @@ only through the GUI route; settings are never edited; nothing needs an approval
 - Completion comes from the fleet's status snapshot and transcripts; if the snapshot is
   replaced by another run, an item falls back to its transcript (considered finished after
   15 idle minutes with an answer).
-- The cockpit GUI route needs an interactive desktop session (screen unlocked).
+- The `gui` route needs an interactive desktop session (screen unlocked); the consistency check's
+  `-ReadOnly` call needs one too, and says so in the report when it cannot run.
 - Charts are simple column charts over the first numeric column of the worker's table.
 
 Japanese one-page guide: USAGE_ja.md
