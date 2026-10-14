@@ -89,10 +89,13 @@ def _read_events(path, tail_bytes=None):
 
 def _worker_rows(conn, key):
     prefix = key + "__refuter_"
+    # INDEXABLE. `substr(key, 1, n) = ?` cannot use fleet_turns_key_idx, so this was a full scan
+    # of a 320 MB table (43-75 s cold) on the fleet's sweep thread, once per worker close. The
+    # prefix match is the range [prefix, prefix + U+10FFFF) on the BINARY-collated key column.
     return [dict(r) for r in conn.execute(
         "SELECT id, key, name, turn, role, text, extra, ts FROM fleet_turns "
-        "WHERE key = ? OR substr(key, 1, ?) = ? ORDER BY ts, id",
-        (key, len(prefix), prefix))]
+        "WHERE key = ? OR (key >= ? AND key < ?) ORDER BY ts, id",
+        (key, prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)))]
 
 
 def _call_text(call):
