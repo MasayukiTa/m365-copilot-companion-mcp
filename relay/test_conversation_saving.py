@@ -214,7 +214,7 @@ def test_the_pacing_wait_is_a_second_place_the_row_can_come_from(rows):
 
 def test_attach_records_when_a_conversation_was_opened():
     src = _read("relay", "relay_fleet.py")
-    assert src.count("self._attached_ts = time.time()") >= 3      # socket, tab, fresh replay
+    assert src.count("self._attached_ts = time.time()") >= 2      # socket, fresh replay (the tab attach is gone)
     assert 'self._note_conversation_unsent("close")' in src
 
 
