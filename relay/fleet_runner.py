@@ -2736,7 +2736,7 @@ _AUTOSCALE_KEYS = frozenset({"on", "max", "default"})
 _STEER_KEYS = frozenset({"worker", "text"})
 #: Exactly the fields goals_from_command carries through.
 _GOAL_KEYS = frozenset({"text", "priority", "checks", "cwd", "jid", "follow_up_to",
-                        "resume_conv", "new_task"})
+                        "resume_conv", "new_task", "retry"})
 
 #: A job id / ack stem: what task_router mints (uuid hex) with room for other callers' ids,
 #: and nothing that can name a different directory or a device.
@@ -2982,7 +2982,7 @@ def _goal_item_error(it):
         v = it.get(key)
         if v is not None and not (_text_ok(v, MAX_REF) and not _CONTROL.search(v)):
             return "%s must be a string of at most %d chars" % (key, MAX_REF)
-    for key in ("priority", "new_task"):
+    for key in ("priority", "new_task", "retry"):
         if it.get(key) is not None and not _is_flag(it[key]):
             return "%s must be true/false" % key
     if it.get("jid") is not None and not _is_safe_id(it["jid"]):
@@ -3514,6 +3514,12 @@ def goals_from_command(cmd, submission_id=None) -> list:
                 # a field with a reader before it had a writer's second line.
                 if it.get("new_task"):
                     g["new_task"] = True
+                # THE COCKPIT'S AUTO-RETRY FLAG, carried through like the fields above. The sender
+                # (ui/FleetCockpit.cs RetryEntry) sets retry=true so the drain can refuse a retry
+                # whose goal is already live; the drain reads item.get("retry"). This function
+                # dropped it, so that guard never saw a retry on the command path.
+                if it.get("retry"):
+                    g["retry"] = True
                 out.append(g)
             elif isinstance(it, str) and it:
                 g = {"text": it, "priority": False}

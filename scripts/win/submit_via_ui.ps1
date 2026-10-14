@@ -360,8 +360,8 @@ function Submit([string]$text, [switch]$ExpectFleetGoal) {
         while ($at -lt $common -and $observed[$at] -eq $text[$at]) { $at++ }
         $expectedCode = if ($at -lt $text.Length) { "U+{0:X4}" -f [int][char]$text[$at] } else { "<end>" }
         $observedCode = if ($at -lt $observed.Length) { "U+{0:X4}" -f [int][char]$observed[$at] } else { "<end>" }
-        throw ("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
-               "Nothing was submitted and the current composer text was left untouched." -f
+        throw (("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
+               "Nothing was submitted and the current composer text was left untouched.") -f
                $at, $expectedCode, $observedCode, $text.Length, $observed.Length)
     }
 
