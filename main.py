@@ -135,6 +135,7 @@ from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
 from tools.audit_ledger_ops import validity_audit_ledger
+from tools.trace_view.tool import trace_session
 from tools.jobs import (
     job_kill,
     job_list,
@@ -563,6 +564,8 @@ TOOLS = (
     job_status, job_wait, job_output, job_list, job_kill,
     # the door an agent walks through to hand this machine a goal
     fleet_submit, fleet_queue,
+    # read-only per-session timeline of the server's own tool ledger (unlock-gated)
+    trace_session,
     # optional helper tools: present only when MCP_EXT_HELPER=1 (see EXT_HELPER_TOOLS)
     *EXT_HELPER_TOOLS,
     # processes / services / registry (Windows host introspection)
