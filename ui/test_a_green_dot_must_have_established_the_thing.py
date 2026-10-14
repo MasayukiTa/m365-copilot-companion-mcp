@@ -3,12 +3,12 @@
 
 An audit of the strip on 2026-09-16 found, ranked by how badly each misleads:
 
-  DOT 4 (agent) called a cached request template a live binding with no maximum age, while
-  relay/profile_token.py -- the module that WRITES that file -- refuses to return one older
-  than TEMPLATE_MAX_AGE_S, and refuses one whose gpt_id is empty. A template 211.7 hours old
-  was on this disk at the time, 8.8 days against a 24 hour cap. The dot would have reported a
-  binding the route itself evicts on first use, and gone on reporting it, because eviction
-  only happens when a capture runs.
+  DOT 4 (agent) called a cached request template a live binding without applying the rule
+  relay/profile_token.py -- the module that WRITES that file -- applies when it loads one. On
+  2026-09-16 that rule included a 24 hour age cap (a template 211.7 hours old was on disk);
+  since the no-tab change (a capture never sends a turn, so an evicted template cannot be
+  re-derived) the route reuses a template regardless of age and refuses only one whose gpt_id
+  is empty. The dot states the same rule.
 
   DOT 2 (edge) called any occurrence of "m365.cloud.microsoft" anywhere in the /json/list
   body "on the agent". That is satisfied by a tab on the DEFAULT Copilot -- the fallback this
@@ -45,35 +45,37 @@ def src():
     return cockpit_source.read(encoding="utf-8-sig")
 
 
-def test_the_agent_dot_ages_the_template_it_calls_a_binding(src):
-    assert "TEMPLATE_MAX_AGE_S" in src
-    assert "ageS > TEMPLATE_MAX_AGE_S" in src, "the age is computed but not acted on"
-    # And existence alone must no longer be the answer.
-    assert 'IndexOf("gptId", StringComparison.Ordinal) >= 0' not in src, \
-        "the substring test is back: it asks about the file's spelling, not about an agent"
+def test_the_agent_dot_judges_the_template_by_the_rule_the_route_uses(src):
+    """The dot must not call a binding a template the route would refuse -- and since the
+    no-tab change the route refuses on content only: load_template returns a template whatever
+    its age, but never one that names no agent. Age is the TOKEN's business (dot 3)."""
+    assert 'IndexOf("gptId", StringComparison.Ordinal) >= 0' not in src,         "the substring test is back: it asks about the file's spelling, not about an agent"
     assert 'StringField(query, "gptId")' in src
+    assert "ageS > TEMPLATE_MAX_AGE_S" not in src,         "the cockpit ages a template the route reuses regardless of age"
 
 
-def test_the_cockpits_age_limit_is_not_looser_than_the_routes():
-    """A COPY, AND COPIES DRIFT. If the cockpit's cap grows past the route's, the dot goes
-    back to reporting bindings the route refuses -- silently, because nothing else compares
-    the two numbers."""
+def test_the_cockpit_and_the_route_state_the_same_template_age_rule():
+    """THE TWO MUST AGREE, AND THE RULE CHANGED. Under the no-tab design a capture never sends a
+    turn, so a template can only be written by an earlier real conversation; evicting it by age
+    would strand every goal. profile_token.TEMPLATE_MAX_AGE_S therefore defaults to 0 = never
+    evict by age. If the route gains a positive default again, the cockpit must age templates
+    too (it would otherwise report bindings the route evicts) -- this fails until it does."""
     cs = cockpit_source.read(encoding="utf-8-sig")
     py = io.open(PROFILE_TOKEN, encoding="utf-8").read()
 
-    m_cs = re.search(r"const double TEMPLATE_MAX_AGE_S\s*=\s*([0-9]+)\s*\*\s*([0-9]+)\s*;", cs)
-    assert m_cs, "the cockpit no longer declares TEMPLATE_MAX_AGE_S in the expected form"
-    cockpit_s = int(m_cs.group(1)) * int(m_cs.group(2))
+    m_py = re.search(r"^TEMPLATE_MAX_AGE_S\s*=\s*float\(os\.environ\.get\([^,]+,\s*\"([0-9.]+)\"\)\)",
+                     py, re.M)
+    assert m_py, "relay/profile_token.py no longer declares TEMPLATE_MAX_AGE_S in the "                 "expected form; the two rules can no longer be compared"
+    route_s = float(m_py.group(1))
+    m_cs = re.search(r"const double TEMPLATE_MAX_AGE_S\s*=", cs)
 
-    m_py = re.search(r"TEMPLATE_MAX_AGE_S\s*=\s*float\(os\.environ\.get\([^,]+,\s*str\("
-                     r"([0-9]+)\s*\*\s*([0-9]+)\)\)\)", py)
-    assert m_py, "relay/profile_token.py no longer declares TEMPLATE_MAX_AGE_S in the "\
-                 "expected form; the two constants can no longer be compared"
-    route_s = int(m_py.group(1)) * int(m_py.group(2))
-
-    assert cockpit_s <= route_s, (
-        "the cockpit would call a template live that the route would evict "
-        "(cockpit %ds > route %ds)" % (cockpit_s, route_s))
+    if route_s <= 0:
+        assert not m_cs, ("the route never evicts a template by age but the cockpit declares "
+                          "an age cap: it would call a binding unbound that the route uses")
+    else:
+        assert m_cs, "the route evicts templates by age and the cockpit does not"
+        m = re.search(r"const double TEMPLATE_MAX_AGE_S\s*=\s*([0-9]+)\s*\*\s*([0-9]+)\s*;", cs)
+        assert m and int(m.group(1)) * int(m.group(2)) <= route_s,             "the cockpit's age cap is looser than the route's"
 
 
 def test_the_edge_dot_asks_for_the_configured_agent_not_the_domain(src):

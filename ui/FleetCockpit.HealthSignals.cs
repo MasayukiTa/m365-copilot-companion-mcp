@@ -224,24 +224,20 @@ partial class CockpitWindow
             string path = Path.Combine(RepoRoot(), ".fleet", "templates",
                                        "template_" + Sha256Prefix(url) + ".json");
             if (!File.Exists(path)) return false;
-            // EXISTENCE IS NOT THE BINDING, and the comment above used to say it was. The
-            // module that writes this file refuses to return one older than
-            // TEMPLATE_MAX_AGE_S (relay/profile_token.py), and refuses one whose gpt_id is
-            // empty (load_template's "a template without an agent is not a cache hit"). This
-            // dot checked neither, so it could report a binding the route itself would evict
-            // on first use -- and would go on reporting it, because the eviction only happens
-            // when a capture runs, about once per token lifetime.
+            // EXISTENCE IS NOT THE BINDING: the file must parse and its gpt_id must be non-empty
+            // (load_template's "a template without an agent is not a cache hit").
             //
-            // Measured when this was written: .fleet/templates held one template 211.7 hours
-            // old, 8.8 days against a 24 hour cap. Dot 3 was given an explicit max age for
-            // exactly this reason ("evidence about the past is not evidence about now"); dot
-            // 4 was not.
+            // NO AGE LIMIT, BECAUSE THE ROUTE HAS NONE. Since "Copilot never runs in a tab" a
+            // capture never sends a turn, so a template can only be written by an earlier real
+            // conversation and expiring it by age would strand every goal:
+            // relay/profile_token.py's TEMPLATE_MAX_AGE_S defaults to 0 = never evict by age.
+            // The signal that a template went stale is the backend refusing a request, and what
+            // expires with time is the TOKEN, which dot 3 judges. The cockpit states the same
+            // rule as the route -- a template is reused regardless of age -- and
+            // ui/test_a_green_dot_must_have_established_the_thing.py compares the two.
             var tpl = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8))
                       as Dictionary<string, object>;
             if (tpl == null) return false;
-            double savedAt = NumberField(tpl, "ts");
-            double ageS = NowUnix() - savedAt;
-            if (savedAt <= 0 || ageS > TEMPLATE_MAX_AGE_S) return false;
             var query = tpl.ContainsKey("query") ? tpl["query"] as Dictionary<string, object>
                                                  : null;
             // Non-EMPTY, not merely present. The old substring test asked whether the five
@@ -254,11 +250,6 @@ partial class CockpitWindow
     // The same 16 hex characters relay/profile_token.py names its cache files with. If these
     // two ever disagree the lookup finds nothing and the dot reports "not bound" for ever --
     // a silent zero -- so the algorithm is stated in both places rather than assumed.
-    //: A COPY OF relay/profile_token.py's TEMPLATE_MAX_AGE_S, and copies drift, so a test
-    //: fails if the two stop agreeing. Stated here rather than read from the environment
-    //: because the cockpit must not report a binding on terms looser than the route's.
-    const double TEMPLATE_MAX_AGE_S = 24 * 3600;
-
     static string Sha256Prefix(string s)
     {
         using (var sha = System.Security.Cryptography.SHA256.Create())
