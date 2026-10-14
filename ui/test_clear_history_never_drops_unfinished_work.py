@@ -25,7 +25,7 @@ def test_clear_history_never_blanks_status_or_hides_unfinished_workers():
     assert "WriteAllText(_statusPath" not in body
     assert "_hiddenKeys.Clear()" not in body
     assert "IsTerminalWorker(w)" in body
-    assert '"workers\\":[]' not in body
+    assert "idle" not in body
     # no liveness guess from the snapshot's age in this method
     assert "NowUnix() - updated" not in body
 
