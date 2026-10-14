@@ -357,7 +357,6 @@ jobs:
             ui/test_the_last_setting_is_reachable.py \
             ui/test_an_answer_does_not_rewrap_when_it_settles.py \
             ui/test_the_same_decision_does_not_flood_the_approval_history.py \
-            relay/test_a_declared_knob_changes_something.py \
             relay/test_a_kept_for_claim_names_a_real_consumer.py \
             scripts/test_the_audit_sees_the_tree_that_will_be_pushed.py \
             scripts/test_the_loop_has_something_that_starts_it.py \

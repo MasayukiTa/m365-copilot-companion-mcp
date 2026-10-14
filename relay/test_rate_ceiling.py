@@ -26,7 +26,6 @@ def test_at_the_ceiling_nothing_is_admitted(monkeypatch):
     ok, why = F.rate_headroom_ok()
     assert ok is False
     assert "holding" in why
-    assert F.admission_is_due(now=1e9) is False
 
 
 def test_over_the_ceiling_nothing_is_admitted(monkeypatch):
@@ -40,7 +39,6 @@ def test_one_below_the_ceiling_admits_again(monkeypatch):
     monkeypatch.setattr(F, "rate_ceiling", lambda default=None: 100.0)
     _rpm(monkeypatch, 99.0)
     assert F.rate_headroom_ok()[0] is True
-    assert F.admission_is_due(now=1e9) is True
 
 
 def test_a_lower_ceiling_binds_before_the_published_one(monkeypatch):
@@ -64,7 +62,6 @@ def test_an_unreadable_meter_does_not_stall_the_fleet(monkeypatch):
     monkeypatch.setattr(F, "rate_ceiling", lambda default=None: 100.0)
     _rpm(monkeypatch, None)
     assert F.rate_headroom_ok()[0] is True
-    assert F.admission_is_due(now=1e9) is True
 
 
 def test_a_quiet_minute_is_not_confused_with_a_missing_meter(monkeypatch):

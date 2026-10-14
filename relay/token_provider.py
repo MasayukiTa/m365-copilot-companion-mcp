@@ -177,13 +177,6 @@ class TokenHold:
             return dict(self._last)
 
 
-def goal_wants_socket(worker=None, resume_is_url=False) -> bool:
-    """Always True. Kept for callers of the old tab/socket split: there is no tab path, so
-    every goal -- including one resuming a page URL, which is reduced to its conversation id
-    in RelayWorker.attach -- waits for a socket."""
-    return True
-
-
 _HOLD = None
 
 

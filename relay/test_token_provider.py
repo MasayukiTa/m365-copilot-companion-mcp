@@ -4,7 +4,7 @@ import base64
 import json
 import time
 
-from relay.token_provider import CapturePolicy, TokenHold, goal_wants_socket, exp_of
+from relay.token_provider import CapturePolicy, TokenHold, exp_of
 
 
 def _tok(exp):
@@ -91,12 +91,6 @@ def test_closed_route_holds_with_its_own_reason_and_every_goal_wants_a_socket():
     assert h.hold_reason("g", r, "a").startswith("socket route unavailable")
     assert h.hold_reason("g", _Route(ready=False), "a", wants_socket=False).startswith(
         "waiting for token")
-
-
-def test_goal_with_url_resume_still_waits_for_a_socket():
-    class W:
-        goal = "hello"
-    assert goal_wants_socket(W(), resume_is_url=True) is True
 
 
 def test_manager_backs_off_on_same_exp_and_failure_never_touches_browser(monkeypatch):

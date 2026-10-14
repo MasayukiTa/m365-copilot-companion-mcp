@@ -13,9 +13,6 @@ properties of the new design:
   (c) verify tab counts in the cap -- a worker in 'verifying' still HOLDS its slot, so a tab in
                                      verify is counted by _active_open and a 1-cap fleet does
                                      NOT open a second tab while one verifies.
-  (d) hysteresis damps thrash      -- with an up-margin dead-band, RAM jitter around the line no
-                                     longer oscillates the cap 1<->N; it HOLDS at the water level
-                                     (and still drains immediately on a real deficit).
 
 Run:  .venv\\Scripts\\python.exe relay\\test_admission.py
 """
@@ -27,7 +24,7 @@ sys.path.insert(0, str(REPO))
 
 import relay.relay_fleet as rf
 from relay.relay_fleet import (
-    disk_admission_ok, ram_target_cap, run_relay_fleet, RelayWorker, TERMINAL,
+    disk_admission_ok, run_relay_fleet, RelayWorker, TERMINAL,
 )
 
 results = []
@@ -113,64 +110,6 @@ def test_disk_floor_predicate():
           reserve_gb=rf.repo_eval_gb("pydata__xarray-1")*2) is True)
 
 
-# ── (d) anti-thrash hysteresis ─────────────────────────────────────────────────────────────
-def test_hysteresis_no_thrash():
-    cap = ram_target_cap
-    PER, HEAD = 700, 1400
-
-    # Simulate the thrash trigger: free RAM hovers just around the up/down line while the cap
-    # sits at 2 with 2 tabs open. WITHOUT a dead-band (legacy up_margin=0) a tiny surplus makes
-    # it ramp to 3; with a dead-band it HOLDS at 2.
-    #   raw = open_now + (avail - HEAD)//PER. open_now=2.
-    #   avail = HEAD + 100 (a small surplus, < PER): raw = 2 + 0 = 2 -> never ramps up anyway.
-    #   avail = HEAD + PER + 50 (just over one tab's worth): raw = 2 + 1 = 3 -> WOULD ramp up.
-    rf.avail_phys_mb = lambda: float(HEAD + PER + 50)      # 50 MB into the next tab's budget
-
-    # legacy (no margin): a 50 MB surplus over a full tab budget is enough -> ramps up to 3
-    check("legacy_ramps_on_tiny_surplus",
-          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=0) == 3)
-    # hysteresis: require 700 MB EXTRA headroom on top of the tab budget -> 50 MB is inside the
-    # dead-band -> HOLD at 2 (no thrash)
-    check("hysteresis_holds_in_deadband",
-          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 2)
-
-    # a genuine, sustained surplus (well past the dead-band) DOES ramp up one step
-    rf.avail_phys_mb = lambda: float(HEAD + 2 * PER + 100)
-    check("hysteresis_ramps_on_real_surplus",
-          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 3)
-
-    # the dead-band NEVER blocks a DOWN drain: a real RAM deficit still drops the cap at once,
-    # regardless of up_margin (down is immediate, only the up side has the dead-band).
-    rf.avail_phys_mb = lambda: float(HEAD - 2 * PER)       # deficit of two tabs
-    check("hysteresis_drain_still_immediate",
-          cap(3, 3, 8, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 1)
-
-    # Stability over a JITTERY sequence: feed an oscillating RAM reading and confirm the cap
-    # under hysteresis never grows past the settled level, while legacy does grow.
-    jitter = [HEAD + PER + 30, HEAD + PER - 30, HEAD + PER + 60, HEAD + PER - 10,
-              HEAD + PER + 40, HEAD + PER + 20]
-    # hysteresis run
-    capn = 2
-    grew_h = False
-    for j in jitter:
-        rf.avail_phys_mb = (lambda v: (lambda: float(v)))(j)
-        new = cap(2, capn, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER)
-        if new > capn:
-            grew_h = True
-        capn = new
-    check("hysteresis_no_growth_under_jitter", grew_h is False and capn == 2)
-    # legacy run on the SAME jitter -> it WOULD grow (proves the dead-band is what damps it)
-    capn = 2
-    grew_l = False
-    for j in jitter:
-        rf.avail_phys_mb = (lambda v: (lambda: float(v)))(j)
-        new = cap(2, capn, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=0)
-        if new > capn:
-            grew_l = True
-        capn = new
-    check("legacy_grows_under_jitter", grew_l is True)
-
-
 # ── shared harness for the loop-level tests (b) and (c) ─────────────────────────────────────
 class _ReadyRoute:
     """A socket route that is open and holds a token: admission proceeds (no hold, no tab)."""
@@ -249,8 +188,6 @@ def test_continuous_admission_no_barrier():
 
     # THIS TEST IS ABOUT THE LANE CAP (the socket capacity). _install_fake_worker installs a ready
     # socket route so the admission loop admits; fake_attach's page sentinel stands for a held slot.
-    orig_due = rf.admission_is_due
-    rf.admission_is_due = lambda now=None: True
 
     state = {"control": {}}
     orig = _install_fake_worker(state)
@@ -298,7 +235,6 @@ def test_continuous_admission_no_barrier():
         # not move with poll_s or with the speed of the machine.
         check("continuous_made_progress", opens["transitions"] <= 12)
     finally:
-        rf.admission_is_due = orig_due
         _restore_worker(orig)
 
 
@@ -859,8 +795,8 @@ def test_soft_shrink_does_not_close_running_tabs():
     the NEXT open. This is BY DESIGN (confirmed: no worker.close() call anywhere gets fired by
     a cap change, only by a worker going terminal -- see the sweep loop in run_relay_fleet).
 
-    This test proves the property end-to-end, not just the pure ram_target_cap math already
-    covered by test_hysteresis_no_thrash: start 2 workers under cap=2, shrink mc_box to 1
+    This test proves the property end-to-end (the pure ram_target_cap math it once sat beside has
+    been retired): start 2 workers under cap=2, shrink mc_box to 1
     WHILE both are still open, and confirm (a) neither running worker is torn down by the
     shrink, so open tab count can sit above the live cap for a while -- exactly the cockpit's
     "N/M with N>M" reading -- and (b) admission of the 3rd goal stays blocked until enough
@@ -1374,7 +1310,6 @@ def main():
                 test_tab_load_accounting,
                 test_socket_workers_respect_the_live_cap,
                 test_soft_shrink_does_not_close_running_tabs,
-                test_hysteresis_no_thrash,
                 test_continuous_admission_no_barrier,
                 test_verifying_counts_in_cap,
                 test_disk_floor_blocks_in_loop,

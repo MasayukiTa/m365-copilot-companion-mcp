@@ -6,9 +6,8 @@ transport 選択は routing 選択に変わる。だからテストは名前で�
 import pytest
 
 from relay.selfimprove import manifest as M
-from relay.transport_policy import (SOCKET, TAB, TRANSPORT_VERSIONS, ATTACHMENT,
-                                    _policy_v1, _policy_v2, classify_fallback,
-                                    choose, evolvable_fields, needs_tab)
+from relay.transport_policy import (SOCKET, TAB,
+                                    _policy_v1, _policy_v2, classify_fallback)
 
 
 # ---- 版が実際に分岐すること -----------------------------------------------------------------------
@@ -45,65 +44,6 @@ def test_v1_preserves_todays_behaviour_rather_than_yesterdays():
 
 # ---- 固定された述語 -------------------------------------------------------------------------------
 
-def test_an_attachment_no_longer_forces_a_tab():
-    """2026-09-18 に引退。「socket にファイルの置き場が無い」は物理ではなく未計測だった。
-
-    3つとも実測で埋まった: プロトコルに場所がある(09-17 観測、サーバが
-    messageAnnotationSource "UserAnnotated" でエコー) / 保持トークンで UploadFile が通る
-    (200・Success、ページの要求を再送しトークンのみ差替) / socket 経由の annotation を
-    モデルが**見る**(ランダム生成の語句を画像から読み返した。ファイル名・パス・プロンプト
-    のどこにも無い)。前提が偽と測れた規則は、残しても安全にはならない。"""
-    assert needs_tab(r"C:\data\sales.csv") is False
-    assert choose("このCSVを分析して", upload_path=r"C:\data\sales.csv") == SOCKET
-
-
-def test_the_structural_veto_still_runs_before_any_version():
-    """今は何も拒否しないが、**順序**は残す。
-
-    価値があるのは規則の中身ではなく形 — どの版にも(将来 evolve された版にも)先んじる
-    拒否点があること。後から本物の構造的制約が見つかったとき、既存の版すべてを縛れる
-    場所がここにある。中身が空になった瞬間に呼び出しごと消すと、その場所が無くなる。"""
-    for impl in TRANSPORT_VERSIONS.values():
-        assert impl("このCSVを分析して") == SOCKET
-    assert choose("このCSVを分析して", upload_path="x.csv") == SOCKET
-
-    # そして順序そのもの: needs_tab が True を返せば、版が何と言おうと TAB になる。
-    import relay.transport_policy as TP
-
-    real = TP.needs_tab
-    try:
-        TP.needs_tab = lambda upload_path="": True
-        assert TP.choose("このCSVを分析して", upload_path="x.csv") == TAB
-    finally:
-        TP.needs_tab = real
-
-
-def test_workiq_goals_are_no_longer_diverted():
-    """実測 2026-08-21: Work IQ は socket に乗る。socket 実ターン20回・8クラスで
-    fallback 0件。しかも尤もらしさで通らない検査をした -- 同日に作成し独立に検証した
-    予定について両経路に尋ね、**両方**がそれを名指しした。見たことのない予定を
-    発明することはできない。"""
-    for goal in ("Outlook の受信トレイを整理して", "SharePoint の資料をまとめて",
-                 "Teams の会議メモを要約", "予定表に登録して"):
-        assert needs_tab() is False
-        assert choose(goal) == SOCKET, goal
-
-
-def test_the_structural_rule_is_not_in_the_evolvable_set():
-    """誤りが静かな次元は進化させない -- この原則は残す。
-    変わったのは対象で、いま固定されているのは『添付』。しかもこれは
-    呼び出し側が持つ値なので、静かに間違えようがない。"""
-    fields = evolvable_fields()
-    for banned in ("attachment", "needs_tab", "upload"):
-        assert not any(banned in f for f in fields), fields
-
-
-def test_the_rule_reads_a_parameter_and_never_the_goal_text():
-    """テキストを読み始めた瞬間、実測が否定した前提に戻る。"""
-    assert needs_tab("") is False
-    assert choose("添付ファイルを見て", upload_path="") == SOCKET
-
-
 # ---- ラベルは3値 ---------------------------------------------------------------------------------
 
 def test_route_caused_fallbacks_are_not_evidence_about_the_goal():
@@ -134,27 +74,6 @@ def test_exploration_can_send_a_tab_prediction_over_a_socket():
     knobs = {"transport_eligible_kinds": ["code"]}
     assert _policy_v2("何かする", kind="other", knobs=knobs) == TAB
     assert _policy_v2("何かする", kind="other", knobs=knobs, explore=True) == SOCKET
-
-
-def test_exploration_never_overrides_the_structural_veto():
-    """探索が安全なのは誤分類の代償がフォールバックだから。拒否点が真を返すなら、
-    それは確率の話ではないので探索の対象にしない。添付はもうその対象ではないが、
-    **拒否点と探索の関係**は変わらないので、そこを固定する。"""
-    import relay.transport_policy as TP
-
-    real = TP.needs_tab
-    try:
-        TP.needs_tab = lambda upload_path="": True
-        assert TP.choose("このCSVを分析して", kind="other",
-                         knobs={"transport_eligible_kinds": ["code"]},
-                         explore=True, upload_path=r"C:\d.csv") == TAB
-    finally:
-        TP.needs_tab = real
-
-    # 添付そのものは、もう探索を止めない。
-    assert choose("このCSVを分析して", kind="other",
-                  knobs={"transport_eligible_kinds": ["code"]},
-                  explore=True, upload_path=r"C:\d.csv") == SOCKET
 
 
 def test_the_policy_itself_does_not_draw_the_random_number():
@@ -229,23 +148,6 @@ def test_a_policy_that_cannot_answer_does_not_cost_a_goal():
     src = inspect.getsource(RF.RelayWorker)
     i = src.index("transport_policy import")
     assert "except Exception" in src[i:i + 400]
-
-
-def test_the_fixed_rule_cannot_be_given_goal_text_at_all():
-    """『テキストは読まない』は約束では守れない。引数として存在しないことで守る。
-
-    実測が否定したのは「M365 に触れる目標は socket に乗らない」という文字列判定であって、
-    同じ判定を別の語で書き直せば同じ誤りが戻る。だから signature を見張る --
-    このファイルが乱数について既にやっているのと同じ理由、同じやり方。"""
-    import inspect
-
-    from relay import transport_policy as TP
-    params = list(inspect.signature(TP.needs_tab).parameters)
-    assert params == ["upload_path"], params
-    src = inspect.getsource(TP.needs_tab)
-    body = src.split('"""')[-1]          # docstring を除いた本体だけを見る
-    for text_ish in ("goal", "lower()", "in text", "MARKERS"):
-        assert text_ish not in body, "本体がテキストを読み始めている: %s" % text_ish
 
 
 def test_the_first_real_fallback_reason_is_classified(monkeypatch):

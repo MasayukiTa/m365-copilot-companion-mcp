@@ -126,7 +126,7 @@ def test_attach_without_a_driver_waits_and_never_opens_a_tab(monkeypatch, open_,
 
 
 def test_hold_has_no_ceiling_and_ignores_the_old_tab_split():
-    from relay.token_provider import TokenHold, goal_wants_socket
+    from relay.token_provider import TokenHold
     t = [0.0]
     h = TokenHold(now=lambda: t[0])
     r = _Route(True, False)
@@ -135,7 +135,6 @@ def test_hold_has_no_ceiling_and_ignores_the_old_tab_split():
     assert h.hold_reason("g", r, "a").startswith("waiting for token")
     assert h.hold_reason("g", _Route(False, False, closed="x"), "a").startswith(
         "socket route unavailable")
-    assert goal_wants_socket(object(), resume_is_url=True) is True
 
 
 def test_socket_loss_midgoal_waits_for_a_driver_instead_of_a_tab(monkeypatch):

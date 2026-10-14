@@ -194,11 +194,9 @@ def throttled_reply(resp: str) -> bool:
 #     20+ replied at minute 1.0                  every one rate-limited
 #     median minute, clean first reply 2.9  /  throttled first reply 1.1
 #
-# The eight that arrived roughly a second and a half apart all got through. That is the number
-# below. It is spacing, not a concurrency cap: every worker still runs, and after the opening
-# ramp the fleet is at full width. For 144 workers the ramp costs a few minutes, against 77
-# workers that produced nothing at all.
-ADMIT_MIN_INTERVAL_S = float(os.environ.get("MCP_ADMIT_INTERVAL_S", "1.5"))
+# The eight that arrived roughly a second and a half apart all got through. The fixed spacing
+# that encoded that (ADMIT_MIN_INTERVAL_S / admission_is_due) was replaced by the send bucket
+# below, which enforces the same fact as a rate; see "SOCKET SEND PACING".
 
 # Seen a throttle recently -> widen the spacing. The quota is shared by every worker, so one
 # worker's refusal is evidence about all of them, and admitting at the ordinary rate into a
@@ -206,7 +204,6 @@ ADMIT_MIN_INTERVAL_S = float(os.environ.get("MCP_ADMIT_INTERVAL_S", "1.5"))
 ADMIT_THROTTLED_FACTOR = float(os.environ.get("MCP_ADMIT_THROTTLED_FACTOR", "4"))
 ADMIT_THROTTLE_MEMORY_S = float(os.environ.get("MCP_ADMIT_THROTTLE_MEMORY_S", "120"))
 
-_LAST_ADMIT_TS = 0.0
 _LAST_THROTTLE_TS = 0.0
 
 
@@ -214,14 +211,6 @@ def note_upstream_throttle(now=None):
     """Record that the upstream refused someone, so admission slows for everyone."""
     global _LAST_THROTTLE_TS
     _LAST_THROTTLE_TS = time.time() if now is None else now
-
-
-def admit_interval_now(now=None):
-    """The spacing to use for the next admission, widened while a throttle is fresh."""
-    now = time.time() if now is None else now
-    if _LAST_THROTTLE_TS > 0.0 and (now - _LAST_THROTTLE_TS) <= ADMIT_THROTTLE_MEMORY_S:
-        return ADMIT_MIN_INTERVAL_S * ADMIT_THROTTLED_FACTOR
-    return ADMIT_MIN_INTERVAL_S
 
 
 #: The user's own ceiling on generative messages per minute. Microsoft's documented figure is
@@ -292,26 +281,6 @@ def rate_headroom_ok(now=None):
         return False, "rate %d/%d per minute -- holding until it drops" % (
             round(rpm), round(ceiling))
     return True, ""
-
-
-def admission_is_due(now=None):
-    """False while the previous admission is still too recent. Never blocks -- the caller
-    stops draining and the next sweep (poll_s, ~1s) asks again."""
-    now = time.time() if now is None else now
-    # The ceiling is checked BEFORE the spacing: spacing asks "has enough time passed since the
-    # last admission", which is a question about this process, and the ceiling is a question
-    # about the shared upstream that every run on this tenant is drawing from.
-    ok, _why = rate_headroom_ok(now)
-    if not ok:
-        return False
-    if ADMIT_MIN_INTERVAL_S <= 0:
-        return True
-    return (now - _LAST_ADMIT_TS) >= admit_interval_now(now)
-
-
-def note_admitted(now=None):
-    global _LAST_ADMIT_TS
-    _LAST_ADMIT_TS = time.time() if now is None else now
 
 
 # ── SOCKET SEND PACING: A RATE, NOT A GAP ─────────────────────────────────────────────────
@@ -385,8 +354,7 @@ def note_socket_sent(now=None):
 def _reset_admission_pacing():
     """Test seam. Module state is per-process and a run is one process; two tests sharing it
     would otherwise pass or fail depending on their order."""
-    global _LAST_ADMIT_TS, _LAST_THROTTLE_TS
-    _LAST_ADMIT_TS = 0.0
+    global _LAST_THROTTLE_TS
     _LAST_THROTTLE_TS = 0.0
     _SEND_BUCKET.reset()
     _SOCKET_SENDS_TOTAL[0] = 0
@@ -3039,67 +3007,6 @@ def disk_admission_ok(floor_gb=None, eval_gb=None, free_gb=None, building=0, res
     eval_gb = DEFAULT_EVAL_DISK_GB if eval_gb is None else float(eval_gb)
     reserve = eval_gb * (1 + max(0, int(building)))
     return (free - reserve) >= floor
-
-
-def admits_another_tab(active_open: int, projected_peak: int, tab_weight: int,
-                       cap) -> bool:
-    """True when one more worker fits the LIVE tab budget. `cap` is `mc_box[0]`.
-
-    WHY THIS HAS A NAME NOW. The settings path is file -> box -> decision. The first half
-    got a name (`fleet_runner.build_settings_follower`) and a behavioural test; the second
-    stayed inside a 700-line run(), so the only thing holding it was a source assertion --
-    and relay/test_a_setting_the_operator_changed_reaches_a_running_fleet.py said so in as
-    many words rather than implying it was covered. A source assertion cannot catch a cap
-    that is read from the wrong place, or compared the wrong way round.
-
-    THE FIRST CLAUSE IS NOT A ROUNDING DETAIL. With `active_open == 0` the fleet admits one
-    worker whatever the cap says, because a cap that can reach zero would otherwise stop the
-    fleet permanently with work queued and nothing running -- and `mc_box[0]` is written by
-    the RAM autoscale, which genuinely can drive it down. `max(1, cap)` is the same guard
-    from the other side, for the case where something is already open.
-
-    Kept as a free function taking numbers, not a method on the run: the whole point is to
-    be callable without a browser, a clock, or a worker.
-    """
-    if active_open == 0:
-        return True
-    return projected_peak + tab_weight <= max(1, cap)
-
-
-def ram_target_cap(open_now, current_cap, ceiling,
-                   per_tab_mb=None, headroom_mb=None, floor=1, up_margin_mb=0):
-    """RAM-aware live concurrency target (autoscale). Recomputed each loop: given how many
-    tabs are open right now (their RAM is already reflected in the free-RAM reading) and how
-    much headroom we want to keep for the user, how many tabs can we SUSTAIN?
-
-    Asymmetric on purpose, to never re-trigger the RAM-exhaustion crash:
-      * scale UP by at most ONE tab per call (gentle ramp -- re-evaluated every loop), and
-      * allow scale DOWN to the raw target immediately. A lower cap is SOFT: running tabs are
-        not killed, we just stop opening new ones until some finish (natural drain).
-
-    ANTI-THRASH HYSTERESIS (`up_margin_mb`): with up_margin_mb=0 (default, back-compat) the up-
-    and down-thresholds coincide, so a fleet can oscillate 1<->3 every loop: open a tab -> RAM
-    tightens just under the line -> drain target -> tab closes -> RAM frees just over the line
-    -> ramp up -> repeat. A positive `up_margin_mb` makes the UP step require that much EXTRA
-    free RAM beyond what merely holding the new tab needs, so once the fleet settles at a water
-    level a small RAM jitter no longer pushes it back up -- it HOLDS. The DOWN side is unchanged
-    (drains immediately on a real deficit), so the dead-band only damps needless growth.
-    Clamped to [floor, ceiling] (ceiling = the user's configured maximum)."""
-    per_tab_mb = FLEET_PER_TAB_MB if per_tab_mb is None else per_tab_mb
-    headroom_mb = FLEET_RAM_FLOOR_MB if headroom_mb is None else headroom_mb
-    avail = avail_phys_mb()
-    # FLOOR division (not int(): truncates toward zero) so a RAM *deficit* yields a negative
-    # term and the target actually drops below open_now -> drains. e.g. (-400)//700 == -1.
-    raw = open_now + int((avail - headroom_mb) // per_tab_mb)
-    target = max(floor, min(raw, ceiling))
-    if target > current_cap:
-        # hysteresis: only ramp UP if there is up_margin_mb of headroom ON TOP of the per-tab
-        # budget the new tab needs (a dead-band so jitter around the line doesn't re-grow us).
-        if (avail - headroom_mb - up_margin_mb) >= per_tab_mb:
-            target = min(current_cap + 1, ceiling)   # ramp up one tab at a time
-        else:
-            target = current_cap                     # in the dead-band -> HOLD, don't grow
-    return target
 
 
 def _page_target_id(page):
