@@ -1345,6 +1345,12 @@ _os.environ.setdefault(
     "MCP_SKILLS_STATE_DB",
     _sandbox_path("skills_state_pytest_%s.sqlite3"))
 
+# tools/access_log.py's request record (.setup/logs/access.log). Only main.py's __main__ writes
+# it, so no test reaches the live file today; set anyway so none ever can.
+_os.environ.setdefault(
+    "MCP_ACCESS_LOG_DIR",
+    _sandbox_path("access_log_pytest_%s"))
+
 # tools.approval_policy.record_bypass_decision's audit trail. Same shape and same reason as
 # MCP_GATE_DIR just above: the module reads MCP_BYPASS_LOG_FILE once, at import, so this must
 # be set at conftest MODULE scope, before tools.approval_policy is imported by anything --
