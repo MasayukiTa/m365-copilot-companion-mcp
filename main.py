@@ -120,6 +120,7 @@ from tools.odbc_ops import (
 )
 from tools.ocr_ops import ocr_image, ocr_pdf
 from tools.render_ops import render_math
+from tools.chart_ops import chart_render, excel_chart_export, chart_from_python
 from tools.schedule_ops import (
     schedule_create,
     schedule_delete,
@@ -690,6 +691,9 @@ TOOLS = (
     list_my_tools, env_info, pip_install, which,
     # security
     unlock, list_unlocked,
+    # generic data -> chart tools (gateway-only: appended after the priority set and past
+    # the MCP_TOOL_MAP_MAX cut, reachable via call_tool; all three are unlock-gated)
+    chart_render, excel_chart_export, chart_from_python,
 )
 
 # --- Tool-gateway mode (MCP_TOOL_MAP=1) --------------------------------------------------
