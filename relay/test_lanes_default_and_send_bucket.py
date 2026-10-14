@@ -123,7 +123,9 @@ def test_the_configured_ceiling_is_a_hard_maximum(monkeypatch):
 
 
 def test_the_default_rate_starts_well_under_the_cloud_limit():
-    assert RF.SOCKET_SEND_RPM <= 40 and RF.SOCKET_SEND_BURST <= 8
+    # default raised 30 -> 100 on 2026-10-14 (owner/main order); the rate actually used is still
+    # min(this, rate_ceiling_rpm), asserted in test_the_configured_ceiling_is_a_hard_maximum.
+    assert RF.SOCKET_SEND_RPM <= 100 and RF.SOCKET_SEND_BURST <= 8
 
 
 def test_a_throttle_cuts_rate_and_burst(open_gate):

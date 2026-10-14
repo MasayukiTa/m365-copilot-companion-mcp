@@ -160,7 +160,7 @@ def test_a_config_error_is_not_answered_with_a_browser_reset():
     wasted budget, and a reset that costs every worker currently running."""
     src = open(os.path.join(REPO, "relay", "fleet_runner.py"), encoding="utf-8").read()
     specific = src.index("except MalformedCheck as e:")
-    generic = src.index("except Exception as e:\n            attempt += 1")
+    generic = src.index("except Exception as e:\n            sweep_active.clear()\n            attempt, _give_up")
     assert specific < generic, (
         "設定エラーの分岐が汎用ハンドラより後ろにある -- 先に汎用が捕まえてリセットする")
     branch = src[specific:generic]
