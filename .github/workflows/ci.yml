@@ -366,6 +366,7 @@ jobs:
             tools/test_data_memory_hook.py \
             tools/test_data_discovery.py \
             tools/test_data_aliases.py \
+            tools/test_sqllib.py \
             tools/test_local_loop_ops.py \
             tools/test_local_loop_registration.py \
             tools/test_lock_state.py \

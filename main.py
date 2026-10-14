@@ -130,6 +130,9 @@ from tools.schedule_ops import (
 )
 from tools.search_web import web_search, web_search_news
 from tools.sql_ops import sqlite_query, sqlite_schema, sqlite_tables, sqlite_to_excel
+from tools.sqllib.mcp_tools import (
+    sql_examples_search, sql_example_save, sql_example_use, sql_example_feedback,
+)
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.tool_probe import get_summary as _tool_probe_summary
@@ -651,6 +654,8 @@ TOOLS = (
     watcher_start, watcher_events, watcher_stop,
     # SQLite (local read-only DB)
     sqlite_tables, sqlite_schema, sqlite_query, sqlite_to_excel,
+    # SQL example library (draft -> validated -> certified); gated, see tools/sqllib/README.md
+    sql_examples_search, sql_example_save, sql_example_use, sql_example_feedback,
     # ODBC (corporate DBs via Windows / Entra auth)
     odbc_drivers, odbc_connections, odbc_tables, odbc_columns, odbc_query, odbc_to_excel,
     # pptx
