@@ -44,6 +44,7 @@ partial class CockpitWindow
     {
         Dictionary<string, object> cap = ReadCaptureStatus();
         bool live = RunIsLive();
+        string tokReason; double tokS;
 
         if (cap == null)
         {
@@ -155,14 +156,35 @@ partial class CockpitWindow
             SetDot(4, HealthState.Yellow, T("hs_agent_route_unknown"), now);
         else if (RouteState() == ROUTE_CLOSED)
         {
-            // THE CANNED-ANSWER SNIFF SURVIVES HERE AND NOWHERE ELSE. It used to decide the
-            // dot's colour, which made a judgement about ONE TURN'S QUALITY into a statement
-            // about infrastructure. It still means something while workers are on tabs, so it
-            // is demoted to a note on the amber rather than deleted.
-            string tail = NewestAssistantText();
-            string note = T("hs_agent_tabs");
-            if (tail != null && LooksLikeCannedNonAnswer(tail)) note += T("hs_agent_canned");
-            SetDot(4, HealthState.Yellow, note, now);
+            // NO "WORKERS ON TABS" STATE EXISTS. Copilot never runs in a tab (relay/no_tab.py),
+            // so a shut route does not move workers anywhere: the goals that need a socket are
+            // HELD in the queue with a reason, and status.json's token_wait says how many and
+            // why. (This branch used to say "every worker is on a tab" -- tab-era wording that
+            // contradicted open_tabs=0 and the edge dot beside it.) Red only when goals are
+            // actually blocked, and the reason is the relay's own text.
+            string heldReason; double heldS;
+            int held = HeldGoals(out heldReason, out heldS);
+            if (held > 0)
+                SetDot(4, HealthState.Red,
+                       T("hs_agent_route_closed_held").Replace("{n}", held.ToString())
+                           .Replace("{why}", heldReason), now);
+            else
+            {
+                // THE CANNED-ANSWER SNIFF SURVIVES HERE AND NOWHERE ELSE: a judgement about one
+                // turn's quality, so it is only a note on the amber, never a colour.
+                string tail = NewestAssistantText();
+                string note = T("hs_agent_route_closed_idle");
+                if (tail != null && LooksLikeCannedNonAnswer(tail)) note += T("hs_agent_canned");
+                SetDot(4, HealthState.Yellow, note, now);
+            }
+        }
+        else if (HeldGoals(out tokReason, out tokS) > 0)
+        {
+            // ROUTE OPEN BUT NO USABLE TOKEN YET: goals are held ("waiting for token") while an
+            // off-thread capture, which sends no turn, retries. Normal for a moment at every
+            // token renewal, so amber; red once it has lasted long enough that it is a fault.
+            SetDot(4, tokS >= TOKEN_WAIT_RED_S ? HealthState.Red : HealthState.Yellow,
+                   T("hs_agent_token_wait").Replace("{s}", ((int)tokS).ToString()), now);
         }
         else if (FleetAgentIsBound())
             SetDot(4, HealthState.Green, T("hs_agent_ok"), now);
@@ -267,6 +289,29 @@ partial class CockpitWindow
     const int ROUTE_OPEN = 0;
     const int ROUTE_CLOSED = 1;
     const int ROUTE_UNKNOWN = 2;
+
+    //: How long goals may wait for a token before the agent dot turns red.
+    const double TOKEN_WAIT_RED_S = 120;
+
+    // Goals the relay is HOLDING because they cannot be bound to a socket right now. The
+    // relay's own account, status.json "token_wait": {waiting, oldest_s, reason}. Returns the
+    // count (0 when nothing is held or the field is absent).
+    int HeldGoals(out string reason, out double oldestS)
+    {
+        reason = ""; oldestS = 0;
+        try
+        {
+            var st = ReadStatus();
+            var tw = (st != null && st.ContainsKey("token_wait")) ? st["token_wait"] as Dictionary<string, object> : null;
+            if (tw == null) return 0;
+            int n = (int)NumberField(tw, "waiting");
+            if (n <= 0) return 0;
+            reason = StringField(tw, "reason") ?? "";
+            oldestS = NumberField(tw, "oldest_s");
+            return n;
+        }
+        catch (Exception) { return 0; }
+    }
 
     int RouteState()
     {

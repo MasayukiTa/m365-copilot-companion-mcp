@@ -100,31 +100,47 @@ def test_agent_is_gray_when_no_run_is_live():
     assert 'SetDot(4, HealthState.Gray, T("hs_agent_gray"), now)' in body[i:i + 200]
 
 
-def test_a_closed_route_is_amber_and_says_workers_are_on_tabs():
-    """経路が閉じている = タブで走っている。障害ではないので赤ではなく黄。"""
+def test_a_closed_route_never_says_workers_are_on_tabs():
+    """Copilot never runs in a tab (relay/no_tab.py): a shut route HOLDS goals, it moves
+    no worker to a tab. Red only when goals are held (count + the relay's reason from
+    status.json token_wait); amber when the route is shut with nothing held."""
     body = _dots_body()
-    # RouteIsClosed became RouteState() when "I could not read the record" needed
-    # somewhere to go that was not "open". The rule under test is unchanged.
     assert "else if (RouteState() == ROUTE_CLOSED)" in body
-    assert 'T("hs_agent_tabs")' in body
-    assert 'SetDot(4, HealthState.Yellow, note, now)' in body
+    assert "hs_agent_tabs" not in SOURCE
+    assert "HeldGoals(" in body
+    assert 'T("hs_agent_route_closed_held")' in body
+    assert 'T("hs_agent_route_closed_idle")' in body
+    blk = body[body.index("else if (RouteState() == ROUTE_CLOSED)"):]
+    blk = blk[:blk.index("else if (FleetAgentIsBound())")]
+    assert "HealthState.Red" in blk and "HealthState.Yellow" in blk
+    assert "HealthState.Green" not in blk
+    assert "全ワーカーがタブ" not in SOURCE
+
+
+def test_token_wait_is_held_goals_not_a_tab_state():
+    body = _dots_body()
+    assert 'T("hs_agent_token_wait")' in body
+    assert "TOKEN_WAIT_RED_S" in body
 
 
 def test_the_canned_answer_sniff_only_annotates_the_amber():
-    """定型の無回答は**色を決めない**。1ターンの質の話を設備の状態に格上げしない。
+    """定型の無回答は**色を決めない**。1ターンの質を設備の状態に格上げしない。
 
-    以前はこれがドットの色を決めていた。今は黄色に付ける注記に降格している。
+    経路閉鎖の分岐では、色は待機中ゴール数(HeldGoals)だけが決める。定型無回答の判定は
+    「待機ゼロの黄色」に付ける注記に限られる。
     """
     body = _dots_body()
-    # RouteIsClosed の分岐**だけ**を切り出す。文字数窓で見ると、コメントを落とした後は
-    # 隣の分岐まで届いてしまい、無関係な SetDot を捕まえて落ちる(実際に落ちた)。
     blk = body[body.index("else if (RouteState() == ROUTE_CLOSED)"):]
-    blk = blk[:blk.index("else if (FleetAgentIsBound())")]
-    assert "LooksLikeCannedNonAnswer" in blk, "定型無回答の判定が黄色の分岐の外にある"
+    blk = blk[:blk.index("else if (HeldGoals(out tokReason")]
     assert 'note += T("hs_agent_canned")' in blk, "注記ではなく色を決めている"
-    assert "HealthState.Red" not in blk and "HealthState.Green" not in blk, (
-        "定型無回答が黄色以外の色を決めている")
-    assert blk.count("SetDot(4,") == 1, "この分岐が複数の色を出している"
+    assert blk.count("LooksLikeCannedNonAnswer") == 1
+    pre = blk[:blk.index("LooksLikeCannedNonAnswer")]
+    assert pre.count("else") >= 1 and "held > 0" in pre, "定型判定が待機ゴールの分岐の外に出ている"
+    tail = blk[blk.index("LooksLikeCannedNonAnswer"):]
+    assert "HealthState.Red" not in tail and "HealthState.Green" not in tail
+    assert tail.count("SetDot(4,") == 1
+
+
 
 
 def test_agent_is_green_only_on_positive_evidence():
