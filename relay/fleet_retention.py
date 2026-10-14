@@ -146,6 +146,9 @@ def rotations(fleet_dir, dry_run=False, keep=None):
         m = _ROTATION.match(n)
         if not m:
             continue
+        # tools/access_log.py's request record: its own size-rotation owns its generations.
+        if m.group(1) == "access.log":
+            continue
         by_base.setdefault(m.group(1), []).append((int(m.group(2)), n))
     freed, removed = 0, []
     for _base, items in by_base.items():
