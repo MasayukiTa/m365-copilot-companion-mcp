@@ -1460,6 +1460,11 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "",
          entire (short) tool-call return value; a long analytical response merely mentioning
          unlock(password=...) is not.
     """
+    if not _unlock_required():
+        # MCP_UNLOCK_REQUIRED=0: the server no longer refuses for lock, so nothing here is a lock
+        # refusal -- a reply that quotes the old text is prose about it. Classifying it as one
+        # would inject a password turn the model rejects as an injection (2026-10-15).
+        return False
     exclusive = _exclusively_refused(worker, since, return_record=True)
     if exclusive:
         _note_locked("exclusive-attribution", resp, since, exclusive, worker)
@@ -1694,6 +1699,8 @@ def _looks_locked_ambiguous(resp: str) -> bool:
     function is the trigger for the PROBE path in _decide: instead of guessing from length,
     ask the worker whether that reply really was a lock refusal.
     """
+    if not _unlock_required():
+        return False
     if _explicit_unlock_not_required(resp):
         return False
     low = (resp or "").lower()
@@ -1729,6 +1736,16 @@ def _probe_answer_is_yes(resp: str) -> bool:
     if "はい" in text or re.search(r"\byes\b", low):
         return True
     return False
+
+
+def _unlock_required() -> bool:
+    """The owner's switch MCP_UNLOCK_REQUIRED (tools/unlock_switch.py), read live from .env.
+    False means no worker is ever told to unlock and no lock refusal is classified."""
+    try:
+        from tools.unlock_switch import unlock_required
+        return unlock_required()
+    except Exception:
+        return True
 
 
 def _unlock_password():
@@ -1797,7 +1814,7 @@ def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
     if plan_mode:
         # Operator-set plan-then-wait: not a component, and not this function's to reinterpret.
         opening = PLAN_PROMPT + goal
-        pw = _unlock_password()
+        pw = _unlock_password() if _unlock_required() else ""
         if not pw:
             return opening, False
         return PROTOCOL + (UNLOCK_PREFIX % pw) + opening, True
@@ -1814,6 +1831,8 @@ def build_reactive_unlock_turn(resume_text: str) -> str:
     sessions call this only after their own non-decisive reply reports that authorization blocked
     the work; it is intentionally NOT an opening-turn helper.
     """
+    if not _unlock_required():
+        return ""      # no unlock exists to recover from; callers treat "" as "nothing to send"
     material = _unlock_password()
     if not material:
         return ""
@@ -5465,6 +5484,20 @@ class RelayWorker:
         affirmative-answer branch. Never raises out of caller expectations; sets
         self.job/self.status/self.reason, or self.status/self.outcome/self.reason on STUCK.
         """
+        if not _unlock_required():
+            # MCP_UNLOCK_REQUIRED=0: never send a password turn and never STUCK on one. Whatever
+            # classified the last reply as a lock refusal was wrong or stale; carry on with the
+            # goal. Bounded by the same counter so a classifier that keeps misfiring cannot loop.
+            if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
+                self._unlock_attempts += 1
+                self.job = self._task_anchor(RETRY_JOB)
+                self.reason = "unlock is not required (MCP_UNLOCK_REQUIRED=0) -> retry the operation"
+                self.status = "ready"
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = ("unlock is switched off (MCP_UNLOCK_REQUIRED=0) yet the worker keeps "
+                           "reporting a lock; the refusal is something else -- read the transcript")
+            return
         pw = _unlock_password()
         if not pw:
             self.status, self.outcome = "stuck", "STUCK"

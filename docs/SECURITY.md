@@ -43,6 +43,15 @@
   session auth を明示的に無効化した場合、または session ID を利用できない transport では、
   `unlock()` が返した `unlock_token` を変更系・実行系の `call_tool(..., unlock_token=...)` に渡します。
   `.fleet/unlock_token_gap.json` は enforcement を明示的に OFF にした配備向けの互換・診断記録です。
+- **`MCP_UNLOCK_REQUIRED`（オーナー専用スイッチ・既定 `1`）**: `0` にすると `require_unlocked()` が全セッションで
+  パスワード・IP 認可・token・session なしで通り、ワーカー向けの指示文・拒否文・再解錠ターンから「unlock せよ」が消えます
+  （`unlock()` を呼んでも「不要」と返すだけ）。背景: 2026-10-15 夜間のフリート実行で、ADAMS DB 系ツール用ワーカー
+  (w1/w4/w19) が、会話に平文で渡されたパスワードをモデルが注入と判断して `unlock()` を呼ばず STUCK になった。
+  `0` / `false` / `off` / `no` / `disabled` 以外の値、未設定、読めない場合は `1`（従来どおり）として扱う。
+  切替は必ず原子的な書き込み口で行う（`python scripts/env_file.py set MCP_UNLOCK_REQUIRED 0` / `... 1`）。
+  サーバのゲート・relay・bridge は `.env` を mtime で再読込するため再起動不要。MCP サーバの指示文だけは起動時に決まるので、
+  アイドル時に再起動すると文面が揃う。`0` の間は `.setup/logs/access.log` に `UNLOCK_SWITCH` 行（状態遷移・起動時・
+  5 分ごとの通過件数）が残る。**`0` はゲート全廃であり、API キーを持つ者は誰でも書込・実行系を使える**（セキュリティは後で）。
 - `127.0.0.1` / `::1` は自動的に信頼（ローカル開発用）。
 - ODBC は `readonly=True` で接続し、`SELECT / WITH / EXEC / SHOW / DESCRIBE` のみ許可。
 - DB 認証は Windows / Entra 統合認証なので、エージェントは **あなたの既存権限の範囲でしか SQL を投げられません**。DBA への新規アカウント申請は不要。
