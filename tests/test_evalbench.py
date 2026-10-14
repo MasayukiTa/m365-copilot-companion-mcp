@@ -481,7 +481,7 @@ def test_environment_directory_is_used_for_relative_paths(tmp_path, monkeypatch)
 
 def test_module_entry_point_runs_and_imports_nothing_from_a_production_tree(tmp_path):
     proc = subprocess.run([sys.executable, "-m", "tools.evalbench", "new-question", "--id", "m1"],
-                          cwd=str(ROOT), capture_output=True, text=True, timeout=60)
+                          cwd=str(ROOT), capture_output=True, encoding="utf-8", errors="replace", timeout=60)
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["id"] == "m1"
     import tools.evalbench as pkg
