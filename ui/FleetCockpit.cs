@@ -14536,8 +14536,17 @@ class CockpitWindow : Window
         var both = new StackPanel { Orientation = Orientation.Vertical };
         both.Children.Add(row);
         both.Children.Add(extraTb);
-        barRow = BuildBudgetBar(w, extraTb.Visibility);
-        if (barRow != null) both.Children.Add(barRow);
+        var barsAll = new StackPanel { Orientation = Orientation.Vertical, Visibility = extraTb.Visibility };
+        var turnsBar = BuildBudgetBar(w, Visibility.Visible);
+        if (turnsBar != null) barsAll.Children.Add(turnsBar);
+        // The other ledger dimensions (workers, concurrent, minutes), additive under the turns bar.
+        int[] moreIdx = { 0, 1, 3 };
+        for (int mi = 0; mi < moreIdx.Length; mi++)
+        {
+            var more = BuildBudgetBarAt(w, moreIdx[mi]);
+            if (more != null) barsAll.Children.Add(more);
+        }
+        if (barsAll.Children.Count > 0) { barRow = barsAll; both.Children.Add(barRow); }
         return both;
     }
 
@@ -14565,6 +14574,35 @@ class CockpitWindow : Window
         bar.Children.Add(new TextBlock {
             Text = text, FontSize = 12, Margin = new Thickness(8, 0, 0, 0), Foreground = Muted,
             VerticalAlignment = VerticalAlignment.Center });
+        System.Windows.Automation.AutomationProperties.SetAutomationId(bar, "budgetBar_turns");
+        return bar;
+    }
+
+    // One more ledger dimension as a bar (idx: 0 total, 1 active, 3 minutes), same drawing and
+    // colouring as the turns bar. Display only; null when that dimension has no cap reported.
+    UIElement BuildBudgetBarAt(Dictionary<string, object> w, int idx)
+    {
+        var g = GroupOfParent(w);
+        if (g == null || _lastRoot == null) return null;
+        double frac; int level;
+        string text = GroupTreeView.BudgetBarAt(_lastRoot, g, idx, _lang == 0, out frac, out level);
+        if (text == null) return null;
+        var fill = level >= 2 ? Theme.Br(Theme.Danger(_dark))
+                   : level == 1 ? Theme.Br(Theme.Warning(_dark)) : Theme.Br(Theme.Info(_dark));
+        const double width = 120;
+        var track = new Grid { Width = width, Height = 6, VerticalAlignment = VerticalAlignment.Center };
+        track.Children.Add(new Border { Background = Theme.Br(Theme.Border(_dark)), CornerRadius = new CornerRadius(3) });
+        track.Children.Add(new Border {
+            Background = fill, CornerRadius = new CornerRadius(3),
+            Width = Math.Max(frac > 0 ? 3 : 0, width * frac), HorizontalAlignment = HorizontalAlignment.Left });
+        var bar = new StackPanel {
+            Orientation = Orientation.Horizontal,
+            Margin = new Thickness(24 + GroupTreeView.IndentPx(g), 2, 0, 0) };
+        bar.Children.Add(track);
+        bar.Children.Add(new TextBlock {
+            Text = text, FontSize = 12, Margin = new Thickness(8, 0, 0, 0), Foreground = Muted,
+            VerticalAlignment = VerticalAlignment.Center });
+        System.Windows.Automation.AutomationProperties.SetAutomationId(bar, "budgetBar_" + FanoutBudgetView.ReportKeys[idx]);
         return bar;
     }
 
