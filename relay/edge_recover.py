@@ -63,6 +63,32 @@ def cdp_alive(cdp_url="http://localhost:9222", timeout_ms=5000):
         return False
 
 
+def cdp_ping(cdp_url="http://localhost:9222", timeout_s=3.0):
+    """Does the browser PROCESS answer on its DevTools port right now? True/False.
+
+    This is the cheap question the stall watchdog asks before it kills the Edge. It reads
+    ``/json/version`` -- the DevTools HTTP endpoint that returns the same payload as the CDP
+    command ``Browser.getVersion`` and is served by the browser process itself -- so it needs
+    no Playwright (cdp_alive spawns a node driver and connects, which is both slow and a load
+    on exactly the machine that is struggling) and is safe to call from the watchdog thread.
+
+    A False means the browser is not answering at all: that, and only that, is the evidence a
+    reset is needed straight away. A True does not prove the sweep is healthy (a page can be
+    hung under a live browser), so the caller still has a bounded ceiling; it just does not
+    treat a slow-but-answering browser as dead."""
+    import json as _json
+    import urllib.request
+    base = str(cdp_url or "").rstrip("/")
+    if not base:
+        return False
+    try:
+        with urllib.request.urlopen(base + "/json/version", timeout=float(timeout_s)) as r:
+            body = _json.loads(r.read().decode("utf-8", "replace") or "{}")
+        return bool(body.get("Browser") or body.get("webSocketDebuggerUrl"))
+    except Exception:
+        return False
+
+
 def hard_reset(port=9222, wait=True):
     """Kill the companion Edge, wipe its session-restore state, relaunch -- by invoking
     start_companion_edge.ps1 -HardReset (the verified path). Safe to call from a thread:

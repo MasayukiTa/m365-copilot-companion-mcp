@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from tools import childproc
+from tools import cockpit_source  # reads every part of the split cockpit source
 
 REPO = Path(__file__).resolve().parents[1]
 UI = REPO / "ui"
@@ -63,12 +64,11 @@ def test_submitted_rows_reconcile_against_new_history_without_swallowing_retries
 
 
 def test_cockpit_passes_history_to_both_submission_merge_boundaries():
-    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    src = cockpit_source.read(encoding="utf-8-sig")
     refresh = src[src.index("void RefreshSubmitted("):src.index("static string StartedOf", src.index("void RefreshSubmitted("))]
     capture = src[src.index("SubmissionBaseline CaptureSubmissionBaseline()"):
                   src.index("void NoteSubmitted(IEnumerable<string> goals)")]
-    note = src[src.index("void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)"):
-               src.index("static string OneLine", src.index("void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)"))]
+    note = cockpit_source.member(src, "void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)")
     assert "HistoryWorkers()" in refresh
     assert "HistoryWorkers()" in capture
     assert "WorkersOf(root)" in capture
@@ -84,7 +84,7 @@ def _method_block(src, name, next_marker):
 
 
 def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
-    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    src = cockpit_source.read(encoding="utf-8-sig")
     assert "sealed class SubmissionBaseline" in src
     assert "SubmissionBaseline CaptureSubmissionBaseline()" in src
     assert "void NoteSubmitted(IEnumerable<string> goals, SubmissionBaseline baseline)" in src
@@ -110,7 +110,7 @@ def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
 
 
 def test_fresh_start_waits_for_closing_coordinator_before_clearing_input():
-    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    src = cockpit_source.read(encoding="utf-8-sig")
     start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
     assert '_fleetLaunchPending' in start
     assert 'waitForClosingRun: true' in start
@@ -134,7 +134,7 @@ def test_fresh_start_waits_for_closing_coordinator_before_clearing_input():
 
 
 def test_fresh_start_uses_unique_goal_file_while_other_spawn_paths_keep_defaults():
-    src = (UI / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    src = cockpit_source.read(encoding="utf-8-sig")
     start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
     assert 'fresh_start_' in start
     assert 'Guid.NewGuid().ToString("N")' in start

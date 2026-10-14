@@ -190,9 +190,8 @@ def test_the_manual_mode_is_still_available():
 # ── and the cockpit agrees with the relay ─────────────────────────────────────────────────
 
 def _cockpit():
-    p = os.path.join(REPO, "ui", "FleetCockpit.cs")
-    with open(p, encoding="utf-8") as fh:
-        return fh.read()
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    return cockpit_source.read(encoding="utf-8")
 
 
 def test_the_cockpit_no_longer_calls_the_unread_mode_recommended():

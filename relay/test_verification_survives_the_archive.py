@@ -28,6 +28,7 @@ import pytest
 
 from relay.fleet_runner import _run_id_of, goals_from_command, read_commands
 from relay.relay_fleet import RelayWorker
+from tools import cockpit_source  # the cockpit source is split across partial-class files
 from relay.task_router import add_goal_to_live_fleet
 
 
@@ -79,7 +80,7 @@ def test_both_archive_sites_carry_the_field(field):
     the operator retires it by hand. Fixing one and leaving the other would make the history
     depend on which route retired the worker -- and that split is the exact shape of the misses
     this codebase keeps recording."""
-    src = io.open("ui/FleetCockpit.cs", encoding="utf-8").read()
+    src = cockpit_source.read(encoding="utf-8")
     hits = len(re.findall(r'e\["%s"\]\s*=' % field, src))
     assert hits == 2, "%s is written at %d of the 2 archive sites" % (field, hits)
 
@@ -87,7 +88,7 @@ def test_both_archive_sites_carry_the_field(field):
 def test_verified_is_copied_as_a_tri_state_not_coerced():
     """`S(w, "verified")` would stringify null to "" and false to "False", and the dashboard
     would then see one value where there are three. The raw object has to pass through."""
-    src = io.open("ui/FleetCockpit.cs", encoding="utf-8").read()
+    src = cockpit_source.read(encoding="utf-8")
     assert 'e["verified"] = w.ContainsKey("verified") ? w["verified"] : null;' in src
     assert 'e["verified"] = S(w, "verified")' not in src, "the tri-state was flattened to a string"
 

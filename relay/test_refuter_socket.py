@@ -157,37 +157,17 @@ def test_a_working_socket_means_the_page_is_never_opened(monkeypatch):
     assert s.socket is True and len(route.asked) == 1
 
 
-def test_the_page_path_carries_the_lens_too(monkeypatch):
-    """観点が落ちると、3人のパネルが同じレビューを3回して多数決が意味を失う。
-    socket 側だけ試験していて、ページ側は無試験だった -- 変異が素通りして分かった。"""
-    sent = []
-
-    class _Page:
-        def goto(self, *a, **k):
-            pass
-
-        def wait_for_timeout(self, _ms):
-            pass
-
-        def locator(self, _sel):
-            return types.SimpleNamespace(count=lambda: 1)
-
-        def close(self):
-            pass
-
-    class _Drv2(_FakeDrv):
-        def send(self, text, **_kw):
-            sent.append(text)
-
+def test_the_page_path_is_refused_not_opened(monkeypatch):
+    """The page path (and its lens handling) was removed with the tab: a refuter that cannot
+    get a socket fails with a harness reason instead of opening a page."""
     class _Ctx:
         def new_page(self):
-            return _Page()
+            raise AssertionError("opened a page")
 
-    import relay.copilot_autopilot_relay as CAR
-    monkeypatch.setattr(CAR, "CopilotWebDriver", lambda page: _Drv2())
     s = RF.RefuterSession(_Ctx(), "https://agent/impl", "目標", "最終回答", lens="security")
     s._do_open()
-    assert sent == [RF.build_refuter_prompt("目標", "最終回答", lens="security")]
+    assert s._done is not None and s._done[0] == "UNCLEAR"
+    assert s._done[1].startswith("harness: ")
 
 
 def test_the_offline_probe_is_not_run_against_a_socket(monkeypatch):

@@ -11,7 +11,9 @@ import io
 import os
 import re
 
-REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+from tools import cockpit_source  # the cockpit source is split across partial-class files
+
+REPO =os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _src(*parts):
@@ -31,7 +33,7 @@ def test_the_reopen_is_written_to_the_ledger():
 
 def test_the_dot_takes_the_newest_route_event():
     """閉鎖1件で即断せず、閉鎖と開放の**新しい方**を採ること。"""
-    src = _src("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8")
     body = src[src.index("int RouteState()"):]
     body = body[:body.index("\n    DateTime RunStartedLocal()")]
 
@@ -49,7 +51,7 @@ def test_both_events_carry_the_timestamp_key_the_scan_looks_for():
     ここがずれると走査は黙って0件になり、**fail-open** する — 経路がどうなっていても
     「開いています」と答える。過去に一度この形で壊れている。
     """
-    cs = _src("ui", "FleetCockpit.cs")
+    cs = cockpit_source.read(encoding="utf-8")
     assert 'const string AtKey = "\\"at\\": \\""' in cs
 
     # 記録側: record() は json.dumps で書く(コロンの後に空白が入る)。

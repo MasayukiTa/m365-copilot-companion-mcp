@@ -22,6 +22,7 @@ import time
 import pytest
 
 from relay import capture_status as CS
+from tools import cockpit_source  # the cockpit source is split across partial-class files
 
 
 class _Template:
@@ -152,8 +153,7 @@ def test_the_cockpit_hashes_a_surface_the_same_way_python_does():
 
     from relay.profile_token import template_path
 
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "ui", "FleetCockpit.cs"), encoding="utf-8").read()
+    src = cockpit_source.read(encoding="utf-8")
     assert "Sha256Prefix" in src, "the cockpit no longer hashes the surface"
     assert re.search(r"for \(int i = 0; i < 8; i\+\+\)", src), \
         "the cockpit takes a different number of bytes than Python's 16 hex characters"
@@ -166,8 +166,7 @@ def test_the_cockpit_hashes_a_surface_the_same_way_python_does():
 def test_the_cockpit_no_longer_judges_sign_in_from_the_tab_list():
     """The predicate that read the tab list is gone with the tab list. A predicate over an
     empty list returns false, so the dot went green because nothing was there."""
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "ui", "FleetCockpit.cs"), encoding="utf-8").read()
+    src = cockpit_source.read(encoding="utf-8")
     for gone in ("LooksLikeUsableM365Chat", "hasUsableM365Chat", "ExtractTabUrls",
                  "LooksLikeLoginWall("):
         assert gone not in src.replace("// ", "").split("UpdateCaptureDots")[0] or True
@@ -178,17 +177,20 @@ def test_the_cockpit_no_longer_judges_sign_in_from_the_tab_list():
 
 
 def test_the_cockpit_reads_the_capture_record():
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "ui", "FleetCockpit.cs"), encoding="utf-8").read()
+    src = cockpit_source.read(encoding="utf-8")
     assert "capture_status.json" in src
     assert "UpdateCaptureDots" in src
 
 
-def test_a_closed_route_is_amber_and_not_red():
-    """Every worker on a tab WORKS, and costs several times more. Red would be a wolf-cry,
-    green would hide a cost regression, and grey would be confused with idle. Amber is exactly
-    'working, worth knowing'."""
-    src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            "ui", "FleetCockpit.cs"), encoding="utf-8").read()
+def test_a_closed_route_is_amber_unless_goals_are_actually_held():
+    """There is no tab to fall back to (relay/no_tab.py), so a shut route moves no worker
+    anywhere. With nothing queued behind it the route is 'worth knowing' and nothing more --
+    amber, the same as idle, so a cost-free state is never a wolf-cry. Red is reserved for goals
+    the relay is HOLDING because they cannot be bound to a socket (status.json token_wait)."""
+    src = cockpit_source.read(encoding="utf-8")
     i = src.index("else if (RouteState() == ROUTE_CLOSED)")
-    assert "HealthState.Yellow" in src[i:i + 900]
+    block = src[i:i + 2600]
+    j = block.index("if (held > 0)")
+    assert "HealthState.Red" in block[j:j + 300], "goals held behind a closed route must be red"
+    assert "HealthState.Yellow" in block[j + 300:], "a closed route with nothing held must be amber"
+    assert "WORKERS ON TABS" not in block.replace('NO "WORKERS ON TABS" STATE EXISTS', "")

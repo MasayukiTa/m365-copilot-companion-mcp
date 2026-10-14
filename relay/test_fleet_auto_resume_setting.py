@@ -32,6 +32,7 @@ if REPO not in sys.path:
 
 from relay import fleet_resume as FRES   # noqa: E402
 from relay import task_router as TR       # noqa: E402
+from tools import cockpit_source          # noqa: E402  (the cockpit source is split across files)
 from tools import settings_keys as SK     # noqa: E402
 from tools import settings_path as SP     # noqa: E402
 
@@ -248,6 +249,15 @@ def test_the_coordinators_status_carries_the_block(state, settings, monkeypatch)
     settings("on")
     monkeypatch.setattr(FR, "_ACTIVE_STATE_DIR", str(state))
     _snap(state, run_id="rS")
+    # THE REPORT IS READ OFF THE SWEEP'S HOT PATH NOW: the first call starts a daemon thread
+    # that refreshes a cache, and returns the previous (empty) value. Reset the cache, start the
+    # refresh, wait for it to land, and read the block the next sweep would see.
+    import time
+    FR._AUTO_RESUME_CACHE.update(value={}, at=0.0, running=False)
+    assert FR._auto_resume_block() == {}
+    deadline = time.time() + 10
+    while FR._AUTO_RESUME_CACHE["running"] and time.time() < deadline:
+        time.sleep(0.01)
     block = FR._auto_resume_block()
     assert block["auto_resume"]["pending_snapshots"] == 1 and block["auto_resume"]["setting"] == "on"
     src = io.open(os.path.join(REPO, "relay", "fleet_runner.py"), encoding="utf-8").read()
@@ -257,6 +267,8 @@ def test_the_coordinators_status_carries_the_block(state, settings, monkeypatch)
 # -- the cockpit control --------------------------------------------------------------------------
 
 def _cs(name):
+    if name == "FleetCockpit.cs":
+        return cockpit_source.read(encoding="utf-8-sig")
     return io.open(os.path.join(REPO, "ui", name), encoding="utf-8-sig").read()
 
 

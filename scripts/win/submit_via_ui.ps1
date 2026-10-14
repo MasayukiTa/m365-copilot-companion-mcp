@@ -24,12 +24,14 @@ param(
     [switch]$Steer,
     [string]$Command = "",
     [switch]$ReadOnly,
+    [switch]$Resubmit,
     [int]$TimeoutSeconds = 30
 )
 
 $ErrorActionPreference = "Stop"
 $RepoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 . (Join-Path $PSScriptRoot 'gui_submit_lock.ps1')
+. (Join-Path $PSScriptRoot 'gui_submit_ledger.ps1')
 Add-Type -AssemblyName UIAutomationClient, UIAutomationTypes, System.Windows.Forms
 
 if (-not ('Win32.Wnd' -as [type])) {
@@ -217,8 +219,8 @@ if ($target) {
     }
     if (-not $best) { throw 'no writable text field found in the cockpit' }
     if ($secondW -gt 0 -and $bestW -lt ($secondW * 2)) {
-        throw ('cannot tell the goal box from the other field: widths {0:N0} and {1:N0}. ' +
-               'Rebuild the cockpit so the box carries its AutomationId.' -f $bestW, $secondW)
+        throw (('cannot tell the goal box from the other field: widths {0:N0} and {1:N0}. ' +
+               'Rebuild the cockpit so the box carries its AutomationId.') -f $bestW, $secondW)
     }
     $target = $best
     Write-Output ('goal box: by width {0:N0} (next widest {1:N0}) -- no AutomationId' -f $bestW, $secondW)
@@ -284,7 +286,50 @@ function Test-GoalAccepted($before, $after, [int]$expectedCount) {
     return [bool]($fresh -or $liveGrowth)
 }
 
+$script:ledgerPath = Join-Path (Join-Path $RepoRoot '.fleet') 'gui_submissions.json'
+$script:invoked = $false
+$script:ledgerKey = ''
+
+# A FAILED SUBMIT LEAVES NOTHING BEHIND, AND A SUBMIT THAT MAY HAVE LANDED IS NEVER REPEATED.
+#  * Before the button is pressed: any failure restores the composer to the text it held before
+#    this call (a half-written or corrupted composer used to stay there and be sent by the next
+#    click, from this script or a person).
+#  * After the button is pressed and not confirmed: the goal set stays recorded for 30 minutes
+#    and a retry of the same goals is refused unless -Resubmit is given, because the cockpit has
+#    probably queued it and the runner turns a second identical command into a second task.
 function Submit([string]$text, [switch]$ExpectFleetGoal) {
+    $script:invoked = $false
+    $prior = ''
+    $vp0 = $null
+    if ($target.TryGetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern, [ref]$vp0)) {
+        $prior = [string]$vp0.Current.Value
+    }
+    if ($ExpectFleetGoal -and -not $Resubmit) {
+        $goalsHere = @($text -split "`r?`n" | ForEach-Object { $_.Trim() } |
+                       Where-Object { $_.Length -gt 0 -and -not $_.StartsWith('#') })
+        $when = Get-RecentInvocation -Path $script:ledgerPath -Key (Get-GoalSetKey $goalsHere) -WindowSeconds 1800
+        if ($when -gt 0) {
+            $why = "these goals were already handed to the cockpit at unix time {0} and that attempt was never confirmed; " +
+                   "NOT submitting again (a second identical command becomes a second task). Check the cockpit/status.json, " +
+                   "or pass -Resubmit to submit anyway."
+            throw ($why -f $when)
+        }
+    }
+    try {
+        Submit-Core $text -ExpectFleetGoal:$ExpectFleetGoal
+        if ($ExpectFleetGoal -and $script:ledgerKey) {
+            # Confirmed: the record exists only to stop retries of an UNCONFIRMED attempt.
+            Remove-SubmissionRecord -Path $script:ledgerPath -Key $script:ledgerKey
+        }
+    } catch {
+        if (-not $script:invoked) {
+            try { [void](Set-Text $target $prior) } catch { }
+        }
+        throw
+    }
+}
+
+function Submit-Core([string]$text, [switch]$ExpectFleetGoal) {
     # CTRL+ENTER, NOT ENTER. The composer sets AcceptsReturn, so a plain Enter inserts a
     # newline and nothing is submitted -- which is exactly what happened the first time
     # this ran: the goal went into the box, the box grew a line, and no run started while
@@ -360,8 +405,8 @@ function Submit([string]$text, [switch]$ExpectFleetGoal) {
         while ($at -lt $common -and $observed[$at] -eq $text[$at]) { $at++ }
         $expectedCode = if ($at -lt $text.Length) { "U+{0:X4}" -f [int][char]$text[$at] } else { "<end>" }
         $observedCode = if ($at -lt $observed.Length) { "U+{0:X4}" -f [int][char]$observed[$at] } else { "<end>" }
-        throw ("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
-               "Nothing was submitted and the current composer text was left untouched." -f
+        throw (("composer text changed before submit at index {0}: expected {1}, observed {2}; lengths {3}->{4}. " +
+               "Nothing was submitted; the composer was restored to its prior text.") -f
                $at, $expectedCode, $observedCode, $text.Length, $observed.Length)
     }
 
@@ -374,6 +419,13 @@ function Submit([string]$text, [switch]$ExpectFleetGoal) {
         $baseline = Get-GoalAcceptanceSnapshot $expectedGoals
     }
 
+    # From here a command may land. Record it BEFORE the button is pressed so any failure after
+    # this point (timeout, crash) is known to the next attempt as "invoked, unconfirmed".
+    if ($ExpectFleetGoal) {
+        $script:ledgerKey = Get-GoalSetKey $expectedGoals
+        Add-SubmissionRecord -Path $script:ledgerPath -Key $script:ledgerKey -WindowSeconds 1800
+        $script:invoked = $true
+    }
     [Console]::Error.WriteLine(("submit: invoking button '{0}'" -f $startBtn.Current.Name))
     $ip.Invoke()
 

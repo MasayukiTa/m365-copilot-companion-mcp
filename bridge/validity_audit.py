@@ -32,8 +32,10 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import re
 import sys
+import threading
 import time
 
 UNATTRIBUTED = "UNATTRIBUTED"
@@ -89,10 +91,13 @@ def _read_events(path, tail_bytes=None):
 
 def _worker_rows(conn, key):
     prefix = key + "__refuter_"
+    # INDEXABLE. `substr(key, 1, n) = ?` cannot use fleet_turns_key_idx, so this was a full scan
+    # of a 320 MB table (43-75 s cold) on the fleet's sweep thread, once per worker close. The
+    # prefix match is the range [prefix, prefix + U+10FFFF) on the BINARY-collated key column.
     return [dict(r) for r in conn.execute(
         "SELECT id, key, name, turn, role, text, extra, ts FROM fleet_turns "
-        "WHERE key = ? OR substr(key, 1, ?) = ? ORDER BY ts, id",
-        (key, len(prefix), prefix))]
+        "WHERE key = ? OR (key >= ? AND key < ?) ORDER BY ts, id",
+        (key, prefix, prefix[:-1] + chr(ord(prefix[-1]) + 1)))]
 
 
 def _call_text(call):
@@ -273,6 +278,62 @@ def sync_unattributed_calls(ledger_path, since, until, *, tail_bytes=None, dry_r
         return {"rows": len(out), "inserted": 0, "already_there": 0, "dry_run": True}
     ins, skipped = S.append_validity_audit(out) if out else (0, 0)
     return {"rows": len(out), "inserted": ins, "already_there": skipped}
+
+
+_Q = None
+_Q_LOCK = threading.Lock()
+_PENDING = set()
+
+
+def _drain():
+    while True:
+        key, kw = _Q.get()
+        try:
+            sync_worker_logged(key, **kw)
+        except Exception:
+            pass
+        finally:
+            with _Q_LOCK:
+                _PENDING.discard(key)
+            _Q.task_done()
+
+
+def sync_worker_async(worker_key, **kw):
+    """Queue the audit sync for a worker and return at once (O(1) on the caller's thread).
+
+    A worker's close() runs on the fleet's sweep thread, and the sync reads up to 16 MB of tool
+    ledger and queries sqlite per worker: 39 cancelled workers froze the sweep for over 150 s
+    and the watchdog reset Edge (2026-10-14). The sync is idempotent (append_validity_audit
+    skips rows already there), so running it later on a single daemon thread, in order, loses
+    nothing but the case of a process exit before the queue drains -- which the backfill script
+    covers. Opens no page. A key already queued is not queued twice. Never raises."""
+    global _Q
+    try:
+        with _Q_LOCK:
+            if _Q is None:
+                _Q = queue.Queue()
+                threading.Thread(target=_drain, name="validity-audit-sync",
+                                 daemon=True).start()
+            if worker_key in _PENDING:
+                return False
+            _PENDING.add(worker_key)
+        _Q.put((worker_key, kw))
+        return True
+    except Exception:
+        return False
+
+
+def wait_async_idle(timeout=30.0):
+    """Block until the queue is drained (tests, orderly shutdown). True when drained."""
+    if _Q is None:
+        return True
+    end = time.time() + timeout
+    while time.time() < end:
+        with _Q_LOCK:
+            if not _PENDING:
+                return True
+        time.sleep(0.01)
+    return False
 
 
 def sync_worker_logged(worker_key, **kw):

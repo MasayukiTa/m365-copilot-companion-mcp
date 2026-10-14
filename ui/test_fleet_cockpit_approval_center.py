@@ -1,7 +1,9 @@
 from pathlib import Path
 
+from tools import cockpit_source  # reads every part of the split cockpit source
 
-SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8")
+
+SOURCE = cockpit_source.read(encoding="utf-8")
 
 
 def test_run_mode_is_not_mislabeled_as_operation_approval():

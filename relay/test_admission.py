@@ -13,9 +13,6 @@ properties of the new design:
   (c) verify tab counts in the cap -- a worker in 'verifying' still HOLDS its slot, so a tab in
                                      verify is counted by _active_open and a 1-cap fleet does
                                      NOT open a second tab while one verifies.
-  (d) hysteresis damps thrash      -- with an up-margin dead-band, RAM jitter around the line no
-                                     longer oscillates the cap 1<->N; it HOLDS at the water level
-                                     (and still drains immediately on a real deficit).
 
 Run:  .venv\\Scripts\\python.exe relay\\test_admission.py
 """
@@ -27,7 +24,7 @@ sys.path.insert(0, str(REPO))
 
 import relay.relay_fleet as rf
 from relay.relay_fleet import (
-    disk_admission_ok, ram_target_cap, run_relay_fleet, RelayWorker, TERMINAL,
+    disk_admission_ok, run_relay_fleet, RelayWorker, TERMINAL,
 )
 
 results = []
@@ -113,72 +110,37 @@ def test_disk_floor_predicate():
           reserve_gb=rf.repo_eval_gb("pydata__xarray-1")*2) is True)
 
 
-# ── (d) anti-thrash hysteresis ─────────────────────────────────────────────────────────────
-def test_hysteresis_no_thrash():
-    cap = ram_target_cap
-    PER, HEAD = 700, 1400
-
-    # Simulate the thrash trigger: free RAM hovers just around the up/down line while the cap
-    # sits at 2 with 2 tabs open. WITHOUT a dead-band (legacy up_margin=0) a tiny surplus makes
-    # it ramp to 3; with a dead-band it HOLDS at 2.
-    #   raw = open_now + (avail - HEAD)//PER. open_now=2.
-    #   avail = HEAD + 100 (a small surplus, < PER): raw = 2 + 0 = 2 -> never ramps up anyway.
-    #   avail = HEAD + PER + 50 (just over one tab's worth): raw = 2 + 1 = 3 -> WOULD ramp up.
-    rf.avail_phys_mb = lambda: float(HEAD + PER + 50)      # 50 MB into the next tab's budget
-
-    # legacy (no margin): a 50 MB surplus over a full tab budget is enough -> ramps up to 3
-    check("legacy_ramps_on_tiny_surplus",
-          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=0) == 3)
-    # hysteresis: require 700 MB EXTRA headroom on top of the tab budget -> 50 MB is inside the
-    # dead-band -> HOLD at 2 (no thrash)
-    check("hysteresis_holds_in_deadband",
-          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 2)
-
-    # a genuine, sustained surplus (well past the dead-band) DOES ramp up one step
-    rf.avail_phys_mb = lambda: float(HEAD + 2 * PER + 100)
-    check("hysteresis_ramps_on_real_surplus",
-          cap(2, 2, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 3)
-
-    # the dead-band NEVER blocks a DOWN drain: a real RAM deficit still drops the cap at once,
-    # regardless of up_margin (down is immediate, only the up side has the dead-band).
-    rf.avail_phys_mb = lambda: float(HEAD - 2 * PER)       # deficit of two tabs
-    check("hysteresis_drain_still_immediate",
-          cap(3, 3, 8, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER) == 1)
-
-    # Stability over a JITTERY sequence: feed an oscillating RAM reading and confirm the cap
-    # under hysteresis never grows past the settled level, while legacy does grow.
-    jitter = [HEAD + PER + 30, HEAD + PER - 30, HEAD + PER + 60, HEAD + PER - 10,
-              HEAD + PER + 40, HEAD + PER + 20]
-    # hysteresis run
-    capn = 2
-    grew_h = False
-    for j in jitter:
-        rf.avail_phys_mb = (lambda v: (lambda: float(v)))(j)
-        new = cap(2, capn, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=PER)
-        if new > capn:
-            grew_h = True
-        capn = new
-    check("hysteresis_no_growth_under_jitter", grew_h is False and capn == 2)
-    # legacy run on the SAME jitter -> it WOULD grow (proves the dead-band is what damps it)
-    capn = 2
-    grew_l = False
-    for j in jitter:
-        rf.avail_phys_mb = (lambda v: (lambda: float(v)))(j)
-        new = cap(2, capn, 4, per_tab_mb=PER, headroom_mb=HEAD, up_margin_mb=0)
-        if new > capn:
-            grew_l = True
-        capn = new
-    check("legacy_grows_under_jitter", grew_l is True)
-
-
 # ── shared harness for the loop-level tests (b) and (c) ─────────────────────────────────────
+class _ReadyRoute:
+    """A socket route that is open and holds a token: admission proceeds (no hold, no tab)."""
+    enabled = True
+    closed_reason = ""
+
+    def open(self):
+        return True
+
+    def ready(self, agent_url=None):
+        return True
+
+    def needs_refresh(self, agent_url=None):
+        return False
+
+    def record(self, *a, **k):
+        pass
+
+    def status(self):
+        return {"open": True, "closed_reason": "", "turns": 0}
+
+
 def _install_fake_worker(monkey_state):
     """Monkeypatch RelayWorker so attach/poll/close are deterministic and browser-free.
 
     Each worker, when attached, gets a sentinel page and goes 'waiting'. Its poll() consults
     a per-name control dict: 'verifying' keeps it busy (non-terminal, holds the tab); 'done'
     flips it terminal. close() just drops the page (frees the slot)."""
-    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close}
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
+            "route": rf._socket_route}
+    rf._socket_route = lambda: _ReadyRoute()
 
     def fake_attach(self, context, agent_url):
         self.page = object()              # sentinel: a non-None page = holds a tab
@@ -214,6 +176,7 @@ def _restore_worker(orig):
     RelayWorker.attach = orig["attach"]
     RelayWorker.poll = orig["poll"]
     RelayWorker.close = orig["close"]
+    rf._socket_route = orig["route"]
     if "tab_weight" in orig:
         RelayWorker.tab_weight = orig["tab_weight"]
 
@@ -223,23 +186,8 @@ def test_continuous_admission_no_barrier():
     rf.avail_phys_mb = lambda: 64000.0       # RAM never the constraint here
     rf.free_disk_gb = lambda path=None: 500.0  # disk never the constraint here
 
-    # THIS TEST IS ABOUT THE TAB CAP. Socket workers deliberately bypass worker-count/tab
-    # admission and are paced at the generative send instead (test_socket_admission_no_pending).
-    # Force the route closed here so fake_attach's page sentinel represents the route the
-    # production admission loop actually budgeted.
-    class _NoSocketRoute:
-        closed_reason = ""
-        def open(self):
-            return False
-        def needs_refresh(self):
-            return False
-        def record(self, *a, **k):
-            pass
-
-    orig_route = rf._socket_route
-    orig_due = rf.admission_is_due
-    rf._socket_route = lambda: _NoSocketRoute()
-    rf.admission_is_due = lambda now=None: True
+    # THIS TEST IS ABOUT THE LANE CAP (the socket capacity). _install_fake_worker installs a ready
+    # socket route so the admission loop admits; fake_attach's page sentinel stands for a held slot.
 
     state = {"control": {}}
     orig = _install_fake_worker(state)
@@ -287,8 +235,6 @@ def test_continuous_admission_no_barrier():
         # not move with poll_s or with the speed of the machine.
         check("continuous_made_progress", opens["transitions"] <= 12)
     finally:
-        rf._socket_route = orig_route
-        rf.admission_is_due = orig_due
         _restore_worker(orig)
 
 
@@ -849,8 +795,8 @@ def test_soft_shrink_does_not_close_running_tabs():
     the NEXT open. This is BY DESIGN (confirmed: no worker.close() call anywhere gets fired by
     a cap change, only by a worker going terminal -- see the sweep loop in run_relay_fleet).
 
-    This test proves the property end-to-end, not just the pure ram_target_cap math already
-    covered by test_hysteresis_no_thrash: start 2 workers under cap=2, shrink mc_box to 1
+    This test proves the property end-to-end (the pure ram_target_cap math it once sat beside has
+    been retired): start 2 workers under cap=2, shrink mc_box to 1
     WHILE both are still open, and confirm (a) neither running worker is torn down by the
     shrink, so open tab count can sit above the live cap for a while -- exactly the cockpit's
     "N/M with N>M" reading -- and (b) admission of the 3rd goal stays blocked until enough
@@ -956,7 +902,8 @@ def _install_fake_socket_worker(monkey_state):
     unit `_active_open()` counts) is True for a socket worker precisely so this fixture can
     stand in for the production socket-route path without opening a browser."""
     orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
-            "tab_weight": RelayWorker.tab_weight}
+            "tab_weight": RelayWorker.tab_weight, "route": rf._socket_route}
+    rf._socket_route = lambda: _ReadyRoute()
 
     def fake_attach(self, context, agent_url):
         self.socket = True
@@ -1033,44 +980,6 @@ def test_socket_workers_respect_the_live_cap():
               len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
         check("socket_admission_never_exceeded_cap_of_one",
               observed["max_concurrent_sockets"] <= 1)
-    finally:
-        _restore_worker(orig)
-
-
-def test_tab_budget_admission():
-    # A worker that fans out to 3 tabs consumes the whole 3-tab budget, so a 2nd worker waits --
-    # "3 open tabs == parallelism 3", reactive, no human cap. All goals still complete (continuous).
-    rf.avail_phys_mb = lambda: 64000.0
-    rf.free_disk_gb = lambda path=None: 500.0
-    state = {"control": {}}
-    orig = _install_fake_worker(state)
-    try:
-        goals = ["g0", "g1", "g2"]
-        max_tabs = {"v": 0}
-        max_mains = {"v": 0}
-        class _Open: page = object()
-
-        def on_tick(workers):
-            # fan the currently-open worker out to 3 tabs BEFORE completing it
-            cur = [w for w in workers if getattr(w, "page", None) is not None and w.status == "waiting"]
-            for w in cur:
-                if w.tab_load() < 3:
-                    w._research_session = _Open(); w._refuter_session = _Open()
-            max_tabs["v"] = max(max_tabs["v"], sum(w.tab_load() for w in workers))
-            mains = sum(1 for w in workers if getattr(w, "page", None) is not None and w.status not in TERMINAL)
-            max_mains["v"] = max(max_mains["v"], mains)
-            # once it is at full fan-out, complete it so the next can be admitted
-            for w in cur:
-                if w.tab_load() >= 3:
-                    w._research_session = None; w._refuter_session = None
-                    state["control"][w.name] = "done"
-                    break
-
-        res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=3,
-                              poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
-        check("tab_budget_all_complete", len(res) == 3 and all(r["outcome"] == "DONE" for r in res))
-        check("tab_budget_total_tabs_capped", max_tabs["v"] <= 3)     # 3-tab budget held
-        check("tab_budget_one_main_when_fanned", max_mains["v"] == 1)  # a 3-tab worker runs solo
     finally:
         _restore_worker(orig)
 
@@ -1278,7 +1187,9 @@ def test_unfinished_excludes_stuck_keeps_infra_stuck():
     import time as _t
     rf.avail_phys_mb = lambda: 64000.0
     rf.free_disk_gb = lambda path=None: 500.0
-    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close}
+    orig = {"attach": RelayWorker.attach, "poll": RelayWorker.poll, "close": RelayWorker.close,
+            "route": rf._socket_route}
+    rf._socket_route = lambda: _ReadyRoute()
 
     # each goal's TEXT encodes the terminal state its (single) poll() call should reach;
     # "g_running" is deliberately absent from the map so it never goes terminal.
@@ -1349,6 +1260,7 @@ def test_unfinished_excludes_stuck_keeps_infra_stuck():
         RelayWorker.attach = orig["attach"]
         RelayWorker.poll = orig["poll"]
         RelayWorker.close = orig["close"]
+        rf._socket_route = orig["route"]
 
 
 def test_stuck_noprogress_early_exit():
@@ -1396,10 +1308,8 @@ def main():
     """
     for _fn in (test_disk_floor_predicate,
                 test_tab_load_accounting,
-                test_tab_budget_admission,
                 test_socket_workers_respect_the_live_cap,
                 test_soft_shrink_does_not_close_running_tabs,
-                test_hysteresis_no_thrash,
                 test_continuous_admission_no_barrier,
                 test_verifying_counts_in_cap,
                 test_disk_floor_blocks_in_loop,

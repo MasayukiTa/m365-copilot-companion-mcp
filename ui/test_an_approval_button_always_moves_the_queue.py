@@ -35,6 +35,8 @@ from __future__ import annotations
 import os
 import re
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 UI = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(UI, "FleetCockpit.cs")
 
@@ -42,8 +44,7 @@ SRC = os.path.join(UI, "FleetCockpit.cs")
 def _code() -> str:
     """The source with // comments stripped -- the comments below name every identifier this
     file asserts on, so without this the module would pass on its own explanations."""
-    with open(SRC, encoding="utf-8") as fh:
-        text = fh.read()
+    text = cockpit_source.read(encoding="utf-8")
     return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.splitlines())
 
 

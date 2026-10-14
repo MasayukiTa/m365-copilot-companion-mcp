@@ -64,7 +64,12 @@ def annotation_for(context, agent_url, upload_path, token, *, log=None):
             return None
 
         captured = {}
-        page = context.new_page()
+        # The upload was derived by driving the Copilot page's own file input in a tab. Copilot
+        # never runs in a browser tab (owner rule, relay/no_tab.py), so this refuses and the
+        # attachment goal is reported as unable to attach rather than opening one.
+        from relay.no_tab import forbid_copilot_tab
+        forbid_copilot_tab("attachment upload page")
+        page = None
         try:
             def _on_request(req):
                 if "uploadfile" not in (req.url or "").lower() or captured:

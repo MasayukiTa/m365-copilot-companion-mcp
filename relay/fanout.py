@@ -787,7 +787,21 @@ def campaigns_from_ledger(lines):
     Tolerant by construction: a truncated final line (the run died mid-write, which is the
     scenario) must not lose the families above it.
     """
-    out = {}
+    out = ledger_ingest({}, lines)
+    # A FAMILY WITHOUT ITS HEADER CANNOT BE MERGED, and saying so is better than returning
+    # a campaign whose parent goal is the empty string -- which would merge into nothing.
+    return ledger_families(out)
+
+
+def ledger_families(out):
+    """The header-bearing families of a raw `ledger_ingest` state (a new dict, shared families)."""
+    return {cid: fam for cid, fam in out.items() if fam.get("goal")}
+
+
+def ledger_ingest(out, lines):
+    """Fold more ledger lines into the raw state `out` (mutated and returned). Feeding a ledger
+    in several slices gives exactly the state of feeding it at once, which is what lets
+    fleet_resume keep an index and read only the appended bytes. See campaigns_from_ledger."""
     for line in lines or []:
         line = (line or "").strip()
         if not line.startswith("{"):
@@ -869,9 +883,7 @@ def campaigns_from_ledger(lines):
         entry = out.setdefault(cid, {"goal": "", "n": 0, "cwd": None, "checks": [],
                                      "partial": "", "merged": False, "children": []})
         entry["children"].append(rec)
-    # A FAMILY WITHOUT ITS HEADER CANNOT BE MERGED, and saying so is better than returning
-    # a campaign whose parent goal is the empty string -- which would merge into nothing.
-    return {cid: fam for cid, fam in out.items() if fam.get("goal")}
+    return out
 
 
 def missing_slices(records):

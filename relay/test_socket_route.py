@@ -103,14 +103,14 @@ def test_closing_is_one_way():
 
 # ---- トークン -------------------------------------------------------------------------------
 
-def test_a_capture_that_fails_does_not_raise_and_counts_as_a_failure():
-    """捕獲が失敗する = 全員タブで走る。この経路が無かった時と同じ状態であって、事故ではない。"""
+def test_a_capture_that_fails_does_not_raise_and_is_not_a_breaker_failure():
+    """捕獲の失敗では経路を閉じない(タブは無い。ゴールはtoken待ちで待ち、捕獲は間隔を空けて再試行される)。"""
     def boom(_ctx, _url):
         raise RuntimeError("no composer")
 
     r = _route(capture_fn=boom)
     assert r.refresh(object(), "url") is False
-    assert r.fallbacks == 1
+    assert r.fallbacks == 0 and r.open()
     assert r.driver_for("w0") is None
 
 
@@ -151,30 +151,13 @@ def test_an_expired_token_hands_out_no_driver():
     assert r.driver_for("w0") is None
 
 
-def test_the_capture_tab_is_closed_again():
-    """出発点が『生存確認のためにタブを開きっぱなし』だったので、
-    トークンのためにタブを開きっぱなしにしたら同じ過ちを別の言い訳でやることになる。"""
+def test_there_is_no_capture_tab_at_all():
+    """The capture tab (a real turn in a page) was removed: Copilot never runs in a tab."""
     from relay import socket_route as SR
+    from relay.no_tab import CopilotTabForbidden
+    with pytest.raises(CopilotTabForbidden):
+        SR.capture_via_tab(object(), "url")
 
-    closed = []
-
-    class _Page:
-        def close(self):
-            closed.append(1)
-
-    monkey = {}
-    monkey["open"] = rf._open_fresh
-    rf._open_fresh = lambda ctx, url: _Page()
-    import relay.chathub_capture as CC
-    orig = CC.capture
-    CC.capture = lambda page, **kw: (_token(), _Tpl())
-    try:
-        tok, tpl = SR.capture_via_tab(object(), "url")
-    finally:
-        rf._open_fresh = monkey["open"]
-        CC.capture = orig
-    assert tok and tpl
-    assert closed == [1]
 
 
 # ---- 艦隊への配線 ---------------------------------------------------------------------------
@@ -218,14 +201,24 @@ def test_a_url_resume_is_never_given_a_socket(monkeypatch):
     で成立し、しかもタブを開かないほうが速く安いので、区別すべきは resume かどうかではなく
     「渡されたのがページか会話か」になった。URL 側の不変条件はそのまま残す。
     """
-    monkeypatch.setattr(rf, "_socket_route",
-                        lambda: pytest.fail("a url resume must not even ask for a socket"))
-    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
-    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: _FakeDrv())
+    # NOW (no tab path): a conversation URL is reduced to the conversation id it carries, and a
+    # URL with none starts a fresh conversation. Either way it is a socket, never a page.
+    seen = {}
+
+    def driver_for(self, n, **kw):
+        seen.update(kw)
+        return _FakeDrv()
+
+    monkeypatch.setattr(rf, "_socket_route", lambda: type("R", (), {"driver_for": driver_for})())
     w = _worker()
-    w.resume_conv = "https://example/chat/123"
+    w.resume_conv = "https://example/chat/4fe936fd-d902-497d-bc89-a2ad4ceb699c"
     assert w.attach(object(), "agent-url") is True
-    assert w.socket is False
+    assert w.socket is True
+    assert seen["conversation_id"] == "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w2 = _worker()
+    w2.resume_conv = "https://example/chat/123"
+    assert w2.attach(object(), "agent-url") is True and w2.socket is True
+    assert seen["conversation_id"] == ""
 
 
 def test_a_socket_worker_reserves_disk_but_not_a_tab():
@@ -237,7 +230,7 @@ def test_a_socket_worker_reserves_disk_but_not_a_tab():
     assert w.tab_load() == 0
 
 
-def test_a_failed_socket_turn_reopens_as_a_tab_and_resends_the_same_job(monkeypatch):
+def test_a_failed_socket_turn_waits_for_a_new_socket_and_resends_the_same_job(monkeypatch):
     noted = []
     monkeypatch.setattr(rf, "_socket_route",
                         lambda: type("R", (), {
@@ -245,9 +238,7 @@ def test_a_failed_socket_turn_reopens_as_a_tab_and_resends_the_same_job(monkeypa
                             "note_failure": lambda self, why: noted.append(why),
                             "token_life": lambda self, agent_url=None: 1800.0,
                             "record": lambda self, event, **f: None})())
-    tab = _FakeDrv()
-    monkeypatch.setattr(rf, "_open_fresh", lambda *a: object())
-    monkeypatch.setattr(rf, "CopilotWebDriver", lambda page: tab)
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("never a tab"))
 
     w = _worker()
     w._context, w._agent_url = object(), "agent-url"
@@ -257,7 +248,8 @@ def test_a_failed_socket_turn_reopens_as_a_tab_and_resends_the_same_job(monkeypa
     w.status = "waiting"
 
     assert w._fall_back_to_tab() is True
-    assert w.socket is False and w.drv is tab
+    # NO TAB: the worker waits for a new socket driver and re-sends the same job from 'ready'.
+    assert w.socket is False and w.drv is None and w._needs_socket_rebind is True
     assert w.status == "ready"          # 'ready' が self.job を送る状態
     assert w.job == "the very same turn"
     assert noted and "InvalidRequest" in noted[0]
@@ -412,7 +404,7 @@ def test_the_answer_counter_is_reset_so_later_successes_are_still_counted(monkey
     assert w._socket_turns_seen == 0
 
 
-def test_a_card_still_opens_a_tab_because_a_socket_cannot_show_one(monkeypatch):
+def test_a_card_turn_waits_for_the_route_it_never_opens_a_tab(monkeypatch):
     """全部を張り直しにすると、タブでしか解けない用件が永久に解けなくなる。"""
     _retry_route(monkeypatch, drv=_FakeDrv())
     tab = _FakeDrv()
@@ -423,7 +415,7 @@ def test_a_card_still_opens_a_tab_because_a_socket_cannot_show_one(monkeypatch):
     w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
     w.drv.failed = "the turn completed but carried no text (a card the tab can show?)"
     w.poll()
-    assert w.socket is False and w.drv is tab
+    assert w.page is None       # never a tab
 
 
 def test_an_unread_reason_is_not_assumed_transient(monkeypatch):
@@ -436,7 +428,7 @@ def test_an_unread_reason_is_not_assumed_transient(monkeypatch):
     w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
     w.drv.failed = "ChatHubError: the backend declined the request: InvalidRequest"
     w.poll()
-    assert w.socket is False, "unknown は route 扱いにしない"
+    assert w.page is None       # never a tab
 
 
 def test_an_exhausted_retry_budget_reports_to_the_route_and_keeps_the_socket(monkeypatch):
@@ -454,7 +446,7 @@ def test_an_exhausted_retry_budget_reports_to_the_route_and_keeps_the_socket(mon
     assert w.socket is True and w._socket_retries == 1
 
 
-def test_a_closed_route_is_what_sends_the_worker_to_a_tab(monkeypatch):
+def test_a_closed_route_makes_the_worker_wait_not_open_a_tab(monkeypatch):
     """タブに退避する条件はただ一つ、経路そのものが塞がれたこと。
     本当に塞がれた時に仕事が止まっては、退避路の意味がない。"""
     _retry_route(monkeypatch, drv=_FakeDrv(), is_open=False)
@@ -467,10 +459,10 @@ def test_a_closed_route_is_what_sends_the_worker_to_a_tab(monkeypatch):
     w._socket_retries = rf.DEFAULT_SOCKET_RETRIES
     w.drv.failed = DROPPED
     w.poll()
-    assert w.socket is False and w.drv is tab
+    assert w.page is None       # never a tab
 
 
-def test_a_route_that_hands_out_no_driver_falls_back_rather_than_hanging(monkeypatch):
+def test_a_route_that_hands_out_no_driver_makes_the_worker_wait(monkeypatch):
     """トークン失効・経路遮断なら driver_for は None を返す。そこで止まったら仕事が消える。"""
     _retry_route(monkeypatch, drv=None)
     tab = _FakeDrv()
@@ -481,7 +473,7 @@ def test_a_route_that_hands_out_no_driver_falls_back_rather_than_hanging(monkeyp
     w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
     w.drv.failed = DROPPED
     w.poll()
-    assert w.socket is False and w.drv is tab
+    assert w.socket is False and w.drv is None and w._needs_socket_rebind is True
 
 
 def test_the_refresh_margin_exceeds_the_longest_turn_a_worker_can_take():
@@ -1386,55 +1378,32 @@ def test_a_fresh_worker_asks_for_no_conversation(monkeypatch):
     assert seen.get("conversation_id") == ""
 
 
-def test_a_conversation_id_resume_with_no_socket_opens_the_agent_not_the_guid(monkeypatch):
-    """`open_url` is resume_conv, so a conversation-id resume that could not get a socket
-    would have handed a bare guid to goto(), failed all three attempts and lost the goal --
-    and _agent_url kept the same value, so a mid-run fallback would open the same nonsense."""
-    opened = {}
-
+def test_a_conversation_id_resume_with_no_socket_waits_and_opens_nothing(monkeypatch):
+    """No tab exists to open. A resume that cannot get a socket stays PENDING with a reason."""
     monkeypatch.setattr(rf, "_socket_route",
                         lambda: type("R", (), {"driver_for": lambda self, n, **kw: None})())
-
-    def _fresh(ctx, url):
-        opened["url"] = url
-        return object()
-
-    monkeypatch.setattr(rf, "_open_fresh", _fresh)
+    monkeypatch.setattr(rf, "_open_fresh", lambda *a: pytest.fail("never a tab"))
     w = _worker()
     w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
-    w.attach(object(), "https://agent.example/chat")
-    assert opened["url"] == "https://agent.example/chat"
-    assert w.socket is False
+    assert w.attach(object(), "https://agent.example/chat") is False
+    assert w.status == rf.PENDING and w.socket is False and w.reason
 
 
-def test_a_url_resume_still_opens_that_url(monkeypatch):
-    """The fix above must not turn a working tab resume into a fresh conversation."""
-    opened = {}
-    monkeypatch.setattr(rf, "_open_fresh",
-                        lambda ctx, url: opened.setdefault("url", url) or object())
+def test_a_url_resume_without_a_conversation_id_starts_a_fresh_socket_conversation(
+        monkeypatch, capsys):
+    """A follow-up that quietly became a fresh conversation answers plausibly and wrongly, so
+    the loss of context is announced."""
+    monkeypatch.setattr(rf, "_socket_route",
+                        lambda: type("R", (), {"driver_for": lambda self, n, **kw: _FakeDrv()})())
     w = _worker()
-    w.resume_conv = "https://example/chat/4fe936fd-d902-497d-bc89-a2ad4ceb699c"
-    w.attach(object(), "https://agent.example/chat")
-    assert opened["url"] == "https://example/chat/4fe936fd-d902-497d-bc89-a2ad4ceb699c"
+    w.resume_conv = "https://example/chat/not-a-guid"
+    assert w.attach(object(), "https://agent.example/chat") is True and w.socket is True
+    assert "will NOT see the earlier one" in capsys.readouterr().out
 
 
-def test_the_lost_context_is_announced(monkeypatch, capsys):
-    """A follow-up that quietly became a fresh conversation answers plausibly and wrongly."""
+def test_the_agent_url_kept_for_a_later_rebind_is_never_a_bare_guid(monkeypatch):
     monkeypatch.setattr(rf, "_socket_route",
                         lambda: type("R", (), {"driver_for": lambda self, n, **kw: None})())
-    monkeypatch.setattr(rf, "_open_fresh", lambda ctx, url: object())
-    w = _worker()
-    w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
-    w.attach(object(), "https://agent.example/chat")
-    assert "will NOT see the earlier conversation" in capsys.readouterr().out
-
-
-def test_a_mid_run_fallback_never_reopens_a_bare_conversation_id(monkeypatch):
-    """_agent_url used to be assigned before the transport was decided, so a conversation-id
-    resume left a bare guid in it -- and _fall_back_to_tab reopens exactly that."""
-    monkeypatch.setattr(rf, "_socket_route",
-                        lambda: type("R", (), {"driver_for": lambda self, n, **kw: None})())
-    monkeypatch.setattr(rf, "_open_fresh", lambda ctx, url: object())
     w = _worker()
     w.resume_conv = "4fe936fd-d902-497d-bc89-a2ad4ceb699c"
     w.attach(object(), "https://agent.example/chat")
@@ -1736,7 +1705,7 @@ def _failing_worker(monkeypatch, route, reason=DROPPED):
         d.failed = reason
         return d
 
-    route.driver_for = lambda n, **kw: fresh()
+    route.driver_for = lambda n, **kw: fresh() if route.open() else None
     w.drv = fresh()
     return w
 
@@ -1774,7 +1743,7 @@ def test_a_run_of_drops_backs_off_and_then_closes_the_route(monkeypatch):
     assert waits == sorted(waits), "待ち時間が伸びていない: %s" % waits
     assert all(b - a >= rf.SOCKET_INCIDENT_WINDOW_S - 0.01
                for a, b in zip(votes_at, votes_at[1:])), "同一窓で二重投票している: %s" % votes_at
-    assert w.socket is False and w.drv is tab, "最後までタブに降りていない"
+    assert w.socket is False and w.drv is None and w._needs_socket_rebind, "route closed: the worker must wait, not open a tab"
     assert not r.open() and "consecutive" in r.closed_reason
 
 
@@ -1796,7 +1765,7 @@ def test_the_goal_is_not_lost_when_the_route_dies(monkeypatch):
         if w.socket is False:
             break
     assert w.job == "the very same turn"
-    assert w.status == "ready", "再送できる状態になっていない"
+    assert w.status == "ready" and w._needs_socket_rebind, "再送できる状態になっていない"
     assert w.outcome is None, "経路の故障をゴールの失敗にしている"
 
 
@@ -1819,7 +1788,7 @@ def test_reconnects_are_bounded_even_while_the_route_stays_open(monkeypatch):
         if w.socket is False:
             break
     assert r.open(), "前提: 経路は開いたまま"
-    assert w.socket is False, "経路が開いている限り無限に張り直している"
+    assert w.socket is False and w._needs_socket_rebind, "after the reconnect budget the worker waits (with backoff), it does not spin"
     assert w._socket_reconnects_total <= rf.SOCKET_RECONNECTS_PER_GOAL
 
 

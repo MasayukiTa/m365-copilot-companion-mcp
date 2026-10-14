@@ -1,7 +1,9 @@
 ﻿from pathlib import Path
 
 THEME = Path(__file__).with_name("Theme.cs").read_text(encoding="utf-8")
-COCKPIT = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8-sig")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+COCKPIT = cockpit_source.read(encoding="utf-8-sig")
 
 
 def test_started_and_running_states_stay_blue_while_done_stays_green():

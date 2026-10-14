@@ -7,8 +7,7 @@ attach-recovery path is driven with fake contexts. Proves:
   * refute budget honoured (no more reviews past max_refute -> DONE stands)
   * checks + refuter compose (verify pass -> refuting -> done verified)
   * a refuter that needs a couple of polls (non-blocking) still settles
-  * attach failing while the WHOLE Edge died -> FleetContextLost (goal resumable);
-    a one-off open failure on a live context -> worker ERROR, run completes
+  * the WHOLE Edge dying (loop-top probe) -> FleetContextLost (goal resumable)
 
 Run:  .venv\\Scripts\\python.exe relay\\test_fleet_refute.py
 """
@@ -138,38 +137,25 @@ def main():
     settle(w)
     check("fleet_panel_minority_done", w.status == "done" and w.outcome == "DONE")
 
-    # --- attach robustness ---
-    class FlakyContext:
-        """cookies() works once (loop-top probe), but the Edge 'dies' the moment we open a
-        tab -> new_page raises and cookies() then fails = whole context lost."""
-        def __init__(self): self.dead = False
+    # --- context loss ---
+    # No goal path opens a tab any more (owner rule, relay/no_tab.py), so attach cannot fail
+    # through context.new_page(). What remains is the loop-top probe: cookies() round-trips to
+    # CDP, and a context that raises there means the whole Edge died -> FleetContextLost with
+    # the unfinished goals, so the runner can resume them in a fresh process.
+    class DeadContext:
         def cookies(self):
-            if self.dead:
-                raise RuntimeError("context closed")
-            return []
-        def new_page(self):
-            self.dead = True
-            raise RuntimeError("Target page, context or browser has been closed")
-
-    class OneOffFailContext:
-        """A single open fails but the context is alive (cookies ok) -> not a context loss."""
-        def cookies(self): return []
-        def new_page(self): raise RuntimeError("boom one-off")
+            raise RuntimeError("context closed")
 
     raised = False
+    unfinished_ok = False
     try:
-        run_relay_fleet(FlakyContext(), ["goalA"], "u", poll_s=0, max_concurrent=1,
+        run_relay_fleet(DeadContext(), ["goalA"], "u", poll_s=0, max_concurrent=1,
                         notify=lambda *a: None)
     except FleetContextLost as e:
         raised = True
         unfinished_ok = any((g.get("text") if isinstance(g, dict) else g) == "goalA"
                             for g in e.unfinished)
     check("dead_context_raises_lost", raised and unfinished_ok)
-
-    res = run_relay_fleet(OneOffFailContext(), ["goalB"], "u", poll_s=0, max_concurrent=1,
-                          notify=lambda *a: None)
-    check("livectx_oneoff_error_completes",
-          len(res) == 1 and res[0]["outcome"] == "ERROR")
 
     print("\n=== %d/%d fleet-refute checks passed ===" % (sum(results), len(results)))
     return 0 if all(results) else 1

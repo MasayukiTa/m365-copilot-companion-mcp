@@ -43,8 +43,8 @@ def test_a_turn_writes_an_open_row_then_a_close_row(tmp_path, monkeypatch):
     w.drv = _SendDrv()
     w.status = "ready"
     w.job = "do work"
-    monkeypatch.setattr(rf, "admission_is_due", lambda now=None: True)
-    monkeypatch.setattr(rf, "note_admitted", lambda now=None: None)
+    monkeypatch.setattr(rf, "socket_send_due", lambda now=None: True)
+    monkeypatch.setattr(rf, "note_socket_sent", lambda now=None: None)
 
     w._begin_send()
     opened = _rows(TC.CONTEXT_PATH)

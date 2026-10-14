@@ -11,8 +11,7 @@ import re
 
 import pytest
 
-CS = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                  "ui", "FleetCockpit.cs")
+from tools import cockpit_source  # the cockpit source is split across partial-class files
 
 #: key -> the reader that must honour it
 CONTRACT = ("rate_ceiling_rpm", "fleet_log_days", "fleet_store_days")
@@ -38,7 +37,7 @@ def wired(tmp_path, monkeypatch):
 def test_the_cockpit_writes_every_key_python_reads(wired):
     # Source-level, because no runtime path spans C# and Python -- but paired below with tests
     # that actually exercise each reader, so this is the contract and not the evidence.
-    body = io.open(CS, encoding="utf-8-sig").read()
+    body = cockpit_source.read(encoding="utf-8-sig")
     written = set(re.findall(r'SaveKey\("([a-z_]+)"', body))
     missing = [k for k in CONTRACT if k not in written]
     assert not missing, "the cockpit cannot write: %s" % missing
@@ -47,7 +46,7 @@ def test_the_cockpit_writes_every_key_python_reads(wired):
 def test_the_cockpit_also_parses_back_what_it_writes(wired):
     # A key it can write but not re-read resets to the default on the next launch, which looks
     # exactly like the setting being ignored.
-    body = io.open(CS, encoding="utf-8-sig").read()
+    body = cockpit_source.read(encoding="utf-8-sig")
     for k in CONTRACT:
         assert ('StartsWith("%s=' % k) in body, "cockpit never reads back %s" % k
 
@@ -55,7 +54,7 @@ def test_the_cockpit_also_parses_back_what_it_writes(wired):
 def test_the_substring_offset_matches_the_key_length(wired):
     # ln.Substring(N) with the wrong N silently parses "0_days=14" or drops a character, and
     # int.TryParse then fails and leaves the default. Every one of these was hand-counted.
-    body = io.open(CS, encoding="utf-8-sig").read()
+    body = cockpit_source.read(encoding="utf-8-sig")
     for k, n in re.findall(r'StartsWith\("([a-z_]+=)"\)\s*&&\s*int\.TryParse\(ln\.Substring\((\d+)\)', body):
         assert len(k) == int(n), "Substring(%s) does not match len('%s')=%d" % (n, k, len(k))
 

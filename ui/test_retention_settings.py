@@ -8,8 +8,9 @@
 import pathlib
 import re
 
-SRC = (pathlib.Path(__file__).resolve().parent / "FleetCockpit.cs").read_text(
-    encoding="utf-8-sig", errors="replace")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SRC = cockpit_source.read(encoding="utf-8-sig", errors="replace")
 
 
 def test_the_day_default_is_ninety_and_the_size_default_is_still_off():

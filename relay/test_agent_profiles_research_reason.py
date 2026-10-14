@@ -503,7 +503,7 @@ def test_which_transport_carried_the_turn_survives_the_session_ending(monkeypatc
     assert s.transport == "socket", "終わった途端に経路が分からなくなった"
 
 
-def test_a_tab_says_so_too(monkeypatch):
+def test_a_side_page_is_refused_not_opened(monkeypatch):
     """片方だけ記録すると、空文字が「タブ」と「一度も送っていない」の両方を意味する。"""
     import types as _t
 
@@ -516,7 +516,7 @@ def test_a_tab_says_so_too(monkeypatch):
     monkeypatch.setattr(CAR, "CopilotWebDriver", lambda page: drv)
     s.context = _t.SimpleNamespace(new_page=lambda: s.page)
     s._do_open()
-    assert s.transport == "tab", "タブで送ったのに経路が空のまま"
+    assert s.transport != "tab", "Copilot never runs in a tab: the side page must be refused"
 
 
 def test_a_task_without_a_file_never_touches_the_upload_path(monkeypatch):

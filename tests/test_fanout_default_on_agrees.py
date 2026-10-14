@@ -25,6 +25,7 @@ if REPO not in sys.path:
 from relay import fleet_runner as FR  # noqa: E402
 from relay import task_router as TR  # noqa: E402
 from tools import childproc  # noqa: E402
+from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
 from tools import settings_keys as SK  # noqa: E402
 
 
@@ -38,7 +39,7 @@ def test_the_registry_default_is_on():
 
 
 def test_the_cockpit_field_default_matches_the_registry():
-    m = re.search(r"bool\s+_fanout\s*=\s*(true|false)\s*;", _read("ui", "FleetCockpit.cs"))
+    m = re.search(r"bool\s+_fanout\s*=\s*(true|false)\s*;", cockpit_source.read(encoding="utf-8-sig"))
     assert m and (m.group(1) == "true") == SK.default("fanout")
     m = re.search(r"public\s+const\s+bool\s+DefaultOn\s*=\s*(true|false)\s*;", _read("ui", "EffortPolicy.cs"))
     assert m and (m.group(1) == "true") == SK.default("fanout")
@@ -106,7 +107,7 @@ def test_the_coordinator_reports_what_it_was_started_with():
 
 
 def test_the_cockpit_has_a_visible_control_not_only_the_slash_command():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8-sig")
     # lives in the gear popup (BuildSettingsPanel), NOT in the header
     assert "col.Children.Add(FanoutControl());" in src
     assert "ctrls.Children.Add(FanoutControl());" not in src

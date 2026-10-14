@@ -34,6 +34,8 @@ from __future__ import annotations
 import os
 import re
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 UI = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(UI, "FleetCockpit.cs")
 
@@ -55,8 +57,7 @@ def _executable(cs: str) -> str:
 
 
 def _src() -> str:
-    with open(SRC, encoding="utf-8") as fh:
-        return fh.read()
+    return cockpit_source.read(encoding="utf-8")
 
 
 SOURCE = _executable(_src())

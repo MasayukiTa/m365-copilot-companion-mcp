@@ -68,16 +68,96 @@ def read_done_map(state_dir):
         return {}
 
 
-def read_campaigns(state_dir):
-    """{campaign_id: family} from campaigns.jsonl via fanout.campaigns_from_ledger; {} when
-    the file is absent or unreadable. Families without a header are not returned."""
+class _LedgerIndex:
+    """campaigns.jsonl parsed ONCE and kept current by reading only the bytes appended since.
+
+    THE SWEEP'S HOT PATH. `_stall_check` re-parsed the whole 10 MB ledger once per unmerged old
+    campaign (~70) on every fleet sweep: 30-37 s and ~1 GB read per sweep, longer than the
+    watchdog's 150 s freeze rule once the rest of a lap was added (2026-10-14). Now a call costs
+    O(bytes appended since the last call). The file is append-only and is never rewritten here;
+    a shrunk file (truncation / rotation) or a changed file identity rebuilds the index.
+    """
+
+    def __init__(self, path):
+        import threading
+        self.path = path
+        self.lock = threading.Lock()
+        self.reset()
+
+    def reset(self):
+        self.raw = {}              # fanout.ledger_ingest state
+        self.offset = 0            # bytes consumed
+        self.ident = None
+
+    def refresh(self):
+        """Bring the index up to the file. Raises OSError when the file cannot be read."""
+        from relay import fanout
+        with self.lock:
+            st = os.stat(self.path)
+            ident = getattr(st, "st_ino", None) or None
+            if st.st_size < self.offset or (self.ident and ident and ident != self.ident):
+                self.reset()
+            self.ident = ident
+            if st.st_size == self.offset:
+                return self.raw
+            with open(self.path, "rb") as fh:
+                fh.seek(self.offset)
+                data = fh.read(st.st_size - self.offset)
+            cut = data.rfind(b"\n") + 1            # complete lines only
+            lines = data[:cut].decode("utf-8", errors="replace").splitlines()
+            tail = data[cut:]
+            if tail.strip():
+                # an unterminated last line: taken only if it is already a whole JSON record
+                # (a half-written one is left for the next call, when it has been completed)
+                try:
+                    json.loads(tail.decode("utf-8"))
+                    lines.append(tail.decode("utf-8"))
+                    cut = len(data)
+                except Exception:
+                    pass
+            fanout.ledger_ingest(self.raw, lines)
+            self.offset += cut
+            return self.raw
+
+
+_LEDGER_INDEXES = {}
+
+
+def _ledger_index(state_dir):
     path = os.path.join(state_dir, CAMPAIGNS_FILE)
+    idx = _LEDGER_INDEXES.get(path)
+    if idx is None:
+        idx = _LEDGER_INDEXES.setdefault(path, _LedgerIndex(path))
+    return idx
+
+
+def read_campaigns_view(state_dir):
+    """READ-ONLY view {campaign_id: family}: the index's own objects, so callers must not mutate
+    them. Cost O(appended bytes). {} when the file is absent or unreadable."""
     try:
         from relay import fanout
-        with open(path, encoding="utf-8") as fh:
-            return fanout.campaigns_from_ledger(fh) or {}
+        idx = _ledger_index(state_dir)
+        raw = idx.refresh()
+        with idx.lock:
+            return fanout.ledger_families(raw)
     except Exception:
         return {}
+
+
+def read_campaign(state_dir, cid):
+    """One family as a private deep copy (safe to mutate), or None. O(appended bytes)."""
+    import copy
+    fam = read_campaigns_view(state_dir).get(cid)
+    return copy.deepcopy(fam) if fam else None
+
+
+def read_campaigns(state_dir):
+    """{campaign_id: family} from campaigns.jsonl via fanout.campaigns_from_ledger; {} when
+    the file is absent or unreadable. Families without a header are not returned. The families
+    are private copies (callers mutate them); use read_campaigns_view / read_campaign on hot
+    paths."""
+    import copy
+    return copy.deepcopy(read_campaigns_view(state_dir))
 
 
 def campaign_id_for_goal(text):
@@ -666,6 +746,11 @@ def rehydrate_decision(fam, done_map):
     (merge was queued but never finished and no aggregator DONE is on record; allowed once).
     """
     if fam.get("merge_done"):
+        return "drop"
+    if fam.get("merge_abandoned"):
+        # TERMINAL: written off in the open (ledger line `merge_abandoned`). It is never carried
+        # into memory again, so it is not re-scanned by every sweep of every later run. The
+        # ledger stays append-only; only how it is read changed.
         return "drop"
     if not fam.get("merged"):
         return "carry"

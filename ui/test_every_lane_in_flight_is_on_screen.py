@@ -19,12 +19,14 @@ from __future__ import annotations
 import io
 import os
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
 
 
 def _src():
-    return io.open(COCKPIT, encoding="utf-8").read()
+    return cockpit_source.read(encoding="utf-8")
 
 
 def _band():

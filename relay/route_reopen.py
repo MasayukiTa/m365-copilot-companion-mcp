@@ -64,6 +64,9 @@ FIRST_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_WAIT_S", "120"))
 #: occasionally, not continuously.
 MAX_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_MAX_WAIT_S", "900"))
 
+#: First wait before probing a route that closed for a NON-transport reason (see _consider).
+NON_TRANSPORT_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_NON_TRANSPORT_WAIT_S", "300"))
+
 #: How long a handshake may take before it counts as a failure. Generous: the fault this exists
 #: for is a proxy refusing an upgrade, which fails fast, and a slow success is still a success.
 PROBE_TIMEOUT_S = float(os.environ.get("MCP_ROUTE_REOPEN_PROBE_S", "15"))
@@ -120,13 +123,16 @@ class ReopenPolicy:
             return False
 
         reason = str(status.get("closed_reason") or "")
-        if not reopenable(reason):
-            self._explain_once(
-                "[reopen] the route is shut for a reason that is not transport, so it stays "
-                "shut: %s" % reason[:110])
-            return False
-
         now = self._now()
+        if not reopenable(reason) and self.closed_at is None:
+            # A NON-TRANSPORT CLOSE USED TO STAY SHUT BECAUSE WORKERS COULD USE TABS. They cannot
+            # any more (relay/no_tab.py): a shut route is an outage and every goal waits on it.
+            # So it is probed too -- only later, and the probe still spends no turn.
+            self.wait_s = max(self.wait_s, NON_TRANSPORT_WAIT_S)
+            self._explain_once(
+                "[reopen] the route is shut for a reason that is not transport; goals are "
+                "waiting (no tab), so it is probed after %.0fs: %s"
+                % (self.wait_s, reason[:110]))
         if self.closed_at is None:
             self.closed_at = now
             self.next_probe_at = now + self.wait_s
@@ -201,6 +207,14 @@ class ReopenPolicy:
         """(reachable, how). A completed turn elsewhere beats a handshake; either will do."""
         if turn_since_close(route, self._turns_at_close):
             return True, "another surface completed a socket turn since the close"
+        try:
+            if route.token_life() <= 0:
+                # NOTHING TO PROBE WITH, AND NO TAB TO FALL BACK TO: reopening is the repair,
+                # because a fresh route is what starts a token capture again (a shut route
+                # captures nothing). The next real turn tests the transport.
+                return True, "the token expired while the route was shut; reopening to recapture"
+        except Exception:
+            pass
         if self._probe is not None:
             return bool(self._probe(route)), "handshake"
         return handshake(route, connect=self._connect,

@@ -182,10 +182,10 @@ def _release(page):
 TEMPLATE_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             ".fleet", "templates")
 
-#: How old a cached template may be before it is re-derived anyway. A backstop, not the
-#: mechanism: the real signal is the backend refusing a request, and this only covers a drift
-#: that changes an answer without ever producing an error.
-TEMPLATE_MAX_AGE_S = float(os.environ.get("MCP_TEMPLATE_MAX_AGE_S", str(24 * 3600)))
+#: How old a cached template may be before it is re-derived anyway. DEFAULT 0 = NEVER: a template
+#: can only be re-derived by a real Copilot turn, which a capture may no longer send, so evicting
+#: it by age would strand every goal. The signal that it is stale is the backend refusing a request.
+TEMPLATE_MAX_AGE_S = float(os.environ.get("MCP_TEMPLATE_MAX_AGE_S", "0"))   # 0 = never evict by age
 
 
 def template_path(agent_url: str, directory=None) -> str:
@@ -364,14 +364,27 @@ def capture_via_profile(context, agent_url, *, log=None, directory=None):
 
       2. a cached template for THIS agent, plus a token read from a page that is navigated and
          closed without sending anything. About five seconds.
-      3. no cached template, or the light path produced nothing: a full capture, which runs a
-         real turn, and whose template is then saved so tier 2 can serve the next refresh.
+      3. REMOVED (owner rule 2026-10-14): a full capture that runs a real turn. With no cached
+         template, or no token on the page, this raises and the caller backs off; goals wait.
 
     Tier 1 is not here because it is not a capture. It is the route not calling this at all,
     which is what happens for the fifty-odd minutes a token remains valid.
     """
     say = log or _say
+    return _capture_no_turn(context, agent_url, say, directory)
 
+
+class NoTemplateWithoutTurn(RuntimeError):
+    """No cached request template exists for this agent, and deriving one needs a Copilot turn.
+
+    A capture NEVER sends a turn (owner rule, relay/no_tab.py), so this is a refusal, not a
+    fallback: goals keep waiting ("waiting for token") and the capture is retried with backoff.
+    The template is a request shape written once by an earlier real conversation
+    (save_template) and kept in .fleet/templates; it is not evicted by age (see
+    TEMPLATE_MAX_AGE_S), so this only occurs for an agent surface never captured on this machine."""
+
+
+def _capture_no_turn(context, agent_url, say, directory):
     recent = _memo_get(agent_url)
     if recent is not None:
         _warn_once(
@@ -384,31 +397,19 @@ def capture_via_profile(context, agent_url, *, log=None, directory=None):
         return recent["token"], recent["template"]
 
     template = load_template(agent_url, directory)
-    if template is not None:
-        try:
-            token = token_via_light_page(context, agent_url, log=say)
-            say("[profile_token] tier 2: cached template + a page with no turn")
-            _memo_put(agent_url, token, template)
-            return token, template
-        except Exception as exc:
-            say("[profile_token] light path declined (%s: %s); running a full capture"
-                % (type(exc).__name__, str(exc)[:120]))
-    say("[profile_token] tier 3: a full capture, with a real turn")
-    from relay.socket_route import capture_via_tab
-    token, template = capture_via_tab(context, agent_url)
-    if save_template(template, agent_url, directory):
-        say("[profile_token] template cached for %s; the next refresh needs no turn"
-            % (template.gpt_id or "(no agent)")[:28])
+    if template is None:
+        raise NoTemplateWithoutTurn(
+            "no cached request template for this agent and a capture never sends a Copilot "
+            "turn; the goal keeps waiting and the capture is retried")
+    # Raises NoLightToken when the page shows no usable token in time; the caller backs off.
+    token = token_via_light_page(context, agent_url, log=say)
+    say("[profile_token] cached template + a page with no turn")
     _memo_put(agent_url, token, template)
     return token, template
 
 
 def capture_fn():
-    """The capture the route should use, chosen at CALL time rather than at import, so an
-    operator's change to the environment takes effect on the next run instead of the next
-    deployment."""
-    raw = os.environ.get("MCP_CAPTURE_LIGHT", "0").strip().lower()
-    if raw not in ("0", "false", "no", "off", ""):
-        return capture_via_profile
-    from relay.socket_route import capture_via_tab
-    return capture_via_tab
+    """The capture the route uses: ALWAYS the no-turn one. `MCP_CAPTURE_LIGHT` is no longer read
+    -- the real-turn capture it switched away from was removed (owner rule: a token capture
+    never sends a Copilot turn)."""
+    return capture_via_profile

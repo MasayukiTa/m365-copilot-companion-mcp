@@ -214,7 +214,7 @@ def test_the_pacing_wait_is_a_second_place_the_row_can_come_from(rows):
 
 def test_attach_records_when_a_conversation_was_opened():
     src = _read("relay", "relay_fleet.py")
-    assert src.count("self._attached_ts = time.time()") >= 3      # socket, tab, fresh replay
+    assert src.count("self._attached_ts = time.time()") >= 2      # socket, fresh replay (the tab attach is gone)
     assert 'self._note_conversation_unsent("close")' in src
 
 
@@ -251,7 +251,8 @@ def test_the_cockpit_constants_equal_the_python_side():
 
 def test_the_cockpit_control_lives_in_the_popup_and_saves_through_savekey_only():
     import re
-    src = _read("ui", "FleetCockpit.cs")
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    src = cockpit_source.read(encoding="utf-8")
     assert "col.Children.Add(MergeConversationControl());" in src
     assert "ctrls.Children.Add(MergeConversationControl());" not in src       # never the header
     assert len(re.findall(r"SaveKey\(MergeConversationView\.Key, _mcVal\)", src)) == 1

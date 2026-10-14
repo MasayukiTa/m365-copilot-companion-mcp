@@ -42,6 +42,7 @@ import re as _re
 import sys
 
 from relay import outcomes as _outcomes
+from relay import token_provider as _token_provider
 import time
 
 # allow running both as `python -m relay.fleet_runner` and `python relay/fleet_runner.py`
@@ -769,13 +770,44 @@ from tools.settings_keys import default as _settings_default
 #: admission gates. It had three owners until 2026-09-17; see that module.
 RAM_FLOOR_DEFAULT_MB = float(_settings_default("ram_floor_mb"))
 
-DEFAULT_MAX_CONCURRENT = 3
+#: HOW MANY GOALS MAY RUN AT ONCE (the "lane ceiling"): DERIVED, NOT A LITERAL. It is the number
+#: of goals the cloud rate can feed at once, with headroom -- ceil(100 RPM x 60 s per turn / 60 x
+#: 2) = 200 -- computed in tools/settings_keys.derive_lane_ceiling and declared there as the
+#: default of the `maxtabs` and `autoscale_max` keys, so the panel, the settings table and this
+#: module share one owner. It replaces the literal 1000 of 2026-10-14. The ceiling is not
+#: what limits throughput (the send token bucket in relay_fleet does, rate = min(100,
+#: rate_ceiling_rpm)); and free RAM never shrinks or stops a running goal -- it only prices the
+#: next admission (relay/socket_capacity.py). No term in this number is a browser tab.
+LANES_DEFAULT = _settings_default("maxtabs")
+DEFAULT_MAX_CONCURRENT = LANES_DEFAULT
 
 #: The autoscale ceiling used when the operator has never set one. MUST MATCH the cockpit's
-#: `_autoMax` default (ui/FleetCockpit.cs), which is 100 and documented there as "high by
-#: design": under autoscale the ceiling exists to get out of ram_target_cap's way, not to cap
-#: anything itself. When the two disagreed the screen showed 100 and the fleet ran 3.
-AUTOSCALE_CEILING_DEFAULT = 100
+#: `_autoMax` default (ui/FleetCockpit.cs). Same derived figure as the lane default.
+AUTOSCALE_CEILING_DEFAULT = _settings_default("autoscale_max")
+
+#: DOCUMENTED PRECEDENCE FOR THE LANE CEILING, highest first:
+#:   1. a live command in this run (cockpit stepper -> set_maxtabs / set_autoscale), or the
+#:      settings follower seeing the settings.txt FILE CHANGE while the run is up -- an operator
+#:      acting now;
+#:   2. an explicit command-line --max-concurrent N / --autoscale-max N / --autoscale-default N;
+#:   3. the derived default above.
+#: A settings.txt `maxtabs` / `autoscale_max` found at START-UP is not on this list: those keys
+#: persist from whenever somebody last touched the stepper (a stale 3, 30, ... from the tab era,
+#: when the number counted browser tabs) and used to silently cap every later run. They are
+#: IGNORED at start-up and the run says so on one line. MCP_FLEET_HONOR_SETTINGS_LANES=1 makes
+#: settings.txt supply the start-up value, for a host whose operator wants exactly that.
+HONOR_SETTINGS_LANES = os.environ.get("MCP_FLEET_HONOR_SETTINGS_LANES", "0") == "1"
+
+
+def lane_setting(key, default=LANES_DEFAULT):
+    """The start-up value of a lane knob (`maxtabs`, `autoscale_max`) under the precedence above."""
+    stale = _settings_int(key, 0)
+    if HONOR_SETTINGS_LANES:
+        return stale if stale > 0 else default
+    if stale > 0 and stale != default:
+        print("[lanes] ignoring settings.txt %s=%d at start-up; using %d (a live change or an "
+              "explicit command-line value still applies)" % (key, stale, default), flush=True)
+    return default
 
 
 def _settings_path():
@@ -1403,12 +1435,41 @@ def _write_scope_tick(workers):
 def _auto_resume_block():
     """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
     of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
-    waiting and what the resume gate last decided. {} on any failure."""
-    try:
-        from relay import fleet_resume as _fres
-        return {"auto_resume": _fres.auto_resume_report(_ACTIVE_STATE_DIR or os.path.join(_repo_root(), ".fleet"))}
-    except Exception:
-        return {}
+    waiting and what the resume gate last decided. {} on any failure.
+
+    OFF THE SWEEP'S HOT PATH. This used to read and json-load every pending-run snapshot file
+    on the sweep thread, every sweep (2026-10-14: the stall diagnostic caught the main thread
+    inside this very json.load). The report only changes when a run is interrupted, so the sweep
+    now takes the last value from a cache that a daemon thread refreshes at most every
+    AUTO_RESUME_REFRESH_S; the thread does file reads only, never anything with the browser."""
+    now = time.time()
+    with _AUTO_RESUME_LOCK:
+        cached = _AUTO_RESUME_CACHE["value"]
+        stale = now - _AUTO_RESUME_CACHE["at"] >= AUTO_RESUME_REFRESH_S
+        start = stale and not _AUTO_RESUME_CACHE["running"]
+        if start:
+            _AUTO_RESUME_CACHE["running"] = True
+    if start:
+        import threading as _th
+        state_dir = _ACTIVE_STATE_DIR or os.path.join(_repo_root(), ".fleet")
+
+        def _refresh():
+            value = {}
+            try:
+                from relay import fleet_resume as _fres
+                value = {"auto_resume": _fres.auto_resume_report(state_dir)}
+            except Exception:
+                value = {}
+            with _AUTO_RESUME_LOCK:
+                _AUTO_RESUME_CACHE.update(value=value, at=time.time(), running=False)
+        _th.Thread(target=_refresh, name="auto-resume-report", daemon=True).start()
+    return dict(cached)
+
+
+AUTO_RESUME_REFRESH_S = 20.0
+import threading as _threading_mod                      # noqa: E402
+_AUTO_RESUME_LOCK = _threading_mod.Lock()
+_AUTO_RESUME_CACHE = {"value": {}, "at": 0.0, "running": False}
 
 
 def _conversation_saving_block():
@@ -1777,6 +1838,8 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # environment and downstream services may impose lower ones, so refusals arriving under
         # the line mean the line is the wrong line, not that the gauge is broken.
         "quota": _quota_snapshot(),
+        # Why goals are held in the queue with no token (empty when none are).
+        "token_wait": _token_provider.status_block(),
         # THE FALLBACK BUTTON'S OWN RECEIPT. None until a {"reunlock":...} command has been
         # applied at least once this run; after that,
         # {"ts","target","ok","delivered","reason"} from apply_reunlock -- so "I pressed the
@@ -2544,27 +2607,155 @@ def should_auto_resume(marker_exists, pid_alive, user_stopped=False):
     return bool(marker_exists) and not pid_alive and not user_stopped
 
 
-def _watchdog_should_reset(status, stalled_s, now=None):
+from relay.logstamp import stamp as _stamp          # noqa: E402
+
+
+def _write_stall_diagnostic(state_dir, status, stalled_s, will_reset, why, now=None):
+    """Append one record to <state_dir>/stall_diagnostics.log: the stacks of ALL threads, the
+    frozen status.json's `updated` time and the stall length, any worker carrying a blocking
+    deadline, and (when the register exists) which declared blocking call is in progress and for
+    how long. Observation only: it never raises and never touches the browser."""
+    import faulthandler
+    import threading
+    import traceback
+    t = time.time() if now is None else now
+    try:
+        path = os.path.join(state_dir, "stall_diagnostics.log")
+        main_id = threading.main_thread().ident
+        names = {th.ident: th.name for th in threading.enumerate()}
+        lines = []
+        upd = (status or {}).get("updated")
+        lines.append("=== %s  STALL %.0fs  will_reset=%s  (%s)" % (
+            time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t)), stalled_s, bool(will_reset), why))
+        try:
+            lines.append("status.json updated=%s (%.0fs before this record)" % (
+                time.strftime("%H:%M:%S", time.localtime(float(upd))), t - float(upd)))
+        except Exception:
+            lines.append("status.json updated=%r" % (upd,))
+        for w in (status or {}).get("workers") or []:
+            try:
+                bu = float(w.get("eval_busy_until") or 0.0)
+            except (TypeError, ValueError):
+                bu = 0.0
+            if bu > t or w.get("status") in VERIFY_STATUSES:
+                lines.append("worker %s status=%s eval_busy_until in %.0fs" % (
+                    w.get("name"), w.get("status"), bu - t))
+        try:
+            from relay import blocking_calls as _bc
+            for kind, started, deadline in _bc.active(t):
+                lines.append("BLOCKING CALL IN PROGRESS: %s for %.0fs (ceiling in %.0fs)" % (
+                    kind, t - started, deadline - t))
+        except Exception:
+            lines.append("(no blocking-call register in this build)")
+        try:
+            from relay.relay_fleet import capture_inflight
+            lines.append("token captures in flight: %d" % capture_inflight())
+        except Exception:
+            pass
+        for ident, frame in sys._current_frames().items():
+            lines.append("--- thread %s (%s)%s" % (
+                ident, names.get(ident, "?"), "  <== SWEEP/MAIN THREAD" if ident == main_id else ""))
+            lines.extend(l.rstrip("\n") for l in traceback.format_stack(frame))
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write("\n".join(lines) + "\n")
+            fh.flush()
+            try:
+                fh.write("--- faulthandler dump\n")
+                fh.flush()
+                faulthandler.dump_traceback(file=fh, all_threads=True)
+            except Exception:
+                pass
+            fh.write("\n")
+    except Exception:
+        pass
+
+
+#: A token capture (async helper process) is allowed to explain a frozen status.json for this
+#: long in total. The helper's own kill is at 90s, so a freeze this old with a helper still
+#: alive is not the capture.
+CAPTURE_STALL_CEILING_S = float(os.environ.get("MCP_WATCHDOG_CAPTURE_CEILING_S", "300") or 300)
+#: A browser this young is still loading the SPA and doing single sign-on; its first tab open
+#: legitimately takes minutes. Bounded: past it the browser is judged like any other.
+EDGE_START_GRACE_S = float(os.environ.get("MCP_WATCHDOG_EDGE_START_GRACE_S", "300") or 300)
+#: A browser that ANSWERS on its DevTools port is not dead, so the freeze needs to be much
+#: older before it is called a wedge. Still finite: a page hung under a live browser is a wedge.
+CDP_RESPONSIVE_STALL_CEILING_S = float(
+    os.environ.get("MCP_WATCHDOG_CDP_CEILING_S", "450") or 450)
+
+
+def _main_thread_in_playwright():
+    """True when the main (sweep) thread's stack is inside a Playwright call right now.
+
+    The sweep thread is the one that drives Playwright's sync API; when status.json freezes
+    while its stack is inside playwright, it is waiting on the browser, and the stack dump of
+    2026-10-14 15:03 showed exactly that. Read from the watchdog thread with sys._current_frames,
+    which touches nothing of Playwright's."""
+    try:
+        import threading
+        frame = sys._current_frames().get(threading.main_thread().ident)
+        while frame is not None:
+            fn = (frame.f_code.co_filename or "").replace("\\", "/").lower()
+            if "/playwright/" in fn:
+                return True
+            frame = frame.f_back
+    except Exception:
+        pass
+    return False
+
+
+def _watchdog_should_reset(status, stalled_s, now=None, declared_blocks=None,
+                           capture_inflight=0, edge_age_s=None, cdp_responsive=None,
+                           main_in_playwright=False):
     """Pure decision: given a (possibly frozen) status.json dict and how long its `updated`
     field has been unchanged, decide whether the dedicated Edge is genuinely WEDGED and must
-    be hard-reset -- vs. the main thread merely being busy in a bounded acceptance eval.
+    be hard-reset -- vs. the main thread merely being busy in a bounded call.
 
     Returns (should_reset: bool, why: str). Keep this side-effect free so it can be unit-tested.
 
+    The keyword arguments are the evidence the watchdog used to ignore. Each is optional and
+    None/0/False means "no such evidence", so the older call shape behaves exactly as before.
+
+      declared_blocks  [(kind, started, deadline)] still inside their own ceiling, from
+                       relay/blocking_calls.py: a synchronous tab open / capture / consent
+                       click-through the sweep thread is inside RIGHT NOW. Not a wedge.
+      capture_inflight number of token-capture helper processes running. They drive this very
+                       Edge over CDP; killing it kills the capture and, because a reset also
+                       forgets the route, restarts the whole cycle.
+      edge_age_s       seconds since THIS process last (re)started the Edge, or None if unknown.
+      cdp_responsive   True/False/None: did the browser answer a DevTools ping just now.
+      main_in_playwright  the sweep thread's stack is inside a Playwright call.
+
     Rule:
       * not running / idle / no stall yet      -> never reset (caller resets its stall clock)
+      * a declared block inside its ceiling    -> do not reset
+      * a capture in flight, freeze <= CAPTURE_STALL_CEILING_S -> do not reset
+      * the Edge was (re)started < EDGE_START_GRACE_S ago      -> do not reset
       * a worker is in a VERIFY status, or its eval_busy_until is still in the future
         -> the main thread is legitimately blocked in a BOUNDED eval, NOT a wedged Edge.
            Do NOT reset, UNLESS the freeze has run past EVAL_STALL_CEILING_S / the worker's
            own eval deadline (failsafe: a real wedge that merely happened to be mid-verify is
            still eventually recovered).
-      * otherwise (no verify in flight, purely no progress past stall_s) -> wedged -> reset.
+      * the sweep thread is inside a Playwright call and the browser does not fail its ping,
+        or the browser answers its DevTools port -> wait, to CDP_RESPONSIVE_STALL_CEILING_S
+      * otherwise (nothing explains the silence, or the browser does not answer) -> wedged.
+
+    EVERY "do not reset" ABOVE HAS A CEILING, so the watchdog can still recover a real wedge.
     """
     now = time.time() if now is None else now
     if not status or not status.get("running") or status.get("idle"):
         return (False, "not running / idle")
     if stalled_s <= 0:
         return (False, "no stall")
+    live_blocks = [b for b in (declared_blocks or ()) if float(b[2]) > now]
+    if live_blocks:
+        kinds = sorted({str(b[0]) for b in live_blocks})
+        return (False, "sweep is inside a declared blocking call %s (within its ceiling)" % kinds)
+    if capture_inflight and stalled_s <= CAPTURE_STALL_CEILING_S:
+        return (False, "%d token capture(s) in flight (within %ds ceiling)" % (
+            capture_inflight, CAPTURE_STALL_CEILING_S))
+    if edge_age_s is not None and 0 <= edge_age_s < EDGE_START_GRACE_S:
+        return (False, "Edge (re)started %ds ago (within %ds start-up grace)" % (
+            edge_age_s, EDGE_START_GRACE_S))
     workers = status.get("workers") or []
     verifying = []          # names of workers legitimately busy in a bounded eval
     deadline_in_future = False
@@ -2594,7 +2785,41 @@ def _watchdog_should_reset(status, stalled_s, now=None):
                 verifying, EVAL_STALL_CEILING_S))
         return (True, "verifying %s but frozen %ds past %ds eval ceiling -> wedged" % (
             verifying, stalled_s, EVAL_STALL_CEILING_S))
+    if cdp_responsive is False:
+        return (True, "stalled %ds and the browser does not answer its DevTools port "
+                      "-> wedged" % stalled_s)
+    if (cdp_responsive is True or main_in_playwright) \
+            and stalled_s <= CDP_RESPONSIVE_STALL_CEILING_S:
+        return (False, "%s (within %ds ceiling)" % (
+            "sweep thread is inside a Playwright call" if main_in_playwright
+            else "browser still answers its DevTools port", CDP_RESPONSIVE_STALL_CEILING_S))
     return (True, "stalled %ds with no eval in flight -> wedged" % stalled_s)
+
+
+def _recovery_step(attempt, progressed, max_recover, base_s=30.0, cap_s=600.0):
+    """Pure decision for the resume loop after a lost context or a failed connect.
+
+    Returns (attempt, backoff_s, give_up).
+
+    PROGRESS RESETS THE COUNT. `attempt` used to climb for the life of the run, so a run that
+    completed goals between each loss was abandoned on its fourth loss anyway, and a separate
+    mechanism then restarted it from turn 1 -- the same failure, three more times. A leg that
+    finished goals proved the stack works; the failure that ended it starts a new streak.
+
+    NO GIVING UP WHILE GOALS REMAIN. Past `max_recover` consecutive no-progress failures the
+    loop does not leave: it waits (30s, 60s, 120s ... capped at `cap_s`) and tries again. The
+    only exits are the operator's: `--no-auto-recover` or `--max-recover 0`, which mean
+    "never recover" and are honoured as written.
+    """
+    if progressed:
+        attempt = 0
+    attempt += 1
+    if max_recover <= 0:
+        return (attempt, 0.0, True)
+    if attempt <= max_recover:
+        return (attempt, 0.0, False)
+    over = attempt - max_recover - 1
+    return (attempt, min(float(cap_s), float(base_s) * (2 ** min(over, 16))), False)
 
 
 COMMANDS_DIR = "commands.d"
@@ -2621,7 +2846,7 @@ ACKS_DIR = "acks"
 
 DISK_FLOOR_GB_BOUNDS = (0.0, 100.0)
 RAM_FLOOR_MB_BOUNDS = (0.0, 65536.0)
-TABS_BOUNDS = (1, 100)
+TABS_BOUNDS = (1, 1000)
 #: Goal / steer text. Generous: the chat window sends a pasted instruction verbatim.
 MAX_COMMAND_TEXT = 100_000
 #: A worker name, a reunlock target.
@@ -2641,7 +2866,7 @@ _AUTOSCALE_KEYS = frozenset({"on", "max", "default"})
 _STEER_KEYS = frozenset({"worker", "text"})
 #: Exactly the fields goals_from_command carries through.
 _GOAL_KEYS = frozenset({"text", "priority", "checks", "cwd", "jid", "follow_up_to",
-                        "resume_conv", "new_task"})
+                        "resume_conv", "new_task", "retry"})
 
 #: A job id / ack stem: what task_router mints (uuid hex) with room for other callers' ids,
 #: and nothing that can name a different directory or a device.
@@ -2887,7 +3112,7 @@ def _goal_item_error(it):
         v = it.get(key)
         if v is not None and not (_text_ok(v, MAX_REF) and not _CONTROL.search(v)):
             return "%s must be a string of at most %d chars" % (key, MAX_REF)
-    for key in ("priority", "new_task"):
+    for key in ("priority", "new_task", "retry"):
         if it.get(key) is not None and not _is_flag(it[key]):
             return "%s must be true/false" % key
     if it.get("jid") is not None and not _is_safe_id(it["jid"]):
@@ -3419,6 +3644,12 @@ def goals_from_command(cmd, submission_id=None) -> list:
                 # a field with a reader before it had a writer's second line.
                 if it.get("new_task"):
                     g["new_task"] = True
+                # THE COCKPIT'S AUTO-RETRY FLAG, carried through like the fields above. The sender
+                # (ui/FleetCockpit.cs RetryEntry) sets retry=true so the drain can refuse a retry
+                # whose goal is already live; the drain reads item.get("retry"). This function
+                # dropped it, so that guard never saw a retry on the command path.
+                if it.get("retry"):
+                    g["retry"] = True
                 out.append(g)
             elif isinstance(it, str) and it:
                 g = {"text": it, "priority": False}
@@ -3990,7 +4221,7 @@ def main():
         # Do not cap the live capacity by len(goals) at t=0.  The pending queue itself prevents
         # over-admission when only one goal exists; keeping the configured capacity lets later
         # add_goal submissions use the idle lanes immediately.
-        max_conc = settings_maxtabs()                    # -1 = cockpit setting (default 3)
+        max_conc = lane_setting("maxtabs", DEFAULT_MAX_CONCURRENT)   # -1 = no CLI value
 
     # ── autoscale: the user picks a DEFAULT (start) and a CEILING (上限). Start at the
     # default, shrink when RAM is tight, grow toward the ceiling when RAM is free.
@@ -4003,11 +4234,14 @@ def main():
     # default/start (and, with autoscale off, the fixed cap as before).
     set_on, set_ceiling = settings_autoscale()
     autoscale = args.autoscale or (set_on and not explicit_mc)
-    asc_default = args.autoscale_default if args.autoscale_default > 0 else settings_maxtabs()
+    asc_default = (args.autoscale_default if args.autoscale_default > 0
+                   else lane_setting("maxtabs", DEFAULT_MAX_CONCURRENT))
     if args.autoscale_max > 0:
         asc_ceiling = args.autoscale_max
-    elif set_ceiling > 0:
+    elif set_ceiling > 0 and HONOR_SETTINGS_LANES:
         asc_ceiling = set_ceiling
+    elif set_ceiling > 0 and autoscale:
+        asc_ceiling = lane_setting("autoscale_max", AUTOSCALE_CEILING_DEFAULT)  # logs + ignores
     else:
         # THE COCKPIT SHOWS 100 AND THE FLEET USED 3. `autoscale_max` is written only when the
         # operator touches the stepper, so on a machine where they never did, the key is absent
@@ -4130,6 +4364,15 @@ def main():
     print("       disk floor: keep >= %.1f GB free on C: -- %s (free now %.1f GB)"
           % (disk_floor, disk_floor_src, free_disk_gb()))
     print("       RAM floor:  keep >= %.0f MB free -- %s" % (ram_floor, ram_floor_src))
+    from relay.relay_fleet import SOCKET_SEND_BURST as _burst, SOCKET_SEND_RPM as _rpm
+    from relay import socket_capacity as _sc
+    print(_stamp("       capacity  : lane ceiling %d (derived from the cloud rate); RAM safeguard "
+                 "prices %.0f MB per socket goal and gates NEW admissions only; sends paced by a "
+                 "token bucket %.0f/min burst %.0f, capped by rate_ceiling_rpm; lane values in "
+                 "settings.txt at start-up %s"
+                 % (LANES_DEFAULT, _sc.goal_cost_mb(), _rpm, _burst,
+                    "honoured" if HONOR_SETTINGS_LANES else "ignored (live changes apply)")),
+          flush=True)
     # EVERY KEY THIS PROCESS ACTUALLY SEES. If the fleet is reading a different copy of the
     # settings file than the cockpit writes, then no setting reaches it -- not just the floor
     # -- and the only way to know is to print what it read, not what we think it read.
@@ -4454,6 +4697,7 @@ def main():
     #: How many times a discretionary reset defers to a sibling before taking it anyway.
     EDGE_SUPPRESS_MAX = int(os.environ.get("MCP_FLEET_EDGE_SUPPRESS_MAX", "3"))
     _suppressed = [0]
+    _edge_started_at = [None]      # set by hard_reset below; None = not restarted by this process
 
     def hard_reset(port, discretionary=False, escalate=False):
         """Reset the Edge AND forget the socket route that was bound to it.
@@ -4507,6 +4751,9 @@ def main():
                       % (_suppressed[0], len(others)), flush=True)
         _suppressed[0] = 0
         _edge_hard_reset(port)
+        # WHEN THE BROWSER LAST STARTED, for the watchdog's start-up grace: a browser this
+        # young is still loading the SPA and signing in, and its first tab open is slow.
+        _edge_started_at[0] = time.time()
         try:
             reset_socket_route()
         except Exception:
@@ -4539,6 +4786,9 @@ def main():
     # to be finished with it.
     sweep_active = threading.Event()
 
+    _wd_diag_for = [object()]
+    _wd_last_note = [0.0]
+
     def _watchdog():
         last_seen, last_change = None, time.time()
         while not stop_wd.is_set():
@@ -4563,10 +4813,43 @@ def main():
                 # eval (SWE-bench docker verify): in the latter case the frozen snapshot carries
                 # a worker in a verify status / with eval_busy_until in the future -- DON'T
                 # hard-reset that (it would discard the eval and resume every goal at attempt 1).
-                should, why = _watchdog_should_reset(d, stalled)
+                #
+                # AND THE EVIDENCE THAT USED TO BE IGNORED (2026-10-14: the watchdog killed the
+                # Edge under a tab open / token capture / Playwright call again and again, each
+                # kill restarted the same work, and the recovery budget ran out): calls the
+                # sweep thread has declared as blocking, capture helpers in flight, how young the
+                # browser is, whether it still answers its DevTools port, and whether the sweep
+                # thread's stack is inside Playwright. Gathered here and judged in the pure
+                # function, where each is tested; each "wait" there has a ceiling.
+                try:
+                    from relay import blocking_calls as _bc
+                    from relay.relay_fleet import capture_inflight as _capture_inflight
+                    from relay.edge_recover import cdp_ping as _cdp_ping
+                    _age = (None if _edge_started_at[0] is None
+                            else time.time() - _edge_started_at[0])
+                    should, why = _watchdog_should_reset(
+                        d, stalled, declared_blocks=_bc.active(),
+                        capture_inflight=_capture_inflight(), edge_age_s=_age,
+                        cdp_responsive=_cdp_ping(args.cdp_url),
+                        main_in_playwright=_main_thread_in_playwright())
+                except Exception:
+                    should, why = _watchdog_should_reset(d, stalled)
+                if not should and stalled > args.stall_s \
+                        and time.time() - _wd_last_note[0] > 60:
+                    _wd_last_note[0] = time.time()
+                    print(_stamp("[watchdog] status frozen %ds but not resetting: %s"
+                                 % (stalled, why)), flush=True)
+                # PROVE WHAT THE SWEEP THREAD IS BLOCKED IN, BEFORE ANYTHING IS RESET. Nobody
+                # had shown what the main thread was doing for >150 s; the stack taken now is
+                # the evidence. Written once per freeze (keyed on the frozen `updated`), whether
+                # or not the decision is to reset, so a wait that later ends in a reset has its
+                # stack on file too.
+                if _wd_diag_for[0] != last_seen:
+                    _wd_diag_for[0] = last_seen
+                    _write_stall_diagnostic(args.state_dir, d, stalled, should, why)
                 if should:
-                    print("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
-                          % (args.stall_s, why))
+                    print(_stamp("\n[watchdog] fleet stalled %ds -> hard-resetting the Edge (%s)"
+                                 % (args.stall_s, why)), flush=True)
                     hard_reset(port, discretionary=True, escalate=True)
                     last_change = time.time()
                 # else: eval in flight -> wait. Re-checked every 5s; last_change is left intact
@@ -4593,9 +4876,34 @@ def main():
     results_by_goal = {}
     pending = list(goals)
     attempt = 0
+    _leg_size = [len(pending)]
+
+    def _after_failed_leg(unfinished, what):
+        """Count the failure, back off if progress has stopped, and say whether to leave.
+
+        Returns (attempt, give_up). See _recovery_step: a leg that finished goals resets the
+        count, and past --max-recover the loop WAITS (30s doubling to 10 min) instead of
+        abandoning goals that a separate mechanism would only restart into the same failure."""
+        progressed = unfinished is not None and len(unfinished) < _leg_size[0]
+        new_attempt, wait_s, give_up_flag = _recovery_step(
+            attempt, progressed, args.max_recover)
+        if args.no_auto_recover:
+            give_up_flag = True
+        if not give_up_flag and wait_s > 0:
+            print(_stamp("[recover] %s: %d consecutive leg(s) without progress; keeping %d "
+                         "goal(s) and backing off %ds before retrying (not giving up)"
+                         % (what, new_attempt,
+                            len(unfinished if unfinished is not None else pending), wait_s)),
+                  flush=True)
+            deadline = time.time() + wait_s
+            while time.time() < deadline and not stop_box[0]:
+                time.sleep(min(5.0, max(0.0, deadline - time.time())))
+        return new_attempt, give_up_flag
+
     while pending:
+        _leg_size[0] = len(pending)
         if not cdp_alive(args.cdp_url):
-            print("[recover] Edge unreachable -> hard reset before (re)connecting")
+            print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
             hard_reset(port)
         try:
             with sync_playwright() as p:
@@ -4719,12 +5027,12 @@ def main():
             pending = []                                   # finished cleanly
         except FleetContextLost as e:
             sweep_active.clear()
-            attempt += 1
+            attempt, _give_up = _after_failed_leg(e.unfinished, "Edge context lost")
             pending = e.unfinished
-            print("\n[recover] Edge context lost; resuming %d goal(s) (attempt %d/%d)"
-                  % (len(pending), attempt, args.max_recover))
-            if args.no_auto_recover or attempt > args.max_recover:
-                print("[recover] giving up (auto-recover off or attempts exhausted)")
+            print(_stamp("\n[recover] Edge context lost; resuming %d goal(s) (attempt %d/%d)"
+                         % (len(pending), attempt, args.max_recover)))
+            if _give_up:
+                print(_stamp("[recover] giving up (auto-recover is switched off)"))
                 break
             if not cdp_alive(args.cdp_url):
                 hard_reset(port)
@@ -4739,10 +5047,11 @@ def main():
                   "reset and no retry:\n  %s" % e)
             raise SystemExit(2)
         except Exception as e:
-            attempt += 1
-            print("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
-                  % (type(e).__name__, attempt, args.max_recover))
-            if args.no_auto_recover or attempt > args.max_recover:
+            sweep_active.clear()
+            attempt, _give_up = _after_failed_leg(None, type(e).__name__)
+            print(_stamp("\n[recover] %s while connecting; hard reset + retry (attempt %d/%d)"
+                         % (type(e).__name__, attempt, args.max_recover)))
+            if _give_up:
                 break
             # ONLY IF THE BROWSER IS ACTUALLY GONE. A context can be lost because a SIBLING
             # run reset this shared Edge, and resetting it again from here is how one reset

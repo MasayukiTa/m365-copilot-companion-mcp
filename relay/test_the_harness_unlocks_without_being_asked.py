@@ -290,9 +290,8 @@ def test_a_sweep_that_cannot_run_does_not_end_the_run(monkeypatch):
 def test_the_panel_no_longer_offers_the_control():
     """THE INSTRUCTION, pinned. A person should not be asked which worker is stuck; the
     records already know."""
-    import io
-    body = io.open(os.path.join(REPO, "ui", "FleetCockpit.cs"),
-                   encoding="utf-8-sig", errors="replace").read()
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    body = cockpit_source.read(encoding="utf-8-sig", errors="replace")
     assert "void RequestReunlock" not in body
     assert "_reunlockBtn" not in body
     assert "set_reunlock_section" not in body or "SectionHeader(T(\"set_reunlock_section\"))" \

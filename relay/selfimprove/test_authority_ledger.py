@@ -573,8 +573,8 @@ def test_a_cockpit_that_will_not_start_does_not_break_the_alert(monkeypatch, tmp
 def test_the_switch_the_notification_uses_exists_in_the_ui():
     """Python 側が --authority を渡しても、C# 側が知らなければ普通の窓が開くだけ。
     ビルド成果物ではなくソースで一致を見張る -- EXE は再ビルド待ちのことがある。"""
-    import io as _io
-    src = _io.open("ui/FleetCockpit.cs", encoding="utf-8").read()
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    src = cockpit_source.read(encoding="utf-8")
     assert '"--authority"' in src
     assert "SelfImproveDashboardWindow()" in src
 

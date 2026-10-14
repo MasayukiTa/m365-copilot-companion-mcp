@@ -47,9 +47,33 @@ class _FakeContext:
         return []
 
 
+class _ReadyRoute:
+    """A socket route that is open and holds a token. The fleet has no tab to fall back to
+    (owner rule: Copilot never runs in a tab), so without a ready route admission holds every
+    goal in the queue and these browserless runs never start."""
+    enabled = True
+    closed_reason = ""
+
+    def open(self):
+        return True
+
+    def ready(self, agent_url=None):
+        return True
+
+    def needs_refresh(self, agent_url=None):
+        return False
+
+    def record(self, *a, **k):
+        pass
+
+    def status(self):
+        return {"open": True, "closed_reason": "", "turns": 0}
+
+
 def _browserless(mp):
     mp.setattr(rf, "avail_phys_mb", lambda: 64000.0)
     mp.setattr(rf, "free_disk_gb", lambda path=None: 500.0)
+    mp.setattr(rf, "_socket_route", lambda: _ReadyRoute())
 
     def fake_attach(self, context, agent_url):
         self.page = object()
@@ -160,7 +184,7 @@ def test_a_config_error_is_not_answered_with_a_browser_reset():
     wasted budget, and a reset that costs every worker currently running."""
     src = open(os.path.join(REPO, "relay", "fleet_runner.py"), encoding="utf-8").read()
     specific = src.index("except MalformedCheck as e:")
-    generic = src.index("except Exception as e:\n            attempt += 1")
+    generic = src.index("except Exception as e:\n            sweep_active.clear()\n            attempt, _give_up")
     assert specific < generic, (
         "設定エラーの分岐が汎用ハンドラより後ろにある -- 先に汎用が捕まえてリセットする")
     branch = src[specific:generic]
