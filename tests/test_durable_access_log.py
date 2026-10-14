@@ -166,7 +166,8 @@ def test_rotation_keeps_numbered_generations(tmp_path):
     assert names == ["access.log", "access.log.1", "access.log.2", "access.log.3"]
 
 
-def test_default_location_is_setup_logs_and_not_fleet():
+def test_default_location_is_setup_logs_and_not_fleet(monkeypatch):
+    monkeypatch.delenv("MCP_ACCESS_LOG_DIR", raising=False)
     p = access_log.log_path().as_posix()
     assert p.endswith(".setup/logs/access.log")
     assert "/.fleet/" not in p
