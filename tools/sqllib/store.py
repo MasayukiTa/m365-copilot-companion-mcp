@@ -412,12 +412,6 @@ def history(entry_id: int) -> list:
             "SELECT * FROM entries_history WHERE entry_id=? ORDER BY history_id", (int(entry_id),))]
 
 
-def uses(entry_id: int) -> list:
-    with closing(connect()) as con:
-        return [dict(r) for r in con.execute(
-            "SELECT * FROM uses WHERE entry_id=? ORDER BY id", (int(entry_id),))]
-
-
 # ---------------------------------------------------------------- import / export
 
 def export_jsonl(path, status: str | None = None) -> int:
