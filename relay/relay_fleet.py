@@ -2452,6 +2452,26 @@ def _consider_socket_refresh(route, agent_url):
         return False
 
 
+def _live_route_entries(route) -> dict:
+    """{agent_url: {"token", "template"}} for every entry of `route` whose token is still alive.
+
+    Read-only; used to carry a credential across a route reopen. Plain strings and the template
+    object only -- no browser object. {} on any failure."""
+    out = {}
+    try:
+        from relay.chathub import expires_in
+        with route._lock:
+            items = list(route._entries.items())
+        for k, e in items:
+            tok = (e or {}).get("token") or ""
+            tpl = (e or {}).get("template")
+            if tok and tpl is not None and expires_in(tok) > 0:
+                out[k] = {"token": tok, "template": tpl}
+    except Exception:
+        return {}
+    return out
+
+
 def _reopen_policy():
     """The run's reopen policy, built once. Backoff is stateful, so it must outlive a pass.
 
@@ -3919,7 +3939,8 @@ class RelayWorker:
             # NOT AN ERROR AND NOT A TAB: the goal waits where it is.
             from relay import token_provider
             self.status = PENDING
-            self.reason = token_provider.wait_reason(route, agent_url)
+            self.reason = (token_provider.hold().hold_reason(self.name, route, agent_url)
+                           or token_provider.wait_reason(route, agent_url))
             return False
         self.page, self.drv, self.socket = None, drv, True
         self.status = "ready"
@@ -7867,9 +7888,18 @@ class RelayWorker:
             drv = None
         if drv is None:
             from relay import token_provider
-            self.reason = token_provider.wait_reason(route, self._agent_url)
+            # REGISTERED AS HELD, so status.json `token_wait` counts this worker and shows the
+            # capture's state. It used to set the reason text only: five hours of "waiting for
+            # token" with `token_wait` empty looked exactly like a fleet with nothing to say.
+            self.reason = (token_provider.hold().hold_reason(self.name, route, self._agent_url)
+                           or token_provider.wait_reason(route, self._agent_url))
             self._cooldown_until = time.time() + 2.0
             return False
+        try:
+            from relay import token_provider
+            token_provider.hold().release(self.name)
+        except Exception:
+            pass
         self.drv, self.socket = drv, True
         self._needs_socket_rebind = False
         self._socket_turns_seen = 0
@@ -9784,24 +9814,36 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if asc_on:
             mc_box[0] = _socket_cap          # shown as the live cap; the ceiling is separate
 
-        while pending:
-            # A refresh may take 5-60s of sync Playwright browser work. It runs in an independent
-            # helper PROCESS with its own CDP connection; this sweep only launches it and returns.
-            try:
+        # KEEP THE TOKEN FRESH WHILE ANY GOAL IS UNFINISHED -- NOT ONLY WHILE THE ADMISSION QUEUE IS
+        # NON-EMPTY. This kick used to sit inside `while pending:`. When every goal had been
+        # admitted the queue was empty, so nothing ever captured: a route reopen
+        # (reset_socket_route) builds a route with no token, and the workers that had lost their
+        # socket waited for a token that no code path would fetch (2026-10-14 18:52 -> 5+ hours,
+        # `token_wait` {}). A refresh may take 5-60 s of browser work; it runs in an independent
+        # helper PROCESS with its own CDP connection, and this sweep only launches it and returns.
+        # It is a cheap no-op while one is in flight or the policy's backoff has not elapsed.
+        try:
+            if any(_w.status not in TERMINAL for _w in workers) or pending:
                 route = _socket_route()
                 if route.open() and route.needs_refresh(agent_url):
                     _consider_socket_refresh(route, agent_url)
-            except Exception:
-                pass
+        except Exception:
+            pass
+
+        while pending:
             # NO TOKEN YET / ROUTE SHUT: HOLD THE GOAL. There is no tab to fall back to (owner
             # rule, relay/no_tab.py), so the goal waits in the queue -- with its reason in
             # status.json -- for as long as the off-thread capture and the route repair take.
             if not _socket_open_now():
                 try:
                     from relay import token_provider
-                    _head = pending[0]
-                    _hold = token_provider.hold().hold_reason(
-                        _head.name, _socket_route(), agent_url)
+                    _hold = ""
+                    for _p in pending:
+                        # EVERY queued goal is registered, not only the head: `token_wait`
+                        # counts the goals that wait, and a count of one for forty is a lie.
+                        _h = token_provider.hold().hold_reason(
+                            _p.name, _socket_route(), agent_url)
+                        _hold = _hold or _h
                     if _hold:
                         for _p in pending:
                             _r = getattr(_p, "reason", "") or ""
@@ -9910,7 +9952,20 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                       closed_reason=str(_route_now.closed_reason)[:300])
                 except Exception:
                     pass
+                # THE LIVE CREDENTIAL SURVIVES THE REOPEN. The reopen is a verdict about the
+                # TRANSPORT (a probe handshake succeeded); the bearer token and the request
+                # template are not part of what failed. Discarding them forced a new capture
+                # (a page load) right after every reopen, and on 2026-10-14 18:52 -- with 47
+                # minutes of token left -- the new empty route had nothing to serve and nobody
+                # to fetch one. Only entries that are still alive are carried over.
+                _carry = _live_route_entries(_route_now)
                 reset_socket_route()
+                try:
+                    _new_route = _socket_route()
+                    for _k, _e in _carry.items():
+                        _new_route.install_capture(_e["token"], _e["template"], _k)
+                except Exception:
+                    pass
         except Exception:
             pass
 

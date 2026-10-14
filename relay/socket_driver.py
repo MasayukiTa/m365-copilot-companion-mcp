@@ -133,7 +133,16 @@ class CopilotSocketDriver:
 
     def fail_stalled_turn(self, reason: str) -> None:
         """Mark a still-live turn unusable and close its socket so normal fallback can run."""
-        self.failed = str(reason or "socket turn stalled")[:240]
+        # SAY WHAT THE STREAM WAS DOING. The idle clock only counts frames that carry progress;
+        # whether a long server-side tool call emits any is a property of the backend, and the
+        # first stall that records its frame census answers it.
+        try:
+            kinds = dict(getattr(self.conv, "frame_kinds", {}) or {})
+            tail = (" [frames: %s]" % ", ".join("%s x%d" % kv for kv in sorted(kinds.items())[:6])
+                    if kinds else " [frames: none besides pings]")
+        except Exception:
+            tail = ""
+        self.failed = (str(reason or "socket turn stalled") + tail)[:300]
         try:
             self.conv.close()
         except Exception:
