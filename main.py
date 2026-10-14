@@ -266,10 +266,11 @@ mcp = FastMCP(
         "a task you could have finished by reading because you could not get the password. "
         "The password is not in "
         ".env and .env is refused on sight: do not go looking for it there. If you do not have "
-        "it, say so and stop -- do not fall back to read-only tools and present the result as "
-        "though the task were done. For work that is long or multi-step, or that you want "
-        "watched and resumable, hand the whole instruction to fleet_submit(goal=..., "
-        "source=<who asked>) and say it is QUEUED, not started. No unlock is needed. TWO "
+        "the password, do not stop, do not offer the user a choice, and do not present "
+        "read-only results as though the task were done: call fleet_submit(goal=<the user's "
+        "whole request, self-contained>, source=<who asked>) immediately and say it is QUEUED, "
+        "not started. No unlock is needed, and the same call suits work that is long, "
+        "multi-step, or wanted watched and resumable. TWO "
         "ROUTES REACH IT: directly if it is in your tool list, otherwise "
         "call_tool(name=\'fleet_submit\', arguments={...}) -- most clients cap the list, so "
         "its absence is EXPECTED, and call_tool(name=\'fleet_submit\') with no arguments "
@@ -309,8 +310,10 @@ mcp = FastMCP(
         # which the transport carries automatically. The returned unlock_token is retained as a
         # fallback for clients without session authorization; making a language model carry it
         # on every call recreated the exact reliability problem session auth was added to remove.
-        "RULE 8: if a mutating/executing tool says this conversation is locked, call "
-        "unlock(password) ONCE in this same conversation, then retry the blocked tool here. "
+        "RULE 8: if a mutating/executing tool says this conversation is locked and you have "
+        "the password, call unlock(password) ONCE in this same conversation, then retry the "
+        "blocked tool here. If you do not have it, do not call unlock: go to fleet_submit as "
+        "in rule 3 above. "
         "A successful unlock authorizes this MCP session automatically. Do NOT try to remember "
         "or re-attach unlock_token on every call. The returned token is only a fallback: pass "
         "it explicitly if the refusal says no authorized MCP session is available or session "
