@@ -134,6 +134,9 @@ TOOL_ANNOTATION_OVERRIDES: dict[str, dict[str, bool]] = {
     "odbc_query": {"openWorldHint": True},  # gated query against a remote/corporate DB
     "odbc_to_excel": {"openWorldHint": True},  # queries a remote database AND writes a local file (gated, not read-only)
 
+    # --- generic charts: write a local file (gated). chart_from_python runs arbitrary code ---
+    "chart_from_python": {"destructiveHint": True, "openWorldHint": True},  # arbitrary python in a child process, same class as run_python
+
     # --- web: read-only BUT open-world (they reach external hosts over the network) ---
     # readOnlyHint + openWorldHint is valid and correct here -- no side effects, but the
     # host should know these leave the machine. Set both (readOnly is derived; openWorld here).

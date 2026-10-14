@@ -6,6 +6,10 @@ httpx>=0.28.1
 anyio>=4.14.2
 pandas
 openpyxl
+# xlsxwriter writes the native (editable) Excel charts of tools/chart_ops.py
+# (excel_chart_export). It was installed by hand on one PC and never declared; a fresh PC
+# would have lacked it. pandas, openpyxl and matplotlib are used by the same module.
+xlsxwriter>=3.2.0
 python-pptx>=1.0.2,<2.0
 python-docx>=1.2.0
 pypdf>=6.19.0
