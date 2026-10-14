@@ -44,6 +44,29 @@ class _FakeContext:
         return []
 
 
+class _ReadyRoute:
+    """A socket route that is open and holds a token. The fleet has no tab to fall back to
+    (owner rule: Copilot never runs in a tab), so without a ready route admission holds every
+    goal in the queue and these browserless runs never start."""
+    enabled = True
+    closed_reason = ""
+
+    def open(self):
+        return True
+
+    def ready(self, agent_url=None):
+        return True
+
+    def needs_refresh(self, agent_url=None):
+        return False
+
+    def record(self, *a, **k):
+        pass
+
+    def status(self):
+        return {"open": True, "closed_reason": "", "turns": 0}
+
+
 def _browserless(mp):
     """attach/poll/close without a browser, and RAM/disk out of the way. Everything else --
     admission, the campaign loop, the merge queue -- is the real code.
@@ -56,6 +79,7 @@ def _browserless(mp):
     """
     mp.setattr(rf, "avail_phys_mb", lambda: 64000.0)
     mp.setattr(rf, "free_disk_gb", lambda path=None: 500.0)
+    mp.setattr(rf, "_socket_route", lambda: _ReadyRoute())
 
     def fake_attach(self, context, agent_url):
         self.page = object()
