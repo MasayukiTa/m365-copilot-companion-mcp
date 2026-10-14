@@ -888,6 +888,7 @@ jobs:
             relay/test_fleet_worker_reads_gated_tools_after_unlock.py \
             tools/test_clipboard_ops_unlock_gate.py \
             tools/test_instructions_name_the_gated_reads.py \
+            tools/test_lock_refusal_hands_off_to_fleet.py \
             tools/test_odbc_ops_unlock_gate.py \
             tools/test_outlook_ops_unlock_gate.py \
             tools/test_registry_ops_unlock_gate.py \
