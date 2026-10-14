@@ -8,8 +8,9 @@ driven by this suite).
 import io
 import os
 import re
-import subprocess
 import tempfile
+
+from tools import childproc
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 LEDGER = os.path.join(REPO, "scripts", "win", "gui_submit_ledger.ps1")
@@ -17,8 +18,8 @@ COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
 
 
 def _ps(script):
-    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
-                       capture_output=True, text=True, timeout=60)
+    r = childproc.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
+                      timeout=60)
     return r.stdout.strip()
 
 
