@@ -32,14 +32,15 @@ import re
 
 import pytest
 
+from tools import cockpit_source  # the cockpit source is split across partial-class files
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
 
 
 def _cs():
     """Cockpit source without // comment lines -- the prose here explains the mistake it fixed,
     and three checks in this repository tripped on their own explanations in one day."""
-    src = io.open(COCKPIT, encoding="utf-8", errors="replace").read()
+    src = cockpit_source.read(encoding="utf-8", errors="replace")
     return "\n".join(l for l in src.splitlines() if not l.lstrip().startswith("//"))
 
 

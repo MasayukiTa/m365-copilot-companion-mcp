@@ -29,6 +29,7 @@ from relay import fanout as fo  # noqa: E402
 from relay import fanout_budget as fb  # noqa: E402
 from relay import fleet_runner as FR  # noqa: E402
 from relay import relay_fleet as rf  # noqa: E402
+from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
 from tools import settings_keys as SK  # noqa: E402
 from tools import settings_path as SP  # noqa: E402
 
@@ -380,7 +381,7 @@ def test_the_shipped_view_has_no_wpf():
 
 
 def test_the_cockpit_has_the_four_boxes_persisted_through_savekey_only():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8-sig")
     # lives in the gear popup (BuildSettingsPanel), NOT in the header
     assert "col.Children.Add(FanoutBudgetControl());" in src
     assert "ctrls.Children.Add(FanoutBudgetControl());" not in src
@@ -397,7 +398,7 @@ def test_the_cockpit_has_the_four_boxes_persisted_through_savekey_only():
 
 
 def test_the_cockpit_loads_with_validation_and_does_not_refire():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8-sig")
     assert "FanoutBudgetView.ParseLine(fbi, ln)" in src                 # settings load, clamped
     assert "FanoutBudgetView.TryParseInput(idx, tb.Text, out v)" in src   # typed value validated
     m = re.search(r"void CommitFanoutBudget\(int idx\).*?\n    }\n", src, re.S)
@@ -407,7 +408,7 @@ def test_the_cockpit_loads_with_validation_and_does_not_refire():
 
 
 def test_the_screen_reads_the_runners_report_not_its_own_boxes():
-    src = _read("ui", "FleetCockpit.cs")
+    src = cockpit_source.read(encoding="utf-8-sig")
     m = re.search(r"void PaintFanoutBudgetInEffect\(.*?\n    }\n", src, re.S)
     assert m and 'Obj(root, "fanout_budget")' in m.group(0)
     assert "FanoutBudgetView.Describe(" in m.group(0) and "FanoutBudgetView.PendingText(" in m.group(0)

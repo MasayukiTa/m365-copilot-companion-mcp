@@ -6,10 +6,12 @@ Run: pytest -q ui/test_fleet_cockpit_advanced_settings.py
 """
 from pathlib import Path
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 NEWLINE = chr(10)
 
 
-SOURCE = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8")
+SOURCE = cockpit_source.read(encoding="utf-8")
 
 
 def _no_comments(text: str) -> str:

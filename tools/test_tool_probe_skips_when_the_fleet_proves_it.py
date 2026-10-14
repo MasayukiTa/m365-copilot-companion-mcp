@@ -33,6 +33,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import bridge.copilot_bridge as B                      # noqa: E402
+from tools import cockpit_source                       # noqa: E402  (the cockpit source is split across files)
 from tools import fleet_tool_health as FTH             # noqa: E402
 from tools import settings_keys as SK                  # noqa: E402
 from tools import settings_path as SP                  # noqa: E402
@@ -363,7 +364,7 @@ def test_the_status_route_exports_the_probe_state(bridge):
 
 # ---------------------------------------------------------------- the cockpit
 def test_the_cockpit_has_the_control_in_the_settings_popup_and_not_the_header():
-    cs = _read("ui", "FleetCockpit.cs")
+    cs = cockpit_source.read(encoding="utf-8-sig")
     assert len(re.findall(r"SaveKey\(ToolProbeView\.Key, _tpVal\)", cs)) == 1
     assert re.search(r'case "tool_probe_idle_min":', cs)             # the timing switch names it
     assert "col.Children.Add(ToolProbeControl());" in cs
@@ -379,7 +380,7 @@ def test_the_cockpit_has_the_control_in_the_settings_popup_and_not_the_header():
 
 
 def test_the_health_dot_follows_the_interval_and_goes_grey_when_off():
-    cs = _read("ui", "FleetCockpit.cs")
+    cs = cockpit_source.read(encoding="utf-8-sig")
     i = cs.index("void PollToolProbeOnce(DateTime now)")
     body = cs[i:cs.index("string AgeMinutesText(double ageMin)", i)]
     assert "ageMin >= ToolProbeStaleAfterMin()" in body

@@ -2,7 +2,9 @@
 """The left FleetCockpit spine combines live task content with execution history."""
 from pathlib import Path
 
-SRC = Path(__file__).with_name("FleetCockpit.cs").read_text(encoding="utf-8-sig")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SRC = cockpit_source.read(encoding="utf-8-sig")
 
 
 def _spine():

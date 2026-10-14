@@ -21,7 +21,7 @@ REPO = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO))
 
 from bench import ui_build_check as B  # noqa: E402
-from tools import childproc  # noqa: E402
+from tools import childproc, cockpit_source  # noqa: E402  # reads every part of the split cockpit source
 
 pytestmark = pytest.mark.skipif(os.name != "nt", reason="WPF/.NET Framework exact-poll harness is Windows-only")
 
@@ -129,7 +129,7 @@ def test_exact_poll_without_a_live_matching_owner_is_red(harness, tmp_path, mode
 
 
 def test_selftest_seam_is_gated_and_poll_body_is_not_reimplemented():
-    src = (Path(B.UI) / "FleetCockpit.cs").read_text(encoding="utf-8-sig")
+    src = cockpit_source.read(encoding="utf-8-sig")
     assert "SelfTestServerHealthPoll" in src
     assert "WindowSelfTest.Active" in src[src.index("SelfTestServerHealthPoll"):src.index("SelfTestServerHealthPoll") + 1800]
     poll = src[src.index("void PollHealthOnce()"):src.index("// 1) Tunnel:")]

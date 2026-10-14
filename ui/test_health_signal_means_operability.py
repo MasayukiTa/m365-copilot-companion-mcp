@@ -8,7 +8,9 @@ color is reserved for impaired/uncertain operation that changes what the operato
 from pathlib import Path
 import re
 
-SRC = Path(__file__).with_name('FleetCockpit.cs').read_text(encoding='utf-8-sig')
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+SRC = cockpit_source.read(encoding='utf-8-sig')
 
 
 def _between(start, end):

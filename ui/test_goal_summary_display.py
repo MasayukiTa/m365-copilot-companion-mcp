@@ -2,11 +2,13 @@
 """The cockpit shows compact task identities while retaining full goals in the expanded view."""
 from pathlib import Path
 
+from tools import cockpit_source  # reads every part of the split cockpit source
+
 COCKPIT = Path(__file__).with_name("FleetCockpit.cs")
 
 
 def src():
-    return COCKPIT.read_text(encoding="utf-8-sig")
+    return cockpit_source.read(encoding="utf-8-sig")
 
 
 def test_directive_band_lists_one_summary_per_distinct_full_goal():

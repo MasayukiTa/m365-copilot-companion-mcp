@@ -19,6 +19,9 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _read(rel):
+    if rel == "ui/FleetCockpit.cs":
+        from tools import cockpit_source  # the cockpit source is split across partial-class files
+        return cockpit_source.read(encoding="utf-8-sig")
     with io.open(os.path.join(REPO, rel), encoding="utf-8-sig") as fh:
         return fh.read()
 

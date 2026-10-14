@@ -86,7 +86,6 @@ def test_start_add_button_uses_stable_automation_identity_before_localized_name_
 
 
 def test_cockpit_source_assigns_start_button_automation_id():
-    cockpit = Path(__file__).resolve().parents[1].joinpath("ui", "FleetCockpit.cs").read_text(
-        encoding="utf-8-sig", errors="replace"
-    )
+    from tools import cockpit_source  # the cockpit source is split across partial-class files
+    cockpit = cockpit_source.read(encoding="utf-8-sig", errors="replace")
     assert 'SetAutomationId(_startBtn, "startButton")' in cockpit

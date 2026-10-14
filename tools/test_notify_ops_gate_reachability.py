@@ -47,6 +47,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 import tools.notify_ops as N  # noqa: E402
+from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
 
 CS_PATH = os.path.join(REPO, "ui", "FleetCockpit.cs")
 
@@ -291,7 +292,7 @@ def _extract_csharp_method(src: str, signature: str) -> str:
 
 @pytest.mark.skipif(not os.path.isfile(CS_PATH), reason="ui/FleetCockpit.cs not present here")
 def test_the_python_resolver_follows_the_same_order_as_the_csharp_one():
-    cs_src = Path(CS_PATH).read_text(encoding="utf-8")
+    cs_src = cockpit_source.read(encoding="utf-8")
     cs_body = _strip_csharp_comments(
         _extract_csharp_method(cs_src, "internal static string ResolveGateDirectory"))
 
@@ -328,5 +329,5 @@ def test_the_approval_window_call_site_passes_no_settings_fallback():
     from the process environment this launcher's child inherits. If that call site ever starts
     passing a settings-file fallback, gate_is_reachable's mirror (which also always passes
     empty strings) silently stops matching what the real window does."""
-    cs_src = _strip_csharp_comments(Path(CS_PATH).read_text(encoding="utf-8"))
+    cs_src = _strip_csharp_comments(cockpit_source.read(encoding="utf-8"))
     assert 'CockpitWindow.ResolveGateDirectory("", "")' in cs_src

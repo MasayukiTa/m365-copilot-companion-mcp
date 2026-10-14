@@ -20,7 +20,9 @@
 """
 from pathlib import Path
 
-RAW = (Path(__file__).with_name("FleetCockpit.cs")).read_text(encoding="utf-8")
+from tools import cockpit_source  # reads every part of the split cockpit source
+
+RAW = cockpit_source.read(encoding="utf-8")
 
 
 def _executable(cs):
