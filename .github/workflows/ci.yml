@@ -113,6 +113,7 @@ jobs:
             tools/test_web_fetch_encoding.py \
             tools/test_arg_repair.py \
             tools/test_tool_catalogue.py \
+            tools/test_trace_view.py \
             tools/test_a_cap_in_bytes_never_bound_the_thing_that_broke.py \
             tools/test_an_idle_machine_is_not_a_broken_one.py \
             tools/test_a_tool_that_returns_its_failure_still_failed.py \
@@ -129,6 +130,7 @@ jobs:
             scripts/test_a_guard_nobody_runs_is_not_a_guard.py \
             bench/test_a_bench_must_not_overrule_the_operators_floor.py \
             tests/test_a_name_that_does_not_exist_is_not_a_style_problem.py \
+            tests/test_evalbench.py \
             tests/test_a_pid_is_unique_at_a_moment_not_over_time.py \
             tests/test_a_submission_you_cannot_see_is_not_submitted.py \
             relay/test_a_panel_reading_a_file_must_not_kill_the_run.py \
@@ -370,6 +372,7 @@ jobs:
             tools/test_data_memory_hook.py \
             tools/test_data_discovery.py \
             tools/test_data_aliases.py \
+            tools/test_sqllib.py \
             tools/test_local_loop_ops.py \
             tools/test_local_loop_registration.py \
             tools/test_lock_state.py \

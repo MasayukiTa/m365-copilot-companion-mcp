@@ -130,11 +130,15 @@ from tools.schedule_ops import (
 )
 from tools.search_web import web_search, web_search_news
 from tools.sql_ops import sqlite_query, sqlite_schema, sqlite_tables, sqlite_to_excel
+from tools.sqllib.mcp_tools import (
+    sql_examples_search, sql_example_save, sql_example_use, sql_example_feedback,
+)
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
 from tools.audit_ledger_ops import validity_audit_ledger
+from tools.trace_view.tool import trace_session
 from tools.jobs import (
     job_kill,
     job_list,
@@ -563,6 +567,8 @@ TOOLS = (
     job_status, job_wait, job_output, job_list, job_kill,
     # the door an agent walks through to hand this machine a goal
     fleet_submit, fleet_queue,
+    # read-only per-session timeline of the server's own tool ledger (unlock-gated)
+    trace_session,
     # optional helper tools: present only when MCP_EXT_HELPER=1 (see EXT_HELPER_TOOLS)
     *EXT_HELPER_TOOLS,
     # processes / services / registry (Windows host introspection)
@@ -651,6 +657,8 @@ TOOLS = (
     watcher_start, watcher_events, watcher_stop,
     # SQLite (local read-only DB)
     sqlite_tables, sqlite_schema, sqlite_query, sqlite_to_excel,
+    # SQL example library (draft -> validated -> certified); gated, see tools/sqllib/README.md
+    sql_examples_search, sql_example_save, sql_example_use, sql_example_feedback,
     # ODBC (corporate DBs via Windows / Entra auth)
     odbc_drivers, odbc_connections, odbc_tables, odbc_columns, odbc_query, odbc_to_excel,
     # pptx
