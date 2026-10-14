@@ -10083,6 +10083,28 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             except Exception:
                 pass
             _candidate_socket = _socket_open_now()
+            # NO TOKEN YET: HOLD THE GOAL, DO NOT OPEN A TAB ON THE SWEEP THREAD. A socket-bound
+            # goal waits (reason shown in status.json) while the off-thread capture runs; the
+            # tab path applies only after relay.token_provider.MAX_HOLD_S. See that module.
+            if not _candidate_socket:
+                try:
+                    from relay import token_provider
+                    _head = pending[0]
+                    _rc = getattr(_head, "resume_conv", "") or ""
+                    _hold = token_provider.hold().hold_reason(
+                        _head.name, _socket_route(), agent_url,
+                        wants_socket=token_provider.goal_wants_socket(
+                            _head, bool(_rc) and not _conversation_id_or_empty(_rc)))
+                    if _hold:
+                        for _p in pending:
+                            _r = getattr(_p, "reason", "") or ""
+                            if not _r or _r.startswith("waiting for token"):
+                                _p.reason = _hold
+                        break
+                    if str(getattr(_head, "reason", "") or "").startswith("waiting for token"):
+                        _head.reason = ""
+                except Exception:
+                    pass
             # A SOCKET GOAL HOLDS NO TAB, SO THE TAB BUDGET DOES NOT APPLY TO IT. The test used
             # to run for it too with weight 0 -- `open_tabs + 0 <= cap` -- which is false the
             # moment the cap sits below the tabs other goals hold, and then socket goals queued

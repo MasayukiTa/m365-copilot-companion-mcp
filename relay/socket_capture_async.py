@@ -23,7 +23,9 @@ import time
 from tools import childproc
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DEFAULT_TIMEOUT_S = float(os.environ.get("MCP_SOCKET_CAPTURE_TIMEOUT_S", "90"))
+#: Raised from 90 s: the stages inside one capture can add up past it (page load plus the tier 3
+#: real turn), so 90 s timed out a capture that was working.
+DEFAULT_TIMEOUT_S = float(os.environ.get("MCP_SOCKET_CAPTURE_TIMEOUT_S", "180"))
 
 
 class AsyncCaptureManager:
@@ -40,6 +42,10 @@ class AsyncCaptureManager:
         self.timeout_s = DEFAULT_TIMEOUT_S if timeout_s is None else float(timeout_s)
         self._popen = popen
         self._now = now
+        # Exp-aware pacing: same-exp results and failures lengthen the interval (see
+        # relay/token_provider.py). The base is this manager's own interval_s.
+        from relay.token_provider import CapturePolicy
+        self.policy = CapturePolicy(base_s=self.interval_s, now=now)
         self._log = log or (lambda m: print(m, flush=True))
         self._lock = threading.Lock()
         self._inflight = {}       # agent key -> process
@@ -67,7 +73,10 @@ class AsyncCaptureManager:
             previous = float(self._last_attempt.get(key) or 0.0)
             if previous and now - previous < self.interval_s:
                 return False
+            if not self.policy.allow(key, now):
+                return False
             self._last_attempt[key] = now
+            self.policy.on_attempt(key, now)
 
         # Snapshot the route generation BEFORE process launch. A synchronous Research/Refuter
         # refresh can complete while Popen is constructing the helper; reading the generation
@@ -110,8 +119,17 @@ class AsyncCaptureManager:
             try:
                 raw_out, raw_err = proc.communicate(timeout=self.timeout_s)
             except subprocess.TimeoutExpired:
+                # Only OUR helper process tree is killed -- never the Edge. Keep the tail of its
+                # stderr so a timeout says which stage it was in (it used to be discarded).
                 childproc.kill_tree(proc, wait_s=2.0)
-                raise RuntimeError("capture helper exceeded %.0fs" % self.timeout_s)
+                tail = ""
+                try:
+                    _o, _e = proc.communicate(timeout=2.0)
+                    tail = childproc.decode(_e).strip().replace("\r", " ").replace("\n", " ")[-200:]
+                except Exception:
+                    pass
+                raise RuntimeError("capture helper exceeded %.0fs%s"
+                                   % (self.timeout_s, (" (last: %s)" % tail) if tail else ""))
             rc = getattr(proc, "returncode", None)
             if rc not in (0, None):
                 err = childproc.decode(raw_err).strip().replace("\r", " ").replace("\n", " ")
@@ -125,6 +143,11 @@ class AsyncCaptureManager:
                 raise ValueError("capture helper returned no usable token/agent template")
             installed = bool(route.install_capture(token, template, key,
                                                    expected_revision=revision))
+            try:
+                have = bool(route.ready(key))
+            except Exception:
+                have = True
+            delay = self.policy.on_success(key, token, have_token=have)
             if installed:
                 with self._lock:
                     self._completed += 1
@@ -146,6 +169,12 @@ class AsyncCaptureManager:
             with self._lock:
                 self._failed += 1
             try:
+                have = bool(route.ready(key))
+            except Exception:
+                have = False
+            self.policy.on_failure(key, have_token=have, why="%s: %s" % (
+                type(exc).__name__, str(exc)[:120]))
+            try:
                 from relay.capture_status import record_failure
                 record_failure(exc, key)
             except Exception:
@@ -166,7 +195,8 @@ class AsyncCaptureManager:
         with self._lock:
             return {"inflight": len(self._inflight), "completed": self._completed,
                     "failed": self._failed, "discarded": self._discarded,
-                    "interval_s": self.interval_s}
+                    "interval_s": self.interval_s,
+                    "policy": {k: self.policy.snapshot(k) for k in self._last_attempt}}
 
 
 def _worker_main() -> int:

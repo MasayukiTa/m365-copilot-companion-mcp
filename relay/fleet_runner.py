@@ -1838,6 +1838,8 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # environment and downstream services may impose lower ones, so refusals arriving under
         # the line mean the line is the wrong line, not that the gauge is broken.
         "quota": _quota_snapshot(),
+        # Why goals are held in the queue with no token (empty when none are).
+        "token_wait": __import__("relay.token_provider", fromlist=["x"]).status_block(),
         # THE FALLBACK BUTTON'S OWN RECEIPT. None until a {"reunlock":...} command has been
         # applied at least once this run; after that,
         # {"ts","target","ok","delivered","reason"} from apply_reunlock -- so "I pressed the
