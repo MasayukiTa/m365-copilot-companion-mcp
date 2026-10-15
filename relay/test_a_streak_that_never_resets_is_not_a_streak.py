@@ -50,7 +50,10 @@ def test_a_clean_turn_clears_the_streak(worker):
 
 def test_two_in_a_row_still_stops_the_worker(worker):
     """The other half: the reset must not disarm the detector it guards. Two consecutive
-    replies that both write out an invocation are the case it exists for."""
+    replies that both write out an invocation are the case it exists for. (Once the bounded
+    fresh-conversation retries are spent; before that the second one recycles instead --
+    see test_fresh_conversation_retry.py.)"""
+    worker._malformed_recycles = F.FRESH_RETRY_MAX
     _decide(worker, MARKUP)
     _decide(worker, MARKUP)
     assert worker._unlanded_calls >= 2

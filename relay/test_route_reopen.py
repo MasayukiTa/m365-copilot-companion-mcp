@@ -107,8 +107,7 @@ def test_a_task_caused_close_is_probed_later_because_there_is_no_tab_to_wait_it_
     ここを reason で止めなければ、片方向ブレーカが書かれた理由そのものを壊す。
     """
     box = [_live_route()]
-    for _ in range(box[0].max_consecutive):
-        box[0].note_failure("w2: the turn completed but carried no text")
+    box[0].close_route("3 consecutive failures, last: w2: the turn completed but carried no text")
     assert box[0].driver_for("w6") is None
 
     clock = [1000.0]

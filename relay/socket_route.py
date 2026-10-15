@@ -52,6 +52,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 
@@ -83,6 +84,9 @@ MAX_CONSECUTIVE = int(os.environ.get("MCP_FLEET_SOCKET_MAX_CONSECUTIVE", "3"))
 #: two is worse than no route: it pays the failure AND the tab open, every time.
 MAX_FALLBACKS = int(os.environ.get("MCP_FLEET_SOCKET_MAX_FALLBACKS", "10"))
 
+#: Stalled conversations only close the route if NO conversation made progress for this long.
+STALL_WINDOW_S = float(os.environ.get("MCP_FLEET_SOCKET_STALL_WINDOW_S", "120"))
+
 
 class SocketRoute:
     """Fleet-wide state for the socket path: is it open, and what does it hand a worker."""
@@ -90,7 +94,7 @@ class SocketRoute:
     def __init__(self, *, capture_fn=None, connect_fn=None, enabled=None,
                  max_consecutive=MAX_CONSECUTIVE, max_fallbacks=MAX_FALLBACKS,
                  refresh_margin_s=REFRESH_MARGIN_S, now=time.time, log=None,
-                 log_path=None):
+                 log_path=None, stall_window_s=STALL_WINDOW_S):
         self.enabled = ENABLED if enabled is None else bool(enabled)
         self._capture_fn = capture_fn
         self._connect_fn = connect_fn
@@ -105,6 +109,12 @@ class SocketRoute:
         #: was writing `route_closed` lines into the live training data and putting three
         #: events into a record that describes a route that never closed.
         self.log_path = DEFAULT_LOG if log_path is None else log_path
+        #: MCP session -> worker/conversation bindings (relay/mcp_attribution.py), rebuilt from
+        #: the log after a restart, and the tool ledger the in-flight view reads (None = the
+        #: repo's tool_events.jsonl, resolved at use).
+        from relay import mcp_attribution as _attr
+        self.mcp_bindings = _attr.Registry(lambda: self.log_path)
+        self.ledger_path = None
         self.max_consecutive = int(max_consecutive)
         self.max_fallbacks = int(max_fallbacks)
         self.refresh_margin_s = float(refresh_margin_s)
@@ -135,6 +145,12 @@ class SocketRoute:
         #: Never decremented. The flap guard.
         self.fallbacks = 0
         self.turns = 0
+        #: When any conversation last made progress or completed a turn. Starts at construction
+        #: so "silent for N s" is measured from when the route began to be offered.
+        self._last_progress_ts = float(self._now())
+        self.stall_window_s = float(stall_window_s)
+        self._recent_failures = []
+        self._recent_stalls = []
 
     # ---- the durable record ------------------------------------------------------------------
 
@@ -178,6 +194,41 @@ class SocketRoute:
         except Exception:
             return ""
         return found
+
+    def record_mcp_bound(self, **fields) -> None:
+        """A conversation's MCP session was identified: write `mcp_session_bound`
+        {mcp_session, worker, conversation, turn_at_bind, how, candidates, ...} and remember it,
+        so the tool ledger can be read per worker (relay/mcp_attribution.py). Never raises."""
+        try:
+            rec = dict(fields)
+            rec["ts"] = float(self._now())
+            self.mcp_bindings.add(rec)
+            self.record("mcp_session_bound", **fields)
+        except Exception:
+            pass
+
+    def record_turn_stats(self, s: dict) -> None:
+        """`socket_turn_stats` for a finished (or failed) turn, then `socket_turn_tools`: the MCP
+        tool calls of this worker's conversation that were in flight during the turn's window.
+        The second record is what tells a stall that is waiting on a long server-side call from
+        one that is waiting on nothing. Never raises."""
+        self.record("socket_turn_stats", **s)
+        try:
+            from relay import mcp_attribution as attr
+            t0, t1 = s.get("t0"), float(self._now())
+            if not t0:
+                return
+            path = self.ledger_path
+            if path is None:
+                from tools import tool_ledger
+                path = str(tool_ledger._repo_path())
+            fields = attr.turn_tools_for(s.get("worker", ""), s.get("turn"), s.get("conversation", ""),
+                                         float(t0), t1, path, self.mcp_bindings.snapshot())
+            if fields is not None:
+                fields["outcome"] = s.get("outcome", "")
+                self.record(attr.TURN_TOOLS_EVENT, **fields)
+        except Exception:
+            pass
 
     def record(self, event: str, **fields) -> None:
         """Append one line about a routing decision. Best effort; never raises, never blocks.
@@ -227,19 +278,99 @@ class SocketRoute:
                   "probed for reopening without spending a turn" % reason)
         self.record("route_closed", reason=reason, turns=turns, fallbacks=fallbacks)
 
+    @staticmethod
+    def _worker_of(reason: str) -> str:
+        m = re.match(r"\s*([A-Za-z]\w{0,15}):\s", reason or "")
+        return m.group(1) if m else ""
+
+    @staticmethod
+    def _frames_of(reason: str) -> str:
+        m = re.search(r"\[frames: ([^\]]*)\]", reason or "")
+        return m.group(1) if m else ""
+
+    def note_progress(self, worker: str = "") -> None:
+        """Any conversation made progress. A progressing conversation proves the route is healthy,
+        so the run of consecutive failures is broken: consecutive means consecutive across ALL
+        conversations in time order."""
+        with self._lock:
+            self._last_progress_ts = float(self._now())
+            self.consecutive = 0
+            self._recent_failures = []
+            self._recent_stalls = []
+
+    def _trip_record(self, kind: str, reason: str) -> None:
+        with self._lock:
+            fails = list(self._recent_failures)
+            stalls = list(self._recent_stalls)
+        per_worker = {}
+        frames = {}
+        for f in fails + stalls:
+            per_worker[f["worker"] or "?"] = per_worker.get(f["worker"] or "?", 0) + 1
+            for part in str(f.get("frames") or "").split(", "):
+                m = re.match(r"(.+) x(\d+)$", part)
+                if m:
+                    frames[m.group(1)] = frames.get(m.group(1), 0) + int(m.group(2))
+        self.record("route_breaker_trip", kind=kind, reason=reason[:300],
+                    connection_failures=len(fails), stalls=len(stalls),
+                    per_worker=per_worker, frames=frames,
+                    consecutive=self.consecutive, fallbacks=self.fallbacks)
+
+    def note_stall(self, worker: str, reason: str, frames: str = "") -> bool:
+        """One conversation stalled. Recorded, NOT a connection failure: the worker recycles that
+        conversation by itself. It closes the route only if no conversation anywhere made
+        progress for ``stall_window_s`` and ``max_consecutive`` distinct conversations stalled
+        in that silence (then nothing is working, which is a route fault)."""
+        frames = frames or self._frames_of(reason)
+        now = float(self._now())
+        with self._lock:
+            self._recent_stalls.append({"worker": worker, "reason": reason[:200],
+                                        "frames": frames, "ts": now})
+            silent_for = now - self._last_progress_ts
+            workers = {s["worker"] for s in self._recent_stalls}
+            nstalls = len(workers)
+        self.record("conversation_stall", worker=worker, reason=reason[:300], frames=frames,
+                    silent_for_s=round(silent_for, 1), stalled_workers=nstalls)
+        self._log("[socket_route] conversation stall (%s), recycled per worker; nothing "
+                  "progressing for %.0fs, %d stalled" % (worker, silent_for, nstalls))
+        if nstalls >= self.max_consecutive and silent_for >= self.stall_window_s:
+            why = ("%d conversations stalled and none progressed anywhere for %.0fs, last: %s"
+                   % (nstalls, silent_for, reason))
+            self._trip_record("stalls_with_no_progress", why)
+            self.close_route(why)
+            return True
+        return False
+
     def note_failure(self, reason: str) -> None:
-        """A worker fell back. Counts twice: against the blip guard and the flap guard."""
+        """A worker fell back. Only failures that indict the CONNECTION or TOKEN count toward
+        the breaker; a per-conversation stall goes to note_stall and anything else is recorded
+        and left to the worker."""
+        from relay.transport_policy import indicts_connection, is_stall
+        worker = self._worker_of(reason)
+        if is_stall(reason):
+            self.note_stall(worker, reason)
+            return
+        if not indicts_connection(reason):
+            self.record("failure_not_counted", worker=worker, reason=reason[:300])
+            self._log("[socket_route] fallback not counted (does not indict the connection): %s"
+                      % reason)
+            return
         with self._lock:
             self.consecutive += 1
             self.fallbacks += 1
             consecutive, fallbacks = self.consecutive, self.fallbacks
+            self._recent_failures.append({"worker": worker, "reason": reason[:200],
+                                          "frames": self._frames_of(reason)})
         self._log("[socket_route] fallback %d (consecutive %d): %s"
                   % (fallbacks, consecutive, reason))
         if consecutive >= self.max_consecutive:
-            self.close_route("%d consecutive failures, last: %s" % (consecutive, reason))
+            why = "%d consecutive failures, last: %s" % (consecutive, reason)
+            self._trip_record("connection", why)
+            self.close_route(why)
         elif fallbacks >= self.max_fallbacks:
-            self.close_route("%d fallbacks this run: the route is not reliable enough to be "
-                             "worth the failed turn plus the tab open" % fallbacks)
+            why = ("%d fallbacks this run: the route is not reliable enough to be "
+                   "worth the failed turn plus the tab open" % fallbacks)
+            self._trip_record("fallbacks", why)
+            self.close_route(why)
 
     def note_capture_failure(self, reason: str) -> None:
         """A TOKEN CAPTURE failed. Logged and recorded, but NOT counted against the breaker.
@@ -256,6 +387,9 @@ class SocketRoute:
         with self._lock:
             self.consecutive = 0
             self.turns += 1
+            self._last_progress_ts = float(self._now())
+            self._recent_failures = []
+            self._recent_stalls = []
 
     def status(self) -> dict:
         return {
@@ -265,6 +399,7 @@ class SocketRoute:
             "turns": self.turns,
             "fallbacks": self.fallbacks,
             "consecutive": self.consecutive,
+            "last_progress_age_s": int(max(0.0, self._now() - self._last_progress_ts)),
             "agents": len(self._entries),
             "token_seconds_left": int(self.token_life()),
         }
@@ -439,7 +574,10 @@ class SocketRoute:
             # refuses frames whose fields disagree is one bad assumption away from refusing
             # this, and the assumption costs nothing to remove.
             conv.turns = max(1, int(getattr(conv, "turns", 0) or 0))
-        return CopilotSocketDriver(conv, connect=self._connect_fn)
+        drv = CopilotSocketDriver(conv, connect=self._connect_fn)
+        drv.worker_name = str(name or "")
+        drv.stats_sink = self.record_turn_stats
+        return drv
 
 
 def websocket_connect(url, headers, timeout_s):
