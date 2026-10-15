@@ -299,14 +299,6 @@ def test_a_recycled_workers_old_session_is_not_counted():
     assert f["n_calls"] == 1 and f["mcp_sessions"] == ["S1b"]
 
 
-def test_attribute_tool_rows_adds_a_worker_for_bound_sessions_only():
-    rows = [dict(call("a", 1, "S1"), worker=""), call("b", 2, "ZZ"), call("c", 3, "")]
-    out = attr.attribute_tool_rows(rows, BINDINGS)
-    assert out[0]["worker_bound"] == "w1" and out[0]["conversation_bound"] == "c1"
-    assert "worker_bound" not in out[1] and "worker_bound" not in out[2]
-    assert "worker_bound" not in rows[0]                     # the input is not modified
-
-
 def test_read_jsonl_tail_drops_a_partial_first_line(tmp_path):
     p = tmp_path / "l.jsonl"
     lines = [json.dumps({"ts": float(i), "pad": "x" * 50}) for i in range(100)]

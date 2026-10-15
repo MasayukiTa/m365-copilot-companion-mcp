@@ -22,7 +22,6 @@ candidates) to socket_route.jsonl. Everything else is a pure function of those e
 tool_events.jsonl:
 
   session_worker_map(route_rows)       mcp session -> binding
-  attribute_tool_rows(tool_rows, map)  a worker label for every call whose session is bound
   turn_tools_fields(...)               the MCP calls in flight during one socket turn
 
 `how` says how far to trust a binding: "id" exact; "unique" temporal and nothing else was
@@ -149,20 +148,6 @@ class Registry:
             return dict(self._by_session)
 
 
-_REGISTRY = None
-_REG_LOCK = threading.Lock()
-
-
-def registry(route_path_fn=None) -> Registry:
-    global _REGISTRY
-    with _REG_LOCK:
-        if _REGISTRY is None:
-            _REGISTRY = Registry(route_path_fn)
-        elif route_path_fn and not _REGISTRY._path_fn:
-            _REGISTRY._path_fn = route_path_fn
-        return _REGISTRY
-
-
 # --- tool calls -----------------------------------------------------------------------------
 def tool_spans(tool_rows):
     """[{id, tool, session, start, end, ok}] from tool_events rows: a `call` row opens a span, the
@@ -186,21 +171,6 @@ def tool_spans(tool_rows):
         except Exception:
             continue
     return spans
-
-
-def attribute_tool_rows(tool_rows, bindings):
-    """Copy of each tool_events row with `worker_bound` / `conversation_bound` / `bind_how`
-    added when its session is bound. Rows are not otherwise changed; their own worker field
-    (the coordinator-window attribution) is kept as is."""
-    out = []
-    for r in tool_rows or []:
-        b = bindings.get(str(r.get("session") or "")) if r.get("session") else None
-        if b:
-            r = dict(r)
-            r["worker_bound"], r["conversation_bound"] = b.get("worker", ""), b.get("conversation", "")
-            r["bind_how"] = b.get("how", "")
-        out.append(r)
-    return out
 
 
 def _union_s(intervals):

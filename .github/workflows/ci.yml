@@ -161,6 +161,9 @@ jobs:
             relay/test_stuck_cause_classifier.py \
             relay/test_mcp_ready.py \
             relay/test_side_socket.py \
+            relay/test_fresh_conversation_retry.py \
+            relay/test_route_breaker_per_conversation.py \
+            relay/test_mcp_attribution.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
