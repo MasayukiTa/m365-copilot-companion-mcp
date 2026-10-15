@@ -192,9 +192,3 @@ def audit_restored() -> None:
         _audit["last_state"] = True
     _write_audit("%s=1 unlock gate is back ON (password / session authorisation required "
                  "again)" % KEY)
-
-
-def reset_for_tests() -> None:
-    with _lock:
-        _file_cache.update(path=None, mtime=None, value=None)
-        _audit.update(last_state=None, passes=0, last_write=0.0, first_ip="")

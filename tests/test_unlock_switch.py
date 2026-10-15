@@ -41,10 +41,16 @@ def _isolated(tmp_path, monkeypatch):
     monkeypatch.delenv("MCP_REQUIRE_UNLOCK_TOKEN", raising=False)
     monkeypatch.delenv("MCP_UNLOCK_SESSION_AUTH", raising=False)
     S.clear_presented_token()
-    U.reset_for_tests()
+    _reset_switch_state()
     yield
     S.clear_presented_token()
-    U.reset_for_tests()
+    _reset_switch_state()
+
+
+def _reset_switch_state():
+    with U._lock:
+        U._file_cache.update(path=None, mtime=None, value=None)
+        U._audit.update(last_state=None, passes=0, last_write=0.0, first_ip="")
 
 
 def _write_env(tmp_path, text):
