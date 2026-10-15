@@ -618,6 +618,8 @@ class ResearchSession:
         #: Asked once. A capture costs a real turn on a real tab, so retrying it every poll
         #: would spend more than the tab it is trying to avoid.
         self._socket_tried = False
+        #: Why the deep-dive has not started yet ("" when it has). A hold is a state, not a result.
+        self.hold_reason = ""
         self._done = None          # report string once finished ('' on failure)
         #: WHY it finished empty, when it did. Every path to an empty report used to look
         #: identical from outside -- a swallowed exception, a timeout and a RAM skip all
@@ -691,7 +693,16 @@ class ResearchSession:
         minutes early, holds still for 169 seconds mid-run, and SHRINKS. Over a socket the
         backend sends a completion frame and the turn is over by protocol.
         """
+        import time as _t
+        if _t.time() < getattr(self, "_next_try_at", 0.0):
+            return False                 # paced: a held deep-dive is not re-probed every lap
         self._socket_tried = True
+        # THE DRIVER IS OBTAINED EXACTLY AS A WORKER OBTAINS ONE (relay/side_socket.py): a live
+        # token + this agent's cached template, the MCP-ready gate, a conversation of its own.
+        # When that is not possible the deep-dive HOLDS with `hold_reason` and asks again next
+        # poll. It used to demand a token with more than the refresh margin left (or a
+        # synchronous capture on the sweep thread) and fall through to a page, which is now
+        # forbidden (relay/no_tab.py): the research ended empty for a reason that was not its own.
         # AN ATTACHMENT NO LONGER ENDS THE ATTEMPT HERE.
         #
         # This returned False for anything with an upload_path, on the premise
@@ -705,39 +716,51 @@ class ResearchSession:
         # uploaded, its docId sent on a socket turn, and the reply read the phrase back --
         # it is in no filename, no path and no prompt, so the pixels are its only source.
         _annotations = None
+        drv = None
         try:
             from relay.relay_fleet import _socket_route
+            from relay.side_socket import acquire_side_driver
 
             route = _socket_route()
-            if not route.open() or self.context is None:
-                return False
             url = getattr(self.profile, "url", "") or ""
             if not url:
+                # A configuration fault, not a wait: no amount of holding gives it an agent.
+                self._fail("the %s profile has no agent url, so no socket conversation can be "
+                           "opened (and a page is never opened)"
+                           % getattr(self.profile, "name", "side agent"))
                 return False
-            if route.needs_refresh(url) and not route.refresh(self.context, url):
-                return False
-            drv = route.driver_for(
-                "research", agent_url=url,
+            drv, why = acquire_side_driver(
+                "research", url, hold_name=self._hold_name(),
                 model=(self.model_name if getattr(self.profile, "model_picker", None) else ""),
-                turn_timeout_s=self._socket_share(self.timeout_s),
-                frame_timeout_s=300.0)
+                turn_timeout_s=float(self.timeout_s), frame_timeout_s=300.0)
+            self.hold_reason = why
             if drv is None:
+                self._next_try_at = _t.time() + 2.0
                 return False
             if self.upload_path:
                 # AFTER the route has a token, because the upload needs one, and BEFORE
                 # the turn goes out, because the Analyst needs the data before the
                 # question.
                 #
-                # A FAILED UPLOAD FALLS BACK TO A TAB, and that is not timidity: the tab
-                # path below names the failure it prevents -- "an instruction about a file
-                # that is not there comes back as a confident answer about nothing" -- and
-                # sending the question annotation-less would reintroduce exactly that.
+                # A FAILED UPLOAD ENDS THE SESSION WITH ITS REASON, not a page and not an
+                # annotation-less question: "an instruction about a file that is not there
+                # comes back as a confident answer about nothing". The upload is derived from
+                # a page (relay/socket_attachment.py), which the no-tab rule refuses, so
+                # waiting cannot repair it -- holding here would hold for ever.
                 from relay.socket_attachment import annotation_for
 
                 _annotations = annotation_for(self.context, url, self.upload_path,
                                               route.token_for(url),
                                               log=lambda m: print(m, flush=True))
                 if not _annotations:
+                    try:
+                        drv.close()
+                    except Exception:
+                        pass
+                    drv = None
+                    self._fail("the attachment upload did not return an annotation (no tab is "
+                               "ever opened to derive one): an instruction about a file that "
+                               "is not there comes back as a confident answer about nothing")
                     return False
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
@@ -747,12 +770,23 @@ class ResearchSession:
             self._pending_open = False
             self._t_send = time.time()
             return True
-        except Exception:
-            # A route that cannot be had is not a failure of the deep-dive: the tab path is
-            # right there and is what ran before this existed.
+        except Exception as exc:
+            # A route that cannot be had is not a failure of the deep-dive: it is held and
+            # asked again on the next poll (never a page).
             self.socket = False
             self.page, self.drv = None, None
+            try:
+                if drv is not None:
+                    drv.close()
+            except Exception:
+                pass
+            self._next_try_at = _t.time() + 2.0
+            self.hold_reason = "research socket start failed: %s: %s" % (
+                type(exc).__name__, str(exc)[:120])
             return False
+
+    def _hold_name(self):
+        return "research-%x" % id(self)
 
     def _do_open(self):
         from .copilot_autopilot_relay import CopilotWebDriver
@@ -825,23 +859,13 @@ class ResearchSession:
             self._t_send = time.time()
             return None
         if self._pending_open:
-            if not self._socket_tried and self._try_socket():
+            # EVERY POLL ASKS AGAIN FOR A SOCKET; no page, no RAM gate (relay/no_tab.py). The
+            # budget clock restarts while held: waiting for a token is not Researcher latency.
+            if self._try_socket():
                 return None
-            from .relay_fleet import ram_room_for_tab
-            if self._t_send and time.time() - self._t_send > self.timeout_s:
-                # RAM-STARVED SKIP (see refuter.py): research never got a tab within timeout_s,
-                # so the worker proceeds WITHOUT the requested deep-dive. Distinct marker so a
-                # benchmark can count tab-pressure degradations and re-run those instances cooler.
-                import sys
-                sys.stderr.write("[research] RAM_SKIP: no tab within %ds, deep-dive SKIPPED "
-                                 "(instance solved without research)\n" % int(self.timeout_s))
-                self._fail("no tab within %ds: the box had no RAM for a side page"
-                           % int(self.timeout_s))
-                return self._done
-            if not ram_room_for_tab():
-                return None
-            self._do_open()
-            return None
+            self._t_send = time.time()
+            return self._done
+        self.hold_reason = ""
         if self.drv is None:
             return self._done
         try:
@@ -981,6 +1005,11 @@ class ResearchSession:
         self.page = None
         self.drv = None
         self.socket = False
+        try:
+            from relay import token_provider
+            token_provider.hold().release(self._hold_name())
+        except Exception:
+            pass
 
 
 def upload_file(page, file_path: str, timeout_s: float = 30.0) -> bool:

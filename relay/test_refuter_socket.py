@@ -30,7 +30,22 @@ class _FakeDrv:
         self.closed = True
 
 
+class _OkGate:
+    def reason(self):
+        return ""
+
+
+@pytest.fixture(autouse=True)
+def _mcp_ready(monkeypatch):
+    """The MCP creation gate probes 127.0.0.1:8000; a unit test must not depend on it."""
+    from relay import mcp_ready
+    monkeypatch.setattr(mcp_ready, "gate", lambda: _OkGate())
+
+
 class _Route:
+    enabled = True
+    default_agent_url = "https://agent/impl"
+
     def __init__(self, driver=None, open_=True):
         self.driver, self._open = driver, open_
         self.asked, self.failures, self.records = [], [], []
@@ -38,11 +53,17 @@ class _Route:
     def open(self):
         return self._open
 
+    def ready(self, url=None):
+        return self._open and self.driver is not None
+
+    def template_for(self, url=None):
+        return object() if self.driver is not None else None
+
     def needs_refresh(self, url=None):
         return False
 
     def refresh(self, ctx, url):
-        return True
+        raise AssertionError("a synchronous capture on the sweep thread")
 
     def driver_for(self, name, agent_url=None, model="", turn_timeout_s=600.0,
                    frame_timeout_s=90.0):
@@ -77,7 +98,7 @@ def test_it_reviews_on_the_agent_it_was_pointed_at(monkeypatch):
     s = _session(route, monkeypatch, timeout_s=900)
     s._try_socket()
     assert route.asked[0]["agent_url"] == "https://agent/impl"
-    assert route.asked[0]["turn_timeout_s"] == 450.0, "socket が予算を独り占めしている"
+    assert route.asked[0]["turn_timeout_s"] == 900.0, "ページへの退避は無いので予算は全部使える"
 
 
 def test_a_lens_reaches_the_socket_prompt(monkeypatch):
@@ -89,18 +110,17 @@ def test_a_lens_reaches_the_socket_prompt(monkeypatch):
     assert drv.sent == [expected]
 
 
-def test_a_route_that_offers_nothing_falls_through_to_a_page(monkeypatch):
+def test_a_route_that_offers_nothing_holds_the_review(monkeypatch):
     s = _session(_Route(driver=None), monkeypatch)
     assert s._try_socket() is False
     assert s.socket is False and s._pending_open is True
+    assert s.hold_reason, "待つ理由が言われていない"
+    assert s._done is None, "保留が判定になった"
 
 
-def test_a_dead_socket_becomes_a_page_review_and_is_recorded(monkeypatch):
-    """予算を使い切ったあとは、これまでどおりpage に退避して記録も残る。
-
-    経路の故障はレビューの故障ではない、という元の不変条件はここで守られる。
-    変わったのは、そこに至る前に接続を張り直すようになったことだけ。
-    """
+def test_a_dead_socket_is_recorded_and_the_review_asks_for_a_socket_again(monkeypatch):
+    """張り直しを使い切ったあとも、ページには退避しない(禁止)。記録を残して保留に戻り、
+    次の poll でまた socket を取りに行く。経路の故障はレビューの故障ではない。"""
     from relay.relay_fleet import DEFAULT_SOCKET_RETRIES
 
     drv = _FakeDrv()
@@ -130,17 +150,31 @@ def test_a_dropped_connection_reconnects_before_it_gives_up_the_socket(monkeypat
     assert s._socket_tried is False, "次の poll で socket を取り直せない"
     assert s._socket_retries == 1
 
-def test_the_socket_is_tried_exactly_once_when_it_is_not_available(monkeypatch):
-    """捕獲は実タブ1枚と実ターン1回。毎 poll 試すと、避けようとしたタブより高くつく。"""
+def test_a_held_review_never_ends_unclear_and_never_opens_a_page(monkeypatch):
+    """実害(2026-10-15): socket が一度取れないと page を開こうとして CopilotTabForbidden ->
+    UNCLEAR になり、独立レビューが一度も走らなかった。今は保留し、取れた時点で走る。"""
     route = _Route(driver=None)
     s = _session(route, monkeypatch)
-    import relay.relay_fleet as rf
-    monkeypatch.setattr(rf, "ram_room_for_tab", lambda: False)
+    monkeypatch.setattr(s, "_do_open", lambda: pytest.fail("ページを開こうとした"))
     s.start()
-    for _ in range(3):
-        s.poll()
-    assert len(route.asked) == 1, "0回なら socket を一度も試していない"
-    assert s._socket_tried is True
+    for _ in range(5):
+        s._next_try_at = 0.0
+        assert s.poll() is None
+    assert s._done is None and s.hold_reason
+    drv = _FakeDrv()
+    route.driver = drv                     # token / template が揃った
+    s._next_try_at = 0.0
+    assert s.poll() is None
+    assert s.socket is True and drv.sent, "取れた時点でレビューが送られていない"
+
+
+def test_a_held_review_does_not_burn_its_budget_waiting(monkeypatch):
+    """待っている時間はレビュアーの遅延ではない。待ちで timeout_s を越えて UNCLEAR にしない。"""
+    s = _session(_Route(driver=None), monkeypatch, timeout_s=10)
+    s.start()
+    s._t_send -= 10_000
+    s._next_try_at = 0.0
+    assert s.poll() is None and s._done is None
 
 
 def test_a_working_socket_means_the_page_is_never_opened(monkeypatch):
