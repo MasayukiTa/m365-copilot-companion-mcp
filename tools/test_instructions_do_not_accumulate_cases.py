@@ -33,11 +33,28 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_INSTRUCTIONS_CHARS = 6000
 
 
+def _eval_instructions(node):
+    """Evaluate main.py's instructions= expression statically, as the DEFAULT server renders it.
+
+    The expression is string literals joined with `+`, plus `_u(on, off)` picks for the owner's
+    unlock switch (tools/unlock_switch.py). The default is the switch ON, so `_u` yields its
+    first argument -- the text this file always had. ast.literal_eval cannot read that."""
+    if isinstance(node, ast.Constant) and isinstance(node.value, str):
+        return node.value
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+        return _eval_instructions(node.left) + _eval_instructions(node.right)
+    if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "_u" and len(node.args) == 2):
+        return _eval_instructions(node.args[0])
+    raise ValueError("instructions= holds an expression this reader does not know: %s"
+                     % ast.dump(node)[:80])
+
+
 def instructions_text():
     tree = ast.parse(io.open(os.path.join(REPO, "main.py"), encoding="utf-8").read())
     for node in ast.walk(tree):
         if isinstance(node, ast.keyword) and node.arg == "instructions":
-            return ast.literal_eval(node.value)
+            return _eval_instructions(node.value)
     raise AssertionError("main.py no longer passes instructions= to the server")
 
 

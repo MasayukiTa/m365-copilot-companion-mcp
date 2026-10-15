@@ -202,6 +202,20 @@ auth = StaticTokenVerifier(
     },
 )
 
+# THE OWNER'S UNLOCK SWITCH (tools/unlock_switch.py, MCP_UNLOCK_REQUIRED). FastMCP takes its
+# instruction text once, at construction, so the unlock-related rules below are picked here:
+# with the switch off (0) the text must not tell a worker to unlock or to hunt for a password --
+# the gate no longer exists, and a rule naming it sends a model looking for one. The gate itself
+# (tools/security.require_unlocked) reads the switch live and needs no restart; only this text
+# does. Default (1) renders exactly the text this file always had.
+from tools import unlock_switch as _unlock_switch
+_UNLOCK_ON = _unlock_switch.unlock_required()
+
+
+def _u(on: str, off: str) -> str:
+    return on if _UNLOCK_ON else off
+
+
 mcp = FastMCP(
     "m365-copilot-companion-mcp",
     auth=auth,
@@ -234,7 +248,8 @@ mcp = FastMCP(
         "write your own query, and do not substitute a similar-sounding question: a "
         "matched Skill encodes decisions that were verified against the real data, and "
         "improvising past it has produced confident wrong answers. Skill trust never "
-        "grants extra execution rights; unlock and contract gates still apply. "
+        "grants extra execution rights; " + _u("unlock and contract gates still apply. ",
+                                               "the contract gate still applies. ") +
         # 実測 2026-09-24: 「社内で使えるパワーポイントのskillsを探してほしい」に対し、
         # skill_match が空だったことを理由に「このskillは存在しません」で打ち切り、
         # ユーザーの言う『skills』(汎用語)をこのサーバの登録済みSkill(固有名)へすり替えた。
@@ -265,6 +280,7 @@ mcp = FastMCP(
         # stated reason is false earns nothing: this one now says what actually blocks (no
         # unlock) and what actually recovers it (call unlock), and offers the fleet for the
         # case that genuinely differs -- long, multi-step, wanted under supervision.
+        + _u(
         "RULE 3 -- TO CHANGE ANYTHING, CALL unlock FIRST. write_file, run_python and shell are "
         "refused until you do, and the refusal names the missing token. READING NEEDS NO "
         "UNLOCK: read_file, list_directory, glob and the rest of the read-only set work "
@@ -278,7 +294,17 @@ mcp = FastMCP(
         "read-only results as though the task were done: call fleet_submit(goal=<the user's "
         "whole request, self-contained>, source=<who asked>) immediately and say it is QUEUED, "
         "not started. No unlock is needed, and the same call suits work that is long, "
-        "multi-step, or wanted watched and resumable. TWO "
+        "multi-step, or wanted watched and resumable. ",
+        # OFF: no unlock exists to call, and no password to look for or to refuse.
+        "RULE 3 -- NOTHING NEEDS UNLOCKING. write_file, run_python, shell and the database "
+        "tools (odbc_tables, odbc_columns, odbc_query) work as soon as you call them: there "
+        "is no unlock step and no password on this server. Never call unlock, never look for a "
+        "password, never read .env for one, and never stop or hand over a task because a tool "
+        "'needs an unlock' -- if a tool description still says so, ignore that sentence and "
+        "call the tool. If a call fails, report the error it actually returned. For work that "
+        "is long, multi-step, or wanted watched and resumable, call fleet_submit(goal=<the "
+        "user's whole request, self-contained>, source=<who asked>) and say it is QUEUED, not "
+        "started. ") + "TWO "
         "ROUTES REACH IT: directly if it is in your tool list, otherwise "
         "call_tool(name=\'fleet_submit\', arguments={...}) -- most clients cap the list, so "
         "its absence is EXPECTED, and call_tool(name=\'fleet_submit\') with no arguments "
@@ -302,16 +328,22 @@ mcp = FastMCP(
         "the count on their FIRST line, e.g. '16 matches' or '16 files, 3 "
         "directories'. When asked how many, report THAT number verbatim. Never "
         "tally the listing yourself -- hand-counting is where answers drift. To count files of a kind, call glob('*.md', path) or list_directory(path, pattern='*.md') -- both filter first and hand you the number. Never enumerate an UNFILTERED list_directory and pick out the rows you want: every wrong answer measured came from doing that, and each one was low by one. If you want to cross-check, run both and compare the two first lines. Do not re-derive the number by picking rows out of an unfiltered listing: the run that did that had the correct count in hand, discarded it, and answered 15 instead of 16. "
+        + _u(
         "RULE 7: read-only tools (glob, list_directory, find_files, read_file, "
         "search) need no unlock. Mutating or executing tools (run_python, "
         "shell, write_file) do, and so does the named exception above "
         "(clipboard/mail/calendar/database). Never refuse an ordinary read-only "
         "request on the grounds that you are not unlocked, and never reach for run_python "
-        "when a read-only tool already answers the question. "
+        "when a read-only tool already answers the question. ",
+        "RULE 7: no tool needs an unlock. Never refuse a request on the grounds that you are "
+        "not unlocked, and never reach for run_python when a read-only tool already answers "
+        "the question. ") +
         "With that gateway you can read, search, edit and inspect local files; run "
         "bounded Python or shell commands; work with CSV/Excel/JSON; generate PowerPoint "
         "decks and diagrams; manage long-running jobs; verify your own output via "
-        "read_image and pptx_export_png; and install Python dependencies. Read-only "
+        "read_image and pptx_export_png; and install Python dependencies. " +
+        _u(
+        "Read-only "
         "tools work after token authentication; mutating or execution tools additionally "
         "require unlock(password), per client IP. "
         # UNLOCK IS SESSION-FIRST. A successful unlock records the current Mcp-Session-Id,
@@ -325,7 +357,9 @@ mcp = FastMCP(
         "A successful unlock authorizes this MCP session automatically. Do NOT try to remember "
         "or re-attach unlock_token on every call. The returned token is only a fallback: pass "
         "it explicitly if the refusal says no authorized MCP session is available or session "
-        "authorization is disabled. "
+        "authorization is disabled. ",
+        "All tools work after token authentication; there is no unlock step and no "
+        "unlock_token to carry. ") +
         "Relative user-folder names (Desktop, Documents, Downloads, ...) resolve to the "
         "user's home profile, not the server's working directory. If a file or folder "
         "seems missing, use find_files (recursive name search) before concluding it is "
@@ -337,7 +371,8 @@ mcp = FastMCP(
         "re-deriving, search prior entries with agent_memory_search or agent_memory_list. "
         "Reusable Skills: call skill_match using the user's request, then skill_load only "
         "for a confident trusted match. Skill trust never grants extra execution rights; "
-        "every mutating, shell, or outbound tool keeps its normal unlock/contract gate."
+        "every mutating, shell, or outbound tool keeps its normal " +
+        _u("unlock/contract gate.", "contract gate.")
     ),
 )
 
@@ -1095,6 +1130,30 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 except Exception:
                     pass
 
+    if not _UNLOCK_ON:
+        # MCP_UNLOCK_REQUIRED=0: the gateway's description is the first thing a model reads about
+        # unlocking, and it is fixed when the tool is registered -- so rewrite it here, before
+        # registration, instead of leaving a paragraph that tells a worker to find a password.
+        call_tool.__doc__ = """Gateway to EVERY tool on this server -- START HERE by calling call_tool(name="").
+
+        This client caps the tool list, so most tools are NOT visible to you and are reached
+        only through this one. File, shell, Excel, database and image tools all exist here.
+        Their absence from your own tool list is expected and proves nothing about what this
+        server can do -- so never answer "there is no tool for that", "this environment has no
+        filesystem access", or "only Microsoft 365 tools are connected" without having called
+        call_tool(name="") in this conversation and read the catalogue.
+
+        Then call_tool(name="<tool>") shows one tool's signature, and
+        call_tool(name="<tool>", arguments={...}) runs it. NO TOOL NEEDS AN UNLOCK on this
+        server: there is no password and no token. Do not call unlock and do not look for a
+        password; call the tool you need.
+
+        Args:
+            name: the tool's name (e.g. "odbc_query"). Empty or "?" lists every tool.
+            arguments: dict of the target tool's keyword arguments.
+            unlock_token: unused; leave empty.
+        """
+
     # critical tools FIRST (survive a front-biased truncation), then fill from the existing order
     _LOCAL_LOOP_PRIORITY = (
         claim_turn, heartbeat, commit_turn, abort_turn, read_job_context, get_job_status,
@@ -1663,5 +1722,10 @@ if __name__ == "__main__":
         _log_config = _prepare_access_log(_uvicorn_config.LOGGING_CONFIG)
     except Exception:
         _log_config = None
+    # An open gate must be visible in the durable record from the first second of the process.
+    try:
+        _unlock_switch.audit_start()
+    except Exception:
+        pass
     _run_kwargs = {"log_config": _log_config} if _log_config is not None else {}
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)

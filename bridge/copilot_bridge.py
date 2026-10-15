@@ -6632,6 +6632,8 @@ def _bridge_unlock_budget_left(key):
 
 def _bridge_unlock_preflight_due(key):
     """True exactly once per conversation: its first turn carries the proactive unlock."""
+    if not _bridge_unlock_required():
+        return False
     with _BRIDGE_UNLOCK_LOCK:
         st = _bridge_unlock_state(key)
         if st["preflight"]:
@@ -6677,6 +6679,8 @@ def _bridge_should_auto_unlock(sent_at, key=None):
     Scoped to the turn on purpose: "was anything refused lately" would let a refusal
     from an unrelated earlier call mark the next few minutes of replies as locked.
     """
+    if not _bridge_unlock_required():
+        return False
     if not _bridge_unlock_budget_left(_bridge_unlock_conv_key() if key is None else key):
         return False
     try:
@@ -6702,6 +6706,16 @@ def _bridge_should_auto_unlock(sent_at, key=None):
 #: Kept in step with relay/relay_fleet.py: the prefix tools/security.py writes when it denies
 #: a caller that had no HTTP request context. A test asserts all three copies agree.
 NO_CONTEXT_REFUSAL = "[locked: no HTTP request context]"
+
+
+def _bridge_unlock_required():
+    """The owner's switch MCP_UNLOCK_REQUIRED (tools/unlock_switch.py), read live from .env.
+    False: no proactive or reactive unlock turn is ever sent from this bridge."""
+    try:
+        from tools.unlock_switch import unlock_required
+        return unlock_required()
+    except Exception:
+        return True
 
 
 def _bridge_unlock_password():

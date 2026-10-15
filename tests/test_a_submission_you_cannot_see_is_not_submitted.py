@@ -133,14 +133,9 @@ def test_the_server_instructions_no_longer_say_no_gateway():
     it across adjacent literals -- "TWO " + "ROUTES REACH IT: ..." -- so a search of the file
     fails on text that is present in the instructions. What matters is what reaches the agent,
     and the existing budget test reads it the same way."""
-    import ast
+    from tools.test_instructions_do_not_accumulate_cases import instructions_text
 
-    tree = ast.parse(_read(os.path.join(REPO, "main.py")))
-    text = None
-    for node in ast.walk(tree):
-        if isinstance(node, ast.keyword) and node.arg == "instructions":
-            text = ast.literal_eval(node.value)
-            break
+    text = instructions_text()
     assert text, "main.py no longer passes instructions= to the server"
 
     assert "it needs no unlock and no gateway" not in text, \

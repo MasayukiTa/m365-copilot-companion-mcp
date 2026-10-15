@@ -555,7 +555,10 @@ def sweep_unclaimed_refusals(workers, now=None, log=None, deliver=None):
     try:
         from tools import lock_state as _ls
         from relay import turn_windows as _tw
-        from relay.relay_fleet import NO_CONTEXT_REFUSAL, is_recovery_payload as _is_recovery_payload
+        from relay.relay_fleet import (NO_CONTEXT_REFUSAL, _unlock_required,
+                                       is_recovery_payload as _is_recovery_payload)
+        if not _unlock_required():
+            return out      # MCP_UNLOCK_REQUIRED=0: old refusal rows must not trigger unlock turns
 
         since = t - float(getattr(_ls, "DEFAULT_FRESH_SEC", 180.0))
         claims = _ls.classifications(since, now=t)
@@ -707,7 +710,14 @@ def apply_reunlock(target, workers, enqueue=None, log=None):
     if name == "*":
         name = ""
 
-    from relay.relay_fleet import UNLOCK_PREFIX, _unlock_password
+    from relay.relay_fleet import UNLOCK_PREFIX, _unlock_password, _unlock_required
+    if not _unlock_required():
+        # MCP_UNLOCK_REQUIRED=0: there is no unlock to send. Reported, not swallowed -- the
+        # operator pressing this must be told why nothing happened.
+        reason = "unlock is switched off (MCP_UNLOCK_REQUIRED=0) -- nothing to deliver"
+        say("[reunlock] SKIPPED for %r: %s" % (name or "*", reason))
+        return {"ts": time.time(), "target": name or "*", "ok": False,
+                "delivered": 0, "reason": reason}
     pw = _unlock_password()
     if not pw:
         try:

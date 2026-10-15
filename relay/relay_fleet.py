@@ -73,6 +73,7 @@ from relay import mechanism_telemetry as _mt
 from relay import first_reply_check
 from relay import effort as effort_mod
 from relay import effort_policy as effort_policy_mod
+from relay import stuck_cause as stuck_cause_mod
 from relay import conversation_saving as conv_saving_mod
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
@@ -1460,6 +1461,11 @@ def _looks_locked(resp: str, since: float = 0.0, worker: str = "",
          entire (short) tool-call return value; a long analytical response merely mentioning
          unlock(password=...) is not.
     """
+    if not _unlock_required():
+        # MCP_UNLOCK_REQUIRED=0: the server no longer refuses for lock, so nothing here is a lock
+        # refusal -- a reply that quotes the old text is prose about it. Classifying it as one
+        # would inject a password turn the model rejects as an injection (2026-10-15).
+        return False
     exclusive = _exclusively_refused(worker, since, return_record=True)
     if exclusive:
         _note_locked("exclusive-attribution", resp, since, exclusive, worker)
@@ -1694,6 +1700,8 @@ def _looks_locked_ambiguous(resp: str) -> bool:
     function is the trigger for the PROBE path in _decide: instead of guessing from length,
     ask the worker whether that reply really was a lock refusal.
     """
+    if not _unlock_required():
+        return False
     if _explicit_unlock_not_required(resp):
         return False
     low = (resp or "").lower()
@@ -1729,6 +1737,16 @@ def _probe_answer_is_yes(resp: str) -> bool:
     if "はい" in text or re.search(r"\byes\b", low):
         return True
     return False
+
+
+def _unlock_required() -> bool:
+    """The owner's switch MCP_UNLOCK_REQUIRED (tools/unlock_switch.py), read live from .env.
+    False means no worker is ever told to unlock and no lock refusal is classified."""
+    try:
+        from tools.unlock_switch import unlock_required
+        return unlock_required()
+    except Exception:
+        return True
 
 
 def _unlock_password():
@@ -1797,7 +1815,7 @@ def _initial_job_with_unlock(goal: str, plan_mode: bool = False):
     if plan_mode:
         # Operator-set plan-then-wait: not a component, and not this function's to reinterpret.
         opening = PLAN_PROMPT + goal
-        pw = _unlock_password()
+        pw = _unlock_password() if _unlock_required() else ""
         if not pw:
             return opening, False
         return PROTOCOL + (UNLOCK_PREFIX % pw) + opening, True
@@ -1814,6 +1832,8 @@ def build_reactive_unlock_turn(resume_text: str) -> str:
     sessions call this only after their own non-decisive reply reports that authorization blocked
     the work; it is intentionally NOT an opening-turn helper.
     """
+    if not _unlock_required():
+        return ""      # no unlock exists to recover from; callers treat "" as "nothing to send"
     material = _unlock_password()
     if not material:
         return ""
@@ -3303,6 +3323,13 @@ class RelayWorker:
         self.original_goal_hash = self.task_envelope.goal_hash
         self.recovery_state = ""
         self.recovery_cause = ""
+        # TYPED STUCK CAUSE read from the tool ledger (relay/stuck_cause.py): "network" |
+        # "locked" | "gateway" | "" -- and the evidence behind it. The reason's first words
+        # come from this, not from whichever branch happened to settle the worker.
+        self.stuck_cause = ""
+        self.stuck_cause_info = {}
+        self._first_turn_sent_at = 0.0
+        self._gateway_unlanded = 0
         self.recovery_result = ""
         self.attempt_transcripts = []
         # resume_conv: when a goal dict carries it, this worker RESUMES that existing Copilot
@@ -4677,6 +4704,8 @@ class RelayWorker:
         # When this turn went out. The lock fallback below compares the server's refusal
         # record against it, so only a refusal caused BY THIS TURN counts.
         self._turn_sent_at = time.time()
+        if not getattr(self, "_first_turn_sent_at", 0.0):
+            self._first_turn_sent_at = self._turn_sent_at
         # THE QUOTA IS SPENT HERE, and this is the only place it is spent. Microsoft's
         # generative-orchestration limit counts MESSAGES, not the MCP tool calls our gateway
         # sees -- a turn may make none of those, or several, so the tool ledger was never the
@@ -5465,6 +5494,20 @@ class RelayWorker:
         affirmative-answer branch. Never raises out of caller expectations; sets
         self.job/self.status/self.reason, or self.status/self.outcome/self.reason on STUCK.
         """
+        if not _unlock_required():
+            # MCP_UNLOCK_REQUIRED=0: never send a password turn and never STUCK on one. Whatever
+            # classified the last reply as a lock refusal was wrong or stale; carry on with the
+            # goal. Bounded by the same counter so a classifier that keeps misfiring cannot loop.
+            if self._unlock_attempts < MAX_UNLOCK_ATTEMPTS:
+                self._unlock_attempts += 1
+                self.job = self._task_anchor(RETRY_JOB)
+                self.reason = "unlock is not required (MCP_UNLOCK_REQUIRED=0) -> retry the operation"
+                self.status = "ready"
+                return
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = ("unlock is switched off (MCP_UNLOCK_REQUIRED=0) yet the worker keeps "
+                           "reporting a lock; the refusal is something else -- read the transcript")
+            return
         pw = _unlock_password()
         if not pw:
             self.status, self.outcome = "stuck", "STUCK"
@@ -5579,10 +5622,58 @@ class RelayWorker:
                 self._diagnose_terminal_give_up(before)
             except Exception:
                 pass
+            # The typed cause goes in LAST so its words are the reason's first words.
+            try:
+                self._stamp_stuck_cause(before)
+            except Exception:
+                pass
             # Shadow effort policy (phase 1): records only; never raises; no-op when off.
             effort_policy_mod.shadow_tick(self)
             # Campaign evidence (phase 2): a finished subtask feeds its siblings' streak.
             effort_policy_mod.observe_child(self)
+
+    def _stamp_stuck_cause(self, status_before, rows=None):
+        """Put the real cause first in the reason of a worker THIS turn settled as stuck.
+
+        WHY HERE. The reason of a stuck worker is composed in ~20 places, each from its own
+        evidence: the model's prose ("settling on its own stated reason"), a text marker
+        (canned non-answer -> "refusal of this instruction"), a count (calls that never
+        landed). Last night 17 workers were stuck, most because the DB host did not answer
+        (10060/08001), and only the ones whose model happened to say so said so. `_decide` is the
+        funnel all of them pass through, so the cause is read once, here, from the tool outcomes
+        in the ledger (relay/stuck_cause.py), and overrides the generic text.
+
+        Typed result on the worker: `stuck_cause` ("network"|"locked"|"gateway") and
+        `stuck_cause_info` (host, code, since, count, attributed). A REFUSED verdict is
+        withdrawn to INFRA_STUCK when a cause is found: the "this instruction was refused,
+        reword it" text is wrong when the host did not answer, and REFUSED is not retried.
+
+        Never raises (the caller also guards it); `rows` is injectable for tests.
+        """
+        if status_before in TERMINAL or self.status != "stuck":
+            return
+        if stuck_cause_mod.already_stamped(self.reason):
+            return
+        sm = stuck_cause_mod
+        since = getattr(self, "_first_turn_sent_at", 0.0) or (time.time() - sm.DEFAULT_LOOKBACK_S)
+        if rows is None:
+            rows = sm.read_tail()
+        cause = sm.classify_rows(rows, worker=self.name, since=since)
+        if cause is not None and not sm.plausible(cause, getattr(self, "goal", "") or "",
+                                                   self.reason or ""):
+            cause = None
+        if getattr(self, "_gateway_unlanded", 0) and (cause is None or not cause.attributed):
+            # The model wrote calls that never arrived. That is the more specific fact.
+            cause = sm.gateway_cause(rows, since=since, unlanded=self._gateway_unlanded)
+        if cause is None:
+            return
+        old_outcome = self.outcome
+        self.reason = sm.compose_reason(cause, self.reason)
+        self.stuck_cause = cause.kind
+        self.stuck_cause_info = cause.as_dict()
+        if old_outcome == "REFUSED":
+            self.outcome = "INFRA_STUCK"
+            self.retryable_override = None
 
     def _diagnose_terminal_give_up(self, status_before):
         """Apply the diagnosis when THIS turn ended a worker that had already replayed fresh.
@@ -6710,6 +6801,7 @@ class RelayWorker:
             if _tried_to_call_a_tool(resp):
                 self._unlanded_calls = getattr(self, "_unlanded_calls", 0) + 1
                 if self._unlanded_calls >= 2:
+                    self._gateway_unlanded = self._unlanded_calls
                     self.status, self.outcome = "stuck", "INFRA_STUCK"
                     self.reason = (
                         "⚠ ツール呼び出しが%d ターン連続でゲートウェイに到達していない。"
@@ -10238,6 +10330,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
              "refusal_count": getattr(w, "refusal_count", 0),
              "refusal_history": list(getattr(w, "refusal_history", [])),
              "recovery_cause": getattr(w, "recovery_cause", ""),
+             "stuck_cause": getattr(w, "stuck_cause", ""),
+             "stuck_cause_info": dict(getattr(w, "stuck_cause_info", {}) or {}),
              "recovery_result": getattr(w, "recovery_result", ""),
              "recovery_state": getattr(w, "recovery_state", ""),
              "attempt_transcripts": list(getattr(w, "attempt_transcripts", []))}
