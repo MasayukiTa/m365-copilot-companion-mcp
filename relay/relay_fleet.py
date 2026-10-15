@@ -1284,7 +1284,27 @@ _INVOKE_MARKUP = ("<invoke name=", "antml:invoke", "<parameter name=")
 def _tried_to_call_a_tool(resp: str) -> bool:
     """Does the reply contain an invocation the model wrote out instead of making?"""
     low = (resp or "")
-    return any(m in low for m in _INVOKE_MARKUP)
+    return any(m in low for m in _INVOKE_MARKUP) or bool(_PSEUDO_CALL_RE.search(low))
+
+
+#: A tool call written out as TEXT, in any dialect the model has been seen to use. Generic on
+#: purpose: markup tags (`<invoke`, `<parameter`, `<function_calls`, namespaced or not) and the
+#: function-call spelling `call_tool(`. Nothing here names a tool or a domain.
+_PSEUDO_CALL_RE = re.compile(
+    r"<\s*/?\s*(?:[\w-]+:)?(?:invoke|parameter|function_calls)\b|\bcall_tool\s*\(", re.I)
+
+#: Fresh-conversation retries for a transient conversation fault (a canned no-answer on the
+#: first turns, a tool call printed as text). Each kind is bounded on its own and neither is
+#: charged to max_recycles (that budget is for token limits). Backoff per attempt, seconds.
+FRESH_RETRY_MAX = int(os.environ.get("MCP_FRESH_RETRY_MAX", "3"))
+FRESH_RETRY_BACKOFF_S = (5.0, 15.0, 30.0)
+#: A canned reply on one of the first N turns of a conversation is the conversation's fault.
+CANNED_RETRY_MAX_TURN = 2
+
+#: What the model is told, once, when it printed a call instead of making it.
+MALFORMED_CALL_STEER = (
+    "直前の返信はツール呼び出しをテキストとして書いただけで、実際には呼び出されていません。"
+    "呼び出しを文章として書かず、ツール呼び出しの仕組みで関数を実行してください。")
 
 
 def _exclusively_refused(worker: str, since: float, *, return_record: bool = False):
@@ -3344,6 +3364,12 @@ class RelayWorker:
         self._mcp_tracking = False
         self._tools_recycles = 0
         self._tools_first_at = 0.0
+        # Fresh-conversation retries (canned no-answer / tool call printed as text); counted
+        # separately from each other and from max_recycles. `_fresh_turn_base` is the turn
+        # number at the last such recycle: "turn 1 or 2" is counted from the new conversation.
+        self._canned_recycles = 0
+        self._malformed_recycles = 0
+        self._fresh_turn_base = 0
         self._first_turn_sent_at = 0.0
         self._gateway_unlanded = 0
         self.recovery_result = ""
@@ -3912,6 +3938,7 @@ class RelayWorker:
         self._socket_conv_id = ""
         self._attached_ts = time.time()
         self._mcp_conv_fresh, self._mcp_tracking, self._tools_recycles = True, False, 0
+        self._canned_recycles = self._malformed_recycles = self._fresh_turn_base = 0
         try:
             mcp_ready.detector().forget(self.name)
         except Exception:
@@ -6256,6 +6283,14 @@ class RelayWorker:
                         self.reason = ("サインイン待ち(定型無回答)、専用Edgeの自動表示は失敗 -> 手動でEdgeを"
                                        "前面に出してサインイン後に自動再試行 (%d回)" % self._canned_streak)
                     return
+                # (a2) A CANNED REPLY ON THE FIRST TURNS IS THE CONVERSATION'S FAULT, NOT THE
+                # GOAL'S. Measured 2026-10-15: the same short goal drew it on turn 1 in several
+                # runs and was answered normally in others, connector alive. So: a NEW
+                # conversation and the SAME goal text (never reworded), bounded, with backoff;
+                # only when the bound is spent does it fall to the diagnostics below.
+                if (self.turn - getattr(self, "_fresh_turn_base", 0)) <= CANNED_RETRY_MAX_TURN \
+                        and self._recycle_fresh_conversation("canned"):
+                    return
                 # (b) NOT a login wall = the headless->default-Copilot fallback. PREFER the cheap,
                 # per-tab redirect recovery: re-navigate the tab back to the agent URL. If it
                 # re-navigated, the next sweep re-sends on the agent surface.
@@ -6856,6 +6891,10 @@ class RelayWorker:
             # back so a false positive is visible rather than silent.
             if _tried_to_call_a_tool(resp):
                 self._unlanded_calls = getattr(self, "_unlanded_calls", 0) + 1
+                # The steer below did not help: the conversation itself is printing calls as
+                # text. A NEW conversation with the same goal, bounded, before giving up.
+                if self._unlanded_calls >= 2 and self._recycle_fresh_conversation("malformed"):
+                    return
                 if self._unlanded_calls >= 2:
                     self._gateway_unlanded = self._unlanded_calls
                     self.status, self.outcome = "stuck", "INFRA_STUCK"
@@ -6882,12 +6921,9 @@ class RelayWorker:
                     except Exception:
                         pass
                     return
-                self.job = self._task_anchor(
-                    "直前の返信にツール呼び出しの記述がありましたが、その呼び出しはサーバに"
-                    "一件も届いていません。同じ書き方を繰り返さないでください。"
-                    "call_tool(name='') でツール名を確かめ、gateway 経由で呼び直してください。"
-                    + CLOSING_INSTRUCTION)
+                self.job = self._task_anchor(MALFORMED_CALL_STEER + CLOSING_INSTRUCTION)
                 self.status = "ready"
+                self.reason = "ツール呼び出しがテキストで出力された→是正の指示を1回送信"
                 return
             self._continue_count += 1
             if self._continue_count >= self.max_continue:
@@ -8157,6 +8193,12 @@ class RelayWorker:
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = "tools-missing recycle refused: %s" % (e,)
                 return
+        self._start_fresh_conversation(job, now + 1.0)
+        self.reason = "ツール未接続 → 新会話で作り直し (%d/%d): %s" % (
+            self._tools_recycles, mcp_ready.MAX_TOOLS_RECYCLES, why[:80])
+
+    def _start_fresh_conversation(self, job, cooldown_until):
+        """Drop this worker's conversation and queue `job` for a NEW one (never a tab)."""
         try:
             if self.drv is not None:
                 self.drv.close()
@@ -8172,9 +8214,48 @@ class RelayWorker:
         self._last_text, self._stable_since = None, None
         self._count_before = 0
         self._t_send = 0.0
-        self._cooldown_until = now + 1.0
-        self.reason = "ツール未接続 → 新会話で作り直し (%d/%d): %s" % (
-            self._tools_recycles, mcp_ready.MAX_TOOLS_RECYCLES, why[:80])
+        self._cooldown_until = cooldown_until
+
+    def _recycle_fresh_conversation(self, kind):
+        """Transient conversation fault: open a NEW conversation and resend the same goal.
+
+        kind: "canned" (a canned no-answer on the first turns) or "malformed" (a tool call
+        printed as text, repeated after one steer). Bounded by FRESH_RETRY_MAX per kind with
+        backoff FRESH_RETRY_BACKOFF_S; neither kind is charged to max_recycles. Returns True
+        when a recycle was started, False when the bound is spent (the caller then falls to
+        its existing stuck diagnostics). The goal text is resent verbatim, never reworded."""
+        attr = "_canned_recycles" if kind == "canned" else "_malformed_recycles"
+        n = getattr(self, attr, 0)
+        if n >= FRESH_RETRY_MAX:
+            return False
+        base = getattr(self, "_fresh_turn_base", 0)
+        if (self.turn - base) <= 1 and getattr(self, "_last_sent_job", None):
+            job = self._last_sent_job            # nothing happened yet: same first message
+        else:
+            try:
+                job = self._recycle_job()        # re-anchor the goal in the fresh chat
+            except EmptyGoalError:
+                return False
+        n += 1
+        setattr(self, attr, n)
+        self._fresh_turn_base = self.turn
+        self._unlanded_calls = 0
+        # A new conversation starts a new repetition count: the same canned / malformed text
+        # arriving again in it is a fresh observation, not "no progress" in the old one.
+        self.no_progress, self.last_norm = 0, None
+        self._mcp_tracking = False
+        try:
+            mcp_ready.detector().forget(self.name)
+        except Exception:
+            pass
+        delay = FRESH_RETRY_BACKOFF_S[min(n, len(FRESH_RETRY_BACKOFF_S)) - 1]
+        print("[relay_fleet] %s: %s fault; new conversation %d/%d (backoff %.0fs)"
+              % (self.name, kind, n, FRESH_RETRY_MAX, delay), flush=True)
+        self._start_fresh_conversation(job, time.time() + delay)
+        self.reason = ("ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)"
+                       if kind == "malformed" else
+                       "定型の無回答→会話を作り直し(%d/%d)") % (n, FRESH_RETRY_MAX)
+        return True
 
     def _rebind_socket(self):
         """Give a worker that lost its socket a new driver, or leave it waiting. NEVER a tab.
