@@ -357,6 +357,7 @@ def _draw_interval(ax, pd, df, x: str, label_col: str, lo: str, hi: str, group: 
     seen: set[str] = set()
     points = 0
     missing = 0
+    na_rows: list[tuple[float, int]] = []
     span = 0.0
     xs_all = [float(v) for v in work[x].dropna()]
     if has_interval:
@@ -377,8 +378,7 @@ def _draw_interval(ax, pd, df, x: str, label_col: str, lo: str, hi: str, group: 
         elif has_interval:
             missing += 1
             anchor = est if not pd.isna(est) else (min(xs_all) if xs_all else 0.0)
-            ax.annotate(na_label, (anchor, yy), xytext=(8, 0), textcoords="offset points",
-                        va="center", ha="left", fontsize=9, color="#555555")
+            na_rows.append((anchor, yy))
         if pd.isna(est):
             continue
         is_hollow = bool(group) and g in hollow
@@ -394,9 +394,17 @@ def _draw_interval(ax, pd, df, x: str, label_col: str, lo: str, hi: str, group: 
     ax.set_ylim(n - 1 + INTERVAL_Y_MARGIN, -INTERVAL_Y_MARGIN)
     if span:
         lo_x, hi_x = ax.get_xlim()
-        ax.set_xlim(lo_x - 0.02 * span, hi_x + 0.15 * span if missing else hi_x + 0.02 * span)
+        ax.set_xlim(lo_x - 0.02 * span, hi_x + 0.02 * span)
+    # the note goes on the side with room, so a point near the right edge does not clip it
+    mid = sum(ax.get_xlim()) / 2.0
+    for anchor, yy in na_rows:
+        left = anchor > mid
+        ax.annotate(na_label, (anchor, yy), xytext=(-10 if left else 10, 0), textcoords="offset points",
+                    va="center", ha="right" if left else "left", fontsize=9, color="#555555")
     if group:
-        ax.legend(loc="best")
+        # below the axes: a legend inside the plot area can sit on a row's note
+        ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=max(1, len(names)),
+                  frameon=False)
     notes = [f"{missing} row(s) without an interval, marked '{na_label}'"] if missing else []
     return points, names, notes
 
