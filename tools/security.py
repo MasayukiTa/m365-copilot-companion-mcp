@@ -28,6 +28,9 @@ from tools.secret_store import unlock_password_from_env
 # Records lock refusals so readers never have to infer them from agent prose.
 from tools import lock_state
 
+# The owner's switch (MCP_UNLOCK_REQUIRED=0 abolishes the gate; default 1 changes nothing).
+from tools import unlock_switch
+
 STATE_FILE = Path(__file__).resolve().parent.parent / ".unlock_state.json"
 
 # IPs that are always trusted when they appear as the *real connection peer*
@@ -962,6 +965,15 @@ _HANDOFF_HINT = ("No password: do not ask the user to choose; call fleet_submit(
 
 def require_unlocked() -> str | None:
     """Return None when the caller can use mutating tools, otherwise an error string."""
+    # THE OWNER'S SWITCH, FIRST, BEFORE ANY CONTEXT LOOKUP (tools/unlock_switch.py). With
+    # MCP_UNLOCK_REQUIRED=0 the gate passes for every session -- no password, no per-IP grant,
+    # no token, no session -- and says so in access.log. Default 1 falls straight through to the
+    # gate below, byte for byte what it was. Overnight 2026-10-15 three fleet workers ended
+    # STUCK because the model correctly refused to type a password a message handed it.
+    if not unlock_switch.unlock_required():
+        unlock_switch.audit_pass()
+        return None
+    unlock_switch.audit_restored()
     try:
         req = get_http_request()
     except Exception:
@@ -1080,6 +1092,13 @@ def require_unlocked() -> str | None:
 
 def unlock(password: str) -> str:
     """Unlock mutating and execution tools for the current remote client IP."""
+    if not unlock_switch.unlock_required():
+        # NOT AN ERROR, AND NOT A REQUEST FOR A PASSWORD: a worker that calls this anyway (its
+        # instructions or a tool description still say "unlock") must be told, once, that it
+        # is done -- an error here would send it hunting for a password that no longer exists.
+        return ("Unlock is not required on this server (MCP_UNLOCK_REQUIRED=0). This session is "
+                "already authorized for write, execute and database tools; no password is "
+                "needed. Do not call unlock again -- retry the tool you were using.")
     expected = unlock_password_from_env()
     if not expected:
         return "[unlock error: MCP_UNLOCK_PASSWORD is not configured]"
@@ -1188,6 +1207,9 @@ def list_unlocked() -> str:
     A genuine local caller (loopback peer, no forwarding header) still gets the full table:
     that is the operator at the machine, and the same information is on their own disk.
     """
+    if not unlock_switch.unlock_required():
+        return ("unlock is not required (MCP_UNLOCK_REQUIRED=0): every session is authorized; "
+                "no password is needed")
     state = _load_state()
     now = time.time()
     try:

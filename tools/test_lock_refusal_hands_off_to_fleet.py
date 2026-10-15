@@ -23,17 +23,15 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
+from tools.test_instructions_do_not_accumulate_cases import instructions_text  # noqa: E402
+
 #: Same ceiling relay_fleet uses to decide a short return value IS a lock refusal.
 DOMINANCE_MAX = 400
 LONG_IPV6 = "ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255"
 
 
 def _instructions():
-    tree = ast.parse(io.open(os.path.join(REPO, "main.py"), encoding="utf-8").read())
-    for node in ast.walk(tree):
-        if isinstance(node, ast.keyword) and node.arg == "instructions":
-            return ast.literal_eval(node.value)
-    raise AssertionError("main.py no longer passes instructions= to the server")
+    return instructions_text()
 
 
 def _rule(text, n):

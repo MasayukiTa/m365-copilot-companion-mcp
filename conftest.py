@@ -1337,6 +1337,16 @@ _os.environ.setdefault(
     "MCP_SKILLS_GATE_DIR",
     _sandbox_path("skills_gates_pytest_%s"))
 
+# THE OWNER'S UNLOCK SWITCH READS THE LIVE .env. tools/unlock_switch.py takes MCP_UNLOCK_REQUIRED
+# from the process environment or, failing that, from the .env file MCP_ENV_FILE names (default:
+# the repo's own). A test run on the production checkout would otherwise obey whatever the owner
+# set there, and the same suite would pass or fail by machine. Point it at a file that does not
+# exist: the switch then defaults to ON, which is the behaviour every gate test is written
+# against. Tests about the switch set their own.
+_os.environ.setdefault(
+    "MCP_ENV_FILE",
+    _sandbox_path("absent_env_pytest_%s.env"))
+
 # And the skills state DB behind the same object. Its tests DO point this at a tmp_path
 # themselves -- measured: the live store holds 9 rows and every one names a real skill directory,
 # none a pytest path -- so this is belt and braces rather than a repair. It costs nothing, and
