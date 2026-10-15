@@ -49,6 +49,7 @@ from .copilot_autopilot_relay import (
 from relay import settle as _settle
 from relay import socket_capacity
 from relay import mcp_ready
+from relay import skill_procedure as skill_procedure_mod
 from relay import fanout as fanout_mod
 from relay import fanout_budget as fanout_budget_mod
 from relay import fleet_resume as resume_mod
@@ -3329,6 +3330,13 @@ class RelayWorker:
         # come from this, not from whichever branch happened to settle the worker.
         self.stuck_cause = ""
         self.stuck_cause_info = {}
+        #: The procedure the frame matched for this goal ({name, description, requires_tools},
+        #: empty when none matched) and how many times a DONE claim was sent back because the
+        #: ledger shows none of the tools that procedure declares as required. Nothing here names
+        #: a tool or a domain: the list comes from the matched skill's own frontmatter.
+        self._skill_proc = {}
+        self._skill_steers = 0
+        self._procedure_state = ""
         # MCP CONNECTOR BINDING (relay/mcp_ready.py). Copilot Studio binds the connector tools when
         # a conversation is CREATED: `_mcp_conv_fresh` = the next send creates one (creation gate
         # applies); `_mcp_tracking` = its first send went out and an `initialize` is expected.
@@ -3601,9 +3609,12 @@ class RelayWorker:
         # the settled verdict (self.fanout is computed further down and also requires depth 0
         # and a splittable goal) -- but it is the right gate: a worker that was never asked to
         # split cannot need the procedure's content to decide a split, so it gets the pointer.
+        _skill_report = {}
         composed_goal = _with_repo_contract(
-            _with_theme_memory(_with_matched_skill(self.goal, want_body=bool(fanout)),
+            _with_theme_memory(_with_matched_skill(self.goal, want_body=bool(fanout),
+                                                   report=_skill_report),
                                theme_text=self.goal))
+        self._skill_proc = _skill_report
         initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)
         # Kept for the branches that REBUILD the job for a fresh conversation -- a replay and
         # a token-limit recycle. Both hand the agent a chat with no history at all, so they
@@ -6936,6 +6947,61 @@ class RelayWorker:
             pass
         return True
 
+    def _procedure_note(self) -> str:
+        """'name: description' of the procedure matched for this goal, or '' (for the reviewer)."""
+        proc = getattr(self, "_skill_proc", None) or {}
+        if not proc.get("name"):
+            return ""
+        return ("%s: %s" % (proc["name"], proc.get("description") or "")).strip()[:600]
+
+    def _ledger_rows(self):
+        """Parsed tool-ledger rows (tail). A method so a test can supply its own."""
+        return stuck_cause_mod.read_tail()
+
+    def _procedure_unfollowed(self) -> bool:
+        """DONE was claimed; did the worker call any tool the matched skill requires?
+
+        Returns True when the claim was NOT accepted (a bounded steer was queued, or the worker
+        was settled STUCK). Returns False -- accept and carry on -- when nothing is required,
+        the ledger cannot tell, or a required tool was called. Domain-free: the tools come from
+        the skill's own frontmatter (`requires_tools`) and the judgement from
+        relay/skill_procedure.py. Ledger rows rarely name the worker in a fleet, so the verdict
+        may be 'unverifiable' and then never blocks; it is recorded either way.
+        """
+        proc = getattr(self, "_skill_proc", None) or {}
+        required = list(proc.get("requires_tools") or [])
+        if not required:
+            return False
+        sp = skill_procedure_mod
+        since = getattr(self, "_first_turn_sent_at", 0.0) or (
+            time.time() - stuck_cause_mod.DEFAULT_LOOKBACK_S)
+        v = sp.check(self._ledger_rows(), skill=str(proc.get("name") or ""), required=required,
+                     worker=self.name, since=since)
+        self._procedure_state = v.state
+        print("[skill] procedure check %s: %s (%s)" % (self.name, v.state, v.detail or
+                                                        ",".join(v.called)), flush=True)
+        if not v.blocks:
+            return False
+        if self._skill_steers < sp.MAX_STEERS:
+            self._skill_steers += 1
+            text = sp.steer_text(v.skill, required)
+            if self._skill_steers > 1:
+                # never two byte-identical sends in one conversation
+                text = "（再送%d回目）\n%s" % (self._skill_steers, text)
+            self.job = self._task_anchor(text)
+            self.status = "ready"
+            self.reason = ("skill procedure not followed -> steer %d/%d"
+                           % (self._skill_steers, sp.MAX_STEERS))
+            return True
+        cause = stuck_cause_mod.procedure_unfollowed_cause(
+            skill=v.skill, required=required, steers=self._skill_steers, since=since,
+            attributed=v.attributed, detail=v.detail)
+        self.status, self.outcome = "stuck", "STUCK"
+        self.reason = stuck_cause_mod.compose_reason(cause, "")
+        self.stuck_cause = cause.kind
+        self.stuck_cause_info = cause.as_dict()
+        return True
+
     def _on_done_claimed(self, resp=None):
         """Copilot reported DONE. With no acceptance checks, go straight to the candidate-
         done step (back-compat trust, unless a refuter is on). With checks, run the
@@ -6951,6 +7017,13 @@ class RelayWorker:
         self._done_reply = resp or ""
         self._candidate_done_reply = self._done_reply or self.last_response or ""
         self._candidate_done_turn = self.turn
+        # BEFORE ANY CHECK OR REVIEWER: an answer produced without the tools the matched
+        # procedure declares as required is not a candidate, whatever it says.
+        try:
+            if self._procedure_unfollowed():
+                return
+        except Exception:
+            pass
         if not self.checks:
             # NOT self.verified = False. __init__'s own comment declares the contract:
             # "None=not checked, True/False after a gate ran" -- and no gate ran here, only
@@ -7086,6 +7159,7 @@ class RelayWorker:
                     self._context, self._agent_url or "", self.goal_as_amended(),
                     self.last_response,
                     unverifiable=not self.checks,
+                    procedure=self._procedure_note(),
                     recorder=self._refuter_recorder("")).start()
             self.status = "refuting"
             return
@@ -7338,6 +7412,7 @@ class RelayWorker:
             self._context, self._agent_url or "", self.goal_as_amended(),
             self.last_response, lens=lens,
             unverifiable=not self.checks,
+            procedure=self._procedure_note(),
             recorder=self._refuter_recorder(lens)).start()
 
     def _install_wire_sink(self):
@@ -8437,7 +8512,8 @@ def _skill_off(goal_text, body):
 def _skill_v1(goal_text, body):
     """The arm that composes the matched procedure in ahead of the goal."""
     nl = chr(10)
-    return _SKILL_HEADER + nl + body + nl + "--- 手順ここまで ---" + nl + nl + goal_text
+    return (_SKILL_HEADER + nl + skill_procedure_mod.FRAME_RULE + nl + body + nl
+            + "--- 手順ここまで ---" + nl + nl + goal_text)
 
 
 #: The two arms, mapped for the self-improvement loop the way memory, planner, quality_cards
@@ -8497,7 +8573,7 @@ def _ask_to_approve_the_near_miss(store, text):
         pass
 
 
-def _with_matched_skill(goal_text, want_body=True):
+def _with_matched_skill(goal_text, want_body=True, report=None):
     """Prepend the approved procedure for this goal, when one matches. Never raises.
 
     WHY THE FRAME DOES THIS. The server orders every worker, as RULE 2, to call skill_match
@@ -8550,6 +8626,18 @@ def _with_matched_skill(goal_text, want_body=True):
         if not hit:
             _ask_to_approve_the_near_miss(store, text)
             return goal_text
+        # WHAT THE CALLER MAY CHECK THE WORKER AGAINST: which procedure matched and the tools
+        # that procedure itself declares as required (frontmatter `requires_tools`). Filled
+        # before the body is composed so a composition failure cannot lose it. `report` is an
+        # out-parameter so the match is not paid for twice.
+        if isinstance(report, dict):
+            try:
+                from relay.skills import requires_tools_of
+                report["name"] = str(hit.get("name") or "")
+                report["description"] = str(hit.get("description") or "").strip()
+                report["requires_tools"] = requires_tools_of(store.get(hit["name"]).metadata)
+            except Exception:
+                pass
         # A POINTER WHEN THE BODY IS NOT THE DECISION.
         #
         # The docstring below argues for sending the whole body, and its measurement is
@@ -8580,6 +8668,9 @@ def _with_matched_skill(goal_text, want_body=True):
                     # reads the description can, so it is told to check before following it.
                     "ただし、話題が同じでも依頼の作業内容がこの手順と異なる場合は使わず、"
                     "そのまま進めてください。"
+                    # The standing rule for ANY matched procedure (relay/skill_procedure.py):
+                    # worded without reference to what a procedure is about.
+                    "%s"
                     # THE FOOTER WAS ALWAYS EMPTY. This read
                     # `_SKILL_FOOTER if "_SKILL_FOOTER" in globals() else ""`, and nothing
                     # anywhere defines _SKILL_FOOTER -- so the guard's true branch was
@@ -8588,7 +8679,7 @@ def _with_matched_skill(goal_text, want_body=True):
                     # so the rendered text is byte-identical.
                     "\n\n\n%s"
                     % (_SKILL_HEADER, hit["name"], hit.get("score"), desc, hit["name"],
-                       goal_text))
+                       skill_procedure_mod.FRAME_RULE, goal_text))
         body = store.render(hit["name"], "")
         if not body:
             return goal_text
