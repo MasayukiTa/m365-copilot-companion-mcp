@@ -2909,6 +2909,11 @@ SOCKET_TURN_TIMEOUT_S = float(os.environ.get("MCP_FLEET_SOCKET_TURN_S", "1200"))
 SOCKET_MEANINGFUL_IDLE_DEFAULT_S = 60.0
 SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get(
     "MCP_FLEET_SOCKET_IDLE_S", str(SOCKET_MEANINGFUL_IDLE_DEFAULT_S)))
+# A stream that KEEPS DELIVERING frames (update frames with no answer text yet) is alive: it gets
+# this longer idle limit. Only a silent stream (no non-ping frame for SOCKET_MEANINGFUL_IDLE_S, or
+# none at all) is judged by the short limit. 2026-10-15: brand-new conversations received 68-95
+# update frames and were declared stalled at 60 s.
+SOCKET_LIVE_STREAM_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_LIVE_IDLE_S", "300"))
 # Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so future
 # evidence can move the default again without guessing. These do not affect recovery, retry
 # budgets or transport state. Keep the 90 s bucket even though the default is 60 s: an explicit
@@ -5025,9 +5030,26 @@ class RelayWorker:
             idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
             self._record_socket_idle_probe(idle_s)
             if idle_s < SOCKET_MEANINGFUL_IDLE_S:
+                # A conversation that is progressing proves the route is healthy: it breaks the
+                # breaker's run of consecutive failures (consecutive = across all conversations).
+                try:
+                    _socket_route().note_progress(self.name)
+                except Exception:
+                    pass
+                return False
+            limit = SOCKET_MEANINGFUL_IDLE_S
+            frame_idle_fn = getattr(self.drv, "frame_idle_s", None)
+            frame_idle = frame_idle_fn() if callable(frame_idle_fn) else None
+            if frame_idle is not None and frame_idle < SOCKET_MEANINGFUL_IDLE_S:
+                limit = max(limit, SOCKET_LIVE_STREAM_IDLE_S)   # frames still arriving: alive
+                try:
+                    _socket_route().note_progress(self.name)
+                except Exception:
+                    pass
+            if idle_s < limit:
                 return False
             reason = ("socket turn made no meaningful progress for %.0fs "
-                      "(limit %.0fs)" % (idle_s, SOCKET_MEANINGFUL_IDLE_S))
+                      "(limit %.0fs)" % (idle_s, limit))
             fail_fn = getattr(self.drv, "fail_stalled_turn", None)
             if callable(fail_fn):
                 fail_fn(reason)
@@ -8224,7 +8246,8 @@ class RelayWorker:
         backoff FRESH_RETRY_BACKOFF_S; neither kind is charged to max_recycles. Returns True
         when a recycle was started, False when the bound is spent (the caller then falls to
         its existing stuck diagnostics). The goal text is resent verbatim, never reworded."""
-        attr = "_canned_recycles" if kind == "canned" else "_malformed_recycles"
+        attr = {"canned": "_canned_recycles", "stalled": "_stalled_recycles"}.get(
+            kind, "_malformed_recycles")
         n = getattr(self, attr, 0)
         if n >= FRESH_RETRY_MAX:
             return False
@@ -8252,9 +8275,43 @@ class RelayWorker:
         print("[relay_fleet] %s: %s fault; new conversation %d/%d (backoff %.0fs)"
               % (self.name, kind, n, FRESH_RETRY_MAX, delay), flush=True)
         self._start_fresh_conversation(job, time.time() + delay)
-        self.reason = ("ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)"
-                       if kind == "malformed" else
-                       "定型の無回答→会話を作り直し(%d/%d)") % (n, FRESH_RETRY_MAX)
+        self.reason = ({"malformed": "ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)",
+                        "stalled": "会話が進まず停滞→この会話だけ作り直し(%d/%d)"}.get(
+                            kind, "定型の無回答→会話を作り直し(%d/%d)")) % (n, FRESH_RETRY_MAX)
+        return True
+
+    def _recycle_stalled_conversation(self, failed):
+        """A per-conversation stall: tell the route (it does NOT count as a connection failure),
+        then recycle only THIS worker's conversation. Returns True when the worker is terminal."""
+        route = _socket_route()
+        try:
+            route.note_stall(self.name, failed)
+        except Exception:
+            pass
+        saw_output = False
+        try:
+            saw_output = bool((self.drv.partial_text() if hasattr(self.drv, "partial_text")
+                               else "") or getattr(self.drv, "_turn_answered", False))
+        except Exception:
+            saw_output = False
+        if saw_output:
+            self._landed_pending = True
+        if getattr(self, "_landed_pending", False) and self._goal_may_act():
+            decision = "refuse"
+            try:
+                from relay.transport_policy import resend_decision_for_landed_act
+                decision = resend_decision_for_landed_act(
+                    self.goal or "", checker=self._effect_checker())
+            except Exception:
+                decision = "refuse"
+            if decision != "resend":
+                self._refuse_resend(failed, "delivered")
+                return True
+        if self._recycle_fresh_conversation("stalled"):
+            return False
+        self.status, self.outcome = "stuck", "STUCK"
+        self.reason = "conversation stalled %d times in fresh conversations: %s" % (
+            FRESH_RETRY_MAX + 1, failed[:120])
         return True
 
     def _rebind_socket(self):
@@ -8318,6 +8375,9 @@ class RelayWorker:
         # feature break a test about text stability.
         if getattr(self, "socket", False):
             failed = getattr(self.drv, "failed", "")
+            if failed and getattr(self.drv, "stalled", False) is True:
+                # A STALL IS ONE CONVERSATION'S PROBLEM, NOT THE ROUTE'S: recycle it alone.
+                return self._recycle_stalled_conversation(failed)
             if failed:
                 # PINNED TO THE SOCKET WHILE THE ROUTE IS OPEN. A tab is the answer to a card,
                 # not to a closed connection, and this branch used to make no distinction: the

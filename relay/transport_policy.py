@@ -207,6 +207,37 @@ TASK_CAUSED = (
 )
 
 
+#: A turn that stopped making progress (or ran past its own clock) on ONE conversation. It says
+#: nothing about the connection: other conversations on the same token keep working. Handled per
+#: worker (fresh conversation), never by closing the route.
+STALL_CAUSED = (r"no meaningful progress", r"deadline exceeded", r"turn stalled")
+
+#: Failures that indict the CONNECTION or the TOKEN: cannot connect, auth rejected, closed by the
+#: peer, silent socket, name resolution. Only these count toward the route breaker.
+CONNECTION_INDICTING = (
+    r"could not open the socket", r"invalidproxystatus", r"proxy rejected", r"socket refused",
+    r"\b40[13]\b", r"\b50[234]\b", r"unauthor", r"forbidden", r"token", r"expired",
+    r"connectionclosed", r"closed by (the )?peer", r"connection (reset|closed|aborted|refused)",
+    r"went silent", r"handshake", r"websocket",
+    r"getaddrinfo", r"name or service not known", r"name resolution", r"\bdns\b",
+    r"nodename nor servname",
+)
+
+
+def is_stall(reason: str) -> bool:
+    """A per-conversation stall (no progress / deadline), not a connection fault."""
+    text = reason or ""
+    return any(re.search(p, text, re.IGNORECASE) for p in STALL_CAUSED)
+
+
+def indicts_connection(reason: str) -> bool:
+    """Whether a failure says the connection or token is bad (and so may count to the breaker)."""
+    text = reason or ""
+    if is_stall(text):
+        return False
+    return any(re.search(p, text, re.IGNORECASE) for p in CONNECTION_INDICTING)
+
+
 def classify_fallback(reason: str) -> str:
     """'route', 'task' or 'unknown' -- and unknown is NOT folded into either.
 

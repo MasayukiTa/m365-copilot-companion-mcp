@@ -97,6 +97,9 @@ class CopilotSocketDriver:
         #: Why the socket route stopped working, or "". The caller falls back on this, and it
         #: is a string rather than a flag so the reason survives into a log.
         self.failed = ""
+        #: True when `failed` is a per-conversation stall (see fail_stalled_turn), not a
+        #: connection fault: the worker recycles the conversation, the route stays open.
+        self.stalled = False
 
         # The tab driver's contract, kept because the loop reads these directly.
         self._count_before = 0
@@ -131,8 +134,19 @@ class CopilotSocketDriver:
             ts = self._meaningful_activity_ts or self._turn_started_ts
         return max(0.0, time.time() - ts) if ts else 0.0
 
+    def frame_idle_s(self):
+        """Seconds since the last non-ping frame of the running turn, or None if none arrived.
+
+        Frames that keep arriving (e.g. ``update``) prove the stream is alive even when none of
+        them carries answer text; only a silent stream is judged by the short idle limit."""
+        if not self._is_generating():
+            return None
+        ts = float(getattr(self.conv, "last_frame_ts", 0.0) or 0.0)
+        return max(0.0, time.time() - ts) if ts else None
+
     def fail_stalled_turn(self, reason: str) -> None:
         """Mark a still-live turn unusable and close its socket so normal fallback can run."""
+        self.stalled = True
         # SAY WHAT THE STREAM WAS DOING. The idle clock only counts frames that carry progress;
         # whether a long server-side tool call emits any is a property of the backend, and the
         # first stall that records its frame census answers it.
@@ -294,7 +308,9 @@ class CopilotSocketDriver:
         except Exception as exc:
             # THE ROUTE FAILING IS NOT THE JOB FAILING. Recorded, not raised: the caller reads
             # `failed`, opens a tab and carries on with the same goal.
-            self.failed = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            if not self.stalled:           # keep the stall reason the idle watchdog recorded
+                self.failed = "%s: %s" % (type(exc).__name__, str(exc)[:200])
+            self._emit_turn_stats("stalled" if self.stalled else "error", str(exc)[:120])
             return
         clean = normalize_answer(answer)
         if not clean:
@@ -309,12 +325,34 @@ class CopilotSocketDriver:
             self.failed = ("the turn completed but carried no text (a card the tab can show?)"
                            + ((" -- frames: " + ", ".join(seen_types[:6])) if seen_types
                               else " -- no non-chat frames either"))
+            self._emit_turn_stats("no_text")
             return
         with self._lock:
             self._last = clean
             self._partial = ""
             self._answers_done += 1
             self._turn_answered = True
+        self._emit_turn_stats("done")
+
+    def _emit_turn_stats(self, outcome, detail=""):
+        """One compact `socket_turn_stats` record per turn (via ``stats_sink``): time to first
+        content, time to completion, frames by (type, target), and the KEY STRUCTURE (never
+        values) of a few text-less update frames. Makes 'is the 60 s cut-off right' measurable."""
+        sink = getattr(self, "stats_sink", None)
+        if sink is None:
+            return
+        try:
+            c = self.conv
+            t0 = float(getattr(c, "turn_t0", 0.0) or 0.0)
+            sink({"worker": getattr(self, "worker_name", ""), "turn": self._turn_seq,
+                  "outcome": outcome, "detail": detail,
+                  "first_frame_s": getattr(c, "first_frame_s", None),
+                  "first_content_s": getattr(c, "first_content_s", None),
+                  "total_s": round(time.time() - t0, 2) if t0 else None,
+                  "frames": dict(getattr(c, "frame_kinds", {}) or {}),
+                  "empty_update_shapes": list(getattr(c, "empty_update_shapes", []) or [])})
+        except Exception:
+            pass
 
     def read_last_response(self) -> str:
         """The answer, or as much of it as has arrived. Never blocks."""
