@@ -98,7 +98,10 @@ def test_the_recycle_road_actually_re_anchors_the_goal():
 def test_exhaustion_still_wins_and_is_not_relabelled():
     """トークン枯渇はヒープとは別の事象。同じ道を通るが、理由は取り違えない。"""
     src = _src(RF.RelayWorker._decide_impl)
-    assert "not conversation_exhausted(resp)) and self._memory_pressure()" in src, (
+    # `_exhausted` = conversation_exhausted(resp) OR a context-class platform error code
+    # (relay/platform_errors.py); either way it must beat the heap label.
+    assert "_exhausted = conversation_exhausted(resp) or" in src
+    assert "(not _exhausted) and self._memory_pressure()" in src, (
         "枯渇しているのにヒープ由来と記録され得る")
     assert "会話トークン上限" in src and "ヒープ" in src
 

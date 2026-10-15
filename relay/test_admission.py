@@ -468,6 +468,7 @@ def test_dead_agent_detector():
     # NETWORK RESILIENCE: a brief outage (errors all WITHIN the window) keeps retrying, does NOT
     # stuck -- a momentary blip must never end the worker.
     w = RelayWorker("do the thing", "w0")
+    w._platform_recycles = rf.FRESH_RETRY_MAX   # the fresh-retry budget is spent: this test is about the wall-clock ride-out
     w._decide(err + "t1"); w._decide(err + "t2"); w._decide(err + "t3")
     check("dead_within_window_retries", w.status != "stuck" and w._copilot_err_streak == 3)
 
@@ -502,6 +503,7 @@ def test_dead_agent_detector():
     rf._infra_healthy = lambda *a, **k: False
     try:
         w_b = RelayWorker("do the thing", "wb")
+        w_b._platform_recycles = rf.FRESH_RETRY_MAX   # the fresh-retry budget is spent: this test is about the wall-clock ride-out
         w_b._decide(err + "t1")
         w_b._agent_err_ts = _t.time() - rf.AGENT_ERR_WINDOW_S - 1
         w_b._decide(err + "t2"); w_b._decide(err + "t3")
@@ -562,6 +564,7 @@ def test_dead_agent_detector():
         class _FakePageE:
             url = "https://copilot.example/chat/?redirfrom=CsrToSSR&auth=2"
         w_e = RelayWorker("do the thing", "we")
+        w_e._platform_recycles = rf.FRESH_RETRY_MAX   # the fresh-retry budget is spent: this test is about the wall-clock ride-out
         w_e.page = _FakePageE()
         w_e._agent_url = "https://copilot.example/chat/?titleId=abc"
         w_e._on_redirect_page = lambda: True
@@ -597,6 +600,7 @@ def test_dead_agent_detector():
 
     # a real (non-error) reply resets the streak AND the window so a one-off blip doesn't accumulate
     w3 = RelayWorker("g", "w2")
+    w3._platform_recycles = rf.FRESH_RETRY_MAX   # the fresh-retry budget is spent: this test is about the wall-clock ride-out
     w3._decide(err + "x")
     w3._decide("ファイルを修正しました。続けます。CONTINUE")
     check("err_streak_resets_on_real_reply", w3._copilot_err_streak == 0 and w3._agent_err_ts == 0.0)
@@ -1148,6 +1152,7 @@ def test_renav_first_on_consent_and_dead_agent():
     # ---- AGENT_DEAD branch: drifted tab + budget available -> re-nav+RETRY instead of
     # immediately accumulating toward the wall-clock STUCK window.
     w3 = RelayWorker("do the thing", "wdead")
+    w3._platform_recycles = rf.FRESH_RETRY_MAX   # the fresh-retry budget is spent: this test is about the wall-clock ride-out
     w3.page = _FakePage()
     w3._agent_url = "https://copilot.example/chat/?titleId=abc"
     w3._on_redirect_page = lambda: True
@@ -1168,6 +1173,7 @@ def test_renav_first_on_consent_and_dead_agent():
     # past-window terminal state is INFRA_STUCK (network/connection), never the "agent
     # disabled" STUCK -- that classification is reserved for admin-block wording + healthy infra.
     w4 = RelayWorker("do the thing", "wdead2")
+    w4._platform_recycles = rf.FRESH_RETRY_MAX   # the fresh-retry budget is spent: this test is about the wall-clock ride-out
     w4._on_redirect_page = lambda: False   # not on a redirect page: real agent, real outage
     w4._decide(err + "t1"); w4._decide(err + "t2"); w4._decide(err + "t3")
     check("dead_genuine_outage_still_rides_out",
