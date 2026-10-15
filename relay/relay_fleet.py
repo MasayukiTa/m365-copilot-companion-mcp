@@ -8209,7 +8209,7 @@ class RelayWorker:
             self._capture_url()
             return self.status in TERMINAL
         if self.status == "waiting":
-            self._check_tools_attached()
+            RelayWorker._check_tools_attached(self)
             if self.status != "waiting":
                 return self.status in TERMINAL
             self._capture_url()
