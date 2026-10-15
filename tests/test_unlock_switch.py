@@ -8,13 +8,12 @@ relay; default 1 is the gate exactly as it was.
 
 Run: python -m pytest -q tests/test_unlock_switch.py
 """
-import subprocess
 import sys
 from pathlib import Path
 
 import pytest
 
-from tools import lock_state
+from tools import childproc, lock_state
 from tools import security as S
 from tools import unlock_switch as U
 
@@ -180,8 +179,7 @@ def test_the_supported_writer_flips_the_switch_both_ways(tmp_path, monkeypatch):
     script = str(ROOT / "scripts" / "env_file.py")
 
     def run(*args):
-        r = subprocess.run([sys.executable, script, *args, "--env", str(env)],
-                           capture_output=True, text=True)
+        r = childproc.run([sys.executable, script, *args, "--env", str(env)])
         assert r.returncode == 0, r.stderr
     run("set", U.KEY, "0")
     assert U.unlock_required() is False
