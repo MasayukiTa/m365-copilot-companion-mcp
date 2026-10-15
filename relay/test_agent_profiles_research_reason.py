@@ -376,7 +376,22 @@ class _FakeDrv:
         self.closed = True
 
 
+class _OkGate:
+    def reason(self):
+        return ""
+
+
+@pytest.fixture(autouse=True)
+def _mcp_ready(monkeypatch):
+    """The MCP creation gate probes 127.0.0.1:8000; a unit test must not depend on it."""
+    from relay import mcp_ready
+    monkeypatch.setattr(mcp_ready, "gate", lambda: _OkGate())
+
+
 class _Route:
+    enabled = True
+    default_agent_url = ""
+
     def __init__(self, driver=None, open_=True, refreshed=True):
         self.driver, self._open, self._refreshed = driver, open_, refreshed
         self.asked = []
@@ -386,11 +401,17 @@ class _Route:
     def open(self):
         return self._open
 
+    def ready(self, url=None):
+        return self._open and self.driver is not None
+
+    def template_for(self, url=None):
+        return object() if self.driver is not None else None
+
     def needs_refresh(self, url=None):
         return not self._refreshed
 
     def refresh(self, ctx, url):
-        return self._refreshed
+        raise AssertionError("a synchronous capture on the sweep thread")
 
     def driver_for(self, name, agent_url=None, model="", turn_timeout_s=600.0,
                    frame_timeout_s=90.0):
@@ -435,9 +456,8 @@ def test_it_asks_for_its_own_agent_and_its_own_model(monkeypatch):
     asked = route.asked[0]
     assert asked["agent_url"] == AP.RESEARCHER.url
     assert asked["model"] == "Claude"
-    # socket にはセッション予算の半分だけ渡す。全額渡すと、失敗したときページの取り分が
-    # ゼロになる -- 実測でそれが起きて、210秒で済む作業に 853秒かかった。
-    assert asked["turn_timeout_s"] == 617.0, "socket が予算を独り占めしている"
+    # ページへの退避は禁止になった(relay/no_tab.py)ので、取り分を残す理由が無く予算は全額。
+    assert asked["turn_timeout_s"] == 1234.0
 
 
 def test_the_analyst_now_takes_a_socket_and_the_file_rides_with_it(monkeypatch):
@@ -471,10 +491,10 @@ def test_the_analyst_now_takes_a_socket_and_the_file_rides_with_it(monkeypatch):
     assert seen["path"] == r"C:\d.csv"
 
 
-def test_an_upload_that_fails_falls_back_to_a_tab_and_sends_nothing(monkeypatch):
+def test_an_upload_that_fails_ends_with_its_reason_and_sends_nothing(monkeypatch):
     """届かなかったファイルについての質問は、何も無いことについての自信ある答えで
-    返ってくる -- タブ側の実装が既に名指ししている故障。socket 側でそれを再導入
-    しないことを固定する。注釈が無いなら、ターンは出さずにタブへ降りる。"""
+    返ってくる。注釈が無いなら、ターンは出さず、タブも開かず、理由を言って空で終える
+    (アップロードの導出はページを要し、禁止なので待っても直らない)。"""
     drv = _FakeDrv()
     route = _Route(driver=drv)
     import relay.socket_attachment as SA
@@ -482,7 +502,9 @@ def test_an_upload_that_fails_falls_back_to_a_tab_and_sends_nothing(monkeypatch)
     s = _session_for_socket(route, monkeypatch, upload_path=r"C:\d.csv")
     assert s._try_socket() is False
     assert drv.sent == [], "ファイル無しで質問だけ送ってはならない"
-    assert s.socket is False and s._pending_open is True
+    assert drv.closed is True
+    assert s.socket is False and s._done == ""
+    assert "attachment upload" in s.error
 
 
 def test_which_transport_carried_the_turn_survives_the_session_ending(monkeypatch):
@@ -529,10 +551,11 @@ def test_a_task_without_a_file_never_touches_the_upload_path(monkeypatch):
     assert s._try_socket() is True
 
 
-def test_a_route_that_offers_nothing_falls_through_to_the_tab(monkeypatch):
+def test_a_route_that_offers_nothing_holds_the_deep_dive(monkeypatch):
     s = _session_for_socket(_Route(driver=None), monkeypatch)
     assert s._try_socket() is False
     assert s.socket is False and s._pending_open is True
+    assert s.hold_reason and s._done is None
 
 
 def test_a_closed_route_is_not_asked(monkeypatch):
@@ -542,26 +565,22 @@ def test_a_closed_route_is_not_asked(monkeypatch):
     assert route.asked == []
 
 
-def test_the_socket_is_tried_once_and_not_on_every_poll(monkeypatch):
-    """捕獲は実タブ1枚と実ターン1回。毎 poll 試すと、避けようとしたタブより高くつく。"""
+def test_a_held_deep_dive_is_paced_not_probed_every_poll(monkeypatch):
+    """保留中は毎 poll 経路を叩かない(間隔を空ける)。そして待ちで終わらせない。"""
     route = _Route(driver=None)
     s = _session_for_socket(route, monkeypatch)
-    monkeypatch.setattr(AP, "ram_room_for_tab", lambda: False, raising=False)
-    import relay.relay_fleet as rf
-    monkeypatch.setattr(rf, "ram_room_for_tab", lambda: False)
     s.start()
-    s.poll()
-    s.poll()
-    s.poll()
-    assert s._socket_tried is True
-    assert len(route.asked) <= 1
+    s._t_send -= 100_000
+    for _ in range(4):
+        assert s.poll() is None
+    assert s._socket_tried is True and s._done is None
+    assert s.hold_reason
 
 
-def test_a_failed_socket_deep_dive_becomes_a_tab_deep_dive(monkeypatch):
-    """予算を使い切ったあとは、これまでどおりtab に退避して記録も残る。
+def test_a_failed_socket_deep_dive_is_recorded_and_asks_for_a_socket_again(monkeypatch):
+    """張り直しを使い切ってもタブには退避しない(禁止)。記録を残し、保留に戻る。
 
     経路の故障は深掘りの故障ではない、という元の不変条件はここで守られる。
-    変わったのは、そこに至る前に接続を張り直すようになったことだけ。
     """
     from relay.relay_fleet import DEFAULT_SOCKET_RETRIES
 

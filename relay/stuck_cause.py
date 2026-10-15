@@ -35,11 +35,12 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-KINDS = ("network", "locked", "gateway", "refused")
+KINDS = ("network", "locked", "gateway", "tools", "refused")
 
 #: Heads of the Japanese headline, one per kind. A reason that already starts with one of these
 #: has been stamped; stamping again would stack them.
-HEADS = {"network": "ネットワーク:", "locked": "ロック:", "gateway": "ゲートウェイ未到達:"}
+HEADS = {"network": "ネットワーク:", "locked": "ロック:", "gateway": "ゲートウェイ未到達:",
+         "tools": "ツール未接続:"}
 
 #: How much of the ledger tail to read. 1.7 KB per row measured, so 12 MB is several thousand
 #: rows: hours of a busy fleet, one seek, never the whole 68 MB file.
@@ -123,6 +124,8 @@ class Cause:
             return "%s ツールが未解錠のため実行できません%s%s" % (HEADS["locked"], ip, tail)
         if self.kind == "gateway":
             return "%s %s%s" % (HEADS["gateway"], self.detail or "ツール呼び出しが本機のMCPに着弾していません", tail)
+        if self.kind == "tools":
+            return "%s %s%s" % (HEADS["tools"], self.detail or "会話にMCPコネクタのツールが付いていません", tail)
         return "拒否: この指示が拒否された可能性があります"
 
 
@@ -329,9 +332,19 @@ def gateway_cause(rows, *, since: float, unlanded: int, until: float = 0.0):
                  extra={"landed_in_window": len(landed)})
 
 
+def tools_unattached_cause(*, since: float, attempts: int, via: str = "") -> Cause:
+    """Every fresh conversation the worker was given came up WITHOUT the MCP connector tools
+    (no `initialize` reached the server after the first send, or the model said it has no
+    call_tool). The connector is bound when a conversation is created (relay/mcp_ready.py)."""
+    d = ("新しい会話を%d回作り直しましたがMCPコネクタのツールが付きませんでした"
+         "(最初の送信後にinitializeが本機のMCPへ着弾せず)%s"
+         % (attempts, ("・検出: " + via) if via else ""))
+    return Cause(kind="tools", since=since, count=attempts, attributed=True, detail=d)
+
+
 def plausible(cause: Cause, goal: str, reason: str) -> bool:
     """May an UNATTRIBUTED cause be put on this worker? Attributed ones always may."""
-    if cause.attributed or cause.kind == "gateway":
+    if cause.attributed or cause.kind in ("gateway", "tools"):
         return True
     words = _NET_WORDS_RE if cause.kind == "network" else _LOCK_WORDS_RE
     if not _CANNED_REASON_RE.search(reason or "") and words.search(reason or ""):

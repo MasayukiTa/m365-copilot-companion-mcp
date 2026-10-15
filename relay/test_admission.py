@@ -433,26 +433,30 @@ def test_fleet_research_nonblocking():
         ap.ResearchSession = orig_rs
 
 
-# ── (h) sub-agent side-page tabs are RAM-gated: open is deferred until there's free RAM ───────
+# ── (h) sub-agent sessions open NO side page at all (relay/no_tab.py): they hold for a socket ──
+# (This was the RAM-gated side-page open. The page is gone; RAM no longer decides anything here,
+# so free RAM must NOT make a held session open a page, and low RAM must not skip it either.)
 def test_research_session_ram_gated_open():
     import relay.agent_profiles as ap
     import relay.relay_fleet as rf2
     rs = ap.ResearchSession(object(), "q")     # context non-None
-    rs.start()                                  # must DEFER the open (no page yet)
+    rs.start()                                  # deferred: no socket conversation yet
     opened = {"n": 0}
 
     def fake_open():
         opened["n"] += 1
-        rs._pending_open = False               # simulate a successful open
+        rs._pending_open = False
     rs._do_open = fake_open
+    rs._try_socket = lambda: False              # the route offers no socket yet
     orig = rf2.ram_room_for_tab
     try:
-        rf2.ram_room_for_tab = lambda floor_mb=2000.0: False   # no RAM -> defer
+        rf2.ram_room_for_tab = lambda floor_mb=2000.0: False
         r = rs.poll()
         check("ram_gate_defers_when_low", r is None and rs._pending_open and opened["n"] == 0)
-        rf2.ram_room_for_tab = lambda floor_mb=2000.0: True    # RAM frees -> open now
-        rs.poll()
-        check("ram_gate_opens_when_free", opened["n"] == 1 and rs._pending_open is False)
+        rf2.ram_room_for_tab = lambda floor_mb=2000.0: True    # free RAM does NOT open a page
+        r = rs.poll()
+        check("ram_gate_opens_when_free",
+              r is None and opened["n"] == 0 and rs._pending_open is True)
     finally:
         rf2.ram_room_for_tab = orig
 

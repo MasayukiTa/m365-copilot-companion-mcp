@@ -218,6 +218,12 @@ class TokenHold:
             base = wait_reason(route, agent_url)
         except Exception:
             return ""
+        return self.hold_text(name, base)
+
+    def hold_text(self, name, base) -> str:
+        """Register `name` as held with an explicit reason (e.g. 'waiting for MCP server ...')
+        so status.json `token_wait` counts it. Returns the reason with the wait time."""
+        now = float(self._now())
         with self._lock:
             since = self._since.setdefault(name, now)
             self._seen[name] = now
