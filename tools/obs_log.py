@@ -134,15 +134,147 @@ def methods_from_body(body: bytes):
     return out
 
 
-def log_inbound(methods, session_id: str, client_ip: str, user_agent: str) -> None:
-    """One line per (method, tool) pair. Never raises."""
+def id_label(raw) -> str:
+    """Non-reversible 16-hex label of an identifier ("" for empty). The one hash every writer and
+    reader of attribution uses (session ids, conversation ids, trace ids), so they can be joined
+    without a raw identifier ever reaching a log."""
+    return _session_label(str(raw or ""))
+
+
+# --- header NAMES and identifier-shaped header values ---------------------------------------
+
+#: Header names that may carry a correlation / conversation / trace identifier. Only a hash of
+#: the value of such a header is ever kept. Everything else is recorded by NAME alone.
+_ID_HEADER_RE = re.compile(
+    r"^(traceparent|tracestate|request-id|x-request-id|x-correlation-id|x-correlationid"
+    r"|x-ms-[a-z0-9-]*(id|trace|correlation|conversation|session|activity)[a-z0-9-]*"
+    r"|x-[a-z0-9-]*(conversation|session|trace|correlation)[a-z0-9-]*)$")
+#: ... unless the name also looks like a credential: those are never read at all.
+_SECRET_HEADER_RE = re.compile(r"auth|cookie|token|key|secret|passw|bearer|sig|credential|api")
+#: Header carrying the MCP session itself: hashed into `session`, not repeated here.
+_SESSION_HEADER = "mcp-session-id"
+_MAX_HDR_NAMES = 40
+_MAX_ID_HEADERS = 8
+
+
+def header_info(headers):
+    """(names, ids) from raw ASGI headers [(bytes, bytes)]: `names` the sorted lower-case header
+    NAMES (no values); `ids` {name: id_label(value)} only for identifier-shaped, non-credential
+    names. Never raises."""
+    names, ids = set(), {}
+    try:
+        for hk, hv in (headers or []):
+            k = hk.decode("latin-1").lower().strip()
+            if not k:
+                continue
+            names.add(k)
+            if (k != _SESSION_HEADER and len(ids) < _MAX_ID_HEADERS and _ID_HEADER_RE.match(k)
+                    and not _SECRET_HEADER_RE.search(k)):
+                v = hv.decode("latin-1").strip()
+                if v:
+                    ids[k] = id_label(v)
+    except Exception:
+        pass
+    return sorted(names)[:_MAX_HDR_NAMES], ids
+
+
+#: A parameter / _meta key whose VALUE is hashed (never stored) because it looks like an id.
+_ID_KEY_RE = re.compile(r"(conversation|session|trace|correlation|activity|request|thread|chat)"
+                        r"[-_a-z0-9]*(id)?$|^id$|[-_]id$", re.I)
+
+
+def _id_hashes(mapping) -> dict:
+    out = {}
+    if isinstance(mapping, dict):
+        for key, val in list(mapping.items())[:60]:
+            k = str(key)[:60]
+            if isinstance(val, (str, int)) and not isinstance(val, bool) and _ID_KEY_RE.search(k) \
+                    and not _SECRET_HEADER_RE.search(k.lower()):
+                out[k] = id_label(val)
+                if len(out) >= _MAX_ID_HEADERS:
+                    break
+    return out
+
+
+def extras_from_body(body: bytes):
+    """One dict per JSON-RPC message, aligned with methods_from_body: only KEY NAMES and
+    hashes of id-shaped values. For `initialize`: the clientInfo and capability key
+    names, the key names of params and params._meta, and hashes of id-shaped values in them.
+    For other methods: the key names of params._meta and hashes of id-shaped values there.
+    Arguments are never read. Never raises."""
+    try:
+        doc = json.loads(body.decode("utf-8", "replace"))
+    except Exception:
+        return [{}]
+    msgs = doc if isinstance(doc, list) else [doc]
+    out = []
+    for m in msgs[:50]:
+        ex = {}
+        try:
+            params = m.get("params") if isinstance(m, dict) else None
+            if isinstance(params, dict):
+                meta = params.get("_meta")
+                if isinstance(meta, dict):
+                    ex["meta_keys"] = sorted(str(k)[:60] for k in meta)[:30]
+                    ids = _id_hashes(meta)
+                    if ids:
+                        ex["meta_ids"] = ids
+                if m.get("method") == "initialize":
+                    ex["param_keys"] = sorted(str(k)[:60] for k in params)[:30]
+                    ci = params.get("clientInfo")
+                    if isinstance(ci, dict):
+                        ex["client_keys"] = sorted(str(k)[:40] for k in ci)[:20]
+                        ids = _id_hashes(ci)
+                        if ids:
+                            ex["client_ids"] = ids
+                    caps = params.get("capabilities")
+                    if isinstance(caps, dict):
+                        ex["cap_keys"] = sorted(str(k)[:40] for k in caps)[:30]
+                    ids = _id_hashes(params)
+                    if ids:
+                        ex["param_ids"] = ids
+        except Exception:
+            ex = {}
+        out.append(ex)
+    return out
+
+
+_SEEN_HDR_SETS = set()
+_SEEN_HDR_SETS_MAX = 64
+
+
+def log_inbound(methods, session_id: str, client_ip: str, user_agent: str,
+                headers=None, extras=None) -> None:
+    """One line per (method, tool) pair. Never raises.
+
+    `headers` is the raw ASGI header list; only header NAMES go to the log (`hdr`, written on
+    every `initialize`, and whenever a header-name set not yet seen by this process appears), plus
+    `hdr_ids` = hashes of identifier-shaped, non-credential header values. `extras` is the list
+    from extras_from_body (key names and hashes only)."""
     try:
         sid = _session_label(session_id)
         ua = str(user_agent or "")[:80]
-        for method, tool in methods:
+        names, ids = header_info(headers) if headers else ([], {})
+        key = tuple(names)
+        new_set = False
+        if names:
+            with _LOCK:
+                if key not in _SEEN_HDR_SETS:
+                    if len(_SEEN_HDR_SETS) >= _SEEN_HDR_SETS_MAX:
+                        _SEEN_HDR_SETS.clear()
+                    _SEEN_HDR_SETS.add(key)
+                    new_set = True
+        for i, (method, tool) in enumerate(methods):
             row = {"method": method, "session": sid, "client_ip": client_ip or "", "ua": ua}
             if tool:
                 row["tool"] = tool
+            if names and (new_set or method == "initialize"):
+                row["hdr"] = names
+            if ids:
+                row["hdr_ids"] = ids
+            ex = extras[i] if extras and i < len(extras) else None
+            if ex:
+                row.update(ex)
             append(INBOUND_NAME, row)
     except Exception as exc:
         _note_failure(exc)

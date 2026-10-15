@@ -4834,7 +4834,9 @@ class RelayWorker:
             try:
                 from relay import token_provider as _tp
                 _tp.hold().release(self.name)
-                mcp_ready.detector().expect(self.name, self._t_send)
+                _ids = self._conversation_ids_for_binding()
+                mcp_ready.detector().expect(self.name, self._t_send,
+                                            ids=[_ids.get("client"), _ids.get("session")])
                 self._mcp_tracking = bool(getattr(self, "socket", False))
             except Exception:
                 self._mcp_tracking = False
@@ -8180,9 +8182,44 @@ class RelayWorker:
             self._recycle_for_missing_tools("no MCP initialize within %ds of the first send"
                                             % int(mcp_ready.INIT_WINDOW_S))
         elif verdict == "attached":
+            if not self._note_mcp_bound():
+                return                       # the new session's label is not read yet: next poll
             self._mcp_tracking = False       # confirmed; the detector keeps the fact
         elif verdict == "untracked":
             self._mcp_tracking = False
+
+    def _conversation_ids_for_binding(self):
+        """{client, server, session, turns} of this worker's socket conversation, or {}."""
+        try:
+            return dict(self.drv.conversation_ids()) if self.drv is not None else {}
+        except Exception:
+            return {}
+
+    #: How long an attached conversation may wait for the first row of its MCP session.
+    _MCP_BIND_GRACE_S = 8.0
+
+    def _note_mcp_bound(self):
+        """Write `mcp_session_bound` {mcp_session, worker, conversation, turn_at_bind} to
+        socket_route.jsonl for the conversation that was just attached, so MCP traffic (tool
+        ledger, inbound log) can be read per worker. Returns False while the session label has
+        not been read yet (try again next poll), True once written or when there is nothing to
+        write. Never raises."""
+        try:
+            b = mcp_ready.detector().binding(self.name)
+            if b is None:
+                return True
+            if not b["session"] and time.time() - b["init_ts"] < self._MCP_BIND_GRACE_S:
+                return False
+            from relay import mcp_attribution
+            ids = self._conversation_ids_for_binding()
+            fields = mcp_attribution.bound_fields(
+                self.name, ids.get("client"), getattr(self.drv, "_turn_seq", 0), b,
+                ids.get("server"))
+            if fields is not None:
+                _socket_route().record_mcp_bound(**fields)
+        except Exception:
+            pass
+        return True
 
     def _recycle_for_missing_tools(self, why):
         """This conversation has no connector tools. Open a NEW conversation with the same goal

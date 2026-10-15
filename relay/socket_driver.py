@@ -344,7 +344,10 @@ class CopilotSocketDriver:
         try:
             c = self.conv
             t0 = float(getattr(c, "turn_t0", 0.0) or 0.0)
+            ids = self.conversation_ids()
             sink({"worker": getattr(self, "worker_name", ""), "turn": self._turn_seq,
+                  "conversation": ids.get("client", ""),
+                  "t0": round(t0, 3) if t0 else None,
                   "outcome": outcome, "detail": detail,
                   "first_frame_s": getattr(c, "first_frame_s", None),
                   "first_content_s": getattr(c, "first_content_s", None),

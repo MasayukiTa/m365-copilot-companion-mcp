@@ -109,6 +109,12 @@ class SocketRoute:
         #: was writing `route_closed` lines into the live training data and putting three
         #: events into a record that describes a route that never closed.
         self.log_path = DEFAULT_LOG if log_path is None else log_path
+        #: MCP session -> worker/conversation bindings (relay/mcp_attribution.py), rebuilt from
+        #: the log after a restart, and the tool ledger the in-flight view reads (None = the
+        #: repo's tool_events.jsonl, resolved at use).
+        from relay import mcp_attribution as _attr
+        self.mcp_bindings = _attr.Registry(lambda: self.log_path)
+        self.ledger_path = None
         self.max_consecutive = int(max_consecutive)
         self.max_fallbacks = int(max_fallbacks)
         self.refresh_margin_s = float(refresh_margin_s)
@@ -188,6 +194,41 @@ class SocketRoute:
         except Exception:
             return ""
         return found
+
+    def record_mcp_bound(self, **fields) -> None:
+        """A conversation's MCP session was identified: write `mcp_session_bound`
+        {mcp_session, worker, conversation, turn_at_bind, how, candidates, ...} and remember it,
+        so the tool ledger can be read per worker (relay/mcp_attribution.py). Never raises."""
+        try:
+            rec = dict(fields)
+            rec["ts"] = float(self._now())
+            self.mcp_bindings.add(rec)
+            self.record("mcp_session_bound", **fields)
+        except Exception:
+            pass
+
+    def record_turn_stats(self, s: dict) -> None:
+        """`socket_turn_stats` for a finished (or failed) turn, then `socket_turn_tools`: the MCP
+        tool calls of this worker's conversation that were in flight during the turn's window.
+        The second record is what tells a stall that is waiting on a long server-side call from
+        one that is waiting on nothing. Never raises."""
+        self.record("socket_turn_stats", **s)
+        try:
+            from relay import mcp_attribution as attr
+            t0, t1 = s.get("t0"), float(self._now())
+            if not t0:
+                return
+            path = self.ledger_path
+            if path is None:
+                from tools import tool_ledger
+                path = str(tool_ledger._repo_path())
+            fields = attr.turn_tools_for(s.get("worker", ""), s.get("turn"), s.get("conversation", ""),
+                                         float(t0), t1, path, self.mcp_bindings.snapshot())
+            if fields is not None:
+                fields["outcome"] = s.get("outcome", "")
+                self.record(attr.TURN_TOOLS_EVENT, **fields)
+        except Exception:
+            pass
 
     def record(self, event: str, **fields) -> None:
         """Append one line about a routing decision. Best effort; never raises, never blocks.
@@ -535,7 +576,7 @@ class SocketRoute:
             conv.turns = max(1, int(getattr(conv, "turns", 0) or 0))
         drv = CopilotSocketDriver(conv, connect=self._connect_fn)
         drv.worker_name = str(name or "")
-        drv.stats_sink = lambda s: self.record("socket_turn_stats", **s)
+        drv.stats_sink = self.record_turn_stats
         return drv
 
 

@@ -1476,7 +1476,9 @@ def _observe_inbound(scope, receive):
     """Return a `receive` that passes every message through untouched while noting the JSON-RPC
     method of the request (tools.obs_log -> .fleet/mcp_inbound.jsonl). Only method names and the
     tools/call tool name are kept; no body, argument or header value other than a hashed
-    Mcp-Session-Id, the derived client IP and a 80-char user-agent. Any failure in here is
+    Mcp-Session-Id, the derived client IP and a 80-char user-agent -- plus header NAMES, hashes of
+    identifier-shaped non-credential header values, and key names of initialize/_meta (the
+    attribution evidence of tools.obs_log). Any failure in here is
     swallowed: the request must behave exactly as without it."""
     state = {"buf": bytearray(), "over": False, "done": False}
 
@@ -1494,13 +1496,16 @@ def _observe_inbound(scope, receive):
         _, ip = derive_identity(client[0] if client else "", xff)
         return sid, ip, ua
 
-    def _finish(methods):
+    def _finish(methods, extras=None):
         if state["done"]:
             return
         state["done"] = True
         from tools import obs_log
         sid, ip, ua = _ctx()
-        obs_log.log_inbound(methods, sid, ip, ua)
+        # Header NAMES (and hashes of identifier-shaped, non-credential values) and the key
+        # names of initialize params / _meta: evidence for which field, if any, identifies the
+        # Copilot conversation on this side. See obs_log.header_info / extras_from_body.
+        obs_log.log_inbound(methods, sid, ip, ua, headers=scope.get("headers"), extras=extras)
 
     try:
         http_method = str(scope.get("method") or "")
@@ -1524,8 +1529,12 @@ def _observe_inbound(scope, receive):
                         state["buf"].extend(chunk)
                 if not message.get("more_body"):
                     from tools import obs_log
-                    _finish([("(oversize)", "")] if state["over"]
-                            else obs_log.methods_from_body(bytes(state["buf"])))
+                    if state["over"]:
+                        _finish([("(oversize)", "")])
+                    else:
+                        _body = bytes(state["buf"])
+                        _finish(obs_log.methods_from_body(_body),
+                                obs_log.extras_from_body(_body))
             elif not state["done"] and message.get("type") == "http.disconnect":
                 _finish([("(disconnect-before-body)", "")])
         except Exception:
