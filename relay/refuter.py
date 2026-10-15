@@ -488,6 +488,10 @@ def unclear_is_harness_fault(reason) -> bool:
     return str(reason or "").startswith(HARNESS_REASON_PREFIX)
 
 
+#: Seconds between two attempts to get a socket for a review that is being held.
+HOLD_RETRY_S = 2.0
+
+
 def _socket_share(budget_s) -> float:
     """How much of a session's budget the socket attempt may spend before falling back.
 
@@ -542,8 +546,12 @@ class RefuterSession:
         #: gate, which is what stops a review being SKIPPED on a busy box -- and a skipped
         #: review means the candidate is accepted unreviewed, which is not a smaller review.
         self.socket = False
-        #: Asked once. A capture costs a real tab and a real turn.
+        #: Kept for readers: True once a socket has been asked for at least once. It no longer
+        #: limits anything -- a review that cannot get a socket now holds and asks again.
         self._socket_tried = False
+        #: Why the review has not started yet ("" when it has, or nothing is wrong). The fleet
+        #: shows this in status.json; a hold is a state, never a verdict.
+        self.hold_reason = ""
 
     def _note(self, direction, text, route=None):
         """Remember one text sent to / received from the reviewer, and hand it to the recorder.
@@ -682,33 +690,31 @@ class RefuterSession:
         return True
 
     def _try_socket(self) -> bool:
-        """Review over a socket if one can be had. Never raises; falls through to a tab.
+        """Start the review over a socket if one can be had now. Never raises, never opens a page.
 
-        The refuter reads and judges; it uploads nothing and reopens no named conversation, so
-        nothing about it structurally needs a page (see relay/transport_policy.py). What it
-        does need is to RUN: on a busy box the RAM gate below turns a review into a RAM_SKIP,
-        and an unreviewed candidate is accepted rather than reviewed briefly.
+        False means "held": `hold_reason` says why, and the next poll asks again. It does NOT
+        mean the review failed -- a review that could not be asked produces no verdict.
         """
         import time
+        if time.time() < getattr(self, "_next_try_at", 0.0):
+            return False                 # paced: a held review is not re-probed every sweep lap
         self._socket_tried = True
+        drv = None
         try:
-            from relay.relay_fleet import _socket_route
-
-            route = _socket_route()
-            if not route.open() or self.context is None or not self.base_url:
-                return False
-            if route.needs_refresh(self.base_url) and not route.refresh(self.context,
-                                                                       self.base_url):
-                return False
-            # THE SOCKET GETS PART OF THE BUDGET, NOT ALL OF IT. Measured today: a socket
-            # review burned its full 400s deadline, fell back, and the page then finished in
-            # ~210s -- 853s in total for work a page does in about 210. A failed socket attempt
-            # on a long-running side agent costs its whole deadline, unlike a main-worker turn
-            # which costs one turn. Leaving the page half the budget bounds that.
-            drv = route.driver_for("refuter", agent_url=self.base_url,
-                                   turn_timeout_s=_socket_share(self.timeout_s),
-                                   frame_timeout_s=120.0)
+            # THE SAME WAY A WORKER GETS ITS DRIVER (relay/side_socket.py): a live token and a
+            # template, the MCP-ready gate, a conversation of its own -- and when any of that is
+            # missing the review HOLDS with a reason. It used to demand a token with more than
+            # the 600 s refresh margin left (or a synchronous capture on the sweep thread), which
+            # no worker needs, and a False fell through to a page that is now forbidden: UNCLEAR
+            # for every goal on 2026-10-15.
+            from relay.side_socket import acquire_side_driver
+            drv, why = acquire_side_driver(
+                "refuter", self.base_url, hold_name=self._hold_name(),
+                turn_timeout_s=float(self.timeout_s), frame_timeout_s=120.0,
+                same_agent_as_default=True)
+            self.hold_reason = why
             if drv is None:
+                self._next_try_at = time.time() + HOLD_RETRY_S
                 return False
             self.page, self.drv, self.socket = None, drv, True
             self._count_before = 0
@@ -717,10 +723,28 @@ class RefuterSession:
             self._pending_open = False
             self._t_send = time.time()
             return True
-        except Exception:
+        except Exception as exc:
             self.socket = False
             self.page, self.drv = None, None
+            try:
+                if drv is not None:
+                    drv.close()
+            except Exception:
+                pass
+            self._next_try_at = time.time() + HOLD_RETRY_S
+            self.hold_reason = "refuter socket start failed: %s: %s" % (
+                type(exc).__name__, str(exc)[:120])
             return False
+
+    def _hold_name(self):
+        return "refuter-%x" % id(self)
+
+    def _release_hold(self):
+        try:
+            from relay import token_provider
+            token_provider.hold().release(self._hold_name())
+        except Exception:
+            pass
 
     def _schedule_network_reopen(self, reason):
         """Close the stale side page and retry the same read-only refuter prompt later."""
@@ -782,25 +806,16 @@ class RefuterSession:
             return None
         # RAM-gated lazy open (bounded by timeout); returns quickly so the sweep stays responsive.
         if self._pending_open:
-            if not self._socket_tried and self._try_socket():
+            # EVERY POLL ASKS AGAIN FOR A SOCKET. There is no page to fall back to (owner rule,
+            # relay/no_tab.py) and no RAM gate to wait on: the review HOLDS, with the reason in
+            # `hold_reason`, until the route can serve it. The budget clock is restarted while
+            # held, because time spent waiting for a token or the MCP server is not reviewer
+            # latency, and a review that could not be ASKED must not end as a verdict.
+            if self._try_socket():
                 return None
-            from .relay_fleet import ram_room_for_tab
-            if self._t_send and time.time() - self._t_send > self.timeout_s:
-                # RAM-STARVED SKIP: the side-page never got a tab within timeout_s, so this
-                # review did NOT run -- the candidate is accepted unreviewed (effective effort
-                # downgrade for THIS instance). Emit a distinct marker so a benchmark can COUNT
-                # how many instances were degraded by tab pressure (vs a genuine reviewer UNCLEAR)
-                # and re-run just those at a lower concurrency. Only fires after a full timeout_s
-                # (default 600s) of never clearing the ram_room floor -- i.e. RAM jammed for 10min.
-                import sys
-                sys.stderr.write("[refuter] RAM_SKIP: no tab within %ds, review SKIPPED (instance "
-                                 "solved without refutation)\n" % int(self.timeout_s))
-                self._finish(("UNCLEAR", HARNESS_REASON_PREFIX + "no tab within %ds: the RAM floor for another page never cleared" % int(self.timeout_s)))
-                return self._done
-            if not ram_room_for_tab():
-                return None
-            self._do_open()
-            return None
+            self._t_send = time.time()
+            return self._done
+        self.hold_reason = ""
         if self.drv is None:
             return self._done
         try:
@@ -996,3 +1011,4 @@ class RefuterSession:
             pass
         self.socket = False
         self.page = None
+        self._release_hold()

@@ -5167,6 +5167,9 @@ class RelayWorker:
         minutes-long deep-dive never freezes the fleet."""
         report = self._research_session.poll()
         if report is None:
+            _hold = getattr(self._research_session, "hold_reason", "")
+            if isinstance(_hold, str) and _hold:
+                self.reason = ("research holding: " + _hold)[:300]
             return False                     # still researching; the sweep keeps moving
         self._research_session = None
         if report:
@@ -7452,6 +7455,11 @@ class RelayWorker:
         per lens in turn, then aggregates by majority."""
         r = self._refuter_session.poll()
         if r is None:
+            # A HELD REVIEW SAYS WHY (no token yet, MCP server not ready, the reviewer agent has
+            # no cached template). It is a wait, not a verdict: status.json shows the reason.
+            _hold = getattr(self._refuter_session, "hold_reason", "")
+            if isinstance(_hold, str) and _hold:
+                self.reason = ("refuter holding: " + _hold)[:300]
             return False
         kind, reason = r
         # THE VERDICT AS THE FLEET TOOK IT, beside the texts that produced it (the session
