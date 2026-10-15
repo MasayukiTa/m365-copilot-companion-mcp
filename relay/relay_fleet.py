@@ -1300,6 +1300,8 @@ FRESH_RETRY_MAX = int(os.environ.get("MCP_FRESH_RETRY_MAX", "3"))
 FRESH_RETRY_BACKOFF_S = (5.0, 15.0, 30.0)
 #: A canned reply on one of the first N turns of a conversation is the conversation's fault.
 CANNED_RETRY_MAX_TURN = 2
+#: How much of the matched approved procedure's own text the reviewer is given.
+PROCEDURE_BODY_MAX = 6000
 
 #: What the model is told, once, when it printed a call instead of making it.
 MALFORMED_CALL_STEER = (
@@ -3374,6 +3376,8 @@ class RelayWorker:
         # number at the last such recycle: "turn 1 or 2" is counted from the new conversation.
         self._canned_recycles = 0
         self._malformed_recycles = 0
+        self._platform_recycles = 0      # platform error replies (relay/platform_errors.py)
+        self._platform_code = ""         # code of the LAST reply if it was a platform error
         self._fresh_turn_base = 0
         self._first_turn_sent_at = 0.0
         self._gateway_unlanded = 0
@@ -3944,6 +3948,7 @@ class RelayWorker:
         self._attached_ts = time.time()
         self._mcp_conv_fresh, self._mcp_tracking, self._tools_recycles = True, False, 0
         self._canned_recycles = self._malformed_recycles = self._fresh_turn_base = 0
+        self._platform_recycles, self._platform_code = 0, ""
         try:
             mcp_ready.detector().forget(self.name)
         except Exception:
@@ -5756,6 +5761,18 @@ class RelayWorker:
         since = getattr(self, "_first_turn_sent_at", 0.0) or (time.time() - sm.DEFAULT_LOOKBACK_S)
         if rows is None:
             rows = sm.read_tail()
+        if getattr(self, "_platform_code", ""):
+            # The last reply WAS a platform error: its code is the cause, and comes first.
+            cause = sm.platform_cause(code=self._platform_code,
+                                      attempts=getattr(self, "_platform_recycles", 0), since=since)
+            old_outcome = self.outcome
+            self.reason = sm.compose_reason(cause, self.reason)
+            self.stuck_cause = cause.kind
+            self.stuck_cause_info = cause.as_dict()
+            if old_outcome == "REFUSED":
+                self.outcome = "INFRA_STUCK"
+                self.retryable_override = None
+            return
         cause = sm.classify_rows(rows, worker=self.name, since=since)
         if cause is not None and not sm.plausible(cause, getattr(self, "goal", "") or "",
                                                    self.reason or ""):
@@ -5940,11 +5957,17 @@ class RelayWorker:
                 and mcp_ready.detector().status(self.name) != "attached"):
             self._recycle_for_missing_tools("the model reports it has no call_tool")
             return
-        heavy = (not conversation_exhausted(resp)) and self._memory_pressure()
-        if conversation_exhausted(resp) or heavy:
+        # PLATFORM ERROR REPLY (relay/platform_errors.py, one table): transient -> same goal on a
+        # fresh conversation; context/payload limit -> the token-limit recycle just below.
+        _pe = "" if _resume else self._handle_platform_error(resp)
+        if _pe == "handled":
+            return
+        _exhausted = conversation_exhausted(resp) or _pe == "recycle"
+        heavy = (not _exhausted) and self._memory_pressure()
+        if _exhausted or heavy:
             self._recycles += 1
             self._heap_recycle_turn = self.turn
-            if _recycle_is_futile(self, conversation_exhausted(resp)):
+            if _recycle_is_futile(self, _exhausted):
                 self.status, self.outcome = "stuck", "STUCK"
                 self.retryable_override = False
                 self.reason = ("conversation recycle cannot make progress: the fresh conversation "
@@ -6009,6 +6032,10 @@ class RelayWorker:
                 self.status, self.outcome = "stuck", "STUCK"
                 self.reason = "token-limit recycle refused: %s" % (e,)
                 return
+            # READY: the re-anchored job is queued for the fresh conversation, and only a
+            # "ready" worker sends it (a worker left 'waiting' waits for a reply that will
+            # never come until the per-turn clock fires).
+            self.status = "ready"
             self.reason = (
                 f"ヒープ {getattr(self, '_last_heap_mb', 0):.0f}MB → 新会話で続行 "
                 f"({self._recycles}/{self._max_recycles})" if heavy else
@@ -6484,6 +6511,10 @@ class RelayWorker:
                 return
             self.job = self._task_anchor(RETRY_JOB)
             self._cooldown_until = now + transient_backoff(self._copilot_err_streak)  # back off, don't hammer
+            # READY, not left "waiting": the retry is queued in self.job, and only a "ready"
+            # worker sends it. Without this the worker sat in 'waiting' for ever after the
+            # error reply (live 2026-10-15, SystemError on turn 1).
+            self.status = "ready"
             return
         self._reset_agent_error_window()
         # P2c policy-refusal recovery. Infrastructure/tool/login/canned/admin signals above
@@ -7012,7 +7043,13 @@ class RelayWorker:
         proc = getattr(self, "_skill_proc", None) or {}
         if not proc.get("name"):
             return ""
-        return ("%s: %s" % (proc["name"], proc.get("description") or "")).strip()[:600]
+        head = ("%s: %s" % (proc["name"], proc.get("description") or "")).strip()[:600]
+        body = str(proc.get("body") or "").strip()[:PROCEDURE_BODY_MAX]
+        if not body:
+            return head
+        # The procedure's own text (trust-checked when it was loaded, bounded), so the reviewer
+        # can check the report against the steps rather than only against the one-line identity.
+        return "%s\n\n【手順本文(先頭%d文字まで)】\n%s" % (head, PROCEDURE_BODY_MAX, body)
 
     def _ledger_rows(self):
         """Parsed tool-ledger rows (tail). A method so a test can supply its own."""
@@ -8275,18 +8312,21 @@ class RelayWorker:
         self._t_send = 0.0
         self._cooldown_until = cooldown_until
 
-    def _recycle_fresh_conversation(self, kind):
+    def _recycle_fresh_conversation(self, kind, limit=None, reason=None):
         """Transient conversation fault: open a NEW conversation and resend the same goal.
 
-        kind: "canned" (a canned no-answer on the first turns) or "malformed" (a tool call
-        printed as text, repeated after one steer). Bounded by FRESH_RETRY_MAX per kind with
-        backoff FRESH_RETRY_BACKOFF_S; neither kind is charged to max_recycles. Returns True
-        when a recycle was started, False when the bound is spent (the caller then falls to
-        its existing stuck diagnostics). The goal text is resent verbatim, never reworded."""
-        attr = {"canned": "_canned_recycles", "stalled": "_stalled_recycles"}.get(
-            kind, "_malformed_recycles")
+        kind: "canned" (a canned no-answer on the first turns), "malformed" (a tool call
+        printed as text, repeated after one steer), "stalled", or "platform" (the platform
+        answered with an error code; `reason` is a format taking (n, limit)). Bounded by
+        `limit` (default FRESH_RETRY_MAX) per kind with backoff FRESH_RETRY_BACKOFF_S; no
+        kind is charged to max_recycles. Returns True when a recycle was started, False when
+        the bound is spent (the caller then falls to its existing stuck diagnostics). The
+        goal text is resent verbatim, never reworded."""
+        attr = {"canned": "_canned_recycles", "stalled": "_stalled_recycles",
+                "platform": "_platform_recycles"}.get(kind, "_malformed_recycles")
+        limit = FRESH_RETRY_MAX if limit is None else limit
         n = getattr(self, attr, 0)
-        if n >= FRESH_RETRY_MAX:
+        if n >= limit:
             return False
         base = getattr(self, "_fresh_turn_base", 0)
         if (self.turn - base) <= 1 and getattr(self, "_last_sent_job", None):
@@ -8310,12 +8350,43 @@ class RelayWorker:
             pass
         delay = FRESH_RETRY_BACKOFF_S[min(n, len(FRESH_RETRY_BACKOFF_S)) - 1]
         print("[relay_fleet] %s: %s fault; new conversation %d/%d (backoff %.0fs)"
-              % (self.name, kind, n, FRESH_RETRY_MAX, delay), flush=True)
+              % (self.name, kind, n, limit, delay), flush=True)
         self._start_fresh_conversation(job, time.time() + delay)
-        self.reason = ({"malformed": "ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)",
-                        "stalled": "会話が進まず停滞→この会話だけ作り直し(%d/%d)"}.get(
-                            kind, "定型の無回答→会話を作り直し(%d/%d)")) % (n, FRESH_RETRY_MAX)
+        self.reason = (reason or {"malformed": "ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)",
+                                  "stalled": "会話が進まず停滞→この会話だけ作り直し(%d/%d)"}.get(
+                                      kind, "定型の無回答→会話を作り直し(%d/%d)")) % (n, limit)
         return True
+
+    def _handle_platform_error(self, resp):
+        """The reply IS a platform error (relay/platform_errors.py). Returns "recycle" when the
+        context/payload class should take the token-limit recycle path (caller continues),
+        "handled" when this method settled the turn (fresh retry started, or STUCK with the
+        code first), or "" when the existing handlers should see the reply."""
+        from relay import platform_errors as pe
+        err = pe.detect(resp)
+        self._platform_code = err.code if err else ""
+        if err is None or err.action == pe.PASS:
+            return ""
+        if err.action == pe.CONTEXT:
+            return "recycle"
+        unknown = err.action == pe.UNKNOWN
+        limit = 1 if unknown else FRESH_RETRY_MAX
+        label = "未知のプラットフォームエラー" if unknown else "一時的なプラットフォームエラー"
+        if self._recycle_fresh_conversation(
+                "platform", limit=limit,
+                reason="%s(%s)→会話を作り直し(%%d/%%d)" % (label, err.code)):
+            return "handled"
+        if unknown or not any(m in resp.lower() for m in AGENT_DEAD_MARKERS):
+            # Nothing else knows this reply: surface the code, verbatim and first.
+            cause = stuck_cause_mod.platform_cause(
+                code=err.code, attempts=getattr(self, "_platform_recycles", 0),
+                since=getattr(self, "_first_turn_sent_at", 0.0))
+            self.status, self.outcome = "stuck", "INFRA_STUCK"
+            self.reason = stuck_cause_mod.compose_reason(cause, "")
+            self.stuck_cause = cause.kind
+            self.stuck_cause_info = cause.as_dict()
+            return "handled"
+        return ""        # the known-transient wall-clock ride-out below keeps it
 
     def _recycle_stalled_conversation(self, failed):
         """A per-conversation stall: tell the route (it does NOT count as a connection failure),
@@ -8814,6 +8885,12 @@ def _with_matched_skill(goal_text, want_body=True, report=None):
                 report["name"] = str(hit.get("name") or "")
                 report["description"] = str(hit.get("description") or "").strip()
                 report["requires_tools"] = requires_tools_of(store.get(hit["name"]).metadata)
+            except Exception:
+                pass
+            try:
+                # The procedure's own text, passed through for the REVIEWER (never interpreted
+                # here). store.render refuses a procedure that is not currently trusted.
+                report["body"] = str(store.render(hit["name"], "") or "")[:PROCEDURE_BODY_MAX]
             except Exception:
                 pass
         # A POINTER WHEN THE BODY IS NOT THE DECISION.
