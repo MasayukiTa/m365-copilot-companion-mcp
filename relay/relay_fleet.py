@@ -48,6 +48,7 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import socket_capacity
+from relay import mcp_ready
 from relay import fanout as fanout_mod
 from relay import fanout_budget as fanout_budget_mod
 from relay import fleet_resume as resume_mod
@@ -3328,6 +3329,13 @@ class RelayWorker:
         # come from this, not from whichever branch happened to settle the worker.
         self.stuck_cause = ""
         self.stuck_cause_info = {}
+        # MCP CONNECTOR BINDING (relay/mcp_ready.py). Copilot Studio binds the connector tools when
+        # a conversation is CREATED: `_mcp_conv_fresh` = the next send creates one (creation gate
+        # applies); `_mcp_tracking` = its first send went out and an `initialize` is expected.
+        self._mcp_conv_fresh = False
+        self._mcp_tracking = False
+        self._tools_recycles = 0
+        self._tools_first_at = 0.0
         self._first_turn_sent_at = 0.0
         self._gateway_unlanded = 0
         self.recovery_result = ""
@@ -3892,6 +3900,11 @@ class RelayWorker:
         self._needs_socket_rebind = True
         self._socket_conv_id = ""
         self._attached_ts = time.time()
+        self._mcp_conv_fresh, self._mcp_tracking, self._tools_recycles = True, False, 0
+        try:
+            mcp_ready.detector().forget(self.name)
+        except Exception:
+            pass
 
         # This is the same initial payload as the original non-plan review task.
         try:
@@ -3972,6 +3985,7 @@ class RelayWorker:
         self.page, self.drv, self.socket = None, drv, True
         self.status = "ready"
         self._attached_ts = time.time()
+        self._mcp_conv_fresh = not resume_id      # a resumed conversation is not created now
         return True
 
     def _note_conversation_unsent(self, where):
@@ -4543,6 +4557,15 @@ class RelayWorker:
         # A WORKER THAT LOST ITS SOCKET WAITS HERE for a new driver. There is no tab to fall back to.
         if getattr(self, "_needs_socket_rebind", False) and not self._rebind_socket():
             return
+        # CREATION GATE (relay/mcp_ready.py). The message about to go out CREATES a Copilot
+        # conversation, and Copilot Studio binds the MCP connector tools at that moment: created
+        # while this PC's MCP server is unreachable, the conversation has no tools for its whole
+        # life. So a fresh conversation is not created until the server answers /health, has been
+        # up a few seconds and (when configured) the tunnel reaches it. The worker stays `ready`
+        # with the reason in status.json `token_wait`; nothing is opened, re-checked every ~5 s.
+        if getattr(self, "_mcp_conv_fresh", False):
+            if self._mcp_gate_blocked():
+                return
         # SOCKET WORKERS DO NOT SPEND A TAB SLOT, but their generative turns still spend the
         # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
         # actually consumes it, rather than leaving socket workers PENDING behind a tab/worker
@@ -4762,6 +4785,16 @@ class RelayWorker:
         self._last_text, self._stable_since, self._t_send = None, None, time.time()
         self._settle_state = _settle.SettleState()
         self.status = "waiting"
+        if getattr(self, "_mcp_conv_fresh", False):
+            # The first message of a new conversation just went out: its MCP initialize is due.
+            self._mcp_conv_fresh = False
+            try:
+                from relay import token_provider as _tp
+                _tp.hold().release(self.name)
+                mcp_ready.detector().expect(self.name, self._t_send)
+                self._mcp_tracking = bool(getattr(self, "socket", False))
+            except Exception:
+                self._mcp_tracking = False
 
     def _on_redirect_page(self):
         """True if the tab is currently parked on a non-agent / SSO-redirect / landing page
@@ -5833,6 +5866,15 @@ class RelayWorker:
         # MAXTURNS. Detect it, open a FRESH conversation on the same agent surface, and
         # re-anchor the goal so the agent re-derives progress from disk (the target Excel /
         # output files) instead of from the lost conversation history.
+        # NO CONNECTOR TOOLS, BY THE MODEL'S OWN WORDS ("no call_tool in my function list").
+        # Same remedy as the initialize detector: a new conversation. Skipped when an
+        # `initialize` was seen for this conversation (the tools are bound; a new chat would not
+        # change what the model says).
+        if (not _resume and getattr(self, "socket", False)
+                and mcp_ready.reply_says_no_tools(resp)
+                and mcp_ready.detector().status(self.name) != "attached"):
+            self._recycle_for_missing_tools("the model reports it has no call_tool")
+            return
         heavy = (not conversation_exhausted(resp)) and self._memory_pressure()
         if conversation_exhausted(resp) or heavy:
             self._recycles += 1
@@ -7965,6 +8007,92 @@ class RelayWorker:
         print("[relay_fleet] %s: socket lost; waiting for the route (%s)" % (self.name, reason[:120]))
         return True
 
+    def _mcp_gate_blocked(self):
+        """True (and the worker is held with a reason) while the local MCP server is not ready to
+        have a conversation created against it. Never raises: a broken probe lets the send go."""
+        try:
+            why = mcp_ready.gate().reason()
+        except Exception:
+            return False
+        try:
+            from relay import token_provider
+            if not why:
+                token_provider.hold().release(self.name)
+                return False
+            self.reason = token_provider.hold().hold_text(self.name, why)
+        except Exception:
+            self.reason = why
+        self._cooldown_until = time.time() + mcp_ready.RECHECK_S
+        self._note_conversation_unsent("mcp_gate")
+        return True
+
+    def _check_tools_attached(self):
+        """Poll-time check that the conversation created by the first send got its MCP connector
+        (an `initialize` reached the server). Recycles the conversation when it did not."""
+        if not getattr(self, "_mcp_tracking", False):
+            return
+        try:
+            verdict = mcp_ready.decide_tools(mcp_ready.detector(), mcp_ready.gate(), self.name)
+        except Exception:
+            return
+        if verdict == "recycle":
+            self._recycle_for_missing_tools("no MCP initialize within %ds of the first send"
+                                            % int(mcp_ready.INIT_WINDOW_S))
+        elif verdict == "attached":
+            self._mcp_tracking = False       # confirmed; the detector keeps the fact
+        elif verdict == "untracked":
+            self._mcp_tracking = False
+
+    def _recycle_for_missing_tools(self, why):
+        """This conversation has no connector tools. Open a NEW conversation with the same goal
+        (never a tab), up to MAX_TOOLS_RECYCLES times, then STUCK with cause ツール未接続.
+        Not charged to max_recycles (that budget is for token limits)."""
+        now = time.time()
+        self._tools_recycles += 1
+        self._tools_first_at = self._tools_first_at or now
+        self._mcp_tracking = False
+        try:
+            mcp_ready.detector().forget(self.name)
+        except Exception:
+            pass
+        print("[relay_fleet] %s: conversation has no MCP tools (%s); new conversation %d/%d"
+              % (self.name, why, self._tools_recycles, mcp_ready.MAX_TOOLS_RECYCLES), flush=True)
+        if self._tools_recycles > mcp_ready.MAX_TOOLS_RECYCLES:
+            cause = stuck_cause_mod.tools_unattached_cause(
+                since=self._tools_first_at, attempts=self._tools_recycles - 1, via=why)
+            self.status, self.outcome = "stuck", "STUCK"
+            self.reason = stuck_cause_mod.compose_reason(cause, "")
+            self.stuck_cause = cause.kind
+            self.stuck_cause_info = cause.as_dict()
+            return
+        if self.turn <= 1 and getattr(self, "_last_sent_job", None):
+            job = self._last_sent_job            # nothing happened yet: same first message
+        else:
+            try:
+                job = self._recycle_job()        # mid-task: re-anchor in the fresh chat
+            except EmptyGoalError as e:
+                self.status, self.outcome = "stuck", "STUCK"
+                self.reason = "tools-missing recycle refused: %s" % (e,)
+                return
+        try:
+            if self.drv is not None:
+                self.drv.close()
+        except Exception:
+            pass
+        self.socket, self.drv = False, None
+        self._needs_socket_rebind = True         # _begin_send binds a fresh driver (no conv id)
+        self._socket_conv_id = ""
+        self._mcp_conv_fresh = True              # ... and the creation gate applies again
+        self._socket_turns_seen = 0
+        self.job = job
+        self.status = "ready"
+        self._last_text, self._stable_since = None, None
+        self._count_before = 0
+        self._t_send = 0.0
+        self._cooldown_until = now + 1.0
+        self.reason = "ツール未接続 → 新会話で作り直し (%d/%d): %s" % (
+            self._tools_recycles, mcp_ready.MAX_TOOLS_RECYCLES, why[:80])
+
     def _rebind_socket(self):
         """Give a worker that lost its socket a new driver, or leave it waiting. NEVER a tab.
 
@@ -8073,6 +8201,9 @@ class RelayWorker:
             self._capture_url()
             return self.status in TERMINAL
         if self.status == "waiting":
+            self._check_tools_attached()
+            if self.status != "waiting":
+                return self.status in TERMINAL
             self._capture_url()
             # The transport knows sooner than the generic 240s turn clock when a socket has
             # stopped making meaningful progress. Consult that signal while the turn is actually
