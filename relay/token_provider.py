@@ -165,8 +165,9 @@ def wait_reason(route, agent_url) -> str:
             return ("socket route unavailable -- disabled (MCP_FLEET_SOCKET); no tab is ever "
                     "opened for a goal")
         if not route.open():
-            return "socket route unavailable -- %s; retrying, no tab is opened" % (
-                str(getattr(route, "closed_reason", "") or "closed")[:100])
+            return ("socket route unavailable -- %s; reopen probe every <=20s (no turn spent), "
+                    "no tab is opened" % (
+                        str(getattr(route, "closed_reason", "") or "closed")[:100]))
     except Exception:
         pass
     return "waiting for token"

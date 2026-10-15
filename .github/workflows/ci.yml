@@ -161,6 +161,9 @@ jobs:
             relay/test_stuck_cause_classifier.py \
             relay/test_mcp_ready.py \
             relay/test_side_socket.py \
+            relay/test_fresh_conversation_retry.py \
+            relay/test_route_breaker_per_conversation.py \
+            relay/test_mcp_attribution.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
@@ -647,6 +650,9 @@ jobs:
             tests/test_resume_scoped_to_interrupted_run.py \
             tests/test_a_matched_skill_is_checked_before_it_is_followed.py \
             tests/test_skill_match_japanese.py \
+            tests/test_skill_requires_tools.py \
+            tests/test_refuter_source_check.py \
+            tests/test_no_domain_words_in_harness.py \
             tests/test_skills_business_draft.py \
             tests/test_skills_business_lifecycle.py \
             tests/test_skills_business_matching.py \

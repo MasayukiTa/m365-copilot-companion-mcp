@@ -120,9 +120,9 @@ def test_the_match_is_not_run_twice_per_worker():
     calls = []
     real = F._with_matched_skill
 
-    def counted(goal_text, want_body=True):
+    def counted(goal_text, want_body=True, **kw):
         calls.append(goal_text)
-        return real(goal_text, want_body=want_body)
+        return real(goal_text, want_body=want_body, **kw)
 
     F._with_matched_skill = counted
     try:

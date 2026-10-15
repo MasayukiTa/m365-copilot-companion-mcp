@@ -60,6 +60,23 @@ _SEND_SLACK_S = 1.0
 _EVENT_KEEP_S = 900.0
 #: Initial look-back when the inbound file is first opened.
 _FIRST_READ_BYTES = 512 * 1024
+#: The row that first carries a new session's label follows its `initialize` by this much at most
+#: (measured 2026-10-15 over 289 pairs: median 0.25 s, max 4.4 s).
+_BIRTH_LAG_S = 10.0
+#: Sends this much before an initialize count as candidates for it (measured send->initialize ~5 s).
+_CAND_SPAN_S = 15.0
+_KNOWN_SESSIONS_MAX = 8192
+
+
+def _row_ids(r):
+    """Hashes of conversation-shaped identifiers an inbound row carries (header or initialize
+    params / _meta). Values are already hashes (tools.obs_log); empty for a legacy row."""
+    out = set()
+    for key in ("hdr_ids", "meta_ids", "client_ids", "param_ids"):
+        v = r.get(key)
+        if isinstance(v, dict):
+            out.update(str(x) for x in v.values() if x)
+    return out
 
 REASON_PREFIX = "waiting for MCP server"
 
@@ -211,13 +228,22 @@ class InitDetector:
         self.window_s = INIT_WINDOW_S if window_s is None else float(window_s)
         self._ua = INIT_UA if ua is None else ua
         self._lock = threading.Lock()
-        self._events = []     # [ts, used]
-        self._exp = {}        # name -> {"t": send time, "event": ts or None}
+        self._events = []     # [ts, used, mcp session label or "", frozenset of id hashes]
+        self._exp = {}        # name -> {"t", "event": ts or None, "ids": set, "how", "cands"}
+        self._known_sessions = set()
 
-    def expect(self, name, t_send=None):
+    def expect(self, name, t_send=None, ids=()):
+        """`ids`: raw identifiers of the conversation this send created (client conversation id,
+        chat session id, ...). Only their hashes are kept. If an inbound row ever carries one of
+        them (header or initialize params), the match is exact instead of temporal."""
+        try:
+            from tools import obs_log
+            hashed = {obs_log.id_label(i) for i in ids if i}
+        except Exception:
+            hashed = set()
         with self._lock:
             self._exp[name] = {"t": float(self._now() if t_send is None else t_send),
-                               "event": None}
+                               "event": None, "ids": hashed, "how": "", "cands": 0}
 
     def forget(self, name):
         with self._lock:
@@ -230,15 +256,40 @@ class InitDetector:
             rows = []
         for r in rows:
             try:
-                if r.get("method") != "initialize":
-                    continue
                 if self._ua and self._ua not in str(r.get("ua", "")):
                     continue
-                self._events.append([float(r["ts"]), False])
+                ts = float(r["ts"])
+                ids = _row_ids(r)
+                if r.get("method") == "initialize":
+                    self._events.append([ts, False, "", frozenset(ids)])
+                    continue
+                sid = str(r.get("session") or "")
+                if not sid or sid in self._known_sessions:
+                    continue
+                # First row of a session this reader has not seen: the session is created in
+                # the response to `initialize`, so the row that follows is the first to carry
+                # its label. Pair it with the earliest unpaired initialize just before it.
+                if len(self._known_sessions) >= _KNOWN_SESSIONS_MAX:
+                    self._known_sessions.clear()
+                self._known_sessions.add(sid)
+                for ev in self._events:
+                    if not ev[2] and 0 <= ts - ev[0] <= _BIRTH_LAG_S:
+                        ev[2] = sid
+                        ev[3] = frozenset(ev[3] | ids)
+                        break
             except Exception:
                 continue
         self._events = sorted((e for e in self._events if now - e[0] <= _EVENT_KEEP_S),
                               key=lambda e: e[0])
+
+    def _bind(self, e, ev, how):
+        ev[1], e["event"] = True, ev[0]
+        # Temporal ambiguity: how many sends (this one included) were made in the _CAND_SPAN_S
+        # before this initialize arrived. 1 = nothing else could have produced it.
+        near = sum(1 for o in self._exp.values()
+                   if o is not e and 0 <= ev[0] - o["t"] <= _CAND_SPAN_S)
+        e["cands"] = 1 + near
+        e["how"] = how if how == "id" else ("unique" if near == 0 else "fifo")
 
     def _assign(self):
         # Re-derive "used" from the attached expectations, then match the pending ones in send
@@ -246,13 +297,45 @@ class InitDetector:
         taken = {e["event"] for e in self._exp.values() if e["event"] is not None}
         for ev in self._events:
             ev[1] = ev[0] in taken
+        # Exact pass: an inbound row that carries an identifier of the conversation itself.
+        for name, e in sorted(self._exp.items(), key=lambda kv: kv[1]["t"]):
+            if e["event"] is not None or not e["ids"]:
+                continue
+            for ev in self._events:
+                if not ev[1] and ev[3] & e["ids"]:
+                    self._bind(e, ev, "id")
+                    break
         for name, e in sorted(self._exp.items(), key=lambda kv: kv[1]["t"]):
             if e["event"] is not None:
                 continue
             for ev in self._events:
                 if not ev[1] and ev[0] >= e["t"] - _SEND_SLACK_S:
-                    ev[1], e["event"] = True, ev[0]
+                    self._bind(e, ev, "time")
                     break
+
+    def binding(self, name, now=None):
+        """The MCP session this conversation's `initialize` produced, or None while the
+        conversation is not (yet) attached: {"session", "init_ts", "sent_at", "how",
+        "candidates"}. `how`: "id" (an identifier of the conversation was in the request),
+        "unique" (temporal, no other send could be the one), "fifo" (temporal, several sends
+        were pending: the pairing is the earliest-send-first order and may be crossed within a
+        burst). `session` is "" until the first row of the new session has been read."""
+        now = float(self._now() if now is None else now)
+        with self._lock:
+            e = self._exp.get(name)
+            if e is None:
+                return None
+            self._pull(now)
+            self._assign()
+            if e["event"] is None:
+                return None
+            sess = ""
+            for ev in self._events:
+                if ev[0] == e["event"]:
+                    sess = ev[2]
+                    break
+            return {"session": sess, "init_ts": e["event"], "sent_at": e["t"],
+                    "how": e["how"], "candidates": e["cands"]}
 
     def status(self, name, now=None) -> str:
         """'attached' | 'waiting' | 'missing' | 'untracked'."""

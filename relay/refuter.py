@@ -36,6 +36,22 @@ REFUTER_INSTRUCTION = (
     "推測や些末な好みではなく、ゴール未達と言える具体的根拠のみを REFUTED の理由にしてください。"
 )
 
+#: THE SOURCE CHECK (2026-10-15). Generic on purpose: it names no system, no tool and no topic --
+#: what a procedure prescribes lives in the procedure. Measured: two goals were answered from a
+#: different source than the one the matched approved procedure prescribes, and every reviewer
+#: UPHELD them because they checked the answer against ITSELF (its own table, its own CSV) and
+#: never against where the answer should have come from.
+SOURCE_CHECK_RULE = (
+    "【出典チェック(必須)】回答の整合性だけでなく、**回答がどの情報源・手順で作られたか**を確認"
+    "すること。このゴールに一致する承認済み手順(スキル)があり(下に『一致した承認済み手順』が"
+    "あればそれ。無ければ skill_match にゴール文を渡して確認)、その手順が使う情報源・ツール・"
+    "順序を指定しているのに、回答が**別の情報源**(表計算・ファイル・検索結果など)を使っている"
+    "場合は、数字が内部で矛盾していなくても REFUTED とし、理由を "
+    "『出典違い: 手順 <名前> は <指定された情報源> を指定、回答は <実際に使った情報源> を使用』"
+    "の形で書くこと。手順を実行できなかったと回答が明記し、その具体的理由(どこで何が失敗したか)"
+    "が書かれている場合は出典違いとはしない。"
+)
+
 # Nudge sent when the reviewer answered without a clear verdict (e.g. it only said
 # "I'll check the files"). Asks it to finish and emit the marker now.
 REFUTER_NUDGE = (
@@ -192,14 +208,17 @@ UNVERIFIABLE_PREAMBLE = (
 
 
 def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
-                         unverifiable: bool = False) -> str:
+                         unverifiable: bool = False, procedure: str = "") -> str:
     """Compose the adversarial reviewer prompt from the goal and the implementer's
     claimed-done summary. `lens` (one of LENS_PROMPTS) focuses a panel reviewer.
 
     `unverifiable` reframes the review for a goal with no acceptance check; the default keeps
     the prompt byte-for-byte as it was for everything else.
+
+    `procedure` is the matched approved procedure's one-line identity ("name: description"), or
+    "" when the harness matched none; SOURCE_CHECK_RULE is present either way.
     """
-    base = REFUTER_INSTRUCTION
+    base = REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE
     if unverifiable:
         base = UNVERIFIABLE_PREAMBLE + "\n\n" + base
     if lens and lens in LENS_PROMPTS:
@@ -207,6 +226,8 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
     return (
         base
         + "\n\n--- ゴール ---\n" + (goal or "").strip()
+        + (("\n\n--- 一致した承認済み手順 ---\n" + procedure.strip())
+           if (procedure or "").strip() else "")
         + "\n\n--- 実装エージェントの最終報告 ---\n" + (final_response or "").strip()
         + "\n--- ここまで ---"
     )
@@ -215,7 +236,8 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
 def _preamble_id(lens="", unverifiable=False):
     """A short id of the instruction text a reviewer is given (base + lens + unverifiable framing)."""
     import hashlib
-    text = REFUTER_INSTRUCTION + (LENS_PROMPTS.get(lens, "") if lens else "")
+    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE
+            + (LENS_PROMPTS.get(lens, "") if lens else ""))
     if unverifiable:
         text = UNVERIFIABLE_PREAMBLE + text
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
@@ -413,7 +435,7 @@ def agent_base_url(conversation_url: str) -> str:
 def run_refuter(context, conversation_url: str, goal: str, final_response: str,
                 notify=None, runlog=None, run_id: str = "relay", turn: int = 0,
                 timeout_s: int = 600, max_nudges: int = 2, lens: str = "",
-                unverifiable: bool = False):
+                unverifiable: bool = False, procedure: str = ""):
     """Open an independent side-page Copilot chat and ask it to refute the claimed DONE.
     Returns (kind, reason). Never raises into the control loop -- any failure yields
     ("UNCLEAR", "") so the loop falls back to accepting the DONE. Mirrors the research/
@@ -440,7 +462,7 @@ def run_refuter(context, conversation_url: str, goal: str, final_response: str,
                     "harness: the composer never rendered within 40s of loading the page")
         drv = CopilotWebDriver(page)
         drv.send(build_refuter_prompt(goal, final_response, lens=lens,
-                                      unverifiable=unverifiable))
+                                      unverifiable=unverifiable, procedure=procedure))
         ok = drv.wait_for_idle(timeout_s=timeout_s)
         raw = drv.read_last_response() if ok else ""
         verdict = (parse_verdict(raw) if ok else
@@ -512,7 +534,8 @@ class RefuterSession:
 
     def __init__(self, context, base_url, goal, final_response,
                  dwell_s=4.0, timeout_s=600, max_nudges=2, lens="",
-                 max_network_reopens=2, unverifiable=False, recorder=None):
+                 max_network_reopens=2, unverifiable=False, recorder=None,
+                 procedure=""):
         self.context = context
         #: Called with one dict per text this session sends or receives (see _note), AS IT
         #: HAPPENS. The reviewer's own conversation used to be stored nowhere: only its verdict
@@ -522,6 +545,9 @@ class RefuterSession:
         self.last_route = ""
         self._last_received = None
         self.unverifiable = unverifiable
+        #: "name: description" of the approved procedure the harness matched for the goal ("" when
+        #: none) -- what the reviewer's source check compares the answer's source against.
+        self.procedure = procedure
         self.base_url = base_url
         self.goal = goal
         self.final = final_response
@@ -596,7 +622,8 @@ class RefuterSession:
     def _send_prompt(self):
         """Compose the reviewer prompt, send it, and record exactly what was sent."""
         prompt = build_refuter_prompt(self.goal, self.final, lens=self.lens,
-                                      unverifiable=self.unverifiable)
+                                      unverifiable=self.unverifiable,
+                                      procedure=self.procedure)
         if self.socket:
             try:
                 self.drv.payload_sink = self._wire_sink()

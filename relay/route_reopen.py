@@ -58,14 +58,19 @@ import uuid
 
 #: How long after a close before the first probe. Long enough that the incident which closed
 #: the route has a chance to end -- the one on record lasted about a minute.
-FIRST_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_WAIT_S", "120"))
+#:
+#: 0 = PROBE AT ONCE. A shut route holds EVERY goal (there is no tab), and the probe is a bare
+#: handshake that spends no turn, so waiting buys nothing: on 2026-10-15 each closure held all
+#: goals ~5 minutes only because the first probe waited 120-300 s.
+FIRST_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_WAIT_S", "0"))
 
-#: Each failed probe doubles the wait, up to this. An upstream outage should be asked about
-#: occasionally, not continuously.
-MAX_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_MAX_WAIT_S", "900"))
+#: Each failed probe doubles the wait (from MIN_WAIT_S), up to this. Kept <= 20 s while goals are
+#: held: a handshake is cheap, a held fleet is not.
+MAX_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_MAX_WAIT_S", "20"))
+MIN_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_MIN_WAIT_S", "5"))
 
 #: First wait before probing a route that closed for a NON-transport reason (see _consider).
-NON_TRANSPORT_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_NON_TRANSPORT_WAIT_S", "300"))
+NON_TRANSPORT_WAIT_S = float(os.environ.get("MCP_ROUTE_REOPEN_NON_TRANSPORT_WAIT_S", "0"))
 
 #: How long a handshake may take before it counts as a failure. Generous: the fault this exists
 #: for is a proxy refusing an upgrade, which fails fast, and a slow success is still a success.
@@ -175,7 +180,7 @@ class ReopenPolicy:
     def _settle(self, now, result):
         ok, how = result
         if not ok:
-            self.wait_s = min(self.wait_s * 2, MAX_WAIT_S)
+            self.wait_s = min(max(self.wait_s * 2, MIN_WAIT_S), MAX_WAIT_S)
             self.next_probe_at = now + self.wait_s
             self._log("[reopen] probe %d says the transport is still down (%s); next in %.0fs"
                       % (self.probes, how, self.wait_s))

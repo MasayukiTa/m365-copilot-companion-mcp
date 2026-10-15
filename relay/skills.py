@@ -205,6 +205,45 @@ def _validate_keywords(value: Any) -> list[str]:
     return out
 
 
+MAX_REQUIRES_TOOLS = 16
+MAX_REQUIRES_TOOL_CHARS = 64
+
+
+def _validate_requires_tools(value: Any) -> list[str]:
+    """The optional `requires_tools:` field: the tool names (or fnmatch families such as
+    ``name_*``) a worker following this Skill's procedure must call at least once before the
+    harness accepts its answer. Absent means [] -- the harness checks nothing.
+
+    WHY IT LIVES IN THE SKILL. Which tools a procedure needs is that procedure's own fact; the
+    harness (relay/skill_procedure.py) names no tool and no domain, it only reads this list.
+    A bare string is refused for the same reason as ``keywords``.
+    """
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise SkillError("requires_tools must be a YAML list of tool names, "
+                         "e.g. requires_tools: [read_file, name_*]")
+    if len(value) > MAX_REQUIRES_TOOLS:
+        raise SkillError(f"requires_tools has more than {MAX_REQUIRES_TOOLS} entries")
+    out: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or not item.strip():
+            raise SkillError("every requires_tools entry must be a non-empty string")
+        if len(item) > MAX_REQUIRES_TOOL_CHARS or not re.fullmatch(r"[A-Za-z0-9_.*?\-]+", item.strip()):
+            raise SkillError("a requires_tools entry must be a tool name or glob "
+                             f"(letters, digits, _ . - * ?; max {MAX_REQUIRES_TOOL_CHARS})")
+        out.append(item.strip())
+    return out
+
+
+def requires_tools_of(metadata: dict | None) -> list[str]:
+    """The Skill's declared requires_tools, or [] (also for metadata that fails validation)."""
+    try:
+        return _validate_requires_tools((metadata or {}).get("requires_tools"))
+    except SkillError:
+        return []
+
+
 def load_bundle(path: str | Path, scope: str = "external") -> Skill:
     root = Path(path).expanduser().resolve()
     rows, total = _safe_files(root)
@@ -227,6 +266,7 @@ def load_bundle(path: str | Path, scope: str = "external") -> Skill:
     if not body:
         raise SkillError("SKILL.md body is empty")
     _validate_keywords(metadata.get("keywords"))
+    _validate_requires_tools(metadata.get("requires_tools"))
     digest = hashlib.sha256()
     for relative, data in rows:
         digest.update(relative.encode("utf-8"))
@@ -1248,25 +1288,51 @@ class SkillStore:
                     (key, skill.digest, now, json.dumps(dict(skill.manifest), sort_keys=True)),
                 )
 
-    def create_local(self, name: str, description: str, body: str = "") -> Skill:
+    def create_local(self, name: str, description: str, body: str = "",
+                     metadata: dict | None = None, replace: bool = False) -> Skill:
+        """Author a Skill on this machine and trust it (the operator wrote it).
+
+        `metadata` adds frontmatter fields beyond name/description -- ``keywords`` (extra
+        phrases the matcher reads, see _validate_keywords) and ``requires_tools`` (see
+        _validate_requires_tools) -- each validated by load_bundle before anything is trusted.
+        `replace=True` rewrites an existing bundle of that name and records the new digest as
+        locally created; it exists because matching reads only the frontmatter, so correcting
+        what a Skill matches on means changing the file. It is a Python-level door for the
+        operator (no model-facing tool calls create_local), and the default stays an error.
+        """
         if not NAME_RE.fullmatch(name):
             raise SkillError("Skill name must use lowercase letters, digits, and hyphens (max 64)")
         if not description.strip():
             raise SkillError("description is required")
+        extra = dict(metadata or {})
+        for reserved in ("name", "description"):
+            if reserved in extra:
+                raise SkillError(f"metadata may not set {reserved}; pass it as an argument")
         target = self.project_root / "skills" / name
-        if target.exists():
+        existed = target.exists()
+        if existed and not replace:
             raise SkillError(f"Skill already exists: {target}")
-        target.mkdir(parents=True)
-        content = (
-            "---\n"
-            f"name: {name}\n"
-            f"description: {json.dumps(description.strip(), ensure_ascii=False)}\n"
-            "---\n\n"
-            + (body.strip() or f"# {name}\n\nDescribe the reusable workflow here.")
-            + "\n"
-        )
-        (target / "SKILL.md").write_text(content, encoding="utf-8")
-        skill = load_bundle(target, "project")
+        target.mkdir(parents=True, exist_ok=True)
+        lines = ["---", f"name: {name}",
+                 f"description: {json.dumps(description.strip(), ensure_ascii=False)}"]
+        for key, value in extra.items():
+            # JSON scalars and lists are valid YAML flow syntax, so no YAML dumper is needed.
+            lines.append(f"{key}: {json.dumps(value, ensure_ascii=False)}")
+        content = ("\n".join(lines) + "\n---\n\n"
+                   + (body.strip() or f"# {name}\n\nDescribe the reusable workflow here.")
+                   + "\n")
+        skill_md = target / "SKILL.md"
+        previous = skill_md.read_bytes() if (existed and skill_md.exists()) else None
+        skill_md.write_text(content, encoding="utf-8")
+        try:
+            skill = load_bundle(target, "project")
+        except Exception:
+            # An invalid replacement must not leave the previous (trusted) Skill corrupted.
+            if previous is not None:
+                skill_md.write_bytes(previous)
+            elif not existed:
+                shutil.rmtree(target, ignore_errors=True)
+            raise
         self._record_source(skill, "local-authored", auto_trust=True)
         provenance, trust = self._state_for(skill)
         return Skill(**{**skill.__dict__, "provenance": provenance, "trust": trust})

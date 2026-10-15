@@ -484,6 +484,28 @@ def collect_activity(frame) -> list:
     return out
 
 
+def frame_shape(frame) -> dict:
+    """KEY STRUCTURE ONLY of a frame: key names, messageType, whether text is empty. Never a
+    value, a token or any text -- safe to write to the routing log."""
+    out = {"keys": sorted(str(k) for k in frame.keys())[:8] if isinstance(frame, dict) else []}
+    try:
+        msgs = []
+        arg_keys = set()
+        for payload in _payloads(frame):
+            arg_keys.update(str(k) for k in payload.keys())
+            for msg in (payload.get("messages") or []):
+                if isinstance(msg, dict):
+                    text = msg.get("text") or msg.get("hiddenText") or ""
+                    msgs.append({"messageType": str(msg.get("messageType") or ""),
+                                 "keys": sorted(str(k) for k in msg.keys())[:16],
+                                 "text_empty": not bool(text)})
+        out["arg_keys"] = sorted(arg_keys)[:12]
+        out["messages"] = msgs[:3]
+    except Exception:
+        pass
+    return out
+
+
 def collect_delta(frame) -> str:
     """Incremental text. Concatenating these across a turn rebuilds the answer."""
     return "".join(_delta_from_payload(p) for p in _payloads(frame))
@@ -607,6 +629,13 @@ class Conversation:
         self.last_progress = []
         #: {"<type>/<target>": count} of the non-ping frames of the last exchange. Diagnostic.
         self.frame_kinds = {}
+        #: When the last NON-PING frame of the current turn arrived (0 = none yet). A stream that
+        #: keeps delivering frames is alive even when none carries answer text.
+        self.last_frame_ts = 0.0
+        self.turn_t0 = 0.0
+        self.first_content_s = None
+        self.first_frame_s = None
+        self.empty_update_shapes = []
         #: The current connection, held only so a failed turn can drop it. A CONVERSATION IS
         #: NOT A CONNECTION here: the client opens a new socket for every message, and keeping
         #: one open was measured WORSE -- with the connection reused, the second turn was
@@ -712,6 +741,11 @@ class Conversation:
             deltas, final, result, seen = [], "", "", 0
             self.last_progress = []
             self.frame_kinds = {}
+            self.last_frame_ts = 0.0
+            self.turn_t0 = time.time()
+            self.first_content_s = None          # seconds from send to the first answer text
+            self.first_frame_s = None            # seconds from send to the first non-ping frame
+            self.empty_update_shapes = []        # key structure of a few text-less updates
             deadline = time.time() + self.turn_timeout_s
             while time.time() < deadline:
                 # A SILENT SOCKET IS NOT A FINISHED TURN. type-3 says the turn completed; it
@@ -729,6 +763,9 @@ class Conversation:
                         continue
                     # What KIND of frames arrive, counted per turn, so a stall can say what the
                     # stream was doing (see CopilotSocketDriver.fail_stalled_turn).
+                    self.last_frame_ts = time.time()
+                    if self.first_frame_s is None:
+                        self.first_frame_s = round(self.last_frame_ts - self.turn_t0, 2)
                     try:
                         _kind = "%s/%s" % (frame.get("type"), frame.get("target") or "")
                         self.frame_kinds[_kind] = self.frame_kinds.get(_kind, 0) + 1
@@ -752,8 +789,17 @@ class Conversation:
                                 on_progress(item)
                             except Exception:
                                 pass
-                    deltas.append(collect_delta(frame))
+                    _d = collect_delta(frame)
+                    deltas.append(_d)
                     final = collect_final(frame) or final
+                    if (_d or final) and self.first_content_s is None:
+                        self.first_content_s = round(time.time() - self.turn_t0, 2)
+                    elif (not _d and not final and frame.get("type") == 1
+                          and len(self.empty_update_shapes) < 3):
+                        try:
+                            self.empty_update_shapes.append(frame_shape(frame))
+                        except Exception:
+                            pass
                     if on_text is not None:
                         try:
                             on_text(final or "".join(deltas))

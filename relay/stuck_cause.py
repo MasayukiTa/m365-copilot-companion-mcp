@@ -35,12 +35,12 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-KINDS = ("network", "locked", "gateway", "tools", "refused")
+KINDS = ("network", "locked", "gateway", "tools", "procedure", "refused")
 
 #: Heads of the Japanese headline, one per kind. A reason that already starts with one of these
 #: has been stamped; stamping again would stack them.
 HEADS = {"network": "ネットワーク:", "locked": "ロック:", "gateway": "ゲートウェイ未到達:",
-         "tools": "ツール未接続:"}
+         "tools": "ツール未接続:", "procedure": "手順未実施:"}
 
 #: How much of the ledger tail to read. 1.7 KB per row measured, so 12 MB is several thousand
 #: rows: hours of a busy fleet, one seek, never the whole 68 MB file.
@@ -126,6 +126,8 @@ class Cause:
             return "%s %s%s" % (HEADS["gateway"], self.detail or "ツール呼び出しが本機のMCPに着弾していません", tail)
         if self.kind == "tools":
             return "%s %s%s" % (HEADS["tools"], self.detail or "会話にMCPコネクタのツールが付いていません", tail)
+        if self.kind == "procedure":
+            return "%s %s%s" % (HEADS["procedure"], self.detail or "承認済み手順が前提とするツールを呼んでいません", tail)
         return "拒否: この指示が拒否された可能性があります"
 
 
@@ -344,7 +346,7 @@ def tools_unattached_cause(*, since: float, attempts: int, via: str = "") -> Cau
 
 def plausible(cause: Cause, goal: str, reason: str) -> bool:
     """May an UNATTRIBUTED cause be put on this worker? Attributed ones always may."""
-    if cause.attributed or cause.kind in ("gateway", "tools"):
+    if cause.attributed or cause.kind in ("gateway", "tools", "procedure"):
         return True
     words = _NET_WORDS_RE if cause.kind == "network" else _LOCK_WORDS_RE
     if not _CANNED_REASON_RE.search(reason or "") and words.search(reason or ""):
@@ -379,3 +381,16 @@ def compose_reason(cause: Cause, old_reason: str) -> str:
         return ("%s / 定型の無回答が継続しているが、原因は上記。**この指示が拒否されたとは"
                 "判定していない**(言い換えは不要・原因の解消後に再投入)。" % head)
     return "%s / %s: %s" % (head, "ワーカーの所見" if old_reason != old else "従来の診断", old)
+
+
+def procedure_unfollowed_cause(*, skill: str, required, steers: int, since: float,
+                               attributed: bool = False, detail: str = "") -> Cause:
+    """The worker kept claiming DONE without calling any tool the matched skill declares as
+    required, through `steers` bounded steers. Domain-free: `skill` and `required` come from the
+    skill's own metadata (relay/skill_procedure.py)."""
+    d = ("skill procedure not followed: `%s` が前提とするツール(%s)を呼ばないまま、%d回の差し戻し後も"
+         "完了を主張しました%s"
+         % (skill, ", ".join(required or []), steers, ("・" + detail) if detail else ""))
+    return Cause(kind="procedure", since=since, count=max(1, steers), attributed=attributed,
+                 detail=d, extra={"skill": skill, "required": list(required or [])})
+

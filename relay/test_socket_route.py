@@ -72,10 +72,10 @@ def test_three_consecutive_failures_close_the_route_for_everyone():
 
 def test_a_success_clears_the_blip_counter():
     r = _route()
-    r.note_failure("a")
-    r.note_failure("b")
+    r.note_failure("w0: socket refused")
+    r.note_failure("w1: socket refused")
     r.note_success()
-    r.note_failure("c")
+    r.note_failure("w2: socket refused")
     assert r.open()                    # 2連続で止まっている
     assert r.consecutive == 1
 
@@ -85,7 +85,7 @@ def test_a_route_that_half_works_is_stopped_by_the_one_way_counter():
     払うので、半分動く経路は経路が無いより悪い。総数カウンタは減らない。"""
     r = _route(max_fallbacks=4)
     for i in range(4):
-        r.note_failure("w%d" % i)
+        r.note_failure("w%d: socket refused" % i)
         r.note_success()
     assert not r.open()
     assert "not reliable enough" in r.closed_reason
@@ -675,8 +675,8 @@ def test_turns_that_worked_are_reported_so_the_breaker_can_reset(monkeypatch):
     w = _worker()
     w.socket, w.drv, w.status = True, _Drv(), "waiting"
 
-    r.note_failure("a")
-    r.note_failure("b")
+    r.note_failure("w0: socket refused")
+    r.note_failure("w1: socket refused")
     assert r.consecutive == 2
 
     _Drv.n = 1                       # 1ターン成功した
@@ -1867,7 +1867,8 @@ def test_a_fresh_replay_stops_calling_itself_a_socket_worker():
 CARD = "the turn completed but carried no text (a card the tab can show?)"
 
 
-def test_task_caused_failures_are_counted_one_by_one(monkeypatch):
+def test_task_caused_failures_do_not_count_against_the_breaker(monkeypatch):
+    """A card/consent is about the goal, not the connection: reported (True) but never counted."""
     r = _route(max_fallbacks=99)
     monkeypatch.setattr(rf, "_socket_route", lambda: r)
     monkeypatch.setattr(rf, "_LAST_ROUTE_FAULT", [0.0])
@@ -1875,7 +1876,7 @@ def test_task_caused_failures_are_counted_one_by_one(monkeypatch):
     for _ in range(5):
         assert rf.report_route_fault(CARD, now=lambda: now[0]) is True
         now[0] += 1.0
-    assert r.fallbacks == 5, "独立な5件を合流させている: %d" % r.fallbacks
+    assert r.fallbacks == 0 and r.open()
 
 
 def test_transport_faults_are_still_coalesced(monkeypatch):
