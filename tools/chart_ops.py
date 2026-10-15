@@ -43,7 +43,7 @@ JP_FONT_CANDIDATES = (
     "Hiragino Sans", "Hiragino Kaku Gothic ProN",
 )
 
-CHART_KINDS = ("bar", "line", "scatter", "hist", "pie", "stacked_bar", "box")
+CHART_KINDS = ("bar", "line", "scatter", "hist", "pie", "stacked_bar", "box", "interval")
 EXCEL_KINDS = ("column", "bar", "line", "scatter", "pie", "stacked_column", "stacked_bar", "area")
 _EXCEL_ALIASES = {"stacked": "stacked_column", "col": "column", "columns": "column"}
 
@@ -292,6 +292,115 @@ def _prepare_categories(pd, df, x: str, ys: list[str], group: str, top_n: int, s
     return base, list(base.columns), notes
 
 
+_HEX_COLOUR = re.compile(r"#[0-9A-Fa-f]{6}")
+#: Distinct colours for groups without a palette entry (and for a table without groups).
+_INTERVAL_DEFAULT_COLOURS = ("#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
+                             "#8c564b", "#e377c2", "#7f7f7f")
+#: Free space (in rows) kept above the first and below the last row of an interval chart.
+INTERVAL_Y_MARGIN = 1.0
+
+
+def _parse_palette(palette: Any) -> dict[str, str]:
+    """'value=#RRGGBB,value2=#RRGGBB' -> {value: colour}. An empty palette is {}."""
+    out: dict[str, str] = {}
+    for item in _as_list(palette):
+        name, sep, colour = item.partition("=")
+        name, colour = name.strip(), colour.strip()
+        if not sep or not name or not _HEX_COLOUR.fullmatch(colour):
+            raise _ToolError(f"palette entry {item!r} is not value=#RRGGBB")
+        out[name] = colour
+    return out
+
+
+def _parse_ref(ref: Any) -> list[float]:
+    """Comma-separated reference values -> floats. Empty -> []."""
+    out: list[float] = []
+    for item in _as_list(ref):
+        try:
+            v = float(item)
+        except ValueError:
+            raise _ToolError(f"ref value {item!r} is not a number") from None
+        if not math.isfinite(v):
+            raise _ToolError(f"ref value {item!r} is not finite")
+        out.append(v)
+    return out
+
+
+def _draw_interval(ax, pd, df, x: str, label_col: str, lo: str, hi: str, group: str,
+                   ref: list[float], na_label: str, palette: dict[str, str],
+                   hollow: set[str]) -> tuple[int, list[str], list[str]]:
+    """Points with intervals, one row per table row, first row at the top.
+
+    A row whose interval ends are missing keeps its point and its label but gets no bar; the
+    text na_label is written beside it. Returns (points drawn, group names, notes).
+    """
+    work = df.copy()
+    work[x] = _numeric(pd, work[x])
+    has_interval = bool(lo and hi)
+    if has_interval:
+        work[lo] = _numeric(pd, work[lo])
+        work[hi] = _numeric(pd, work[hi])
+    n = len(work)
+    names: list[str] = []
+    if group:
+        for g in work[group].astype(str):
+            if g not in names:
+                names.append(g)
+    colour_of: dict[str, str] = {}
+    for i, g in enumerate(names):
+        colour_of[g] = palette.get(g) or _INTERVAL_DEFAULT_COLOURS[i % len(_INTERVAL_DEFAULT_COLOURS)]
+    default_colour = _INTERVAL_DEFAULT_COLOURS[0]
+
+    for v in ref:
+        ax.axvline(v, color="#888888", linestyle="--", linewidth=1, zorder=1)
+
+    seen: set[str] = set()
+    points = 0
+    missing = 0
+    span = 0.0
+    xs_all = [float(v) for v in work[x].dropna()]
+    if has_interval:
+        xs_all += [float(v) for v in work[lo].dropna()] + [float(v) for v in work[hi].dropna()]
+    xs_all += ref
+    if xs_all:
+        span = (max(xs_all) - min(xs_all)) or 1.0
+    for pos, (_, row) in enumerate(work.iterrows()):
+        yy = pos
+        g = str(row[group]) if group else ""
+        colour = colour_of.get(g, default_colour)
+        est = row[x]
+        l_end = row[lo] if has_interval else float("nan")
+        h_end = row[hi] if has_interval else float("nan")
+        interval_ok = has_interval and not (pd.isna(l_end) or pd.isna(h_end))
+        if interval_ok:
+            ax.hlines(yy, l_end, h_end, color=colour, linewidth=2.2, zorder=2)
+        elif has_interval:
+            missing += 1
+            anchor = est if not pd.isna(est) else (min(xs_all) if xs_all else 0.0)
+            ax.annotate(na_label, (anchor, yy), xytext=(8, 0), textcoords="offset points",
+                        va="center", ha="left", fontsize=9, color="#555555")
+        if pd.isna(est):
+            continue
+        is_hollow = bool(group) and g in hollow
+        label = g if (group and g not in seen) else None
+        ax.plot([est], [yy], marker="o", markersize=8, linestyle="none", zorder=3,
+                markerfacecolor="white" if is_hollow else colour, markeredgecolor=colour,
+                markeredgewidth=1.8, label=label)
+        seen.add(g)
+        points += 1
+    ax.set_yticks(list(range(n)))
+    ax.set_yticklabels([str(v) for v in work[label_col]])
+    # first row on top; the margin keeps the first and last rows off the axes
+    ax.set_ylim(n - 1 + INTERVAL_Y_MARGIN, -INTERVAL_Y_MARGIN)
+    if span:
+        lo_x, hi_x = ax.get_xlim()
+        ax.set_xlim(lo_x - 0.02 * span, hi_x + 0.15 * span if missing else hi_x + 0.02 * span)
+    if group:
+        ax.legend(loc="best")
+    notes = [f"{missing} row(s) without an interval, marked '{na_label}'"] if missing else []
+    return points, names, notes
+
+
 def chart_render(
     kind: str,
     data_path: str = "",
@@ -310,6 +419,12 @@ def chart_render(
     sheet: str = "",
     cell_range: str = "",
     max_rows: int = DEFAULT_MAX_ROWS,
+    lo: str = "",
+    hi: str = "",
+    ref: str = "",
+    na_label: str = "区間なし",
+    palette: str = "",
+    hollow_groups: str = "",
 ) -> str:
     """Draw a chart from a data table and save it as a PNG picture.
 
@@ -321,7 +436,7 @@ def chart_render(
     unlock(password=...) first if refused.
 
     Args:
-        kind: bar | line | scatter | hist | pie | stacked_bar | box.
+        kind: bar | line | scatter | hist | pie | stacked_bar | box | interval.
         data_path: CSV (.csv/.tsv) or Excel (.xlsx) path under the allowed base.
         rows: Inline data instead of data_path.
         x: Category / horizontal column (bar, line, scatter, pie labels, box groups).
@@ -339,6 +454,15 @@ def chart_render(
         cell_range: Cell range for xlsx input, e.g. "A1:D200".
         max_rows: Input rows read at most (default 10000, ceiling 200000); the answer says
             when rows were dropped.
+        lo: interval only: column with the lower end of the interval (give lo and hi together).
+        hi: interval only: column with the upper end of the interval.
+        ref: interval only: reference lines at these x values, comma-separated ("0,0.5").
+        na_label: interval only: text written beside a row whose interval is empty.
+        palette: interval only: group colours as "value=#RRGGBB,value2=#RRGGBB".
+        hollow_groups: interval only: group values drawn as hollow (white-filled) points.
+
+    kind=interval draws one row per table row, first row on top: a point at x, a bar from lo
+    to hi, y = the label column, group = colour. Rows without an interval keep point and label.
 
     Returns: the PNG path and a text summary (points, axes, series, notes), or
     "[chart_render error: ...]".
@@ -348,13 +472,15 @@ def chart_render(
         return locked
     try:
         return _chart_render(kind, data_path, rows, x, y, group, title, xlabel, ylabel,
-                             top_n, sort, out_path, dpi, size, sheet, cell_range, max_rows)
+                             top_n, sort, out_path, dpi, size, sheet, cell_range, max_rows,
+                             lo, hi, ref, na_label, palette, hollow_groups)
     except Exception as e:
         return _fail("chart_render", e)
 
 
 def _chart_render(kind, data_path, rows, x, y, group, title, xlabel, ylabel,
-                  top_n, sort, out_path, dpi, size, sheet, cell_range, max_rows) -> str:
+                  top_n, sort, out_path, dpi, size, sheet, cell_range, max_rows,
+                  lo="", hi="", ref="", na_label="区間なし", palette="", hollow_groups="") -> str:
     kind = (kind or "").strip().lower()
     if kind not in CHART_KINDS:
         raise _ToolError(f"kind must be one of: {', '.join(CHART_KINDS)}")
@@ -370,6 +496,17 @@ def _chart_render(kind, data_path, rows, x, y, group, title, xlabel, ylabel,
     ys = _as_list(y)
     x = (x or "").strip()
     group = (group or "").strip()
+    lo, hi = (lo or "").strip(), (hi or "").strip()
+    ref_values = _parse_ref(ref)
+    colours = _parse_palette(palette)
+    hollow = set(_as_list(hollow_groups))
+    if kind == "interval":
+        if not x or not ys:
+            raise _ToolError("interval needs x (the point column) and y (the label column)")
+        if bool(lo) != bool(hi):
+            raise _ToolError("interval needs lo and hi together (or neither, for points only)")
+        ys = ys[:1]
+        _pick_columns(df, "", [c for c in (lo, hi) if c], "", "chart_render")
     if not ys:
         ys = _default_ys(pd, df, x, group)
     _pick_columns(df, x, ys, group, "chart_render")
@@ -505,9 +642,20 @@ def _chart_render(kind, data_path, rows, x, y, group, title, xlabel, ylabel,
                 else ax.boxplot(data, labels=labels)
             points = int(sum(len(d) for d in data))
 
+        elif kind == "interval":
+            points, series, n2 = _draw_interval(
+                ax, pd, df, x, ys[0], lo, hi, group, ref_values,
+                (na_label if na_label is not None else "区間なし"), colours, hollow)
+            notes += n2
+            series = series or [x]
+
         if title:
             ax.set_title(title)
-        if kind not in ("pie", "hist"):
+        if kind == "interval":
+            ax.set_xlabel(xlabel or x)
+            if ylabel:
+                ax.set_ylabel(ylabel)
+        elif kind not in ("pie", "hist"):
             ax.set_xlabel(xlabel or x or "")
             ax.set_ylabel(ylabel or (ys[0] if len(ys) == 1 else ""))
         elif kind == "hist":

@@ -324,3 +324,113 @@ def test_the_three_tools_are_in_the_gateway_catalogue():
     assert tool_catalogue.categorise("excel_chart_export") == "data"
     assert tool_catalogue.categorise("chart_from_python") == "run"
     assert sys.version_info >= (3, 10)
+
+
+# ------------------------------------------------------------------ chart_render: interval
+
+INTERVAL_ROWS = [
+    {"item": "item A", "est": 0.8, "lo": 0.5, "hi": 1.1, "grp": "g1"},
+    {"item": "item B", "est": 0.1, "lo": -0.2, "hi": 0.4, "grp": "g2"},
+    {"item": "item C", "est": 0.3, "lo": None, "hi": None, "grp": "g2"},
+]
+
+
+def _interval(tmp_path, name="iv.png", **kw):
+    args = dict(rows=INTERVAL_ROWS, x="est", y="item", lo="lo", hi="hi", group="grp",
+                out_path=str(tmp_path / name))
+    args.update(kw)
+    return C.chart_render("interval", **args)
+
+
+def test_interval_makes_a_png_with_groups_and_a_missing_interval(tmp_path):
+    res = _interval(tmp_path, ref="0,0.3,-0.3", palette="g1=#0f8b8d,g2=#e8871e",
+                    hollow_groups="g2", title="区間つきの点")
+    assert not res.startswith("["), res
+    assert _is_png(tmp_path / "iv.png")
+    assert "kind=interval" in res and "points=3" in res and "series (2)" in res
+    assert "1 row(s) without an interval, marked '区間なし'" in res
+
+
+def test_interval_custom_na_label_is_reported(tmp_path):
+    res = _interval(tmp_path, na_label="n/a")
+    assert "marked 'n/a'" in res
+
+
+def test_interval_without_group_or_interval_columns(tmp_path):
+    res = _interval(tmp_path, group="", lo="", hi="")
+    assert not res.startswith("["), res
+    assert "points=3" in res and "without an interval" not in res
+    assert "series (1)" in res
+
+
+def test_interval_without_group_still_draws_bars(tmp_path):
+    res = _interval(tmp_path, group="")
+    assert not res.startswith("["), res
+    assert "1 row(s) without an interval" in res
+
+
+@pytest.mark.parametrize("palette", ["g1", "g1=red", "=#112233", "g1=#12345", "g1=#0f8b8d,g2"])
+def test_interval_invalid_palette_is_an_error(tmp_path, palette):
+    res = _interval(tmp_path, palette=palette)
+    assert res.startswith("[chart_render error:") and "palette" in res
+    assert not (tmp_path / "iv.png").exists()
+
+
+@pytest.mark.parametrize("ref", ["", " ", ",", None])
+def test_interval_empty_ref_draws_no_reference_lines(tmp_path, ref):
+    assert C._parse_ref(ref) == []
+    res = _interval(tmp_path, ref=ref)
+    assert not res.startswith("["), res
+
+
+def test_interval_bad_ref_is_an_error(tmp_path):
+    assert _interval(tmp_path, ref="0,abc").startswith("[chart_render error:")
+    assert _interval(tmp_path, ref="nan").startswith("[chart_render error:")
+
+
+def test_parse_palette_reads_pairs():
+    assert C._parse_palette("g1=#0f8b8d, g2=#E8871E") == {"g1": "#0f8b8d", "g2": "#E8871E"}
+    assert C._parse_palette("") == {}
+
+
+def test_interval_hollow_groups_draw_white_filled_points(tmp_path):
+    from matplotlib.figure import Figure
+    pd = pytest.importorskip("pandas")
+    fig = Figure()
+    ax = fig.add_subplot(111)
+    C._draw_interval(ax, pd, pd.DataFrame(INTERVAL_ROWS), "est", "item", "lo", "hi", "grp",
+                     [], "none", {"g1": "#0f8b8d", "g2": "#e8871e"}, {"g2"})
+    faces = {ln.get_markeredgecolor(): ln.get_markerfacecolor() for ln in ax.lines
+             if ln.get_marker() == "o"}
+    assert faces["#0f8b8d"] == "#0f8b8d"
+    assert faces["#e8871e"] == "white"
+
+
+def test_interval_y_axis_has_margin_and_first_row_on_top():
+    from matplotlib.figure import Figure
+    pd = pytest.importorskip("pandas")
+    fig = Figure()
+    ax = fig.add_subplot(111)
+    C._draw_interval(ax, pd, pd.DataFrame(INTERVAL_ROWS), "est", "item", "lo", "hi", "grp",
+                     [0.0], "none", {}, set())
+    top, bottom = ax.get_ylim()[1], ax.get_ylim()[0]
+    n = len(INTERVAL_ROWS)
+    assert top <= -0.5 and bottom >= n - 1 + 0.5      # rows 0 and n-1 stay off the axes
+    assert top < bottom                                   # inverted: row 0 is drawn first (top)
+    assert [t.get_text() for t in ax.get_yticklabels()] == ["item A", "item B", "item C"]
+
+
+def test_interval_argument_errors(tmp_path):
+    assert "lo and hi together" in _interval(tmp_path, hi="")
+    assert "needs x" in _interval(tmp_path, x="")
+    assert "column 'nope' not found" in _interval(tmp_path, lo="nope")
+
+
+def test_existing_kinds_ignore_the_interval_arguments(tmp_path):
+    a = C.chart_render("bar", rows=ROWS, x="部門", y="売上", out_path=str(tmp_path / "a.png"))
+    b = C.chart_render("bar", rows=ROWS, x="部門", y="売上", out_path=str(tmp_path / "b.png"),
+                       lo="", hi="", ref="", palette="", hollow_groups="")
+    assert not a.startswith("[") and not b.startswith("[")
+    assert a.splitlines()[1:] == b.splitlines()[1:]
+    assert (tmp_path / "a.png").read_bytes() == (tmp_path / "b.png").read_bytes()
+    assert C.CHART_KINDS[:7] == ("bar", "line", "scatter", "hist", "pie", "stacked_bar", "box")
