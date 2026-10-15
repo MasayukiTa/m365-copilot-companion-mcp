@@ -35,12 +35,12 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 
-KINDS = ("network", "locked", "gateway", "tools", "procedure", "refused")
+KINDS = ("network", "locked", "gateway", "tools", "procedure", "platform", "refused")
 
 #: Heads of the Japanese headline, one per kind. A reason that already starts with one of these
 #: has been stamped; stamping again would stack them.
 HEADS = {"network": "ネットワーク:", "locked": "ロック:", "gateway": "ゲートウェイ未到達:",
-         "tools": "ツール未接続:", "procedure": "手順未実施:"}
+         "tools": "ツール未接続:", "procedure": "手順未実施:", "platform": "プラットフォームエラー:"}
 
 #: How much of the ledger tail to read. 1.7 KB per row measured, so 12 MB is several thousand
 #: rows: hours of a busy fleet, one seek, never the whole 68 MB file.
@@ -128,6 +128,9 @@ class Cause:
             return "%s %s%s" % (HEADS["tools"], self.detail or "会話にMCPコネクタのツールが付いていません", tail)
         if self.kind == "procedure":
             return "%s %s%s" % (HEADS["procedure"], self.detail or "承認済み手順が前提とするツールを呼んでいません", tail)
+        if self.kind == "platform":
+            return "%s %s%s" % (HEADS["platform"], self.code or "不明",
+                                ("(" + self.detail + ")") if self.detail else "")
         return "拒否: この指示が拒否された可能性があります"
 
 
@@ -344,9 +347,18 @@ def tools_unattached_cause(*, since: float, attempts: int, via: str = "") -> Cau
     return Cause(kind="tools", since=since, count=attempts, attributed=True, detail=d)
 
 
+def platform_cause(*, code: str, attempts: int, since: float = 0.0) -> Cause:
+    """The platform answered with an error code instead of an answer, in the worker's own
+    reply (not from the tool ledger). The code is verbatim and comes first in the reason."""
+    d = ("プラットフォームがエラーを返しました。会話を作り直して%d回再試行しても解消せず"
+         % attempts) if attempts else "プラットフォームがエラーを返しました"
+    return Cause(kind="platform", code=code, since=since, count=max(1, attempts),
+                 attributed=True, detail=d)
+
+
 def plausible(cause: Cause, goal: str, reason: str) -> bool:
     """May an UNATTRIBUTED cause be put on this worker? Attributed ones always may."""
-    if cause.attributed or cause.kind in ("gateway", "tools", "procedure"):
+    if cause.attributed or cause.kind in ("gateway", "tools", "procedure", "platform"):
         return True
     words = _NET_WORDS_RE if cause.kind == "network" else _LOCK_WORDS_RE
     if not _CANNED_REASON_RE.search(reason or "") and words.search(reason or ""):
