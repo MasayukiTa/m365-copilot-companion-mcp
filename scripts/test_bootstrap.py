@@ -753,5 +753,193 @@ class GenEnvFreshStillWritesSecretsTests(unittest.TestCase):
         self.assertTrue(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR))
 
 
+class GenEnvUnexpectedFailureTests(unittest.TestCase):
+    """B1: an UNCAUGHT exception from gen_env must become a resumable StepError that says to
+    re-run quickstart.bat. Every write in that step goes through tools.secret_store's DPAPI
+    protect_secret and scripts/env_file's temp-file-plus-rename, so a locked or read-only .env --
+    or a DPAPI refusal -- raised straight out of run_all as a traceback, and the operator got a
+    stack trace with no instruction while the one thing they may run is quickstart.bat."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._orig_root = bootstrap.ROOT
+        bootstrap.ROOT = self.root
+
+    def tearDown(self):
+        bootstrap.ROOT = self._orig_root
+        self.tmp.cleanup()
+
+    def test_an_oserror_from_protecting_a_secret_becomes_a_step_error(self):
+        # No .env yet, so this is the create path; it protects the minted secrets with DPAPI
+        # first thing, which is where OSError comes from on a real machine.
+        with mock.patch.object(bootstrap, "protect_secret",
+                               side_effect=OSError("DPAPI refused")):
+            with self.assertRaises(bootstrap.StepError) as ctx:
+                bootstrap.step_gen_env()
+        msg = str(ctx.exception)
+        self.assertIn("quickstart.bat", msg)
+        # The TYPE and the message survive: they are what says which file or handle is at fault.
+        self.assertIn("OSError", msg)
+        self.assertIn("DPAPI refused", msg)
+
+    def test_a_locked_env_becomes_a_step_error_not_a_traceback(self):
+        # A DIRECTORY where .env should be: opening it for reading raises OSError on Windows and
+        # on POSIX alike, which is the shape of "another program is holding .env".
+        (self.root / ".env").mkdir()
+        with self.assertRaises(bootstrap.StepError) as ctx:
+            bootstrap.step_gen_env()
+        self.assertIn("quickstart.bat", str(ctx.exception))
+
+    def test_the_guard_does_not_reword_a_step_error_or_an_action_needed(self):
+        # ActionNeeded and StepError already carry a readable instruction; the guard exists to
+        # explain the exceptions that carry none, not to replace the ones that do.
+        @bootstrap._step_errors_are_actionable("Testing")
+        def step(exc):
+            raise exc
+
+        with self.assertRaises(bootstrap.StepError) as ctx:
+            step(bootstrap.StepError("its own message"))
+        self.assertEqual(str(ctx.exception), "its own message")
+        with self.assertRaises(bootstrap.ActionNeeded):
+            step(bootstrap.ActionNeeded("sign in to Microsoft"))
+
+
+class VerifyMarksTheVenvForRebuildTests(unittest.TestCase):
+    """B2: when main.py will not import, the .venv may be half-broken and a plain re-run repeats
+    the failure -- its python still runs, so ensure_venv calls it healthy and skips it, and
+    install_deps finds requirements.txt satisfied and does nothing. The venv is moved aside to
+    .venv.broken-<timestamp> and the ensure_venv/install_deps checkpoints are cleared, so the
+    NEXT run of quickstart.bat rebuilds it -- and the error message says exactly that."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self._orig_root = bootstrap.ROOT
+        self._orig_vpy = bootstrap.VENV_PYTHON
+        self._orig_sf = bootstrap.STATE_FILE
+        bootstrap.ROOT = self.root
+        self.venv = self.root / ".venv"
+        self.vpy = self.venv / "Scripts" / "python.exe"
+        bootstrap.VENV_PYTHON = self.vpy
+        self.vpy.parent.mkdir(parents=True, exist_ok=True)
+        self.vpy.write_text("python", encoding="utf-8")
+        (self.root / ".env").write_text(
+            "MCP_API_KEY_PROTECTED=dpapi:test-api\n"
+            + bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=dpapi:test-unlock\n",
+            encoding="utf-8")
+        self.state_file = self.root / ".setup" / "state.json"
+        bootstrap.STATE_FILE = self.state_file
+        self.state = None
+
+    def tearDown(self):
+        bootstrap.ROOT = self._orig_root
+        bootstrap.VENV_PYTHON = self._orig_vpy
+        bootstrap.STATE_FILE = self._orig_sf
+        self.tmp.cleanup()
+
+    def _build_done(self):
+        """The state a previously successful run leaves behind."""
+        self.state = {"done": {n: True for n in ("ensure_venv", "install_deps", "gen_env",
+                                                "verify")}}
+        bootstrap.save_state(self.state, self.state_file)
+        return self.state
+
+    def _verify(self, count):
+        """step_verify with the .env key check and the child import both answered for us; the
+        DPAPI usability check is not what these tests are about."""
+        with mock.patch.object(bootstrap, "_secret_is_usable", return_value=True), \
+                mock.patch.object(bootstrap, "_load_dotenv_into_env", lambda _p: None), \
+                mock.patch.object(bootstrap, "_count_tools_via_subprocess", return_value=count):
+            bootstrap.step_verify(state=self.state, state_file=self.state_file)
+
+    def _aside_dirs(self):
+        return sorted(p.name for p in self.root.glob(".venv.broken-*"))
+
+    def test_an_import_failure_moves_the_venv_aside_and_clears_the_checkpoints(self):
+        self._build_done()
+        with self.assertRaises(bootstrap.StepError) as ctx:
+            self._verify(None)
+        msg = str(ctx.exception)
+
+        self.assertFalse(self.venv.exists(), "the unusable .venv is still in place")
+        self.assertFalse(self.vpy.exists())
+        aside = self._aside_dirs()
+        self.assertEqual(len(aside), 1, "the venv was not moved aside exactly once")
+        self.assertTrue(aside[0].startswith(".venv.broken-"), aside[0])
+        # RENAMED, NOT DELETED: what was wrong with it is still on disk to look at.
+        self.assertTrue((self.root / aside[0] / "Scripts" / "python.exe").exists())
+
+        # THE MESSAGE SAYS EXACTLY THAT THE NEXT RUN REBUILDS IT.
+        self.assertIn("quickstart.bat", msg)
+        self.assertIn("rebuilds .venv from scratch", msg)
+        self.assertIn(aside[0], msg)
+
+        # THE CHECKPOINTS ARE CLEARED IN THE SAVED STATE, not merely in memory.
+        saved = bootstrap.load_state(self.state_file)
+        self.assertFalse(bootstrap.is_done(saved, "ensure_venv"))
+        self.assertFalse(bootstrap.is_done(saved, "install_deps"))
+
+        # AND THE PROBE THAT USED TO SKIP IT NO LONGER CALLS IT HEALTHY (the loop this removes).
+        self.assertFalse(bootstrap._venv_is_healthy())
+
+    def test_only_the_projects_own_venv_is_touched(self):
+        self._build_done()
+        keep = self.root / "keep-me"
+        keep.mkdir()
+        (keep / "file.txt").write_text("x", encoding="utf-8")
+        with self.assertRaises(bootstrap.StepError):
+            self._verify(None)
+        self.assertTrue((keep / "file.txt").exists(), "a directory outside .venv was moved")
+        self.assertEqual(len(self._aside_dirs()), 1)
+
+    def test_no_directory_named_venv_is_ever_taken(self):
+        # The one thing this must never do is take something that is not the project's .venv.
+        self.venv.rename(self.root / "moved-away-by-the-test")
+        elsewhere = self.root / "not-a-venv"
+        elsewhere.mkdir()
+        (elsewhere / "python.exe").write_text("python", encoding="utf-8")
+        bootstrap.VENV_PYTHON = elsewhere / "python.exe"
+        self.assertIsNone(bootstrap._venv_dir_for_rebuild())
+
+    def test_a_verify_timeout_keeps_the_venv(self):
+        """D26, unchanged: running out of time says nothing about the install, so the packages
+        and the venv are KEPT. Only a real import FAILURE marks the environment for a rebuild."""
+        self._build_done()
+        with self.assertRaises(bootstrap.VerifyTimedOut):
+            self._verify(bootstrap._IMPORT_TIMED_OUT)
+        self.assertTrue(self.venv.exists())
+        self.assertEqual(self._aside_dirs(), [])
+        saved = bootstrap.load_state(self.state_file)
+        self.assertTrue(bootstrap.is_done(saved, "install_deps"))
+
+    def test_a_healthy_import_leaves_the_venv_and_the_checkpoints_alone(self):
+        self._build_done()
+        self._verify(8)
+        self.assertTrue(self.venv.exists())
+        self.assertEqual(self._aside_dirs(), [])
+        saved = bootstrap.load_state(self.state_file)
+        self.assertTrue(bootstrap.is_done(saved, "ensure_venv"))
+        self.assertTrue(bootstrap.is_done(saved, "install_deps"))
+
+    def test_a_venv_that_can_neither_be_moved_nor_removed_still_says_what_to_do(self):
+        # A handle open inside the tree refuses both the rename and the delete. The checkpoints
+        # are cleared all the same, and the message names the situation instead of pretending.
+        self._build_done()
+        with mock.patch.object(bootstrap, "_VENV_RETIRE_ATTEMPTS", 1), \
+                mock.patch.object(bootstrap.Path, "rename",
+                                  side_effect=PermissionError("in use")), \
+                mock.patch.object(bootstrap.shutil, "rmtree",
+                                  side_effect=OSError("in use")):
+            with self.assertRaises(bootstrap.StepError) as ctx:
+                self._verify(None)
+        msg = str(ctx.exception)
+        self.assertIn("could not be moved aside or removed", msg)
+        self.assertIn("quickstart.bat", msg)
+        self.assertTrue(self.venv.exists(), "the venv was removed after the move failed")
+        saved = bootstrap.load_state(self.state_file)
+        self.assertFalse(bootstrap.is_done(saved, "ensure_venv"))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
