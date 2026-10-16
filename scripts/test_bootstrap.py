@@ -92,7 +92,9 @@ class StateMachineTests(unittest.TestCase):
             rc = bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
 
         self.assertEqual(rc, 0)
-        self.assertEqual(rec.calls, ["ensure_venv", "install_deps", "verify"],
+        # gen_env is revalidated every run (its flag proves nothing about the .env on disk); the
+        # other artefact steps (check_edge, dev_tunnel, gen_connector) stay skipped.
+        self.assertEqual(rec.calls, ["ensure_venv", "install_deps", "gen_env", "verify"],
                          "the venv-dependent steps did not re-run")
 
     def test_an_existing_venv_leaves_the_build_checkpoints_alone(self):
@@ -134,7 +136,22 @@ class StateMachineTests(unittest.TestCase):
             bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
 
         self.assertIn("verify", rec.calls)
-        self.assertEqual(bootstrap.ALWAYS_REVALIDATE, ("verify",))
+        self.assertEqual(bootstrap.ALWAYS_REVALIDATE, ("gen_env", "verify"))
+
+    def test_gen_env_runs_even_when_its_checkpoint_says_it_is_done(self):
+        """A .env carried from another PC arrives WITH a state.json saying gen_env is done, so the
+        step that can repair it was skipped and verify failed on the first run; it only ran on
+        the second. It must run on the first."""
+        state = {"done": {n: True for n in ("ensure_venv", "install_deps", "gen_env", "verify")}}
+        bootstrap.save_state(state, self.state_file)
+
+        present = Path(self.tmp.name) / "python.exe"
+        present.write_text("", encoding="utf-8")
+        with mock.patch.object(bootstrap, "VENV_PYTHON", present):
+            rec = RecordingSteps(["ensure_venv", "install_deps", "gen_env", "verify"])
+            bootstrap.run_all(steps=rec.steps, state_file=self.state_file)
+
+        self.assertIn("gen_env", rec.calls)
 
     def test_a_failed_verify_clears_what_the_next_run_has_to_rebuild(self):
         """Otherwise "re-run to retry this step" retries only verify, forever: the steps that
@@ -623,16 +640,79 @@ class GenEnvBackfillsMissingSecretsTests(unittest.TestCase):
 
     def test_only_api_key_missing_generates_only_api_key(self):
         env = self.root / ".env"
-        # Unlock present (protected form); API key absent.
+        # Unlock present (a value this account can open); API key absent.
+        good_unlock = bootstrap.protect_secret("keep-this-unlock")
         env.write_text(
-            bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=abc123\n",
+            bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=" + good_unlock + "\n",
             encoding="utf-8",
         )
         bootstrap.step_gen_env()
         api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
         self.assertTrue(api and api.startswith("dpapi:"))
         # The existing protected unlock value is untouched, and no plain unlock line is minted.
-        self.assertEqual(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR), "abc123")
+        self.assertEqual(bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR), good_unlock)
+
+    def test_one_run_repairs_a_carried_over_env_with_done_flags(self):
+        """The screen that was reported: .env and state.json both came from another PC, every
+        step is flagged done, the protected secrets cannot be opened here. ONE run of the real
+        gen_env + verify must end at rc 0 -- not fail first and mend on the second run."""
+        state_file = self.root / ".setup" / "state.json"
+        state_file.parent.mkdir(parents=True, exist_ok=True)
+        orig_sf = bootstrap.STATE_FILE
+        bootstrap.STATE_FILE = state_file
+        try:
+            (self.root / ".env").write_text(
+                "MCP_API_KEY_PROTECTED=dpapi:foreign-blob-a\n"
+                + bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=dpapi:foreign-blob-b\n",
+                encoding="utf-8")
+            bootstrap.save_state({"done": {n: True for n in ("ensure_venv", "install_deps",
+                                                              "gen_env", "verify")}}, state_file)
+            steps = [("ensure_venv", lambda: None), ("install_deps", lambda: None),
+                     ("gen_env", bootstrap.step_gen_env), ("verify", bootstrap.step_verify)]
+            present = self.root / "python.exe"
+            present.write_text("", encoding="utf-8")
+            with mock.patch.object(bootstrap, "VENV_PYTHON", present), \
+                    mock.patch.object(bootstrap, "_count_tools_via_subprocess", return_value=8), \
+                    mock.patch.object(bootstrap, "deps_are_stale", return_value=False):
+                rc = bootstrap.run_all(steps=steps, state_file=state_file)
+        finally:
+            bootstrap.STATE_FILE = orig_sf
+        self.assertEqual(rc, 0, "the first run did not repair the carried-over .env")
+        self.assertTrue(bootstrap._secret_is_usable(bootstrap._read_env_value("MCP_API_KEY_PROTECTED")))
+
+    def test_secrets_this_machine_cannot_use_are_replaced_not_kept(self):
+        # An .env carried from another PC/account: the protected values are present but cannot be
+        # opened here (foreign blob), blank, or a template placeholder. They are machine-made and
+        # never typed, so this machine makes new ones -- with the old file kept aside -- instead of
+        # leaving verify failing on every run.
+        for bad_api, bad_unlock in (("dpapi:foreign-blob-c", "dpapi:foreign-blob"),
+                                    ("", "replace-me"),
+                                    ("dpapi:generated-by-setup", "")):
+            with self.subTest(api=bad_api, unlock=bad_unlock):
+                env = self.root / ".env"
+                env.write_text("SOME_OTHER=1\nMCP_API_KEY_PROTECTED=" + bad_api + "\n"
+                               + bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR + "=" + bad_unlock + "\n",
+                               encoding="utf-8")
+                bootstrap.step_gen_env()
+                api = bootstrap._read_env_value("MCP_API_KEY_PROTECTED")
+                unlock = bootstrap._read_env_value(bootstrap.UNLOCK_PASSWORD_PROTECTED_VAR)
+                self.assertTrue(bootstrap._secret_is_usable(api), "API key was not re-made")
+                self.assertTrue(bootstrap._secret_is_usable(unlock), "unlock password was not re-made")
+                self.assertNotEqual(api, bad_api)
+                # Copilot Studio still holds the old key: the marker lets quickstart.bat refuse to
+                # skip STEP 5 and start_all keep saying so. It holds no secret.
+                marker = self.root / ".setup" / "bearer_remade"
+                self.assertTrue(marker.exists(), "no marker that the key was re-made")
+                self.assertNotIn(api, marker.read_text(encoding="ascii"))
+                marker.unlink()
+                self.assertIn("SOME_OTHER=1", env.read_text(encoding="utf-8-sig"))
+                backup = self.root / ".env.before-secret-repair"
+                self.assertTrue(backup.exists(), "the old .env was not kept aside")
+                self.assertIn(bad_api, backup.read_text(encoding="utf-8-sig"))
+                backup.unlink()
+                with mock.patch.object(bootstrap, "_count_tools_via_subprocess", return_value=1):
+                    bootstrap.step_verify()   # the repaired file passes the check that failed
+
 
     def test_repaired_env_then_passes_verify(self):
         # End to end: a .env missing both secrets is repaired by gen_env so that a subsequent

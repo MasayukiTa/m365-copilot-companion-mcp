@@ -77,7 +77,7 @@ if __name__ == "__main__" and tuple(sys.version_info[:2]) < MIN_PYTHON:
 _SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if _SCRIPTS_DIR not in sys.path:
     sys.path.append(_SCRIPTS_DIR)   # appended, not prepended: nothing here may shadow a package
-from tools.secret_store import UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret  # noqa: E402
+from tools.secret_store import UNLOCK_PASSWORD_PROTECTED_VAR, protect_secret, unprotect_secret  # noqa: E402
 import env_file  # noqa: E402  (scripts/env_file.py -- the atomic .env writer)
 
 STATE_DIR = ROOT / ".setup"
@@ -1291,6 +1291,43 @@ _AGAIN_HINT = ("Show them again with copilot_studio_values.bat "
                "(scripts\\copilot_studio_values.ps1)")
 
 
+_SECRET_PLACEHOLDERS = ("replace", "dpapi:generated-by-setup", "changeme", "<")
+
+
+def _secret_is_usable(raw: str) -> bool:
+    """True when `raw` (a MCP_*_PROTECTED value) opens on THIS Windows account and is not a template
+    placeholder. Blank, placeholder and undecryptable are all "not usable"."""
+    value = (raw or "").strip()
+    if not value or value.lower().startswith(_SECRET_PLACEHOLDERS):
+        return False
+    try:
+        opened = (unprotect_secret(value) or "").strip()
+    except Exception:  # noqa: BLE001  (a foreign DPAPI blob raises; the reason does not matter here)
+        return False
+    return bool(opened) and not opened.lower().startswith(_SECRET_PLACEHOLDERS)
+
+
+def _drop_unusable_secrets(env_path: Path, text: str) -> "tuple[str, list[str]]":
+    """Remove the protected-secret lines of `text` that this machine cannot use, so the caller
+    mints fresh ones. Returns (new text, names removed); the old file is copied aside first.
+    Names only -- a value never reaches a log."""
+    last: dict = {}
+    for line in text.splitlines():
+        m = re.match(r"^\s*(MCP_API_KEY_PROTECTED|" + re.escape(UNLOCK_PASSWORD_PROTECTED_VAR)
+                     + r")\s*=(.*)$", line)
+        if m:
+            last[m.group(1)] = m.group(2)
+    bad = [k for k, v in last.items() if not _secret_is_usable(v)]
+    if not bad:
+        return text, []
+    shutil.copyfile(str(env_path), str(env_path) + ".before-secret-repair")
+    nl = env_file.newline_of(text)
+    kept = [ln for ln in text.splitlines()
+            if not re.match(r"^\s*(" + "|".join(re.escape(k) for k in bad) + r")\s*=", ln)]
+    new_text = nl.join(kept) + (nl if text.endswith(("\n", "\r")) else "")
+    return new_text, bad
+
+
 def step_gen_env() -> None:
     step_header("Preparing .env")
     env_path = ROOT / ".env"
@@ -1365,6 +1402,19 @@ def step_gen_env() -> None:
         # secret as a missing key and mint a fresh one, on exactly the same append-only terms:
         # if the key is already present (even blank/placeholder -- that is the user's value to
         # keep or fix), it is NOT touched. We never overwrite an existing secret here.
+        # A SECRET THAT IS PRESENT BUT UNUSABLE IS NOT THE USER'S VALUE, IT IS A BROKEN ONE.
+        # A .env carried from another PC or account holds a DPAPI blob this account cannot open
+        # (or a blank / template placeholder). "Keep whatever is there" left such a file failing
+        # verify on every run with nothing able to repair it, and the only way out was a person
+        # editing .env. These secrets are machine-generated, never typed, so this machine makes new
+        # ones. Only an UNUSABLE value is replaced (a working one is never touched), and the old
+        # file is copied aside first because it holds every other value on the machine.
+        current, _repaired = _drop_unusable_secrets(env_path, current)
+        if _repaired:
+            log("    OK: .env held secret(s) this machine cannot use (copied from another PC or a "
+                "blank/placeholder value); replaced: " + ", ".join(_repaired)
+                + ". Old file kept as .env.before-secret-repair.")
+
         secret_lines = []
         have_api = any((line.lstrip().startswith("MCP_API_KEY=") or line.lstrip().startswith("MCP_API_KEY_PROTECTED=")) for line in current.splitlines())
         have_unlock = any(
@@ -1413,6 +1463,17 @@ def step_gen_env() -> None:
                 # used to be minted without a word.
                 shown = []
                 if minted_api is not None:
+                    # A MARKER, NOT THE VALUE. Copilot Studio still holds the old key, so it answers
+                    # 401 until the new one is pasted there. quickstart.bat reads this to stop
+                    # offering "skip" and shows the values; it deletes the file once that leg is
+                    # done. start_all reads it to keep saying so on every start until then.
+                    try:
+                        marker = ROOT / ".setup" / "bearer_remade"
+                        marker.parent.mkdir(parents=True, exist_ok=True)
+                        marker.write_text("re-made; paste the new values into Copilot Studio\n",
+                                          encoding="ascii")
+                    except OSError:
+                        pass
                     shown.append(("Bearer token (MCP_API_KEY)", minted_api))
                 if minted_unlock is not None:
                     shown.append(("Unlock password", minted_unlock))
@@ -2095,7 +2156,8 @@ def step_verify() -> None:
     missing = []
     for k in required:
         v = _read_env_value(k)
-        if not v or v.startswith("replace"):
+        # Present is not enough: a blob from another PC or account is "set" and useless here.
+        if not _secret_is_usable(v):
             missing.append(k)
     unlock_plain = _read_env_value("MCP_UNLOCK_PASSWORD")
     unlock_protected = _read_env_value(UNLOCK_PASSWORD_PROTECTED_VAR)
@@ -2261,7 +2323,11 @@ STEPS = [
 #: Never skipped, whatever the checkpoint says. `verify` is a CHECK -- it imports main.py in a
 #: subprocess and counts the tools -- and a check that is skipped has stopped being one. Its
 #: flag can also arrive from another machine inside a copied .setup/state.json.
-ALWAYS_REVALIDATE = ("verify",)
+#: gen_env is here because its done-flag proves nothing about the .env on disk: the flag can arrive
+#: in a copied .setup/state.json, or outlive a .env that was replaced by one from another PC. It is
+#: idempotent and cheap ("already exists, left untouched" when the file is fine), and it is the only
+#: step that can repair a carried-over .env, so it must run on the first run, not the second.
+ALWAYS_REVALIDATE = ("gen_env", "verify")
 
 #: Cleared when a revalidating step fails, so the next run rebuilds rather than skipping back to
 #: the same failure. These are the steps that produce what `verify` verifies.
@@ -2347,7 +2413,7 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             # back into a run that skips straight to the same failure.
             # EXCEPT WHEN IT DID NOT FAIL BUT RAN OUT OF TIME (D26): a timeout says nothing about
             # the install, and clearing it made a slow PC reinstall everything on every run.
-            if name in ALWAYS_REVALIDATE and not isinstance(e, VerifyTimedOut):
+            if name == "verify" and not isinstance(e, VerifyTimedOut):
                 for stale in REPAIRED_BY_RERUN:
                     if state.get("done", {}).pop(stale, None):
                         log("    (cleared '%s' so the next run rebuilds it)" % stale)

@@ -1038,6 +1038,13 @@ Check-TriState "server_not_stale" "Running server is on the current checkout (no
         $checker = Join-Path $scriptDir "stale_server_check.py"
         if (-not (Test-Path $checker)) { return $null }
         $marker = Join-Path $repo ".setup\server_started_head.txt"
+        # A FOLDER THAT IS NOT A GIT CHECKOUT CANNOT GO STALE THIS WAY. A ZIP unpacked on a new PC has no
+        # .git (and often no git at all), so HEAD never resolves, this check answered "could not be
+        # determined" on EVERY run, and quickstart.bat ended in SETUP NOT CONFIRMED for good -- the
+        # only people it happened to were the ones installing from the release ZIP. Such a folder is
+        # updated by unpacking a new ZIP, not by a pull under a running server, so the question does
+        # not apply: pass. Still indeterminate when a .git IS there and git fails (a real fault).
+        if (-not (Test-Path (Join-Path $repo ".git"))) { return $true }
         $head = (& git -C $repo rev-parse HEAD 2>$null)
         if ($LASTEXITCODE -ne 0 -or -not $head) { return $null }
         $runningFlag = if ($up) { "1" } else { "0" }
