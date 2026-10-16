@@ -5774,8 +5774,9 @@ class RelayWorker:
                 self.retryable_override = None
             return
         cause = sm.classify_rows(rows, worker=self.name, since=since)
-        if cause is not None and not sm.plausible(cause, getattr(self, "goal", "") or "",
-                                                   self.reason or ""):
+        if cause is not None and not sm.plausible(
+                cause, getattr(self, "goal", "") or "", self.reason or "",
+                required_tools=list((getattr(self, "_skill_proc", None) or {}).get("requires_tools") or [])):
             cause = None
         if getattr(self, "_gateway_unlanded", 0) and (cause is None or not cause.attributed):
             # The model wrote calls that never arrived. That is the more specific fact.
