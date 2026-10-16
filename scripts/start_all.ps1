@@ -182,6 +182,80 @@ function Record-PhaseTiming([string]$Name, [datetime]$Since) {
     $script:phaseTimings[$Name] = [math]::Round(((Get-Date) - $Since).TotalSeconds, 2)
 }
 
+# WHAT FAILED, AND IN WHICH STAGE (2026-10-16). $script:startupFailures already carried the
+# problems -- to the screen, to .setup\logs\start_all_summary.txt and, as a COUNT, to
+# start_all_runs.jsonl -- and a count is not a cause: a run that ended "3 problem(s)" on a PC
+# nobody was watching left nothing that said WHICH stage failed and why, so the only way to find
+# out was to make it happen again. Two things are written down now, both from ONE call per
+# failure so they can never disagree:
+#   * .setup\last_failure.txt -- one small file, OVERWRITTEN by every failure, so the last one a
+#     run hit is still readable after the hidden process that saw it is gone. Deleted by a run
+#     that had nothing to report, so a stale cause cannot outlive the fault it described.
+#   * the "failure" and "failure_stage" fields on this run's line in start_all_runs.jsonl.
+# Save-StartupFailure is called immediately after every "$script:startupFailures += ..." line
+# (that idiom is left alone -- it is how the list has always been built and what the tests read)
+# and takes the entry that line just appended plus the stage that Set-StartupStage named on entry.
+$script:startupStage = "start"
+$script:lastFailure = ""
+$script:lastFailureStage = ""
+function Set-StartupStage([string]$Name) {
+    # PURE. Which stage is running now -- see the block above. Every stage that can fail names
+    # itself before it does anything, so a failure is attributed to the stage that caused it
+    # rather than to whichever stage happens to run next.
+    $script:startupStage = [string]$Name
+}
+function Get-StartupStage {
+    # PURE. Never empty: a failure recorded before any stage named itself reads "start".
+    if ($script:startupStage) { return [string]$script:startupStage }
+    return "start"
+}
+function Get-StartAllFailurePath([string]$RepoRoot) {
+    # PURE. The one place that path is built. Next to .setup\convenience_provisioned and
+    # .setup\bearer_remade rather than under .setup\logs: it is the single thing a person is
+    # pointed at after a silent failure, so it is one level up from the logs they would
+    # otherwise have to search through.
+    return (Join-Path $RepoRoot ".setup\last_failure.txt")
+}
+function Write-StartupFailureFile([string]$Path, [string]$Stage, [string]$Text, [int]$Count = 1) {
+    # OVERWRITTEN, never appended (see the block above): this file answers "what stopped the LAST
+    # run", not "everything that ever went wrong". Written temp-then-rename so a reader never sees
+    # a half-written file, and it never throws -- a failure that cannot be written down must not
+    # become a second failure.
+    try {
+        $dir = Split-Path -Parent $Path
+        if ($dir -and -not (Test-Path -LiteralPath $dir)) { [void](New-Item -ItemType Directory -Force -Path $dir) }
+        $lines = @(("stage=" + $Stage),
+                   ("failures=" + $Count),
+                   ("failure=" + $Text),
+                   "fix: re-run start_all.bat")
+        $tmp = $Path + ".tmp"
+        [System.IO.File]::WriteAllLines($tmp, [string[]]$lines, (New-Object System.Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $Path -Force
+        return $true
+    } catch { return $false }
+}
+function Remove-StartAllFailureFile([string]$Path) {
+    # A RUN WITH NOTHING TO REPORT LEAVES NOTHING BEHIND, so the file it finds next time is
+    # always about the run before it rather than about a fault that was fixed days ago. Never
+    # throws: a marker that cannot be deleted is not a startup failure.
+    try {
+        if (Test-Path -LiteralPath $Path) { Remove-Item -LiteralPath $Path -Force }
+        return $true
+    } catch { return $false }
+}
+function Save-StartupFailure {
+    # THE ONE WRITE. Called by the line after every failure append (see the block above): the
+    # text is the entry just appended, the stage is the one running, and both the file and the
+    # run record read the same two values. Returns the write's outcome, so a caller ignores it
+    # with "$null = Save-StartupFailure" -- a failure is recorded whether or not the file could
+    # be written.
+    $all = @($script:startupFailures)
+    $text = $(if ($all.Count -gt 0) { [string]$all[-1] } else { "" })
+    $script:lastFailure = Hide-Secrets $text
+    $script:lastFailureStage = Get-StartupStage
+    return (Write-StartupFailureFile (Get-StartAllFailurePath $root) $script:lastFailureStage $script:lastFailure $all.Count)
+}
+
 
 # ---------------------------------------------------------------------------
 # ONE start_all AT A TIME (new-PC analysis D14).
@@ -631,6 +705,10 @@ function New-StartAllRunRecord([string]$Outcome) {
         lock             = $script:lockState
         lock_wait_s      = $script:lockWaitSec
         failures         = @($script:startupFailures).Count
+        # WHAT the run failed with and in WHICH stage (see Save-StartupFailure): the count above
+        # says how many, these say why. Empty on a run with nothing to report.
+        failure_stage    = [string]$script:lastFailureStage
+        failure          = [string]$script:lastFailure
         outcome          = $Outcome
         holder_pid       = [int]$script:busyHolderPid
         phases           = $(if ($script:phaseTimings) { $script:phaseTimings } else { [ordered]@{} })
@@ -1569,6 +1647,7 @@ function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
     # Returns the outcome word (ok / recorded / installed / deferred / failed / unknown / skipped)
     # and COUNTS every outcome that leaves the venv behind requirements.txt into
     # $script:startupFailures -- with what failed and "re-run start_all.bat", never setup.bat.
+    Set-StartupStage "deps_sync"      # what Save-StartupFailure names on its lines below
     #
     # No venv or no bootstrap.py: nothing to bring up to date; the first-time setup gate and the
     # supervisor's own "no usable Python" refusal cover "nothing is installed yet".
@@ -1634,6 +1713,7 @@ function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
     if ($live) {
         Write-Host "[deps] not updating now: $why"
         $script:startupFailures += "Python dependencies need updating ($need), but $why -- they will be updated automatically the next time start_all.bat runs while nothing is running"
+        $null = Save-StartupFailure
         return "deferred"
     }
 
@@ -1660,10 +1740,12 @@ function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
         "failed" {
             Write-Host "[deps] FAILED: $($res.Detail)" -ForegroundColor Yellow
             $script:startupFailures += "Python dependencies could not be brought up to date ($need): $($res.Detail)"
+            $null = Save-StartupFailure
         }
         default {
             Write-Host "[deps] no verdict from bootstrap.py --sync-deps: $($res.Detail)" -ForegroundColor Yellow
             $script:startupFailures += "Python dependencies could not be brought up to date ($need): bootstrap.py --sync-deps ended without a verdict (last output: $($res.Detail)); its record is .setup\bootstrap.log -- re-run start_all.bat"
+            $null = Save-StartupFailure
         }
     }
     return $res.Verdict
@@ -2175,10 +2257,12 @@ function Test-TunnelServing {
     # CLI is signed in and the tunnel exists, because the supervisor may have been started a
     # few seconds ago and hosting takes up to ~50 s.
     param([int]$HostWaitSec = 60, [int]$PollSec = 5)
+    Set-StartupStage "tunnel_confirm"    # what Save-StartupFailure names on its lines below
     $dt = Resolve-DevTunnelExe
     if (-not $dt) {
         Write-Host "[tunnel] devtunnel CLI not found -- Copilot Studio cannot reach this PC." -ForegroundColor Yellow
         $script:startupFailures += "devtunnel CLI not found: install it with quickstart.bat (STEP 4) or 'winget install Microsoft.devtunnel', then start again"
+        $null = Save-StartupFailure
         return
     }
     $login = Get-TunnelLoginState (Invoke-DevTunnelBounded $dt @('user', 'show') 10)
@@ -2186,6 +2270,7 @@ function Test-TunnelServing {
         Write-Host "[tunnel] devtunnel is SIGNED OUT: the tunnel is not hosted and Copilot Studio cannot reach this PC." -ForegroundColor Yellow
         Write-Host "         Run:  devtunnel user login   (opens a browser). The supervisor resumes hosting on its own within a minute." -ForegroundColor Yellow
         $script:startupFailures += "devtunnel is signed out, so the tunnel is not hosted: run 'devtunnel user login', then start again"
+        $null = Save-StartupFailure
         return
     }
     if ($login -eq "unknown") {
@@ -2197,6 +2282,7 @@ function Test-TunnelServing {
     if (-not $tn) {
         Write-Host "[tunnel] MCP_TUNNEL_NAME is empty in .env: no tunnel is configured." -ForegroundColor Yellow
         $script:startupFailures += "no Dev Tunnel configured (MCP_TUNNEL_NAME is empty): run quickstart.bat (STEP 4) or powershell -File scripts\setup_devtunnel.ps1"
+        $null = Save-StartupFailure
         return
     }
     $deadline = (Get-Date).AddSeconds($HostWaitSec)
@@ -2206,6 +2292,7 @@ function Test-TunnelServing {
         if ($n -eq -1) {
             Write-Host "[tunnel] Dev Tunnel '$tn' does not exist on this account (expired or deleted)." -ForegroundColor Yellow
             $script:startupFailures += ("Dev Tunnel '" + $tn + "' does not exist on this account (expired or deleted): recreate it with powershell -File scripts\setup_devtunnel.ps1 and re-paste the URL it prints into Copilot Studio")
+            $null = Save-StartupFailure
             return
         }
         if ((Get-Date) -ge $deadline) { break }
@@ -2218,6 +2305,34 @@ function Test-TunnelServing {
     }
     Write-Host "[tunnel] Dev Tunnel '$tn' has no host connection after $HostWaitSec s -- Copilot Studio cannot reach this PC." -ForegroundColor Yellow
     $script:startupFailures += ("Dev Tunnel '" + $tn + "' is not hosted after " + $HostWaitSec + " s: the supervisor hosts it -- see " + (Join-Path $env:TEMP 'm365-companion-supervisor.log') + ", or run doctor.bat")
+    $null = Save-StartupFailure
+}
+
+# THE SERVER ITSELF, ASKED LAST (2026-10-16). Every stage above can fail and be counted and the
+# stack can STILL be unreachable: the supervisor process exists, the tunnel is hosted, and
+# http://127.0.0.1:8000/health answers nothing at all -- so a run that printed "Done." and exited
+# 0 was indistinguishable from one whose server never bound, and Copilot Studio was the thing
+# that found out. These two functions are the one probe for it; the tail calls them after the
+# tunnel wait above, which is what gives a just-started server the time to import.
+function Get-McpHealthUrl { if ($env:MCP_HEALTH_URL) { return $env:MCP_HEALTH_URL }; return "http://127.0.0.1:8000/health" }
+function Test-McpServerHealth([string]$Url = (Get-McpHealthUrl)) {
+    # PURE probe: 200 from /health is the one answer that means the server is up AND serving
+    # (a port that accepts a connection but answers 500 is not this stack being ready).
+    try {
+        $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 4 -Uri $Url
+        return ([int]$r.StatusCode -eq 200)
+    } catch { return $false }
+}
+function Wait-McpServerHealth([string]$Url = (Get-McpHealthUrl), [int]$TimeoutSec = 30, [int]$PollSec = 2) {
+    # RETRIES for up to $TimeoutSec: the supervisor may have started the server seconds ago and it
+    # imports before it binds -- the same reason quickstart waits for this endpoint before
+    # measuring it. One attempt when $TimeoutSec is 0, which is what a test wants.
+    $deadline = (Get-Date).AddSeconds([math]::Max(0, $TimeoutSec))
+    while ($true) {
+        if (Test-McpServerHealth $Url) { return $true }
+        if ((Get-Date) -ge $deadline) { return $false }
+        Start-Sleep -Seconds ([math]::Max(1, $PollSec))
+    }
 }
 
 # ---------------------------------------------------------------------------
@@ -2263,6 +2378,7 @@ function Invoke-UiStep {
     # is not running. -NoLaunch, so there is one launch path: the loop below. rebuild_ui.ps1
     # stops both apps before compiling -- the same thing the update path's rebuild does -- so a
     # window running a stale build is closed and reopened on the new one.
+    Set-StartupStage "browser_bridge_ui"   # what Save-StartupFailure names on its lines below
     Set-SplashStatus $script:splash "Opening the chat and cockpit windows..."
     $ui = Get-UiBuildState
     $counted = @{}
@@ -2288,6 +2404,7 @@ function Invoke-UiStep {
                     # COUNTED. A UI that did not build is a startup problem, and the exit
                     # code exists to carry exactly that.
                     $script:startupFailures += "${app}: rebuild failed"
+                    $null = Save-StartupFailure
                     $counted[$app] = $true
                 }
             } else {
@@ -2317,6 +2434,7 @@ function Invoke-UiStep {
             Write-Host "[4/4] ${app}: no usable ui\$app.exe -- the chat/cockpit window cannot open" -ForegroundColor Yellow
             if (-not $counted[$app]) {
                 $script:startupFailures += ("${app}: ui\" + $app + ".exe is missing or empty and was not rebuilt -- run powershell -File ui\rebuild_ui.ps1")
+                $null = Save-StartupFailure
             }
         }
     }
@@ -2392,6 +2510,7 @@ function Send-StartupFailureNotice([string]$SummaryPath) {
 function Invoke-Startup {
     # FIRST, BEFORE ANYTHING IS WRITTEN OR STARTED: one copy of this script at a time (see
     # Enter-StartAllLock). The splash keeps painting while a second copy waits.
+    Set-StartupStage "lock"    # named here, and re-named by every stage below
     $lockT0 = Get-Date
     $heldAtEntry = [bool]$script:startAllLock
     if ($heldAtEntry) {
@@ -2412,8 +2531,10 @@ function Invoke-Startup {
     if (-not $gotLock) {
         $script:lockTimedOut = $true
         $script:startupFailures += "another start_all.ps1 held the startup lock for 10 minutes; this one did not start anything alongside it -- close it (Task Manager) and start again"
+        $null = Save-StartupFailure
         return
     }
+    Set-StartupStage "setup"    # the .env / unlock-password / key repairs below
     Ensure-EnvDefaults
 
     Start-BackgroundSecurityUiCloser
@@ -2465,6 +2586,7 @@ function Invoke-Startup {
                 if (Test-Path (Join-Path $root ".setup\bearer_remade")) {
                     Write-Host "[setup] The connection key for Copilot Studio was re-made on this PC (the old one came from another PC or account)."
                     $script:startupFailures += "the connection key for Copilot Studio was re-made on this PC and Copilot Studio does not have it yet; run quickstart.bat to show the new values and paste them"
+                    $null = Save-StartupFailure
                 }
             }
             # A SCRIPT FILE, NOT A `-c` PAYLOAD -- the form that made the unlock CHECK
@@ -2503,6 +2625,7 @@ function Invoke-Startup {
                 # COUNTED, not only printed. The exit code is the number of startup problems and
                 # nothing was feeding it: this one means every mutating tool is refused.
                 $script:startupFailures += ("unlock password repair failed: " + $repair.Substring("failed:".Length))
+                $null = Save-StartupFailure
             }
         }
     } catch {
@@ -2536,6 +2659,7 @@ function Invoke-Startup {
     } catch {
         Write-Host "[deps] dependency update skipped ($($_.Exception.Message))"
         $script:startupFailures += "Python dependencies could not be checked: $($_.Exception.Message) -- re-run start_all.bat"
+        $null = Save-StartupFailure
     }
     Record-PhaseTiming "deps_sync" $t0_depsSync
 
@@ -2559,6 +2683,7 @@ function Invoke-Startup {
     #    forever. Detect that with Test-SupervisorTunnelDrift and restart on the correct
     #    tunnel; otherwise behave exactly as before.
     Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
+    Set-StartupStage "supervisor_start"   # what Save-StartupFailure names inside Start-FreshSupervisor
     $t0_supervisor = Get-Date
     function Start-FreshSupervisor([string]$tn) {
         # QUOTED. -ArgumentList elements are joined with spaces and not quoted, so an
@@ -2596,6 +2721,7 @@ function Invoke-Startup {
                     } catch { }
                     Write-Host ("[1/4] " + $why) -ForegroundColor Yellow
                     $script:startupFailures += $why
+                    $null = Save-StartupFailure
                     $script:supervisorDied = $true
                 } else {
                     # It survived its first statements, so it will reach its own startup-time
@@ -2739,6 +2865,7 @@ function Invoke-Startup {
     } finally { Record-PhaseTiming "fleet_resume_and_reaper" $t0_fleetResume }
 
     $t0_browserBridgeUi = Get-Date
+    Set-StartupStage "browser_bridge_ui"   # the Edge, the bridge and the UI windows below
     # 2) Companion Edge :9222 (the fleet / agent Edge). Idempotent; skip if the port answers.
     Set-SplashStatus $script:splash "Starting the agent browser..."
     if (Port-Up 9222) {
@@ -2810,6 +2937,7 @@ function Invoke-Startup {
             Write-Host "        Starting another bridge cannot bind that port. Stop pid $portOwner8765, then run this again." -ForegroundColor Yellow
             Write-Host "        (A bridge started outside .venv answers / but not /conv, which is what this looks like.)" -ForegroundColor Yellow
             $script:startupFailures += "bridge: :8765 held by pid $portOwner8765 and not serving /conv"
+            $null = Save-StartupFailure
         } else {
         Write-Host "[3/4] bridge: starting (headless keepalive)"
         # ITS ERROR MESSAGE IS THE MOST USEFUL ONE IN THE WHOLE STARTUP and it was going
@@ -2856,6 +2984,7 @@ function Invoke-Startup {
             Write-Host ("[3/4] " + $why) -ForegroundColor Yellow
             Write-Host "        (A fresh PC often has MCP_IMPL_AGENT_URL unset, which the bridge exits on -- see $bridgeLog.err.)" -ForegroundColor Yellow
             $script:startupFailures += $why
+            $null = Save-StartupFailure
         }
         }
     }
@@ -2884,6 +3013,7 @@ function Invoke-Startup {
     # 5) One-time convenience provisioning (Desktop icon + logon autostart). Runs last, after every
     #    service/UI above is already launched, so any failure here can never block real startup.
     $t0_provisioning = Get-Date
+    Set-StartupStage "provisioning"   # the Desktop icon / logon autostart step
     Ensure-ConvenienceProvisioning
     Record-PhaseTiming "provisioning" $t0_provisioning
 
@@ -2912,6 +3042,8 @@ function Invoke-Startup {
 $script:splash = $null
 $script:startupFailures = @()
 $script:startupUnclear = @()
+$script:lastFailure = ""                # the run's last failure text / stage (see Save-StartupFailure)
+$script:lastFailureStage = ""
 $script:phaseTimings = [ordered]@{}
 $script:lockTimedOut = $false           # Enter-StartAllLock gave up: nothing was started
 $script:supervisorStartedHere = $false  # this run started a supervisor that survived
@@ -2934,7 +3066,7 @@ try {
             # THE EXCEPTION USED TO VANISH HERE. `catch { }` on the entire startup meant a
             # failure anywhere in it left no trace at all: no message, no code, nothing to
             # read. The splash closed and everything looked finished.
-            try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)" }
+            try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)"; $null = Save-StartupFailure }
             try { $script:splash.Form.Close() } catch { }
         })
         $timer.Start()
@@ -2947,7 +3079,7 @@ try {
 } catch { $ranViaSplash = $false }
 if (-not $ranViaSplash) {
     $script:splash = $null
-    try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)" }
+    try { Invoke-Startup } catch { $script:startupFailures += "startup: $($_.Exception.Message)"; $null = Save-StartupFailure }
 }
 
 # THE TUNNEL, CHECKED AND COUNTED (Test-TunnelServing; new-PC analysis D24). After the splash
@@ -3034,10 +3166,12 @@ function Report-OtherProfileSignIns {
         Write-Host ("[m365] " + $fixJa + " (" + $m.Groups[2].Value + " :" + $m.Groups[1].Value + ", " + $m.Groups[5].Value + ")") -ForegroundColor Yellow
         # English and exact: doctor.ps1 maps this line (for the bridge port) to the same sentence.
         $script:startupFailures += ("M365 sign-in needed on " + $m.Groups[2].Value + " (:" + $m.Groups[1].Value + ")")
+        $null = Save-StartupFailure
     }
 }
 
 $t0_m365Signin = Get-Date
+Set-StartupStage "m365_signin"    # the stage every sign-in failure in this block is filed under
 try {
     $signinPs = Join-Path $scriptDir "ensure_m365_signin.ps1"
     if ((Test-Path $signinPs) -and (-not $CoreOnly) -and (-not $script:lockTimedOut)) {
@@ -3057,6 +3191,7 @@ try {
             if ($LASTEXITCODE -eq 1) {
                 Write-Host "[m365] a sign-in is needed, and a background start cannot show it." -ForegroundColor Yellow
                 $script:startupFailures += "M365 sign-in needed (background start could not prompt)"
+                $null = Save-StartupFailure
             }
             Report-OtherProfileSignIns $signinReport
         } else {
@@ -3093,6 +3228,29 @@ try {
     Record-PhaseTiming "m365_signin" $t0_m365Signin
 }
 
+# THE ONE THING EVERY EARLIER STAGE ASSUMED, ASKED ONE LAST TIME (2026-10-16). A run could print
+# "Done." for a stack whose server had never bound: the supervisor PROCESS existed, the tunnel
+# was hosted, and http://127.0.0.1:8000/health answered nothing -- so the launcher exited 0 and
+# Copilot Studio was the thing that found out. The probe runs LAST, after the tunnel wait above
+# has given a just-started server time to import, and it retries for 30 s for the same reason
+# (see Wait-McpServerHealth). Skipped exactly where the tunnel check above is skipped: nothing
+# was started on a lock timeout, and a supervisor that died at once is already a counted failure
+# -- asking here as well would report one cause twice.
+if (-not $script:lockTimedOut) {
+    $t0_health = Get-Date
+    Set-StartupStage "health"
+    if ($script:supervisorDied) {
+        Write-Host "[health] not checked: the supervisor, which runs the server, did not start (see above)" -ForegroundColor DarkGray
+    } elseif (Wait-McpServerHealth) {
+        Write-Host "[health] the MCP server answered http://127.0.0.1:8000/health"
+    } else {
+        Write-Host "[health] the MCP server did NOT answer http://127.0.0.1:8000/health within 30 s" -ForegroundColor Yellow
+        $script:startupFailures += "the MCP server did not answer http://127.0.0.1:8000/health within 30 s -- re-run start_all.bat"
+        $null = Save-StartupFailure
+    }
+    Record-PhaseTiming "health" $t0_health
+}
+
 # WHAT WENT WRONG, SAID OUT LOUD AT THE END. This script returns 0 whatever happens, so a
 # caller checking its exit code learns nothing -- the missing thing was never the code, it was
 # any statement of the failure. Printed last so it is the final thing on screen rather than
@@ -3113,6 +3271,14 @@ if (@($script:startupUnclear).Count -gt 0) {
     Write-Host " $(@($script:startupUnclear).Count) thing(s) could not be confirmed either way:" -ForegroundColor DarkYellow
     foreach ($u in $script:startupUnclear) { Write-Host ("  ? " + (Hide-Secrets $u)) -ForegroundColor DarkYellow }
     Write-Host ""
+}
+# A RUN THAT HAD NOTHING TO REPORT DELETES WHAT THE LAST ONE LEFT, so .setup\last_failure.txt is
+# always about the run that just happened and never about a fault that was fixed days ago (see
+# Save-StartupFailure). "Fully successful" is read as "no failure was recorded": a lock timeout
+# cannot reach here without one, and an "unclear" entry is something that could not be
+# CONFIRMED, not a known-bad state this file is here to describe.
+if (@($script:startupFailures).Count -eq 0) {
+    $null = Remove-StartAllFailureFile (Get-StartAllFailurePath $root)
 }
 
 # AND WHERE SOMEBODY WILL SEE IT when this ran hidden -- see Write-StartupSummary's header.
