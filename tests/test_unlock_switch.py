@@ -2,7 +2,7 @@
 """MCP_UNLOCK_REQUIRED: the owner's reversible switch for the whole unlock gate.
 
 Owner order 2026-10-15: unlock must never be the reason a fleet goal fails. Overnight, fleet
-workers on ADAMS ODBC goals ended STUCK because the model refused to type a password that a
+workers on database-tool goals ended STUCK because the model refused to type a password that a
 message handed it. The switch turns the gate off without touching code or restarting the
 relay; default 1 is the gate exactly as it was.
 

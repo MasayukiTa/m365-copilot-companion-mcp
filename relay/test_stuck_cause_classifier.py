@@ -23,10 +23,10 @@ LOCK_TEXT = ("refused (locked) [locked: no valid unlock token for '20.210.146.12
              "'<password>') and pass the returned `unlock_token` with the call. If you do not have "
              "the password, do not stop: hand the whole instruction to fleet_submit(goal=..., "
              "source=...), which needs no unlock.")
-ENV = {"MCP_DB_ADAMS": r"DRIVER={SQL Server};SERVER=10.8.67.28\ADAMS,50379;DATABASE=mcl;UID=u;PWD=x;"}
+ENV = {"MCP_DB_MAIN": r"DRIVER={SQL Server};SERVER=192.0.2.10\INST,14330;DATABASE=maindb;UID=u;PWD=x;"}
 
 
-def _pair(i, tool, ts, ok, text="", worker="", conn="adams", result=None):
+def _pair(i, tool, ts, ok, text="", worker="", conn="main", result=None):
     call = {"schema": 1, "event": "call", "id": "c%d" % i, "ts": ts, "tool": tool, "task": "",
             "worker": worker, "turn": None, "attr": "ambiguous" if not worker else "window",
             "args": {"connection": {"text": conn, "len": len(conn), "truncated": False}}}
@@ -47,10 +47,10 @@ def _rows(*specs):
 TABLE = [
     ("odbc 08001/10060 on unattributed rows",
      [("odbc_tables", False, NET_TEXT), ("odbc_query", False, NET_TEXT)],
-     "network", "10060", "10.8.67.28", "50379", "", False),
+     "network", "10060", "192.0.2.10", "14330", "", False),
     ("odbc 10060 attributed to the worker",
      [("odbc_query", False, NET_TEXT, {"worker": "w9"})],
-     "network", "10060", "10.8.67.28", "50379", "", True),
+     "network", "10060", "192.0.2.10", "14330", "", True),
     ("lock refusal names the session IP",
      [("run_python", False, LOCK_TEXT)],
      "locked", "locked", "", "", "20.210.146.129", False),
@@ -84,7 +84,7 @@ def test_network_headline_names_host_code_and_since():
     c = S.classify_rows(_rows(("odbc_query", False, NET_TEXT), ("odbc_query", False, NET_TEXT)),
                         worker="w9", since=0.0, until=T0 + 1000, env=ENV)
     h = c.headline()
-    assert h.startswith("ネットワーク: DBサーバ 10.8.67.28:50379 へ到達できません(10060)")
+    assert h.startswith("ネットワーク: DBサーバ 192.0.2.10:14330 へ到達できません(10060)")
     assert "2回" in h and "同時間帯" in h          # count, and the honest attribution note
 
 
@@ -111,7 +111,7 @@ CANNED_REFUSED = ("⚠ 定型の無回答が継続。ただし本走行の別ワ
                   "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
 
 
-def _worker(outcome, reason, goal="過去1か月の不良データをADAMSのDBから集計して", **kw):
+def _worker(outcome, reason, goal="過去1か月のデータをDBから集計して", **kw):
     w = types.SimpleNamespace(
         name="w2", status="stuck", outcome=outcome, reason=reason, goal=goal,
         _first_turn_sent_at=T0 - 1, _gateway_unlanded=0, retryable_override=False,
@@ -130,7 +130,7 @@ def _stamp(w, rows, monkeypatch):
 def test_canned_no_answer_is_not_called_a_refusal_when_the_host_is_down(monkeypatch):
     w = _stamp(_worker("REFUSED", CANNED_REFUSED), _rows(("odbc_query", False, NET_TEXT)),
                monkeypatch)
-    assert w.reason.startswith("ネットワーク: DBサーバ 10.8.67.28:50379")
+    assert w.reason.startswith("ネットワーク: DBサーバ 192.0.2.10:14330")
     assert "この指示に対する拒否" not in w.reason and "言い換えが要る" not in w.reason
     assert w.outcome == "INFRA_STUCK" and w.retryable_override is None
     assert w.stuck_cause == "network" and w.stuck_cause_info["code"] == "10060"
@@ -138,7 +138,7 @@ def test_canned_no_answer_is_not_called_a_refusal_when_the_host_is_down(monkeypa
 
 def test_stuck_on_the_models_own_words_gets_the_typed_cause_first(monkeypatch):
     own = ("worker reached the same conclusion on consecutive turns -> settling on its own stated "
-           "reason instead of nudging again: ADAMS DB照会ツールが恒常的にロック（セッションIP未認可）")
+           "reason instead of nudging again: DB照会ツールが恒常的にロック（セッションIP未認可）")
     w = _stamp(_worker("STUCK", own), _rows(("run_python", False, LOCK_TEXT)), monkeypatch)
     assert w.reason.startswith("ロック: ") and "20.210.146.129" in w.reason
     assert "settling on its own stated reason" not in w.reason
@@ -169,3 +169,15 @@ def test_stamping_twice_does_not_stack(monkeypatch):
     first = w.reason
     F.RelayWorker._stamp_stuck_cause(w, "running", rows=_rows(("odbc_query", False, NET_TEXT)))
     assert w.reason == first
+
+
+def test_an_unattributed_network_cause_is_put_on_a_worker_whose_procedure_declares_the_failing_tool():
+    """The goal's wording is not consulted: the domain lives in the procedure (its declared
+    `requires_tools`), never in the harness. A goal with no technology word at all gets the cause
+    when its matched procedure needs the tool that failed, and does not when it needs another."""
+    c = S.Cause(kind="network", code="10060", tool="odbc_query", attributed=False)
+    goal = "先週のまとめを出して"            # no technology word at all
+    assert not S.plausible(c, goal, "")
+    assert S.plausible(c, goal, "", required_tools=["odbc_query"])
+    assert not S.plausible(c, goal, "", required_tools=["chart_render"])
+    assert not S.plausible(c, goal, "", required_tools=[])

@@ -69,7 +69,7 @@ _HOST_RE = re.compile(r"\b(\d{1,3}(?:\.\d{1,3}){3})(?:[:,](\d{2,5}))?")
 #: is attached to a worker whose own words do not mention a network problem only if its goal is
 #: about data the DB holds -- otherwise an unrelated worker would be headlined with a fault that
 #: merely happened beside it.
-_DB_GOAL_RE = re.compile(r"DB|ＤＢ|ADAMS|mcl|odbc|SQL|データベース|不良|検査|ロット|集計|ワニス|銅箔", re.I)
+_DB_GOAL_RE = re.compile(r"DB|ＤＢ|odbc|SQL|データベース", re.I)   # the technology, never a business word
 #: The worker's own stuck reason already speaks of the matching fault.
 _NET_WORDS_RE = re.compile(r"ネットワーク|network|10060|08001|到達|タイムアウト|timeout|VPN|接続", re.I)
 _LOCK_WORDS_RE = re.compile(r"ロック|解錠|unlock|未認可|locked", re.I)
@@ -198,7 +198,7 @@ def _arg_text(call: dict, key: str) -> str:
 
 # --- connection target ---------------------------------------------------------------------
 def parse_server(conn: str):
-    """('10.8.67.28', '50379') from a connection string's SERVER=... part. ('', '') if absent."""
+    """('192.0.2.10', '14330') from a connection string's SERVER=... part. ('', '') if absent."""
     m = re.search(r"\b(?:server|host|data source)\s*=\s*([^;]+)", conn or "", re.I)
     if not m:
         return "", ""
@@ -356,9 +356,16 @@ def platform_cause(*, code: str, attempts: int, since: float = 0.0) -> Cause:
                  attributed=True, detail=d)
 
 
-def plausible(cause: Cause, goal: str, reason: str) -> bool:
-    """May an UNATTRIBUTED cause be put on this worker? Attributed ones always may."""
+def plausible(cause: Cause, goal: str, reason: str, required_tools=()) -> bool:
+    """May an UNATTRIBUTED cause be put on this worker? Attributed ones always may.
+
+    `required_tools` are the tools the worker's matched procedure declares (`requires_tools`).
+    A procedure that needs the failing tool is the worker's own evidence that it was going to
+    use it, so the goal's wording is not consulted -- the domain lives in the procedure, never here.
+    """
     if cause.attributed or cause.kind in ("gateway", "tools", "procedure", "platform"):
+        return True
+    if cause.tool and cause.tool in set(required_tools or ()):
         return True
     words = _NET_WORDS_RE if cause.kind == "network" else _LOCK_WORDS_RE
     if not _CANNED_REASON_RE.search(reason or "") and words.search(reason or ""):
