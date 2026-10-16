@@ -574,18 +574,7 @@ class SocketRoute:
             # refuses frames whose fields disagree is one bad assumption away from refusing
             # this, and the assumption costs nothing to remove.
             conv.turns = max(1, int(getattr(conv, "turns", 0) or 0))
-        from relay import tool_bridge
-        if tool_bridge.is_bridge() and not model:
-            # BRIDGE TRANSPORT (settings.txt tool_transport=bridge): the agent has no tools, so
-            # the conversation advertises the gateway and runs the calls it asks for here. A
-            # deep-research conversation (`model`) never gets tools. `protocol` stays empty:
-            # the goal text already carries the fleet's protocol.
-            drv = CopilotSocketDriver(
-                conv, connect=self._connect_fn,
-                catalogue=tool_bridge.catalogue(), protocol="",
-                run_tool=tool_bridge.make_run_tool(str(name or "")))
-        else:
-            drv = CopilotSocketDriver(conv, connect=self._connect_fn)
+        drv = CopilotSocketDriver(conv, connect=self._connect_fn)
         drv.worker_name = str(name or "")
         drv.stats_sink = self.record_turn_stats
         return drv
