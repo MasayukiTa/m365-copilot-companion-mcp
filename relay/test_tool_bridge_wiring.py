@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """The bridge transport reaches the driver, and the driver carries it through the loop.
 
-(a) socket_route.driver_for: connector builds the driver exactly as before (no catalogue, no
+(a) the route's driver_for (equipped by tool_bridge.equip; socket_route.py itself is frozen): connector builds the driver exactly as before (no catalogue, no
     run_tool); bridge hands over the gateway catalogue and a run_tool. Until now no test
     looked at what driver_for passed to the driver at all.
 (e) driver -> Conversation.ask: the run_tool the driver holds is the one the loop calls, and
@@ -45,7 +45,7 @@ def _token(seconds=3600):
 def _route():
     r = SocketRoute(enabled=True, connect_fn=object(), capture_fn=lambda *a: (_token(), _Tpl()))
     assert r.refresh(object(), "u")
-    return r
+    return TB.equip(r)
 
 
 def _transport(monkeypatch, value):
@@ -111,6 +111,56 @@ def test_an_unset_transport_in_a_real_settings_file_means_connector(tmp_path, mo
     assert _route().driver_for("w0")._run_tool is None
     p.write_text("maxtabs=3\ntool_transport=bridge\n", encoding="utf-8")
     assert _route().driver_for("w0")._run_tool is not None
+
+
+def test_the_fleet_s_own_route_is_equipped(monkeypatch):
+    """The wiring is not only a helper that exists: relay_fleet._socket_route() applies it, so
+    a driver the fleet builds in bridge mode really carries the tools."""
+    from relay import relay_fleet as rf
+    from relay import socket_route as SR
+    from relay import profile_token as PT
+    built = []
+
+    def fake_route(**kw):
+        r = SocketRoute(enabled=True, connect_fn=object(),
+                        capture_fn=lambda *a: (_token(), _Tpl()))
+        r.refresh(object(), "u")
+        built.append(r)
+        return r
+
+    monkeypatch.setattr(rf, "_SOCKET_ROUTE", None)
+    monkeypatch.setattr(SR, "SocketRoute", fake_route)
+    monkeypatch.setattr(PT, "capture_fn", lambda: (lambda *a: (_token(), _Tpl())))
+    _transport(monkeypatch, "bridge")
+    route = rf._socket_route()
+    assert route is built[0]
+    assert route.driver_for("w1")._run_tool is not None
+    _transport(monkeypatch, "connector")
+    assert route.driver_for("w1")._run_tool is None      # the setting is read per driver
+
+
+def test_a_route_that_cannot_be_wrapped_is_returned_as_it_is():
+    marker = object()
+    assert TB.equip(marker) is marker
+
+
+def test_the_original_driver_for_is_what_builds_the_driver(monkeypatch):
+    """equip only decorates: the connector result is the original's, the same object."""
+    _transport(monkeypatch, "connector")
+    sentinel = object()
+    route = type("R", (), {"driver_for": lambda self, name, *a, **k: sentinel})()
+    assert TB.equip(route).driver_for("w0", model="m") is sentinel
+    assert TB.equip(type("R", (), {"driver_for": lambda self, n, *a, **k: None})()
+                    ).driver_for("w0") is None
+
+
+def test_use_tools_sets_what_the_turn_loop_forwards():
+    conv, sent = _scripted_conversation(["x"])
+    drv = SD.CopilotSocketDriver(conv, connect=None)
+    assert drv._run_tool is None
+    fn = lambda n, a: (True, "")
+    drv.use_tools(TB.catalogue(), fn, protocol="")
+    assert drv._run_tool is fn and drv._catalogue and drv._protocol == ""
 
 
 # ---------------------------------------------------------------- (e) driver -> ask

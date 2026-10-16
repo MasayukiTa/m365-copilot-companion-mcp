@@ -454,5 +454,14 @@ class CopilotSocketDriver:
         """No tab, so no title strip to scrape. The caller falls back to the goal text."""
         return ""
 
+    def use_tools(self, catalogue, run_tool, protocol=""):
+        """Switch this driver to the bridge transport: advertise `catalogue` in each turn and
+        run the calls the model asks for with `run_tool`. Called by relay/tool_bridge.equip on
+        a freshly built driver, before its first turn; a driver never given tools keeps
+        asking once, exactly as before."""
+        self._catalogue = catalogue
+        self._protocol = protocol or ""
+        self._run_tool = run_tool
+
     def close(self):
         self.conv.close()
