@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import getpass
 import hashlib
 import inspect
@@ -1328,6 +1329,40 @@ def _drop_unusable_secrets(env_path: Path, text: str) -> "tuple[str, list[str]]"
     return new_text, bad
 
 
+def _step_errors_are_actionable(label: str):
+    """Decorator: turn an UNEXPECTED exception from a step into a resumable StepError (B1).
+
+    WHY. run_all handles ActionNeeded and StepError; anything else leaves the driver as a
+    traceback, so the operator gets a stack trace and no instruction -- while the one thing this
+    product's users are told to do is run quickstart.bat again. gen_env is where that happens in
+    practice, and not hypothetically: every write there goes through tools.secret_store's DPAPI
+    protect_secret and scripts/env_file's temp-file-plus-rename, and a .env open in an editor,
+    held by antivirus or locked by a second quickstart makes one of them raise OSError.
+
+    ActionNeeded and StepError already carry a readable instruction, so they pass through
+    unchanged (a StepError raised by the step keeps its own wording). The exception TYPE stays in
+    the text: it is the part that says WHICH file or handle is at fault, and neither
+    protect_secret nor env_file puts a secret in an error message.
+    """
+    def deco(fn):
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            try:
+                return fn(*args, **kwargs)
+            except (ActionNeeded, StepError):
+                raise
+            except Exception as exc:  # noqa: BLE001 -- converted into a StepError, not swallowed
+                raise StepError(
+                    "%s failed with an unexpected error (%s: %s). This usually means a file this "
+                    "step needs (.env, or the folder holding it) is locked or read-only -- close "
+                    "any program that has it open, such as an editor or a second quickstart "
+                    "window -- and re-run quickstart.bat (or setup.bat), which retries this step."
+                    % (label, type(exc).__name__, exc)) from exc
+        return wrapper
+    return deco
+
+
+@_step_errors_are_actionable("Preparing .env")
 def step_gen_env() -> None:
     step_header("Preparing .env")
     env_path = ROOT / ".env"
@@ -2148,7 +2183,101 @@ sign-in. The bootstrap does NOT automate the Studio UI.
 # --------------------------------------------------------------------------- #
 # STEP: verify
 # --------------------------------------------------------------------------- #
-def step_verify() -> None:
+#: How many times the retire helper tries to rename .venv before falling back to a delete. A
+#: rename is refused on Windows while any file inside the tree is open without FILE_SHARE_DELETE,
+#: and that is often transient (a reader that opened the file a millisecond ago), so it is worth
+#: retrying before the heavier fallback.
+_VENV_RETIRE_ATTEMPTS = 3
+
+
+def _venv_dir_for_rebuild() -> Path | None:
+    """The project's OWN .venv directory, or None when there is no such directory to move.
+
+    ONLY A DIRECTORY CALLED '.venv' IS EVER RETURNED. This decides what is moved or deleted, and
+    the one thing that must never happen is moving something that is not this project's
+    environment. Two candidates, because the two constants that name the venv can be pointed at
+    the same place two ways: ROOT/.venv (what ensure_venv creates and removes) and the directory
+    holding VENV_PYTHON (what every probe in this module executes). The name check keeps a
+    relocated or patched interpreter constant from pointing this at a plain folder.
+    """
+    for cand in (ROOT / ".venv", Path(VENV_PYTHON).parent.parent):
+        try:
+            if cand.name == ".venv" and cand.is_dir():
+                return cand
+        except OSError:
+            continue
+    return None
+
+
+def _retire_venv_for_rebuild() -> tuple:
+    """Take the project's .venv out of the way so the NEXT run rebuilds it (B2).
+
+    Returns (aside_name, removed, problem): `aside_name` is the name it was moved aside to,
+    `removed` says it was deleted instead, and `problem` is a short reason when it could be
+    neither.
+
+    WHY THE VENV ITSELF HAS TO GO. A failed import of main.py while pip reported success is the
+    one state a re-run cannot repair by itself: the venv's python still runs and pip is still
+    there, so ensure_venv's probe calls the venv healthy and SKIPS it, and install_deps finds
+    requirements.txt already satisfied and does nothing. Clearing the checkpoints on their own
+    therefore walks straight back to the same failure; the environment has to be rebuilt, and
+    the only thing that starts a rebuild is .venv not being there or not running.
+
+    RENAMED, NOT DELETED, so what was wrong with it is still on disk to look at. A tree that
+    cannot be renamed (a handle open inside it) is deleted instead, which is the other way to
+    make the next run rebuild. Nothing outside this project's own .venv is touched, and the
+    moved-aside copy is deliberately NOT cleaned up here: it is evidence, it is the operator's
+    to remove, and deleting a directory that this run did not create is not this step's call.
+    """
+    venv = _venv_dir_for_rebuild()
+    if venv is None:
+        return None, False, ""
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    aside = venv.with_name("%s.broken-%s" % (venv.name, stamp))
+    n = 1
+    while aside.exists():                     # same-second second failure: keep both
+        n += 1
+        aside = venv.with_name("%s.broken-%s-%d" % (venv.name, stamp, n))
+    last = None
+    for attempt in range(_VENV_RETIRE_ATTEMPTS):
+        try:
+            venv.rename(aside)
+            return aside.name, False, ""
+        except OSError as e:
+            last = e
+            time.sleep(0.2 * (attempt + 1))
+    # Windows marks some files read-only and rmtree cannot unlink those, so a plain call fails
+    # with WinError 5; clear the bit and retry -- the same cure step_ensure_venv already uses.
+    def _force(func, path, _exc):
+        try:
+            os.chmod(path, stat.S_IWRITE)
+            func(path)
+        except OSError:
+            pass
+
+    if venv.exists():
+        try:
+            shutil.rmtree(str(venv), onerror=_force)
+        except OSError:
+            pass
+    if not venv.exists():
+        return None, True, ""
+    return None, False, ("%s: %s" % (type(last).__name__, last))
+
+
+def _clear_venv_checkpoints(state, state_file) -> list:
+    """Pop the ensure_venv/install_deps done flags so the next run builds the venv again.
+    Returns the names cleared; a no-op when there is no live state (a direct step_verify call)."""
+    if state is None:
+        return []
+    cleared = [n for n in ("ensure_venv", "install_deps")
+               if state.get("done", {}).pop(n, None)]
+    if cleared:
+        save_state(state, STATE_FILE if state_file is None else state_file)
+    return cleared
+
+
+def step_verify(state: dict | None = None, state_file: Path = None) -> None:
     step_header("Verifying environment")
 
     # 1. Required .env keys must be present and non-placeholder.
@@ -2182,10 +2311,35 @@ def step_verify() -> None:
             "packages are KEPT. Wait a minute and re-run quickstart.bat (or setup.bat); a second "
             "import is much faster." % VERIFY_IMPORT_TIMEOUT_S)
     if count is None:
+        # THE VENV IS MARKED FOR REBUILD, NOT MERELY RETRIED (B2). "Re-run quickstart.bat" alone
+        # was a dead end here: the install steps find a venv that runs and dependencies that are
+        # installed, skip, and verify fails on the same import again -- for ever. So the
+        # environment is taken out of the way (and the checkpoints that claim it is built are
+        # cleared) and the message says exactly that the next run rebuilds it.
+        aside, removed, problem = _retire_venv_for_rebuild()
+        cleared = _clear_venv_checkpoints(state, state_file)
+        if aside:
+            log("    .venv moved aside as %s so the next run rebuilds it" % aside)
+            what = "The unusable .venv was moved aside as %s." % aside
+        elif removed:
+            log("    .venv removed so the next run rebuilds it")
+            what = "The unusable .venv was removed."
+        elif problem:
+            log("    WARN: .venv could not be moved aside or removed (%s)" % problem)
+            what = ("The unusable .venv could not be moved aside or removed (%s), because a "
+                    "program is holding files inside it (a terminal started in .venv, or a "
+                    "server still running from it); close that program." % problem)
+        else:
+            what = ""
+        if cleared:
+            log("    cleared %s so the next run builds the environment again"
+                % ", ".join("'%s'" % n for n in cleared))
         raise StepError(
-            "Could not import main.py to count tools. Check that dependencies "
-            "installed correctly, then re-run quickstart.bat (or setup.bat)."
-        )
+            "The server code (main.py) does not import with the packages installed in .venv, so "
+            "this environment is not usable, and re-running alone cannot repair it: .venv's "
+            "python still runs, so the install steps skip it. %s Re-run quickstart.bat (or "
+            "setup.bat): the next run rebuilds .venv from scratch and reinstalls the dependencies "
+            "(the import error above names the module that failed)." % what)
     log("    OK: main.py imported; registered tool count = %d" % count)
 
 
