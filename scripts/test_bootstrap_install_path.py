@@ -656,6 +656,7 @@ def test_the_import_timeout_is_reported_as_a_timeout(monkeypatch, tmp_path):
         encoding="utf-8")
     monkeypatch.setattr(B, "ROOT", tmp_path)
     monkeypatch.setattr(B, "_load_dotenv_into_env", lambda _p: None)
+    monkeypatch.setattr(B, "_secret_is_usable", lambda _v: True)   # the DPAPI check is not under test
     with pytest.raises(B.VerifyTimedOut) as ei:
         B.step_verify()
     assert "KEPT" in str(ei.value) and str(B.VERIFY_IMPORT_TIMEOUT_S) in str(ei.value)

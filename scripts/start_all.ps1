@@ -2451,6 +2451,22 @@ function Invoke-Startup {
         $venvPy = Join-Path $root ".venv\Scripts\python.exe"
         if (Test-Path $venvPy) {
             $envFile = Join-Path $root ".env"
+            # THE SAME CARRIED-OVER .ENV BREAKS THE API KEY TOO, AND ONLY quickstart USED TO MEND IT.
+            # bootstrap.py's gen_env step re-makes any protected secret this account cannot use
+            # (foreign, blank or placeholder; the old file is kept as .env.before-secret-repair) and
+            # touches nothing that works. Not interactive, so it also runs under -NoUi.
+            if (Test-Path $script:bootstrapPy) {
+                try { $null = @(& $venvPy $script:bootstrapPy --only gen_env 2>&1) } catch { }
+                # A RE-MADE KEY IS NOT SILENT, AND NOT ONLY ONCE. Copilot Studio still holds the old
+                # one and answers 401 until the new value is pasted there. bootstrap.py leaves
+                # .setup\bearer_remade (no secret in it) when it made a new key; quickstart.bat shows
+                # the values and deletes it once they are pasted. Until then every start says so, so a
+                # clean second start cannot hide it. The file is read, never a secret.
+                if (Test-Path (Join-Path $root ".setup\bearer_remade")) {
+                    Write-Host "[setup] The connection key for Copilot Studio was re-made on this PC (the old one came from another PC or account)."
+                    $script:startupFailures += "the connection key for Copilot Studio was re-made on this PC and Copilot Studio does not have it yet; run quickstart.bat to show the new values and paste them"
+                }
+            }
             # A SCRIPT FILE, NOT A `-c` PAYLOAD -- the form that made the unlock CHECK
             # unable to fail. It prints one line: noop:<why> / repaired:<password> / failed:<why>.
             $repairScript = Join-Path $scriptDir "repair_unlock.py"

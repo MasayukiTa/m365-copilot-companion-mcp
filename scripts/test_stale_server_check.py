@@ -194,3 +194,19 @@ def test_cli_pyside_reads_stdin_when_no_paths_follow_flag():
     )
     assert proc.returncode == 0
     assert proc.stdout.strip() == "yes"
+
+
+def test_a_folder_without_git_passes_the_staleness_check_instead_of_staying_indeterminate():
+    """A ZIP unpacked on a new PC has no .git, HEAD never resolves, and the check used to answer
+    "could not be determined" on every run -- so quickstart.bat ended in SETUP NOT CONFIRMED for
+    good, for exactly the people installing from the release ZIP. Such a folder is updated by
+    unpacking a new ZIP, so the question does not apply. The guard must come BEFORE the git call,
+    and a .git that exists while git fails must stay indeterminate."""
+    text = (Path(__file__).resolve().parent / "doctor.ps1").read_text(encoding="utf-8-sig")
+    block = text[text.index('Check-TriState "server_not_stale"'):]
+    block = block[:block.index("auth_bearer")]
+    guard = block.index('if (-not (Test-Path (Join-Path $repo ".git"))) { return $true }')
+    git_call = block.index("rev-parse HEAD")
+    assert guard < git_call, "the no-.git pass must precede the git call"
+    assert "if ($LASTEXITCODE -ne 0 -or -not $head) { return $null }" in block, \
+        "a real git failure inside a checkout must stay indeterminate"
