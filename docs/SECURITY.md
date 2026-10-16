@@ -45,7 +45,7 @@
   `.fleet/unlock_token_gap.json` は enforcement を明示的に OFF にした配備向けの互換・診断記録です。
 - **`MCP_UNLOCK_REQUIRED`（オーナー専用スイッチ・既定 `1`）**: `0` にすると `require_unlocked()` が全セッションで
   パスワード・IP 認可・token・session なしで通り、ワーカー向けの指示文・拒否文・再解錠ターンから「unlock せよ」が消えます
-  （`unlock()` を呼んでも「不要」と返すだけ）。背景: 2026-10-15 夜間のフリート実行で、ADAMS DB 系ツール用ワーカー
+  （`unlock()` を呼んでも「不要」と返すだけ）。背景: 2026-10-15 夜間のフリート実行で、データベース系ツール用ワーカー
   (w1/w4/w19) が、会話に平文で渡されたパスワードをモデルが注入と判断して `unlock()` を呼ばず STUCK になった。
   `0` / `false` / `off` / `no` / `disabled` 以外の値、未設定、読めない場合は `1`（従来どおり）として扱う。
   切替は必ず原子的な書き込み口で行う（`python scripts/env_file.py set MCP_UNLOCK_REQUIRED 0` / `... 1`）。
