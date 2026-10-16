@@ -2314,7 +2314,8 @@ function Test-TunnelServing {
 # 0 was indistinguishable from one whose server never bound, and Copilot Studio was the thing
 # that found out. These two functions are the one probe for it; the tail calls them after the
 # tunnel wait above, which is what gives a just-started server the time to import.
-function Test-McpServerHealth([string]$Url = "http://127.0.0.1:8000/health") {
+function Get-McpHealthUrl { if ($env:MCP_HEALTH_URL) { return $env:MCP_HEALTH_URL }; return "http://127.0.0.1:8000/health" }
+function Test-McpServerHealth([string]$Url = (Get-McpHealthUrl)) {
     # PURE probe: 200 from /health is the one answer that means the server is up AND serving
     # (a port that accepts a connection but answers 500 is not this stack being ready).
     try {
@@ -2322,7 +2323,7 @@ function Test-McpServerHealth([string]$Url = "http://127.0.0.1:8000/health") {
         return ([int]$r.StatusCode -eq 200)
     } catch { return $false }
 }
-function Wait-McpServerHealth([string]$Url = "http://127.0.0.1:8000/health", [int]$TimeoutSec = 30, [int]$PollSec = 2) {
+function Wait-McpServerHealth([string]$Url = (Get-McpHealthUrl), [int]$TimeoutSec = 30, [int]$PollSec = 2) {
     # RETRIES for up to $TimeoutSec: the supervisor may have started the server seconds ago and it
     # imports before it binds -- the same reason quickstart waits for this endpoint before
     # measuring it. One attempt when $TimeoutSec is 0, which is what a test wants.

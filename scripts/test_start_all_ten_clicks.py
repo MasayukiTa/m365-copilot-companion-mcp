@@ -138,8 +138,39 @@ def build_tree(base: Path, start_all_text: str) -> Path:
     return tree
 
 
+_HEALTH_STUB = {}
+
+
+def health_stub_url() -> str:
+    """A loopback /health that answers 200, started once per test process.
+
+    These tests run the real start_all.ps1 to its end with a FAKE supervisor, so no MCP server ever
+    binds :8000; the launcher's last check (is /health answering?) would wait out its 30 s and call
+    the run a failure. MCP_HEALTH_URL points that check at this stub instead, so the tests keep
+    measuring the lock and role logic and not the absence of a server."""
+    if "url" not in _HEALTH_STUB:
+        import threading
+        from http.server import BaseHTTPRequestHandler, HTTPServer
+
+        class _Ok(BaseHTTPRequestHandler):
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "2")
+                self.end_headers()
+                self.wfile.write(b"ok")
+
+            def log_message(self, *args):
+                pass
+
+        srv = HTTPServer(("127.0.0.1", 0), _Ok)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        _HEALTH_STUB["srv"] = srv
+        _HEALTH_STUB["url"] = "http://127.0.0.1:%d/health" % srv.server_address[1]
+    return _HEALTH_STUB["url"]
+
+
 def tree_env(tree: Path, **extra) -> dict:
-    env = clean_env(tree, minimal_path(), TEST_BRINGUP_SEC=BRINGUP_SEC, **extra)
+    env = clean_env(tree, minimal_path(), TEST_BRINGUP_SEC=BRINGUP_SEC, MCP_HEALTH_URL=health_stub_url(), **extra)
     for k in ("MCP_STARTALL_REEXEC", "MCP_STARTALL_HANDOFF_PID", "M365_LAUNCHED_BY_START_ALL"):
         env.pop(k, None)
     # Windows PowerShell 5.1's own module path, whatever shell runs pytest (d0190f9).

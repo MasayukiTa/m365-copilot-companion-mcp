@@ -420,7 +420,7 @@ def test_the_health_check_is_the_last_thing_checked_and_can_flip_the_exit_code()
     assert "Wait-McpServerHealth" in block
     assert "$script:supervisorDied" in block
     # The endpoint, and the retry the task asks for.
-    assert 'function Wait-McpServerHealth([string]$Url = "http://127.0.0.1:8000/health", [int]$TimeoutSec = 30' in src
+    assert 'function Wait-McpServerHealth([string]$Url = (Get-McpHealthUrl), [int]$TimeoutSec = 30' in src
     # Reported, not printed: the failure joins the list the exit code counts, and the message
     # tells the operator the one thing they can do (the product rule: quickstart.bat /
     # start_all.bat are the only entry points a person runs; never "edit this file").
@@ -441,3 +441,11 @@ def test_a_run_with_no_failures_deletes_the_file_at_the_end_of_the_run():
     assert guard < delete, "the delete is not guarded by 'no failures were recorded'"
     assert runs > delete, "the file is removed only after the run record is written"
     assert src.index("exit $script:startupFailures.Count") > delete
+
+
+def test_the_health_url_can_be_pointed_elsewhere_by_environment_and_defaults_to_the_server_port():
+    # The ten-click harness fakes the supervisor, so it needs the last check pointed at a stub.
+    with open(START_ALL, encoding="utf-8") as fh:
+        src = fh.read()
+    assert 'function Get-McpHealthUrl { if ($env:MCP_HEALTH_URL)' in src
+    assert 'return "http://127.0.0.1:8000/health"' in src
