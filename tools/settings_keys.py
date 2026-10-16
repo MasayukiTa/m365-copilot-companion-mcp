@@ -159,6 +159,15 @@ KEYS = OrderedDict([
        "evaluation) with no restart; decisions already made stand. An MCP_EFFORT_POLICY "
        "environment variable beats this setting and is reported as a conflict."),
 
+    _k("tool_transport", EACH_GATE, "connector",
+       "relay/tool_bridge.py:transport (every driver_for, mtime-cached)",
+       "connector|bridge. connector: the agent holds the tools itself (the existing path). "
+       "bridge: the agent has no tools registered; the model asks for a call in its reply and "
+       "this process runs it against the local server. Read when a conversation is created, so "
+       "a change reaches the NEXT conversation with no restart and conversations already "
+       "running keep the transport they started with. Anything else reads as connector. No "
+       "environment variable overrides it."),
+
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
     # enforcing a write scope would go through the folder policy (frozen) and needs a separate
