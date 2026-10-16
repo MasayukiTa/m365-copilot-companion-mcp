@@ -86,7 +86,11 @@ _FUNCS = ["Env-Value", "Get-UpdateCheckSkipReason", "Get-ParentProcessInfo",
           "Test-ShouldNotifyStartupFailures", "Send-StartupFailureNotice",
           "Ensure-ConvenienceProvisioning", "Test-ShortcutTargetsWscript", "Test-WshDisabled",
           "Get-Win32ProcessByPid", "ConvertFrom-WmiDate", "Get-LaunchLineage", "Get-StartAllMode",
-          "New-StartAllRunRecord", "Write-StartAllRunRecord", "Record-PhaseTiming"]
+          "New-StartAllRunRecord", "Write-StartAllRunRecord", "Record-PhaseTiming",
+          # What a failure is written down as and where (2026-10-16): the stages below record
+          # through these, so they are part of the code under test, not scaffolding.
+          "Set-StartupStage", "Get-StartupStage", "Get-StartAllFailurePath",
+          "Write-StartupFailureFile", "Remove-StartAllFailureFile", "Save-StartupFailure"]
 
 
 def _extract_braced_block(text: str, start_marker: str) -> str:
