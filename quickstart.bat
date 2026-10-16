@@ -424,8 +424,22 @@ set "SKIP56="
 REM IMPL ALONE. `findstr /r` treats the space as OR -- measured: FLEET only also exits 0 --
 REM so a machine with just the fleet URL skipped the step that sets the REQUIRED one and
 REM called itself configured. The fleet URL is optional and falls back to this very key.
+REM A KEY RE-MADE FOR A CARRIED-OVER .ENV CANNOT BE SKIPPED. bootstrap.py leaves .setup\bearer_remade
+REM (no secret in it) when it had to make a new connection key: Copilot Studio still holds the old
+REM one and answers 401 until the new value is pasted there, and the S default below sent people
+REM straight past it. With the marker the skip is not offered; STEP 5/6 shows the values and the
+REM marker is deleted once that leg is done.
+set "KEY_REMADE="
+if exist ".setup\bearer_remade" set "KEY_REMADE=1"
+if defined KEY_REMADE (
+    echo.
+    echo   The connection key was re-made on this PC ^(the old one came from another PC or account^).
+    echo   Copilot Studio needs the new values, so STEP 5/6 runs now.
+)
 findstr /b /r "MCP_IMPL_AGENT_URL=..*" ".env" >nul 2>nul
-if not errorlevel 1 (
+if defined KEY_REMADE (
+    REM no skip offered
+) else if not errorlevel 1 (
     echo.
     echo   An agent URL is already configured -- Copilot Studio step appears DONE.
     choice /C SR /N /M "   Press S to skip to STEP 7 (launch), or R to redo STEP 5/6: "
@@ -454,6 +468,12 @@ if not defined SKIP56 (
     echo   Press any key AFTER you have created the agent in Copilot Studio...
     pause >nul
 
+    if defined KEY_REMADE (
+        del ".setup\bearer_remade" >nul 2>nul
+        echo.
+        echo   The new key is in Copilot Studio. The agent URL did not change, so STEP 6 is skipped.
+    )
+    if not defined KEY_REMADE (
     echo.
     echo ===========================================================================
     echo  STEP 6/7  Paste your agent URLs  ^(a dialog window opens^)
@@ -476,6 +496,7 @@ if not defined SKIP56 (
     ) else if errorlevel 2 (
         echo   The dialog was CANCELLED -- .env was not changed and the agent URL is still
         echo   unset. Re-run configure_env.bat when you have it.
+    )
     )
 ) else (
     echo.
