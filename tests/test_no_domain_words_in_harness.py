@@ -22,9 +22,29 @@ from relay import refuter as R  # noqa: E402
 from relay import skill_procedure as SP  # noqa: E402
 from relay import relay_fleet as F  # noqa: E402
 
-#: The vocabulary that belongs to one deployment's data, not to the harness.
-DOMAIN = re.compile(r"adams|mcl|odbc|sql\s*server|不良|設備|検査|ロット|銅箔|ワニス|塗工|梱包",
-                    re.IGNORECASE)
+def _domain_pattern():
+    """The vocabulary that belongs to one deployment's data, not to the harness.
+
+    THE LIST OF WORDS IS ITSELF A DISCLOSURE, SO IT DOES NOT LIVE IN THIS REPOSITORY. This file used
+    to spell the deployment's own system names and data words in a regex, which put in a public
+    repository exactly the words the test exists to keep out of it. They are read from the
+    environment (MCP_DOMAIN_WORDS) or from one file in the user's home (~/.m365_domain_words.txt),
+    each a `|`-separated alternation. Where neither is set (CI, a fresh clone) only the technology
+    words below are checked, which is still a real check of the harness texts.
+    """
+    words = (os.environ.get("MCP_DOMAIN_WORDS") or "").strip()
+    if not words:
+        path = os.path.join(os.path.expanduser("~"), ".m365_domain_words.txt")
+        try:
+            with open(path, encoding="utf-8-sig") as fh:
+                words = fh.read().strip()
+        except OSError:
+            words = ""
+    technology = r"odbc|sql\s*server"
+    return re.compile(technology + (("|" + words) if words else ""), re.IGNORECASE)
+
+
+DOMAIN = _domain_pattern()
 
 
 def _read(rel):
