@@ -134,7 +134,10 @@ def catalogue():
         "description": (
             "The gateway to every tool. Call it with name='' to list the categories, "
             "name='<category>' to open one, name='<tool>' to see that tool's parameters, and "
-            "name='<tool>' with arguments to run it."),
+            "name='<tool>' with arguments to run it. "
+            "WRITE A CALL AS A CODE BLOCK whose info string is call_tool and whose body is one JSON "
+            "object, exactly like this (no other call syntax exists):\n"
+            "```call_tool\n{\"name\": \"\", \"arguments\": {}}\n```"),
         "parameters": {
             "type": "object",
             "properties": {

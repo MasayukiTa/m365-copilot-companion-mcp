@@ -68,6 +68,13 @@ def main():
         }]
         question = ("ツール call_tool を name='ping' で1回呼び、返ってきた echo_code の値をそのまま答えてください。"
                     "他のことはしないでください。")
+        if os.environ.get("BRIDGE_GOAL_FILE"):      # real read-only task through the production gateway
+            from relay import tool_bridge as TB
+            from dotenv import load_dotenv      # the key lives in the server's .env; never printed
+            load_dotenv(os.environ.get("BRIDGE_ENV_FILE", os.path.join(ROOT, ".env")), encoding="utf-8-sig")
+            question = open(os.environ["BRIDGE_GOAL_FILE"], encoding="utf-8").read()
+            catalogue = TB.catalogue()
+            run_tool = TB.make_run_tool("bridge_probe")
         t0 = time.time()
         answer = conv.ask(question, connect=websocket_connect, run_tool=run_tool, catalogue=catalogue)
         dt = time.time() - t0
