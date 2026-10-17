@@ -177,3 +177,59 @@ def test_the_default_directory_is_not_the_live_record_under_test():
     os.makedirs(os.path.join(CW.FLEET_DIR, "tasks", "pending"), exist_ok=True)
     assert CW.tick(now=NOW, alive=False, launcher=ln) == "ok"
     assert not os.path.exists(os.path.join(REPO, ".fleet", "consumer_alarm.json"))
+
+
+# -- the launch must really run the script, and the alarm must not claim otherwise --------------
+
+windows_only = pytest.mark.skipif(os.name != "nt", reason="Windows process creation flags")
+
+
+def _ps1(tmp_path, body):
+    p = tmp_path / "probe.ps1"
+    p.write_text(body, encoding="ascii")
+    return str(p)
+
+
+@windows_only
+def test_the_launcher_really_runs_the_script(tmp_path):
+    # 2026-10-18: with DETACHED_PROCESS in the flags the child exited with code 0 within a
+    # second and never ran start_all, while the alarm said "being restarted".
+    marker = tmp_path / "ran.txt"
+    script = _ps1(tmp_path, "Set-Content -LiteralPath '%s' -Value ran\nStart-Sleep 6\n" % marker)
+    took, note = CW.launch_start_all(str(tmp_path), repo=str(tmp_path), script=script, args=())
+    import time as _t
+    for _ in range(100):
+        if marker.exists():
+            break
+        _t.sleep(0.1)
+    assert marker.exists(), note
+    assert took, note
+
+
+@windows_only
+def test_a_child_that_exits_at_once_is_reported_with_its_exit_code(tmp_path):
+    script = _ps1(tmp_path, "exit 7\n")
+    took, note = CW.launch_start_all(str(tmp_path), repo=str(tmp_path), script=script,
+                                     args=(), wait_s=20.0)
+    assert not took
+    assert "exited with code 7" in note
+
+
+def test_an_ineffective_launch_is_logged_and_the_alarm_says_it_did_not_take_effect(root):
+    _job(root, "a", 600)
+    st = CW.tick(root, now=NOW, alive=False,
+                 launcher=lambda f: (False, "the child (pid 1) had already exited with code 0"))
+    assert st == "failed"
+    a = _alarm(root)
+    assert a["state"] == "failed"
+    assert "did not take effect" in a["text_en"] and "効果がありませんでした" in a["text_ja"]
+    assert "restarted automatically" not in a["text_en"]
+    log = open(os.path.join(root, "consumer_watch.log"), encoding="utf-8").read()
+    assert "DID NOT TAKE EFFECT" in log and "exited with code 0" in log
+
+
+def test_after_the_grace_with_no_consumer_the_alarm_stops_saying_restarting(root):
+    _job(root, "a", 600)
+    ln = Launcher()
+    assert CW.tick(root, now=NOW, alive=False, launcher=ln) == "restarting"
+    assert CW.tick(root, now=NOW + CW.START_GRACE_S + 1, alive=False, launcher=ln) == "failed"
