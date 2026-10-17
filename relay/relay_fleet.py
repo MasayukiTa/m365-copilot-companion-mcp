@@ -2916,6 +2916,12 @@ SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get(
 # none at all) is judged by the short limit. 2026-10-15: brand-new conversations received 68-95
 # update frames and were declared stalled at 60 s.
 SOCKET_LIVE_STREAM_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_LIVE_IDLE_S", "300"))
+# A turn that has used attributed MCP tools is silent between a tool result and the next call
+# while the model writes its next action. Measured 2026-10-17 over socket_turn_tools rows: 881
+# gaps in 96 completed tool-using turns, median 6.8 s, p90 13.6, p99 23.8, max 176.3 s; none
+# exceeded 300 s. So silence is measured against the same 300 s as a live stream, from the last
+# tool activity (an open call keeps its own bound: the tool's timeout plus grace).
+SOCKET_TOOL_SILENCE_S = SOCKET_LIVE_STREAM_IDLE_S
 # Diagnostic-only thresholds. Each socket turn records the first crossing of each bucket so future
 # evidence can move the default again without guessing. These do not affect recovery, retry
 # budgets or transport state. Keep the 90 s bucket even though the default is 60 s: an explicit
@@ -5046,6 +5052,16 @@ class RelayWorker:
         except Exception:
             return None
 
+    def _socket_tool_wait_alive(self, now=None):
+        """True when this worker's turn has had MCP tool activity (a call open within its own
+        timeout, or one that finished) no longer ago than SOCKET_TOOL_SILENCE_S. The silence
+        after a tool result is the model producing its next action; measured over 881 gaps of
+        completed tool-using turns the longest was 176 s (w0 23:42-23:46: 77 s, then it called
+        again), so the stream-alive limit applies, measured from the last tool activity. A worker
+        with no attributed tool activity gets False and is judged exactly as before."""
+        ti = RelayWorker._socket_tool_idle_s(self, now)
+        return ti is not None and ti < SOCKET_TOOL_SILENCE_S
+
     def _socket_meaningful_idle_stalled(self, now=None):
         """Fail one live socket turn after meaningful-progress silence.
 
@@ -5087,8 +5103,7 @@ class RelayWorker:
                 return False
             # A tool call of this worker's conversation is running (or just finished) on our
             # side: the stream is quiet because the agent is waiting for it, not because it hung.
-            tool_idle = RelayWorker._socket_tool_idle_s(self, now)
-            if tool_idle is not None and tool_idle < SOCKET_MEANINGFUL_IDLE_S:
+            if RelayWorker._socket_tool_wait_alive(self, now):
                 try:
                     _socket_route().note_progress(self.name)
                 except Exception:
@@ -8602,8 +8617,7 @@ class RelayWorker:
             # failed at +240s with job_wait open and answered DONE at +440s). While tool activity
             # attributed to this worker is recent, the budget is the driver's own absolute bound.
             if getattr(self, "socket", False) and time.time() - self._t_send > _bound:
-                _ti = RelayWorker._socket_tool_idle_s(self)
-                if _ti is not None and _ti < SOCKET_MEANINGFUL_IDLE_S:
+                if RelayWorker._socket_tool_wait_alive(self):
                     _bound = max(_bound, SOCKET_TURN_TIMEOUT_S)
             # A REPLY THAT ALREADY EXISTS BEATS OUR OUTER CLOCK. This check must happen BEFORE
             # timeout/retry. Measured twice now: r6aa597a8 turn 3 replied at +70s but was retried

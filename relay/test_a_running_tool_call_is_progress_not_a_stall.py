@@ -93,13 +93,14 @@ def _fresh_cache():
         cache.update(path=None, at=0.0, spans=[])
 
 
-def _setup(tmp_path, monkeypatch, calls, how="unique", idle=100.0, frame_idle=90.0, **bind):
+def _setup(tmp_path, monkeypatch, calls, how="unique", idle=100.0, frame_idle=90.0, turn_ago=120.0,
+           **bind):
     now = time.time()
     route = _route(tmp_path)
     _bind(route, how=how, **bind)
     _ledger(route, [(c[0], c[1], now + c[2], None if c[3] is None else now + c[3], c[4],
                      c[5] if len(c) > 5 else SESSION) for c in calls])
-    drv = _StreamDrv(idle, frame_idle, now - 120.0)
+    drv = _StreamDrv(idle, frame_idle, now - turn_ago)
     return _worker(route, monkeypatch, drv), drv, now
 
 
@@ -134,9 +135,59 @@ def test_a_long_explicit_timeout_is_honoured(tmp_path, monkeypatch):
     assert w._socket_meaningful_idle_stalled(now) is False
 
 
-def test_a_finished_call_long_ago_is_not_progress(tmp_path, monkeypatch):
-    w, drv, now = _setup(tmp_path, monkeypatch, [("c1", "run_python", -110, -90, None)])
+def test_a_finished_call_older_than_the_silence_limit_is_not_progress(tmp_path, monkeypatch):
+    w, drv, now = _setup(tmp_path, monkeypatch, [("c1", "run_python", -400, -320, None)],
+                         turn_ago=420.0)
     assert w._socket_meaningful_idle_stalled(now) is True
+
+
+# ---- the model's own latency between tool calls (measured 2026-10-17, w0 23:42-23:46) ----------
+# Gaps after a tool result: 77 s (w0, then it called again 6 s later), 115 s (w0 22:07), and the
+# longest of 881 measured gaps, 176 s. None may stall; a silence past the limit still must.
+
+@pytest.mark.parametrize("gap", [77.0, 115.0, 176.3, 250.0])
+def test_silence_after_a_tool_result_is_the_model_thinking_not_a_stall(tmp_path, monkeypatch, gap):
+    w, drv, now = _setup(tmp_path, monkeypatch, [("c1", "run_python", -gap - 56, -gap, None)],
+                         idle=gap + 60, frame_idle=gap, turn_ago=gap + 130)
+    assert w._socket_meaningful_idle_stalled(now) is False
+    assert drv.failed == ""
+
+
+def test_silence_longer_than_the_limit_after_the_last_tool_activity_stalls(tmp_path, monkeypatch):
+    gap = rf.SOCKET_TOOL_SILENCE_S + 10
+    w, drv, now = _setup(tmp_path, monkeypatch, [("c1", "run_python", -gap - 56, -gap, None)],
+                         idle=gap + 60, frame_idle=gap, turn_ago=gap + 130)
+    assert w._socket_meaningful_idle_stalled(now) is True
+
+
+def test_a_hung_call_is_not_excused_by_an_earlier_finished_call(tmp_path, monkeypatch):
+    # run_python finished 20 s before a job_wait (timeout 90) that has been open 200 s: hung
+    w, drv, now = _setup(tmp_path, monkeypatch, [("c1", "run_python", -240, -220, None),
+                                                 ("c2", "job_wait", -200, None, 90)])
+    assert w._socket_meaningful_idle_stalled(now) is True
+
+
+def test_an_unclosed_old_call_does_not_block_when_the_turn_moved_on(tmp_path, monkeypatch):
+    # the old call never got an outcome row, but a later call finished: the turn is alive
+    w, drv, now = _setup(tmp_path, monkeypatch, [("c1", "job_wait", -200, None, 90),
+                                                 ("c2", "run_python", -100, -90, None)])
+    assert w._socket_meaningful_idle_stalled(now) is False
+
+
+def test_replay_w0_turn_2_gap_of_77_s_then_third_call(tmp_path, monkeypatch):
+    """Real ids/timestamps: t0=1792248144.479, calls +6.63..+63.31, +68.48..+124.82, third call
+    started +202.12. The stall fired at +195.5 s (70 s after call 2 ended)."""
+    t0 = 1792248144.479
+    route = _route(tmp_path)
+    _bind(route, worker="w0")
+    _ledger(route, [("a", "run_python", t0 + 6.63, t0 + 63.31, None, SESSION),
+                    ("b", "run_python", t0 + 68.48, t0 + 124.82, None, SESSION)])
+    spans = attr.recent_spans(route.ledger_path, now=t0 + 195.5)
+    b = route.mcp_bindings.snapshot()
+    idle = attr.attributed_tool_idle_s("w0", CONV, t0, t0 + 195.5, spans, b)
+    assert 70.0 < idle < 71.0
+    assert idle < rf.SOCKET_TOOL_SILENCE_S                # not a stall under the chosen limit
+    assert idle > rf.SOCKET_MEANINGFUL_IDLE_S             # but it WAS one under the 60 s rule
 
 
 def test_an_unattributed_worker_behaves_exactly_as_before(tmp_path, monkeypatch):
@@ -247,6 +298,12 @@ def _poller(tmp_path, monkeypatch, calls, sent_ago=250.0, how="unique"):
 
 def test_per_turn_budget_is_extended_while_a_call_is_open(tmp_path, monkeypatch):
     w = _poller(tmp_path, monkeypatch, [("c1", "job_wait", -30, None, 90)])
+    assert w.poll() is False
+    assert w.retried is False and w.status == "waiting"
+
+
+def test_per_turn_budget_is_extended_through_the_models_gap_between_calls(tmp_path, monkeypatch):
+    w = _poller(tmp_path, monkeypatch, [("c1", "run_python", -170, -115, None)])
     assert w.poll() is False
     assert w.retried is False and w.status == "waiting"
 
