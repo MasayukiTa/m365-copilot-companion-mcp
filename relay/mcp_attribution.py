@@ -257,6 +257,8 @@ def attributed_tool_idle_s(worker, conversation, t0, now, spans, bindings):
     """Seconds since the last tool activity attributed to this worker's turn, or None.
 
     Activity is a call still open (age 0) or one that ended in this turn (age since its end).
+    The caller decides how long a silence after the last activity is tolerated (the model's
+    own latency between tool calls: measured max 176 s over 881 gaps of completed turns).
     Counted: calls on sessions bound to the worker by `id` or `unique`; `fifo` ones only when
     `_fifo_consistent`; an open call older than `call_allowed_s` (its tool's own timeout plus
     grace) is a hung call and is NOT counted. Anything else, and an unattributed worker, gives
@@ -265,6 +267,7 @@ def attributed_tool_idle_s(worker, conversation, t0, now, spans, bindings):
     if not mine:
         return None
     last = None
+    hung_start = None
     for sp in spans:
         if sp["session"] not in mine or sp["start"] > now:
             continue
@@ -277,6 +280,7 @@ def attributed_tool_idle_s(worker, conversation, t0, now, spans, bindings):
             continue
         if sp["end"] is None:
             if now - sp["start"] > call_allowed_s(sp):
+                hung_start = sp["start"] if hung_start is None else max(hung_start, sp["start"])
                 continue
             act = now
         else:
@@ -284,6 +288,11 @@ def attributed_tool_idle_s(worker, conversation, t0, now, spans, bindings):
                 continue
             act = min(sp["end"], now)
         last = act if last is None else max(last, act)
+    # A call open past its own timeout is hung. Activity from BEFORE it started cannot excuse
+    # it (that would give a hung call the whole inter-call allowance); activity after it
+    # started shows the turn moved on, so the call is not what the turn is waiting on.
+    if hung_start is not None and (last is None or last < hung_start):
+        return None
     return None if last is None else max(0.0, now - last)
 
 
