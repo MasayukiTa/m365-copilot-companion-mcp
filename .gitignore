@@ -101,6 +101,9 @@ desktop.ini
 ~$*
 .cache/
 
+# Benchmark output written beside the probe when --out is not given (scripts/probes/bridge_bench.py).
+/scripts/probes/bench_out.jsonl
+
 ui/*.exe
 .codeql-build/
 
