@@ -1,16 +1,19 @@
 # -*- coding: utf-8 -*-
 """A live, read-only benchmark of the fenced-block bridge, over a fixed list of tasks.
 
-WHAT IT MEASURES. Five questions about a checkout, asked through the tool-calling bridge: the
-model is told it may call one gateway, it asks THIS side to run a tool, and the answer it finally
-gives is scored against a number computed here, locally, before anything was sent. So a "success"
-is the model's answer agreeing with this repository rather than with itself.
+WHAT IT MEASURES. Questions about a checkout, asked through the tool-calling bridge: the model is
+told it may call one gateway, it asks THIS side to run a tool, and the answer it finally gives is
+scored against a number computed here, locally, before anything was sent. So a "success" is the
+model's answer agreeing with this repository rather than with itself. The five SHORT tasks are one
+lookup each; the three LONG ones (`--group long`) need several tool calls and are scored on every
+part of a several-part answer.
 
-IT SENDS REAL TURNS. Each ask is a new conversation against a real agent through a real socket:
-one user turn, plus whatever tool-result follow-up turns the model asks for. That is the point --
-the tool loop runs inside `Conversation.ask` and never surfaces, so the only way to know whether
-the bridge works end to end is to run it. Every task is read-only (count files, read a constant,
-count `def ` lines, sum squares, quote a first line); nothing here writes to the tree it reads.
+IT SENDS REAL TURNS, UP TO `--parallel` AT ONCE. Each ask is a new conversation against a real
+agent through a real socket: one user turn, plus whatever tool-result follow-up turns the model
+asks for. That is the point -- the tool loop runs inside `Conversation.ask` and never surfaces, so
+the only way to know whether the bridge works end to end is to run it. Every task is read-only
+(count files, read a constant, count `def ` lines, sum squares, quote a first line); nothing here
+writes to the tree it reads.
 
 NOT RUN BY CI. It needs a signed-in Edge on the debug port and a live local gateway, so it is an
 operator's tool, not a test. The offline half -- the expected answers and the summary arithmetic
@@ -20,6 +23,7 @@ matched, what it cost, and how many tool calls it took -- never the token, never
 
 usage: python bridge_bench.py <agent_url_file> <donor_template_json> [cdp_url]
                               [--repeat N] [--tree DIR] [--out FILE]
+                              [--group short|long|all] [--parallel N]
 """
 from __future__ import annotations
 
@@ -33,6 +37,7 @@ import statistics
 import sys
 import tempfile
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 sys.path.insert(0, ROOT)
@@ -114,9 +119,89 @@ def sum_of_squares(n=100) -> str:
     return str(sum(i * i for i in range(1, n + 1)))
 
 
-def make_tasks(tree):
-    """The fixed task list: (id, prompt, expected_fn). The expected_fn is called by the caller so
-    that a ground truth which cannot be computed surfaces as an error rather than as a bad row."""
+# -- the long tasks' expectations -----------------------------------------------------------------
+#
+# THREE MORE GROUND TRUTHS, EACH A SEVERAL-PART ANSWER. The five above are one lookup each and one
+# short string to score; these ask for a count AND a name AND a line count, so the scorer cannot
+# accept a lucky half of the reply. All three stay pure functions of `--tree`, which is what keeps
+# them checkable in the selfcheck test instead of only in a live run.
+
+def _line_count(tree, rel) -> int:
+    """How many lines `rel` (under `tree`) has, read the same way `expected_def_count` reads it."""
+    return len(_read_text(tree, rel).splitlines())
+
+
+def _py_files(tree, subdir="relay"):
+    """The .py files DIRECTLY under `subdir`, as tree-relative paths, sorted.
+
+    NOT RECURSIVE, and the tasks say so too: "directly in relay/" is a different question from
+    "anywhere under relay/", and a walk that descended would answer the wrong one -- the answer
+    would change the day somebody adds a subdirectory rather than the day the code changes.
+    """
+    pattern = os.path.join(tree, *subdir.split("/"), "*.py")
+    return sorted(os.path.relpath(p, tree).replace("\\", "/") for p in glob.glob(pattern))
+
+
+def files_containing(tree, needle="Conversation", subdir="relay"):
+    """(relative path, line count) for every .py file directly under `subdir` carrying `needle`.
+
+    Read through `_read_text`, so a byte-order mark cannot decide whether a file "contains" the
+    string -- the same tolerance the live task's tools are expected to have."""
+    out = []
+    for rel in _py_files(tree, subdir):
+        if needle in _read_text(tree, rel):
+            out.append((rel, _line_count(tree, rel)))
+    return out
+
+
+def expected_files_with_text(tree, needle="Conversation", subdir="relay"):
+    """How many files carry `needle`, and the longest of them, as [count, name, lines].
+
+    THE TIE IS BROKEN BY NAME, so the expectation is one value for a given tree rather than
+    whichever file the filesystem happened to list first; a tree where two files tie for longest
+    would make the model's answer ambiguous, and the checkouts this runs against do not.
+    """
+    hits = files_containing(tree, needle, subdir)
+    if not hits:
+        raise ValueError("no .py file directly under %s contains %r" % (subdir, needle))
+    rel, lines = max(hits, key=lambda item: (item[1], item[0]))
+    return [str(len(hits)), os.path.basename(rel), str(lines)]
+
+
+def expected_largest_py(tree, subdir="relay", count=3):
+    """The `count` .py files with the most lines directly under `subdir`, as a flat
+    [name, lines, name, lines, ...] in descending line order (the name decides a tie).
+
+    ALL THREE ARE REQUIRED. A model that names the files but not their line counts, or gives the
+    counts for the wrong files, has not answered the question, and a scorer checking only the names
+    would call that a success."""
+    ranked = sorted(((_line_count(tree, rel), rel) for rel in _py_files(tree, subdir)),
+                    key=lambda item: (-item[0], item[1]))
+    if len(ranked) < count:
+        raise ValueError("only %d .py files directly under %s" % (len(ranked), subdir))
+    return [part for lines, rel in ranked[:count] for part in (os.path.basename(rel), str(lines))]
+
+
+def expected_line_sum(tree, pattern="relay/test_tool_*.py"):
+    """The total line count of the files the glob matches, as one required fragment.
+
+    ONE NUMBER, BUT NOT ONE LOOKUP: earning it means reading every matched file and adding them,
+    which is the reason the task is here at all. The glob is split on "/" and rejoined with the
+    platform's separator, so a Windows tree matches the same files a POSIX one would.
+    """
+    matches = sorted(glob.glob(os.path.join(tree, *pattern.split("/"))))
+    if not matches:
+        raise ValueError("nothing matches %s under the tree" % pattern)
+    return [str(sum(_line_count(tree, os.path.relpath(p, tree)) for p in matches))]
+
+
+#: What `--group` selects between: the five single-lookup asks, the three that take several tool
+#: calls, or both in one pass.
+GROUPS = ("short", "long", "all")
+
+
+def _short_tasks(tree):
+    """The original five: one lookup each, each scored on a single short string."""
     return [
         ("glob_count",
          "How many files match relay/test_*.py ? Use the tools.",
@@ -136,7 +221,66 @@ def make_tasks(tree):
     ]
 
 
+def _long_tasks(tree):
+    """The longer three: each needs several tool calls, and each answer has more than one required
+    part.
+
+    The point of the group is the TOOL LOOP, not the question: one lookup proves the bridge carries
+    a single call, and these prove it carries a run of them -- list, read, count, and only then
+    answer. Each is written so the tools are the only way to answer it and the answer is a fact
+    about the given tree, so the same local expectation still decides success. The prompts name the
+    steps, because a task that can be answered from memory measures the model, not the bridge.
+    """
+    return [
+        ("text_files",
+         "In relay/, look only at the .py files directly in that directory, not in any "
+         "subdirectory. How many of those files contain the text 'Conversation', and which one of "
+         "them has the most lines? Use the tools for each step, then report the count, the file "
+         "name, and that file's line count.",
+         lambda: expected_files_with_text(tree)),
+        ("largest_py",
+         "Using the tools, get the line count of every .py file directly in relay/, then report "
+         "the 3 files with the most lines, each with its line count.",
+         lambda: expected_largest_py(tree)),
+        ("line_sum",
+         "Using the tools, add up the line counts of all files matching relay/test_tool_*.py and "
+         "report the total.",
+         lambda: expected_line_sum(tree)),
+    ]
+
+
+def make_tasks(tree, group="short"):
+    """The task list for one group. `short` (the default) is the original five, `long` the three
+    that take several tool calls, `all` both.
+
+    An unknown group RAISES rather than quietly falling back to `short`: a typo on the command line
+    that silently benchmarked the wrong tasks would publish a success rate for a group nobody
+    asked for.
+    """
+    if group == "short":
+        return _short_tasks(tree)
+    if group == "long":
+        return _long_tasks(tree)
+    if group == "all":
+        return _short_tasks(tree) + _long_tasks(tree)
+    raise ValueError("unknown task group %r (expected one of %s)" % (group, ", ".join(GROUPS)))
+
+
 # -- one ask -------------------------------------------------------------------------------------
+
+def answer_has(answer, expected) -> bool:
+    """True when the answer carries everything the task required.
+
+    `expected` is a string (one required fragment -- what every short task produces) or an iterable
+    of fragments (the long tasks, whose answer has several parts). EVERY fragment must appear: a
+    model that reports the count but not the file has not answered the question, and a scorer that
+    accepted either half would print a success rate about nothing.
+    """
+    text = answer or ""
+    if isinstance(expected, str):
+        return expected in text
+    return all(str(part) in text for part in expected)
+
 
 def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool, connect):
     """One ask in a NEW conversation. Records what it cost and whether the expected string is in
@@ -144,7 +288,9 @@ def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool,
 
     A new conversation per ask is deliberate -- the bridge keeps continuity in the conversation id
     rather than in the wire, so a shared one would let ask 3 answer from ask 1's context and score
-    a memory the benchmark is not trying to measure.
+    a memory the benchmark is not trying to measure. That also makes an ask safe to run on a worker
+    thread of its own: nothing here is shared with another ask but the ready pieces, which are
+    read-only.
 
     THE ANSWER TEXT IS NOT RECORDED ANYWHERE. It goes into one boolean and is dropped: the rows
     are written to a file, and nothing that reaches a file may carry a credential the model
@@ -166,7 +312,7 @@ def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool,
         error = type(exc).__name__
     dt = time.time() - t0
     return {"task": task_id,
-            "success": bool(expected in (answer or "")),
+            "success": answer_has(answer, expected),
             "seconds": round(dt, 3),
             "turns": int(conv.turns),
             "last_result": str(conv.last_result),
@@ -197,8 +343,23 @@ def _seconds(row) -> float:
     return float(row.get("seconds") or 0.0)
 
 
-def summarize(rows) -> dict:
+def asks_per_minute(asks, wall_s) -> float:
+    """The run's throughput: `asks` over `wall_s`, in asks per minute.
+
+    A run that measured no wall time gives 0.0 rather than raising, the same rule `_rate` follows:
+    a killed benchmark that got through setup and no ask must still be summarisable, or the failure
+    report is the thing that fails. With `--parallel` the rate exceeds the single-ask rate, which
+    is the number this exists to show.
+    """
+    return (float(asks) * 60.0 / float(wall_s)) if wall_s and float(wall_s) > 0 else 0.0
+
+
+def summarize(rows, wall_s=0.0) -> dict:
     """The run as the operator reads it: overall rates and medians, then the same per task.
+
+    `wall_s` is the whole run's elapsed time, which the caller measured around the asks rather than
+    summing the rows: under `--parallel` the sum of the asks is larger than the wall clock, and the
+    point of running them together is that difference.
 
     An empty run gives zeroes rather than raising -- a killed benchmark that got through the setup
     and no asks must still be summarisable, or the failure report is the thing that fails.
@@ -217,6 +378,8 @@ def summarize(rows) -> dict:
     return {
         "asks": len(rows),
         "success_rate": _rate(rows),
+        "wall_s": round(float(wall_s or 0.0), 3),
+        "asks_per_minute": round(asks_per_minute(len(rows), wall_s), 3),
         "median_seconds": _median([_seconds(r) for r in rows]),
         "median_turns": _median([float(r.get("turns") or 0) for r in rows]),
         "mean_tool_calls": _mean([float(r.get("tool_calls") or 0) for r in rows]),
@@ -239,10 +402,12 @@ def format_table(rows) -> str:
 
 
 def format_summary(summary) -> str:
-    """The overall line first (success rate, median turns, mean tool calls), then each task's."""
-    lines = ["asks=%d  success rate %.1f%%  median seconds %.3f  median turns %.1f  "
-             "mean tool calls %.2f"
-             % (summary["asks"], 100.0 * summary["success_rate"], summary["median_seconds"],
+    """The overall line first (success rate, wall time, throughput, medians), then each task's."""
+    lines = ["asks=%d  success rate %.1f%%  wall %.1fs  asks/min %.2f  median seconds %.3f  "
+             "median turns %.1f  mean tool calls %.2f"
+             % (summary["asks"], 100.0 * summary["success_rate"],
+                float(summary.get("wall_s") or 0.0),
+                float(summary.get("asks_per_minute") or 0.0), summary["median_seconds"],
                 summary["median_turns"], summary["mean_tool_calls"])]
     for task_id in sorted(summary["tasks"]):
         t = summary["tasks"][task_id]
@@ -271,11 +436,16 @@ def _parse_args(argv=None):
                     help="the bgedge debug port (never the operator's own 9222/9223/9224)")
     ap.add_argument("--repeat", type=int, default=2, help="asks per task (default 2)")
     ap.add_argument("--tree", default=default_tree(), help="the checkout the tasks read")
+    ap.add_argument("--group", choices=GROUPS, default="short",
+                    help="which task group to run: short (default), long, or all")
+    ap.add_argument("--parallel", type=int, default=1,
+                    help="how many asks to run at the same time (default 1, one at a time)")
     ap.add_argument("--out", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                  "bench_out.jsonl"),
                     help="where the jsonl rows go (git-ignored)")
     args = ap.parse_args(argv)
     assert ":9222" not in args.cdp and ":9223" not in args.cdp and ":9224" not in args.cdp
+    args.parallel = max(1, int(args.parallel or 1))   # a zero or negative is one, not none
     return args
 
 
@@ -324,34 +494,70 @@ def _failed_row(task_id, exc):
             "tool_calls": 0, "error": type(exc).__name__}
 
 
-def _ask_all(args, ready):
-    """Every task, `--repeat` times, appending each row to `--out` AS IT ARRIVES.
+def _plan_asks(args):
+    """Every ask this run will make, as (task_id, prompt, expected) -- ground truth computed HERE,
+    before a thread starts or a byte is sent.
 
-    Flushed per row on purpose: a run that is killed part-way -- the operator stops it, the machine
-    goes to sleep -- still has every ask that finished, and the next run appends rather than
-    republishing.
-    """
-    rows = []
-    with open(args.out, "a", encoding="utf-8") as fh:
-        for task_id, prompt, expected_fn in make_tasks(args.tree):
-            try:
-                expected = expected_fn()
-            except Exception as exc:                  # unreadable ground truth: a row, not an end
-                for _ in range(args.repeat):
-                    row = _failed_row(task_id, exc)
-                    rows.append(row)
-                    fh.write(json.dumps({"kind": "ask", **row}) + "\n")
-                    fh.flush()
-                continue
+    A task whose expectation cannot be computed still becomes `--repeat` rows carrying the
+    exception, exactly as the serial path did: the model is not blamed for the benchmark's own
+    unreadable tree, and the run is not quietly shortened."""
+    asks = []
+    for task_id, prompt, expected_fn in make_tasks(args.tree, group=args.group):
+        try:
+            expected = expected_fn()
+        except Exception as exc:                  # unreadable ground truth: a row, not an end
             for _ in range(args.repeat):
-                row = run_one(task_id, prompt, expected,
-                              holder=ready["holder"], template=ready["template"],
-                              catalogue=ready["catalogue"], run_tool=ready["run_tool"],
-                              connect=ready["connect"])
+                asks.append((task_id, prompt, exc))
+            continue
+        for _ in range(args.repeat):
+            asks.append((task_id, prompt, expected))
+    return asks
+
+
+def _ask_one(planned, ready):
+    """One planned ask, in whatever thread runs it: a fresh Conversation of its own, and no
+    exception out of here -- a raised ask must not end a run that other asks are still measuring."""
+    task_id, prompt, expected = planned
+    if isinstance(expected, Exception):
+        return _failed_row(task_id, expected)
+    try:
+        return run_one(task_id, prompt, expected,
+                       holder=ready["holder"], template=ready["template"],
+                       catalogue=ready["catalogue"], run_tool=ready["run_tool"],
+                       connect=ready["connect"])
+    except Exception as exc:                       # run_one should never get here; be sure anyway
+        return _failed_row(task_id, exc)
+
+
+def _ask_all(args, ready, on_row):
+    """Every planned ask, up to `--parallel` at a time, handing each row to `on_row` AS IT ARRIVES.
+
+    THREADS, AND NOT ASYNCIO, BECAUSE OF WHERE THE EVENT LOOP IS. `relay.socket_route.
+    websocket_connect` starts an asyncio loop of its own per connection, so it must be called from
+    a thread that owns no loop Playwright's sync API is driving. The token is taken before any
+    worker starts (`_setup`), and every ask after that is exactly such a thread.
+
+    Returns `(rows, wall_s)`, the rows in completion order. The wall clock spans the asks, so
+    `--parallel 4` that finishes four asks in the time one took reports that rather than the sum of
+    its parts; `on_row` is called on this thread, one row at a time, so the writer needs no lock.
+    """
+    planned = _plan_asks(args)
+    rows = []
+    t0 = time.time()
+    if args.parallel <= 1:
+        for item in planned:
+            row = _ask_one(item, ready)
+            rows.append(row)
+            on_row(row)
+    else:
+        with ThreadPoolExecutor(max_workers=args.parallel,
+                                thread_name_prefix="bridge_bench") as pool:
+            futures = [pool.submit(_ask_one, item, ready) for item in planned]
+            for fut in as_completed(futures):
+                row = fut.result()
                 rows.append(row)
-                fh.write(json.dumps({"kind": "ask", **row}) + "\n")
-                fh.flush()
-    return rows
+                on_row(row)
+    return rows, time.time() - t0
 
 
 def main(argv=None) -> int:
@@ -368,9 +574,19 @@ def main(argv=None) -> int:
         except Exception as exc:                  # no template, no token: say it and stop
             print("FAILED: %s: %s" % (type(exc).__name__, str(exc)[:300]))
             return 1
+        log.append("group=%s parallel=%d" % (args.group, args.parallel))
         print("\n".join(log))
-        rows = _ask_all(args, ready)
-        summary = summarize(rows)
+        # Rows are appended and flushed AS THEY ARRIVE: a run that is killed part-way -- the
+        # operator stops it, the machine goes to sleep -- still has every ask that finished, and
+        # the next run appends rather than republishing. The callback runs on this one thread, so
+        # `--parallel` needs no lock around the file.
+        with open(args.out, "a", encoding="utf-8") as fh:
+            def on_row(row):
+                fh.write(json.dumps({"kind": "ask", **row}) + "\n")
+                fh.flush()
+
+            rows, wall_s = _ask_all(args, ready, on_row)
+        summary = summarize(rows, wall_s)
         print(format_table(rows))
         print(format_summary(summary))
         with open(args.out, "a", encoding="utf-8") as fh:

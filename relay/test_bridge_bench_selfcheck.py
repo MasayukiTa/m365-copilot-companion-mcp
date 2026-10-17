@@ -8,6 +8,11 @@ ground truth is checked here instead: against a synthetic tree whose answers a r
 against the spec's own literal 338350, and against a summary computed on hand-built rows whose
 medians are the ones written down beside them.
 
+THE LONG TASKS ARE CHECKED HERE TOO. The three of them answer with several parts (a count, a file
+name, a line count), so the same argument applies twice over: a wrong expectation would look like a
+model that cannot count, and a scorer that accepted only one part would call half an answer a
+success. Both the expectations and the all-parts scorer are pinned below.
+
 NO NETWORK. The probe module IS imported (by path -- it lives under scripts/probes, outside every
 importable package), which loads relay.chathub; that import is stdlib-only, so this stays hermetic.
 The live half of the bench -- the token, the browser, the gateway -- is never touched here.
@@ -195,3 +200,161 @@ def test_format_table_has_one_line_per_ask_and_marks_the_failure():
     assert len(lines) == 3                       # a header and the two asks
     assert "glob_count" in lines[1] and "ok" in lines[1]
     assert "FAIL" in lines[2] and "TimeoutError" in lines[2]
+
+
+# -- the wall clock: one run, several asks in flight -------------------------------------------------
+
+def test_asks_per_minute_is_asks_over_the_wall_clock():
+    """THE NUMBER `--parallel` EXISTS TO SHOW. Two asks in a 6-second wall is 20 a minute, whether
+    they ran one after the other or side by side -- the throughput is the run's, not a row's."""
+    assert _bench().asks_per_minute(2, 6.0) == pytest.approx(20.0)
+
+
+def test_asks_per_minute_of_no_wall_time_is_zero_not_a_division():
+    """A run with no usable wall clock (killed before any ask) reads 0.0, not ZeroDivisionError --
+    the failure report must not be the thing that fails."""
+    assert _bench().asks_per_minute(4, 0.0) == 0.0
+    assert _bench().asks_per_minute(0, 0.0) == 0.0
+
+
+def test_summarize_reports_the_wall_clock_and_the_throughput():
+    """The summary gains the run's own elapsed time and asks-per-minute, alongside the existing
+    success rate -- the three numbers the operator reads first."""
+    rows = [_row("glob_count", True, 1.0, 1, 0),
+            _row("glob_count", True, 3.0, 2, 2)]
+    s = _bench().summarize(rows, wall_s=12.0)
+    assert s["asks"] == 2
+    assert s["success_rate"] == pytest.approx(1.0)
+    assert s["wall_s"] == pytest.approx(12.0)
+    assert s["asks_per_minute"] == pytest.approx(10.0)     # 2 asks in 12 s
+
+
+def test_summarize_without_a_wall_clock_still_works():
+    """`wall_s` defaults to 0, so every existing caller -- and a hand-built summary -- keeps
+    working: the new keys are present as zeroes rather than absent."""
+    s = _bench().summarize([_row("read_line", True, 1.0, 1, 1)])
+    assert s["wall_s"] == 0.0
+    assert s["asks_per_minute"] == 0.0
+
+
+def test_format_summary_names_the_wall_clock_and_the_throughput():
+    """The printed summary is the deliverable, so the two new numbers have to appear in WORDS there
+    and not only as JSON keys."""
+    text = _bench().format_summary(
+        _bench().summarize([_row("glob_count", True, 1.0, 1, 0)], wall_s=30.0))
+    assert "asks/min" in text
+    assert "wall" in text
+
+
+# -- the long tasks' ground truth -----------------------------------------------------------------
+
+def _long_tree(tmp_path):
+    """A checkout whose long-task answers are counted by hand as the constants in each test, plus a
+    file in a SUBDIRECTORY that every one of the three must ignore -- each asks about `relay/`
+    directly, and a walk that descended would answer a different question."""
+    relay = tmp_path / "relay"
+    relay.mkdir()
+    (relay / "aa.py").write_text("top\nConversation\n", encoding="utf-8")       # 2 lines, carries it
+    (relay / "bb.py").write_text("Conversation\n" * 5, encoding="utf-8")        # 5 lines, carries it
+    (relay / "cc.py").write_text("nothing to see here\n", encoding="utf-8")     # 1 line, does not
+    (relay / "test_tool_a.py").write_text("a\nb\nc\n", encoding="utf-8")        # 3 lines
+    (relay / "test_tool_b.py").write_text("only\n", encoding="utf-8")           # 1 line
+    sub = relay / "sub"
+    sub.mkdir()
+    (sub / "dd.py").write_text("Conversation\n" * 9, encoding="utf-8")          # 9 lines, out of scope
+    return str(tmp_path)
+
+
+def test_expected_files_with_text_counts_the_hits_and_names_the_longest(tmp_path):
+    """The first long task's answer: how many files carry the text, and which is longest. Its name
+    and its line count are facts about the tree, computed before the model is asked."""
+    assert _bench().expected_files_with_text(_long_tree(tmp_path)) == ["2", "bb.py", "5"]
+
+
+def test_expected_files_with_text_ignores_a_subdirectory(tmp_path):
+    """THE NON-RECURSION, PINNED. `relay/sub/dd.py` carries the text and is the longest file in the
+    synthetic tree; a recursive walk would hand the model a question the prompt did not ask and
+    score it against an answer nobody could give."""
+    got = _bench().expected_files_with_text(_long_tree(tmp_path))
+    assert got[0] == "2" and got[2] == "5" and "dd.py" not in got
+
+
+def test_expected_largest_py_is_the_top_three_with_their_line_counts(tmp_path):
+    """The second long task: three names AND three counts, in descending line order. A scorer that
+    checked only the names would accept a model that never measured anything."""
+    assert _bench().expected_largest_py(_long_tree(tmp_path)) == [
+        "bb.py", "5", "test_tool_a.py", "3", "aa.py", "2"]
+
+
+def test_expected_largest_py_refuses_a_tree_that_is_too_small(tmp_path):
+    """Asking for more files than exist is an expectation that cannot be computed, so it raises and
+    becomes a labelled row -- never a zero scored as though the model had failed."""
+    with pytest.raises(ValueError):
+        _bench().expected_largest_py(_long_tree(tmp_path), count=99)
+
+
+def test_expected_line_sum_adds_every_matched_file(tmp_path):
+    """The third long task: 3 + 1 lines across the two matched files. One number, but it takes a
+    look at every file the glob matches -- which is why the task is here."""
+    assert _bench().expected_line_sum(_long_tree(tmp_path)) == ["4"]
+
+
+def test_expected_line_sum_refuses_a_glob_that_matches_nothing(tmp_path):
+    """A tree with nothing to add must raise rather than report a total of 0: 0 is also what a
+    model that summed nothing would say, and the two must not look alike."""
+    with pytest.raises(ValueError):
+        _bench().expected_line_sum(_long_tree(tmp_path), pattern="relay/test_nope_*.py")
+
+
+# -- the all-parts scorer --------------------------------------------------------------------------
+
+def test_answer_has_a_string_still_requires_that_substring():
+    """The short tasks keep their scoring: one required fragment, present or not."""
+    assert _bench().answer_has("the value is 8", "8")
+    assert not _bench().answer_has("the value is 9", "8")
+
+
+def test_answer_has_a_list_requires_every_fragment():
+    """THE LONG TASKS' SHAPE. A count AND a file name AND a line count: a model that reports the
+    count alone has not answered the question, and scoring it as a success would publish a rate
+    that means nothing."""
+    required = ["16", "relay_fleet.py", "10851"]
+    assert _bench().answer_has("16 files; the longest is relay_fleet.py with 10851 lines", required)
+    assert not _bench().answer_has("16 files contain it", required)
+    assert not _bench().answer_has("relay_fleet.py has 10851 lines", required)
+
+
+def test_answer_has_no_answer_at_all_is_not_a_match():
+    """An ask that never returned (`answer` is None) fails every requirement rather than raising --
+    a failed ask is a row, not the end of the run."""
+    assert not _bench().answer_has(None, "8")
+    assert not _bench().answer_has(None, ["8"])
+
+
+# -- the groups ------------------------------------------------------------------------------------
+
+def test_make_tasks_defaults_to_the_five_and_group_long_is_the_three(tmp_path):
+    """`--group` picks the list, and the default is unchanged: a run with no flag benchmarks the
+    same five tasks it always did, so an old success rate and a new one are rates of the same
+    thing."""
+    tree = _tree(tmp_path)
+    short = [t[0] for t in _bench().make_tasks(tree)]
+    long_ = [t[0] for t in _bench().make_tasks(tree, group="long")]
+    assert short == ["glob_count", "const_value", "def_count", "arithmetic", "read_line"]
+    assert long_ == ["text_files", "largest_py", "line_sum"]
+    assert [t[0] for t in _bench().make_tasks(tree, group="all")] == short + long_
+
+
+def test_every_long_task_has_a_prompt_and_a_computable_expectation(tmp_path):
+    """Each long task is a prompt plus a ground truth the tree can actually produce, checked on the
+    synthetic tree the tests above count by hand."""
+    for task_id, prompt, expected_fn in _bench().make_tasks(_long_tree(tmp_path), group="long"):
+        assert prompt.strip(), task_id
+        assert expected_fn(), task_id
+
+
+def test_make_tasks_refuses_a_group_it_does_not_have(tmp_path):
+    """A typo must not silently benchmark the default group: that would publish a success rate for
+    a set of tasks nobody asked for."""
+    with pytest.raises(ValueError):
+        _bench().make_tasks(_tree(tmp_path), group="medium")
