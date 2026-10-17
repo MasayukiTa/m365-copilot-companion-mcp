@@ -88,10 +88,16 @@ def test_restarts_are_bounded_per_hour(root):
 
 
 def test_no_restart_when_a_consumer_is_alive_or_cannot_be_asked(root):
-    _job(root, "a", 6000)
     ln = Launcher()
+    _job(root, "a", 40)                      # one normal drain behind: nothing to say
     assert CW.tick(root, now=NOW, alive=True, launcher=ln) == "ok"
+    _job(root, "a", 6000)
     assert CW.tick(root, now=NOW, alive=None, launcher=ln) == "unknown"
+    assert ln.calls == 0
+    # alive and still not drained after 6000 s is not "ok" any more (the supervisor is up and is
+    # not draining: an alarm, never a restart of a supervisor that holds its mutex) -- see
+    # relay/test_consumer_watch_routes.py
+    assert CW.tick(root, now=NOW, alive=True, launcher=ln, live=False, router=True) == "failed"
     assert ln.calls == 0
 
 
@@ -128,6 +134,8 @@ def test_alarm_is_withdrawn_when_a_consumer_is_back(root):
     _job(root, "a", 900)
     CW.tick(root, now=NOW, alive=False, launcher=Launcher())
     assert os.path.exists(os.path.join(root, "consumer_alarm.json"))
+    # the restarted supervisor's first drain consumes the job
+    os.remove(os.path.join(root, "tasks", "pending", "a.json"))
     CW.tick(root, now=NOW + 30, alive=True, launcher=Launcher())
     assert not os.path.exists(os.path.join(root, "consumer_alarm.json"))
 
