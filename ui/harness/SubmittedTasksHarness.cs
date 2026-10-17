@@ -156,6 +156,10 @@ static class SubmittedTasksHarness
                         rec["order"] = order;
                         rec["signature_ja"] = SubmittedTasks.Signature(views, true);
                     }
+                    else if (op == "goaltext")
+                    {
+                        rec["text"] = SubmittedTasks.GoalTextOf(Str(s, "raw"));
+                    }
                     else if (op == "dismiss")
                     {
                         rec["ok"] = st.Dismiss(Str(s, "key"), now);
