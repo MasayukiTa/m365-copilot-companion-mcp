@@ -159,7 +159,8 @@ def tool_spans(tool_rows):
             if ev == "call":
                 sp = {"id": str(r.get("id") or ""), "tool": str(r.get("tool") or "")[:80],
                       "session": str(r.get("session") or ""), "start": float(r["ts"]),
-                      "end": None, "ok": None, "worker_logged": str(r.get("worker") or "")}
+                      "end": None, "ok": None, "worker_logged": str(r.get("worker") or ""),
+                      "timeout_s": _arg_timeout_s(r.get("args"))}
                 spans.append(sp)
                 if sp["id"]:
                     by_id[sp["id"]] = sp
@@ -171,6 +172,137 @@ def tool_spans(tool_rows):
         except Exception:
             continue
     return spans
+
+
+def sessions_of_worker(worker, conversation, bindings, t1):
+    """The MCP sessions bound to this worker's conversation (a set of session ids)."""
+    mine = {s for s, b in bindings.items()
+            if b.get("worker") == worker and (not conversation or b.get("conversation") == conversation)}
+    if not mine:
+        # The conversation id may not match (rehydrated / unknown): fall back to this worker's
+        # most recent binding at or before the window end.
+        cand = [b for b in bindings.values() if b.get("worker") == worker
+                and float(b.get("ts", 0) or 0) <= t1 + 1.0]
+        if cand:
+            last = max(cand, key=lambda b: float(b.get("ts", 0) or 0))
+            mine = {s for s, b in bindings.items() if b is last or (
+                b.get("worker") == worker and b.get("conversation") == last.get("conversation"))}
+    return mine
+
+
+# --- is the worker's conversation waiting on a tool call of ours? ------------------------------
+#: The server-side timeout each tool applies when the caller passes none (the `timeout`
+#: parameter defaults in tools/code_exec.py, tools/jobs.py, tools/verify_ops.py).
+TOOL_DEFAULT_TIMEOUT_S = {"run_python": 60.0, "shell_exec": 30.0, "job_wait": 90.0,
+                          "verify_python": 60.0, "render_mermaid_png": 30.0}
+#: A tool with no timeout parameter of its own: how long an open call still counts as work.
+UNKNOWN_TOOL_TIMEOUT_S = 300.0
+#: Slack on top of a tool's own timeout (process-tree kill, result write-back, ledger lag).
+TIMEOUT_GRACE_S = 30.0
+#: A `fifo` binding is only a hypothesis: its init must have followed its send by about this much.
+FIFO_MAX_INIT_LAG_S = 10.0
+#: Trust levels whose calls count as this worker's.
+TRUSTED_HOW = ("id", "unique")
+#: Ledger tail read for the in-flight check (open calls are recent; minutes of rows).
+INFLIGHT_TAIL_BYTES = 2 * 1024 * 1024
+_INFLIGHT_CACHE_S = 2.0
+_inflight_cache = {"path": None, "at": 0.0, "spans": []}
+_inflight_lock = threading.Lock()
+
+
+def _arg_timeout_s(args):
+    """The `timeout` argument of a ledger `call` row (top level or under `arguments`), or None."""
+    try:
+        if not isinstance(args, dict):
+            return None
+        for src in (args, args.get("arguments") if isinstance(args.get("arguments"), dict) else {}):
+            for k in ("timeout", "timeout_s"):
+                v = src.get(k)
+                if isinstance(v, dict):
+                    v = v.get("text")
+                if v is not None:
+                    f = float(v)
+                    if f > 0:
+                        return f
+    except Exception:
+        pass
+    return None
+
+
+def call_allowed_s(sp):
+    """How long a call of this tool may stay open and still count as work in flight."""
+    own = sp.get("timeout_s")
+    if own is None:
+        own = TOOL_DEFAULT_TIMEOUT_S.get(str(sp.get("tool") or "").split(".")[0], UNKNOWN_TOOL_TIMEOUT_S)
+    return float(own) + TIMEOUT_GRACE_S
+
+
+def _fifo_consistent(binding, sp, t0):
+    """A fifo binding may be crossed with another worker's. Accept a call only if its timing fits:
+    the call started in this turn (not before it) and the session's init followed the send."""
+    if sp["start"] < t0 - 1.0:
+        return False
+    sent, init = binding.get("sent_at"), binding.get("init_ts")
+    try:
+        if sent is not None and init is not None and not 0.0 <= float(init) - float(sent) <= FIFO_MAX_INIT_LAG_S:
+            return False
+        if init is not None and sp["start"] < float(init) - 1.0:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
+def attributed_tool_idle_s(worker, conversation, t0, now, spans, bindings):
+    """Seconds since the last tool activity attributed to this worker's turn, or None.
+
+    Activity is a call still open (age 0) or one that ended in this turn (age since its end).
+    Counted: calls on sessions bound to the worker by `id` or `unique`; `fifo` ones only when
+    `_fifo_consistent`; an open call older than `call_allowed_s` (its tool's own timeout plus
+    grace) is a hung call and is NOT counted. Anything else, and an unattributed worker, gives
+    None, so the caller behaves exactly as before."""
+    mine = sessions_of_worker(worker, conversation, bindings, now)
+    if not mine:
+        return None
+    last = None
+    for sp in spans:
+        if sp["session"] not in mine or sp["start"] > now:
+            continue
+        b = bindings[sp["session"]]
+        how = str(b.get("how", ""))
+        if how == "fifo":
+            if not _fifo_consistent(b, sp, t0):
+                continue
+        elif how not in TRUSTED_HOW:
+            continue
+        if sp["end"] is None:
+            if now - sp["start"] > call_allowed_s(sp):
+                continue
+            act = now
+        else:
+            if sp["end"] < t0:
+                continue
+            act = min(sp["end"], now)
+        last = act if last is None else max(last, act)
+    return None if last is None else max(0.0, now - last)
+
+
+def recent_spans(ledger_path, now=None):
+    """Spans of the ledger tail, cached for a couple of seconds (the fleet polls every worker
+    about once a second). Never raises."""
+    try:
+        now = time.time() if now is None else now
+        with _inflight_lock:
+            c = _inflight_cache
+            if c["path"] == ledger_path and abs(now - c["at"]) < _INFLIGHT_CACHE_S:
+                return c["spans"]
+        rows, _ = read_jsonl_tail(ledger_path, INFLIGHT_TAIL_BYTES)
+        spans = tool_spans(rows)
+        with _inflight_lock:
+            _inflight_cache.update(path=ledger_path, at=now, spans=spans)
+        return spans
+    except Exception:
+        return []
 
 
 def _union_s(intervals):
@@ -197,17 +329,7 @@ def turn_tools_fields(worker, turn, conversation, t0, t1, spans, bindings, ledge
     `other_overlap` counts overlapping calls on sessions bound to ANOTHER worker and
     `unbound_overlap` those on sessions bound to nobody: nonzero unbound_overlap means the
     picture is incomplete."""
-    mine = {s for s, b in bindings.items()
-            if b.get("worker") == worker and (not conversation or b.get("conversation") == conversation)}
-    if not mine:
-        # The conversation id may not match (rehydrated / unknown): fall back to this worker's
-        # most recent binding at or before the window end.
-        cand = [b for b in bindings.values() if b.get("worker") == worker
-                and float(b.get("ts", 0) or 0) <= t1 + 1.0]
-        if cand:
-            last = max(cand, key=lambda b: float(b.get("ts", 0) or 0))
-            mine = {s for s, b in bindings.items() if b is last or (
-                b.get("worker") == worker and b.get("conversation") == last.get("conversation"))}
+    mine = sessions_of_worker(worker, conversation, bindings, t1)
     listed, clipped, n_mine, other, unbound, open_end, longest = [], [], 0, 0, 0, 0, 0.0
     for sp in spans:
         if sp["start"] > t1:

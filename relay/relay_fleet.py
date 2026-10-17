@@ -5016,6 +5016,36 @@ class RelayWorker:
         except Exception:
             pass
 
+    def _socket_tool_idle_s(self, now=None):
+        """Seconds since an MCP tool call attributed to THIS worker's turn was last open or
+        finished, or None when there is no such call or the worker is not attributed.
+
+        THE ONE PLACE that knows a quiet socket may be a conversation waiting on a tool running
+        on this machine (job_wait, shell_exec, a long pytest): the stream carries no frames while
+        it runs, so the idle judge and the per-turn budget would both fail a turn that is working.
+        Joins the worker to its MCP session through the `mcp_session_bound` binding and reads the
+        tool ledger (ids and timestamps only); the rules are in relay/mcp_attribution.py
+        (`attributed_tool_idle_s`). Never raises; None means "behave as before"."""
+        try:
+            route = _socket_route()
+            if route is None:
+                return None
+            bindings = route.mcp_bindings.snapshot()
+            if not bindings:
+                return None
+            from relay import mcp_attribution as attr
+            now = time.time() if now is None else float(now)
+            path = route.ledger_path
+            if path is None:
+                from tools import tool_ledger
+                path = str(tool_ledger._repo_path())
+            ids = self._conversation_ids_for_binding()
+            t0 = float(getattr(self.drv, "_turn_started_ts", 0.0) or getattr(self, "_t_send", 0.0) or 0.0)
+            return attr.attributed_tool_idle_s(self.name, ids.get("client"), t0, now,
+                                               attr.recent_spans(path, now), bindings)
+        except Exception:
+            return None
+
     def _socket_meaningful_idle_stalled(self, now=None):
         """Fail one live socket turn after meaningful-progress silence.
 
@@ -5054,6 +5084,15 @@ class RelayWorker:
                 except Exception:
                     pass
             if idle_s < limit:
+                return False
+            # A tool call of this worker's conversation is running (or just finished) on our
+            # side: the stream is quiet because the agent is waiting for it, not because it hung.
+            tool_idle = RelayWorker._socket_tool_idle_s(self, now)
+            if tool_idle is not None and tool_idle < SOCKET_MEANINGFUL_IDLE_S:
+                try:
+                    _socket_route().note_progress(self.name)
+                except Exception:
+                    pass
                 return False
             reason = ("socket turn made no meaningful progress for %.0fs "
                       "(limit %.0fs)" % (idle_s, limit))
@@ -8559,6 +8598,13 @@ class RelayWorker:
             # already had. The defect in turn 3 is that the poll did not see a reply it had,
             # and why is NOT DETERMINED. Widening a clock to cover for that would hide it.
             _bound = self.per_turn_timeout_s
+            # A TURN THAT IS WAITING ON ITS OWN TOOL CALLS IS WORKING (measured 2026-10-17: w3 was
+            # failed at +240s with job_wait open and answered DONE at +440s). While tool activity
+            # attributed to this worker is recent, the budget is the driver's own absolute bound.
+            if getattr(self, "socket", False) and time.time() - self._t_send > _bound:
+                _ti = RelayWorker._socket_tool_idle_s(self)
+                if _ti is not None and _ti < SOCKET_MEANINGFUL_IDLE_S:
+                    _bound = max(_bound, SOCKET_TURN_TIMEOUT_S)
             # A REPLY THAT ALREADY EXISTS BEATS OUR OUTER CLOCK. This check must happen BEFORE
             # timeout/retry. Measured twice now: r6aa597a8 turn 3 replied at +70s but was retried
             # at +240s; r6ab7a384 w4 turn 12 replied at +16s but was retried at +240.6s. In both
