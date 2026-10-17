@@ -1643,17 +1643,94 @@ function Restore-ProcessEnvironment([hashtable]$Saved) {
     if (-not $Saved) { return }
     foreach ($n in @($Saved.Keys)) { [Environment]::SetEnvironmentVariable($n, $Saved[$n], "Process") }
 }
+function Get-SystemPython {
+    # A Python 3.10+ to run bootstrap.py with BEFORE this checkout has a .venv of its own to run
+    # it with (Invoke-DependencySync repairs a missing or unusable .venv). Same two candidates
+    # and the same minimum setup.ps1 uses -- bootstrap.py's own MIN_PYTHON -- so an old Python on
+    # PATH is never the interpreter a fresh .venv gets built on. The Windows Store alias under
+    # WindowsApps is not an interpreter (it opens the Store), so it is refused, exactly as
+    # supervisor.ps1 refuses it. Returns @{ Exe = <exe>; Args = @(<prefix args>) }, or $null.
+    foreach ($name in @("python", "py")) {
+        $cmd = Get-Command $name -CommandType Application -ErrorAction SilentlyContinue |
+               Select-Object -First 1
+        if (-not $cmd -or -not $cmd.Source) { continue }
+        if ($cmd.Source -match '\\WindowsApps\\') { continue }
+        $prefix = @()
+        if ($name -eq "py") { $prefix = @("-3") }
+        try {
+            $ver = @(& $cmd.Source @prefix -c "import sys; print('%d.%d' % sys.version_info[:2])" 2>&1 |
+                     ForEach-Object { [string]$_ })
+        } catch { continue }
+        if ($LASTEXITCODE -ne 0) { continue }
+        $line = @($ver | Where-Object { $_ -match '^\s*(\d+)\.(\d+)\s*$' } | Select-Object -Last 1)
+        if (-not $line) { continue }
+        $m = [regex]::Match([string]$line[0], '(\d+)\.(\d+)')
+        $major = [int]$m.Groups[1].Value
+        $minor = [int]$m.Groups[2].Value
+        if ($major -gt 3 -or ($major -eq 3 -and $minor -ge 10)) {
+            return @{ Exe = $cmd.Source; Args = $prefix }
+        }
+    }
+    return $null
+}
+
 function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
     # Returns the outcome word (ok / recorded / installed / deferred / failed / unknown / skipped)
     # and COUNTS every outcome that leaves the venv behind requirements.txt into
     # $script:startupFailures -- with what failed and "re-run start_all.bat", never setup.bat.
     Set-StartupStage "deps_sync"      # what Save-StartupFailure names on its lines below
     #
-    # No venv or no bootstrap.py: nothing to bring up to date; the first-time setup gate and the
-    # supervisor's own "no usable Python" refusal cover "nothing is installed yet".
-    if ((-not $VenvPy) -or (-not (Test-Path -LiteralPath $VenvPy)) -or
-        (-not $BootstrapPy) -or (-not (Test-Path -LiteralPath $BootstrapPy))) {
+    # A CHECKOUT WITH NO USABLE .venv IS PREPARED HERE, ON THE DAILY PATH (2026-10-17). A copy
+    # of the project with no .venv at all (a ZIP extracted by a new user) used to leave this
+    # function returning "skipped": the supervisor then refused to run ("no usable Python",
+    # exit 3) and the only line a person ever saw pointed at setup.bat. The project's own
+    # bootstrap does the work instead, through the same entry point setup.bat uses -- its
+    # ensure_venv step makes the venv and its install_deps step fills it -- so the daily path
+    # repairs itself and names no other file to run.
+    #
+    # bootstrap.py is the only thing that can bring the venv up to date: with none there is
+    # nothing to check or install with, so that case is still skipped (unchanged).
+    if ((-not $BootstrapPy) -or (-not (Test-Path -LiteralPath $BootstrapPy))) {
         return "skipped"
+    }
+    # EXISTS IS NOT USABLE. A half-created .venv has a python.exe that will not run, and the
+    # check below would report that as "unknown" with nothing repaired; bootstrap's own
+    # ensure_venv rebuilds exactly that venv. Probed by RUNNING it, the way bootstrap's own
+    # _venv_runs decides, so "the file is there" is never read as "it works".
+    $venvUsable = $false
+    if ($VenvPy -and (Test-Path -LiteralPath $VenvPy)) {
+        try { $null = @(& $VenvPy -c "import sys" 2>&1); $venvUsable = ($LASTEXITCODE -eq 0) }
+        catch { $venvUsable = $false }
+    }
+    if (-not $venvUsable) {
+        # The venv's own interpreter is the thing that is missing, so bootstrap.py is run with a
+        # Python found on PATH (Get-SystemPython); the venv that step creates is used from then on.
+        Set-SplashStatus $script:splash "Preparing the Python environment automatically..."
+        Write-Host "Preparing the Python environment automatically..."
+        try {
+            $py = Get-SystemPython
+            if (-not $py) { throw "no Python 3.10 or newer was found on this PC" }
+            $saved = Set-PipNetworkEnvironment
+            try {
+                foreach ($step in @("ensure_venv", "install_deps")) {
+                    $null = @(& $py.Exe @($py.Args) $BootstrapPy --only $step 2>&1 |
+                              ForEach-Object { [string]$_ })
+                    if ($LASTEXITCODE -ne 0) {
+                        throw "bootstrap.py --only $step exited $LASTEXITCODE"
+                    }
+                }
+            } finally {
+                Restore-ProcessEnvironment $saved
+            }
+        } catch {
+            Write-Host "Environment preparation failed: $($_.Exception.Message)"
+            $script:startupFailures += "Python environment could not be prepared automatically ($($_.Exception.Message)); re-run start_all.bat or quickstart.bat"
+            $null = Save-StartupFailure
+            return "failed"
+        }
+        # The venv was just created and filled by bootstrap's own two steps, so there is nothing
+        # left for the check below to do.
+        return "installed"
     }
     # 1. The cheap question. A matching stamp answers from one hash; a missing or different stamp
     #    reads the installed metadata and, when everything is satisfied, RECORDS the stamp -- so a
