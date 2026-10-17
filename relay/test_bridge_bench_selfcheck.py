@@ -648,3 +648,53 @@ def test_redact_blanks_the_token_and_a_key_shaped_env_value():
 def test_redact_of_none_is_an_empty_string_not_none():
     """A row always has a string where a message is expected; `redact(None)` is "", never None."""
     assert _bench().redact(None, token="", env={}) == ""
+
+
+# -- thousands separators in the scorer -----------------------------------------------------------
+#
+# A model writes a count as "10,824 行"; the expected fragment is "10824". `answer_has` now removes
+# a comma that sits BETWEEN two digits before matching, so the correct answer is not scored as a
+# failure. The match is not loosened otherwise: a numeric fragment matches as a whole number, so
+# "3,431" does not satisfy "431", and a comma that is not between digits is left in place.
+
+def test_answer_has_matches_a_number_written_with_a_thousands_separator():
+    """THE BUG THIS FIXES. "10,824" carries the expected "10824": the separating comma is removed
+    before the substring test, so a right answer stops reading as a wrong one."""
+    assert _bench().answer_has("the file has 10,824 lines", "10824")
+    assert _bench().answer_has("total 1,234,567 items", "1234567")
+    assert _bench().answer_has("2,907 行", "2907")
+
+
+def test_answer_has_still_requires_a_whole_number_not_a_substring_of_one():
+    """NOT LOOSENED. "3,431" normalises to "3431"; the fragment "431" must NOT match inside it, and
+    "10824" must not match inside "110824" -- a numeric fragment matches on digit boundaries."""
+    assert not _bench().answer_has("found 3,431 files", "431")
+    assert not _bench().answer_has("count is 110824", "10824")
+    assert _bench().answer_has("count is 110824", "110824")
+
+
+def test_answer_has_a_comma_not_between_digits_does_not_join_the_numbers():
+    """A comma that is a list separator (followed by a space) is not a thousands separator, so
+    "1, 234" does not carry "1234"; and an answer that lists file names with commas still matches
+    its own non-numeric fragments."""
+    assert not _bench().answer_has("items 1, 234 and more", "1234")
+    assert _bench().answer_has("files: a.py, b.py", "a.py")
+
+
+def test_answer_has_a_list_requires_every_fragment_with_commas_stripped():
+    """THE LONG TASKS' SHAPE, with grouped numbers: every required fragment must appear, each read
+    with its thousands separators removed."""
+    assert _bench().answer_has("files: 2,907 and 10,824", ["2907", "10824"])
+    assert not _bench().answer_has("files: 2,907 only", ["2907", "10824"])
+
+
+def test_normalise_for_match_strips_only_between_digit_commas():
+    """The helper removes an ASCII or full-width comma that sits between two digits and leaves
+    every other comma in place, so it cannot blank unrelated text."""
+    nf = _bench().normalise_for_match
+    assert nf("10,824") == "10824"
+    assert nf("1,234,567") == "1234567"
+    assert nf("10，824") == "10824"      # full-width comma between digits
+    assert nf("a, b") == "a, b"
+    assert nf("1, 234") == "1, 234"
+    assert nf("") == "" and nf(None) == ""

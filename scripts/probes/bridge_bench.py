@@ -358,6 +358,34 @@ def redact(text, *, token="", env=None):
 
 # -- one ask -------------------------------------------------------------------------------------
 
+#: A comma (ASCII ',' or full-width '，' U+FF0C) that sits BETWEEN two digits -- a thousands
+#: separator. Only these are stripped; a comma with a non-digit on either side is left alone.
+_THOUSANDS_SEP = re.compile(r"(?<=\d)[,\uff0c](?=\d)")
+
+
+def normalise_for_match(text) -> str:
+    """The ANSWER text with thousands-separator commas removed, used ONLY for matching.
+
+    A model writes '10,824 行'; the expected fragment is '10824'. Removing a comma that sits
+    between two digits lets the correct answer match without loosening anything else: commas that
+    are not between digits are untouched, and the original text is kept for answer_head.
+    """
+    return _THOUSANDS_SEP.sub("", text or "")
+
+
+def _part_in(part, text) -> bool:
+    """Whether one required fragment appears in the (already normalised) answer text.
+
+    A fragment that is a whole number must match on digit boundaries, so '431' does not match
+    inside '3431' and '10824' does not match inside '110824'. Non-numeric fragments keep the
+    plain substring test.
+    """
+    part = str(part)
+    if part.isdigit():
+        return re.search(r"(?<!\d)" + re.escape(part) + r"(?!\d)", text) is not None
+    return part in text
+
+
 def answer_has(answer, expected) -> bool:
     """True when the answer carries everything the task required.
 
@@ -365,11 +393,14 @@ def answer_has(answer, expected) -> bool:
     of fragments (the long tasks, whose answer has several parts). EVERY fragment must appear: a
     model that reports the count but not the file has not answered the question, and a scorer that
     accepted either half would print a success rate about nothing.
+
+    The answer is normalised first (thousands-separator commas removed) so '10,824 行' carries
+    '10824'; numeric fragments then match on digit boundaries so '3,431' does not satisfy '431'.
     """
-    text = answer or ""
+    text = normalise_for_match(answer or "")
     if isinstance(expected, str):
-        return expected in text
-    return all(str(part) in text for part in expected)
+        return _part_in(expected, text)
+    return all(_part_in(part, text) for part in expected)
 
 
 def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool, connect,
