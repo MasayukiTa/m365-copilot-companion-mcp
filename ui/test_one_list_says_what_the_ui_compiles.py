@@ -119,6 +119,11 @@ EXEMPT = {
         "ui/harness/ into a throwaway console exe: it runs the cockpit's submitted-group merge "
         "and list order against real files without WPF, which is the reason SubmittedTasks.cs "
         "is its own file, not a build of the UI",
+    "ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py":
+        "compiles the same three files as test_a_submitted_task_is_on_top_at_once.py "
+        "(ui/SubmittedTasks.cs + ui/FleetCommands.cs + ui/harness/SubmittedTasksHarness.cs) into a "
+        "throwaway non-WPF console exe to run the cockpit's goal-key rule against the runner's "
+        "parser; not a build of either shipped UI binary",
     "ui/test_the_effort_policy_says_what_is_in_effect.py":
         "compiles ui/EffortPolicy.cs with the test-only driver ui/harness/EffortPolicyHarness.cs "
         "into a throwaway console exe: it runs the effort-policy parse and wording the cockpit "
