@@ -2685,6 +2685,14 @@ if (Test-DevtunnelLoggedInCached) {
 }
 # -- TUNNEL STARTUP FAST PATH (end) ----------------------------------------------------------
 
+# AN EXIT RECORD. 2026-10-17 the supervisor's log simply stopped at 08:44:58 and the next line, 13 h
+# later, was a fresh "supervisor up": nothing said whether it exited, was closed with its session or
+# was killed, so the cause could not be told. This try/finally writes a line on every way out that
+# PowerShell gets to run code for (exit, a terminating error, Ctrl+C / console close); a death that
+# leaves NO such line was a hard kill, which is itself the answer. (A PowerShell.Exiting engine event
+# was tried first and does not fire under -File.) relay/consumer_watch.py adds the other half -- when
+# the log was last written -- when it finds the supervisor gone.
+try {
 while ($true) {
     # Live self-correction ("never again" / defense-in-depth): if .env's MCP_TUNNEL_NAME
     # changed since this supervisor started hosting $TunnelName -- e.g. heal_tunnel.ps1's
@@ -2870,4 +2878,8 @@ while ($true) {
         Invoke-FleetReap
         Invoke-QueueDrain -Tag "express"
     }
+}
+} finally {
+    "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')  supervisor pid $PID leaving its loop (exit, error or console close)" |
+        Out-File -FilePath $Log -Append -Encoding utf8
 }

@@ -329,7 +329,16 @@ partial class CockpitWindow
         // submitted item survives the worker-pickup budget after current/history reconciliation,
         // surface it here so the operator does not have to discover it by scrolling.
         SubmittedHealth queueHealth = SubmittedTasks.SummarizeHealth(ReadQueuedJobs());
-        if (!anyBad && !_fixRunning && _fixNote != null)
+        // NOTHING IS DRAINING THE QUEUE is worse than "unstarted", and is shown even when a dot is
+        // red: relay/consumer_watch.py (hosted by the server) writes .fleet\consumer_alarm.json
+        // while a job has waited past its limit with no supervisor, and removes it when one is back.
+        string consumerAlarm = ReadConsumerAlarm();
+        if (consumerAlarm.Length > 0 && !_fixRunning && _fixNote != null)
+        {
+            _fixNote.Text = consumerAlarm;
+            _fixNote.Foreground = Theme.Br(Theme.Warning(_dark));
+        }
+        else if (!anyBad && !_fixRunning && _fixNote != null)
         {
             if (queueHealth.StaleCount > 0)
             {
@@ -343,6 +352,22 @@ partial class CockpitWindow
                 _fixNote.Foreground = Muted;
             }
         }
+    }
+    // The alarm text in the cockpit's language, or "" when there is none (or it is stale: the
+    // watcher rewrites it every ~15 s, so one not touched for 5 minutes is a dead watcher's).
+    string ReadConsumerAlarm()
+    {
+        try
+        {
+            string path = Path.Combine(RepoRootForSettings(), ".fleet", "consumer_alarm.json");
+            if (!File.Exists(path)) return "";
+            if ((DateTime.UtcNow - File.GetLastWriteTimeUtc(path)).TotalSeconds > 300) return "";
+            var m = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            object t;
+            if (m == null || !m.TryGetValue(_lang == 0 ? "text_ja" : "text_en", out t) || t == null) return "";
+            return Convert.ToString(t);
+        }
+        catch (Exception) { return ""; }
     }
     static readonly string[] _healthKeys = { "hs_server", "hs_tunnel", "hs_edge", "hs_signin", "hs_agent", "hs_tool" };
 
@@ -826,6 +851,7 @@ partial class CockpitWindow
             sb.Append(",\"queued_stale_count\":").Append(qh.StaleCount.ToString(inv));
             sb.Append(",\"queued_taken_stale_count\":").Append(qh.TakenStaleCount.ToString(inv));
             sb.Append(",\"queued_oldest_age_s\":").Append(qh.OldestAgeS.ToString("F1", inv));
+            sb.Append(",\"consumer_alarm\":\"").Append(JsonEscape(ReadConsumerAlarm())).Append('"');
             sb.Append(",\"queued\":[");
             for (int qi = 0; qi < qj.Count && qi < 20; qi++)
             {

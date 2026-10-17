@@ -616,6 +616,7 @@ jobs:
             tests/test_idle_edge_release.py \
             relay/test_merge_delivery.py \
             relay/test_campaign_ledger.py \
+            relay/test_consumer_watch.py \
             relay/test_effort_per_goal.py \
             relay/test_effort_policy.py \
             relay/test_first_reply_check.py \
