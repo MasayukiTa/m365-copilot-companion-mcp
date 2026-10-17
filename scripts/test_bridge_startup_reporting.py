@@ -52,8 +52,18 @@ def test_bridge_new_start_rechecks_liveness_and_counts_a_dead_bridge():
     branch = _bridge_new_start_branch(_start_all())
 
     # It probes the liveness endpoint the rest of the block uses, not process existence.
-    assert 'Http-Up "http://127.0.0.1:8765/conv"' in branch, \
+    # The probe moved into Wait-BridgeConv (it keeps the per-attempt timings for the run
+    # record), so the branch calls that with the /conv URL and Wait-BridgeConv itself calls
+    # Http-Up. Behaviour -- an unanswered /conv yields up=$false, an answered one up=$true --
+    # is run against real stubs in scripts/test_start_all_records_the_bridge_poll.py.
+    assert 'Wait-BridgeConv "http://127.0.0.1:8765/conv"' in branch, \
         "the bridge new-start branch does not re-check /conv after launching"
+    src = _start_all()
+    waiter = src[src.index("function Wait-BridgeConv"):]
+    waiter = waiter[:waiter.index("\nfunction ", 10)]
+    assert "Http-Up $Url" in waiter, "Wait-BridgeConv does not probe the endpoint it is given"
+    assert "[bool]$script:bridgePoll.up" in branch and "if (-not $bridgeUp)" in branch, \
+        "the branch does not act on whether the poll succeeded"
 
     # A bridge that never answers is counted, so start_all's exit code (the count of
     # startupFailures) is non-zero and quickstart cannot print SETUP COMPLETE over it.
