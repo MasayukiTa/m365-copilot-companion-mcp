@@ -131,9 +131,9 @@ def alarm_text(age_s, restarting):
             "is not running). It is being restarted automatically." % en,
         )
     return (
-        "投入済みのジョブが %s 待たされています。監視プロセスを自動で再起動できませんでした: start_all.bat をもう一度実行してください。" % ja,
-        "A submitted job has been waiting %s and the supervisor could not be restarted "
-        "automatically: run start_all.bat again." % en,
+        "投入済みのジョブが %s 待たされています。自動再起動は効果がありませんでした(監視プロセスが戻っていません): start_all.bat をもう一度実行してください。" % ja,
+        "A submitted job has been waiting %s and the automatic restart did not take effect (the "
+        "supervisor did not come back): run start_all.bat again." % en,
     )
 
 
@@ -178,25 +178,43 @@ def _clear_alarm(fleet):
         return False
 
 
-def launch_start_all(fleet, repo=None):
-    """The product's own bring-up, detached and windowless. Returns True when it was spawned."""
+#: CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP. NOT DETACHED_PROCESS (0x08): measured 2026-10-18,
+#: a powershell started with it exits with code 0 inside a second, prints nothing and never runs
+#: the script, so start_all "launched" and did nothing while the alarm said it was restarting.
+LAUNCH_FLAGS_NT = 0x08000000 | 0x00000200
+
+#: A real start_all takes 65-90 s (start_all_runs.jsonl), so a child gone within this many seconds
+#: did not run it.
+EARLY_EXIT_WINDOW_S = 3.0
+
+
+def launch_start_all(fleet, repo=None, script=None, args=("-NoUi", "-NoSplash"),
+                     wait_s=EARLY_EXIT_WINDOW_S):
+    """The product's own bring-up, windowless. Returns (took_effect, note).
+
+    took_effect is False when nothing was spawned or the child was already gone after wait_s;
+    note says why (exit code included), for the log and the alarm.
+    """
     repo = repo or REPO_ROOT
-    ps1 = os.path.join(repo, "scripts", "start_all.ps1")
+    ps1 = script or os.path.join(repo, "scripts", "start_all.ps1")
     if not os.path.isfile(ps1):
-        return False
-    flags = 0
-    if os.name == "nt":
-        flags = 0x08000000 | 0x00000008 | 0x00000200  # NO_WINDOW | DETACHED | NEW_GROUP
+        return False, "%s does not exist" % ps1
+    flags = LAUNCH_FLAGS_NT if os.name == "nt" else 0
     try:
         out = open(os.path.join(fleet, "consumer_watch_start_all.log"), "ab")
-        subprocess.Popen(
+        proc = subprocess.Popen(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
-             "-File", ps1, "-NoUi", "-NoSplash"],
+             "-File", ps1] + list(args),
             cwd=repo, stdin=subprocess.DEVNULL, stdout=out, stderr=out, creationflags=flags)
-        return True
     except Exception as exc:
-        _log(fleet, "could not launch start_all.ps1: %s: %s" % (type(exc).__name__, exc))
-        return False
+        return False, "could not launch %s: %s: %s" % (os.path.basename(ps1), type(exc).__name__, exc)
+    try:
+        rc = proc.wait(timeout=wait_s)
+    except subprocess.TimeoutExpired:
+        return True, "pid %d running after %.0fs" % (proc.pid, wait_s)
+    return False, ("the child (pid %d) had already exited with code %s after %.0fs, so %s did not "
+                   "run; its output is in consumer_watch_start_all.log"
+                   % (proc.pid, rc, wait_s, os.path.basename(ps1)))
 
 
 def _forensics(fleet):
@@ -237,17 +255,24 @@ def tick(fleet=None, now=None, alive=_PROBE, launcher=None):
     starts = [t for t in st.get("starts", []) if now - t < 3600]
     last = starts[-1] if starts else 0.0
     can = len(starts) < RESTART_MAX_PER_HOUR and now - last >= RESTART_MIN_INTERVAL_S
+    effective = st.get("last_effective", True)
     if can:
         why = ("oldest pending job is %.0fs old (limit %.0fs) and no supervisor holds %s; %s"
                % (oldest, STALE_AFTER_S, SUPERVISOR_MUTEX, _forensics(fleet)))
-        if launcher(fleet):
-            starts.append(now)
-            _log(fleet, "restarting through start_all.ps1 -NoUi -NoSplash (%d in the last hour): %s"
-                 % (len(starts), why))
+        res = launcher(fleet)
+        took, note = res if isinstance(res, tuple) else (bool(res), "")
+        starts.append(now)
+        effective = took
+        if took:
+            _log(fleet, "restarting through start_all.ps1 -NoUi -NoSplash (%d in the last hour; %s): %s"
+                 % (len(starts), note, why))
         else:
-            _log(fleet, "restart NOT launched: " + why)
-    _write_json(_state_path(fleet), {"starts": starts, "last_tick": now})
-    restarting = bool(starts) and (now - starts[-1] < START_GRACE_S or len(starts) < RESTART_MAX_PER_HOUR)
+            _log(fleet, "restart DID NOT TAKE EFFECT (%d in the last hour): %s -- %s"
+                 % (len(starts), note, why))
+    _write_json(_state_path(fleet), {"starts": starts, "last_tick": now, "last_effective": effective})
+    # "Being restarted" only while an effective launch is inside its grace; once the grace has
+    # passed with the consumer still absent, or the launch never ran, the text must say so.
+    restarting = bool(starts) and effective and now - starts[-1] < START_GRACE_S
     ja, en = alarm_text(oldest, restarting)
     _write_json(_alarm_path(fleet), {"ts": now, "state": "restarting" if restarting else "failed",
                                     "oldest_pending_age_s": round(oldest, 1),
