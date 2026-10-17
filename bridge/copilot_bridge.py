@@ -47,6 +47,9 @@ from pathlib import Path
 from socketserver import ThreadingMixIn
 
 logger = logging.getLogger(__name__)
+#: When this module was first imported -- the nearest in-process stand-in for "the process
+#: started", so the "listening" line in bridge.log can say how long the launch took to bind.
+_MODULE_T0 = time.time()
 
 
 def _configure_logging():
@@ -7929,7 +7932,49 @@ def _page_main(cdp, fresh):
         PAGE_EXECUTOR.run_forever()
 
 
+_RETENTION_LOCK = threading.Lock()
+_RETENTION_DONE = False
+
+
+def _run_session_retention_once():
+    """The startup retention pass, at most once per process and never two at the same time.
+
+    The server is already serving when this runs, so it hands apply_retention the session the
+    server is driving (ACTIVE_SID, read at delete time) and prune() additionally skips any
+    session whose last_active_ts moved after the pass selected it. Returns True if it ran.
+    """
+    global _RETENTION_DONE
+    if not _RETENTION_LOCK.acquire(blocking=False):
+        return False                                   # one is in flight
+    try:
+        if _RETENTION_DONE:
+            return False
+        _RETENTION_DONE = True
+        t0 = time.time()
+        try:
+            _pruned = S.apply_retention(protect=lambda: {ACTIVE_SID} if ACTIVE_SID else ())
+            if _pruned:
+                logger.info("session retention: removed %d session(s), store now %.1f MB",
+                            _pruned["removed_sessions"], _pruned["mb_after"])
+        except Exception:
+            logger.warning("session retention pass failed; leaving the store alone",
+                           exc_info=True)
+        logger.info("session retention took %.1f s", time.time() - t0)
+        return True
+    finally:
+        _RETENTION_LOCK.release()
+
+
+def _start_session_retention():
+    """Run the retention pass on a daemon thread, so the caller goes on to serve_forever()."""
+    th = threading.Thread(target=_run_session_retention_once, name="session-retention",
+                          daemon=True)
+    th.start()
+    return th
+
+
 def main():
+    _main_t0 = time.time()
     # BEFORE ANYTHING ELSE CAN FAIL. Everything this process learns about its own health is
     # reported through `logger`, and until this call that reporting has no destination.
     _configure_logging()
@@ -7943,13 +7988,11 @@ def main():
     if _port_already_served(port):
         print("bridge already serving port %d; exiting (single-instance guard)" % port, flush=True)
         return
-    # Start the page-owner thread FIRST and let it finish PAGE/DRIVER setup (including
-    # startup auto-resume) before the HTTP server starts accepting connections -- a request
-    # arriving before PAGE exists would otherwise submit a job to an executor with nothing
-    # to run it against. PAGE_EXECUTOR.submit() blocks the calling (request) thread until the
-    # job runs, so simply starting the HTTP server after this call is enough serialization;
-    # no separate "ready" event is needed because do_GET's first PAGE access is always via
-    # run_on_page_thread, which is a no-op-until-queued blocking call.
+    # Start the page-owner thread; start() returns at once and the page is set up on that
+    # thread while this one goes on to bind the HTTP server. The server does NOT wait for page
+    # setup: PAGE_EXECUTOR.submit() blocks the calling (request) thread until the page thread
+    # gets to the job, so a request that needs the page waits there, and the open routes
+    # (BRIDGE_OPEN_ROUTES: /, /status, /conv) answer without it.
     PAGE_EXECUTOR.start(lambda: _page_main(cdp, fresh))
     _start_cdp_watchdog(cdp)
     # Arm the idle tool-call self-probe AFTER the page-owner thread has been started (so PAGE
@@ -7967,20 +8010,16 @@ def main():
     # still not thread-safe -- PageExecutor (module-level PAGE_EXECUTOR) is the single
     # serialization point ensuring only the page-owner thread ever touches PAGE/DRIVER; see
     # its docstring near the top of this file.
-    # RETENTION RUNS ONCE, HERE, AND NOT ON A TIMER. A pass that can fire mid-turn is a pass
+    # RETENTION RUNS ONCE PER PROCESS, AND NOT ON A TIMER. A pass that can fire mid-turn is a pass
     # that can delete the conversation being written to, and the difference between pruning
     # now and pruning in an hour is not worth that. Nothing happens unless the operator has
     # set a limit; the default keeps everything, because this store exists precisely because
     # history was being lost.
-    try:
-        _pruned = S.apply_retention()
-        if _pruned:
-            logger.info("session retention: removed %d session(s), store now %.1f MB",
-                        _pruned["removed_sessions"], _pruned["mb_after"])
-    except Exception:
-        logger.warning("session retention pass failed; leaving the store alone",
-                       exc_info=True)
-
+    # IT RUNS AFTER THE SERVER IS LISTENING, ON A BACKGROUND THREAD (see
+    # _start_session_retention below). It used to run here, before the bind: on a 345 MB store a
+    # pass took 2 s with 14 sessions to remove and 17.6 s with 540 (measured on a copy,
+    # 2026-10-18), and the HTTP port stayed closed for all of it -- which start_all.ps1 polls
+    # for 16 s and reports as a failed start. Still once per process, still never on a timer.
     srv = _SingleBindHTTPServer(("127.0.0.1", port), Handler)
     # THE TOKEN IS WRITTEN AFTER THE BIND, NEVER BEFORE. A second instance that loses the bind
     # (or exits at the single-instance guard above) must not overwrite the token of the bridge
@@ -7999,6 +8038,11 @@ def main():
     print("copilot bridge: token file %s (owner-only: %s)"
           % (bridge_auth.token_path(port), " ".join(str(_acl).split())[:200]), flush=True)
     print("copilot bridge: http://127.0.0.1:%d" % port, flush=True)
+    # The distribution of "how long until the port answers" goes on disk, one line per start.
+    logger.info("listening on 127.0.0.1:%d: %.1f s after the bridge module was imported, "
+                "%.1f s after main() began", port, time.time() - _MODULE_T0,
+                time.time() - _main_t0)
+    _start_session_retention()
     srv.serve_forever()
 
 
