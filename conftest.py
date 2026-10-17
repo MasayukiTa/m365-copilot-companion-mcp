@@ -280,6 +280,11 @@ LIVE_RECORD_REDIRECTS = {
     # other ten entries above were found in, just one step earlier: before the write rather than
     # after it.
     "tools.task_ops": {"STATE_FILE": "todo_state.json"},
+    # 2026-10-18. The job-queue consumer watcher writes consumer_alarm.json, consumer_watch.json,
+    # consumer_watch.log and consumer_watch_start_all.log, and reads tasks/pending, all under this
+    # one directory, and its default (tick(), start_watcher(), launch_start_all()) would otherwise
+    # write the operator's live .fleet. Its tests pass a directory of their own as well.
+    "relay.consumer_watch": {"FLEET_DIR": "consumer_watch_fleet"},
 }
 
 #: Constants that build a .fleet path but are NOT redirected, each with the reason. Being on

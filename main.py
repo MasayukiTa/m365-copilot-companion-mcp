@@ -1674,6 +1674,12 @@ class _BearerPrefix:
 if __name__ == "__main__":
     _install_faulthandler()
     _start_approval_watcher()
+    try:
+        # Jobs pending while nothing drains them (the supervisor is gone) -> restart + alarm.
+        from relay.consumer_watch import start_watcher as _start_consumer_watcher
+        _start_consumer_watcher()
+    except Exception as _cw_exc:
+        print("consumer_watch not started: %s: %s" % (type(_cw_exc).__name__, _cw_exc), flush=True)
     # THE ONE NUMBER THAT DECIDES A SECURITY SWITCH, SAID OUT LOUD ONCE PER BOOT.
     # tools/lock_state.py has counted every call that passed the unlock gate on identity alone
     # since 2026-08-18 so that MCP_REQUIRE_UNLOCK_TOKEN could be turned on with evidence instead
