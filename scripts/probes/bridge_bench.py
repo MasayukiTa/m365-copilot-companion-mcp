@@ -18,8 +18,20 @@ writes to the tree it reads.
 NOT RUN BY CI. It needs a signed-in Edge on the debug port and a live local gateway, so it is an
 operator's tool, not a test. The offline half -- the expected answers and the summary arithmetic
 -- is pinned by `relay/test_bridge_bench_selfcheck.py`, which needs neither a network nor a model.
-Nothing it prints or writes carries a credential: the per-ask record holds whether the answer
-matched, what it cost, and how many tool calls it took -- never the token, never the model's prose.
+
+A FAILED ASK HAS TO BE READABLE. The first live `--group long` run could not be told apart one
+failure from another, because a row kept only the exception's CLASS. So a failed ask now also
+records `error_msg` (the message, truncated) and `answer_head` (the first 300 characters of the
+answer, if there was one), and the table prints both under the failing row. Nothing that reaches a
+file carries a credential: both strings go through `redact`, which replaces the live token and any
+key-shaped value from the environment before they are written.
+
+AN ASK THAT CANNOT BE SCORED IS NOT A MODEL FAILURE. Each task's expected answer is a pure
+function of the tree, and each one RAISES -- naming its task -- when its precondition fails (the
+file is missing, the constant is not assigned, the glob matches fewer than `MIN_MATCHES` files).
+The harness turns that into a `harness_error` row: it is excluded from the success-rate denominator
+and listed separately, because a broken ground truth scored as a model failure is a published
+number about the benchmark's own bug.
 
 usage: python bridge_bench.py <agent_url_file> <donor_template_json> [cdp_url]
                               [--repeat N] [--tree DIR] [--out FILE]
@@ -74,40 +86,84 @@ def default_tree():
 # the filesystem, so the selfcheck test can pin them without a network, and a bug in one of them
 # would otherwise be reported as a bug in the model.
 
-def _read_text(tree, rel):
+#: The smallest number of files a glob-based task may match. A prompt that says "add up the line
+#: counts of ALL files matching <glob>" over a glob matching one or two files is a single lookup
+#: wearing a multi-file prompt, so a pattern that finds fewer than this is a broken GROUND TRUTH:
+#: every expected_fn built on one raises -- naming its task -- instead of scoring a model against
+#: it. The default patterns match 266 and 8 files in the primary checkout, so they clear this.
+MIN_MATCHES = 3
+
+
+def _task_msg(task_id, text) -> str:
+    """The message form every precondition failure uses. It NAMES THE TASK, because the operator's
+    next question about a harness error is "which task was it?"."""
+    return ("%s: %s" % (task_id, text)) if task_id else text
+
+
+def _read_text(tree, rel, task_id="") -> str:
     """One file's text under `tree`. utf-8-sig so a byte-order mark, if one is ever committed,
-    is not silently part of the first line the `read_line` task asks about."""
-    with open(os.path.join(tree, rel), encoding="utf-8-sig", errors="replace") as fh:
-        return fh.read()
+    is not silently part of the first line the `read_line` task asks about.
+
+    A file that is not there raises, NAMING THE TASK: a task whose ground truth cannot be read must
+    not score zero as though the model had got it wrong, and the message has to say which task."""
+    try:
+        with open(os.path.join(tree, rel), encoding="utf-8-sig", errors="replace") as fh:
+            return fh.read()
+    except OSError as exc:
+        raise ValueError(_task_msg(task_id, "cannot read %s under the tree: %s" % (rel, exc)))
 
 
-def expected_glob_count(tree, pattern="relay/test_*.py") -> str:
-    """How many files the task's glob matches under `tree`, as the string the answer must carry."""
-    return str(len(glob.glob(os.path.join(tree, pattern))))
+def _glob(tree, pattern) -> list:
+    """Every path `pattern` matches under `tree`, sorted.
+
+    The pattern is split on "/" and rejoined with the platform's separator, so a Windows tree
+    matches the same files a POSIX one would."""
+    return sorted(glob.glob(os.path.join(tree, *pattern.split("/"))))
 
 
-def expected_const_value(tree, name="MAX_CALLS_PER_REPLY", rel="relay/socket_tools.py") -> str:
+def _require_matches(task_id, pattern, matches) -> list:
+    """The glob precondition, checked before anything is scored: a pattern must find MIN_MATCHES
+    files, or the task is not the multi-file question its prompt claims to ask."""
+    if len(matches) < MIN_MATCHES:
+        raise ValueError(_task_msg(
+            task_id, "pattern %s matches %d file(s) under the tree, need at least %d"
+                     % (pattern, len(matches), MIN_MATCHES)))
+    return matches
+
+
+def expected_glob_count(tree, pattern="relay/test_*.py", task_id="glob_count") -> str:
+    """How many files the task's glob matches under `tree`, as the string the answer must carry.
+
+    Raises, naming the task, unless the glob matches at least MIN_MATCHES files: a glob that finds
+    none (or one) is a broken expectation, and scoring a model against it would publish the
+    benchmark's own bug as the model's failure."""
+    return str(len(_require_matches(task_id, pattern, _glob(tree, pattern))))
+
+
+def expected_const_value(tree, name="MAX_CALLS_PER_REPLY", rel="relay/socket_tools.py",
+                         task_id="const_value") -> str:
     """The value assigned to `name` in `rel`, as written.
 
     ANCHORED to the start of a line, so a comment or docstring that merely MENTIONS the constant
     is not mistaken for its assignment. Raises rather than returning something empty: a task whose
     ground truth cannot be computed must not score zero as though the model had got it wrong.
     """
-    m = re.search(r"^\s*" + re.escape(name) + r"\s*=\s*(\S+)", _read_text(tree, rel), re.M)
+    m = re.search(r"^\s*" + re.escape(name) + r"\s*=\s*(\S+)",
+                  _read_text(tree, rel, task_id), re.M)
     if not m:
-        raise ValueError("%s is not assigned in %s" % (name, rel))
+        raise ValueError(_task_msg(task_id, "%s is not assigned in %s" % (name, rel)))
     return m.group(1)
 
 
-def expected_def_count(tree, rel="relay/socket_tools.py") -> str:
+def expected_def_count(tree, rel="relay/socket_tools.py", task_id="def_count") -> str:
     """How many lines of `rel` begin with `def ` -- the question the `def_count` task asks."""
-    text = _read_text(tree, rel)
+    text = _read_text(tree, rel, task_id)
     return str(sum(1 for line in text.splitlines() if line.startswith("def ")))
 
 
-def expected_first_line(tree, rel="relay/socket_tools.py") -> str:
+def expected_first_line(tree, rel="relay/socket_tools.py", task_id="read_line") -> str:
     """The first line of `rel`, stripped -- the answer `read_line` looks for."""
-    return _read_text(tree, rel).splitlines()[0].strip()
+    return _read_text(tree, rel, task_id).splitlines()[0].strip()
 
 
 def sum_of_squares(n=100) -> str:
@@ -131,7 +187,7 @@ def _line_count(tree, rel) -> int:
     return len(_read_text(tree, rel).splitlines())
 
 
-def _py_files(tree, subdir="relay"):
+def _py_files(tree, subdir="relay") -> list:
     """The .py files DIRECTLY under `subdir`, as tree-relative paths, sorted.
 
     NOT RECURSIVE, and the tasks say so too: "directly in relay/" is a different question from
@@ -142,7 +198,7 @@ def _py_files(tree, subdir="relay"):
     return sorted(os.path.relpath(p, tree).replace("\\", "/") for p in glob.glob(pattern))
 
 
-def files_containing(tree, needle="Conversation", subdir="relay"):
+def files_containing(tree, needle="Conversation", subdir="relay") -> list:
     """(relative path, line count) for every .py file directly under `subdir` carrying `needle`.
 
     Read through `_read_text`, so a byte-order mark cannot decide whether a file "contains" the
@@ -154,7 +210,8 @@ def files_containing(tree, needle="Conversation", subdir="relay"):
     return out
 
 
-def expected_files_with_text(tree, needle="Conversation", subdir="relay"):
+def expected_files_with_text(tree, needle="Conversation", subdir="relay",
+                             task_id="text_files") -> list:
     """How many files carry `needle`, and the longest of them, as [count, name, lines].
 
     THE TIE IS BROKEN BY NAME, so the expectation is one value for a given tree rather than
@@ -163,12 +220,13 @@ def expected_files_with_text(tree, needle="Conversation", subdir="relay"):
     """
     hits = files_containing(tree, needle, subdir)
     if not hits:
-        raise ValueError("no .py file directly under %s contains %r" % (subdir, needle))
+        raise ValueError(_task_msg(
+            task_id, "no .py file directly under %s contains %r" % (subdir, needle)))
     rel, lines = max(hits, key=lambda item: (item[1], item[0]))
     return [str(len(hits)), os.path.basename(rel), str(lines)]
 
 
-def expected_largest_py(tree, subdir="relay", count=3):
+def expected_largest_py(tree, subdir="relay", count=3, task_id="largest_py") -> list:
     """The `count` .py files with the most lines directly under `subdir`, as a flat
     [name, lines, name, lines, ...] in descending line order (the name decides a tie).
 
@@ -178,20 +236,19 @@ def expected_largest_py(tree, subdir="relay", count=3):
     ranked = sorted(((_line_count(tree, rel), rel) for rel in _py_files(tree, subdir)),
                     key=lambda item: (-item[0], item[1]))
     if len(ranked) < count:
-        raise ValueError("only %d .py files directly under %s" % (len(ranked), subdir))
+        raise ValueError(_task_msg(
+            task_id, "only %d .py file(s) directly under %s, need %d" % (len(ranked), subdir, count)))
     return [part for lines, rel in ranked[:count] for part in (os.path.basename(rel), str(lines))]
 
 
-def expected_line_sum(tree, pattern="relay/test_tool_*.py"):
+def expected_line_sum(tree, pattern="relay/test_socket_*.py", task_id="line_sum") -> list:
     """The total line count of the files the glob matches, as one required fragment.
 
     ONE NUMBER, BUT NOT ONE LOOKUP: earning it means reading every matched file and adding them,
-    which is the reason the task is here at all. The glob is split on "/" and rejoined with the
-    platform's separator, so a Windows tree matches the same files a POSIX one would.
-    """
-    matches = sorted(glob.glob(os.path.join(tree, *pattern.split("/"))))
-    if not matches:
-        raise ValueError("nothing matches %s under the tree" % pattern)
+    which is the reason the task is here at all. The pattern is one the DEFAULT tree really has
+    -- `relay/test_tool_*.py` matched nothing there, which is how a live run raised before its
+    first ask -- and it must clear `MIN_MATCHES` or this raises, naming the task."""
+    matches = _require_matches(task_id, pattern, _glob(tree, pattern))
     return [str(sum(_line_count(tree, os.path.relpath(p, tree)) for p in matches))]
 
 
@@ -243,7 +300,7 @@ def _long_tasks(tree):
          "the 3 files with the most lines, each with its line count.",
          lambda: expected_largest_py(tree)),
         ("line_sum",
-         "Using the tools, add up the line counts of all files matching relay/test_tool_*.py and "
+         "Using the tools, add up the line counts of all files matching relay/test_socket_*.py and "
          "report the total.",
          lambda: expected_line_sum(tree)),
     ]
@@ -266,6 +323,39 @@ def make_tasks(tree, group="short"):
     raise ValueError("unknown task group %r (expected one of %s)" % (group, ", ".join(GROUPS)))
 
 
+# -- keeping credentials out of the rows ---------------------------------------------------------
+
+def _key_shaped_values(env):
+    """The values in `env` that look like a secret worth hiding: anything assigned to a name with
+    KEY, TOKEN, SECRET or PASSWORD in it, kept only when it is long enough to be one (8+ chars) so
+    an empty or placeholder value does not blank out unrelated text."""
+    marks = ("KEY", "TOKEN", "SECRET", "PASSWORD")
+    out = []
+    for name, value in (env or {}).items():
+        if value and len(value) >= 8 and any(m in name.upper() for m in marks):
+            out.append(value)
+    return out
+
+
+def redact(text, *, token="", env=None):
+    """`text` with the live token and any key-shaped environment value replaced by a marker.
+
+    The two strings a failed ask records -- the exception message and the first of the answer --
+    are the two places the model's own words (or an echoed credential) could reach a file, so both
+    go through here before they are written. The token is blanked first, then the longest
+    env-values first, so a value that contains another is not half-replaced. An empty or None text
+    comes back as an empty string, never None, so a row always has a string where one is expected.
+    """
+    s = text or ""
+    if not s:
+        return ""
+    secrets = [token] if token else []
+    secrets.extend(_key_shaped_values(env if env is not None else os.environ))
+    for secret in sorted((x for x in secrets if x), key=len, reverse=True):
+        s = s.replace(secret, "[REDACTED]")
+    return s
+
+
 # -- one ask -------------------------------------------------------------------------------------
 
 def answer_has(answer, expected) -> bool:
@@ -282,7 +372,8 @@ def answer_has(answer, expected) -> bool:
     return all(str(part) in text for part in expected)
 
 
-def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool, connect):
+def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool, connect,
+            redact_env=None):
     """One ask in a NEW conversation. Records what it cost and whether the expected string is in
     the answer. NEVER raises: one failure must not end the run.
 
@@ -292,9 +383,11 @@ def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool,
     thread of its own: nothing here is shared with another ask but the ready pieces, which are
     read-only.
 
-    THE ANSWER TEXT IS NOT RECORDED ANYWHERE. It goes into one boolean and is dropped: the rows
-    are written to a file, and nothing that reaches a file may carry a credential the model
-    happened to echo back.
+    THE RECORDED STRINGS ARE REDACTED FIRST. A failed ask keeps `error_msg` (the exception's
+    message) and `answer_head` (the first 300 characters of the answer, when there was one), so a
+    reader can tell one failure from another; both pass through `redact` before they are returned,
+    which blanks the live token and any key-shaped environment value so nothing reaching a file
+    carries a credential the model happened to echo back.
     """
     conv = Conversation(lambda: holder["t"], template=template)
     calls = []
@@ -304,20 +397,28 @@ def run_one(task_id, prompt, expected, *, holder, template, catalogue, run_tool,
         return run_tool(name, args)
 
     error = ""
+    error_text = ""
     answer = ""
     t0 = time.time()
     try:
         answer = conv.ask(prompt, connect=connect, run_tool=counted, catalogue=catalogue)
     except Exception as exc:                       # report it in the row; do not re-raise
         error = type(exc).__name__
+        error_text = str(exc)[:300]
     dt = time.time() - t0
+    tok = holder.get("t") if hasattr(holder, "get") else None
+    tok = tok if isinstance(tok, str) else ""
+    err_msg = redact(error_text, token=tok, env=redact_env) if error else ""
     return {"task": task_id,
             "success": answer_has(answer, expected),
+            "harness_error": False,
             "seconds": round(dt, 3),
             "turns": int(conv.turns),
             "last_result": str(conv.last_result),
             "tool_calls": len(calls),
-            "error": error}
+            "error": error,
+            "error_msg": err_msg,
+            "answer_head": redact((answer or "")[:300], token=tok, env=redact_env)}
 
 
 # -- the summary: pure, and the half the selfcheck test pins -------------------------------------
@@ -333,9 +434,33 @@ def _mean(values) -> float:
     return float(sum(values)) / len(values) if values else 0.0
 
 
+def _scored(rows) -> list:
+    """The rows the model was actually scored on: every row that is not a harness error. A broken
+    ground truth never reached the model, so it does not belong in a rate ABOUT the model."""
+    return [r for r in rows if not r.get("harness_error")]
+
+
 def _rate(rows) -> float:
-    """The fraction of these rows whose answer carried the expected string; 0.0 for none."""
-    return (sum(1 for r in rows if r.get("success")) / float(len(rows))) if rows else 0.0
+    """The fraction of the SCORABLE rows whose answer carried the expected string; 0.0 for none.
+
+    Harness-error rows -- a ground truth that could not be computed -- are excluded from both the
+    numerator and the denominator: scoring them as model failures would publish the benchmark's own
+    bug as a number about the model, and a run that is ALL harness errors reads 0.0 rather than
+    raising."""
+    scorable = _scored(rows)
+    return (sum(1 for r in scorable if r.get("success")) / float(len(scorable))) if scorable else 0.0
+
+
+def _count_harness(rows) -> int:
+    """How many of these rows are harness errors -- a ground truth that could not be computed."""
+    return sum(1 for r in rows if r.get("harness_error"))
+
+
+def _count_zero_calls(rows) -> int:
+    """How many SCORABLE asks made no tool call at all. An ask that answered the file question
+    without ever reading a file did not use the bridge, so this is the count that says whether the
+    bridge was exercised -- a green run of zero-call asks is measuring the model's guesswork."""
+    return sum(1 for r in _scored(rows) if not int(r.get("tool_calls") or 0))
 
 
 def _seconds(row) -> float:
@@ -372,12 +497,16 @@ def summarize(rows, wall_s=0.0) -> dict:
         per_task[task_id] = {
             "asks": len(group),
             "success_rate": _rate(group),
+            "harness_errors": _count_harness(group),
+            "tool_calls_zero": _count_zero_calls(group),
             "median_seconds": _median([_seconds(r) for r in group]),
             "mean_tool_calls": _mean([float(r.get("tool_calls") or 0) for r in group]),
         }
     return {
         "asks": len(rows),
         "success_rate": _rate(rows),
+        "harness_errors": _count_harness(rows),
+        "tool_calls_zero": _count_zero_calls(rows),
         "wall_s": round(float(wall_s or 0.0), 3),
         "asks_per_minute": round(asks_per_minute(len(rows), wall_s), 3),
         "median_seconds": _median([_seconds(r) for r in rows]),
@@ -388,33 +517,52 @@ def summarize(rows, wall_s=0.0) -> dict:
 
 
 def format_table(rows) -> str:
-    """One fixed-width line per ask: task, run index, ok/FAIL, seconds, turns, tool calls, error."""
+    """One fixed-width line per ask: task, run index, ok/FAIL/HARN, seconds, turns, tool calls,
+    error. A failing or harness-error row is followed by an indented detail line carrying the
+    redacted message and the first of the answer, so one failure can be told from another without
+    opening the jsonl. A harness error is marked HARN, because it is the benchmark's fault, not the
+    model's."""
     header = "%-10s %4s %5s %9s %6s %6s  %s" % (
         "task", "run", "ok", "seconds", "turns", "calls", "error")
     lines = [header]
     for i, row in enumerate(rows, 1):
+        if row.get("harness_error"):
+            mark = "HARN"
+        elif row.get("success"):
+            mark = "ok"
+        else:
+            mark = "FAIL"
         lines.append("%-10s %4d %5s %9.3f %6d %6d  %s" % (
-            row.get("task", ""), i,
-            "ok" if row.get("success") else "FAIL",
+            row.get("task", ""), i, mark,
             _seconds(row), int(row.get("turns") or 0), int(row.get("tool_calls") or 0),
             row.get("error") or ""))
+        if mark != "ok":
+            detail = (row.get("error_msg") or "").strip()
+            head = (row.get("answer_head") or "").strip()
+            if detail:
+                lines.append("           msg: " + detail.replace("\n", " "))
+            if head:
+                lines.append("           answer: " + head.replace("\n", " "))
     return "\n".join(lines)
 
 
 def format_summary(summary) -> str:
-    """The overall line first (success rate, wall time, throughput, medians), then each task's."""
-    lines = ["asks=%d  success rate %.1f%%  wall %.1fs  asks/min %.2f  median seconds %.3f  "
-             "median turns %.1f  mean tool calls %.2f"
+    """The overall line first (success rate, wall time, throughput, medians, and the two counts the
+    operator reads next -- harness errors and zero-call asks), then each task's."""
+    lines = ["asks=%d  success rate %.1f%%  harness errors %d  zero-call asks %d  wall %.1fs  "
+             "asks/min %.2f  median seconds %.3f  median turns %.1f  mean tool calls %.2f"
              % (summary["asks"], 100.0 * summary["success_rate"],
+                int(summary.get("harness_errors") or 0), int(summary.get("tool_calls_zero") or 0),
                 float(summary.get("wall_s") or 0.0),
                 float(summary.get("asks_per_minute") or 0.0), summary["median_seconds"],
                 summary["median_turns"], summary["mean_tool_calls"])]
     for task_id in sorted(summary["tasks"]):
         t = summary["tasks"][task_id]
-        lines.append("  %-10s asks=%d  success rate %.1f%%  median seconds %.3f  "
-                     "mean tool calls %.2f"
-                     % (task_id, t["asks"], 100.0 * t["success_rate"], t["median_seconds"],
-                        t["mean_tool_calls"]))
+        lines.append("  %-10s asks=%d  success rate %.1f%%  harness errors %d  zero-call asks %d  "
+                     "median seconds %.3f  mean tool calls %.2f"
+                     % (task_id, t["asks"], 100.0 * t["success_rate"],
+                        int(t.get("harness_errors") or 0), int(t.get("tool_calls_zero") or 0),
+                        t["median_seconds"], t["mean_tool_calls"]))
     return "\n".join(lines)
 
 
@@ -489,9 +637,16 @@ def _setup(args, tmp, log):
 def _failed_row(task_id, exc):
     """A task whose expected answer cannot be computed is a ROW, not a crash. Counting it as a
     plain failure would blame the model for the benchmark's own unreadable ground truth, and
-    dropping it would quietly shorten the run, so it is reported with the exception's name."""
-    return {"task": task_id, "success": False, "seconds": 0.0, "turns": 0, "last_result": "",
-            "tool_calls": 0, "error": type(exc).__name__}
+    dropping it would quietly shorten the run, so it is reported with the exception's name.
+
+    It carries `harness_error=True`, which keeps it OUT of the success-rate denominator -- the
+    model never saw this ask, so it is not a model failure -- while still appearing as its own line
+    in the table and its own count in the summary. The exception's message (redacted) goes in
+    `error_msg` so the operator can read WHICH precondition failed, not only that one did.
+    """
+    return {"task": task_id, "success": False, "harness_error": True, "seconds": 0.0, "turns": 0,
+            "last_result": "", "tool_calls": 0, "error": type(exc).__name__,
+            "error_msg": redact(str(exc)[:300]), "answer_head": ""}
 
 
 def _plan_asks(args):

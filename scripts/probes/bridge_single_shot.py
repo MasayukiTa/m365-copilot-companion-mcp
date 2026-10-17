@@ -80,7 +80,7 @@ def main():
         dt = time.time() - t0
         log.append("answer in %.1fs, tool calls made: %d %s" % (dt, len(calls), [c[0] for c in calls]))
         log.append("last_result=%s turns=%s" % (conv.last_result, conv.turns))
-        log.append("ANSWER: " + (answer or "")[:600])
+        log.append("ANSWER: " + (answer or "")[:4000])
         log.append("SUCCESS (secret echoed): %s" % (secret in (answer or "")))
     except Exception as e:                         # report, never hide
         log.append("FAILED: %s: %s" % (type(e).__name__, str(e)[:500]))

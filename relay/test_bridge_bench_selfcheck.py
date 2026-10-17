@@ -68,6 +68,7 @@ def _tree(tmp_path):
     (relay / "socket_tools.py").write_text(SOCKET_TOOLS, encoding="utf-8")
     (relay / "test_a.py").write_text("# only here to be counted\n", encoding="utf-8")
     (relay / "test_b.py").write_text("# likewise\n", encoding="utf-8")
+    (relay / "test_c.py").write_text("# a third, so the glob clears MIN_MATCHES\n", encoding="utf-8")
     return str(tmp_path)
 
 
@@ -75,8 +76,9 @@ def _tree(tmp_path):
 
 def test_expected_glob_count_counts_the_files_the_glob_matches(tmp_path):
     """Pins that glob_count's expectation is the COUNT of matches under the given tree, not a
-    number typed in beside the prompt -- a hardcoded answer would make the task unfalsifiable."""
-    assert _bench().expected_glob_count(_tree(tmp_path)) == "2"
+    number typed in beside the prompt -- a hardcoded answer would make the task unfalsifiable. The
+    tree has three `test_*.py`, which is also the fewest the glob is allowed to match."""
+    assert _bench().expected_glob_count(_tree(tmp_path)) == "3"
 
 
 def test_expected_const_value_reads_the_assignment_and_ignores_the_comment(tmp_path):
@@ -129,11 +131,18 @@ def test_make_tasks_is_the_spec_five_in_the_spec_order(tmp_path):
 
 # -- the summary ---------------------------------------------------------------------------------
 
-def _row(task, success, seconds, turns, tool_calls, error=""):
-    """One ask as `run_one` returns it, so the summary is tested against the shape it really gets."""
-    return {"task": task, "success": success, "seconds": seconds, "turns": turns,
-            "last_result": "Success" if success else "declined", "tool_calls": tool_calls,
-            "error": error}
+def _row(task, success, seconds, turns, tool_calls, error="", *, harness_error=False,
+         error_msg="", answer_head=""):
+    """One ask as `run_one` returns it, so the summary is tested against the shape it really gets.
+
+    `harness_error` marks a row the model never saw (the ground truth could not be computed); it is
+    excluded from the success rate and counted on its own. `error_msg` and `answer_head` are the
+    two redacted strings a failed row now carries so one failure reads differently from another.
+    """
+    return {"task": task, "success": success, "harness_error": harness_error, "seconds": seconds,
+            "turns": turns, "last_result": "Success" if success else "declined",
+            "tool_calls": tool_calls, "error": error, "error_msg": error_msg,
+            "answer_head": answer_head}
 
 
 def test_summarize_reports_overall_rates_and_medians():
@@ -259,6 +268,9 @@ def _long_tree(tmp_path):
     (relay / "cc.py").write_text("nothing to see here\n", encoding="utf-8")     # 1 line, does not
     (relay / "test_tool_a.py").write_text("a\nb\nc\n", encoding="utf-8")        # 3 lines
     (relay / "test_tool_b.py").write_text("only\n", encoding="utf-8")           # 1 line
+    (relay / "test_socket_a.py").write_text("x\ny\n", encoding="utf-8")         # 2 lines, line_sum
+    (relay / "test_socket_b.py").write_text("x\ny\n", encoding="utf-8")         # 2 lines, line_sum
+    (relay / "test_socket_c.py").write_text("only\n", encoding="utf-8")         # 1 line, line_sum
     sub = relay / "sub"
     sub.mkdir()
     (sub / "dd.py").write_text("Conversation\n" * 9, encoding="utf-8")          # 9 lines, out of scope
@@ -294,9 +306,10 @@ def test_expected_largest_py_refuses_a_tree_that_is_too_small(tmp_path):
 
 
 def test_expected_line_sum_adds_every_matched_file(tmp_path):
-    """The third long task: 3 + 1 lines across the two matched files. One number, but it takes a
-    look at every file the glob matches -- which is why the task is here."""
-    assert _bench().expected_line_sum(_long_tree(tmp_path)) == ["4"]
+    """The third long task: 2 + 2 + 1 lines across the three matched `test_socket_*.py` files. One
+    number, but it takes a look at every file the glob matches -- which is why the task is here, and
+    three of them is also the fewest the glob is allowed to match."""
+    assert _bench().expected_line_sum(_long_tree(tmp_path)) == ["5"]
 
 
 def test_expected_line_sum_refuses_a_glob_that_matches_nothing(tmp_path):
@@ -358,3 +371,280 @@ def test_make_tasks_refuses_a_group_it_does_not_have(tmp_path):
     a set of tasks nobody asked for."""
     with pytest.raises(ValueError):
         _bench().make_tasks(_tree(tmp_path), group="medium")
+
+
+# -- harness errors, zero-call asks, and the redacted failure strings -----------------------------
+
+def test_summarize_excludes_harness_errors_from_the_success_rate():
+    """A harness-error row (ground truth that could not be computed) must leave the rate ABOUT the
+    model alone: two scorable asks, one of them failed, is 50% -- the harness row is neither
+    numerator nor denominator, and is counted on its own instead."""
+    rows = [_row("glob_count", True, 1.0, 1, 2),
+            _row("glob_count", False, 2.0, 1, 2, error="TimeoutError"),
+            _row("line_sum", False, 0.0, 0, 0, error="ValueError",
+                 harness_error=True, error_msg="line_sum: pattern matches 0 file(s)")]
+    s = _bench().summarize(rows)
+    assert s["asks"] == 3
+    assert s["harness_errors"] == 1
+    assert s["success_rate"] == pytest.approx(0.5)      # 1 of the 2 scorable, not 1 of 3
+    assert s["tasks"]["line_sum"]["harness_errors"] == 1
+    assert s["tasks"]["line_sum"]["success_rate"] == 0.0
+
+
+def test_summarize_counts_asks_that_made_no_tool_call():
+    """THE BRIDGE-FAILURE CLASS. An ask that answered the file question without ever calling a tool
+    answered from memory, not over the bridge; the summary carries that count both overall and per
+    task. A harness-error row (no model ask at all) is not counted among them."""
+    rows = [_row("read_line", True, 1.0, 1, 0),        # answered with no tool call
+            _row("read_line", True, 1.0, 2, 3),        # used the bridge
+            _row("glob_count", False, 2.0, 1, 0, error="TimeoutError"),   # zero-call failure
+            _row("line_sum", False, 0.0, 0, 0, harness_error=True)]       # not a model ask
+    s = _bench().summarize(rows)
+    assert s["tool_calls_zero"] == 2
+    assert s["tasks"]["read_line"]["tool_calls_zero"] == 1
+    assert s["tasks"]["glob_count"]["tool_calls_zero"] == 1
+    assert s["tasks"]["line_sum"]["tool_calls_zero"] == 0
+
+
+def test_format_summary_names_harness_errors_and_zero_call_asks():
+    """The two counts the operator reads next have to appear in WORDS in the printed deliverable,
+    not only as JSON keys."""
+    rows = [_row("read_line", True, 1.0, 1, 0),
+            _row("line_sum", False, 0.0, 0, 0, harness_error=True)]
+    text = _bench().format_summary(_bench().summarize(rows))
+    assert "harness errors" in text
+    assert "zero-call asks" in text
+
+
+def test_failed_row_is_a_harness_error_naming_the_task():
+    """`_failed_row` turns an uncomputable expectation into a row that is marked `harness_error`,
+    keeps the exception's class and its message, and carries no answer -- so it is listed apart
+    from a model failure and the operator can read which precondition failed."""
+    row = _bench()._failed_row("line_sum", ValueError("line_sum: pattern matches 0 file(s)"))
+    assert row["harness_error"] is True
+    assert row["success"] is False
+    assert row["error"] == "ValueError"
+    assert "line_sum" in row["error_msg"]
+    assert row["answer_head"] == ""
+    assert row["tool_calls"] == 0
+
+
+def test_redact_blanks_the_token_and_key_shaped_env_values():
+    """The two strings a failed ask records pass through `redact` first: the live token and any
+    long KEY/TOKEN/SECRET/PASSWORD env value are replaced before anything reaches a file, and a
+    short placeholder value is left alone so it cannot blank unrelated text."""
+    env = {"GATEWAY_API_KEY": "super-secret-value-here", "SHELL": "/bin/sh", "SHORT_TOKEN": "abc"}
+    out = _bench().redact("tok=live-token-xyz key=super-secret-value-here keep=abc",
+                          token="live-token-xyz", env=env)
+    assert "live-token-xyz" not in out
+    assert "super-secret-value-here" not in out
+    assert "keep=abc" in out            # the short value is not treated as a secret
+    assert out.count("[REDACTED]") == 2
+
+
+def test_redact_of_nothing_is_an_empty_string_not_none():
+    """An empty or None text comes back as "", never None, so a row always has a string where one
+    is expected."""
+    assert _bench().redact(None) == ""
+    assert _bench().redact("") == ""
+
+
+def test_format_table_prints_the_redacted_message_and_answer_under_a_failure():
+    """A failed ask's detail lines carry the recorded message and the first of the answer, so one
+    failure reads differently from another without opening the jsonl."""
+    rows = [_row("text_files", False, 2.0, 2, 1, error="ValueError",
+                 error_msg="text_files: no .py file contains it",
+                 answer_head="I could not find any such file.")]
+    text = _bench().format_table(rows)
+    assert "text_files: no .py file contains it" in text
+    assert "I could not find any such file." in text
+
+
+def test_format_table_marks_a_harness_error_as_harn():
+    """A harness-error row is marked HARN, not FAIL: it is the benchmark's fault, not the model's,
+    and the mark has to say so."""
+    rows = [_row("line_sum", False, 0.0, 0, 0, error="ValueError",
+                 harness_error=True, error_msg="line_sum: pattern matches 0 file(s)")]
+    lines = _bench().format_table(rows).splitlines()
+    assert "HARN" in lines[1]
+    assert "line_sum: pattern matches 0 file(s)" in text_of(lines)
+
+
+def text_of(lines):
+    """The joined table body, for a membership check that does not care which line a string is on."""
+    return "\n".join(lines)
+
+
+# -- harness errors and zero-call asks: the two counts the operator reads next --------------------
+
+def test_summarize_excludes_a_harness_error_from_the_success_rate():
+    """A harness error is a benchmark bug, not a model failure: it is kept OUT of both halves of the
+    success rate, so one broken ground truth cannot pull a true 100% down to 50%. It is still
+    counted on its own, and still an ask."""
+    rows = [_row("glob_count", True, 1.0, 1, 2),
+            _row("line_sum", False, 0.0, 0, 0, error="ValueError",
+                 harness_error=True, error_msg="line_sum: pattern matches 0 file(s)")]
+    s = _bench().summarize(rows)
+    assert s["asks"] == 2
+    assert s["success_rate"] == pytest.approx(1.0)       # the one scorable ask succeeded
+    assert s["harness_errors"] == 1
+    per = s["tasks"]["line_sum"]
+    assert per["harness_errors"] == 1
+    assert per["success_rate"] == 0.0                    # no scorable ask of this task
+
+
+def test_summarize_of_only_harness_errors_is_zero_not_a_division():
+    """A run that could compute no ground truth at all reads 0.0 rather than raising: the whole
+    scorable set is empty, and an empty set is 0.0 by the same rule the empty run follows."""
+    rows = [_row("line_sum", False, 0.0, 0, 0, error="ValueError", harness_error=True),
+            _row("glob_count", False, 0.0, 0, 0, error="ValueError", harness_error=True)]
+    s = _bench().summarize(rows)
+    assert s["success_rate"] == 0.0
+    assert s["harness_errors"] == 2
+
+
+def test_summarize_counts_zero_call_asks_among_the_scorable():
+    """An ask that answered a file question without ever calling a tool did not exercise the bridge,
+    so it is counted: a green run of zero-call asks is measuring the model's guesswork, not the
+    socket. A harness-error row -- which never ran -- is not a zero-call ask."""
+    rows = [_row("glob_count", True, 1.0, 1, 0),                       # scored, no tool call
+            _row("glob_count", True, 2.0, 1, 3),                       # scored, used the bridge
+            _row("line_sum", False, 0.0, 0, 0, harness_error=True)]    # never ran: not counted
+    s = _bench().summarize(rows)
+    assert s["tool_calls_zero"] == 1
+    assert s["tasks"]["glob_count"]["tool_calls_zero"] == 1
+
+
+def test_format_summary_names_harness_errors_and_zero_call_asks():
+    """The two counts are part of the printed deliverable, in words, so an operator reading the
+    summary -- not the JSON -- sees how many asks never ran and how many never touched the bridge."""
+    rows = [_row("glob_count", True, 1.0, 1, 0),
+            _row("line_sum", False, 0.0, 0, 0, error="ValueError", harness_error=True)]
+    text = _bench().format_summary(_bench().summarize(rows))
+    assert "harness errors" in text
+    assert "zero-call asks" in text
+
+
+def test_format_table_marks_a_harness_error_and_prints_its_message():
+    """A harness-error row is marked HARN -- not FAIL -- because it is the benchmark's fault, and the
+    message that says WHICH precondition failed is printed under it so the operator need not open
+    the jsonl to tell one harness error from another."""
+    rows = [_row("line_sum", False, 0.0, 0, 0, error="ValueError", harness_error=True,
+                 error_msg="line_sum: pattern relay/test_socket_*.py matches 0 file(s)")]
+    text = _bench().format_table(rows)
+    assert "HARN" in text
+    assert "FAIL" not in text
+    assert "matches 0 file(s)" in text
+
+
+def test_format_table_prints_the_answer_head_under_a_model_failure():
+    """A model failure that did return something prints the first of that answer under its row, so a
+    wrong-but-present answer reads differently from an ask that never answered at all."""
+    rows = [_row("read_line", False, 3.0, 2, 1, error="",
+                 answer_head="I think the first line is something else")]
+    lines = _bench().format_table(rows).splitlines()
+    assert any("answer:" in ln and "something else" in ln for ln in lines)
+    assert any("FAIL" in ln for ln in lines)
+
+
+def test_make_tasks_long_includes_line_sum_over_the_socket_glob(tmp_path):
+    """THE PROMPT AND THE EXPECTATION NAME THE SAME GLOB. `line_sum`'s prompt asks about
+    `relay/test_socket_*.py`, and its expectation sums exactly those files; a prompt that named a
+    different glob than the scorer would blame the model for answering the question it was asked."""
+    tasks = {t[0]: t for t in _bench().make_tasks(_long_tree(tmp_path), group="long")}
+    _id, prompt, expected_fn = tasks["line_sum"]
+    assert "relay/test_socket_*.py" in prompt
+    assert expected_fn() == ["5"]
+
+
+# -- the harness-error accounting, the zero-call count, and redaction ------------------------------
+
+def _hrow(task, exc_name="ValueError", msg="boom"):
+    """A harness-error row as `_failed_row` returns it: the ground truth could not be computed, so
+    it is NOT a model failure and must stay out of the scored denominator."""
+    return {"task": task, "success": False, "harness_error": True, "seconds": 0.0, "turns": 0,
+            "last_result": "", "tool_calls": 0, "error": exc_name, "error_msg": msg,
+            "answer_head": ""}
+
+
+def test_failed_row_is_a_harness_error_carrying_the_exception_name(tmp_path):
+    """`_failed_row` turns an uncomputable ground truth into a row flagged `harness_error` and
+    named by the exception -- a crash here would end the run, and a plain failure would blame the
+    model for the bench's own unreadable tree."""
+    row = _bench()._failed_row("line_sum", ValueError("no match"))
+    assert row["harness_error"] is True
+    assert row["success"] is False
+    assert row["error"] == "ValueError"
+    assert "no match" in row["error_msg"]
+
+
+def test_rate_excludes_harness_errors_from_the_denominator():
+    """THE WHOLE POINT OF (2). One scored pass and one harness error read as 100%, not 50%: the
+    broken ground truth never reached the model, so it is not a model failure."""
+    rows = [_row("glob_count", True, 1.0, 1, 2), _hrow("line_sum")]
+    s = _bench().summarize(rows)
+    assert s["success_rate"] == pytest.approx(1.0)
+    assert s["harness_errors"] == 1
+    assert s["asks"] == 2                         # still counted as an ask that happened
+
+
+def test_rate_of_all_harness_errors_is_zero_not_a_division():
+    """A run that is nothing but harness errors has no scorable asks; the rate reads 0.0 rather
+    than raising ZeroDivisionError."""
+    s = _bench().summarize([_hrow("line_sum"), _hrow("largest_py")])
+    assert s["success_rate"] == 0.0
+    assert s["harness_errors"] == 2
+
+
+def test_tool_calls_zero_counts_only_scorable_asks_with_no_call():
+    """(4). The count of asks that answered without ever calling a tool -- the bridge was not
+    exercised -- over the SCORABLE asks only, so a harness error (0 calls by construction) is not
+    counted among them."""
+    rows = [_row("glob_count", True, 1.0, 1, 0),   # answered with no tool call
+            _row("glob_count", True, 1.0, 1, 3),   # used the bridge
+            _hrow("line_sum")]                      # harness error, not a zero-call model ask
+    s = _bench().summarize(rows)
+    assert s["tool_calls_zero"] == 1
+
+
+def test_format_table_marks_a_harness_error_HARN_and_prints_its_message():
+    """A harness error is marked HARN, not FAIL, and its redacted message appears on the detail
+    line so the operator reads WHICH precondition failed."""
+    rows = [_hrow("line_sum", exc_name="ValueError", msg="glob matched nothing")]
+    text = _bench().format_table(rows)
+    assert "HARN" in text
+    assert "glob matched nothing" in text
+
+
+def test_format_table_prints_the_redacted_answer_head_under_a_failure():
+    """A scored failure (not harness) keeps a detail line too, carrying the first of the answer so
+    one wrong answer can be told from another without opening the jsonl."""
+    row = _row("glob_count", False, 1.0, 1, 2, error="")
+    row["answer_head"] = "the answer was seventeen"
+    row["error_msg"] = ""
+    text = _bench().format_table([row])
+    assert "FAIL" in text
+    assert "seventeen" in text
+
+
+def test_format_summary_names_harness_errors_and_zero_call_asks():
+    """The printed deliverable surfaces (2) and (4) in WORDS, not only as JSON keys."""
+    rows = [_row("glob_count", True, 1.0, 1, 0), _hrow("line_sum")]
+    text = _bench().format_summary(_bench().summarize(rows))
+    assert "harness errors" in text
+    assert "zero-call asks" in text
+
+
+def test_redact_blanks_the_token_and_a_key_shaped_env_value():
+    """The two recorded strings pass through `redact` first: the live token and a KEY/TOKEN/SECRET/
+    PASSWORD-named env value (8+ chars) are both replaced, so neither reaches the row."""
+    secret_env = {"MCP_UNLOCK_PASSWORD": "hunter2hunter2"}
+    out = _bench().redact("tok=ABCDEFGH pw=hunter2hunter2 done", token="ABCDEFGH", env=secret_env)
+    assert "ABCDEFGH" not in out
+    assert "hunter2hunter2" not in out
+    assert "[REDACTED]" in out
+
+
+def test_redact_of_none_is_an_empty_string_not_none():
+    """A row always has a string where a message is expected; `redact(None)` is "", never None."""
+    assert _bench().redact(None, token="", env={}) == ""
