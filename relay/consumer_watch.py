@@ -48,24 +48,27 @@ START_GRACE_S = 240.0
 SUPERVISOR_MUTEX = "Global\\m365-copilot-companion-supervisor"
 
 
-def _fleet(root):
-    return os.path.join(root, ".fleet")
+#: The operator's record directory. A module CONSTANT, so conftest.LIVE_RECORD_REDIRECTS moves it
+#: for the whole test session and no test of this module can write the live .fleet; every path
+#: below is derived from the `fleet` argument, which defaults to it.
+REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+FLEET_DIR = os.path.join(REPO_ROOT, ".fleet")
 
 
-def _pending_dir(root):
-    return os.path.join(_fleet(root), "tasks", "pending")
+def _pending_dir(fleet):
+    return os.path.join(fleet, "tasks", "pending")
 
 
-def _alarm_path(root):
-    return os.path.join(_fleet(root), "consumer_alarm.json")
+def _alarm_path(fleet):
+    return os.path.join(fleet, "consumer_alarm.json")
 
 
-def _state_path(root):
-    return os.path.join(_fleet(root), "consumer_watch.json")
+def _state_path(fleet):
+    return os.path.join(fleet, "consumer_watch.json")
 
 
-def _log_path(root):
-    return os.path.join(_fleet(root), "consumer_watch.log")
+def _log_path(fleet):
+    return os.path.join(fleet, "consumer_watch.log")
 
 
 def consumer_alive():
@@ -93,16 +96,16 @@ def consumer_alive():
         return None
 
 
-def pending_ages(root, now=None):
+def pending_ages(fleet, now=None):
     """Ages (s) of the finished job files in pending, oldest first."""
     now = time.time() if now is None else now
     ages = []
     try:
-        for n in os.listdir(_pending_dir(root)):
+        for n in os.listdir(_pending_dir(fleet)):
             if not n.endswith(".json"):
                 continue
             try:
-                ages.append(max(0.0, now - os.path.getmtime(os.path.join(_pending_dir(root), n))))
+                ages.append(max(0.0, now - os.path.getmtime(os.path.join(_pending_dir(fleet), n))))
             except OSError:
                 pass
     except OSError:
@@ -134,14 +137,14 @@ def alarm_text(age_s, restarting):
     )
 
 
-def _log(root, msg):
+def _log(fleet, msg):
     line = "%s  %s" % (time.strftime("%Y-%m-%d %H:%M:%S"), msg)
     try:
         print("consumer_watch: " + msg, flush=True)
     except Exception:
         pass
     try:
-        with open(_log_path(root), "a", encoding="utf-8") as fh:
+        with open(_log_path(fleet), "a", encoding="utf-8") as fh:
             fh.write(line + "\n")
     except OSError:
         pass
@@ -167,38 +170,39 @@ def _write_json(path, obj):
         pass
 
 
-def _clear_alarm(root):
+def _clear_alarm(fleet):
     try:
-        os.remove(_alarm_path(root))
+        os.remove(_alarm_path(fleet))
         return True
     except OSError:
         return False
 
 
-def launch_start_all(root):
+def launch_start_all(fleet, repo=None):
     """The product's own bring-up, detached and windowless. Returns True when it was spawned."""
-    ps1 = os.path.join(root, "scripts", "start_all.ps1")
+    repo = repo or REPO_ROOT
+    ps1 = os.path.join(repo, "scripts", "start_all.ps1")
     if not os.path.isfile(ps1):
         return False
     flags = 0
     if os.name == "nt":
         flags = 0x08000000 | 0x00000008 | 0x00000200  # NO_WINDOW | DETACHED | NEW_GROUP
     try:
-        out = open(os.path.join(_fleet(root), "consumer_watch_start_all.log"), "ab")
+        out = open(os.path.join(fleet, "consumer_watch_start_all.log"), "ab")
         subprocess.Popen(
             ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
              "-File", ps1, "-NoUi", "-NoSplash"],
-            cwd=root, stdin=subprocess.DEVNULL, stdout=out, stderr=out, creationflags=flags)
+            cwd=repo, stdin=subprocess.DEVNULL, stdout=out, stderr=out, creationflags=flags)
         return True
     except Exception as exc:
-        _log(root, "could not launch start_all.ps1: %s: %s" % (type(exc).__name__, exc))
+        _log(fleet, "could not launch start_all.ps1: %s: %s" % (type(exc).__name__, exc))
         return False
 
 
-def _forensics(root):
+def _forensics(fleet):
     """What the next investigation needs and this one lacked: when the supervisor last wrote."""
     bits = []
-    st = _read_json(os.path.join(_fleet(root), "supervisor_state.json"))
+    st = _read_json(os.path.join(fleet, "supervisor_state.json"))
     if st.get("pid"):
         bits.append("last supervisor pid=%s started=%s" % (st.get("pid"), st.get("start_ts")))
     for p in (os.path.join(os.environ.get("TEMP", ""), "m365-companion-supervisor.log"),):
@@ -213,54 +217,55 @@ def _forensics(root):
 _PROBE = object()
 
 
-def tick(root, now=None, alive=_PROBE, launcher=None):
+def tick(fleet=None, now=None, alive=_PROBE, launcher=None):
     """One pass. Returns the state name: ok | waiting | restarting | failed | unknown."""
+    fleet = FLEET_DIR if fleet is None else fleet
     now = time.time() if now is None else now
     alive = consumer_alive() if alive is _PROBE else alive
     launcher = launch_start_all if launcher is None else launcher
-    ages = pending_ages(root, now)
+    ages = pending_ages(fleet, now)
     if alive is None:
         return "unknown"
     if alive or not ages:
-        if _clear_alarm(root):
-            _log(root, "consumer alive=%s, pending=%d: alarm cleared" % (alive, len(ages)))
+        if _clear_alarm(fleet):
+            _log(fleet, "consumer alive=%s, pending=%d: alarm cleared" % (alive, len(ages)))
         return "ok"
     oldest = ages[0]
     if oldest < STALE_AFTER_S:
         return "waiting"
-    st = _read_json(_state_path(root))
+    st = _read_json(_state_path(fleet))
     starts = [t for t in st.get("starts", []) if now - t < 3600]
     last = starts[-1] if starts else 0.0
     can = len(starts) < RESTART_MAX_PER_HOUR and now - last >= RESTART_MIN_INTERVAL_S
     if can:
         why = ("oldest pending job is %.0fs old (limit %.0fs) and no supervisor holds %s; %s"
-               % (oldest, STALE_AFTER_S, SUPERVISOR_MUTEX, _forensics(root)))
-        if launcher(root):
+               % (oldest, STALE_AFTER_S, SUPERVISOR_MUTEX, _forensics(fleet)))
+        if launcher(fleet):
             starts.append(now)
-            _log(root, "restarting through start_all.ps1 -NoUi -NoSplash (%d in the last hour): %s"
+            _log(fleet, "restarting through start_all.ps1 -NoUi -NoSplash (%d in the last hour): %s"
                  % (len(starts), why))
         else:
-            _log(root, "restart NOT launched: " + why)
-    _write_json(_state_path(root), {"starts": starts, "last_tick": now})
+            _log(fleet, "restart NOT launched: " + why)
+    _write_json(_state_path(fleet), {"starts": starts, "last_tick": now})
     restarting = bool(starts) and (now - starts[-1] < START_GRACE_S or len(starts) < RESTART_MAX_PER_HOUR)
     ja, en = alarm_text(oldest, restarting)
-    _write_json(_alarm_path(root), {"ts": now, "state": "restarting" if restarting else "failed",
+    _write_json(_alarm_path(fleet), {"ts": now, "state": "restarting" if restarting else "failed",
                                     "oldest_pending_age_s": round(oldest, 1),
                                     "text_ja": ja, "text_en": en})
     return "restarting" if restarting else "failed"
 
 
-def start_watcher(root, period=PERIOD_S):
+def start_watcher(fleet=None, period=PERIOD_S):
     """Daemon thread; a failure is logged and the next period tries again."""
     import threading
 
     def loop():
         while True:
             try:
-                tick(root)
+                tick(fleet)
             except Exception as exc:
                 try:
-                    _log(root, "tick failed: %s: %s" % (type(exc).__name__, exc))
+                    _log(fleet, "tick failed: %s: %s" % (type(exc).__name__, exc))
                 except Exception:
                     pass
             time.sleep(period)

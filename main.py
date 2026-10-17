@@ -1677,7 +1677,7 @@ if __name__ == "__main__":
     try:
         # Jobs pending while nothing drains them (the supervisor is gone) -> restart + alarm.
         from relay.consumer_watch import start_watcher as _start_consumer_watcher
-        _start_consumer_watcher(os.path.dirname(os.path.abspath(__file__)))
+        _start_consumer_watcher()
     except Exception as _cw_exc:
         print("consumer_watch not started: %s: %s" % (type(_cw_exc).__name__, _cw_exc), flush=True)
     # THE ONE NUMBER THAT DECIDES A SECURITY SWITCH, SAID OUT LOUD ONCE PER BOOT.
