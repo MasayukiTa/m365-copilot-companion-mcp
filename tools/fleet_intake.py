@@ -126,6 +126,27 @@ def _waiting_count() -> int:
     return n
 
 
+def _consumer_sentence() -> str:
+    """Whether anything is draining the queue RIGHT NOW -- the one fact "queued" hid.
+
+    2026-10-17: jobs sat 4 h 45 min in pending because the supervisor (the only caller of the
+    router) was gone while this server kept answering, and the reply said only "queued".
+    """
+    try:
+        from relay import consumer_watch as CW
+        alive = CW.consumer_alive()
+    except Exception:
+        alive = None
+    if alive is True:
+        return "A queue consumer (the supervisor) is running."
+    if alive is False:
+        return ("WARNING: no queue consumer (the supervisor) is running right now, so this job "
+                "will NOT be picked up until it is restarted. The server restarts it "
+                "automatically after about %d s; if the job is still waiting after a few "
+                "minutes, the owner must run start_all.bat." % int(CW.STALE_AFTER_S))
+    return "Could not tell whether a queue consumer is running."
+
+
 #: MEASURED 2026-09-15. A worker that could not obtain an unlock token called this door to hand
 #: its work to another worker instead of stopping (origin.source recorded "unlock unavailable on
 #: this client"). Two more submissions for the same PowerPoint rebuild followed -- one a worker's
@@ -405,7 +426,7 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     # rather than locked against.
     return ("queued %s -- the goal is in this machine's queue and will be picked up by its "
             "runner. It has NOT started yet, and nothing has run because of this call. "
-            "%d job(s) waiting." % (jid, _waiting_count()))
+            "%d job(s) waiting. %s" % (jid, _waiting_count(), _consumer_sentence()))
 
 
 def fleet_queue() -> str:
