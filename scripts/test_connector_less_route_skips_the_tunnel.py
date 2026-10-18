@@ -142,7 +142,8 @@ def test_the_connector_route_still_runs_every_step(tmp_path):
 
 
 def test_a_failure_to_read_the_setting_means_the_connector_route():
-    with mock.patch.dict(sys.modules, {"relay.tool_bridge": None}):
+    from relay import tool_bridge
+    with mock.patch.object(tool_bridge, "is_bridge", side_effect=OSError("settings unreadable")):
         assert bootstrap.connector_less_route() is False
 
 
