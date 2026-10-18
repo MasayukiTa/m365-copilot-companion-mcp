@@ -1226,7 +1226,12 @@ function Test-TunnelHosting {
 #   ours     the tunnel answers with our pid, or a devtunnel host of OURS is running and nothing
 #            contradicts it -> fine.
 #   none     nobody hosts it -> re-host after the debounce, exactly as before.
-#   foreign  it is hosted, but not by a host process of this machine -> ANOTHER PC is serving
+#   stale    (2026-10-19) hosted per the relay's count, no host process of this machine, and a probe
+#            through the URL that RAN got NO answer: a ghost connection left by our own dead host
+#            (measured: 15+ minutes after a network drop). Re-host after the debounce, at most one
+#            such re-host per 10 minutes.
+#   foreign  it is hosted, no host process of this machine, AND the URL answers with a server pid
+#            that is not this machine's (evidence) -> ANOTHER PC is serving
 #            this PC's tunnel. Do not fight: say so once in the log and in .fleet\tunnel_host.json
 #            (which doctor reads), with what to do. When the other PC lets go the count falls to 0
 #            and this PC re-hosts by itself.
@@ -1302,14 +1307,48 @@ function Get-HealthPidAt {
 
 function Resolve-TunnelHostingState {
     # PURE. See the block comment above for what each answer means.
-    param($Connections, [bool]$OurHostRunning, $LocalPid, $TunnelPid)
+    #
+    # "foreign" NEEDS EVIDENCE (2026-10-19). A connection count >= 1 with no host of ours is also
+    # what a GHOST looks like: the relay keeps the connection of our own dead host for 15+ minutes
+    # after a network drop. Measured: 'foreign' was declared with nothing answering through the
+    # URL, and the supervisor then refused to re-host while a hand-started host took over at once.
+    # So foreign = a probe that RAN got an ANSWER (a server pid) other than this PC's. A probe that
+    # ran and got no answer = "stale" (a ghost; nobody serves traffic). A probe that did not run
+    # ($ProbeOutcome "skipped": backoff; "nourl": no URL to ask) is no evidence either way: the
+    # previous state is kept.
+    param($Connections, [bool]$OurHostRunning, $LocalPid, $TunnelPid,
+          [string]$ProbeOutcome = "noanswer", [string]$PreviousState = "")
     if ($LocalPid -and $TunnelPid -and ([int]$TunnelPid -eq [int]$LocalPid)) { return "ours" }
     if ($null -eq $Connections -or [int]$Connections -lt 1) { return "none" }
     if ($OurHostRunning) {
         if ($LocalPid -and $TunnelPid) { return "shared" }
         return "ours"
     }
-    return "foreign"
+    if ($TunnelPid) { return "foreign" }
+    if ($ProbeOutcome -eq "skipped") {
+        if ($PreviousState) { return $PreviousState }
+        return "stale"
+    }
+    if ($ProbeOutcome -eq "nourl") {
+        if ($PreviousState) { return $PreviousState }
+        return "foreign"
+    }
+    return "stale"
+}
+
+# AT MOST ONE STALE RE-HOST PER 10 MINUTES. If the re-host of a "stale" tunnel does not cure it
+# (the relay keeps a connection that does not answer), re-hosting every few ticks would churn the
+# relay for nothing; the next try waits for this window.
+$script:StaleRehostAt = $null
+$script:StaleRehostMinSeconds = 600
+$script:StaleBlockedLogged = $false
+$script:TunnelProbeOutcome = ""
+
+function Test-StaleRehostAllowed {
+    # PURE. $LastAt is $null (never re-hosted for a ghost) or the time of the last such re-host.
+    param($LastAt, [datetime]$Now, [int]$MinSeconds = 600)
+    if ($null -eq $LastAt) { return $true }
+    return ((($Now - [datetime]$LastAt).TotalSeconds) -ge $MinSeconds)
 }
 
 # THE PROBE THROUGH THE TUNNEL IS BOUNDED. It is a remote round trip (up to 6 s), and in exactly
@@ -1327,14 +1366,23 @@ function Reset-TunnelProbeBackoff {
 }
 
 function Get-TunnelServerPidBounded {
-    if ($script:TunnelProbeSkip -gt 0) { $script:TunnelProbeSkip--; return $null }
+    # Returns $null for three different reasons, which $script:TunnelProbeOutcome tells apart:
+    # "skipped" (backoff: no probe ran), "nourl" (nothing to ask), "noanswer" (it ran, no answer);
+    # "answered" when it returns a pid.
+    if ($script:TunnelProbeSkip -gt 0) {
+        $script:TunnelProbeSkip--
+        $script:TunnelProbeOutcome = "skipped"
+        return $null
+    }
     $origin = Get-TunnelOrigin (Get-EnvTunnelUrl)
-    if (-not $origin) { return $null }
+    if (-not $origin) { $script:TunnelProbeOutcome = "nourl"; return $null }
     $p = Get-HealthPidAt ($origin + "/health") 6000
     if ($null -eq $p) {
+        $script:TunnelProbeOutcome = "noanswer"
         $script:TunnelProbeSkip = $script:TunnelProbeBackoff
         $script:TunnelProbeBackoff = [int][math]::Min($script:TunnelProbeBackoff * 2, $script:TunnelProbeBackoffMax)
     } else {
+        $script:TunnelProbeOutcome = "answered"
         Reset-TunnelProbeBackoff
     }
     return $p
@@ -1370,6 +1418,15 @@ function Get-TunnelHostingAdvice {
                 Action  = ("On the OTHER PC run quickstart.bat so it creates its own tunnel (and paste that " +
                            "PC's new URL into its own Copilot Studio connector); then on THIS PC run " +
                            "start_all.bat.")
+            }
+        }
+        "stale" {
+            return @{
+                Message = ("The relay reports " + $Connections + " host connection(s) for this PC's tunnel '" +
+                           $Name + "', but no devtunnel host of this PC is running and nothing answers " +
+                           "through the tunnel URL: it looks like a stale (ghost) connection left by a host " +
+                           "of this PC that died. The supervisor re-hosts the tunnel (at most once per 10 minutes).")
+                Action  = ""
             }
         }
         "none" {
@@ -1420,13 +1477,15 @@ function Invoke-TunnelHostingCheck {
     $ourHost = $false
     $localPid = $null
     $tunnelPid = $null
+    $script:TunnelProbeOutcome = ""
     if ($null -ne $conn -and $conn -ge 1) {
         $ourHost = Test-OurTunnelHostRunning
         $localPid = Get-HealthPidAt "http://127.0.0.1:$Port/health" 5000
         $tunnelPid = Get-TunnelServerPidBounded
     }
     $state = Resolve-TunnelHostingState -Connections $conn -OurHostRunning $ourHost `
-                                        -LocalPid $localPid -TunnelPid $tunnelPid
+                                        -LocalPid $localPid -TunnelPid $tunnelPid `
+                                        -ProbeOutcome $script:TunnelProbeOutcome -PreviousState $script:TunnelState
     $wasContested = ($script:TunnelState -eq "foreign" -or $script:TunnelState -eq "shared")
 
     if ($state -eq "foreign" -or $state -eq "shared") {
@@ -1451,7 +1510,45 @@ function Invoke-TunnelHostingCheck {
         Write-Log ("tunnel no longer served by another PC (now: " + $state + ", host connections = " + $conn + ")")
     }
     $script:TunnelState = $state
+
+    if ($state -eq "stale") {
+        # A GHOST: the relay counts a connection, no host of this PC runs, and nothing answers
+        # through the URL. Re-host through the same debounce as "none", bounded to one stale
+        # re-host per 10 minutes; if the URL then answers with a foreign pid the next tick says
+        # foreign/shared and nothing here fights it.
+        Set-TunnelHostStatus -State "stale" -Connections $conn -OurHostRunning $ourHost `
+                             -LocalPid $localPid -TunnelPid $tunnelPid
+        $script:tunnelMiss++
+        if ($script:tunnelMiss -lt $FailuresBeforeAction) { return $state }
+        $script:tunnelMiss = 0
+        if (-not (Test-StaleRehostAllowed $script:StaleRehostAt (Get-Date) $script:StaleRehostMinSeconds)) {
+            if (-not $script:StaleBlockedLogged) {
+                Write-Log ("tunnel host connection still looks stale (connections=" + $conn + "), but a stale " +
+                           "re-host was done less than " + [int]($script:StaleRehostMinSeconds / 60) +
+                           " minutes ago: waiting before the next one")
+                $script:StaleBlockedLogged = $true
+            }
+            return $state
+        }
+        Clear-DevtunnelLoginCache "tunnel host connection is stale"
+        if ($script:DevtunnelLoginAnswerWasCached -and -not (Test-DevtunnelLoggedInCached)) {
+            Write-Log "devtunnel NOT logged in on the live re-check before re-hosting -> tunnel management PAUSED, not re-hosting."
+            $script:loggedIn = $false
+            return $state
+        }
+        Write-Log ("tunnel host connection looks stale (connections=" + $conn + ", no answer through the URL, " +
+                   "no host of this PC): re-hosting")
+        $script:StaleRehostAt = Get-Date
+        $script:StaleBlockedLogged = $false
+        if (-not (Start-TunnelHost)) {
+            Clear-DevtunnelLoginCache "the stale re-host did not establish"
+        }
+        Start-Sleep -Seconds 8
+        return $state
+    }
+
     if ($state -eq "ours") {
+        $script:StaleBlockedLogged = $false
         $script:tunnelMiss = 0
         Set-TunnelHostStatus -State "ours" -Connections $conn -OurHostRunning $ourHost `
                              -LocalPid $localPid -TunnelPid $tunnelPid
@@ -2843,7 +2940,8 @@ if (-not (Test-TunnelRouteWanted)) {
         $startupTunnelPid = Get-TunnelServerPidBounded
     }
     $startupTunnelState = Resolve-TunnelHostingState -Connections $startupConn -OurHostRunning $startupOurHost `
-                                                      -LocalPid $startupLocalPid -TunnelPid $startupTunnelPid
+                                                      -LocalPid $startupLocalPid -TunnelPid $startupTunnelPid `
+                                                      -ProbeOutcome $script:TunnelProbeOutcome
     Set-TunnelHostStatus -State $startupTunnelState -Connections $startupConn -OurHostRunning $startupOurHost `
                          -LocalPid $startupLocalPid -TunnelPid $startupTunnelPid
     # Seeds the tick loop's own state tracking so its first "was this contested before" check
