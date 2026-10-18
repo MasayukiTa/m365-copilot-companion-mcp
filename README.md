@@ -194,6 +194,9 @@ A. Dev Tunnel の公開 URL が生成・host されているか確認してく�
 **Q. エージェントがツールを呼んでくれない**
 A. Copilot Studio でエージェントに MCP コネクタの「接続を承認」が済んでいるか確認してください。認証（Bearer）が通っていないと呼び出せません。「API キーの値」に `Bearer ` を付け忘れていないかも確認を。
 
+**Q. 組織の設定で、自分の MCP のコネクタ(接続)が作れない**
+A. コネクタもトンネルも使わない別の経路があります。標準のエージェントに Microsoft 提供のツールだけを付け、ツールの呼び出しはこの PC が受け持ちます。手順は [docs/custom_mcp_fallback_route.md](docs/custom_mcp_fallback_route.md)、仕組みと設定は [docs/connector_less_route.md](docs/connector_less_route.md) です。**注意:** 鍵なしで公開したツールは、リンクを知っている全員が使えます。各自が自分の環境(自分のエージェントと自分の PC)を作り、他人のツールやエージェントのリンクは使わないでください。
+
 **Q. 途中で失敗した。やり直して大丈夫？**
 A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行しても安全**で、足りないものだけ補います。既に動いているトンネルは止めません。
 
@@ -266,6 +269,8 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 - [docs/SECURITY.md](docs/SECURITY.md) — 認証・認可モデルと運用上の注意
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 症状別の直し方・doctor 各行の意味
 - [docs/ADVANCED.md](docs/ADVANCED.md) — 全ツールカタログ・relay/fleet の詳細・ODBC・ベンチ再現手順
+- [docs/custom_mcp_fallback_route.md](docs/custom_mcp_fallback_route.md) — MCP のコネクタが作れないときの、コネクタ・トンネルなしの経路(画面つき手順)
+- [docs/connector_less_route.md](docs/connector_less_route.md) — その経路の仕組み・設定(`tool_transport`)・制約
 - [scripts/AUTOSTART.md](scripts/AUTOSTART.md) — ログオン時自動起動の設定・解除方法
 
 ---
