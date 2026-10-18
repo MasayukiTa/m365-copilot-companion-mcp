@@ -132,7 +132,7 @@ ui/_buildcheck/
 !/docs/agent_contract.md
 /docs/validation/
 # generic how-to for an organisation whose DLP policy blocks the MCP connection
-!/docs/dlp_fallback_route.md
+!/docs/custom_mcp_fallback_route.md
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py
 /bench/_pro_*.py
