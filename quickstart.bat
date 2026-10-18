@@ -211,6 +211,15 @@ if defined DO_PULL (
     )
 )
 
+REM THE TOOL ROUTE (setting tool_transport, GUI: Settings > Tools), asked of the product's own
+REM reader so this file, the other scripts and the GUI cannot disagree. "connector" (the default
+REM and what an unreadable answer means) needs a custom connector and a Dev Tunnel. "connector-less"
+REM needs neither: the access question and STEP 4 below are skipped and STEP 5 does not ask for a
+REM connector. See docs/connector_less_route.md.
+set "TOOL_ROUTE=connector"
+for /f "usebackq delims=" %%R in (`"!QS_PY!" -m relay.tool_bridge 2^>nul`) do set "TOOL_ROUTE=%%R"
+if "!TOOL_ROUTE!"=="connector-less" goto :route_connectorless
+
 echo.
 echo ===========================================================================
 echo  How should Copilot Studio be allowed to reach this machine?
@@ -226,16 +235,21 @@ echo   [T] Tenant     - only accounts in the Entra tenant of the Microsoft accou
 echo                    you sign devtunnel in with in STEP 4. More restrictive.
 echo   [N] Neither    - decide later. Copilot Studio will NOT connect, and quickstart
 echo                    STOPS after STEP 4 until you choose A or T.
+echo   [L] Connector-less - no custom connector and NO Dev Tunnel. The agent writes
+echo                    its tool calls in the chat and this PC runs them. STEP 4 is
+echo                    skipped. See docs\connector_less_route.md. Change it later in
+echo                    Settings ^> Tools ^> Tool route.
 echo.
 set "TUNNEL_ACCESS="
 set "TENANT_ID="
-choice /C ATN /N /M "   Press A, T or N: "
+choice /C ATNL /N /M "   Press A, T, N or L: "
 REM Read errorlevel IMMEDIATELY -- choice sets it (A=1, T=2, N=3) and any command
 REM in between resets it. Delayed expansion is on, so !ERRORLEVEL! is the runtime value.
 set "QS_CHOICE=!ERRORLEVEL!"
 if "!QS_CHOICE!"=="1" set "TUNNEL_ACCESS=anonymous"
 if "!QS_CHOICE!"=="2" set "TUNNEL_ACCESS=tenant"
 if "!QS_CHOICE!"=="3" set "TUNNEL_ACCESS=none"
+if "!QS_CHOICE!"=="4" goto :route_choose_connectorless
 REM NO ANSWER IS NOT N (2026-09-24). MEASURED: with stdin closed, `choice` prints "ERROR: The file
 REM is either empty or does not contain the valid choices" and sets none of the above. That used
 REM to be recorded as N, the run went on, and it ended with a tunnel nothing could connect to
@@ -352,6 +366,7 @@ if errorlevel 1 (
     exit /b 1
 )
 
+:after_step4
 echo.
 echo ===========================================================================
 echo  Convenience setup  (asked BEFORE anything is created)
@@ -431,6 +446,9 @@ REM straight past it. With the marker the skip is not offered; STEP 5/6 shows th
 REM marker is deleted once that leg is done.
 set "KEY_REMADE="
 if exist ".setup\bearer_remade" set "KEY_REMADE=1"
+REM Nothing is pasted into Copilot Studio on the connector-less route, so a re-made key needs no STEP 5.
+REM The marker is KEPT: if the route is switched back to the connector, the new key must still be pasted.
+if defined KEY_REMADE if "!TOOL_ROUTE!"=="connector-less" set "KEY_REMADE="
 if defined KEY_REMADE (
     echo.
     echo   The connection key was re-made on this PC ^(the old one came from another PC or account^).
@@ -455,13 +473,25 @@ if not defined SKIP56 (
     echo ===========================================================================
     echo  STEP 5/7  Copilot Studio  ^(the ONLY manual, by-hand step^)
     echo ===========================================================================
-    echo   Add an MCP connector in Copilot Studio, then create your companion agent.
-    echo   The 3 EXACT values to paste are printed below ^(full guide: README STEP 4^):
-    echo.
-    echo   Opening Copilot Studio ^(https://copilotstudio.microsoft.com/^) in your browser...
-    start "" "https://copilotstudio.microsoft.com/"
-    echo.
-    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\copilot_studio_values.ps1"
+    if "!TOOL_ROUTE!"=="connector-less" (
+        echo   Connector-less route: create a STANDARD agent and add NO connector or tool.
+        echo   Steps ^(full guide: docs\connector_less_route.md^):
+        echo     1. In Copilot Studio create an agent, leave Tools empty, and Publish it.
+        echo     2. Add it to Microsoft 365 Copilot ^(Channels, then Microsoft 365 Copilot^).
+        echo     3. For mail and calendar, add the Microsoft Work IQ tools to the agent and
+        echo        approve their consent cards once.
+        echo   Opening Copilot Studio ^(https://copilotstudio.microsoft.com/^) in your browser...
+        start "" "https://copilotstudio.microsoft.com/"
+        echo.
+    ) else (
+        echo   Add an MCP connector in Copilot Studio, then create your companion agent.
+        echo   The 3 EXACT values to paste are printed below ^(full guide: README STEP 4^):
+        echo.
+        echo   Opening Copilot Studio ^(https://copilotstudio.microsoft.com/^) in your browser...
+        start "" "https://copilotstudio.microsoft.com/"
+        echo.
+        powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\copilot_studio_values.ps1"
+    )
     echo   After creating the agent, open it in M365 Copilot and copy its address-bar
     echo   URL -- you will paste it into a dialog in the next step.
     echo.
@@ -646,6 +676,28 @@ REM ---- subroutines and early exits (never reached by falling through) --------
 :release_lock
 powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\quickstart_lock.ps1" release >nul 2>nul
 exit /b 0
+
+:route_choose_connectorless
+echo.
+"!QS_PY!" -m relay.tool_bridge set connector-less
+if errorlevel 1 (
+    echo   STOPPED: could not record the connector-less route in the settings file.
+    echo   Nothing was changed. Run quickstart.bat again, or set it in Settings ^> Tools.
+    call :release_lock
+    pause
+    exit /b 5
+)
+echo   Recorded: connector-less route ^(tool_transport=connector-less^).
+
+:route_connectorless
+echo.
+echo ===========================================================================
+echo  Tool route: connector-less  ^(no custom connector, no Dev Tunnel^)
+echo ===========================================================================
+echo   The access question and STEP 4 ^(Dev Tunnel^) are skipped. To use the connector
+echo   route instead, set Settings ^> Tools ^> Tool route to Connector and run
+echo   quickstart.bat again.
+goto :after_step4
 
 :access_unanswered
 echo.
