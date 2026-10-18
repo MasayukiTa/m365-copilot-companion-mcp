@@ -261,6 +261,7 @@ partial class CockpitWindow
                 return "live";
             case "tool_probe_idle_min":
             case "merge_conversation":
+            case "tool_transport":
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
             case "rate_ceiling_rpm":
@@ -774,6 +775,10 @@ partial class CockpitWindow
         col.Children.Add(SupervisorSelfRestartControl());
         col.Children.Add(ToolProbeControl());
         PaintToolProbeInEffect();
+
+        // ── Tool route / ツール: how a fleet conversation reaches its tools (connector or connector-less).
+        col.Children.Add(SectionHeader(L("ツール", "Tools")));
+        col.Children.Add(ToolRouteControl());
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //
