@@ -442,13 +442,23 @@ def test_wrong_shape_index_file_is_tolerated():
     assert idx["topics"] == []
 
 
-def test_save_recovers_cleanly_after_malformed_index():
+def test_save_never_replaces_a_malformed_index():
+    """The index is not rewritten from a stand-in: the topic (the data) is
+    saved, the damaged index is left byte-for-byte as found."""
     amo._ensure_dirs()
     amo._index_path().write_text("{{{ broken", encoding="utf-8")
     result = amo.memory_save(topic_id="infra_ssh", title="v1")
-    assert "created" in result.lower() or "updated" in result.lower()
-    idx = amo._load_index()
-    assert any(t["id"] == "infra_ssh" for t in idx["topics"])
+    assert "saved topic" in result and "NOT modified" in result
+    assert amo._index_path().read_text(encoding="utf-8") == "{{{ broken"
+    assert amo._load_topic("infra_ssh")["title"] == "v1"
+
+
+def test_save_refuses_a_malformed_topic_file():
+    amo._ensure_dirs()
+    amo._topic_path("infra_ssh").write_text("{{{ broken", encoding="utf-8")
+    result = amo.memory_save(topic_id="infra_ssh", title="v1")
+    assert "error" in result.lower()
+    assert amo._topic_path("infra_ssh").read_text(encoding="utf-8") == "{{{ broken"
 
 
 def test_missing_topic_dir_is_tolerated_by_list_and_search():

@@ -21,6 +21,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import state_store
 from .security import require_unlocked
 
 STATE_FILE = Path(__file__).resolve().parent.parent / ".procedural_memory.json"
@@ -128,21 +129,37 @@ def _dedup_preserve_order(items: list[str]) -> list[str]:
     return out
 
 
-def _load() -> dict:
-    if STATE_FILE.exists():
-        try:
-            data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict) and isinstance(data.get("procedures"), dict):
-                return data
-            return {"procedures": {}}
-        except Exception:
-            return {"procedures": {}}
+def _valid_state(data) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("procedures"), dict)
+
+
+def _entry_count(state: dict) -> int:
+    return len(state["procedures"])
+
+
+def _empty_state() -> dict:
     return {"procedures": {}}
 
 
-def _save(state: dict) -> None:
-    STATE_FILE.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+def _load() -> dict:
+    """Read the store. NEVER turns an unreadable file into an empty state.
+
+    A read/parse failure retries, then falls back to the newest valid backup
+    generation, and otherwise raises state_store.StateUnreadable (callers that
+    would save then refuse). Only a missing or zero-byte file is "empty".
+    """
+    return state_store.read_json(STATE_FILE, validate=_valid_state, default=_empty_state)
+
+
+def _update(mutate, *, allow_shrink: bool = False):
+    """Locked, atomic read-modify-write of the whole store (see state_store)."""
+    return state_store.update_json(
+        STATE_FILE,
+        mutate,
+        validate=_valid_state,
+        count=_entry_count,
+        default=_empty_state,
+        allow_shrink=allow_shrink,
     )
 
 
@@ -212,22 +229,22 @@ def procedural_memory_save(
             return f"[procedural_memory_save error: snippet exceeds {MAX_SNIPPET_CHARS} chars]"
         tag_list = [t.strip() for t in (tags or "").split(",") if t.strip()]
         slug = _slugify(intent)
-        state = _load()
-        bucket = state["procedures"]
-        prev = bucket.get(slug)
-        bucket[slug] = {
-            "intent": intent,
-            "snippet": snippet,
-            "tags": tag_list,
-            "context": context or "",
-            "updated_at": time.time(),
-            "history_count": (prev.get("history_count", 0) if prev else 0) + 1,
-        }
-        _save(state)
-        return (
-            f"saved procedure [{slug}] ({len(snippet)} chars, "
-            f"rev #{bucket[slug]['history_count']})"
-        )
+
+        def _mutate(state: dict) -> int:
+            bucket = state["procedures"]
+            prev = bucket.get(slug)
+            bucket[slug] = {
+                "intent": intent,
+                "snippet": snippet,
+                "tags": tag_list,
+                "context": context or "",
+                "updated_at": time.time(),
+                "history_count": (prev.get("history_count", 0) if prev else 0) + 1,
+            }
+            return bucket[slug]["history_count"]
+
+        rev = _update(_mutate)
+        return f"saved procedure [{slug}] ({len(snippet)} chars, rev #{rev})"
     except Exception as e:
         return f"[procedural_memory_save error: {type(e).__name__}: {e}]"
 
@@ -351,13 +368,19 @@ def procedural_memory_delete(intent_slug: str) -> str:
     try:
         if not intent_slug or not isinstance(intent_slug, str):
             return "[procedural_memory_delete error: intent_slug must be a non-empty string]"
-        state = _load()
-        bucket = state["procedures"]
-        key = intent_slug if intent_slug in bucket else _slugify(intent_slug)
-        if key not in bucket:
+
+        def _mutate(state: dict):
+            bucket = state["procedures"]
+            key = intent_slug if intent_slug in bucket else _slugify(intent_slug)
+            if key not in bucket:
+                return None
+            bucket.pop(key)
+            return key
+
+        # An explicit delete is the one legitimate way for the store to shrink.
+        key = _update(_mutate, allow_shrink=True)
+        if key is None:
             return f"[procedural_memory_delete: no entry at {intent_slug!r}]"
-        bucket.pop(key)
-        _save(state)
         return f"deleted procedure [{key}]"
     except Exception as e:
         return f"[procedural_memory_delete error: {type(e).__name__}: {e}]"
@@ -413,12 +436,18 @@ def procedural_memory_import_markdown(path: str, tags: str = "") -> str:
             chunk_tags = _dedup_preserve_order(
                 caller_tags + ["import", f"src:{basename}"] + _extract_table_tags(body_stripped)
             )
-            procedural_memory_save(
+            saved = procedural_memory_save(
                 intent=intent,
                 snippet=snippet,
                 tags=",".join(chunk_tags),
                 context=context,
             )
+            if not saved.startswith("saved procedure"):
+                # a refused/failed save must not be reported as imported
+                return (
+                    f"[procedural_memory_import_markdown stopped after {imported} chunks: "
+                    f"{saved}]"
+                )
             imported += 1
         return f"imported {imported} chunks from {basename} (skipped {skipped} empty)"
     except Exception as e:

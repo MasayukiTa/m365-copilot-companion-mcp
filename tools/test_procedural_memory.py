@@ -174,18 +174,20 @@ def test_save_same_intent_twice_updates_and_bumps_revision():
     assert state["procedures"]["repeat_task"]["snippet"] == "v2 snippet"
 
 
-def test_malformed_state_file_is_tolerated(tmp_path, monkeypatch):
+def test_malformed_state_file_is_never_treated_as_empty(tmp_path, monkeypatch):
+    """An unreadable file with no valid backup must not become an empty store:
+    reads report the problem and a save refuses, leaving the bytes untouched
+    (the old behaviour replaced the whole file with one entry)."""
     bad_file = tmp_path / "bad.json"
     bad_file.write_text("{ this is not valid json", encoding="utf-8")
     monkeypatch.setattr(pm, "STATE_FILE", bad_file)
 
-    # _load must not raise, and search over the recovered-empty store is clean.
     result = pm.procedural_memory_search("anything")
-    assert result == "(no matches)"
+    assert "unreadable" in result and "no matches" not in result
 
-    # save must still work afterward (overwrites the malformed file cleanly).
     save_result = pm.procedural_memory_save(intent="after bad file", snippet="works fine")
-    assert "saved procedure" in save_result
+    assert "error" in save_result.lower()
+    assert bad_file.read_text(encoding="utf-8") == "{ this is not valid json"
 
 
 def test_missing_state_file_is_tolerated(tmp_path, monkeypatch):
@@ -194,14 +196,15 @@ def test_missing_state_file_is_tolerated(tmp_path, monkeypatch):
     assert result == "(no matches)"
 
 
-def test_wrong_shape_state_file_is_tolerated(tmp_path, monkeypatch):
-    """A JSON file that parses but isn't the expected {"procedures": {...}} shape
-    (e.g. a list, or missing the key) must not raise."""
+def test_wrong_shape_state_file_is_not_overwritten(tmp_path, monkeypatch):
+    """A JSON file that parses but isn't {"procedures": {...}} is unreadable
+    for our purposes: reads report it and a save refuses to replace it."""
     odd_file = tmp_path / "odd.json"
     odd_file.write_text('["not", "a", "dict"]', encoding="utf-8")
     monkeypatch.setattr(pm, "STATE_FILE", odd_file)
-    result = pm.procedural_memory_search("anything")
-    assert result == "(no matches)"
+    assert "unreadable" in pm.procedural_memory_search("anything")
+    assert "error" in pm.procedural_memory_save(intent="x", snippet="y").lower()
+    assert odd_file.read_text(encoding="utf-8") == '["not", "a", "dict"]'
 
 
 # ===========================================================================

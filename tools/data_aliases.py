@@ -32,10 +32,9 @@ expand_terms would silently break that caller for locked clients.
 """
 from __future__ import annotations
 
-import json
-import os
 from pathlib import Path
 
+from . import state_store
 from .security import require_unlocked
 
 STATE_FILE = Path(__file__).resolve().parent.parent / ".procedural_memory_aliases.json"
@@ -43,36 +42,29 @@ STATE_FILE = Path(__file__).resolve().parent.parent / ".procedural_memory_aliase
 _EXPAND_CAP_DEFAULT = 16
 
 
+def _clean(data: dict) -> dict:
+    clean: dict = {}
+    for k, v in data.items():
+        if isinstance(k, str) and isinstance(v, list):
+            clean[k] = [s for s in v if isinstance(s, str)]
+    return clean
+
+
+def _is_dict(data) -> bool:
+    return isinstance(data, dict)
+
+
 def _load_aliases() -> dict:
-    """Load the alias store as {str: [str, ...]}. Missing file, corrupt JSON,
-    a non-dict top level, or a non-list value under some key are all
-    tolerated by falling back to {} (or dropping just the bad key) -- never
-    raises."""
-    if not STATE_FILE.exists():
-        return {}
+    """READ-ONLY view of the alias store as {str: [str, ...]}.
+
+    Missing file -> {}. An unreadable file (after retries and backups) also
+    yields {} here so query expansion never raises -- but this result must
+    never be saved back; data_aliases_add goes through state_store.update_json,
+    which refuses to write over an unreadable store."""
     try:
-        data = json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        if not isinstance(data, dict):
-            return {}
-        clean: dict = {}
-        for k, v in data.items():
-            if isinstance(k, str) and isinstance(v, list):
-                clean[k] = [s for s in v if isinstance(s, str)]
-        return clean
-    except Exception:
+        return _clean(state_store.read_json(STATE_FILE, validate=_is_dict, default=dict))
+    except state_store.StateStoreError:
         return {}
-
-
-def _save_aliases(data: dict) -> None:
-    """Atomic write (tmp file + os.replace, same pattern as tools/auth_stats.py
-    and tools/contract_gate.py) so a crash mid-write never corrupts the store.
-    utf-8 + ensure_ascii=False so Japanese terms round-trip as literal
-    characters, not \\uXXXX escapes."""
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    tmp = str(STATE_FILE) + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, str(STATE_FILE))
 
 
 def _connected_group(term: str, data: dict) -> list[str]:
@@ -163,13 +155,19 @@ def data_aliases_add(term: str, synonyms: str) -> str:
         if not syn_list:
             return "[data_aliases_add error: no usable synonyms found in input]"
 
-        data = _load_aliases()
-        merged = list(data.get(term, []))
-        for s in syn_list:
-            if s != term and s not in merged:
-                merged.append(s)
-        data[term] = merged
-        _save_aliases(data)
+
+        def _mutate(data: dict) -> list:
+            prev = data.get(term)
+            merged = [x for x in prev if isinstance(x, str)] if isinstance(prev, list) else []
+            for s in syn_list:
+                if s != term and s not in merged:
+                    merged.append(s)
+            data[term] = merged
+            return merged
+
+        merged = state_store.update_json(
+            STATE_FILE, _mutate, validate=_is_dict, count=len, default=dict
+        )
         return f"aliases[{term}] -> {len(merged)} synonym(s): {', '.join(merged)}"
     except Exception as e:
         return f"[data_aliases_add error: {type(e).__name__}: {e}]"
