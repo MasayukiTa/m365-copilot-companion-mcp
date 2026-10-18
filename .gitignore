@@ -33,6 +33,11 @@ dist/
 .memory_state.json
 .procedural_memory.json
 .procedural_memory_aliases.json
+# tools/state_store.py side files: generation backups, lock, temp
+.*.json.bak.*
+.*.json.lock
+.*.json.*.tmp
+agent_memory/index.json.*
 .companion_runs/
 .companion_gates/
 
