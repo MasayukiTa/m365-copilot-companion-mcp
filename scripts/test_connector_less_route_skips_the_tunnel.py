@@ -65,6 +65,9 @@ def test_quickstart_skips_step_4_and_the_connector_values_when_connector_less():
     # the choice is offered where the access question is asked, and recorded through the product
     assert "choice /C ATNL" in qs and 'if "!QS_CHOICE!"=="4" goto :route_choose_connectorless' in qs
     assert "-m relay.tool_bridge set connector-less" in qs
+    # ...and THIS run follows the choice at once (the reader above ran before it was made)
+    choose = qs[qs.index(":route_choose_connectorless\n"):qs.index(":route_connectorless\n", qs.index(":route_choose_connectorless\n"))]
+    assert 'set "TOOL_ROUTE=connector-less"' in choose
     # the connector values are not shown for it
     block = qs[qs.index('if "!TOOL_ROUTE!"=="connector-less" (\n        echo   Connector-less route'):]
     assert block.index("copilot_studio_values.ps1") > block.index(") else (")

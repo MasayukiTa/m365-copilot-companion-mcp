@@ -679,7 +679,7 @@ exit /b 0
 
 :route_choose_connectorless
 echo.
-"!QS_PY!" -m relay.tool_bridge set connector-less
+"!QS_PY!" -m relay.tool_bridge set connector-less >nul
 if errorlevel 1 (
     echo   STOPPED: could not record the connector-less route in the settings file.
     echo   Nothing was changed. Run quickstart.bat again, or set it in Settings ^> Tools.
@@ -688,6 +688,8 @@ if errorlevel 1 (
     exit /b 5
 )
 echo   Recorded: connector-less route ^(tool_transport=connector-less^).
+REM This run follows the choice just made; the reader at the top of the file ran before it.
+set "TOOL_ROUTE=connector-less"
 
 :route_connectorless
 echo.
