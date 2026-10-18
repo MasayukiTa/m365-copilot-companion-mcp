@@ -181,6 +181,7 @@ $script:startupUnclear = @()
 # arithmetic plus one hashtable write -- never throws, so a phase that itself fails still gets
 # its time recorded by the caller's own try/finally or by running to its next statement.
 $script:phaseTimings = [ordered]@{}
+$script:bridgePoll = $null   # Wait-BridgeConv result, set only when a bridge was started and polled
 function Record-PhaseTiming([string]$Name, [datetime]$Since) {
     if (-not $script:phaseTimings) { $script:phaseTimings = [ordered]@{} }
     $script:phaseTimings[$Name] = [math]::Round(((Get-Date) - $Since).TotalSeconds, 2)
@@ -716,6 +717,9 @@ function New-StartAllRunRecord([string]$Outcome) {
         outcome          = $Outcome
         holder_pid       = [int]$script:busyHolderPid
         phases           = $(if ($script:phaseTimings) { $script:phaseTimings } else { [ordered]@{} })
+        # The :8765/conv poll of this run (Wait-BridgeConv): per-attempt timing, the first
+        # success or the give-up time. $null on a run that did not start a bridge.
+        bridge_poll      = $script:bridgePoll
     }
 }
 function Enter-StartAllRunLogLock([string]$Path) {
@@ -1186,6 +1190,33 @@ function Get-BridgePollAttempts([string]$ImplAgentUrl, [int]$MaxAttempts = 8) {
     # plus a Python import is a real, sometimes-slow startup this must not shortcut.
     if (-not $ImplAgentUrl) { return 0 }
     return $MaxAttempts
+}
+
+function Wait-BridgeConv([string]$Url, [int]$MaxAttempts, [int]$SleepSec = 2) {
+    # THE :8765/conv POLL, WITH ITS TIMINGS KEPT. Same loop as before (sleep, probe, stop at the
+    # first answer); what is new is that every attempt is recorded -- when it ran and how long
+    # the probe took, in seconds from the call -- and the first success or the give-up time is
+    # reported. start_all_runs.jsonl carries the result (bridge_poll), so "the bridge was slow"
+    # and "the bridge never came" stop being the same line and the distribution of the first
+    # success is on disk. LOGGING ONLY: the budget is the caller's MaxAttempts and is unchanged.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $tries = @()
+    $up = $false
+    $firstOk = $null
+    for ($i = 0; $i -lt $MaxAttempts; $i++) {
+        Start-Sleep -Seconds $SleepSec
+        $t0 = $sw.Elapsed.TotalSeconds
+        $ok = Http-Up $Url
+        $tries += [ordered]@{ n = ($i + 1); at_s = [math]::Round($t0, 1); took_s = [math]::Round($sw.Elapsed.TotalSeconds - $t0, 1); ok = [bool]$ok }
+        if ($ok) { $up = $true; $firstOk = [math]::Round($sw.Elapsed.TotalSeconds, 1); break }
+    }
+    return [ordered]@{
+        up           = $up
+        budget_s     = ($MaxAttempts * $SleepSec)
+        first_ok_s   = $firstOk
+        gave_up_s    = $(if ($up) { $null } else { [math]::Round($sw.Elapsed.TotalSeconds, 1) })
+        attempts     = $tries
+    }
 }
 
 function Show-OwnedDialog([string]$body, [string]$title, [string]$buttons, [string]$icon) {
@@ -3050,9 +3081,9 @@ function Invoke-Startup {
         # poll is skipped outright rather than waiting out the full ~16s on every single start.
         $bridgePollAttempts = Get-BridgePollAttempts (Env-Value "MCP_IMPL_AGENT_URL")
         $bridgeUp = $false
-        for ($bi = 0; $bi -lt $bridgePollAttempts; $bi++) {
-            Start-Sleep -Seconds 2
-            if (Http-Up "http://127.0.0.1:8765/conv") { $bridgeUp = $true; break }
+        if ($bridgePollAttempts -gt 0) {
+            $script:bridgePoll = Wait-BridgeConv "http://127.0.0.1:8765/conv" $bridgePollAttempts 2
+            $bridgeUp = [bool]$script:bridgePoll.up
         }
         if (-not $bridgeUp) {
             if ($bridgePollAttempts -eq 0) {
