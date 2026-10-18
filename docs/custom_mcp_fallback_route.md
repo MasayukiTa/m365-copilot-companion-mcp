@@ -1,11 +1,10 @@
-# When the DLP policy of Copilot Studio blocks your MCP connection
+# When you cannot build your own MCP connection in Copilot Studio: a route with no custom connector and no tunnel
 
-A route with no custom connector and no tunnel.
-
-This is a how-to for any organisation. It describes what to do when a data
-loss prevention (DLP) policy stops you from creating the connection that a
-Copilot Studio agent needs in order to reach your own MCP server, and how to
-reach the same goal through Microsoft-provided tools only.
+This is a how-to for any organisation. It describes what to do when the
+connection that a Copilot Studio agent needs in order to reach your own MCP
+server cannot be created, and how to reach the same goal through
+Microsoft-provided tools only. The route is an alternative architecture: it
+needs no custom connector, no tunnel and no exception to any rule.
 
 > **CAUTION - read before you publish anything.**
 > A tool that is published without API-key authentication ("keyless
@@ -18,25 +17,27 @@ reach the same goal through Microsoft-provided tools only.
 ## 1. The symptom
 
 You add an MCP server (or a custom connector) to a Copilot Studio agent. When
-Copilot Studio tries to create the connection, the dialog shows an error of the
-form:
+Copilot Studio tries to create the connection, it cannot be created: the dialog
+reports that your organisation's administrator settings blocked it, or the
+creation fails for another reason. The error is of the form:
 
 > Could not create a connection to `<your tool>`. It was blocked by your
-> organisation's data loss prevention or agent content protection policy
-> "`<policy name>`". Contact your administrator.
+> organisation's administrator settings, or the connection could not be
+> created. Contact your administrator.
 
-![The connection dialog showing the DLP block message](img/dlp_fallback/step1_dlp_block.png)
+![The connection dialog showing that the connection could not be created](img/custom_mcp_fallback/step1_connection_failed.png)
 
 Things worth knowing about this message:
 
 - It is raised when the **connection** is created, so it is independent of
   authentication. Switching between "API key" and "no authentication" does not
   change the outcome, and neither does a correct key.
-- The policy decides which connectors and MCP servers may be used together in
-  an environment. A custom MCP server is usually in the blocked group.
-- Only the administrator who owns the policy can change it. Do not try to
-  hide, rename or tunnel around it: the point of the route below is that it
-  needs nothing the policy forbids.
+- Your organisation's administrator settings decide which connectors and MCP
+  servers may be used together in an environment. A custom MCP server is often
+  not available in a given environment.
+- Only the administrator can change those settings. The route below does not
+  depend on changing them: it is an alternative architecture that needs no
+  custom connector of your own.
 
 ## 2. The route
 
@@ -50,27 +51,27 @@ carry the calls to your local tools.
 2. **Choose a model** for it in the agent settings.
 3. **Attach only Microsoft-provided tools that you are allowed to use.** For
    example the Work IQ MCP tools: Mail, Calendar, Teams, OneDrive, SharePoint,
-   Copilot and User. Attaching them did not trigger the DLP block, because
-   they are Microsoft-provided and the existing connection of the signed-in
-   user is reused.
+   Copilot and User. Attaching them created the connection without an error,
+   because they are Microsoft-provided and the existing connection of the
+   signed-in user is reused.
 
-   ![Tools page with the seven Work IQ tools attached](img/dlp_fallback/step2_tools_seven.png)
+   ![Tools page with the seven Work IQ tools attached](img/custom_mcp_fallback/step2_tools_seven.png)
 
 4. **Publish** the agent. Leave "force the latest version" off unless you need
    running Teams chats to move to the new version at once.
 
-   ![Publish dialog](img/dlp_fallback/step3_publish.png)
+   ![Publish dialog](img/custom_mcp_fallback/step3_publish.png)
 
 5. **Turn on the Microsoft 365 Copilot channel** ("Make agent available in
    Microsoft 365 Copilot") and add the channel.
 
-   ![Channels page, Microsoft 365 channel](img/dlp_fallback/step4_channel.png)
+   ![Channels page, Microsoft 365 channel](img/custom_mcp_fallback/step4_channel.png)
 
 6. **Add the agent from the agent store** in Microsoft 365 Copilot (open the
    agent store, open the agent, press "Add").
 
-   ![Agent store entry with the Add button](img/dlp_fallback/step5_store.png)
-   ![The agent added and ready for a chat](img/dlp_fallback/step6_added.png)
+   ![Agent store entry with the Add button](img/custom_mcp_fallback/step5_store.png)
+   ![The agent added and ready for a chat](img/custom_mcp_fallback/step6_added.png)
 
 7. **Copy the chat URL** of the agent from the address bar once its chat is
    open.
@@ -125,7 +126,7 @@ caller acts on that machine.
 
 - **Administrators can switch pieces off.** Custom-app upload in Teams, the
   Microsoft 365 Copilot channel, agent sharing or agent use can each be
-  disabled by tenant policy. If a step is greyed out, that is the reason.
+  disabled by tenant settings. If a step is greyed out, that is the reason.
 - **Publish capacity.** Environments and tenants have limits on published
   agents and on messages or credits. A Standard agent with Microsoft-provided
   tools avoids the credit use of the GitHub-Copilot type, but limits still
@@ -138,9 +139,10 @@ caller acts on that machine.
 - **Vendor-side behaviour can change.** The menus, wording and rules of
   Copilot Studio and Microsoft 365 Copilot are changed by Microsoft. This
   guide describes what worked on the date below; re-check each step.
-- This route works **with** your DLP policy, not around it. If your
-  organisation prohibits the tools or channels used here, do not use it; ask
-  the administrator.
+- This route works **within** your organisation's settings, not around them.
+  It uses only Microsoft-provided tools and channels and asks for no
+  exception. If your organisation prohibits the tools or channels used here,
+  do not use it; ask the administrator.
 
 ## 5. Rolling back
 
@@ -160,15 +162,15 @@ Verified (one test tenant, October 2026):
 
 - Creating a Standard-type agent, choosing a model, attaching the seven Work IQ
   tools, publishing, adding the Microsoft 365 channel and adding the agent from
-  the agent store all completed without a DLP message.
+  the agent store all completed without an error.
 - Mail, calendar, Teams and file questions put to the new agent returned
   answers matching those of an agent that had been built earlier.
-- The DLP block message on connection creation was reproduced with a dummy
-  custom tool, both with API-key and with no authentication.
+- The failure to create a connection was reproduced with a dummy custom tool,
+  both with API-key and with no authentication.
 
 Not verified:
 
-- Other tenants, other DLP policies, other regions or licences.
+- Other tenants, other administrator settings, other regions or licences.
 - Long-term stability, including behaviour after Microsoft changes the preview
   tools.
 - The consent card step is described from the product's behaviour; no
@@ -176,6 +178,6 @@ Not verified:
 
 ## Images
 
-The screenshots in `docs/img/dlp_fallback/` are redacted: names, accounts,
-avatars, agent names and identifiers are covered by solid boxes. The product
-language of the screenshots is Japanese.
+The screenshots in `docs/img/custom_mcp_fallback/` are redacted: names,
+accounts, avatars, agent names and identifiers are covered by solid boxes. The
+product language of the screenshots is Japanese.
