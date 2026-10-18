@@ -220,7 +220,7 @@ $script:HostCalls = 0
 function Test-DevtunnelLoggedInCached { return $true }
 # RECORDS instead of launching a real `devtunnel host`: what is under test is whether the
 # decision to re-host is taken, not devtunnel.
-function Start-TunnelHost { $script:HostCalls++; return $true }
+function Start-TunnelHost { $script:HostCalls++; return ($null -eq $script:HostOk -or [bool]$script:HostOk) }
 function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) }
 . (Join-Path $RootDir "tunnel_name_util.ps1")
 '''
@@ -290,6 +290,11 @@ try {
     $r.bound1 = Case "stale, 20 ticks" 20
     $script:StaleRehostAt = (Get-Date).AddMinutes(-11)
     $r.bound2 = Case "stale, window passed" 8
+    # (e) a re-host that FAILS (network down) must not spend the 10-minute window.
+    Reset-All; Set-Stub 1 $null 500; $script:HostOk = $false
+    $r.failedRehost = Case "stale, re-host fails" 12
+    $r.failedRehostWindowSpent = ($null -ne $script:StaleRehostAt)
+    $script:HostOk = $null
     # (c) a probe skipped by backoff keeps the previous state (here foreign: no flip to stale).
     Reset-All; Set-Stub 1 $null 500
     $script:TunnelState = "foreign"; $script:TunnelProbeSkip = 3
@@ -512,6 +517,14 @@ def test_a_stale_rehost_happens_at_most_once_per_ten_minutes(sup):
     assert b1["hostCalls"] == 1, b1["hostCalls"]
     assert len([l for l in _lines(b1["log"]) if "still looks stale" in l]) == 1, b1["log"]
     assert b2["hostCalls"] == 2, "no second stale re-host once the 10 minutes had passed"
+
+
+def test_a_failed_stale_rehost_does_not_spend_the_ten_minute_window(sup):
+    """(e) the network was down at 07:33-07:37 and every start failed: the next try, once the
+    network is back, must not wait 10 minutes. 12 ticks = 3 debounce completions = 3 tries."""
+    r = sup["failedRehost"]
+    assert r["hostCalls"] == 3, r["hostCalls"]
+    assert sup["failedRehostWindowSpent"] is False
 
 
 def test_when_the_other_pc_lets_go_this_pc_takes_its_tunnel_back(sup):

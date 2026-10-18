@@ -1538,9 +1538,12 @@ function Invoke-TunnelHostingCheck {
         }
         Write-Log ("tunnel host connection looks stale (connections=" + $conn + ", no answer through the URL, " +
                    "no host of this PC): re-hosting")
-        $script:StaleRehostAt = Get-Date
         $script:StaleBlockedLogged = $false
-        if (-not (Start-TunnelHost)) {
+        # The window is spent only by a re-host that ESTABLISHED. A failed start (network down, DNS)
+        # must not hold back the next try for 10 minutes once the network is back (2026-10-19).
+        if (Start-TunnelHost) {
+            $script:StaleRehostAt = Get-Date
+        } else {
             Clear-DevtunnelLoginCache "the stale re-host did not establish"
         }
         Start-Sleep -Seconds 8
