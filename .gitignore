@@ -106,6 +106,9 @@ desktop.ini
 ~$*
 .cache/
 
+# Benchmark output written beside the probe when --out is not given (scripts/probes/bridge_bench.py).
+/scripts/probes/bench_out.jsonl
+
 ui/*.exe
 .codeql-build/
 
@@ -135,6 +138,8 @@ ui/_buildcheck/
 !/docs/unreached_burndown.md
 # the contract an agent reads before deciding whether its work landed
 !/docs/agent_contract.md
+# the connector-less route: setup and switching back, for a user (generic, no host names)
+!/docs/connector_less_route.md
 /docs/validation/
 # generic how-to for an organisation whose DLP policy blocks the MCP connection
 !/docs/dlp_fallback_route.md
