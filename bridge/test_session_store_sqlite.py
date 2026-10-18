@@ -567,11 +567,14 @@ def test_the_bridge_prunes_at_startup_not_on_a_timer():
     import pathlib as _pl
     src = (_pl.Path(__file__).resolve().parents[1] / "bridge" / "copilot_bridge.py"
            ).read_text(encoding="utf-8", errors="replace")
-    assert "S.apply_retention()" in src, "起動時に保持を適用していない"
-    i = src.index("S.apply_retention()")
-    # 実際の呼び出しを見る。最初の出現はコメント("mirrors the old srv.serve_forever()")で、
-    # そちらを取ると本物より手前に見えて判定が逆になる。
-    j = src.rindex("    srv.serve_forever()")
-    assert i < j, "サーバ開始後に剪定している"
+    # The pass is called from ONE place, and main() starts it only after the bind (see
+    # bridge/test_the_bridge_listens_before_it_prunes.py, which runs main()); it is never
+    # scheduled on a timer.
+    assert src.count("S.apply_retention(") == 1, "起動時に保持を適用していない(呼び出し箇所が1つでない)"
+    main_src = src[src.index("\ndef main():"):]
+    start = main_src.index("_start_session_retention()")
+    assert main_src.index("_SingleBindHTTPServer((") < start < main_src.index("srv.serve_forever()")
+    assert "threading.Timer" not in src[src.index("def _run_session_retention_once"):
+                                         src.index("\ndef main():")]
     # 失敗しても起動を止めないこと
     assert "leaving the store alone" in src

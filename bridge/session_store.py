@@ -1210,7 +1210,7 @@ def store_stats():
                                 if oldest else None)}
 
 
-def prune(max_age_days=None, max_mb=None, now=None, limit=None):
+def prune(max_age_days=None, max_mb=None, now=None, limit=None, protect=None):
     """Delete old sessions, oldest first, and hand the pages back. Returns what it did.
 
     NEITHER LIMIT IS ON BY DEFAULT, and that is deliberate. This store exists because
@@ -1234,6 +1234,7 @@ def prune(max_age_days=None, max_mb=None, now=None, limit=None):
     """
     now = time.time() if now is None else now
     removed, freed_before = [], store_stats()["bytes"]
+    seen_ts = {}
     conn = _db()
     try:
         if max_age_days:
@@ -1243,8 +1244,10 @@ def prune(max_age_days=None, max_mb=None, now=None, limit=None):
             if limit:
                 q += " LIMIT ?"
                 params.append(int(limit))
+            q = q.replace("SELECT sid FROM", "SELECT sid, last_active_ts FROM")
             rows = conn.execute(q, params).fetchall()
             removed.extend(r["sid"] for r in rows)
+            seen_ts.update((r["sid"], r["last_active_ts"]) for r in rows)
 
         if max_mb:
             # Size is a property of the FILE, and a delete does not shrink it until the pages
@@ -1267,11 +1270,28 @@ def prune(max_age_days=None, max_mb=None, now=None, limit=None):
                 if r["sid"] in removed:
                     continue
                 removed.append(r["sid"])
+                seen_ts[r["sid"]] = r["ts"]
                 total -= r["w"] * scale
 
+        # THE SERVER MAY BE LIVE WHILE THIS RUNS (the bridge prunes on a background thread after
+        # it is already listening). Two guards, so a pass cannot delete what is being served:
+        #  * `protect` -- sids that must never go (the bridge passes its ACTIVE_SID), read NOW,
+        #    at delete time, not when the pass started;
+        #  * the session is removed only if its last_active_ts is still the value the SELECT
+        #    saw. A turn, a touch or a resume bumps that column, so a session that became
+        #    active after it was selected is skipped, not deleted out from under its writer.
+        selected = len(removed)
+        keep = set(protect() if callable(protect) else (protect or ()))
+        really = []
         for sid in removed:
-            conn.execute("DELETE FROM turns WHERE sid = ?", (sid,))
-            conn.execute("DELETE FROM sessions WHERE sid = ?", (sid,))
+            if sid in keep:
+                continue
+            cur = conn.execute("DELETE FROM sessions WHERE sid = ? AND last_active_ts IS ?",
+                               (sid, seen_ts.get(sid)))
+            if cur.rowcount:
+                conn.execute("DELETE FROM turns WHERE sid = ?", (sid,))
+                really.append(sid)
+        removed = really
         if removed:
             # THE ROWS MUST BE CONSUMED OR THE PRAGMA STOPS AFTER ONE PAGE. Python's sqlite3
             # returns a cursor and runs the statement lazily, so `execute` alone reclaimed a
@@ -1302,7 +1322,7 @@ def prune(max_age_days=None, max_mb=None, now=None, limit=None):
             "still_over": bool(max_mb and after["mb"] > float(max_mb)),
             # True when `limit` cut this pass short -- there may be more sessions past the
             # cutoff than this call was willing to remove. A later prune picks up the rest.
-            "batched": bool(limit and len(removed) >= limit)}
+            "batched": bool(limit and selected >= limit)}
 
 
 #: The shared settings file the cockpit writes and the fleet reads. Retention lives here rather
@@ -1384,7 +1404,7 @@ def read_retention():
     return days, mb
 
 
-def apply_retention(now=None):
+def apply_retention(now=None, protect=None):
     """Prune according to settings.txt, applying the 90-day default when the operator has
     never set session_retention_days. Returns the prune report, or None when the effective
     policy is "keep everything" (explicit 0 for days, and no size cap either).
@@ -1401,7 +1421,8 @@ def apply_retention(now=None):
     effective_days = DEFAULT_RETENTION_DAYS if days is None else days
     if not effective_days and not mb:
         return None
-    return prune(max_age_days=effective_days, max_mb=mb, now=now, limit=PRUNE_BATCH_LIMIT)
+    return prune(max_age_days=effective_days, max_mb=mb, now=now, limit=PRUNE_BATCH_LIMIT,
+                 protect=protect)
 
 
 def compact():
