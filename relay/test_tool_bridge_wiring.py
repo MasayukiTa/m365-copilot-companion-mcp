@@ -224,3 +224,32 @@ def test_without_a_run_tool_the_driver_asks_once_and_nothing_is_executed():
     drv.send("the job text")
     _wait(drv)
     assert sent == ["the job text"]
+
+
+# ---------------------------------------------------------------- (e) no tunnel in the path
+
+def test_connector_less_does_not_probe_a_tunnel_left_over_in_env(monkeypatch):
+    from relay import mcp_ready
+    monkeypatch.setenv("MCP_TUNNEL_URL", "https://example.invalid/mcp")
+    probed = []
+    monkeypatch.setattr(mcp_ready, "fetch_json", lambda url, timeout_s=3.0: probed.append(url))
+    _transport(monkeypatch, "connector-less")
+    assert mcp_ready.default_tunnel(123) == (True, "")
+    assert probed == []
+    _transport(monkeypatch, "connector")
+    ok, why = mcp_ready.default_tunnel(123)
+    assert ok is False and probed and probed[0].startswith("https://example.invalid")
+
+
+def test_infra_health_asks_only_the_local_server_when_connector_less(monkeypatch):
+    from relay import relay_fleet
+    monkeypatch.setenv("MCP_TUNNEL_URL", "https://example.invalid/mcp")
+    asked = []
+    monkeypatch.setattr(relay_fleet, "_url_ok", lambda url, timeout_s=3.0: asked.append(url) or True)
+    _transport(monkeypatch, "connector-less")
+    assert relay_fleet._infra_healthy() is True
+    assert asked == ["http://127.0.0.1:8000/health"]
+    asked.clear()
+    _transport(monkeypatch, "connector")
+    assert relay_fleet._infra_healthy() is True
+    assert len(asked) == 2

@@ -273,3 +273,35 @@ def test_a_tool_that_merely_mentions_outlook_is_not_blocked():
     run = TB.make_run_tool("w", client_factory=_factory(_FakeClient(_Result("ok"), log=log)))
     ok, _ = run("call_tool", {"name": "export_for_outlook", "arguments": {}})
     assert ok and len(log) == 1
+
+
+# ---------------------------------------------------------------- the command line the scripts use
+
+def test_set_transport_writes_one_line_and_keeps_the_rest(tmp_path):
+    p = _settings(tmp_path, "maxtabs=3\ntool_transport=connector\nrate_ceiling_rpm=80\n")
+    assert TB.set_transport("connector-less", p) is True
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8") == \
+        "maxtabs=3\ntool_transport=connector-less\nrate_ceiling_rpm=80\n"
+    assert TB.transport(p) == "connector-less"
+
+
+def test_set_transport_appends_when_absent_and_dedups_when_repeated(tmp_path):
+    p = _settings(tmp_path, "maxtabs=3\n")
+    assert TB.set_transport("connector-less", p)
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8").splitlines()[-1] == "tool_transport=connector-less"
+    p2 = _settings(tmp_path, "tool_transport=bridge\ntool_transport=connector\n")
+    assert TB.set_transport("connector", p2)
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8") == "tool_transport=connector\n"
+
+
+def test_set_transport_refuses_a_value_that_is_not_a_transport(tmp_path):
+    p = _settings(tmp_path, "maxtabs=3\n")
+    assert TB.set_transport("tunnel", p) is False
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8") == "maxtabs=3\n"
+
+
+def test_main_prints_the_transport(capsys, monkeypatch):
+    monkeypatch.setattr(TB, "transport", lambda path=None: "connector-less")
+    assert TB.main([]) == 0
+    assert capsys.readouterr().out.strip() == "connector-less"
+    assert TB.main(["bogus"]) == 2

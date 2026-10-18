@@ -328,3 +328,71 @@ def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):
             return False, "%s: %s" % (type(exc).__name__, str(exc)[:300])
 
     return run_tool
+
+
+# ------------------------------------------------------------------------------------------
+# COMMAND LINE: the one reader and writer the setup scripts use.
+#
+#   python -m relay.tool_bridge            prints `connector` or `connector-less`
+#   python -m relay.tool_bridge set X      writes tool_transport=X into the settings file
+#
+# quickstart.bat, start_all.ps1, doctor.ps1, supervisor.ps1 and bootstrap.py decide whether a Dev
+# Tunnel is needed by asking THIS function, so the answer cannot differ between them and the GUI
+# (which writes the same key). Nothing else parses the setting in a script.
+
+def set_transport(value, path=None) -> bool:
+    """Write `tool_transport=<value>` into the settings file, keeping every other line.
+
+    Mirrors what the cockpit's SaveKey does: the current file is read (old or new location), the
+    key's line replaced or appended, and the result written to the file the cockpit writes. Returns
+    False for a value that is not one of the two transports or when the write fails.
+    """
+    v = _ALIASES.get(str(value or "").strip().lower())
+    if v is None:
+        return False
+    try:
+        if path:
+            src = dst = str(path)
+        else:
+            from tools.settings_path import settings_file, settings_file_for_write
+            src, dst = settings_file(), settings_file_for_write()
+        lines, found = [], False
+        if os.path.isfile(src):
+            with open(src, encoding="utf-8-sig") as fh:
+                for ln in fh.read().splitlines():
+                    if ln.startswith("tool_transport="):
+                        if not found:
+                            lines.append("tool_transport=" + v)
+                        found = True
+                    else:
+                        lines.append(ln)
+        if not found:
+            lines.append("tool_transport=" + v)
+        tmp = dst + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="") as fh:
+            fh.write("\n".join(lines) + "\n")
+        os.replace(tmp, dst)
+        _cache.pop(dst, None)
+        return True
+    except Exception:
+        return False
+
+
+def main(argv=None) -> int:
+    import sys
+    args = list(sys.argv[1:] if argv is None else argv)
+    if not args:
+        print(transport())
+        return 0
+    if args[0] == "set" and len(args) == 2:
+        if set_transport(args[1]):
+            print(transport())
+            return 0
+        print("could not write tool_transport=%s" % args[1])
+        return 1
+    print("usage: python -m relay.tool_bridge [set connector|connector-less]")
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

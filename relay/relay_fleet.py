@@ -1956,7 +1956,7 @@ def _infra_healthy(timeout_s=3.0) -> bool:
     try:
         if not _url_ok("http://127.0.0.1:8000/health", timeout_s=timeout_s):
             return False
-        tunnel = _mcp_tunnel_url()
+        tunnel = "" if tool_bridge.is_bridge() else _mcp_tunnel_url()   # connector-less: no tunnel in the path
         if tunnel:
             base = tunnel.rstrip("/")
             if not _url_ok(base + "/health", timeout_s=timeout_s):
