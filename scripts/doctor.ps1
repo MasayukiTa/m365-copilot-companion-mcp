@@ -332,6 +332,17 @@ Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
 #    a hung/offline CLI cannot stall doctor. Chained: once the first link FAILs, the
 #    remaining links are not meaningful, so they are shown as [SKIP] instead of being
 #    run and possibly double-reporting -- only the one root cause counts toward $bad.
+# ON THE CONNECTOR-LESS ROUTE (setting tool_transport, GUI: Settings > Tools) the agent holds no
+# connector and nothing reaches this PC through a tunnel, so every Dev Tunnel check in this
+# section is not applicable. It is shown as ONE informational row saying so, never as a pass
+# for each check it replaces. The connector route keeps every check below, unchanged.
+# The answer comes from relay/tool_bridge.py through Get-ToolTransport (tunnel_name_util.ps1).
+$script:ToolRoute = Get-ToolTransport -Python (Join-Path $repo ".venv\Scripts\python.exe") -RepoRoot $repo
+if ($script:ToolRoute -eq "connector-less") {
+    Check "tool_route" "Tool route: connector-less (no custom connector, no Dev Tunnel - tunnel checks not applicable)" `
+        { $false } `
+        "to use the connector route instead: Settings > Tools > Tool route > Connector, then run quickstart.bat" -Info
+} else {
 $turl = $envv['MCP_TUNNEL_URL']
 $tname = $envv['MCP_TUNNEL_NAME']
 
@@ -720,6 +731,8 @@ if (-not $script:supervisorCmdLine) {
         { -not (Test-SupervisorTunnelDrift -RunningCommandLine $script:supervisorCmdLine -EnvTunnelName $tname) } `
         $script:tunnelMatchFix
 }
+
+}   # end of the connector route's Dev Tunnel checks
 
 # 4. Companion Edge (:9222) for the fleet/agent
 # SAY WHAT IT SAID, not just "launch it". start_companion_edge.ps1 now redirects its launch

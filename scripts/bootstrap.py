@@ -2483,6 +2483,21 @@ STEPS = [
 #: step that can repair a carried-over .env, so it must run on the first run, not the second.
 ALWAYS_REVALIDATE = ("gen_env", "verify")
 
+#: Steps that exist only for the connector route (a Dev Tunnel and the custom-connector helper).
+#: With `tool_transport=connector-less` they are not run and not marked done, so switching back to
+#: the connector route finds them pending. The answer comes from relay.tool_bridge, the one reader
+#: of the setting, so this script cannot disagree with the GUI or the other scripts.
+CONNECTOR_ONLY_STEPS = ("dev_tunnel", "gen_connector")
+
+
+def connector_less_route() -> bool:
+    """True when the settings choose the connector-less route. Any failure reads as False."""
+    try:
+        from relay import tool_bridge
+        return tool_bridge.is_bridge()
+    except Exception:
+        return False
+
 #: Cleared when a revalidating step fails, so the next run rebuilds rather than skipping back to
 #: the same failure. These are the steps that produce what `verify` verifies.
 REPAIRED_BY_RERUN = ("ensure_venv", "install_deps")
@@ -2542,6 +2557,9 @@ def run_all(steps=STEPS, state=None, state_file=STATE_FILE) -> int:
             % (done_count, total, next_pending))
 
     for name, fn in steps:
+        if name in CONNECTOR_ONLY_STEPS and connector_less_route():
+            log("--- %-14s not needed on the connector-less route (skipping)" % name)
+            continue
         # A CHECK THAT IS SKIPPED IS NOT A CHECK. `verify` imports main.py and counts the tools,
         # so it is the step that catches an empty or broken venv -- and it was being skipped on
         # a flag that can arrive from another machine in a copied .setup/state.json, while

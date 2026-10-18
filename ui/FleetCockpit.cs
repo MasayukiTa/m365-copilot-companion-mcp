@@ -234,6 +234,10 @@ partial class CockpitWindow : Window
     TextBlock _srLbl, _srNow;
     DateTime _srReadAt = DateTime.MinValue;   // supervisor_state.json is re-read at most every 5 s
     string _srText = null;
+    // tool route connector|connector-less -> settings.txt tool_transport ; absent key = connector
+    string _trVal = ToolRouteView.Default;
+    ComboBox _trBox;
+    TextBlock _trLbl;
     // tool-call check interval 0|15|30|60 minutes -> settings.txt tool_probe_idle_min ; absent key = 30
     string _tpVal = ToolProbeView.Default;
     ComboBox _tpBox;

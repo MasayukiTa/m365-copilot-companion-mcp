@@ -321,3 +321,19 @@ function ConvertTo-EnvLinesWithKeysAside([string[]]$Lines, [string[]]$Keys, [str
     }
     return ,$out
 }
+
+function Get-ToolTransport {
+    # "connector" or "connector-less": how a fleet conversation reaches its tools (setting
+    # tool_transport, GUI: Settings > Tools). Asked of relay/tool_bridge.py, the ONE reader of the
+    # setting, so every script that decides whether a Dev Tunnel is needed agrees with the GUI and
+    # with the fleet. Anything that cannot be read -- no interpreter, an import error, an odd answer --
+    # is "connector": the route that existed before, never the newer one by accident.
+    # A Dev Tunnel is needed only for "connector".
+    param([string]$Python, [string]$RepoRoot)
+    try {
+        if (-not $Python -or -not (Test-Path -LiteralPath $Python) -or -not $RepoRoot) { return "connector" }
+        $out = & $Python -c "import sys; sys.path.insert(0, r'$RepoRoot'); from relay import tool_bridge; print(tool_bridge.transport())" 2>$null
+        if (([string]$out).Trim() -eq "connector-less") { return "connector-less" }
+    } catch { }
+    return "connector"
+}

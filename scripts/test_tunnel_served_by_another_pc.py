@@ -495,7 +495,8 @@ _STARTUP_DRIVER_HEAD = r'''param(
     [Parameter(Mandatory=$true)][string]$StateFile,
     [Parameter(Mandatory=$true)][int]$LocalPort,
     [Parameter(Mandatory=$true)][string]$OutFile,
-    [string]$LoggedInStr = "true"
+    [string]$LoggedInStr = "true",
+    [string]$RouteWantedStr = "true"
 )
 $ErrorActionPreference = "SilentlyContinue"
 $script:CapturedLog = New-Object System.Collections.Generic.List[string]
@@ -511,6 +512,11 @@ $script:HostCalls = 0
 # variable would be overwritten by that before Test-DevtunnelLoggedInCached ever reads it.
 $script:StubDevtunnelLoggedIn = ($LoggedInStr -eq "true")
 function Test-DevtunnelLoggedInCached { return $script:StubDevtunnelLoggedIn }
+# THE TOOL ROUTE (setting tool_transport). The real function asks the product's reader, which would
+# read THIS machine's settings file; the stub fixes the answer so the test is the same everywhere.
+# $false = connector-less: the startup block must not touch the tunnel at all.
+$script:StubRouteWanted = ($RouteWantedStr -eq "true")
+function Test-TunnelRouteWanted { return $script:StubRouteWanted }
 # RECORDS instead of launching a real `devtunnel host`: what is under test is whether the
 # startup block DECIDES to host at once, not devtunnel itself.
 function Start-TunnelHost { $script:HostCalls++; return $true }
@@ -529,7 +535,8 @@ $r | ConvertTo-Json -Depth 8 | Set-Content -Path $OutFile -Encoding UTF8
 '''
 
 
-def run_startup_driver(supervisor_text: str, hosts, tunnel_pid, tunnel_status=200, logged_in=True):
+def run_startup_driver(supervisor_text: str, hosts, tunnel_pid, tunnel_status=200, logged_in=True,
+                       route_wanted=True):
     """Runs the REAL startup fast-path block (extracted between its begin/end markers) against
     the same stub devtunnel/HTTP servers run_supervisor_driver uses, with one state set before
     the block runs once -- there is no loop here, only the single startup pass."""
@@ -587,7 +594,8 @@ def run_startup_driver(supervisor_text: str, hosts, tunnel_pid, tunnel_status=20
             [_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", driver,
              "-RootDir", root, "-DtCmd", os.path.join(stub, "devtunnel.cmd"), "-StateFile", state,
              "-LocalPort", str(local_port), "-OutFile", out,
-             "-LoggedInStr", ("true" if logged_in else "false")],
+             "-LoggedInStr", ("true" if logged_in else "false"),
+             "-RouteWantedStr", ("true" if route_wanted else "false")],
             env=env, timeout=120, creationflags=childproc.headless_creationflags())
         assert proc.returncode == 0, "driver failed:\n%s\n%s" % (proc.stdout, proc.stderr)
         with open(out, "r", encoding="utf-8-sig") as fh:
@@ -611,6 +619,16 @@ def test_startup_hosts_at_once_when_nobody_hosts_it_no_debounce_wait():
     assert not [l for l in r["log"] if "connections = 0 (" in l], r["log"]
     assert any("at startup -> hosting the tunnel now, without the debounce" in l for l in r["log"]), r["log"]
     assert r["status"]["state"] == "none"
+
+
+def test_startup_does_nothing_about_a_tunnel_on_the_connector_less_route():
+    """No connector means no tunnel is needed: nothing is hosted, probed or reported, and the
+    login state is left unasked (a tunnel that is not wanted must not look 'signed out')."""
+    r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=0, tunnel_pid=None, route_wanted=False)
+    assert r["hostCalls"] == 0
+    assert not r["tunnelState"] and r["status"] is None
+    assert r["loggedInVar"] is None
+    assert any("connector-less" in l for l in r["log"]), r["log"]
 
 
 def test_startup_leaves_an_already_ours_tunnel_alone():

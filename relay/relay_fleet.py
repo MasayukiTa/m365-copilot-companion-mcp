@@ -77,6 +77,7 @@ from relay import effort as effort_mod
 from relay import effort_policy as effort_policy_mod
 from relay import stuck_cause as stuck_cause_mod
 from relay import conversation_saving as conv_saving_mod
+from relay import tool_bridge
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
@@ -1281,8 +1282,15 @@ _INVOKE_MARKUP = ("<invoke name=", "antml:invoke", "<parameter name=")
 #: for and the window held 19 landed calls, 18 of them successful. Only the malformed blocks
 #: landed nowhere, so the conjunction was false exactly when it was needed. The reply's markup
 #: is the whole of the evidence; adding the ledger back only makes the branch unreachable again.
-def _tried_to_call_a_tool(resp: str) -> bool:
-    """Does the reply contain an invocation the model wrote out instead of making?"""
+def _tried_to_call_a_tool(resp: str, bridged: bool = False) -> bool:
+    """Does the reply contain an invocation the model wrote out instead of making?
+
+    `bridged`: under the bridge transport the model is TOLD to write its calls into the reply
+    (fenced blocks the conversation executes), so a call spelled out in prose is not evidence
+    of an unlanded call; the check does not apply.
+    """
+    if bridged:
+        return False
     low = (resp or "")
     return any(m in low for m in _INVOKE_MARKUP) or bool(_PSEUDO_CALL_RE.search(low))
 
@@ -1948,7 +1956,7 @@ def _infra_healthy(timeout_s=3.0) -> bool:
     try:
         if not _url_ok("http://127.0.0.1:8000/health", timeout_s=timeout_s):
             return False
-        tunnel = _mcp_tunnel_url()
+        tunnel = "" if tool_bridge.is_bridge() else _mcp_tunnel_url()   # connector-less: no tunnel in the path
         if tunnel:
             base = tunnel.rstrip("/")
             if not _url_ok(base + "/health", timeout_s=timeout_s):
@@ -2452,6 +2460,9 @@ def _socket_route():
                                             log=lambda m: print(
                                                 __import__("relay.logstamp", fromlist=["stamp"])
                                                 .stamp(m), flush=True))
+                # tool_transport=connector-less: a driver built by this route gets the gateway and a
+                # run_tool. Applied here (socket_route.py is frozen); a no-op for `connector`.
+                tool_bridge.equip(_SOCKET_ROUTE)
     return _SOCKET_ROUTE
 
 
@@ -5082,7 +5093,13 @@ class RelayWorker:
             idle_fn = getattr(self.drv, "generation_idle_s", None)
             idle_s = float(idle_fn()) if callable(idle_fn) else 0.0
             self._record_socket_idle_probe(idle_s)
-            if idle_s < SOCKET_MEANINGFUL_IDLE_S:
+            _floor_s, _live_s = SOCKET_MEANINGFUL_IDLE_S, SOCKET_LIVE_STREAM_IDLE_S
+            if tool_bridge.worker_is_bridged(self):
+                # A bridged turn runs its tools HERE, with no frames from the backend while
+                # one runs, so the silence limits are longer for it (and for it only).
+                _floor_s = max(_floor_s, tool_bridge.idle_limit_s())
+                _live_s = max(_live_s, _floor_s)
+            if idle_s < _floor_s:
                 # A conversation that is progressing proves the route is healthy: it breaks the
                 # breaker's run of consecutive failures (consecutive = across all conversations).
                 try:
@@ -5090,11 +5107,11 @@ class RelayWorker:
                 except Exception:
                     pass
                 return False
-            limit = SOCKET_MEANINGFUL_IDLE_S
+            limit = _floor_s
             frame_idle_fn = getattr(self.drv, "frame_idle_s", None)
             frame_idle = frame_idle_fn() if callable(frame_idle_fn) else None
-            if frame_idle is not None and frame_idle < SOCKET_MEANINGFUL_IDLE_S:
-                limit = max(limit, SOCKET_LIVE_STREAM_IDLE_S)   # frames still arriving: alive
+            if frame_idle is not None and frame_idle < _floor_s:
+                limit = max(limit, _live_s)   # frames still arriving: alive
                 try:
                     _socket_route().note_progress(self.name)
                 except Exception:
@@ -6008,6 +6025,7 @@ class RelayWorker:
         # `initialize` was seen for this conversation (the tools are bound; a new chat would not
         # change what the model says).
         if (not _resume and getattr(self, "socket", False)
+                and not tool_bridge.worker_is_bridged(self)    # a bridged agent has no connector by design
                 and mcp_ready.reply_says_no_tools(resp)
                 and mcp_ready.detector().status(self.name) != "attached"):
             self._recycle_for_missing_tools("the model reports it has no call_tool")
@@ -6956,7 +6974,8 @@ class RelayWorker:
         # counter needs the turn that breaks the streak to clear it, and the turn that breaks
         # it is any turn whose reply carries no unlanded invocation, whichever branch it then
         # takes. Reset here, above the branch, so no path can forget.
-        if not _tried_to_call_a_tool(resp):
+        _bridged = tool_bridge.worker_is_bridged(self)
+        if not _tried_to_call_a_tool(resp, _bridged):
             self._unlanded_calls = 0
         if "FAIL" in last_line:
             self.job = self._task_anchor(FIX_JOB)
@@ -6999,7 +7018,7 @@ class RelayWorker:
             # A reply merely DISCUSSING the syntax could trip this; the cost of that is one
             # corrective nudge, against 8 wasted turns for a miss, and the reply is quoted
             # back so a false positive is visible rather than silent.
-            if _tried_to_call_a_tool(resp):
+            if _tried_to_call_a_tool(resp, _bridged):
                 self._unlanded_calls = getattr(self, "_unlanded_calls", 0) + 1
                 # The steer below did not help: the conversation itself is printing calls as
                 # text. A NEW conversation with the same goal, bounded, before giving up.
@@ -8266,6 +8285,11 @@ class RelayWorker:
         (an `initialize` reached the server). Recycles the conversation when it did not."""
         if not getattr(self, "_mcp_tracking", False):
             return
+        if tool_bridge.worker_is_bridged(self):
+            # A bridged agent has no connector, so an MCP `initialize` will never arrive: waiting
+            # for one would recycle a healthy conversation every INIT_WINDOW_S.
+            self._mcp_tracking = False
+            return
         try:
             verdict = mcp_ready.decide_tools(mcp_ready.detector(), mcp_ready.gate(), self.name)
         except Exception:
@@ -8619,6 +8643,9 @@ class RelayWorker:
             if getattr(self, "socket", False) and time.time() - self._t_send > _bound:
                 if RelayWorker._socket_tool_wait_alive(self):
                     _bound = max(_bound, SOCKET_TURN_TIMEOUT_S)
+            if tool_bridge.worker_is_bridged(self):
+                # A bridged turn includes its tool round trips, so the one-turn clock is longer.
+                _bound = max(_bound, tool_bridge.turn_limit_s())
             # A REPLY THAT ALREADY EXISTS BEATS OUR OUTER CLOCK. This check must happen BEFORE
             # timeout/retry. Measured twice now: r6aa597a8 turn 3 replied at +70s but was retried
             # at +240s; r6ab7a384 w4 turn 12 replied at +16s but was retried at +240.6s. In both

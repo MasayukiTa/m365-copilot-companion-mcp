@@ -365,6 +365,24 @@ function Get-SupervisorSelfRestartSetting {
     return "on"
 }
 
+function Test-TunnelRouteWanted {
+    # $false when the setting tool_transport is connector-less: the agent holds no connector, so
+    # no Dev Tunnel is needed and none is hosted, logged into or reported on. Asked of the
+    # product's own reader (Get-ToolTransport), at most once a minute, so a change in the
+    # GUI is followed without a restart and a tick pays nothing. A host that is ALREADY running is
+    # left alone (this supervisor never kills a live tunnel): it just stops being managed.
+    $now = [DateTime]::UtcNow
+    if ($script:TunnelRouteAt -and (($now - $script:TunnelRouteAt).TotalSeconds -lt 60)) { return $script:TunnelRouteWanted }
+    $t = Get-ToolTransport -Python $Py -RepoRoot $Root
+    $wanted = ($t -ne "connector-less")
+    if ($null -ne $script:TunnelRouteWanted -and $script:TunnelRouteWanted -ne $wanted) {
+        Write-Log ("tool route changed: " + $t + " -> Dev Tunnel management " + $(if ($wanted) { "resumes" } else { "stops (no tunnel is needed)" }))
+    }
+    $script:TunnelRouteWanted = $wanted
+    $script:TunnelRouteAt = $now
+    return $wanted
+}
+
 function Test-SupervisorScriptsParse {
     # Do the files the NEXT supervisor will run parse? Same parser PowerShell itself uses to load
     # them, in-process. Returns the errors (empty = parses). A file that cannot be read is an error.
@@ -2651,7 +2669,9 @@ $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on 
 # $script:ForeignStreak is left at its initial 0 so a foreign/shared state discovered here still
 # goes through the loop's own $FailuresBeforeAction-gated report exactly as it would starting
 # from any other tick -- this fast path changes nothing about foreign/shared handling.
-if (Test-DevtunnelLoggedInCached) {
+if (-not (Test-TunnelRouteWanted)) {
+    Write-Log "tool route is connector-less -> no Dev Tunnel is hosted (none is needed)"
+} elseif (Test-DevtunnelLoggedInCached) {
     $startupConn = Get-TunnelHostConnections
     $startupOurHost = $false
     $startupLocalPid = $null
@@ -2854,7 +2874,10 @@ while ($true) {
         }
     }
 
-    if (-not (Test-DevtunnelLoggedInCached)) {
+    if (-not (Test-TunnelRouteWanted)) {
+        # connector-less route: nothing to host or log in to (see Test-TunnelRouteWanted)
+        $tunnelMiss = 0
+    } elseif (-not (Test-DevtunnelLoggedInCached)) {
         # First-run / token-cleared: pause tunnel management and DO NOT touch devtunnel,
         # so the user can run `devtunnel login` (interactive) without it being reaped.
         if ($loggedIn -ne $false) {

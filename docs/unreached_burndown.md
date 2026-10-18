@@ -1281,5 +1281,4 @@ Two rows are kept, as `deliberate`, because something real still uses them:
 
 | row | verdict | why it stays |
 |---|---|---|
-| `profile_token.py::save_template` | deliberate | the only WRITER of the request-template cache that `load_template` reads; `tests/test_profile_token.py` and `relay/test_no_goal_path_opens_a_tab.py` build their fixtures through it, and a capture never sends a turn any more, so a future template-seeding tool belongs here rather than in a second writer |
 | `bridge/validity_audit.py::wait_async_idle` | deliberate | the synchronisation point for the async audit writer; `relay/test_sweep_hot_path.py` drains the queue through it before reading the log |

@@ -618,7 +618,14 @@ partial class CockpitWindow
         // the wrong place either way. "ours"/"none" (or no file / dead supervisor) add nothing
         // the probe does not already establish, so they fall through to it unchanged.
         TunnelHostState tunHost = ReadTunnelHostState();
-        if (tunHost != null && (tunHost.State == "foreign" || tunHost.State == "shared"))
+        if (_trVal == "connector-less")
+        {
+            // CONNECTOR-LESS ROUTE (Settings > Tools): the agent holds no connector and nothing reaches this PC
+            // through a tunnel, so there is nothing for this dot to establish. Gray with a Fix button absent is
+            // the truthful state; red or amber here would send the repair at a tunnel nobody uses.
+            SetDot(1, HealthState.Gray, T("hs_tun_detail_notused"), now);
+        }
+        else if (tunHost != null && (tunHost.State == "foreign" || tunHost.State == "shared"))
         {
             string detail = tunHost.Message;
             if (!string.IsNullOrEmpty(tunHost.Action)) detail = detail + "  " + tunHost.Action;

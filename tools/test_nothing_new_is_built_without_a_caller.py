@@ -153,9 +153,9 @@ NO_CALLER_BUT_TESTED = {
     "tools/auto/ext_helper.py::validity_negative_control",
     "tools/auto/ext_helper.py::validity_verify_lock",
     # TAB-ERA LEFTOVERS, 2026-10-14 (owner rule: Copilot never runs in a tab). Nine siblings
-    # were DELETED; these two stay because something real still uses them. See
+    # were DELETED; the survivors stay because something real still uses them. save_template
+    # left the list 2026-10-18: relay/template_seed.py (the connector-less route) calls it. See
     # docs/unreached_burndown.md, "the tab era's leftovers".
-    "relay/profile_token.py::save_template",                     # 24 test refs, only cache writer
     "bridge/validity_audit.py::wait_async_idle",                 # test/shutdown drain helper
 }
 
@@ -385,7 +385,6 @@ REASONS: dict[str, tuple[str, str]] = {
                                                               "docs/unreached_burndown.md"),
 
     # TAB-ERA LEFTOVERS, 2026-10-14. Kept on purpose; the nine tab-only siblings were deleted.
-    "relay/profile_token.py::save_template": ("deliberate", "docs/unreached_burndown.md"),
     "bridge/validity_audit.py::wait_async_idle": ("deliberate", "docs/unreached_burndown.md"),
 }
 

@@ -299,6 +299,13 @@ def section_bridge_and_edge(rep):
 
 
 def section_tunnel(rep, health):
+    try:
+        from relay import tool_bridge
+        if tool_bridge.is_bridge():
+            rep.row(OK, "tunnel", "not used: tool_transport=connector-less (no connector, no Dev Tunnel)")
+            return
+    except Exception:
+        pass
     url = ""
     try:
         for ln in io.open(os.path.join(REPO, ".env"), encoding="utf-8-sig"):
