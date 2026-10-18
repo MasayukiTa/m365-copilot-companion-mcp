@@ -1011,6 +1011,56 @@ public static class SupervisorCodeView
     }
 }
 
+// The tool-route selector's words and parsing, WPF-free. The Python side decides:
+// relay/tool_bridge.py reads `tool_transport` whenever a fleet conversation is created. `connector`
+// is the existing path (the agent holds a custom connector and needs a Dev Tunnel); `connector-less`
+// registers nothing on the agent: the model writes the call in its reply and this machine runs it.
+// `bridge` is the first spelling of the second value and is read as connector-less. Default connector.
+public static class ToolRouteView
+{
+    //: must equal tools/settings_keys.py and relay/tool_bridge.py (TRANSPORTS / DEFAULT_TRANSPORT).
+    public const string Key = "tool_transport";
+    public const string Default = "connector";
+
+    public static readonly string[] Modes = { "connector", "connector-less" };
+
+    public static bool IsMode(string v) { return v == "connector" || v == "connector-less"; }
+
+    /// <summary>The mode named by one tool_transport= line; null when the line is not that key or the
+    /// value is unknown (the caller keeps its value). A byte order mark is tolerated, the value is
+    /// case-insensitive and the old spelling `bridge` reads as connector-less, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        if (v == "bridge" || v == "connector_less" || v == "connectorless") return "connector-less";
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "ツールの接続方式" : "Tool route"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "connector") return ja ? "コネクタ(従来)" : "Connector";
+        if (mode == "connector-less") return ja ? "コネクタなし" : "Connector-less";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "コネクタ=エージェントにカスタムコネクタを登録し、Dev Tunnel 経由でツールを呼びます(従来どおり)。コネクタなし=コネクタもトンネルも使わず、モデルが返信にツール呼び出しを書き、このPCが実行して結果を返します。セットアップにDev Tunnelは不要です。メールと予定は、エージェントに追加した Microsoft Work IQ を使います。手順は docs/connector_less_route.md。"
+                  : "Connector registers a custom connector on the agent and reaches the tools through a Dev Tunnel (as before). Connector-less registers nothing: the model writes the tool call in its reply, this PC runs it and returns the result, and setup needs no Dev Tunnel. Mail and calendar use the Microsoft Work IQ tools attached to the agent. Steps: docs/connector_less_route.md.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次に作る会話から有効。再起動不要。実行中の会話は始めた方式のまま続きます。"
+                  : "Applies to the next conversation created, no restart. Conversations already running keep the route they started with.";
+    }
+}
+
 // The merge-conversation selector's words and parsing, WPF-free. KEPT AT THE END OF THE FILE on
 // purpose: shape tests slice this file from one view class to the end of the next, and a view
 // dropped between two of them has already broken one. The Python side decides:

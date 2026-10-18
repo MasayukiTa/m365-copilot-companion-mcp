@@ -303,7 +303,9 @@ class CopilotSocketDriver:
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    annotations=annotations,
                                    on_progress=on_progress,
-                                   catalogue=self._catalogue, protocol=self._protocol,
+                                   catalogue=self._catalogue,
+                                   # the protocol prefix is for a conversation's FIRST turn only
+                                   protocol=(self._protocol if not getattr(self.conv, "turns", 0) else ""),
                                    run_tool=self._run_tool, **_extra)
         except Exception as exc:
             # THE ROUTE FAILING IS NOT THE JOB FAILING. Recorded, not raised: the caller reads
@@ -453,6 +455,15 @@ class CopilotSocketDriver:
     def conversation_title(self) -> str:
         """No tab, so no title strip to scrape. The caller falls back to the goal text."""
         return ""
+
+    def use_tools(self, catalogue, run_tool, protocol=""):
+        """Switch this driver to the bridge transport: advertise `catalogue` in each turn and
+        run the calls the model asks for with `run_tool`. Called by relay/tool_bridge.equip on
+        a freshly built driver, before its first turn; a driver never given tools keeps
+        asking once, exactly as before."""
+        self._catalogue = catalogue
+        self._protocol = protocol or ""
+        self._run_tool = run_tool
 
     def close(self):
         self.conv.close()

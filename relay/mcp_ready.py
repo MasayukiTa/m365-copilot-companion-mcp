@@ -104,7 +104,16 @@ def default_health():
 
 
 def default_tunnel(local_pid):
-    """(ok, why) for the path Copilot uses. No tunnel configured => (True, '')."""
+    """(ok, why) for the path Copilot uses. No tunnel configured => (True, '').
+
+    On the connector-less route nothing reaches this machine through a tunnel, so a tunnel left
+    over in .env is not part of the path and is not probed."""
+    try:
+        from relay import tool_bridge
+        if tool_bridge.is_bridge():
+            return True, ""
+    except Exception:
+        pass
     try:
         from relay.relay_fleet import _mcp_tunnel_url
         base = (_mcp_tunnel_url() or "").rstrip("/")

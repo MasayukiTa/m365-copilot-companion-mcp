@@ -33,6 +33,11 @@ dist/
 .memory_state.json
 .procedural_memory.json
 .procedural_memory_aliases.json
+# tools/state_store.py side files: generation backups, lock, temp
+.*.json.bak.*
+.*.json.lock
+.*.json.*.tmp
+agent_memory/index.json.*
 .companion_runs/
 .companion_gates/
 
@@ -101,6 +106,9 @@ desktop.ini
 ~$*
 .cache/
 
+# Benchmark output written beside the probe when --out is not given (scripts/probes/bridge_bench.py).
+/scripts/probes/bench_out.jsonl
+
 ui/*.exe
 .codeql-build/
 
@@ -130,6 +138,8 @@ ui/_buildcheck/
 !/docs/unreached_burndown.md
 # the contract an agent reads before deciding whether its work landed
 !/docs/agent_contract.md
+# the connector-less route: setup and switching back, for a user (generic, no host names)
+!/docs/connector_less_route.md
 /docs/validation/
 # generic how-to for when a custom MCP connection cannot be created
 !/docs/custom_mcp_fallback_route.md

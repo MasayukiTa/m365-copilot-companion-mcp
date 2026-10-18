@@ -368,3 +368,14 @@ def test_take_new_also_resolves_a_removed_upstream_conflict(tmp_path, monkeypatc
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))
+
+
+def test_state_store_side_files_of_preserved_state_are_preserved():
+    for name in (
+        ".procedural_memory.json.bak.1",
+        ".procedural_memory.json.lock",
+        ".memory_state.json.bak.5",
+    ):
+        assert ufr.should_skip(Path(name)), name
+    assert not ufr.should_skip(Path("tools/state_store.py"))
+    assert not ufr.should_skip(Path("somefile.json.bak.1"))

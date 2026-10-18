@@ -111,6 +111,7 @@ partial class CockpitWindow
         if (k == "hs_srv_detail_auth") return ja ? "サーバは応答しているが、直近10分に認証失敗が出ています。MCP_API_KEY の不一致を疑ってください。件数:" : "Server is responding, but reporting auth failures in the last 10 minutes. Suspect an MCP_API_KEY mismatch. Count:";
         if (k == "hs_tun_detail_ok") return ja ? "トンネル経由でサーバに到達できます" : "Server reachable through the tunnel";
         if (k == "hs_tun_detail_bad") return ja ? "トンネルからサーバに到達できません" : "Server not reachable through the tunnel";
+        if (k == "hs_tun_detail_notused") return ja ? "コネクタなし経路のためトンネルは使いません" : "Not used: the connector-less route needs no tunnel";
         if (k == "hs_tun_detail_none") return ja ? "MCP_TUNNEL_URL が .env に未設定です" : "MCP_TUNNEL_URL is not set in .env";
         if (k == "hs_fix_edge_navigate") return ja ? "エージェントのページを開いています..." : "opening the agent page...";
         if (k == "hs_fix_edge_still") return ja ? "ページを開いても準備完了になりません" : "navigated, but the page is still not ready";
