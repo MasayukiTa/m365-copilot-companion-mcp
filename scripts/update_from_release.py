@@ -206,6 +206,12 @@ def should_skip(rel: Path) -> bool:
     parts = rel.parts
     if parts and parts[0] in PRESERVE_NAMES:
         return True
+    # state_store side files (.bak.N generations, .lock, temp) next to a preserved
+    # state file are as local as the file itself.
+    if len(parts) == 1 and any(
+        parts[0].startswith(n + ".") for n in PRESERVE_NAMES if n.endswith(".json")
+    ):
+        return True
     rel_norm = Path(*parts) if parts else rel
     for prefix in PRESERVE_PREFIXES:
         if rel_norm == prefix or prefix in rel_norm.parents:
