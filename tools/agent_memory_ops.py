@@ -116,14 +116,26 @@ def _now_iso() -> str:
 # ===========================================================================
 
 
-def _read_json(path: Path, default):
-    """Read one store file. A missing file returns `default`. A file that exists
-    but cannot be parsed is NOT treated as empty: it is retried, then replaced by
-    the newest valid backup generation, else state_store.StateUnreadable is raised
-    so no caller can save a stand-in over it."""
+def _read_json(path: Path, default, strict: bool = False):
+    """Read one store file. A missing file returns `default`.
+
+    A file that exists but cannot be parsed is retried, then replaced by the
+    newest valid backup generation (state_store). If nothing valid exists:
+      * strict=False (read/list/search paths): return `default` -- a view only;
+      * strict=True (every read that precedes a write): raise
+        state_store.StateUnreadable so the save refuses instead of writing a
+        stand-in over the damaged file.
+    """
     if not path.exists() or not path.is_file():
         return default
-    return state_store.read_json(path, validate=lambda d: isinstance(d, dict), default=lambda: default)
+    try:
+        return state_store.read_json(
+            path, validate=lambda d: isinstance(d, dict), default=lambda: default
+        )
+    except state_store.StateUnreadable:
+        if strict:
+            raise
+        return default
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
@@ -211,13 +223,13 @@ def _new_topic(topic_id: str, title: Optional[str] = None) -> dict:
     }
 
 
-def _load_topic(topic_id: str) -> Optional[dict]:
-    topic = _read_json(_topic_path(topic_id), None)
+def _load_topic(topic_id: str, strict: bool = False) -> Optional[dict]:
+    topic = _read_json(_topic_path(topic_id), None, strict=strict)
     return topic if isinstance(topic, dict) else None
 
 
-def _load_index() -> dict:
-    idx = _read_json(_index_path(), None)
+def _load_index(strict: bool = False) -> dict:
+    idx = _read_json(_index_path(), None, strict=strict)
     if not isinstance(idx, dict):
         idx = {}
     idx.setdefault("version", "1.0")
@@ -241,7 +253,7 @@ def _load_index() -> dict:
 
 
 def _upsert_index(topic: dict) -> None:
-    idx = _load_index()
+    idx = _load_index(strict=True)
     tid = topic.get("topic_id", "")
     one_liner = (topic.get("summary") or topic.get("title") or "").replace("\n", " ").strip()
     if len(one_liner) > 160:
@@ -344,7 +356,7 @@ def memory_save(
 
         with state_store.file_lock(_index_path()):
             _ensure_dirs()
-            topic = _load_topic(topic_id)
+            topic = _load_topic(topic_id, strict=True)
             created_new = topic is None
             if topic is None:
                 topic = _new_topic(topic_id, title=title)
@@ -414,7 +426,15 @@ def memory_save(
 
             topic["updated"] = _now_iso()
             _atomic_write_json(_topic_path(topic_id), topic)
-            _upsert_index(topic)
+            try:
+                _upsert_index(topic)
+            except state_store.StateStoreError as e:
+                # The topic file (the data) is saved; a damaged index is left
+                # exactly as found rather than replaced by a one-topic stand-in.
+                return (
+                    f"memory_save: saved topic '{topic_id}' but the index is unreadable "
+                    f"and was NOT modified ({e})"
+                )
 
         verb = "created" if created_new else "updated"
         if not changed:
