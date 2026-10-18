@@ -44,13 +44,12 @@ every read/write this module performs -- see tools/test_agent_memory_ops.py.
 from __future__ import annotations
 
 import json
-import os
 import re
-import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from . import state_store
 from .security import require_unlocked
 
 # Repo root resolved from __file__ (tools/agent_memory_ops.py -> repo root is
@@ -117,35 +116,32 @@ def _now_iso() -> str:
 # ===========================================================================
 
 
-def _read_json(path: Path, default):
-    """Tolerant JSON read: missing file, unreadable file, or malformed JSON
-    all fall back to `default` instead of raising."""
+def _read_json(path: Path, default, strict: bool = False):
+    """Read one store file. A missing file returns `default`.
+
+    A file that exists but cannot be parsed is retried, then replaced by the
+    newest valid backup generation (state_store). If nothing valid exists:
+      * strict=False (read/list/search paths): return `default` -- a view only;
+      * strict=True (every read that precedes a write): raise
+        state_store.StateUnreadable so the save refuses instead of writing a
+        stand-in over the damaged file.
+    """
+    if not path.exists() or not path.is_file():
+        return default
     try:
-        if not path.exists() or not path.is_file():
-            return default
-        data = json.loads(path.read_text(encoding="utf-8-sig"))
-        return data
-    except Exception:
+        return state_store.read_json(
+            path, validate=lambda d: isinstance(d, dict), default=lambda: default
+        )
+    except state_store.StateUnreadable:
+        if strict:
+            raise
         return default
 
 
 def _atomic_write_json(path: Path, data: dict) -> None:
-    """Write `data` as pretty JSON to `path` atomically: tmp file in the same
-    directory + os.replace(). UTF-8, no BOM."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fd, tmp_name = tempfile.mkstemp(
-        prefix=f".tmp_{path.stem}_", suffix=".json", dir=str(path.parent)
-    )
-    try:
-        with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        os.replace(tmp_name, str(path))
-    except Exception:
-        try:
-            os.remove(tmp_name)
-        except Exception:
-            pass
-        raise
+    """Atomic write (temp file + fsync + os.replace) with rotating backups; the
+    caller of a read-modify-write holds state_store.file_lock."""
+    state_store.atomic_write_json(path, data)
 
 
 # ===========================================================================
@@ -227,13 +223,13 @@ def _new_topic(topic_id: str, title: Optional[str] = None) -> dict:
     }
 
 
-def _load_topic(topic_id: str) -> Optional[dict]:
-    topic = _read_json(_topic_path(topic_id), None)
+def _load_topic(topic_id: str, strict: bool = False) -> Optional[dict]:
+    topic = _read_json(_topic_path(topic_id), None, strict=strict)
     return topic if isinstance(topic, dict) else None
 
 
-def _load_index() -> dict:
-    idx = _read_json(_index_path(), None)
+def _load_index(strict: bool = False) -> dict:
+    idx = _read_json(_index_path(), None, strict=strict)
     if not isinstance(idx, dict):
         idx = {}
     idx.setdefault("version", "1.0")
@@ -257,7 +253,7 @@ def _load_index() -> dict:
 
 
 def _upsert_index(topic: dict) -> None:
-    idx = _load_index()
+    idx = _load_index(strict=True)
     tid = topic.get("topic_id", "")
     one_liner = (topic.get("summary") or topic.get("title") or "").replace("\n", " ").strip()
     if len(one_liner) > 160:
@@ -358,78 +354,87 @@ def memory_save(
         if not topic_id or not isinstance(topic_id, str):
             return "[memory_save error: topic_id must be a non-empty string]"
 
-        _ensure_dirs()
-        topic = _load_topic(topic_id)
-        created_new = topic is None
-        if topic is None:
-            topic = _new_topic(topic_id, title=title)
+        with state_store.file_lock(_index_path()):
+            _ensure_dirs()
+            topic = _load_topic(topic_id, strict=True)
+            created_new = topic is None
+            if topic is None:
+                topic = _new_topic(topic_id, title=title)
 
-        changed: list[str] = []
+            changed: list[str] = []
 
-        if title:
-            if topic.get("title") != title:
-                topic["title"] = title
-                changed.append("title")
-        if summary:
-            if topic.get("summary") != summary:
-                topic["summary"] = summary
-                changed.append("summary")
-        if status:
-            if topic.get("status") != status:
-                topic["status"] = status
-                changed.append("status")
+            if title:
+                if topic.get("title") != title:
+                    topic["title"] = title
+                    changed.append("title")
+            if summary:
+                if topic.get("summary") != summary:
+                    topic["summary"] = summary
+                    changed.append("summary")
+            if status:
+                if topic.get("status") != status:
+                    topic["status"] = status
+                    changed.append("status")
 
-        tag_list = _as_str_list(tags)
-        if tag_list:
-            before = list(topic.get("tags", []) or [])
-            topic["tags"] = _merge_dedup(before, tag_list)
-            if topic["tags"] != before:
-                changed.append("tags")
+            tag_list = _as_str_list(tags)
+            if tag_list:
+                before = list(topic.get("tags", []) or [])
+                topic["tags"] = _merge_dedup(before, tag_list)
+                if topic["tags"] != before:
+                    changed.append("tags")
 
-        kw_list = _as_str_list(keywords)
-        if kw_list:
-            before = list(topic.get("keywords", []) or [])
-            topic["keywords"] = _merge_dedup(before, kw_list)
-            if topic["keywords"] != before:
-                changed.append("keywords")
+            kw_list = _as_str_list(keywords)
+            if kw_list:
+                before = list(topic.get("keywords", []) or [])
+                topic["keywords"] = _merge_dedup(before, kw_list)
+                if topic["keywords"] != before:
+                    changed.append("keywords")
 
-        if key_fact:
-            conf = confidence if confidence in _VALID_CONFIDENCE else "medium"
-            entry = {"fact": key_fact, "confidence": conf}
-            if _append_dict_unique(topic.setdefault("key_facts", []), entry, "fact"):
-                changed.append("key_fact")
+            if key_fact:
+                conf = confidence if confidence in _VALID_CONFIDENCE else "medium"
+                entry = {"fact": key_fact, "confidence": conf}
+                if _append_dict_unique(topic.setdefault("key_facts", []), entry, "fact"):
+                    changed.append("key_fact")
 
-        if data_source:
-            entry = {"path": data_source, "note": source_note or ""}
-            if _append_dict_unique(topic.setdefault("data_sources", []), entry, "path"):
-                changed.append("data_source")
+            if data_source:
+                entry = {"path": data_source, "note": source_note or ""}
+                if _append_dict_unique(topic.setdefault("data_sources", []), entry, "path"):
+                    changed.append("data_source")
 
-        if method_step:
-            if _append_str_unique(topic.setdefault("method", []), method_step):
-                changed.append("method_step")
+            if method_step:
+                if _append_str_unique(topic.setdefault("method", []), method_step):
+                    changed.append("method_step")
 
-        if decision:
-            entry = {"decision": decision, "rationale": rationale or "", "when": _now_iso()}
-            if _append_dict_unique(topic.setdefault("decisions", []), entry, "decision"):
-                changed.append("decision")
+            if decision:
+                entry = {"decision": decision, "rationale": rationale or "", "when": _now_iso()}
+                if _append_dict_unique(topic.setdefault("decisions", []), entry, "decision"):
+                    changed.append("decision")
 
-        if artifact:
-            a_type = artifact_type if artifact_type in _VALID_ARTIFACT_TYPES else "other"
-            entry = {"path": artifact, "type": a_type, "note": artifact_note or ""}
-            if _append_dict_unique(topic.setdefault("artifacts", []), entry, "path"):
-                changed.append("artifact")
+            if artifact:
+                a_type = artifact_type if artifact_type in _VALID_ARTIFACT_TYPES else "other"
+                entry = {"path": artifact, "type": a_type, "note": artifact_note or ""}
+                if _append_dict_unique(topic.setdefault("artifacts", []), entry, "path"):
+                    changed.append("artifact")
 
-        if next_action:
-            if _append_str_unique(topic.setdefault("next_actions", []), next_action):
-                changed.append("next_action")
+            if next_action:
+                if _append_str_unique(topic.setdefault("next_actions", []), next_action):
+                    changed.append("next_action")
 
-        if open_question:
-            if _append_str_unique(topic.setdefault("open_questions", []), open_question):
-                changed.append("open_question")
+            if open_question:
+                if _append_str_unique(topic.setdefault("open_questions", []), open_question):
+                    changed.append("open_question")
 
-        topic["updated"] = _now_iso()
-        _atomic_write_json(_topic_path(topic_id), topic)
-        _upsert_index(topic)
+            topic["updated"] = _now_iso()
+            _atomic_write_json(_topic_path(topic_id), topic)
+            try:
+                _upsert_index(topic)
+            except state_store.StateStoreError as e:
+                # The topic file (the data) is saved; a damaged index is left
+                # exactly as found rather than replaced by a one-topic stand-in.
+                return (
+                    f"memory_save: saved topic '{topic_id}' but the index is unreadable "
+                    f"and was NOT modified ({e})"
+                )
 
         verb = "created" if created_new else "updated"
         if not changed:
