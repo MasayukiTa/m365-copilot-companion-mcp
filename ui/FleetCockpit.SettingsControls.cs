@@ -218,6 +218,7 @@ partial class CockpitWindow
         PaintAutoResume();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
+        PaintToolRoute();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -518,6 +519,46 @@ partial class CockpitWindow
         _hmPending.Text = pend ?? "";
         _hmPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _hmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Tool route (connector|connector-less). Persists through SaveKey only; relay/tool_bridge.py
+    // re-reads the key whenever a fleet conversation is created (each_gate), so a change reaches the
+    // next conversation and a running one keeps the route it started with. Words: ToolRouteView.
+    UIElement ToolRouteControl()
+    {
+        _trLbl = new TextBlock(); _trLbl.VerticalAlignment = VerticalAlignment.Center;
+        _trLbl.FontSize = 12;
+
+        _trBox = new ComboBox();
+        _trBox.ToolTip = ToolRouteView.Help(_lang == 0) + "\n" + ToolRouteView.TakeEffectTip(_lang == 0);
+        _trBox.Cursor = Cursors.Hand; _trBox.FontSize = 12;
+        _trBox.FontWeight = FontWeights.SemiBold; _trBox.MinWidth = 64;
+        _trBox.Padding = new Thickness(8, 2, 4, 2);
+        _trBox.VerticalAlignment = VerticalAlignment.Center;
+        var trHelp = new Dictionary<string, string>();
+        foreach (string m in ToolRouteView.Modes) trHelp[m] = ToolRouteView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_trBox, ToolRouteView.Modes, trHelp, _trVal);
+        _trBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _trBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_trBox);
+            if (!ToolRouteView.IsMode(sel) || sel == _trVal) return;   // unchanged -> no write, no re-fire
+            _trVal = sel;
+            SaveKey(ToolRouteView.Key, _trVal);
+        };
+
+        var wrap = SettingsComboBlock(_trLbl, _trBox, new TextBlock(), new TextBlock());
+        PaintToolRoute();
+        return wrap;
+    }
+    void PaintToolRoute()
+    {
+        if (_trLbl != null) { _trLbl.Text = ToolRouteView.Label(_lang == 0); _trLbl.Foreground = Muted; }
+        if (_trBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_trBox), _trVal)) ComboSelectVal(_trBox, _trVal);
+        _trBox.ToolTip = ToolRouteView.Help(_lang == 0) + "\n" + ToolRouteView.TakeEffectTip(_lang == 0);
+        _trBox.Background = BtnBg; _trBox.Foreground = Fg; _trBox.BorderBrush = Border;
+        StyleFlatCombo(_trBox);
     }
     // Merge conversation (fresh|parent), in the Fan-out section. Persists through SaveKey only; the
     // runner re-reads the key at every split and every merge (each_gate). Parent runs the merge in

@@ -30,6 +30,10 @@ $root = Split-Path -Parent $scriptDir
 # reads. Named once so the tests can point them at a throwaway clone and a stub server
 # instead of this machine's live bridge.
 $script:venvPy = Join-Path $root ".venv\Scripts\python.exe"
+# How fleet conversations reach their tools (setting tool_transport): "connector" needs a Dev Tunnel,
+# "connector-less" needs none. Set from the product's own reader inside Invoke-Startup; "connector"
+# until then, so a path that never got that far behaves as it always did.
+$script:ToolRoute = "connector"
 $script:bootstrapPy = Join-Path $scriptDir "bootstrap.py"
 $script:bridgeStatusUrl = "http://127.0.0.1:8765/status"
 # Japanese-capable WinForms font helper (Get-JapaneseUiFont), dot-sourced once here so every
@@ -2774,9 +2778,14 @@ function Invoke-Startup {
     # Dev Tunnel self-heal (best-effort, non-blocking, runs even under -NoUi):
     # repoints MCP_TUNNEL_NAME/MCP_TUNNEL_URL to a tunnel this account actually
     # owns, BEFORE the supervisor (below) hosts it.
-    Set-SplashStatus $script:splash "Checking the Dev Tunnel..."
+    $script:ToolRoute = Get-ToolTransport -Python $script:venvPy -RepoRoot $root
     $t0_tunnelHeal = Get-Date
-    Invoke-TunnelHealPreflight
+    if ($script:ToolRoute -eq "connector-less") {
+        Write-Host "[tunnel] connector-less route (Settings > Tools): no custom connector and no Dev Tunnel are used, so none is checked or hosted"
+    } else {
+        Set-SplashStatus $script:splash "Checking the Dev Tunnel..."
+        Invoke-TunnelHealPreflight
+    }
     Record-PhaseTiming "tunnel_heal" $t0_tunnelHeal
 
     Write-Host "=== Daily startup (idempotent -- already-running parts are left as-is) ==="
@@ -2790,7 +2799,7 @@ function Invoke-Startup {
     #    own tunnel stays unhosted, and doctor.ps1's tunnel_serving check would stay red
     #    forever. Detect that with Test-SupervisorTunnelDrift and restart on the correct
     #    tunnel; otherwise behave exactly as before.
-    Set-SplashStatus $script:splash "Starting the MCP server and Dev Tunnel..."
+    Set-SplashStatus $script:splash $(if ($script:ToolRoute -eq "connector-less") { "Starting the MCP server..." } else { "Starting the MCP server and Dev Tunnel..." })
     Set-StartupStage "supervisor_start"   # what Save-StartupFailure names inside Start-FreshSupervisor
     $t0_supervisor = Get-Date
     function Start-FreshSupervisor([string]$tn) {
@@ -2865,7 +2874,7 @@ function Invoke-Startup {
         Start-FreshSupervisor $envTn
     } else {
         $runCmdLine = $runningSupervisors[0].CommandLine
-        if (Test-SupervisorTunnelDrift -RunningCommandLine $runCmdLine -EnvTunnelName $envTn) {
+        if (($script:ToolRoute -ne "connector-less") -and (Test-SupervisorTunnelDrift -RunningCommandLine $runCmdLine -EnvTunnelName $envTn)) {
             $runTn = Get-SupervisorArgTunnel $runCmdLine
             Write-Host "[1/4] supervisor is hosting a STALE tunnel ('$runTn') != .env ('$envTn') -- stopping and restarting on the correct tunnel"
             try {
@@ -3199,6 +3208,8 @@ if (-not $script:lockTimedOut) {
     try {
         if ($script:supervisorDied) {
             Write-Host "[tunnel] not checked: the supervisor, which hosts it, did not start (see above)" -ForegroundColor DarkGray
+        } elseif ($script:ToolRoute -eq "connector-less") {
+            Write-Host "[tunnel] not used: connector-less route (no Dev Tunnel is needed)" -ForegroundColor DarkGray
         } else {
             Test-TunnelServing
         }
