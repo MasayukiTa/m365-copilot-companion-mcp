@@ -133,6 +133,8 @@ ui/_buildcheck/
 !/docs/unreached_burndown.md
 # the contract an agent reads before deciding whether its work landed
 !/docs/agent_contract.md
+# the connector-less route: setup and switching back, for a user (generic, no host names)
+!/docs/connector_less_route.md
 /docs/validation/
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py
