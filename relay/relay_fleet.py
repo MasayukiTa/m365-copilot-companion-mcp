@@ -2460,7 +2460,7 @@ def _socket_route():
                                             log=lambda m: print(
                                                 __import__("relay.logstamp", fromlist=["stamp"])
                                                 .stamp(m), flush=True))
-                # tool_transport=bridge: a driver built by this route gets the gateway and a
+                # tool_transport=connector-less: a driver built by this route gets the gateway and a
                 # run_tool. Applied here (socket_route.py is frozen); a no-op for `connector`.
                 tool_bridge.equip(_SOCKET_ROUTE)
     return _SOCKET_ROUTE

@@ -167,7 +167,7 @@ _LIVE_READERS = {
     "supervisor_self_restart": (_reader_supervisor_self_restart, "off", "on"),
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),
     "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
-    "tool_transport": (_reader_tool_transport, "bridge", "connector"),
+    "tool_transport": (_reader_tool_transport, "connector-less", "connector"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),

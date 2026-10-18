@@ -1,13 +1,18 @@
 # -*- coding: utf-8 -*-
 """The tool transport: which way a fleet conversation reaches its tools.
 
+User-facing name of the second transport: the CONNECTOR-LESS ROUTE (setting value `connector-less`).
+"bridge" is this module's internal word for it and an accepted legacy spelling of the setting; in
+this repository "the bridge" otherwise means the Copilot chat bridge, which is why the setting
+uses the other name. See docs/connector_less_route.md.
+
 TWO TRANSPORTS, ONE SETTING
 
   connector  The agent holds the tools itself (an MCP connector registered on the agent) and
              calls them while it answers. This is the default and the behaviour that existed
              before this module: nothing here changes it.
 
-  bridge     The agent has NO tools registered. The model asks for a call in a fenced block in
+  connector-less  The agent has NO tools registered. The model asks for a call in a fenced block in
              its reply (relay/socket_tools.py), this process runs the call against its own
              local MCP server, and the result goes back in the next message. The model is a
              language model inside our loop; nothing connects outward on its behalf.
@@ -16,7 +21,7 @@ The choice is read from `tool_transport=` in settings.txt (the cockpit's file, r
 tools/settings_path.py) and nowhere else. There is deliberately NO environment variable for it:
 an environment value that beats the screen is how a hand-passed flag silently overrides what the
 operator sees (effort_policy carries that scar). Anything missing, unreadable or not one of the
-two words reads as `connector`, so a typo can never switch a machine onto the unproven path.
+two accepted spellings reads as `connector`, so a typo can never switch a machine onto the unproven path.
 
 WHAT THE BRIDGE MODE HAS TO TURN OFF. The fleet has several checks that assume the agent holds a
 connector: "the MCP connector never initialised", "the model says it has no call_tool", "a call
@@ -35,8 +40,13 @@ import os
 import threading
 
 CONNECTOR = "connector"
-BRIDGE = "bridge"
-TRANSPORTS = (CONNECTOR, BRIDGE)
+CONNECTOR_LESS = "connector-less"
+BRIDGE = CONNECTOR_LESS            # internal name kept for callers; the setting value is connector-less
+TRANSPORTS = (CONNECTOR, CONNECTOR_LESS)
+#: Spellings read as the connector-less route. `bridge` is what the first version of the setting
+#: was called; a settings.txt written with it keeps working.
+_ALIASES = {"bridge": CONNECTOR_LESS, "connector-less": CONNECTOR_LESS, "connector_less": CONNECTOR_LESS,
+            "connectorless": CONNECTOR_LESS, "connector": CONNECTOR}
 DEFAULT_TRANSPORT = CONNECTOR
 
 #: The local MCP server the bridge calls. The gateway tool lives behind this one URL.
@@ -66,7 +76,7 @@ def _settings_path(path=None):
 
 
 def transport(path=None) -> str:
-    """`connector` or `bridge`, from settings.txt. Never raises; anything unclear is connector.
+    """`connector` or `connector-less`, from settings.txt. Never raises; anything unclear is connector.
 
     `path` exists for tests (they must never be steered by the developer's own settings file).
     """
@@ -83,7 +93,7 @@ def transport(path=None) -> str:
                 ln = ln.strip()
                 if ln.startswith("tool_transport="):
                     v = ln.split("=", 1)[1].strip().lower()
-                    val = v if v in TRANSPORTS else DEFAULT_TRANSPORT
+                    val = _ALIASES.get(v, DEFAULT_TRANSPORT)
                     break
         _cache[p] = (key, val)
         return val
@@ -127,6 +137,43 @@ def turn_limit_s() -> float:
     return _env_seconds("MCP_FLEET_BRIDGE_TURN_S", BRIDGE_TURN_DEFAULT_S)
 
 
+#: Tool-name prefixes the model is never offered and never allowed to run through the gateway.
+#: Owner rule: Outlook is never launched on this machine. The tools in question drive the desktop
+#: mail client, so they are removed at the source (the lists the model reads and the call itself),
+#: not merely discouraged in prose. Mail and calendar come from Microsoft Work IQ instead: those
+#: tools are attached to the agent itself, the model calls them natively, and they never pass
+#: through this module.
+BLOCKED_PREFIXES = ("outlook",)
+
+
+def is_blocked_tool(name) -> bool:
+    """True for a tool name this route never offers or runs (case and surrounding space ignored)."""
+    low = str(name or "").strip().lower()
+    return any(low.startswith(p) for p in BLOCKED_PREFIXES)
+
+
+def _is_discovery(payload) -> bool:
+    """A gateway call that LISTS or DESCRIBES (index, category, signature) rather than runs."""
+    nm = str(payload.get("name") or "").strip()
+    return nm in ("", "?", "list", "*") or payload.get("arguments") is None
+
+
+def scrub_listing(text) -> str:
+    """Drop the lines of a gateway listing that offer a blocked tool.
+
+    The gateway's index and category listings give one tool per line as `  name -- summary` or
+    `  name(params) -- summary`. A line is dropped when its first word starts with a blocked prefix.
+    Other lines (counts, category headers) are kept as they are.
+    """
+    out = []
+    for ln in str(text).splitlines():
+        word = ln.strip().split(" ", 1)[0].split("(", 1)[0]
+        if word and is_blocked_tool(word):
+            continue
+        out.append(ln)
+    return "\n".join(out)
+
+
 def catalogue():
     """What the model is told it may call: the one gateway, in the `tools_block` shape."""
     return [{
@@ -137,7 +184,10 @@ def catalogue():
             "name='<tool>' with arguments to run it. "
             "WRITE A CALL AS A CODE BLOCK whose info string is call_tool and whose body is one JSON "
             "object, exactly like this (no other call syntax exists):\n"
-            "```call_tool\n{\"name\": \"\", \"arguments\": {}}\n```"),
+            "```call_tool\n{\"name\": \"\", \"arguments\": {}}\n```\n"
+            "For mail and calendar use the Microsoft Work IQ tools attached to this agent "
+            "directly: they are not behind call_tool. Tools whose name starts with outlook "
+            "are not available."),
         "parameters": {
             "type": "object",
             "properties": {
@@ -263,8 +313,15 @@ def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):
                 payload["arguments"] = dict(inner, _worker=str(worker_name))
             # No `arguments` at all means "show me the signature": adding one would turn that
             # into a run, so attribution is attached only to a call that already has them.
+            if is_blocked_tool(payload.get("name")):
+                return False, ("[call_tool: no tool or category named '%s'. "
+                               "For mail and calendar use the Microsoft Work IQ tools.]"
+                               % str(payload.get("name"))[:60])
             result = _run_coroutine(_call(factory, payload, limit))
-            return (not _is_error(result)), _text_of(result)
+            text = _text_of(result)
+            if _is_discovery(payload):
+                text = scrub_listing(text)
+            return (not _is_error(result)), text
         except asyncio.TimeoutError:
             return False, "TimeoutError: the tool call took longer than %d s" % int(limit)
         except Exception as exc:

@@ -79,7 +79,7 @@ def test_connector_passes_exactly_the_arguments_it_always_did(monkeypatch):
 
 
 def test_bridge_hands_the_driver_the_gateway_and_a_run_tool(monkeypatch):
-    _transport(monkeypatch, "bridge")
+    _transport(monkeypatch, "connector-less")
     drv = _route().driver_for("w7")
     assert [t["name"] for t in drv._catalogue] == ["call_tool"]
     assert callable(drv._run_tool)
@@ -89,7 +89,7 @@ def test_bridge_hands_the_driver_the_gateway_and_a_run_tool(monkeypatch):
 
 
 def test_bridge_run_tool_is_bound_to_this_worker(monkeypatch):
-    _transport(monkeypatch, "bridge")
+    _transport(monkeypatch, "connector-less")
     made = []
     monkeypatch.setattr(TB, "make_run_tool", lambda name, **kw: made.append(name) or (lambda n, a: (True, "")))
     _route().driver_for("w7")
@@ -97,7 +97,7 @@ def test_bridge_run_tool_is_bound_to_this_worker(monkeypatch):
 
 
 def test_a_deep_research_conversation_never_gets_tools(monkeypatch):
-    _transport(monkeypatch, "bridge")
+    _transport(monkeypatch, "connector-less")
     drv = _route().driver_for("w0", model="some-deep-model")
     assert drv._catalogue is None and drv._run_tool is None
 
@@ -131,7 +131,7 @@ def test_the_fleet_s_own_route_is_equipped(monkeypatch):
     monkeypatch.setattr(rf, "_SOCKET_ROUTE", None)
     monkeypatch.setattr(SR, "SocketRoute", fake_route)
     monkeypatch.setattr(PT, "capture_fn", lambda: (lambda *a: (_token(), _Tpl())))
-    _transport(monkeypatch, "bridge")
+    _transport(monkeypatch, "connector-less")
     route = rf._socket_route()
     assert route is built[0]
     assert route.driver_for("w1")._run_tool is not None

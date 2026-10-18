@@ -32,9 +32,9 @@ def test_the_default_is_connector_when_the_key_is_absent(tmp_path):
     assert TB.transport(_settings(tmp_path, "maxtabs=3\n")) == "connector"
 
 
-@pytest.mark.parametrize("raw", ["bridge", "BRIDGE", " Bridge "])
-def test_bridge_is_read_from_the_file(tmp_path, raw):
-    assert TB.transport(_settings(tmp_path, "maxtabs=3\ntool_transport=%s\n" % raw)) == "bridge"
+@pytest.mark.parametrize("raw", ["connector-less", "Connector-Less", " connector-less ", "bridge", "BRIDGE"])
+def test_connector_less_is_read_from_the_file_and_bridge_is_its_legacy_spelling(tmp_path, raw):
+    assert TB.transport(_settings(tmp_path, "maxtabs=3\ntool_transport=%s\n" % raw)) == "connector-less"
 
 
 @pytest.mark.parametrize("raw", ["", "brigde", "text_bridge", "1", "on", "connector "])
@@ -45,14 +45,14 @@ def test_an_unknown_value_falls_back_to_connector(tmp_path, raw):
 def test_a_byte_order_mark_is_tolerated(tmp_path):
     p = tmp_path / "settings.txt"
     p.write_bytes(b"\xef\xbb\xbftool_transport=bridge\n")
-    assert TB.transport(str(p)) == "bridge"
+    assert TB.transport(str(p)) == "connector-less"
 
 
 def test_a_change_to_the_file_is_seen_without_a_restart(tmp_path):
     p = _settings(tmp_path, "tool_transport=connector\n")
     assert TB.transport(p) == "connector"
     _settings(tmp_path, "tool_transport=bridge\n")
-    assert TB.transport(p) == "bridge"
+    assert TB.transport(p) == "connector-less"
 
 
 def test_no_environment_variable_can_override_the_file(tmp_path, monkeypatch):
@@ -225,3 +225,51 @@ def test_importing_the_module_opens_no_connection_and_builds_no_client():
     src = inspect.getsource(TB)
     top_level_imports = [ln for ln in src.splitlines() if ln.startswith(("import ", "from "))]
     assert not any("fastmcp" in ln for ln in top_level_imports)
+
+
+# ---------------------------------------------------------------- outlook is never offered
+
+_INDEX = "\n".join([
+    "3 tools, in 2 categories.",
+    "  read_file(path) -- read a file",
+    "  outlook_inbox(n) -- the desktop mail client's inbox",
+    "  Outlook_Calendar -- calendar",
+    "  count_rows -- rows in a table",
+])
+
+
+def test_the_catalogue_names_work_iq_and_says_outlook_is_not_available():
+    text = TB.catalogue()[0]["description"]
+    assert "Work IQ" in text and "outlook" in text.lower()
+
+
+def test_a_listing_loses_its_outlook_lines_and_keeps_the_rest():
+    log = []
+    run = TB.make_run_tool("w", client_factory=_factory(_FakeClient(_Result(_INDEX), log=log)))
+    ok, text = run("call_tool", {"name": ""})
+    assert ok
+    assert "outlook" not in text.lower()
+    assert "read_file(path)" in text and "count_rows" in text
+
+
+def test_a_category_listing_is_scrubbed_too():
+    run = TB.make_run_tool("w", client_factory=_factory(_FakeClient(_Result(_INDEX))))
+    ok, text = run("call_tool", {"name": "mail"})
+    assert "outlook" not in text.lower()
+
+
+@pytest.mark.parametrize("name", ["outlook_inbox", "Outlook_Send_Mail", "  outlook_calendar", "outlook"])
+def test_a_call_to_an_outlook_tool_never_reaches_the_server(name):
+    log = []
+    run = TB.make_run_tool("w", client_factory=_factory(_FakeClient(_Result("sent"), log=log)))
+    for args in ({"name": name}, {"name": name, "arguments": {"to": "x"}}):
+        ok, text = run("call_tool", args)
+        assert ok is False and "Work IQ" in text
+    assert log == []
+
+
+def test_a_tool_that_merely_mentions_outlook_is_not_blocked():
+    log = []
+    run = TB.make_run_tool("w", client_factory=_factory(_FakeClient(_Result("ok"), log=log)))
+    ok, _ = run("call_tool", {"name": "export_for_outlook", "arguments": {}})
+    assert ok and len(log) == 1
