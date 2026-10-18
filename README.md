@@ -32,6 +32,23 @@ API 契約は不要。会社アカウントのまま。管理者権限も不要�
 
 ---
 
+## 二つの経路(どちらも同じ `quickstart.bat` と `start_all.bat`)
+
+Copilot がこの PC のツールを呼ぶ道は二つあります。**起動に使う bat は同じです**(専用の bat はありません)。違いは設定 `tool_transport` だけです。
+
+| | コネクタ経路(既定) | **コネクタなし経路(新)** |
+|---|---|---|
+| 使うもの | Copilot Studio のカスタムコネクタ + Dev Tunnel | **どちらも使わない**。標準のエージェント + Microsoft 提供のツール |
+| 向いている場面 | 通常 | 組織の設定で、自分の MCP のコネクタが作れないとき |
+| 選び方 | `quickstart.bat` の質問で何も選ばない(従来どおり) | `quickstart.bat` の質問で **L** を押す。あとからは、コックピットの「設定 → ツール → ツール経路」で切り替え(次の会話から有効、再起動不要) |
+| 起動 | `start_all.bat` | **同じ `start_all.bat`**(トンネルの確認と起動は自動で省かれる) |
+| 確認 | `doctor.bat` | `doctor.bat`(トンネル検査の代わりに「Tool route: connector-less」と1行出る) |
+| 手順 | 下の「セットアップ」 | [docs/connector_less_route.md](docs/connector_less_route.md)(仕組みと設定)・[docs/custom_mcp_fallback_route.md](docs/custom_mcp_fallback_route.md)(画面つき手順) |
+
+既存のフリート・スキル・ツールは、どちらの経路でも**同じ使い方**です(短い作業・長い作業・DB の読み取り・メールと予定・複数並列のフリートで確認済み。ほかの環境・組織設定では、小さな作業で先に試してください)。コネクタなし経路では、メールや予定は Microsoft 提供の Work IQ ツールで取得します。**注意:** 鍵なしで公開したツールは、リンクを知っている全員が使えます。各自が自分の環境を作り、他人のツールやエージェントのリンクは使わないでください。
+
+---
+
 ## 必要なもの
 
 1. **Windows 10 / 11**
@@ -194,6 +211,9 @@ A. Dev Tunnel の公開 URL が生成・host されているか確認してく�
 **Q. エージェントがツールを呼んでくれない**
 A. Copilot Studio でエージェントに MCP コネクタの「接続を承認」が済んでいるか確認してください。認証（Bearer）が通っていないと呼び出せません。「API キーの値」に `Bearer ` を付け忘れていないかも確認を。
 
+**Q. 組織の設定で、自分の MCP のコネクタ(接続)が作れない**
+A. コネクタもトンネルも使わない別の経路があります。標準のエージェントに Microsoft 提供のツールだけを付け、ツールの呼び出しはこの PC が受け持ちます。手順は [docs/custom_mcp_fallback_route.md](docs/custom_mcp_fallback_route.md)、仕組みと設定は [docs/connector_less_route.md](docs/connector_less_route.md) です。**注意:** 鍵なしで公開したツールは、リンクを知っている全員が使えます。各自が自分の環境(自分のエージェントと自分の PC)を作り、他人のツールやエージェントのリンクは使わないでください。
+
 **Q. 途中で失敗した。やり直して大丈夫？**
 A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行しても安全**で、足りないものだけ補います。既に動いているトンネルは止めません。
 
@@ -266,6 +286,8 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 - [docs/SECURITY.md](docs/SECURITY.md) — 認証・認可モデルと運用上の注意
 - [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — 症状別の直し方・doctor 各行の意味
 - [docs/ADVANCED.md](docs/ADVANCED.md) — 全ツールカタログ・relay/fleet の詳細・ODBC・ベンチ再現手順
+- [docs/custom_mcp_fallback_route.md](docs/custom_mcp_fallback_route.md) — MCP のコネクタが作れないときの、コネクタ・トンネルなしの経路(画面つき手順)
+- [docs/connector_less_route.md](docs/connector_less_route.md) — その経路の仕組み・設定(`tool_transport`)・制約
 - [scripts/AUTOSTART.md](scripts/AUTOSTART.md) — ログオン時自動起動の設定・解除方法
 
 ---
