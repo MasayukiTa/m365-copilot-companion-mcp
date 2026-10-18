@@ -10,24 +10,36 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import state_store
 from .security import require_unlocked
 
 STATE_FILE = Path(__file__).resolve().parent.parent / ".memory_state.json"
 MAX_VALUE_CHARS = 16_000
 
 
-def _load() -> dict:
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except Exception:
-            return {"scopes": {}}
+def _valid_state(data) -> bool:
+    return isinstance(data, dict) and isinstance(data.get("scopes"), dict)
+
+
+def _entry_count(state: dict) -> int:
+    return sum(len(b) for b in state["scopes"].values() if isinstance(b, dict))
+
+
+def _empty_state() -> dict:
     return {"scopes": {}}
 
 
-def _save(state: dict) -> None:
-    STATE_FILE.write_text(
-        json.dumps(state, indent=2, ensure_ascii=False), encoding="utf-8"
+def _load() -> dict:
+    """Read the store; an unreadable file is never turned into an empty state
+    (retry, newest valid backup, else state_store.StateUnreadable)."""
+    return state_store.read_json(STATE_FILE, validate=_valid_state, default=_empty_state)
+
+
+def _update(mutate, *, allow_shrink: bool = False):
+    """Locked, atomic read-modify-write (tools/state_store.py)."""
+    return state_store.update_json(
+        STATE_FILE, mutate, validate=_valid_state, count=_entry_count,
+        default=_empty_state, allow_shrink=allow_shrink,
     )
 
 
@@ -87,20 +99,20 @@ def memory_save_local(
             return "[memory_save error: value must be a string]"
         if len(value) > MAX_VALUE_CHARS:
             return f"[memory_save error: value exceeds {MAX_VALUE_CHARS} chars]"
-        state = _load()
-        bucket = state["scopes"].setdefault(scope, {})
-        prev = bucket.get(key)
-        bucket[key] = {
-            "value": value,
-            "tags": list(tags) if tags else (prev["tags"] if prev else []),
-            "updated_at": time.time(),
-            "history_count": (prev.get("history_count", 0) if prev else 0) + 1,
-        }
-        _save(state)
-        return (
-            f"saved [{scope}/{key}] ({len(value)} chars, "
-            f"rev #{bucket[key]['history_count']})"
-        )
+
+        def _mutate(state: dict) -> int:
+            bucket = state["scopes"].setdefault(scope, {})
+            prev = bucket.get(key)
+            bucket[key] = {
+                "value": value,
+                "tags": list(tags) if tags else (prev["tags"] if prev else []),
+                "updated_at": time.time(),
+                "history_count": (prev.get("history_count", 0) if prev else 0) + 1,
+            }
+            return bucket[key]["history_count"]
+
+        rev = _update(_mutate)
+        return f"saved [{scope}/{key}] ({len(value)} chars, rev #{rev})"
     except Exception as e:
         return f"[memory_save error: {type(e).__name__}: {e}]"
 
@@ -169,12 +181,17 @@ def memory_delete(key: str, scope: str = "global") -> str:
     if locked:
         return locked
     try:
-        state = _load()
-        bucket = state["scopes"].get(scope, {})
-        if key not in bucket:
+
+        def _mutate(state: dict) -> bool:
+            bucket = state["scopes"].get(scope, {})
+            if key not in bucket:
+                return False
+            bucket.pop(key)
+            return True
+
+        # an explicit delete is the one legitimate way for the store to shrink
+        if not _update(_mutate, allow_shrink=True):
             return f"[memory_delete: no entry at {scope}/{key}]"
-        bucket.pop(key)
-        _save(state)
         return f"deleted [{scope}/{key}]"
     except Exception as e:
         return f"[memory_delete error: {type(e).__name__}: {e}]"
