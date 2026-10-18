@@ -558,8 +558,168 @@ function Invoke-SupervisorCodeCycle {
     }
 }
 
+# -- SUPERVISOR FORENSICS: a heartbeat that survives a hard kill (2026-10-18) -----------------
+# PROBLEM (measured): scripts/supervisor.ps1 disappeared twice without a trace. The supervisor
+# started 2026-10-18 03:56:06 was gone before 15:11 and its log has NO 'leaving its loop' record
+# (PR 176's try/finally exit line only runs on a normal exit or a catchable error), so it was
+# KILLED or crashed hard; its child python main.py survived. Free RAM was ~1 GB then (the machine
+# was saturated), but that is only a hypothesis. The try/finally exit record cannot explain a hard
+# kill BY DEFINITION -- nothing runs when the process is torn down -- so the death leaves no
+# evidence at all. These two functions add the evidence next time:
+#   (1) every loop iteration, overwrite a tiny heartbeat file (atomic, same .fleet state dir and
+#       same temp+Move-Item write as Write-SupervisorState) with pid, iteration, local time, free
+#       physical memory MB, committed-bytes-in-use percent, total CPU percent (a cheap formatted
+#       counter read, not a sampled Get-Counter, so it is never more than ~100 ms), and this
+#       supervisor's own working set.
+#   (2) on the NEXT start, before the loop, read the previous heartbeat: if it exists, its pid is
+#       not running, and no 'leaving its loop' record follows it in the log, append ONE line
+#       naming the last heartbeat and its resources, and keep supervisor_last_death.json plus a
+#       small jsonl history capped at 50 lines. If the previous exit WAS recorded, write nothing.
+$script:SupervisorHeartbeatPath = Join-Path $SupFleetDir "supervisor_heartbeat.json"
+$script:SupervisorLastDeathPath = Join-Path $SupFleetDir "supervisor_last_death.json"
+$script:SupervisorDeathHistoryPath = Join-Path $SupFleetDir "supervisor_death_history.jsonl"
+$script:SupervisorDeathHistoryMax = 50
+$script:HeartbeatIteration = 0
+
+function Get-SupervisorHeartbeatSample {
+    # PURE-ISH: @{ pid; iteration; local_time; free_ram_mb; committed_pct; cpu_pct; working_set_mb;
+    # started } for ONE heartbeat. Every reading is best-effort: a counter that cannot be read is
+    # $null, never an exception, because a heartbeat that throws is a heartbeat that is not written.
+    param([int]$Iteration)
+    $freeRamMb = $null
+    $committedPct = $null
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        if ($os.FreePhysicalMemory) { $freeRamMb = [int]([double]$os.FreePhysicalMemory / 1024.0) }
+    } catch { }
+    try {
+        $mem = Get-CimInstance Win32_PerfFormattedData_PerfOS_Memory -ErrorAction Stop
+        if ($null -ne $mem.PercentCommittedBytesInUse) { $committedPct = [int]$mem.PercentCommittedBytesInUse }
+    } catch { }
+    # A FORMATTED counter, not Get-Counter: Win32_PerfFormattedData_* exposes the value the perf
+    # subsystem already computed, so it is a single read of ~tens of ms, never the 1 s sampling
+    # interval a raw Get-Counter would block on. '_Total' is the all-CPU figure.
+    $cpuPct = $null
+    try {
+        $cpu = Get-CimInstance Win32_PerfFormattedData_PerfOS_Processor -Filter "Name='_Total'" -ErrorAction Stop
+        if ($null -ne $cpu.PercentProcessorTime) { $cpuPct = [int]$cpu.PercentProcessorTime }
+    } catch { }
+    $wsMb = $null
+    try { $wsMb = [int]((Get-Process -Id $PID -ErrorAction Stop).WorkingSet64 / 1048576) } catch { }
+    return [ordered]@{
+        pid            = $PID
+        started        = $SupervisorStartedUnix
+        iteration      = [int]$Iteration
+        local_time     = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+        free_ram_mb    = $freeRamMb
+        committed_pct  = $committedPct
+        cpu_pct        = $cpuPct
+        working_set_mb = $wsMb
+    }
+}
+
+function Write-SupervisorHeartbeat {
+    # Overwrite the heartbeat file atomically (temp + Move-Item, UTF8 no BOM), the same way
+    # Write-SupervisorState writes its own sidecar. Never throws: a heartbeat that could block the
+    # loop it is supposed to be reporting on would be worse than a missing beat.
+    param([int]$Iteration)
+    try {
+        if (-not (Test-Path $SupFleetDir)) { New-Item -ItemType Directory -Path $SupFleetDir -Force | Out-Null }
+        $body = (Get-SupervisorHeartbeatSample -Iteration $Iteration) | ConvertTo-Json -Compress
+        $tmp = $script:SupervisorHeartbeatPath + ".tmp." + $PID
+        [IO.File]::WriteAllText($tmp, $body, (New-Object Text.UTF8Encoding($false)))
+        Move-Item -LiteralPath $tmp -Destination $script:SupervisorHeartbeatPath -Force
+    } catch { }
+}
+
+function Test-SupervisorExitRecordedAfter {
+    # PURE. Did a 'leaving its loop' record (PR 176's try/finally line) appear in the log AT OR
+    # AFTER the heartbeat's own local time? The log lines start 'yyyy-MM-dd HH:mm:ss  ...', so a
+    # record whose timestamp parses and is >= the heartbeat time means the previous supervisor
+    # left cleanly; anything else is treated as 'not recorded'. An unparseable heartbeat time, or
+    # a log that cannot be read, fails closed to $false (not recorded) -- the death is the
+    # interesting case, so an unreadable answer must not be allowed to hide it.
+    param([string[]]$LogLines, [string]$HeartbeatLocalTime)
+    $hbTime = [datetime]::MinValue
+    if (-not [datetime]::TryParseExact($HeartbeatLocalTime, 'yyyy-MM-dd HH:mm:ss',
+            [System.Globalization.CultureInfo]::InvariantCulture,
+            [System.Globalization.DateTimeStyles]::None, [ref]$hbTime)) {
+        return $false
+    }
+    foreach ($line in $LogLines) {
+        if ($line -notmatch 'leaving its loop') { continue }
+        if ($line -match '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})') {
+            $t = [datetime]::MinValue
+            if ([datetime]::TryParseExact($matches[1], 'yyyy-MM-dd HH:mm:ss',
+                    [System.Globalization.CultureInfo]::InvariantCulture,
+                    [System.Globalization.DateTimeStyles]::None, [ref]$t)) {
+                if ($t -ge $hbTime) { return $true }
+            }
+        }
+    }
+    return $false
+}
+
+function Invoke-SupervisorPreviousDeathCheck {
+    # On THIS start, before the loop: read the previous heartbeat. If it exists, its pid is not
+    # running, and no 'leaving its loop' record follows it, record a hard kill -- one log line, a
+    # supervisor_last_death.json copy, and one capped jsonl history line. If the previous exit was
+    # recorded (clean leave), write nothing extra. Never throws.
+    try {
+        if (-not (Test-Path -LiteralPath $script:SupervisorHeartbeatPath)) { return }
+        $hb = $null
+        try { $hb = (Get-Content -LiteralPath $script:SupervisorHeartbeatPath -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop } catch { return }
+        if ($null -eq $hb) { return }
+        $prevPid = 0
+        try { $prevPid = [int]$hb.pid } catch { return }
+        if ($prevPid -le 0 -or $prevPid -eq $PID) { return }
+        # The previous supervisor is still alive -> this start is a second instance (the mutex
+        # already turned it away above) or a PID that has not yet been reused; either way there is
+        # no death to report.
+        if (Get-Process -Id $prevPid -ErrorAction SilentlyContinue) { return }
+        $logLines = @()
+        try { if (Test-Path -LiteralPath $Log) { $logLines = @(Get-Content -LiteralPath $Log -ErrorAction Stop) } } catch { $logLines = @() }
+        $hbLocal = [string]$hb.local_time
+        if (Test-SupervisorExitRecordedAfter -LogLines $logLines -HeartbeatLocalTime $hbLocal) { return }
+        $freeTxt = if ($null -ne $hb.free_ram_mb) { [string]$hb.free_ram_mb } else { 'unknown' }
+        $cpuTxt = if ($null -ne $hb.cpu_pct) { [string]$hb.cpu_pct } else { 'unknown' }
+        Write-Log ("previous supervisor pid ${prevPid}: last heartbeat at $hbLocal " +
+                   "(free RAM $freeTxt MB, CPU $cpuTxt %), no exit record -> it was killed or crashed hard")
+        $death = [ordered]@{
+            prev_pid       = $prevPid
+            prev_started   = $hb.started
+            last_heartbeat = $hbLocal
+            iteration      = $hb.iteration
+            free_ram_mb    = $hb.free_ram_mb
+            committed_pct  = $hb.committed_pct
+            cpu_pct        = $hb.cpu_pct
+            working_set_mb = $hb.working_set_mb
+            detected_by    = $PID
+            detected_at    = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            verdict        = 'killed_or_crashed_hard'
+        }
+        try {
+            if (-not (Test-Path $SupFleetDir)) { New-Item -ItemType Directory -Path $SupFleetDir -Force | Out-Null }
+            $tmp = $script:SupervisorLastDeathPath + ".tmp." + $PID
+            [IO.File]::WriteAllText($tmp, ($death | ConvertTo-Json -Compress), (New-Object Text.UTF8Encoding($false)))
+            Move-Item -LiteralPath $tmp -Destination $script:SupervisorLastDeathPath -Force
+        } catch { }
+        try {
+            Add-Content -LiteralPath $script:SupervisorDeathHistoryPath -Value ($death | ConvertTo-Json -Compress) -Encoding UTF8
+            # Cap from the front: the oldest death is the least useful and the newest must never be
+            # the one dropped.
+            $lines = @(Get-Content -LiteralPath $script:SupervisorDeathHistoryPath -ErrorAction Stop)
+            if ($lines.Count -gt $script:SupervisorDeathHistoryMax) {
+                $keep = $lines[($lines.Count - $script:SupervisorDeathHistoryMax)..($lines.Count - 1)]
+                Set-Content -LiteralPath $script:SupervisorDeathHistoryPath -Value $keep -Encoding UTF8
+            }
+        } catch { }
+    } catch { }
+}
+
 Initialize-SupervisorCodeWatch
 Write-SupervisorState
+Invoke-SupervisorPreviousDeathCheck
 
 # The cockpit must distinguish "the server died" from "the supervisor is deliberately
 # replacing stale code".  Without a machine-readable transition, both are a few seconds of
@@ -2706,6 +2866,10 @@ while ($true) {
     # First, the interpreter every python launch of this tick uses (D2): one Test-Path unless a
     # .venv has appeared that this supervisor is not using yet. See Update-PythonInterpreter.
     Update-PythonInterpreter "this tick's reaper and queue drain"
+    # SUPERVISOR FORENSICS: one heartbeat per loop iteration, so a hard kill leaves a last-seen
+    # pid, time and resource reading for the NEXT start to read (see Invoke-SupervisorPreviousDeathCheck).
+    $script:HeartbeatIteration++
+    Write-SupervisorHeartbeat -Iteration $script:HeartbeatIteration
     $freshTn = Get-EnvTunnelName
     if ($freshTn -and ((Get-BareTunnelName $freshTn) -ne (Get-BareTunnelName $TunnelName))) {
         # A NEW NAME IS A CLAIM, AND IT USED TO BE BELIEVED WITHOUT CHECKING.
