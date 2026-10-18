@@ -176,8 +176,18 @@ sealed class SubmittedTasks
         catch (Exception) { return 0.0; }
     }
 
-    /// The goal text a SpawnFleet line carries: either the line itself, or -- for the callers
-    /// that pass an already-serialised {"text":..,"resume_conv":..} object -- its "text".
+    /// The goal text a goals-file line carries: either the line itself, or -- for the callers
+    /// that pass an already-serialised {"text":..,"resume_conv":..} or {"cwd":..,"goal":..}
+    /// object -- its "text", else its "goal".
+    ///
+    /// THE SAME RULE AS THE RUNNER'S, AND PINNED TO IT. relay/fleet_runner._read_goals_file reads a
+    /// '{' line as a dict and relay_fleet.goal_fields takes `text or goal` from it, so the worker
+    /// the runner builds carries that sentence -- not the wrapper. This read only "text", so a
+    /// submission wrapped as {"cwd":..,"goal":..} was keyed by its wrapper text, no worker ever
+    /// carried that key, and a job that had run stayed "submitted, not picked up" for ever
+    /// (measured 2026-10-18, 8 h 50 min, raising the stale-queue alarm). Every key in this file
+    /// goes through KeyOf, which unwraps with THIS function, for entries and workers alike.
+    /// ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py runs both parsers on the same lines.
     public static string GoalTextOf(string raw)
     {
         string t = (raw ?? "").Trim();
@@ -189,12 +199,22 @@ sealed class SubmittedTasks
                 if (o != null)
                 {
                     object v;
+                    if (o.TryGetValue("text", out v) && v is string && ((string)v).Length > 0)
+                        return (string)v;
+                    if (o.TryGetValue("goal", out v) && v is string && ((string)v).Length > 0)
+                        return (string)v;
                     if (o.TryGetValue("text", out v) && v is string) return (string)v;
                 }
             }
             catch (Exception) { }
         }
         return raw ?? "";
+    }
+
+    /// The de-dup / worker-match key: the goal the runner would run, whitespace-normalised.
+    public static string KeyOf(string goal)
+    {
+        return Normalize(GoalTextOf(goal));
     }
 
     // ── reading the disk ───────────────────────────────────────────────────────────────────
@@ -373,7 +393,7 @@ sealed class SubmittedTasks
         foreach (Dictionary<string, object> w in rows)
         {
             if (w == null) continue;
-            string k = Normalize(Str(w, "goal"));
+            string k = KeyOf(Str(w, "goal"));
             if (k.Length == 0) continue;
             string wk = WorkerIdentity(started, w);
             if (wk.Length == 0) continue;
@@ -442,10 +462,10 @@ sealed class SubmittedTasks
 
     public bool AddLocal(string goal, double nowUnix, Dictionary<string, List<string>> byGoal)
     {
-        string key = Normalize(goal);
+        string key = KeyOf(goal);
         if (key.Length == 0) return false;
         if (Find(key) != null) return true;          // already on screen
-        NewEntry(key, goal, "local", "", nowUnix, nowUnix, byGoal);
+        NewEntry(key, GoalTextOf(goal), "local", "", nowUnix, nowUnix, byGoal);
         return true;
     }
 
@@ -468,11 +488,11 @@ sealed class SubmittedTasks
             foreach (SubmittedFile f in files)
             {
                 if (f == null) continue;
-                string key = Normalize(f.Goal);
+                string key = KeyOf(f.Goal);
                 if (key.Length == 0) continue;
                 Entry e = Find(key);
                 if (e == null)
-                    e = NewEntry(key, f.Goal, f.Source, f.Id, f.SubmittedUnix, nowUnix, byGoal);
+                    e = NewEntry(key, GoalTextOf(f.Goal), f.Source, f.Id, f.SubmittedUnix, nowUnix, byGoal);
                 // The furthest stage a file shows wins the label: a command is at the run's
                 // door, for_fleet is waiting for a run, pending is not yet routed.
                 if (!e.Backed || StageOf(f.Source) > StageOf(e.Source))
