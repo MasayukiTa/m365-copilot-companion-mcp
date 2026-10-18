@@ -226,7 +226,11 @@ def equip(route):
         model = kwargs.get("model") or (args[1] if len(args) > 1 else "")
         if model:
             return drv
-        drv.use_tools(catalogue(), make_run_tool(str(name or "")), protocol="")
+        # The server's own instructions, as the protocol prefix of the FIRST turn (the driver drops
+        # it on later turns). A fetch that fails gives "" and the conversation starts without it.
+        text = server_instructions()
+        drv.use_tools(catalogue(), make_run_tool(str(name or "")),
+                      protocol=(text.rstrip() + "\n\n") if text else "")
         return drv
 
     try:
@@ -287,6 +291,54 @@ def _run_coroutine(coro):
     if "e" in box:
         raise box["e"]
     return box["v"]
+
+
+#: The server's own `instructions` (what an MCP connector agent is handed when it connects), kept
+#: here only as a cached copy fetched from the live gateway -- the text itself lives in main.py and
+#: is never copied into the repository a second time.
+INSTRUCTIONS_TTL_S = 600.0
+INSTRUCTIONS_RETRY_S = 60.0
+_instructions_cache = {}
+
+
+async def _initialize_instructions(client_factory):
+    async with client_factory() as client:
+        # `client.instructions` works in every protocol era; the legacy initialize result carries the
+        # same text where the client has no such property.
+        text = getattr(client, "instructions", None)
+        if not text:
+            text = getattr(getattr(client, "initialize_result", None), "instructions", "")
+        return str(text or "")
+
+
+def server_instructions(client_factory=None, now=None, ttl_s=None) -> str:
+    """The MCP server's `instructions`, from the initialize result of the live gateway.
+
+    A connector agent receives this text automatically; a connector-less agent does not, so it is
+    sent once as the protocol prefix of a conversation's first turn (see equip). Cached for
+    INSTRUCTIONS_TTL_S and then refreshed. A failed fetch returns the stale copy if there is one,
+    else "" (the conversation simply starts without it), is logged to stderr, and is not retried
+    for INSTRUCTIONS_RETRY_S so a down server does not cost every new conversation a timeout.
+    """
+    import sys
+    import time
+    clock = now or time.time
+    ttl = INSTRUCTIONS_TTL_S if ttl_s is None else float(ttl_s)
+    t = clock()
+    c = _instructions_cache
+    if c and t < c.get("until", 0.0):
+        return c.get("text", "")
+    try:
+        text = _run_coroutine(asyncio.wait_for(
+            _initialize_instructions(client_factory or _real_client_factory), 10.0))
+        c.update(text=text, until=t + ttl)
+        return text
+    except Exception as exc:
+        sys.stderr.write("[tool_bridge] could not fetch the server instructions: %s: %s\n"
+                         % (type(exc).__name__, str(exc)[:160]))
+        c.setdefault("text", "")
+        c["until"] = t + INSTRUCTIONS_RETRY_S
+        return c["text"]
 
 
 def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):

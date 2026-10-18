@@ -253,3 +253,34 @@ def test_infra_health_asks_only_the_local_server_when_connector_less(monkeypatch
     _transport(monkeypatch, "connector")
     assert relay_fleet._infra_healthy() is True
     assert len(asked) == 2
+
+
+# ---------------------------------------------------------------- (f) the server's own instructions
+
+def test_the_instructions_ride_on_the_first_turn_only():
+    """A connector agent is handed the server's instructions when it connects; the connector-less
+    agent gets them as the protocol prefix of the conversation's FIRST turn and never again."""
+    conv, sent = _scripted_conversation(["one", "two"])
+    drv = SD.CopilotSocketDriver(conv, connect=None, catalogue=TB.catalogue(), protocol="SERVER-RULES\n\n",
+                                 run_tool=lambda n, a: (True, ""))
+    drv.send("first job")
+    _wait(drv)
+    drv.send("second job")
+    _wait(drv)
+    assert sent[0].startswith("SERVER-RULES") and sent[0].endswith("first job")
+    assert "SERVER-RULES" not in sent[1] and sent[1].endswith("second job")
+
+
+def test_equip_hands_the_fetched_instructions_to_a_connector_less_driver(monkeypatch):
+    monkeypatch.setattr(TB, "server_instructions", lambda *a, **k: "RULE 1 -- call call_tool first")
+    _transport(monkeypatch, "connector-less")
+    drv = _route().driver_for("w0")
+    assert drv._protocol.startswith("RULE 1 -- call call_tool first")
+    _transport(monkeypatch, "connector")
+    assert _route().driver_for("w0")._protocol == ""        # the connector route is untouched
+
+
+def test_a_failed_fetch_leaves_the_protocol_empty(monkeypatch):
+    monkeypatch.setattr(TB, "server_instructions", lambda *a, **k: "")
+    _transport(monkeypatch, "connector-less")
+    assert _route().driver_for("w0")._protocol == ""

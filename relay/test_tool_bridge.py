@@ -305,3 +305,77 @@ def test_main_prints_the_transport(capsys, monkeypatch):
     assert TB.main([]) == 0
     assert capsys.readouterr().out.strip() == "connector-less"
     assert TB.main(["bogus"]) == 2
+
+
+# ---------------------------------------------------------------- the server's instructions
+
+class _Init:
+    def __init__(self, instructions):
+        self.instructions = instructions
+
+
+class _InitClient(_FakeClient):
+    def __init__(self, instructions, fail=False):
+        super().__init__(_Result("x"))
+        self.initialize_result = None if fail else _Init(instructions)
+
+
+@pytest.fixture
+def fresh_instructions():
+    TB._instructions_cache.clear()
+    yield
+    TB._instructions_cache.clear()
+
+
+def test_instructions_come_from_the_initialize_result(fresh_instructions):
+    assert TB.server_instructions(client_factory=_factory(_InitClient("RULE 1 ..."))) == "RULE 1 ..."
+
+
+def test_instructions_are_cached_then_refreshed(fresh_instructions):
+    clock = [1000.0]
+    calls = []
+
+    def factory():
+        calls.append(1)
+        return _InitClient("v%d" % len(calls))
+    get = lambda: TB.server_instructions(client_factory=factory, now=lambda: clock[0], ttl_s=100)
+    assert get() == "v1" and get() == "v1" and len(calls) == 1
+    clock[0] += 101
+    assert get() == "v2" and len(calls) == 2
+
+
+def test_a_failed_fetch_is_empty_logged_and_not_retried_at_once(fresh_instructions, capsys):
+    clock = [0.0]
+    calls = []
+
+    def factory():
+        calls.append(1)
+        raise ConnectionError("refused")
+    get = lambda: TB.server_instructions(client_factory=factory, now=lambda: clock[0], ttl_s=600)
+    assert get() == "" and get() == "" and len(calls) == 1
+    assert "instructions" in capsys.readouterr().err
+    clock[0] += 61
+    assert get() == "" and len(calls) == 2
+
+
+def test_a_stale_copy_is_kept_when_the_refresh_fails(fresh_instructions):
+    clock = [0.0]
+    ok = [True]
+
+    def factory():
+        if not ok[0]:
+            raise ConnectionError("down")
+        return _InitClient("OLD")
+    get = lambda: TB.server_instructions(client_factory=factory, now=lambda: clock[0], ttl_s=10)
+    assert get() == "OLD"
+    ok[0] = False
+    clock[0] += 11
+    assert get() == "OLD"
+
+
+def test_a_real_fastmcp_client_exposes_the_instructions_of_an_in_memory_server(fresh_instructions):
+    """The attribute the fetch reads exists on the real client (no network: in-memory transport)."""
+    fastmcp = pytest.importorskip("fastmcp")
+    server = fastmcp.FastMCP("probe", instructions="RULE 1 -- from the real initialize result")
+    assert TB.server_instructions(client_factory=lambda: fastmcp.Client(server)) == \
+        "RULE 1 -- from the real initialize result"

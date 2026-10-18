@@ -45,6 +45,14 @@ If you already installed with the connector route, open the cockpit's **Settings
 **Tool route** to **Connector-less**. The change applies to the next conversation the fleet creates, with
 no restart; conversations already running keep the route they started with. Then follow steps 2 to 5.
 
+## What the agent is told
+
+A connector agent receives the local server's own instructions when it connects. The connector-less
+agent has no connection, so this PC reads the same instructions from the running server and sends
+them once, at the start of each conversation (never again in that conversation), ahead of the tool
+description. They are refreshed periodically; if the server cannot be reached when a conversation
+starts, it starts without them and a line is logged.
+
 ## Mail and calendar
 
 Use the native Work IQ tools attached to the agent. They are not behind `call_tool`: the agent calls

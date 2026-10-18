@@ -303,7 +303,9 @@ class CopilotSocketDriver:
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    annotations=annotations,
                                    on_progress=on_progress,
-                                   catalogue=self._catalogue, protocol=self._protocol,
+                                   catalogue=self._catalogue,
+                                   # the protocol prefix is for a conversation's FIRST turn only
+                                   protocol=(self._protocol if not getattr(self.conv, "turns", 0) else ""),
                                    run_tool=self._run_tool, **_extra)
         except Exception as exc:
             # THE ROUTE FAILING IS NOT THE JOB FAILING. Recorded, not raised: the caller reads
