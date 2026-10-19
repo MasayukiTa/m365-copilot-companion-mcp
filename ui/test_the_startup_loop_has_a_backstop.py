@@ -21,14 +21,15 @@
 
 ui/FleetCockpit.cs is WPF and cannot be imported from pytest, so this exercises the extracted
 PURE decision classes directly -- `StartupGate.GateAutomaticLaunch` and `AutoFixBudget.Decide`,
-both in the SHIPPED ui/SelfImproveDashboard.cs (placed there, not in FleetCockpit.cs, because
-that file has no Main and a throwaway console harness can compile it standalone; see FrozenGate's
-now-removed placement for precedent). These are the SAME functions FleetCockpit.cs's RunStartAll,
+both in the SHIPPED ui/StartupGate.cs (a file of their own, not in FleetCockpit.cs, because a
+throwaway console harness can compile this one standalone; they used to live in
+ui/SelfImproveDashboard.cs, which needed WPF to compile). These are the SAME functions
+FleetCockpit.cs's RunStartAll,
 its startup-sweep auto-heal, and MaybeAutoFix call -- not a re-implementation of their policy.
 
-Compiles ui/SelfImproveDashboard.cs + ui/Theme.cs (WPF references: SelfImproveDashboardWindow
-extends Window) plus the test-only driver ui/harness/StartupGateHarness.cs with the real csc.
-Registered in ui/test_one_list_says_what_the_ui_compiles.py's EXEMPT (compiles a WPF source file
+Compiles ui/StartupGate.cs (no WPF) plus the test-only driver ui/harness/StartupGateHarness.cs
+with the real csc.
+Registered in ui/test_one_list_says_what_the_ui_compiles.py's EXEMPT (compiles a shipped source file
 standalone into a throwaway console harness, not a build of either shipped UI binary) and
 COMPILED_BY_A_TEST (ui/harness/StartupGateHarness.cs).
 
@@ -70,26 +71,18 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from tools import childproc  # noqa: E402
-from tools import ui_source  # noqa: E402  (the dashboard source is spread over SelfImproveDashboard*.cs)
 
 UI = os.path.join(REPO, "ui")
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 CSC = os.path.join(FW, "csc.exe")
-WPF = os.path.join(FW, "WPF")
 
 SOURCES = [
-    *ui_source.self_improve_paths(),  # every part: SelfImproveDashboard.cs + SelfImproveDashboard.<Topic>.cs
-    os.path.join(UI, "Theme.cs"),
+    os.path.join(UI, "StartupGate.cs"),  # StartupGate + AutoFixBudget: pure, no WPF
     os.path.join(UI, "harness", "StartupGateHarness.cs"),
 ]
 
 REFS = [
-    os.path.join(WPF, "PresentationFramework.dll"),
-    os.path.join(WPF, "PresentationCore.dll"),
-    os.path.join(WPF, "WindowsBase.dll"),
-    os.path.join(FW, "System.Xaml.dll"),
     os.path.join(FW, "System.Web.Extensions.dll"),
-    os.path.join(FW, "System.Windows.Forms.dll"),
 ]
 
 pytestmark = pytest.mark.skipif(

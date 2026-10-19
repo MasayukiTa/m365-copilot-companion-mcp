@@ -1,5 +1,5 @@
 // StartupGateHarness.cs -- TEST-ONLY. Drives StartupGate.GateAutomaticLaunch and
-// AutoFixBudget.Decide (both in the SHIPPED ui/SelfImproveDashboard.cs) against synthetic
+// AutoFixBudget.Decide (both in the SHIPPED ui/StartupGate.cs) against synthetic
 // inputs, for ui/test_the_startup_loop_has_a_backstop.py. Not in any Build line: see
 // COMPILED_BY_A_TEST in ui/test_one_list_says_what_the_ui_compiles.py.
 //
