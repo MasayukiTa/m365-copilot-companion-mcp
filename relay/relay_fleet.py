@@ -2507,6 +2507,29 @@ def _consider_socket_refresh(route, agent_url):
         return False
 
 
+def _prestart_socket_token(goals, agent_url):
+    """Launch the token fetch at the top of a run, so it overlaps the run's own set-up.
+
+    The fetch is an independent helper process (see _consider_socket_refresh) that takes
+    15-27 s (measured 2026-10-19: 6 runs in-process 6.4 s warm, subprocess 17.8-28.2 s). It used to
+    be launched from the first sweep, after the campaigns, workers, queues and watchdogs had been
+    built, so none of that time overlapped it. This is the same call the sweep makes, issued
+    earlier; the sweep's own call stays and is a no-op while this one is in flight or inside the
+    capture policy's backoff, so nothing is fetched twice and the capture floor is unchanged.
+
+    No turn is sent (relay/no_tab.py). Never raises and never blocks. Returns whether a helper
+    was launched."""
+    try:
+        if not goals:
+            return False
+        route = _socket_route()
+        if route.open() and route.needs_refresh(agent_url):
+            return bool(_consider_socket_refresh(route, agent_url))
+    except Exception:
+        pass
+    return False
+
+
 def _live_route_entries(route) -> dict:
     """{agent_url: {"token", "template"}} for every entry of `route` whose token is still alive.
 
@@ -9389,6 +9412,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # Was a literal 3 in the signature. Same value, now taken from the harness, so an A/B
         # over research depth is two different programs rather than two runs of one.
         max_research = _genome_default("max_research", 3)
+    # THE TOKEN FETCH STARTS NOW, NOT AT THE FIRST SWEEP. See _prestart_socket_token.
+    _prestart_socket_token(goals, agent_url)
     review_lenses = _resolve_review_lenses(review_lenses)
 
     # WHAT WAS SWITCHED ON, RECORDED AT THE START, ONCE.

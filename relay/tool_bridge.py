@@ -230,7 +230,8 @@ def equip(route):
         # it on later turns). A fetch that fails gives "" and the conversation starts without it.
         text = server_instructions()
         drv.use_tools(catalogue(), make_run_tool(str(name or "")),
-                      protocol=(text.rstrip() + "\n\n") if text else "")
+                      protocol=(text.rstrip() + "\n\n") if text else "",
+                      preflight=make_preflight(str(name or "")) if preflight_enabled() else None)
         return drv
 
     try:
@@ -238,6 +239,49 @@ def equip(route):
     except Exception:
         return route
     return route
+
+
+#: Longest the first-turn lookups may take. They are an optimisation: past this the model is
+#: simply left to ask for them, as before.
+PREFLIGHT_TIMEOUT_S = 20.0
+
+
+def preflight_enabled() -> bool:
+    """On by default for the connector-less route; MCP_BRIDGE_PREFLIGHT=0 turns it off (the A/B
+    switch). Follows the module's idiom for tuning values: a default with an env override. This
+    is not the transport switch -- the connector route never reaches this code."""
+    return os.environ.get("MCP_BRIDGE_PREFLIGHT", "").strip().lower() not in ("0", "off", "false", "no")
+
+
+def make_preflight(worker_name="", *, client_factory=None, timeout_s=None):
+    """A `preflight(request_text) -> str` for one worker: the index listing and skill_match for
+    the request, run HERE (in parallel, they do not depend on each other) so the first prompt
+    already carries what the model would otherwise spend its first turn asking for.
+
+    Goes through the same run_tool as a model-requested call, so the ledger attribution, the
+    blocked-prefix scrub and the permission checks are identical. A failed lookup is left out."""
+    from concurrent.futures import ThreadPoolExecutor
+    from relay import socket_tools as ST
+    run = make_run_tool(worker_name, client_factory=client_factory,
+                        timeout_s=timeout_s or PREFLIGHT_TIMEOUT_S)
+
+    def preflight(request_text):
+        req = str(request_text or "").strip()[:4000]
+        jobs = [("索引 (call_tool name='')", {"name": ""})]
+        if req:
+            jobs.append(("skill_match(依頼)", {"name": "skill_match", "arguments": {"text": req}}))
+        with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+            futs = [pool.submit(run, "call_tool", args) for _label, args in jobs]
+            items = []
+            for (label, _args), fut in zip(jobs, futs):
+                try:
+                    ok, text = fut.result()
+                except Exception:
+                    ok, text = False, ""
+                items.append((label, ok, text))
+        return ST.preflight_block(items)
+
+    return preflight
 
 
 def _real_client_factory():

@@ -77,6 +77,7 @@ class CopilotSocketDriver:
         self._catalogue = catalogue
         self._protocol = protocol or ""
         self._run_tool = run_tool
+        self._preflight = None
 
         self._lock = threading.Lock()
         self._thread = None
@@ -305,7 +306,7 @@ class CopilotSocketDriver:
                                    on_progress=on_progress,
                                    catalogue=self._catalogue,
                                    # the protocol prefix is for a conversation's FIRST turn only
-                                   protocol=(self._protocol if not getattr(self.conv, "turns", 0) else ""),
+                                   protocol=self._first_turn_prefix(text),
                                    run_tool=self._run_tool, **_extra)
         except Exception as exc:
             # THE ROUTE FAILING IS NOT THE JOB FAILING. Recorded, not raised: the caller reads
@@ -456,7 +457,7 @@ class CopilotSocketDriver:
         """No tab, so no title strip to scrape. The caller falls back to the goal text."""
         return ""
 
-    def use_tools(self, catalogue, run_tool, protocol=""):
+    def use_tools(self, catalogue, run_tool, protocol="", preflight=None):
         """Switch this driver to the bridge transport: advertise `catalogue` in each turn and
         run the calls the model asks for with `run_tool`. Called by relay/tool_bridge.equip on
         a freshly built driver, before its first turn; a driver never given tools keeps
@@ -464,6 +465,24 @@ class CopilotSocketDriver:
         self._catalogue = catalogue
         self._protocol = protocol or ""
         self._run_tool = run_tool
+        #: fn(request_text) -> str, run on THIS side before the first model turn.
+        self._preflight = preflight
+
+    def _first_turn_prefix(self, text):
+        """The protocol prefix, plus the pre-run lookups, for a conversation's FIRST turn only.
+
+        A lookup that fails or raises adds nothing: the model then asks for it itself, as it
+        did before this existed."""
+        if getattr(self.conv, "turns", 0):
+            return ""
+        prefix = self._protocol
+        fn = getattr(self, "_preflight", None)
+        if fn is not None:
+            try:
+                prefix += str(fn(text) or "")
+            except Exception:
+                pass
+        return prefix
 
     def close(self):
         self.conv.close()
