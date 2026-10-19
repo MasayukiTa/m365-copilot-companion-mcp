@@ -79,7 +79,7 @@ function Resolve-UiTree($spec, $label) {
 # The source list of one target, read from that tree's own rebuild_ui.ps1 Build line.
 function Get-BuildSources($uiDir, $name) {
     $line = Get-Content -LiteralPath (Join-Path $uiDir "rebuild_ui.ps1") |
-        Where-Object { $_ -match ('^Build\s+"' + [regex]::Escape($name) + '"\s+@\(') } | Select-Object -First 1
+        Where-Object { ($_ -match '^Build\s+"([A-Za-z0-9_]+)"\s+@\(') -and ($Matches[1] -eq $name) } | Select-Object -First 1
     if (-not $line) { Write-Host ("ERROR: no Build `"" + $name + "`" line in " + $uiDir + "\rebuild_ui.ps1"); exit 2 }
     return @([regex]::Matches($line, '"([^"]+\.cs)"') | ForEach-Object { $_.Groups[1].Value })
 }
