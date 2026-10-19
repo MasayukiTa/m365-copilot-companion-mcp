@@ -99,18 +99,6 @@ def build_prompt(user_text: str, catalogue, *, protocol: str = "") -> str:
         "依頼:\n" + user_text)
 
 
-def parse_calls(reply: str, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_REPLY):
-    """The tool calls a reply is asking for, as [(name, args_dict)].
-
-    A block whose body is not a JSON OBJECT is skipped rather than guessed at: the model
-    writes ordinary fenced code too, and reading ```python as a tool call would execute
-    whatever happened to parse. A block naming something outside `allowed` is skipped for the
-    same reason at a higher stake.
-    """
-    return [(name, args) for _pos, name, args in
-            read_reply(reply, allowed=allowed, max_calls=max_calls)["calls"]]
-
-
 def _short(text, limit=80) -> str:
     """One line, bounded: a notice must not carry a model-sized payload back to the model."""
     one = " ".join(str(text).split())

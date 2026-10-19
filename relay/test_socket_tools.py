@@ -13,13 +13,18 @@ import json
 from relay import socket_tools as ST
 
 
+def _parse_calls(reply, **kw):
+    """The calls a reply asks for, as [(name, args)]: read_reply is the production reader."""
+    return [(name, args) for _pos, name, args in ST.read_reply(reply, **kw)["calls"]]
+
+
 # ---- 実行してよいものだけを実行すること ---------------------------------------------------------
 
 def test_only_allowed_names_are_returned():
     """モデルの出力は untrusted input。許可一覧に無い名前を拾えば、
     たまたまその名前だったブロックを、こちらが実行することになる。"""
     reply = "```rm_rf\n{\"path\": \"/\"}\n```"
-    assert ST.parse_calls(reply) == []
+    assert _parse_calls(reply) == []
 
 
 def test_the_gateway_tool_is_what_is_advertised():
@@ -32,12 +37,12 @@ def test_a_body_that_is_not_a_json_object_is_skipped():
     """モデルは普通のコードも書く。```python を呼び出しとして読むと、
     たまたまパースできたものを実行する。"""
     for body in ("print('hi')", "[1,2,3]", '"just a string"', "42", "null", "{oops"):
-        assert ST.parse_calls("```call_tool\n%s\n```" % body) == [], body
+        assert _parse_calls("```call_tool\n%s\n```" % body) == [], body
 
 
 def test_a_well_formed_call_is_read():
     reply = '```call_tool\n{"name": "read_file", "arguments": {"path": "a.txt"}}\n```'
-    calls = ST.parse_calls(reply)
+    calls = _parse_calls(reply)
     assert calls == [("call_tool", {"name": "read_file",
                                     "arguments": {"path": "a.txt"}})]
 
@@ -47,12 +52,12 @@ def test_several_independent_calls_in_one_reply_are_all_read():
              '```call_tool\n{"name": "a"}\n```\n'
              'あいだの文\n'
              '```call_tool\n{"name": "b"}\n```\n')
-    assert [a["name"] for _n, a in ST.parse_calls(reply)] == ["a", "b"]
+    assert [a["name"] for _n, a in _parse_calls(reply)] == ["a", "b"]
 
 
 def test_the_number_of_calls_is_bounded():
     reply = "".join('```call_tool\n{"name": "t%d"}\n```\n' % i for i in range(50))
-    assert len(ST.parse_calls(reply)) == ST.MAX_CALLS_PER_REPLY
+    assert len(_parse_calls(reply)) == ST.MAX_CALLS_PER_REPLY
 
 
 def test_a_reply_with_no_calls_ends_the_turn():
@@ -149,15 +154,15 @@ def test_a_fence_must_start_its_own_line():
     """文中に埋まった ``` を呼び出しとして読むと、モデルが説明のために書いた
     引用まで実行対象になる。行頭要求は意図的な厳しさ。"""
     inline = '確認します。```call_tool\n{"name": "ls"}\n```'
-    assert ST.parse_calls(inline) == []
+    assert _parse_calls(inline) == []
     proper = '確認します。\n```call_tool\n{"name": "ls"}\n```'
-    assert ST.parse_calls(proper) == [("call_tool", {"name": "ls"})]
+    assert _parse_calls(proper) == [("call_tool", {"name": "ls"})]
 
 
 def test_an_indented_fence_still_counts():
     """箇条書きの中でモデルがインデントすることはある。行頭要求は
     『行の先頭が空白のみ』まで許す。"""
-    assert ST.parse_calls('- 手順:\n  ```call_tool\n  {"name": "ls"}\n  ```') != []
+    assert _parse_calls('- 手順:\n  ```call_tool\n  {"name": "ls"}\n  ```') != []
 
 
 # ---- 一括(バッチ)で返したとき、結果が呼び出しと取り違えられないこと -------------------------------
