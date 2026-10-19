@@ -61,7 +61,8 @@ $forbiddenPrefixes = @(
     "${root}.github/",
     "${root}.venv/",
     "${root}.fleet/",
-    "${root}.setup/"
+    "${root}.setup/",
+    "${root}docs/private/"
 )
 $forbiddenExact = @(
     "${root}.env"
