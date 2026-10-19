@@ -863,7 +863,7 @@ if (-not ((Dt port list $target) -match ("\b" + [string]$Port + "\b"))) {
 # matched as "+Tenant" / "+Tenants". doctor.ps1's Get-AccessGrantFromListing is the same parse;
 # scripts/test_setup_devtunnel_access_and_identity.py runs both on the same listings.
 function Test-AnonymousInListing([string]$text) { return [bool]($text -match '\+\s*Anonymous\b') }
-function Test-TenantInListing([string]$text) { return [bool]($text -match '\+\s*Tenants?\b') }
+function Test-TenantInListing([string]$text) { return [bool]($text -match '\+\s*(?:AAD\s+)?Tenants?\b') }
 function Get-AccessGrantFromListing([string]$text) {
     if (Test-AnonymousInListing $text) { return "anonymous" }
     if (Test-TenantInListing $text) { return "tenant" }
@@ -997,7 +997,7 @@ if ($AllowAnonymous) {
 #   * none chosen -> the tunnel and its URL are still set up and recorded, and the run ends with
 #     exit 3 saying exactly what to choose (quickstart stops there instead of reporting success).
 # The exit codes are quickstart's to explain (bootstrap.py --tunnel-access-advice, EN + JA).
-function Test-AnyAllowEntry([string]$text) { return [bool]($text -match '(?m)^\s*\+\s*\S') }
+function Test-AnyAllowEntry([string]$text) { return [bool]($text -match '(?m)^\s*(?:\d+:\s*)?\+\s*\S') }
 $FinalAccess = Get-TunnelAccessGrant $target $Port
 for ($try = 0; ($null -eq $FinalAccess) -and ($try -lt 2); $try++) {
     Start-Sleep -Seconds 2
