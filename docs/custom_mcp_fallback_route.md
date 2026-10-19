@@ -16,9 +16,7 @@ Copilot Studio のエージェントに MCP サーバー(またはカスタム�
 
 > `<ツール名>` への接続を作成できませんでした。組織の管理者設定でブロックされたか、接続を作成できませんでした。管理者に連絡してください。
 
-![接続を作るダイアログ(エラーの帯は伏せています)](img/custom_mcp_fallback/step1_connection_failed.png)
-
-*画像は接続を作るダイアログです。作成を押すと、前述のエラーがこのダイアログに帯で表示されます(画像ではその帯を黒く塗っています)。*
+このメッセージは、接続を作るダイアログ(「作成」を押したとき)に表示されます。
 
 このメッセージについて、知っておくと役に立つことがあります。
 
@@ -98,7 +96,7 @@ Copilot Studio のエージェントに MCP サーバー(またはカスタム�
 
 - Standard タイプのエージェントの作成、モデルの選択、7つの Work IQ ツールの追加、公開、Microsoft 365 チャネルの追加、エージェントストアからの追加は、すべてエラーなしで終わりました。
 - 新しいエージェントにメール、予定表、Teams、ファイルのことを聞くと、以前に作ったエージェントと同じ内容の答えが返りました。
-- 接続を作れない現象は、ダミーのカスタムツールで再現しました。API キーを付けても、認証なしでも同じでした。
+- 接続を作れない現象は、GitHub Copilot タイプのエージェントで、ダミーのカスタムツールを使って再現しました。API キーを付けても、認証なしでも同じでした。Standard タイプのエージェントでの再現は、まだ確認していません。
 
 確認できていないこと:
 
@@ -141,9 +139,7 @@ creation fails for another reason. The error is of the form:
 > organisation's administrator settings, or the connection could not be
 > created. Contact your administrator.
 
-![The connection-creation dialog (the error banner is covered)](img/custom_mcp_fallback/step1_connection_failed.png)
-
-*The image shows the dialog in which the connection is created. When you press Create, the error above appears in this dialog as a banner (covered with a black box in the image).*
+The message appears in the dialog in which the connection is created (when you press Create).
 
 Things worth knowing about this message:
 
@@ -283,8 +279,9 @@ Verified (one test tenant, October 2026):
   the agent store all completed without an error.
 - Mail, calendar, Teams and file questions put to the new agent returned
   answers matching those of an agent that had been built earlier.
-- The failure to create a connection was reproduced with a dummy custom tool,
-  both with API-key and with no authentication.
+- The failure to create a connection was reproduced in a GitHub Copilot-type agent with a dummy
+  custom tool, both with API-key and with no authentication. Reproduction in a Standard-type agent
+  has not been confirmed yet.
 
 Not verified:
 
