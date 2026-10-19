@@ -57,6 +57,7 @@ FLEET_TOOLS = {
     # -- see its own work ----------------------------------------------------------------
     "git_status":       "what have I changed",
     "git_diff":         "the answer it is being asked for IS this diff",
+    "board_digest":     "read-only: what the siblings of its campaign have settled, as unverified data",
 
     # -- drive the desktop ---------------------------------------------------------------
     #
