@@ -12,12 +12,13 @@ bridge/test_a_chat_turn_is_always_stored.py.
 """
 from __future__ import annotations
 
-import io
 import os
 import re
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-SRC = io.open(os.path.join(REPO, "ui", "CopilotChat.cs"), encoding="utf-8-sig").read()
+from tools import ui_source  # noqa: E402  (the chat window source is spread over CopilotChat*.cs)
+
+SRC = ui_source.chat_window_source(encoding="utf-8-sig")
 
 
 def _method(sig_regex):

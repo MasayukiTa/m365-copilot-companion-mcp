@@ -49,8 +49,9 @@ import re
 
 import pytest
 
+from tools import ui_source  # the chat window source is spread over CopilotChat*.cs
+
 UI = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(UI, "CopilotChat.cs")
 #: The send path moved here on 2026-09-24 and is now EXECUTED by
 #: ui/test_the_chat_window_sends_what_was_typed.py, which checks every branch below by running
 #: it and comparing with the pre-extraction code. What remains in this file are shape checks
@@ -65,10 +66,9 @@ def _code() -> str:
     the code does anything -- and every comment here names the very identifiers being asserted
     on, so without this the whole module would be vacuous.
     """
-    text = ""
-    for p in (SRC, SEND):
-        with open(p, encoding="utf-8-sig") as fh:
-            text += fh.read() + "\n"
+    text = ui_source.chat_window_source(encoding="utf-8-sig") + "\n"
+    with open(SEND, encoding="utf-8-sig") as fh:
+        text += fh.read() + "\n"
     return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.splitlines())
 
 

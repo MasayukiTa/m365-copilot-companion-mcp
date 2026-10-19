@@ -10,7 +10,7 @@ import os
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 THEME_CS = os.path.join(REPO, "ui", "Theme.cs")
-COPILOT_CHAT_CS = os.path.join(REPO, "ui", "CopilotChat.cs")
+# ui/CopilotChat.cs is split into parts; read the chat window only through tools/ui_source.py
 
 
 def test_theme_ui_font_lists_a_japanese_font_first():
@@ -25,7 +25,8 @@ def test_theme_ui_font_lists_a_japanese_font_first():
 def test_copilot_chat_has_no_duplicate_hardcoded_font_chain():
     # Guards against the duplicate-hardcode regressing: both BODY_FACE and the user-bubble
     # TextBox must reference Theme.UiFont instead of re-hardcoding the font string.
-    text = open(COPILOT_CHAT_CS, encoding="utf-8").read()
+    from tools import ui_source
+    text = ui_source.chat_window_source(encoding="utf-8")
     # Look only at live code, not a historical comment (~line 4580) that mentions the old string
     # by name while explaining a past bug -- strip '//' line comments first.
     code_lines = [line.split("//", 1)[0] for line in text.splitlines()]

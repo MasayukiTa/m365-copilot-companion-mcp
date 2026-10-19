@@ -30,6 +30,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from tools import cockpit_source                 # noqa: E402  (the cockpit source is split across files)
+from tools import ui_source                      # noqa: E402  (the chat window source is split across files)
 from tools import settings_keys as SK            # noqa: E402
 from tools import settings_path as SP            # noqa: E402
 from tools.childproc import run as _run         # noqa: E402  -- locale-safe child output
@@ -38,6 +39,8 @@ from tools.childproc import run as _run         # noqa: E402  -- locale-safe chi
 def _read(rel, encoding="utf-8"):
     if rel == "ui/FleetCockpit.cs":
         return cockpit_source.read(encoding=encoding, errors="replace")
+    if rel == "ui/CopilotChat.cs":
+        return ui_source.chat_window_source(encoding=encoding, errors="replace")
     return io.open(os.path.join(REPO, rel), encoding=encoding, errors="replace").read()
 
 

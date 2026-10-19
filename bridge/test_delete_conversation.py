@@ -118,7 +118,8 @@ def test_the_default_delete_mode_also_forgets_locally():
 
     モード1はアプリ自身のファイルだけを消し、保存層とフリートの行を残していた --
     「最も安全」と説明されているモードが、ゾンビを残す唯一のモードだった。"""
-    chat = (ROOT / "ui" / "CopilotChat.cs").read_text(encoding="utf-8-sig", errors="replace")
+    from tools import ui_source  # the chat window's source is spread over CopilotChat*.cs
+    chat = ui_source.chat_window_source(encoding="utf-8-sig", errors="replace")
     i = chat.index("void CommitPendingDelete()")
     body = chat[i:i + 1800]
     assert "/forget?url=" in body, "確定時にローカルの記録を消していない"
