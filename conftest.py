@@ -125,6 +125,12 @@ LIVE_RECORD_REDIRECTS = {
     # is exactly what the tests use -- so the log could not distinguish a refusal that happened
     # from one a test simulated, and the evidence for the switch was not evidence.
     "relay.fleet_toolset": {"SHADOW_LOG": "toolset_shadow.jsonl"},
+    # C3 SHADOW RECORD, WRITTEN ON THE ADMISSION PATH. Every test that drives run_relay_fleet with
+    # fanout_load_routing=shadow would append rows for goals that were never queued in earnest, and
+    # the report that decides whether the router is worth building counts exactly these rows. The
+    # profile it reads is derived from the directory of this same file, so the redirect also keeps
+    # a test from deriving a profile out of the operator's records.
+    "relay.load_routing": {"LOG": "load_routing_shadow.jsonl"},
     # THE ONLY RECORD OF WHETHER THE NIGHTLY LOOP ACTUALLY RUNS. A test firing written here
     # would answer "has it run?" with yes on a machine where it never has -- which is precisely
     # the question the file was added to make answerable. NOT in ONLY_IF_ALREADY_IMPORTED with

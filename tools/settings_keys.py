@@ -179,6 +179,16 @@ KEYS = OrderedDict([
        "row when two siblings write one path or one writes a path another's step names; "
        "nothing is blocked and no prompt or output changes."),
 
+    # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
+    # which queued goal a router using the remaining admission margins and the role profile
+    # would have admitted, beside the one that was. There is deliberately no value that routes.
+    _k("fanout_load_routing", EACH_GATE, "off",
+       "relay/load_routing.py:mode (every admission, mtime-cached)",
+       "off|shadow. Re-read at every admission with no restart. shadow appends one row per "
+       "admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the router "
+       "would have admitted, the margins); nothing is reordered and no prompt or output "
+       "changes."),
+
     # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
     # already running keeps going, and the next split uses the new values.
     _k("fanout_max_total", EACH_GATE, 24,

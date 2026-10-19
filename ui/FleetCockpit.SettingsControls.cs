@@ -215,6 +215,7 @@ partial class CockpitWindow
         PaintHierarchicalMerge();
         PaintMergeConversation();
         PaintWriteScope();
+        PaintLoadRouting();
         PaintAutoResume();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
@@ -702,6 +703,80 @@ partial class CockpitWindow
         _wsPending.Text = pend ?? "";
         _wsPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _wsPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Load-aware routing (off|shadow), beside the sibling write scope. Persists through SaveKey only;
+    // the coordinator re-reads the key at every admission (each_gate). SHADOW ONLY: it records the
+    // goal a router would have admitted and changes nothing, and there is no option that routes.
+    // What is IN EFFECT comes from status.json "fanout_load_routing"; the words and parsing live in
+    // LoadRoutingView.
+    UIElement LoadRoutingControl()
+    {
+        _lrLbl = new TextBlock(); _lrLbl.VerticalAlignment = VerticalAlignment.Center;
+        _lrLbl.FontSize = 12;
+
+        _lrBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_lrBox, "loadRoutingBox");
+        _lrBox.ToolTip = LoadRoutingView.Help(_lang == 0) + "\n" + LoadRoutingView.TakeEffectTip(_lang == 0);
+        _lrBox.Cursor = Cursors.Hand; _lrBox.FontSize = 12;
+        _lrBox.FontWeight = FontWeights.SemiBold; _lrBox.MinWidth = 78;
+        _lrBox.Padding = new Thickness(8, 2, 4, 2);
+        _lrBox.VerticalAlignment = VerticalAlignment.Center;
+        var lrHelp = new Dictionary<string, string>();
+        foreach (string m in LoadRoutingView.Modes) lrHelp[m] = LoadRoutingView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_lrBox, LoadRoutingView.Modes, lrHelp, _lrVal);
+        _lrBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _lrBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_lrBox);
+            if (!LoadRoutingView.IsMode(sel) || sel == _lrVal) return;   // unchanged -> no write, no re-fire
+            _lrVal = sel;
+            SaveKey(LoadRoutingView.Key, _lrVal);
+            PaintLoadRoutingInEffect(_lastRoot);
+        };
+
+        _lrNow = new TextBlock(); _lrNow.VerticalAlignment = VerticalAlignment.Center;
+        _lrNow.FontSize = 11.5;
+        _lrPending = new TextBlock(); _lrPending.VerticalAlignment = VerticalAlignment.Center;
+        _lrPending.FontSize = 11.5; _lrPending.FontWeight = FontWeights.SemiBold;
+        _lrPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_lrLbl, _lrBox, _lrNow, _lrPending);
+        PaintLoadRouting();
+        return wrap;
+    }
+    void PaintLoadRouting()
+    {
+        if (_lrLbl != null) { _lrLbl.Text = LoadRoutingView.Label(_lang == 0); _lrLbl.Foreground = Muted; }
+        if (_lrBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_lrBox), _lrVal)) ComboSelectVal(_lrBox, _lrVal);
+        _lrBox.ToolTip = LoadRoutingView.Help(_lang == 0) + "\n" + LoadRoutingView.TakeEffectTip(_lang == 0);
+        _lrBox.Background = BtnBg; _lrBox.Foreground = Fg; _lrBox.BorderBrush = Border;
+        StyleFlatCombo(_lrBox);
+        PaintLoadRoutingInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "fanout_load_routing"). No report (old
+    // runner, no run yet) -> nothing shown, never a guess from the selection.
+    void PaintLoadRoutingInEffect(Dictionary<string, object> root)
+    {
+        if (_lrNow == null || _lrPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> lr = root != null ? Obj(root, "fanout_load_routing") : null;
+        if (lr != null && lr.ContainsKey("mode") && lr["mode"] != null)
+        {
+            string rep = S(lr, "mode");
+            now = LoadRoutingView.Describe(rep,
+                lr.ContainsKey("recorded") && lr["recorded"] != null ? I(lr, "recorded") : 0,
+                lr.ContainsKey("differed") && lr["differed"] != null ? I(lr, "differed") : 0, ja);
+            pend = LoadRoutingView.PendingText(rep, _lrVal, ja);
+        }
+        _lrNow.Text = now ?? "";
+        _lrNow.Foreground = Muted;
+        _lrNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _lrPending.Text = pend ?? "";
+        _lrPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _lrPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     // Auto-resume of an interrupted run (off|on), in its own Recovery section. Persists through
     // SaveKey only; the supervisor re-reads the key every cycle (each_gate). What is IN EFFECT comes

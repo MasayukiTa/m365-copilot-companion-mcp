@@ -214,6 +214,10 @@ partial class CockpitWindow : Window
     TextBlock _fdLbl, _fdNow, _fdPending;
     // sibling write scope off|shadow -> settings.txt fanout_write_scope ; absent key = off (WriteScopeView.Default)
     string _wsVal = WriteScopeView.Default;
+    // load-aware routing off|shadow -> settings.txt fanout_load_routing ; absent key = off (LoadRoutingView.Default)
+    string _lrVal = LoadRoutingView.Default;
+    ComboBox _lrBox;
+    TextBlock _lrLbl, _lrNow, _lrPending;
     // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
     string _hmVal = HierarchicalMergeView.Default;
     ComboBox _hmBox;

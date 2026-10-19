@@ -234,6 +234,7 @@ jobs:
             relay/test_judge_is_depth_aware.py \
             relay/test_cockpit_header_controls.py \
             relay/test_write_scope.py \
+            relay/test_load_routing.py \
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
             relay/test_fleet_auto_resume_setting.py \
@@ -620,6 +621,7 @@ jobs:
             tests/test_retry_sets_agree.py \
             tests/test_fanout_default_on_agrees.py \
             tests/test_fanout_write_scope_agrees.py \
+            tests/test_fanout_load_routing_agrees.py \
             tests/test_fanout_budget.py \
             tests/test_fanout_budget_large_ledger.py \
             tests/test_campaigns_ledger_retention.py \
@@ -900,6 +902,7 @@ jobs:
             scripts/test_sibling_dup_report.py \
             scripts/test_ab_compare.py \
             scripts/test_capability_profile.py \
+            scripts/test_load_routing_report.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \

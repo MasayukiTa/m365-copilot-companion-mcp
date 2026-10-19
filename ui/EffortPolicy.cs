@@ -1131,3 +1131,73 @@ public static class MergeConversationView
         return ja ? "選択は次の分割・統合から反映" : "selection applies from the next split or merge";
     }
 }
+
+// The load-aware routing selector's words and parsing, WPF-free (same file as WriteScopeView). The
+// Python side decides: relay/load_routing.py reads `fanout_load_routing` at every admission and, in
+// shadow, records which queued goal a router using the remaining admission margins and the role
+// profile would have admitted, beside the one that was; relay/fleet_runner.py exports
+// {mode, recorded, differed} as status.json "fanout_load_routing". SHADOW ONLY: no value routes,
+// so the queue order, the prompts and the outputs are never changed.
+public static class LoadRoutingView
+{
+    //: must equal tools/settings_keys.py and relay/load_routing.py KEY / MODES.
+    public const string Key = "fanout_load_routing";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+
+    /// <summary>The mode named by one fanout_load_routing= line; null when the line is not that
+    /// key or the value is not off|shadow (the caller keeps its value, off). A byte order mark
+    /// is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "負荷を見た割当" : "Load-aware routing"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: 割当は変わりません。ゴールを走らせるたびに、空き状況と役割ごとの実績から選んだ場合に走らせたはずのゴールを記録します。"
+                  : "Record only: assignment is unchanged. At each admission, records which queued goal a router using the free capacity and the per-role record would have admitted.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次に走らせるゴールから有効。再起動不要。"
+                  : "Applies from the next admission, no restart.";
+    }
+
+    /// <summary>What the coordinator reports (mode / rows recorded / rows that differed); null
+    /// when the mode is not usable (old runner): the cockpit then shows nothing, not a guess.</summary>
+    public static string Describe(string mode, int recorded, int differed, bool ja)
+    {
+        if (!IsMode(mode)) return null;
+        string head = (ja ? "稼働中: " : "In effect: ") + (mode == "shadow" ? (ja ? "シャドウ(記録のみ)" : "shadow (record only)") : (ja ? "オフ" : "off"));
+        if (mode == "shadow")
+            head += ja ? " / 記録 " + recorded + " 件、うち異なる選択 " + differed + " 件"
+                       : " / " + recorded + " recorded, " + differed + " would differ";
+        return head;
+    }
+
+    /// <summary>The note shown when the mode the runner reports differs from the selection (the
+    /// runner re-reads the key at its next admission); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
+        return ja ? "選択は次の割当から反映" : "selection applies from the next admission";
+    }
+}
