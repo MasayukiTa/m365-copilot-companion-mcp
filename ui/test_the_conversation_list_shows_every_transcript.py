@@ -35,6 +35,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from tools import childproc  # noqa: E402
+from tools import ui_source  # noqa: E402  (the chat window source is spread over CopilotChat*.cs)
 
 UI = os.path.join(REPO, "ui")
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
@@ -42,7 +43,7 @@ CSC = os.path.join(FW, "csc.exe")
 SOURCES = [os.path.join(UI, "FleetConvIdentity.cs"),
            os.path.join(UI, "harness", "ConvListingHarness.cs")]
 
-CHAT = open(os.path.join(UI, "CopilotChat.cs"), encoding="utf-8-sig").read()
+CHAT = ui_source.chat_window_source(encoding="utf-8-sig")
 
 needs_csc = pytest.mark.skipif(os.name != "nt", reason="C# compiled by the .NET Framework csc")
 

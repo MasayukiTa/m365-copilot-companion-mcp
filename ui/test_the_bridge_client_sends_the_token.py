@@ -33,6 +33,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from tools import childproc  # noqa: E402
+from tools import ui_source  # noqa: E402  (the chat window source is spread over CopilotChat*.cs)
 
 UI = os.path.join(REPO, "ui")
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
@@ -242,8 +243,7 @@ def test_an_old_window_is_told_to_rebuild_in_the_text_it_shows(harness, tmp_path
 def test_every_bridge_call_in_the_window_goes_through_the_client():
     """The only raw request left in CopilotChat.cs is the reachability probe of the token-free
     /conv. Any other `_bridge + ...` request would be a bridge call without the token."""
-    with open(os.path.join(UI, "CopilotChat.cs"), encoding="utf-8-sig") as fh:
-        src = fh.read()
+    src = ui_source.chat_window_source(encoding="utf-8-sig")
     raw = re.findall(r"WebRequest\.Create\(\s*_bridge\s*\+\s*([^)]*)\)", src)
     assert raw == ['"/conv"'], raw
     assert "BridgeClient.Call(_bridge" in src and "BridgeClient.Open(_bridge" in src

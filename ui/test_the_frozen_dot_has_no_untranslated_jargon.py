@@ -46,9 +46,10 @@ from pathlib import Path
 import pytest
 
 from tools import cockpit_source  # reads every part of the split cockpit source
+from tools import ui_source  # reads every part of the split dashboard source
 
 UI = Path(__file__).resolve().parent
-SOURCES = [Path(p) for p in cockpit_source.paths()] + [UI / "SelfImproveDashboard.cs"]
+SOURCES = [Path(p) for p in cockpit_source.paths()] + [Path(p) for p in ui_source.self_improve_paths()]
 
 #: Case-sensitive Japanese term (case doesn't apply) + case-insensitive English term. Both
 #: named literally, not derived, so a rename of one does not silently stop checking the other.
@@ -90,6 +91,6 @@ def test_the_replacement_wording_is_actually_present():
     Only ui/SelfImproveDashboard.cs is checked here: ui/FleetCockpit.cs no longer has a health
     dot for this concept at all (removed after 12b06fd; see the module docstring), so it is not
     expected to carry either the jargon or its replacement any more."""
-    dash = (UI / "SelfImproveDashboard.cs").read_text(encoding="utf-8", errors="replace")
+    dash = ui_source.self_improve_source(encoding="utf-8", errors="replace")
     assert "自己改善の安全確認" in dash, "auth_intact's Japanese label went missing, not just its jargon"
     assert "Self-improvement check" in dash, "auth_intact's English label went missing, not just its jargon"

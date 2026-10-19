@@ -19,9 +19,9 @@ ui/test_copilot_chat_conv_lifecycle.py and ui/test_fleet_cockpit_approval_center
 
 Run: pytest -q ui/test_sync_registry_accepts_socket_workers.py
 """
-from pathlib import Path
+from tools import ui_source  # the chat window's source is spread over CopilotChat*.cs
 
-SOURCE = Path(__file__).with_name("CopilotChat.cs").read_text(encoding="utf-8")
+SOURCE = ui_source.chat_window_source(encoding="utf-8")
 
 
 def _sync_registry_body():

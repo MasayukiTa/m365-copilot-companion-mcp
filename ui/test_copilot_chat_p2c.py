@@ -1,7 +1,7 @@
-from pathlib import Path
+from tools import ui_source  # the chat window's source is spread over CopilotChat*.cs
 
 
-SOURCE = (Path(__file__).parent / "CopilotChat.cs").read_text(encoding="utf-8-sig")
+SOURCE = ui_source.chat_window_source(encoding="utf-8-sig")
 
 
 def test_p2c_commands_are_flag_gated_in_native_slash_palette():

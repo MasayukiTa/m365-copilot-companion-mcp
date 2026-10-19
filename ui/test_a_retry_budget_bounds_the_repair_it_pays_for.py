@@ -30,15 +30,15 @@ time, and the caller presenting the bad token was not identified. That remains o
 """
 from __future__ import annotations
 
-import io
 import os
 import re
 
 from tools import cockpit_source  # reads every part of the split cockpit source
+from tools import ui_source  # reads every part of the split dashboard source
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
-SELFIMPROVE_DASHBOARD = os.path.join(REPO, "ui", "SelfImproveDashboard.cs")
+# SelfImproveDashboard.cs is spread over parts; _dashboard_src() reads them all via tools/ui_source.py
 
 
 def _src():
@@ -46,7 +46,7 @@ def _src():
 
 
 def _dashboard_src():
-    return io.open(SELFIMPROVE_DASHBOARD, encoding="utf-8").read()
+    return ui_source.self_improve_source(encoding="utf-8")
 
 
 def _body(signature, src=None):

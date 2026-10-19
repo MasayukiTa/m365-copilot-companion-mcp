@@ -70,6 +70,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
 from tools import childproc  # noqa: E402
+from tools import ui_source  # noqa: E402  (the dashboard source is spread over SelfImproveDashboard*.cs)
 
 UI = os.path.join(REPO, "ui")
 FW = r"C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
@@ -77,7 +78,7 @@ CSC = os.path.join(FW, "csc.exe")
 WPF = os.path.join(FW, "WPF")
 
 SOURCES = [
-    os.path.join(UI, "SelfImproveDashboard.cs"),
+    *ui_source.self_improve_paths(),  # every part: SelfImproveDashboard.cs + SelfImproveDashboard.<Topic>.cs
     os.path.join(UI, "Theme.cs"),
     os.path.join(UI, "harness", "StartupGateHarness.cs"),
 ]
