@@ -207,6 +207,9 @@ jobs:
             relay/test_chathub.py \
             relay/test_chathub_sliding_deadline.py \
             relay/test_socket_tools.py \
+            relay/test_first_turn_preflight.py \
+            relay/test_token_prestart.py \
+            relay/test_batching_rule_in_prompt.py \
             relay/test_tool_bridge.py \
             relay/test_tool_bridge_wiring.py \
             relay/test_tool_bridge_fleet_checks.py \

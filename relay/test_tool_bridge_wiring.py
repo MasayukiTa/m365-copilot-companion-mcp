@@ -93,7 +93,7 @@ def test_bridge_run_tool_is_bound_to_this_worker(monkeypatch):
     made = []
     monkeypatch.setattr(TB, "make_run_tool", lambda name, **kw: made.append(name) or (lambda n, a: (True, "")))
     _route().driver_for("w7")
-    assert made == ["w7"]
+    assert made and set(made) == {"w7"}      # the run_tool, and the first-turn lookups' own
 
 
 def test_a_deep_research_conversation_never_gets_tools(monkeypatch):
