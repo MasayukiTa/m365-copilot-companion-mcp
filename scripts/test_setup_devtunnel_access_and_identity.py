@@ -168,7 +168,7 @@ if a[0] == "access":
         if "--tenant" in a or "-t" in a:
             if st.get("tenant_noop"):
                 save(); sys.exit(0)          # exit 0, nothing granted
-            acl.append(st.get("tenant_text", "+Tenant [connect]"))
+            acl.append(st.get("tenant_text", "+AAD Tenant [connect] (9d07533c-a4e0-4639-9782-aa2cae12a928)"))
         save(); sys.exit(0)
 if a[:1] == ["host"]:
     sys.exit(0)
@@ -299,7 +299,7 @@ def test_tenant_after_anonymous_revokes_anonymous_and_grants_the_flag_form(tmp_p
     assert ["access", "create", name, "--tenant"] in calls, calls
     assert not [c for c in calls if GUID in c], "the tenant id was passed to devtunnel"
     acl = _all_acl(rig.state, name)
-    assert "+Anonymous [connect]" not in acl and "+Tenant [connect]" in acl, acl
+    assert "+Anonymous [connect]" not in acl and any(e.startswith("+AAD Tenant [connect]") for e in acl), acl
     assert "ACCESS: TENANT ONLY" in rig.out and "NOT VERIFIED" in rig.out, rig.out
     assert "IGNORED for this run" in rig.out
 
@@ -610,6 +610,7 @@ LISTINGS = {
     "+Anonymous [connect]": "anonymous",
     "Found 1 access control entry\n  +Anonymous [connect]\n  +Tenant [connect]": "anonymous",
     "+Tenant [connect]": "tenant",
+    " 0: +AAD Tenant [connect] (9d07533c-a4e0-4639-9782-aa2cae12a928)": "tenant",  # measured, devtunnel 1.0.1516
     "No access control entries.": "none",
     "-Anonymous [connect]": "none",
 }
@@ -631,6 +632,7 @@ def test_doctor_and_setup_read_an_access_listing_the_same_way(tmp_path):
 @pytest.mark.parametrize("acl,expect", [
     (["+Anonymous [connect]"], "anonymous|True|False|0|0"),
     (["+Tenant [connect]"], "tenant|False|True|0|1"),
+    ([" 0: +AAD Tenant [connect] (9d07533c-a4e0-4639-9782-aa2cae12a928)"], "tenant|False|True|0|1"),
     ([], "none|False|False|1|0"),
     (None, "|False|True|0|1"),            # tunnel unknown to the CLI: exit 1 -> could not be read
 ])

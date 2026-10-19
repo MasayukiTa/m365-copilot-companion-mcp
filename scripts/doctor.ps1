@@ -516,7 +516,7 @@ Check-TriState "tunnel_owned" "Dev Tunnel name is owned by this account (MCP_TUN
 # setup_devtunnel.ps1's Get-AccessGrantFromListing, and
 # scripts/test_setup_devtunnel_access_and_identity.py runs both on the same listings.
 function Test-AnonymousInListing([string]$text) { return [bool]($text -match '\+\s*Anonymous\b') }
-function Test-TenantInListing([string]$text) { return [bool]($text -match '\+\s*Tenants?\b') }
+function Test-TenantInListing([string]$text) { return [bool]($text -match '\+\s*(?:AAD\s+)?Tenants?\b') }
 function Get-AccessGrantFromListing([string]$text) {
     if (Test-AnonymousInListing $text) { return "anonymous" }
     if (Test-TenantInListing $text) { return "tenant" }
