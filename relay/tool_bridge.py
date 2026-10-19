@@ -311,8 +311,18 @@ def _is_error(result) -> bool:
 
 
 async def _call(client_factory, args, timeout_s):
-    async with client_factory() as client:
-        return await asyncio.wait_for(client.call_tool("call_tool", args), timeout_s)
+    """One gateway call. `timeout_s` bounds the whole exchange (connect, handshake, call), not
+    only `call_tool`: a server that accepts the connection and never answers the handshake used
+    to hold the turn thread for good. The client is built BEFORE the clock starts: its first use
+    imports hundreds of modules synchronously, and an event loop busy doing that cannot fire its
+    own timer, so counting it would charge the wait with work that has nothing to do with the
+    server."""
+    session = client_factory()
+
+    async def _go():
+        async with session as client:
+            return await client.call_tool("call_tool", args)
+    return await asyncio.wait_for(_go(), timeout_s)
 
 
 def _run_coroutine(coro):
@@ -342,11 +352,23 @@ def _run_coroutine(coro):
 #: is never copied into the repository a second time.
 INSTRUCTIONS_TTL_S = 600.0
 INSTRUCTIONS_RETRY_S = 60.0
+#: How long one fetch may wait for the server to answer. It bounds the WAIT only: building the client
+#: (its first use imports several hundred modules on this thread) is done before the clock starts.
+INSTRUCTIONS_FETCH_TIMEOUT_S = 10.0
 _instructions_cache = {}
 
 
-async def _initialize_instructions(client_factory):
-    async with client_factory() as client:
+async def _initialize_instructions(client_factory, timeout_s=None):
+    """The instructions text. `timeout_s` bounds the connect and handshake only; the client is
+    built first, outside the bound (see _call)."""
+    session = client_factory()
+    return await asyncio.wait_for(
+        _read_instructions(session),
+        INSTRUCTIONS_FETCH_TIMEOUT_S if timeout_s is None else timeout_s)
+
+
+async def _read_instructions(session):
+    async with session as client:
         # `client.instructions` works in every protocol era; the legacy initialize result carries the
         # same text where the client has no such property.
         text = getattr(client, "instructions", None)
@@ -373,8 +395,7 @@ def server_instructions(client_factory=None, now=None, ttl_s=None) -> str:
     if c and t < c.get("until", 0.0):
         return c.get("text", "")
     try:
-        text = _run_coroutine(asyncio.wait_for(
-            _initialize_instructions(client_factory or _real_client_factory), 10.0))
+        text = _run_coroutine(_initialize_instructions(client_factory or _real_client_factory))
         c.update(text=text, until=t + ttl)
         return text
     except Exception as exc:

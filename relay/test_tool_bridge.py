@@ -374,8 +374,77 @@ def test_a_stale_copy_is_kept_when_the_refresh_fails(fresh_instructions):
 
 
 def test_a_real_fastmcp_client_exposes_the_instructions_of_an_in_memory_server(fresh_instructions):
-    """The attribute the fetch reads exists on the real client (no network: in-memory transport)."""
+    """The attribute the fetch reads exists on the real client (no network: in-memory transport).
+
+    This asks what the client exposes, not how fast it answers, so it runs WITHOUT the fetch
+    budget: the in-memory server shares the event loop with the client and its first request
+    imports modules on that loop, which under load can outlast any fixed budget."""
     fastmcp = pytest.importorskip("fastmcp")
     server = fastmcp.FastMCP("probe", instructions="RULE 1 -- from the real initialize result")
-    assert TB.server_instructions(client_factory=lambda: fastmcp.Client(server)) == \
-        "RULE 1 -- from the real initialize result"
+    finished, text = _run_guarded(
+        lambda: asyncio.run(TB._read_instructions(fastmcp.Client(server))), 300)
+    assert finished, "the in-memory handshake did not finish"
+    assert text == "RULE 1 -- from the real initialize result"
+
+
+# ---------------------------------------------------------------- what may block, and for how long
+
+def _run_guarded(fn, within_s):
+    """Run `fn` on a daemon thread; return (finished, result). A defect that waits forever then
+    fails the test at `within_s` instead of hanging the whole run."""
+    import threading
+    box = {}
+
+    def _go():
+        box["v"] = fn()
+    t = threading.Thread(target=_go, daemon=True)
+    t.start()
+    t.join(within_s)
+    return (not t.is_alive()), box.get("v")
+
+
+class _NeverConnects(_FakeClient):
+    """A server that accepts the connection and then never answers the handshake."""
+
+    async def __aenter__(self):
+        await asyncio.Event().wait()
+
+
+class _YieldingInit(_InitClient):
+    """Like a real client, the handshake waits on something (I/O) for a moment."""
+
+    async def __aenter__(self):
+        await asyncio.sleep(0.05)
+        return self
+
+
+def test_building_the_client_does_not_spend_the_fetch_budget(fresh_instructions, monkeypatch):
+    """The first `fastmcp.Client` use imports a few hundred modules, synchronously, on the event
+    loop. A loop that is busy cannot fire its own timer, so that work, slow on a loaded or scanned
+    disk, used to be charged to the wait that is meant to bound only the server's answer."""
+    import time
+    monkeypatch.setattr(TB, "INSTRUCTIONS_FETCH_TIMEOUT_S", 0.2)
+
+    def slow_to_build():
+        time.sleep(0.6)                       # stands in for the cold import under load
+        return _YieldingInit("RULE 1 ...")
+    ok, text = _run_guarded(lambda: TB.server_instructions(client_factory=slow_to_build), 30)
+    assert ok and text == "RULE 1 ..."
+
+
+def test_a_server_that_never_answers_the_handshake_costs_the_budget_and_no_more(fresh_instructions, monkeypatch, capsys):
+    import time
+    monkeypatch.setattr(TB, "INSTRUCTIONS_FETCH_TIMEOUT_S", 0.3)
+    t0 = time.time()
+    ok, text = _run_guarded(lambda: TB.server_instructions(client_factory=_factory(_NeverConnects())), 30)
+    assert ok and text == ""
+    assert time.time() - t0 < 10
+    assert "TimeoutError" in capsys.readouterr().err
+
+
+def test_a_tool_call_to_a_server_that_never_answers_the_handshake_ends_at_the_limit():
+    """The limit used to wrap only `call_tool`; the connect before it had no bound at all."""
+    run = TB.make_run_tool("w1", client_factory=_factory(_NeverConnects()), timeout_s=0.3)
+    ok, out = _run_guarded(lambda: run("call_tool", {"name": "count", "arguments": {}}), 30)
+    assert ok, "run_tool is still waiting for a handshake that never comes"
+    assert out[0] is False and out[1].startswith("TimeoutError")
