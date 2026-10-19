@@ -19,15 +19,13 @@ ui/test_copilot_chat_conv_lifecycle.py and ui/test_fleet_cockpit_approval_center
 
 Run: pytest -q ui/test_sync_registry_accepts_socket_workers.py
 """
-from tools import ui_source  # the chat window's source is spread over CopilotChat*.cs
+from tools import cockpit_source, ui_source  # the chat window source is spread over CopilotChat*.cs
 
 SOURCE = ui_source.chat_window_source(encoding="utf-8")
 
 
 def _sync_registry_body():
-    start = SOURCE.index("void SyncRegistry()")
-    body = SOURCE[start:]
-    return body[:body.index("readonly JavaScriptSerializer _cjs")]
+    return cockpit_source.member(SOURCE, "void SyncRegistry()")
 
 
 def test_a_row_with_no_url_but_a_transcript_is_no_longer_skipped():

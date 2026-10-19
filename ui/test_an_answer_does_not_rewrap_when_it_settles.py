@@ -70,11 +70,19 @@ def test_no_rendering_path_still_hard_codes_the_size():
 
 def test_the_reason_is_written_down_where_the_constants_are():
     """So the next person to 'tidy up' the duplicate face name knows what it costs."""
-    i = SOURCE.index("static readonly FontFamily BODY_FACE")
-    j = SOURCE.rindex("//: THE TWO RENDERINGS", 0, i)
+    # The constants (BODY_FACE, BODY_PAD) are initialised fields and stay in CopilotChat.cs; the
+    # comment that explains them sits with the rendering code in another part. So the preamble is
+    # read as the comment block that starts at the marker, not as "everything before BODY_FACE".
+    assert "static readonly FontFamily BODY_FACE" in SOURCE
+    j = SOURCE.index("//: THE TWO RENDERINGS")
+    block = []
+    for ln in SOURCE[j:].splitlines():
+        if not ln.strip().startswith("//"):
+            break
+        block.append(ln)
     # WHITESPACE-NORMALISED, because the phrase is split across a comment line break and a
     # test that pins where a sentence wraps is a test that fails the next time someone reflows
     # a paragraph. This repository has been bitten by that anchor several times over.
-    preamble = " ".join(SOURCE[j:i].replace("//", " ").split())
+    preamble = " ".join("\n".join(block).replace("//", " ").split())
     assert "wrap" in preamble, "the comment does not say what goes wrong"
     assert "READING POSITION" in preamble, "the comment does not say why it matters"
