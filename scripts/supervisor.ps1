@@ -517,6 +517,22 @@ function Start-SupervisorHandoff {
     } catch { return $false }
 }
 
+function Start-SupervisorExitWatch {
+    # Starts scripts\supervisor_exit_watch.ps1 for THIS process: a separate hidden process that
+    # waits for us and writes our exit code to the log. A hard kill runs no `finally`, so this is
+    # the only way the cause of such a death (code 1 = Stop-Process/taskkill, 0xC0000005 = crash,
+    # 0xC000013A = console close or logoff) can be read afterwards. Best-effort: never throws,
+    # never delays the supervisor.
+    try {
+        $helper = Join-Path $PSScriptRoot "supervisor_exit_watch.ps1"
+        if (-not (Test-Path -LiteralPath $helper)) { return }
+        $a = @("-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", ('"{0}"' -f $helper),
+               "-WatchPid", $PID, "-LogPath", ('"{0}"' -f $Log))
+        Start-Process -FilePath (Join-Path $env:SystemRoot "System32\WindowsPowerShell\v1.0\powershell.exe") `
+            -ArgumentList $a -WindowStyle Hidden | Out-Null
+    } catch { }
+}
+
 function Invoke-SupervisorCodeCycle {
     # Once per tick. Cheap when nothing changed (a stat per file). Never throws.
     try {
@@ -738,6 +754,7 @@ function Invoke-SupervisorPreviousDeathCheck {
 Initialize-SupervisorCodeWatch
 Write-SupervisorState
 Invoke-SupervisorPreviousDeathCheck
+Start-SupervisorExitWatch
 
 # The cockpit must distinguish "the server died" from "the supervisor is deliberately
 # replacing stale code".  Without a machine-readable transition, both are a few seconds of
