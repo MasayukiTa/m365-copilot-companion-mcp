@@ -220,7 +220,7 @@ $script:HostCalls = 0
 function Test-DevtunnelLoggedInCached { return $true }
 # RECORDS instead of launching a real `devtunnel host`: what is under test is whether the
 # decision to re-host is taken, not devtunnel.
-function Start-TunnelHost { $script:HostCalls++; return $true }
+function Start-TunnelHost { $script:HostCalls++; return ($null -eq $script:HostOk -or [bool]$script:HostOk) }
 function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) }
 . (Join-Path $RootDir "tunnel_name_util.ps1")
 '''
@@ -233,6 +233,7 @@ function Set-Stub([object]$Hosts, [object]$TunnelPid, [int]$TunnelStatus = 200) 
 function Reset-All {
     $script:tunnelMiss = 0; $script:HostCalls = 0; $script:ForeignStreak = 0; $script:TunnelState = ""
     $script:TunnelStatusKey = ""; Reset-TunnelProbeBackoff; $script:CapturedLog.Clear()
+    $script:StaleRehostAt = $null; $script:StaleBlockedLogged = $false; $script:TunnelProbeOutcome = ""
     if (Test-Path $script:TunnelStatusPath) { Remove-Item $script:TunnelStatusPath -Force }
     [IO.File]::WriteAllText($HitsFile, "")
 }
@@ -265,8 +266,9 @@ try {
     Reset-All; Set-Stub $null $null
     $r.unreadable = Case "unreadable count" 4
 
-    # 3. FOREIGN, the incident: hosted, the URL times out / errors, no host process of ours.
-    Reset-All; Set-Stub 1 $null 500
+    # 3. FOREIGN: hosted, no host process of ours, and the URL ANSWERS with another machine's pid
+    # (the evidence). The 2026-09-24 incident.
+    Reset-All; Set-Stub 1 9999
     $r.foreign = Case "foreign" 6
     $r.foreignSupervisorPid = $PID
     # ... and the other PC letting go: the count falls to 0 -> re-host by itself.
@@ -274,9 +276,48 @@ try {
     $script:CapturedLog.Clear()
     $r.release = Case "release" 4
 
-    # 3b. FOREIGN answering with another machine's pid.
+    # 3b. FOREIGN, two connections.
     Reset-All; Set-Stub 2 9999
     $r.foreignPid = Case "foreign with another pid" 5
+
+    # 3c. STALE, the 2026-10-19 incident: the relay counts a connection (our own dead host's
+    # ghost), no host of ours runs, and the URL does not answer. NOT foreign: re-host once the
+    # debounce (4 ticks) is through.
+    Reset-All; Set-Stub 1 $null 500
+    $r.stale = Case "stale" 6
+    # (d) the bound: one stale re-host per 10 minutes, however long the ghost stays.
+    Reset-All; Set-Stub 1 $null 500
+    $r.bound1 = Case "stale, 20 ticks" 20
+    $script:StaleRehostAt = (Get-Date).AddMinutes(-11)
+    $r.bound2 = Case "stale, window passed" 8
+    # (e) a re-host that FAILS (network down) must not spend the 10-minute window.
+    Reset-All; Set-Stub 1 $null 500; $script:HostOk = $false
+    $r.failedRehost = Case "stale, re-host fails" 12
+    $r.failedRehostWindowSpent = ($null -ne $script:StaleRehostAt)
+    $script:HostOk = $null
+    # (c) a probe skipped by backoff keeps the previous state (here foreign: no flip to stale).
+    Reset-All; Set-Stub 1 $null 500
+    $script:TunnelState = "foreign"; $script:TunnelProbeSkip = 3
+    $r.skippedKeepsForeign = Case "skipped, was foreign" 1
+    # ... and the stale -> foreign turn when the URL starts to answer with another pid.
+    Set-Stub 1 9999
+    $script:TunnelProbeSkip = 0
+    $r.staleToForeign = Case "answer from another pid" 1
+    # The pure decision, case by case.
+    $r.pure = [ordered]@{
+        staleNoAnswer     = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $false -LocalPid 4242 -TunnelPid $null -ProbeOutcome "noanswer" -PreviousState ""
+        staleNoLocal      = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $false -LocalPid $null -TunnelPid $null -ProbeOutcome "noanswer" -PreviousState "foreign"
+        foreignAnswered   = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $false -LocalPid 4242 -TunnelPid 9999 -ProbeOutcome "answered" -PreviousState "stale"
+        skippedKeepsStale = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $false -LocalPid 4242 -TunnelPid $null -ProbeOutcome "skipped" -PreviousState "stale"
+        skippedKeepsForeign = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $false -LocalPid 4242 -TunnelPid $null -ProbeOutcome "skipped" -PreviousState "foreign"
+        oursByPid         = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $false -LocalPid 4242 -TunnelPid 4242 -ProbeOutcome "answered" -PreviousState "stale"
+        noneNoConnections = Resolve-TunnelHostingState -Connections 0 -OurHostRunning $false -LocalPid 4242 -TunnelPid $null -ProbeOutcome "" -PreviousState "stale"
+        sharedWithOurHost = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $true -LocalPid 4242 -TunnelPid 9999 -ProbeOutcome "answered" -PreviousState ""
+        oursHostNoAnswer  = Resolve-TunnelHostingState -Connections 1 -OurHostRunning $true -LocalPid 4242 -TunnelPid $null -ProbeOutcome "noanswer" -PreviousState ""
+        allowedNever      = Test-StaleRehostAllowed $null (Get-Date) 600
+        allowedSoon       = Test-StaleRehostAllowed (Get-Date).AddMinutes(-9) (Get-Date) 600
+        allowedLater      = Test-StaleRehostAllowed (Get-Date).AddMinutes(-11) (Get-Date) 600
+    }
 
     # 4. OUR host is running (the process this supervisor launched).
     $sleeper = Start-Process -FilePath $SleeperPy -ArgumentList '-c "import time; time.sleep(300)"' -WindowStyle Hidden -PassThru
@@ -312,6 +353,7 @@ _SUP_FUNCTIONS = (
     "function Test-IsTunnelHostCommandLine", "function Test-OurTunnelHostRunning",
     "function Get-EnvTunnelUrl", "function Get-TunnelOrigin", "function Get-HealthPidAt",
     "function Resolve-TunnelHostingState", "function Reset-TunnelProbeBackoff",
+    "function Test-StaleRehostAllowed",
     "function Get-TunnelServerPidBounded", "function Get-TunnelHostingAdvice",
     "function Set-TunnelHostStatus", "function Invoke-TunnelHostingCheck",
     "function Clear-DevtunnelLoginCache",
@@ -319,7 +361,8 @@ _SUP_FUNCTIONS = (
 _SUP_INIT = (
     "$script:TunnelProbeSkip = 0", "$script:TunnelProbeBackoff = 1", "$script:TunnelProbeBackoffMax =",
     "$script:TunnelStatusPath =", "$script:TunnelStatusKey =", "$script:TunnelState =",
-    "$script:ForeignStreak =",
+    "$script:ForeignStreak =", "$script:StaleRehostAt =", "$script:StaleRehostMinSeconds =",
+    "$script:StaleBlockedLogged =", "$script:TunnelProbeOutcome =",
 )
 
 
@@ -430,6 +473,60 @@ def test_another_pc_serving_this_tunnel_is_reported_and_not_fought(sup):
     assert "OTHER PC run quickstart.bat" in st["action"] and "THIS PC run start_all.bat" in st["action"]
 
 
+def test_a_ghost_connection_with_no_answer_is_stale_and_rehosted_after_the_debounce(sup):
+    """(a) 2026-10-19: connections=1, no host of ours, the probe RAN and got no answer."""
+    r = sup["stale"]
+    assert _lines(r["states"]) == ["stale"] * 6, r["states"]
+    assert r["hostCalls"] == 1, "a ghost connection was not re-hosted after the debounce"
+    want = ("tunnel host connection looks stale (connections=1, no answer through the URL, "
+            "no host of this PC): re-hosting")
+    assert _lines(r["log"]).count(want) == 1, r["log"]
+    assert not [l for l in _lines(r["log"]) if l.startswith("tunnel FOREIGN")], r["log"]
+    st = r["status"]
+    assert st["state"] == "stale" and st["host_connections"] == 1
+    assert "stale (ghost) connection" in st["message"] and st["action"] == ""
+
+
+def test_the_pure_decision_foreign_needs_an_answer(sup):
+    p = sup["pure"]
+    assert p["staleNoAnswer"] == "stale" and p["staleNoLocal"] == "stale"      # (a)
+    assert p["foreignAnswered"] == "foreign"                                    # (b)
+    assert p["skippedKeepsStale"] == "stale"                                    # (c)
+    assert p["skippedKeepsForeign"] == "foreign"                                # (c)
+    assert p["oursByPid"] == "ours" and p["noneNoConnections"] == "none"
+    assert p["sharedWithOurHost"] == "shared" and p["oursHostNoAnswer"] == "ours"
+    assert p["allowedNever"] is True and p["allowedSoon"] is False and p["allowedLater"] is True
+
+
+def test_a_probe_skipped_by_backoff_keeps_the_previous_state(sup):
+    r = sup["skippedKeepsForeign"]
+    assert _lines(r["states"]) == ["foreign"], r["states"]
+    assert r["hits"] == 0, "the probe was meant to be skipped"
+    assert r["hostCalls"] == 0
+
+
+def test_a_ghost_that_starts_answering_with_another_pid_turns_foreign_not_rehosted(sup):
+    r = sup["staleToForeign"]
+    assert _lines(r["states"]) == ["foreign"] and r["hostCalls"] == 0, r
+
+
+def test_a_stale_rehost_happens_at_most_once_per_ten_minutes(sup):
+    """(d) 20 ticks of an unanswered ghost re-host once (tick 4); the later debounce
+    completions are held back. Past the window the next completion re-hosts again."""
+    b1, b2 = sup["bound1"], sup["bound2"]
+    assert b1["hostCalls"] == 1, b1["hostCalls"]
+    assert len([l for l in _lines(b1["log"]) if "still looks stale" in l]) == 1, b1["log"]
+    assert b2["hostCalls"] == 2, "no second stale re-host once the 10 minutes had passed"
+
+
+def test_a_failed_stale_rehost_does_not_spend_the_ten_minute_window(sup):
+    """(e) the network was down at 07:33-07:37 and every start failed: the next try, once the
+    network is back, must not wait 10 minutes. 12 ticks = 3 debounce completions = 3 tries."""
+    r = sup["failedRehost"]
+    assert r["hostCalls"] == 3, r["hostCalls"]
+    assert sup["failedRehostWindowSpent"] is False
+
+
 def test_when_the_other_pc_lets_go_this_pc_takes_its_tunnel_back(sup):
     r = sup["release"]
     assert set(_lines(r["states"])) == {"none"}
@@ -486,7 +583,7 @@ _STARTUP_FUNCTIONS = (
 _STARTUP_INIT = (
     "$script:TunnelProbeSkip = 0", "$script:TunnelProbeBackoff = 1", "$script:TunnelProbeBackoffMax =",
     "$script:TunnelStatusPath =", "$script:TunnelStatusKey =", "$script:TunnelState =",
-    "$script:ForeignStreak =",
+    "$script:ForeignStreak =", "$script:TunnelProbeOutcome =",
 )
 
 _STARTUP_DRIVER_HEAD = r'''param(
@@ -638,8 +735,14 @@ def test_startup_leaves_an_already_ours_tunnel_alone():
     assert r["status"]["state"] == "ours"
 
 
-def test_startup_never_fights_a_tunnel_another_pc_is_serving():
+def test_startup_leaves_a_ghost_to_the_debounced_loop():
     r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=1, tunnel_pid=None, tunnel_status=500)
+    assert r["hostCalls"] == 0, "the startup fast path re-hosted a ghost without the debounce"
+    assert r["tunnelState"] == "stale" and r["status"]["state"] == "stale"
+
+
+def test_startup_never_fights_a_tunnel_another_pc_is_serving():
+    r = run_startup_driver(_read(SUPERVISOR_PS1), hosts=1, tunnel_pid=9999)
     assert r["hostCalls"] == 0, "the startup fast path fought a foreign tunnel"
     assert r["tunnelState"] == "foreign"
     assert r["status"]["state"] == "foreign"
