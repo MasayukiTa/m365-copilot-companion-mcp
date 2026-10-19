@@ -69,7 +69,11 @@ Write-Host "Building release ZIP from committed HEAD:"
 Write-Host "  package: $packageName"
 Write-Host "  output:  $zipPath"
 
-& git archive --format=zip --prefix="$packageName/" --output="$zipPath" HEAD -- $paths
+# docs/private holds the maintainer's working ledgers and design notes. They are committed so the
+# ledger check can read them, but they are not part of what a user installs, so the pathspec
+# leaves them out of the ZIP (the release inspection in .github/scripts/test-release-package.ps1
+# refuses a ZIP that contains them).
+& git archive --format=zip --prefix="$packageName/" --output="$zipPath" HEAD -- $paths ":(exclude)docs/private"
 if ($LASTEXITCODE -ne 0) { throw "git archive failed" }
 
 $commit = (& git rev-parse HEAD).Trim()
