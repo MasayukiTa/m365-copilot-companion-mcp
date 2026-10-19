@@ -12,13 +12,9 @@ Copilot Studio で自分の MCP サーバーへの接続が作れないときに
 
 ## 1. こんな症状のとき
 
-Copilot Studio のエージェントに MCP サーバー(またはカスタムコネクタ)を追加すると、接続の作成で失敗します。次のようなメッセージが出ます。
+Standard タイプの Copilot Studio エージェントに、MCP サーバー(またはカスタムコネクタ)のツールを追加すると、接続の作成で失敗します。接続を作るダイアログで「作成」を押すと、上部に赤いエラーの帯が出て、ダイアログは閉じません。内容は、「この接続の作成が、組織の設定によってブロックされた」という趣旨です(英語で表示されます)。
 
-> `<ツール名>` への接続を作成できませんでした。組織の管理者設定でブロックされたか、接続を作成できませんでした。管理者に連絡してください。
-
-![接続を作るダイアログ(エラーの帯は伏せています)](img/custom_mcp_fallback/step1_connection_failed.png)
-
-*画像は接続を作るダイアログです。作成を押すと、前述のエラーがこのダイアログに帯で表示されます(画像ではその帯を黒く塗っています)。*
+![Standard タイプのエージェントで、接続を作るダイアログにエラーの帯が出た画面(帯の文字、アカウント名、接続名は伏せています)](img/custom_mcp_fallback/step1_connection_blocked.png)
 
 このメッセージについて、知っておくと役に立つことがあります。
 
@@ -98,7 +94,7 @@ Copilot Studio のエージェントに MCP サーバー(またはカスタム�
 
 - Standard タイプのエージェントの作成、モデルの選択、7つの Work IQ ツールの追加、公開、Microsoft 365 チャネルの追加、エージェントストアからの追加は、すべてエラーなしで終わりました。
 - 新しいエージェントにメール、予定表、Teams、ファイルのことを聞くと、以前に作ったエージェントと同じ内容の答えが返りました。
-- 接続を作れない現象は、ダミーのカスタムツールで再現しました。API キーを付けても、認証なしでも同じでした。
+- 接続を作れない現象は、ダミーのカスタムツールを使って再現しました。GitHub Copilot タイプのエージェントでは、API キーを付けても認証なしでも同じでした。Standard タイプのエージェントでも、API キーの欄にダミーの文字列を入れた接続で、同じブロックを確認しました(2026年10月19日)。
 
 確認できていないこと:
 
@@ -132,18 +128,13 @@ needs no custom connector, no tunnel and no exception to any rule.
 
 ## 1. The symptom
 
-You add an MCP server (or a custom connector) to a Copilot Studio agent. When
-Copilot Studio tries to create the connection, it cannot be created: the dialog
-reports that your organisation's administrator settings blocked it, or the
-creation fails for another reason. The error is of the form:
+You add the tool of an MCP server (or a custom connector) to a Standard-type Copilot Studio agent.
+When Copilot Studio tries to create the connection, it fails: in the dialog in which the connection
+is created, pressing Create shows a red error banner at the top, and the dialog stays open. The
+message says, in substance, that the creation of this connection was blocked by your organisation's
+settings (it is shown in English).
 
-> Could not create a connection to `<your tool>`. It was blocked by your
-> organisation's administrator settings, or the connection could not be
-> created. Contact your administrator.
-
-![The connection-creation dialog (the error banner is covered)](img/custom_mcp_fallback/step1_connection_failed.png)
-
-*The image shows the dialog in which the connection is created. When you press Create, the error above appears in this dialog as a banner (covered with a black box in the image).*
+![The connection-creation dialog in a Standard-type agent with the error banner (the banner text, the account name and the connector name are covered)](img/custom_mcp_fallback/step1_connection_blocked.png)
 
 Things worth knowing about this message:
 
@@ -283,8 +274,10 @@ Verified (one test tenant, October 2026):
   the agent store all completed without an error.
 - Mail, calendar, Teams and file questions put to the new agent returned
   answers matching those of an agent that had been built earlier.
-- The failure to create a connection was reproduced with a dummy custom tool,
-  both with API-key and with no authentication.
+- The failure to create a connection was reproduced with a dummy custom tool. In a GitHub
+  Copilot-type agent it was the same with an API key and with no authentication. In a Standard-type
+  agent the same block was confirmed with a connection whose key field held a dummy string
+  (19 October 2026).
 
 Not verified:
 
