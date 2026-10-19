@@ -582,7 +582,8 @@ class Conversation:
 
     def __init__(self, token_supplier, *, send_origin=False, user_agent=None,
                  connect_timeout_s=15.0, frame_timeout_s=30.0, turn_timeout_s=300.0,
-                 max_frames=2000, max_tool_rounds=16, gpt_id="", template=None):
+                 max_frames=2000, max_tool_rounds=16, gpt_id="", template=None,
+                 turn_ceiling_s=None, clock=None):
         if not callable(token_supplier):
             raise ChatHubError(
                 "token_supplier must be a callable that returns a token obtained elsewhere. "
@@ -597,6 +598,15 @@ class Conversation:
         self.connect_timeout_s = float(connect_timeout_s)
         self.frame_timeout_s = float(frame_timeout_s)
         self.turn_timeout_s = float(turn_timeout_s)
+        #: The turn deadline SLIDES: every progress signal moves it to now + turn_timeout_s, so a
+        #: turn that keeps working is not cut by the absolute clock while the stall judge (which
+        #: is idle-based) says it is healthy. The ceiling is the one absolute bound left: no turn
+        #: runs longer than this from its start, whatever it keeps emitting. Default 3x.
+        self.turn_ceiling_s = max(self.turn_timeout_s,
+                                  float(turn_ceiling_s) if turn_ceiling_s is not None
+                                  else 3.0 * self.turn_timeout_s)
+        #: Injectable so the deadline can be tested without sleeping.
+        self._clock = clock if callable(clock) else time.time
         self.max_frames = int(max_frames)
         self.max_tool_rounds = int(max_tool_rounds)
         #: The agent to talk to. Empty reaches the default Copilot -- no connector, no tenant
@@ -746,8 +756,11 @@ class Conversation:
             self.first_content_s = None          # seconds from send to the first answer text
             self.first_frame_s = None            # seconds from send to the first non-ping frame
             self.empty_update_shapes = []        # key structure of a few text-less updates
-            deadline = time.time() + self.turn_timeout_s
-            while time.time() < deadline:
+            _t0 = self._clock()
+            _ceiling_at = _t0 + self.turn_ceiling_s
+            deadline = min(_t0 + self.turn_timeout_s, _ceiling_at)
+            _extended = False
+            while self._clock() < deadline:
                 # A SILENT SOCKET IS NOT A FINISHED TURN. type-3 says the turn completed; it
                 # says nothing about a connection that died, so the read is bounded separately
                 # and the pings are what prove the far end is still there.
@@ -774,7 +787,9 @@ class Conversation:
                     result = result_value(frame) or result
                     self.server_conversation_id = (conversation_id_of(frame)
                                                    or self.server_conversation_id)
+                    _progressed = False
                     for item in collect_progress(frame):
+                        _progressed = True
                         self.last_progress.append(item)
                         if on_progress is not None:
                             try:
@@ -783,15 +798,28 @@ class Conversation:
                                 pass
                     # Text-less status markers (a tool is running) refresh the idle clock but
                     # are not kept in `last_progress`, which callers read as prose.
-                    if on_progress is not None:
-                        for item in collect_activity(frame):
+                    for item in collect_activity(frame):
+                        _progressed = True
+                        if on_progress is not None:
                             try:
                                 on_progress(item)
                             except Exception:
                                 pass
                     _d = collect_delta(frame)
                     deltas.append(_d)
-                    final = collect_final(frame) or final
+                    _f = collect_final(frame)
+                    final = _f or final
+                    if _d or _f:
+                        _progressed = True
+                    if _progressed:
+                        # PROGRESS SLIDES THE DEADLINE, never past the ceiling. A ping never
+                        # reaches here (it `continue`d above), and a frame with no text, no
+                        # progress item and no activity marker does not count either.
+                        _now = self._clock()
+                        _new = min(max(deadline, _now + self.turn_timeout_s), _ceiling_at)
+                        if _new > deadline:
+                            _extended = True
+                        deadline = _new
                     if (_d or final) and self.first_content_s is None:
                         self.first_content_s = round(time.time() - self.turn_t0, 2)
                     elif (not _d and not final and frame.get("type") == 1
@@ -814,6 +842,11 @@ class Conversation:
                         if result and result != "Success":
                             raise ChatHubError("the backend declined the request: %s" % result)
                         return final or "".join(deltas)
+            if _extended and self._clock() >= _ceiling_at:
+                raise ChatHubError("turn ceiling exceeded (%.0fs) while the stream was still "
+                                   "progressing: deadline exceeded before a completion "
+                                   "frame"
+                                   % self.turn_ceiling_s)
             raise ChatHubError("turn deadline exceeded before a completion frame")
         except Exception:
             # A TURN THAT FAILED LEAVES THE CONNECTION IN AN UNKNOWN STATE, so it is dropped
