@@ -39,6 +39,7 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from tools import cockpit_source  # noqa: E402  (the cockpit source is split across files)
+from tools import ui_source  # noqa: E402  (the chat window source is split across files)
 from tools import settings_path as SP  # noqa: E402
 
 
@@ -158,7 +159,7 @@ def test_the_settings_path_is_the_same_in_every_language():
         if cs == "ui/FleetCockpit.cs":
             body = cockpit_source.read(encoding="utf-8-sig")
         else:
-            body = io.open(os.path.join(REPO, cs), encoding="utf-8-sig").read()
+            body = ui_source.chat_window_source(encoding="utf-8-sig")
         assert 'Path.Combine(RepoRootForSettings(), ".config", "settings.txt")' in body, cs
         assert "SettingsFileForWrite" in body, "%s still writes to the read path" % cs
         # The old location must remain READABLE -- retiring it is the last step, not this one.

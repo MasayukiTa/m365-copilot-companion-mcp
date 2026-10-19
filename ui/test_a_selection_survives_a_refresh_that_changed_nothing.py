@@ -22,15 +22,16 @@ applied and is not.
 """
 from __future__ import annotations
 
-import io
 import os
 
+from tools import ui_source  # noqa: E402
+
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")
+# the chat window's source is spread over ui/CopilotChat*.cs; read it only through tools/ui_source.py
 
 
 def _src():
-    return io.open(CHAT, encoding="utf-8").read()
+    return ui_source.chat_window_source(encoding="utf-8")
 
 
 def _method(signature):

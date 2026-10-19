@@ -33,7 +33,9 @@ import sys
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
 
-CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")
+from tools import ui_source  # noqa: E402  (the chat window source is spread over CopilotChat*.cs)
+
+CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")  # the MAIN part; _cs_method(path=CHAT) reads all parts
 #: Where the follow-up payload is built since 2026-09-24. ui/test_the_chat_window_sends_what_was_typed.py
 #: RUNS it (and reads what it wrote back through fleet_runner.goals_from_command); the two
 #: shape checks below stay because they name the order of preference.
@@ -44,7 +46,8 @@ FLEET = os.path.join(REPO, "relay", "relay_fleet.py")
 
 def _cs_method(signature, path=CHAT):
     """One C# method's text, located by its own signature rather than by a line inside it."""
-    src = io.open(path, encoding="utf-8").read()
+    src = (ui_source.chat_window_source(encoding="utf-8") if path == CHAT
+           else io.open(path, encoding="utf-8").read())
     i = src.index(signature)
     j = src.find("\n    void ", i + 1)
     k = src.find("\n    string ", i + 1)
@@ -68,7 +71,7 @@ def test_a_follow_up_sends_the_conversation_id():
 def test_the_row_it_reads_is_the_one_that_holds_the_id():
     """`ConvUrl` on a fleet row is "sess:<guid>", read from the transcript's guid line. If that
     stops being true the id above is a string nobody can resolve."""
-    src = io.open(CHAT, encoding="utf-8").read()
+    src = ui_source.chat_window_source(encoding="utf-8")
     assert 'ConvUrl = guid.Length > 0 ? "sess:" + guid : ""' in src, (
         "fleet rows no longer carry sess:<guid>; the follow-up has nothing to send")
 

@@ -25,15 +25,18 @@ import io
 import os
 
 from tools import cockpit_source  # reads every part of the split cockpit source
+from tools import ui_source  # reads every part of the split chat window source
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
-CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")
+CHAT = os.path.join(REPO, "ui", "CopilotChat.cs")  # the MAIN part; _read() returns all parts
 
 
 def _read(path):
     if path == COCKPIT:
         return cockpit_source.read(encoding="utf-8")
+    if path == CHAT:
+        return ui_source.chat_window_source(encoding="utf-8")
     return io.open(path, encoding="utf-8").read()
 
 

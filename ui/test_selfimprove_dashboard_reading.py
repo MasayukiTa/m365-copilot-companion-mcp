@@ -18,8 +18,10 @@ Run: pytest -q ui/test_selfimprove_dashboard_reading.py
 """
 from pathlib import Path
 
+from tools import ui_source  # the dashboard source is spread over SelfImproveDashboard*.cs
+
 UI = Path(__file__).parent
-SRC = (UI / "SelfImproveDashboard.cs").read_text(encoding="utf-8")
+SRC = ui_source.self_improve_source(encoding="utf-8")
 
 
 def _fn(name: str, end: str = "\n    }") -> str:

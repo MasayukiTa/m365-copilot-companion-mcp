@@ -21,12 +21,11 @@ apart without someone deliberately unpicking them.
 """
 from __future__ import annotations
 
-import io
-import os
 import re
 
-SOURCE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "CopilotChat.cs")
-SOURCE = io.open(SOURCE_PATH, encoding="utf-8", errors="replace").read()
+from tools import ui_source  # noqa: E402  (the chat window source is spread over CopilotChat*.cs)
+
+SOURCE = ui_source.chat_window_source(encoding="utf-8", errors="replace")
 
 
 def _body(start, end):

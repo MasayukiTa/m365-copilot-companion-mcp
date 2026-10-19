@@ -475,6 +475,7 @@ jobs:
             relay/test_watchdog_blocking_aware.py \
             tests/test_gui_submit_idempotency.py \
             tools/test_resplit_cockpit_patch.py \
+            tools/test_ui_source_reads_every_part.py \
             scripts/test_diag_report.py \
             scripts/test_diag_warmup_bias.py \
             scripts/test_recycle_report.py \

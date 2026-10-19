@@ -305,9 +305,8 @@ def test_stdin_is_decoded_as_utf8_and_not_as_the_console_encoding(monkeypatch):
 
 
 def test_the_dashboard_no_longer_rewrites_quotes():
-    from pathlib import Path
-    ui = (Path(P.__file__).parent.parent.parent / "ui" / "SelfImproveDashboard.cs")
-    src = ui.read_text(encoding="utf-8")
+    from tools import ui_source  # the dashboard source is spread over SelfImproveDashboard*.cs
+    src = ui_source.self_improve_source(encoding="utf-8")
     body = src[src.index("bool RecordDecision"):]
     body = body[:body.index("\n    // ")]
     assert '--authorization -' in body

@@ -14,9 +14,9 @@ ui/test_fleet_cockpit_approval_center.py.
 
 Run: pytest -q ui/test_copilot_chat_conv_lifecycle.py
 """
-from pathlib import Path
+from tools import ui_source  # the chat window's source is spread over CopilotChat*.cs
 
-SOURCE = Path(__file__).with_name("CopilotChat.cs").read_text(encoding="utf-8")
+SOURCE = ui_source.chat_window_source(encoding="utf-8")
 
 
 def test_startup_reopens_the_last_used_conversation():

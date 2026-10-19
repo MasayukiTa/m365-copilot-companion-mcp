@@ -17,10 +17,11 @@ Run: pytest -q ui/test_fleet_cockpit_authority_window.py
 from pathlib import Path
 
 from tools import cockpit_source  # reads every part of the split cockpit source
+from tools import ui_source  # reads every part of the split dashboard source
 
 UI = Path(__file__).parent
 COCKPIT = cockpit_source.read(encoding="utf-8")
-DASH = (UI / "SelfImproveDashboard.cs").read_text(encoding="utf-8")
+DASH = ui_source.self_improve_source(encoding="utf-8")
 
 
 def _authority_branch() -> str:

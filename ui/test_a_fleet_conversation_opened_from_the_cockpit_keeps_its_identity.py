@@ -48,13 +48,13 @@ import re
 
 import pytest
 
+from tools import ui_source  # the chat window source is spread over CopilotChat*.cs
+
 UI = os.path.dirname(os.path.abspath(__file__))
-SRC = os.path.join(UI, "CopilotChat.cs")
 
 
 def _code() -> str:
-    with open(SRC, encoding="utf-8-sig") as fh:
-        text = fh.read()
+    text = ui_source.chat_window_source(encoding="utf-8-sig")
     return "\n".join(re.sub(r"//.*$", "", ln) for ln in text.splitlines())
 
 
