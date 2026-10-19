@@ -90,17 +90,13 @@ def mode(settings_path=None):
 
 # ------------------------------------------------------------------ the profile
 
-def _fleet_dir():
-    # Derived from LOG at call time, so a test that redirects LOG redirects the profile source
-    # with it and never reads the operator's records.
-    return os.path.dirname(LOG)
-
-
 def profiles(now=None):
     """{role: capability_profile entry}, cached for PROFILE_TTL_S. {} when it cannot be read."""
     try:
         t = time.time() if now is None else now
-        fdir = _fleet_dir()
+        # Derived from LOG at call time, so a test that redirects LOG redirects the profile
+        # source with it and never reads the operator's records.
+        fdir = os.path.dirname(LOG)
         c = _profile_cache
         if c["at"] is not None and c["dir"] == fdir and 0 <= t - c["at"] < PROFILE_TTL_S:
             return c["profiles"]
