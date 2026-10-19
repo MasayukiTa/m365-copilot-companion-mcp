@@ -7,13 +7,12 @@ reads and measures. It writes nothing (not into .fleet, not anywhere), is not im
 runtime module, and changes no existing behaviour.
 
 THE CONSUMER (documented here so the output is not another file nobody reads). Roadmap item C3,
-load-aware routing in SHADOW mode, is the intended reader: it would take the JSON `profiles`
-object printed by this script (role -> labels) next to the existing admission margins (maxtabs,
-rate ceiling, RAM) and record the assignment it WOULD have made, without acting on it. C3 is not
-implemented: at the time of writing no code and no settings key for it exist. Until it does, the
-only reader is the scheduled roadmap loop, which must run this script over the real .fleet and
-look for a role with `confidence` other than "unknown" (n_runs >= --min-n). It must not wait for
-a profile file in .fleet: nothing writes one, and nothing ever will.
+load-aware routing in SHADOW mode (relay/load_routing.py, setting `fanout_load_routing`), reads
+the `profiles` object (role -> labels) through `load_profiles` below, next to the existing
+admission margins (maxtabs, rate ceiling, RAM), and records the assignment it WOULD have made
+without acting on it. This script itself still writes nothing. A role with `confidence` other
+than "unknown" (n_runs >= --min-n) is what makes a profile usable. Nothing writes a profile file
+in .fleet, and nothing ever will: the profile is derived again from the records.
 
 WHY THE OLD INPUT NEVER FILLED. The first version read only status.json `workers`, which holds
 the LAST run only, and named a group after the worker's `profile`, else its `name`. No worker
@@ -199,6 +198,22 @@ def load_all(fleet_dir):
                                           ("mechanisms.jsonl", bad_me),
                                           ("history.json", bad_hi)) if n}
     return events, workers, camps, n_tr, history, effort_reached_by_run(mech), unreadable
+
+
+def load_profiles(fleet_dir, min_n=DEFAULT_MIN_N):
+    """{role: profile entry} for the runtime reader (relay/load_routing.py), read-only.
+
+    The same derivation as `derive`, but without the two inputs that only feed the tool mix and
+    the effort split: tool_events.jsonl is the largest record in the directory and the router
+    needs neither. Never raises: any read problem leaves that source empty, so the roles it
+    would have described come out `unknown`."""
+    try:
+        camps, _ = _read_jsonl_counted(os.path.join(fleet_dir, "campaigns.jsonl"))
+        history, _ = _read_history(os.path.join(fleet_dir, "history.json"))
+        workers = S._read_status_workers(os.path.join(fleet_dir, "status.json"))
+        return derive([], workers, camps, min_n=min_n, history=history)["profiles"]
+    except Exception:
+        return {}
 
 
 # --------------------------------------------------------------------------- records
