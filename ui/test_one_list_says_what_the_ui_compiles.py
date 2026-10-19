@@ -130,8 +130,7 @@ EXEMPT = {
         "shows, without WPF, which is the reason EffortPolicy.cs is its own file, not a build of "
         "the UI",
     "ui/test_the_startup_loop_has_a_backstop.py":
-        "compiles the SHIPPED ui/SelfImproveDashboard.cs + ui/Theme.cs (with WPF references, "
-        "since SelfImproveDashboardWindow extends Window) plus the test-only driver in "
+        "compiles the SHIPPED ui/StartupGate.cs (no WPF) plus the test-only driver in "
         "ui/harness/ into a throwaway console exe: it drives StartupGate.GateAutomaticLaunch "
         "and AutoFixBudget.Decide, the pure startup/auto-repair policy, directly -- not a "
         "build of either shipped UI binary",

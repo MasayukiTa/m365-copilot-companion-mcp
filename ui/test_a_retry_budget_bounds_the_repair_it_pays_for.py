@@ -38,7 +38,7 @@ from tools import ui_source  # reads every part of the split dashboard source
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 COCKPIT = os.path.join(REPO, "ui", "FleetCockpit.cs")
-# SelfImproveDashboard.cs is spread over parts; _dashboard_src() reads them all via tools/ui_source.py
+# AutoFixBudget (the persisted retry budget) is in ui/StartupGate.cs; _dashboard_src() reads it via tools/ui_source.py
 
 
 def _src():
@@ -46,7 +46,7 @@ def _src():
 
 
 def _dashboard_src():
-    return ui_source.self_improve_source(encoding="utf-8")
+    return ui_source.read_parts("StartupGate", encoding="utf-8")  # AutoFixBudget lives in ui/StartupGate.cs
 
 
 def _body(signature, src=None):
@@ -117,7 +117,7 @@ def test_the_cap_is_still_consulted():
     comparison `_autoFixAttempts >= AUTOFIX_MAX_ATTEMPTS` moved out of MaybeAutoFix entirely --
     a budget of a THIS-PROCESS field bound nothing across the very relaunches it existed to
     stop, so the count is now persisted to .fleet/autofix_budget.json and the comparison lives
-    in AutoFixBudget.Decide (ui/SelfImproveDashboard.cs), which MaybeAutoFix reaches through
+    in AutoFixBudget.Decide (ui/StartupGate.cs), which MaybeAutoFix reaches through
     TryConsumeAutoFixBudget. Both ends of that handoff are checked here: the call site still
     passes AUTOFIX_MAX_ATTEMPTS, and Decide still bounds attempts against it."""
     body = _body("void MaybeAutoFix()")
