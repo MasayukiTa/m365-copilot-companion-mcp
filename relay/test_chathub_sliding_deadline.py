@@ -172,9 +172,3 @@ def test_the_ceiling_is_a_constructor_argument_and_defaults_to_three_times():
     # a ceiling below the timeout would make the timeout unreachable: it is raised to it
     assert CH.Conversation(lambda: _token(), turn_timeout_s=50,
                            turn_ceiling_s=10).turn_ceiling_s == 50.0
-
-
-def test_the_socket_route_passes_the_ceiling_to_the_conversation():
-    import inspect
-    from relay.socket_route import SocketRoute
-    assert "turn_ceiling_s" in inspect.signature(SocketRoute.driver_for).parameters

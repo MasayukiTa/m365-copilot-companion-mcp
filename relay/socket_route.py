@@ -520,7 +520,7 @@ class SocketRoute:
 
     def driver_for(self, name: str, agent_url=None, model: str = "",
                    turn_timeout_s: float = 600.0, frame_timeout_s: float = 90.0,
-                   conversation_id: str = "", turn_ceiling_s=None):
+                   conversation_id: str = ""):
         """A socket driver for one worker or side agent, or None to open a tab instead.
 
         `conversation_id` continues an earlier conversation instead of starting one. MEASURED,
@@ -561,8 +561,7 @@ class SocketRoute:
 
         conv = Conversation(supply, template=template,
                             turn_timeout_s=float(turn_timeout_s),
-                            frame_timeout_s=float(frame_timeout_s),
-                            turn_ceiling_s=turn_ceiling_s)
+                            frame_timeout_s=float(frame_timeout_s))
         if conversation_id:
             # The one field that carries the history. Set here rather than in Conversation's
             # constructor so that "start a conversation" stays the default and continuing one
