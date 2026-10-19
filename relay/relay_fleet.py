@@ -78,6 +78,7 @@ from relay import effort_policy as effort_policy_mod
 from relay import stuck_cause as stuck_cause_mod
 from relay import conversation_saving as conv_saving_mod
 from relay import tool_bridge
+from relay import load_routing
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
@@ -10599,6 +10600,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
+            # C3, SHADOW ONLY: records which queued goal a load-aware router would have admitted
+            # beside this one. Returns nothing and changes nothing (off = no-op, never raises).
+            load_routing.shadow_assign(w, pending, _active_open(), _socket_cap, _lane_ceiling,
+                                       run_id=run_id, ram_floor_mb=ram_box[0],
+                                       probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
             ok = w.attach(context, agent_url)
             if not ok and w.status == PENDING:
                 # NO SOCKET AVAILABLE (it went away between the readiness check above and the

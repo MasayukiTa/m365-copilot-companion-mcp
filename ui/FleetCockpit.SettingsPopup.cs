@@ -268,6 +268,7 @@ partial class CockpitWindow
             case "supervisor_self_restart":
             case "job_approval_mode":
             case "fanout_write_scope":
+            case "fanout_load_routing":
             case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
@@ -758,6 +759,7 @@ partial class CockpitWindow
         col.Children.Add(FanoutDepthControl());
         col.Children.Add(HierarchicalMergeControl());
         col.Children.Add(WriteScopeControl());
+        col.Children.Add(LoadRoutingControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the
@@ -765,6 +767,7 @@ partial class CockpitWindow
         PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
         PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
+        PaintLoadRoutingInEffect(_lastRoot);
         PaintMergeConversationInEffect(_lastRoot);
 
         // ── Recovery / 復旧: what happens to a run whose coordinator died. One control for now;

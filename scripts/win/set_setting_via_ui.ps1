@@ -25,6 +25,7 @@ $Boxes = @{
     'fanout_max_depth'          = 'fanoutDepthBox'
     'fanout_hierarchical_merge' = 'hierarchicalMergeBox'
     'fanout_write_scope'        = 'writeScopeBox'
+    'fanout_load_routing'       = 'loadRoutingBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]
