@@ -45,6 +45,8 @@ Copilot がこの PC のツールを呼ぶ道は二つあります。**起動に
 | 確認 | `doctor.bat` | `doctor.bat`(トンネル検査の代わりに「Tool route: connector-less」と1行出る) |
 | 手順 | 下の「セットアップ」 | [docs/connector_less_route.md](docs/connector_less_route.md)(仕組みと設定)・[docs/custom_mcp_fallback_route.md](docs/custom_mcp_fallback_route.md)(画面つき手順) |
 
+**すでにコネクタ経路で使っている人**: 専用の移行ツールはありません。旧エージェントとコネクタはそのまま残し(戻り先)、コネクタなしの新しい標準エージェントを作って URL を差し替え、設定「ツール経路」を切り替えるだけです。スキル・フリート・記憶・設定は引き継がれます。手順は [docs/connector_less_route.md](docs/connector_less_route.md) の「Moving an install that already uses the connector route」です。
+
 既存のフリート・スキル・ツールは、どちらの経路でも**同じ使い方**です(短い作業・長い作業・DB の読み取り・メールと予定・複数並列のフリートで確認済み。ほかの環境・組織設定では、小さな作業で先に試してください)。コネクタなし経路では、メールや予定は Microsoft 提供の Work IQ ツールで取得します。**注意:** 鍵なしで公開したツールは、リンクを知っている全員が使えます。各自が自分の環境を作り、他人のツールやエージェントのリンクは使わないでください。
 
 ---
