@@ -36,14 +36,37 @@ You do not need the Dev Tunnel CLI, a tunnel, a connector, or an access grant.
    there. Copy the chat page's address from the address bar.
 4. Paste that address into the dialog `quickstart.bat` opens (or run `configure_env.bat` later). It is
    saved as the agent URL.
-5. For mail and calendar, attach the **Microsoft Work IQ** tools to the same agent in Copilot Studio.
+5. Paste the text of `docs/examples/connector_less_agent_instructions.txt` into the agent's
+   **Instructions** in Copilot Studio and publish again. Without it, an agent that also has Microsoft
+   tools attached can refuse the fenced-block protocol ("that tool does not exist"); with it, the
+   protocol was followed in every measured run.
+6. For mail and calendar, attach the **Microsoft Work IQ** tools to the same agent in Copilot Studio.
    The first time the agent uses one, a consent card appears in the chat: approve it once.
-6. Run `start_all.bat` (or let `quickstart.bat` finish). `doctor.bat` shows one informational line,
+7. Run `start_all.bat` (or let `quickstart.bat` finish). `doctor.bat` shows one informational line,
    "Tool route: connector-less", in place of the Dev Tunnel checks.
 
-If you already installed with the connector route, open the cockpit's **Settings**, find **Tools**, and set
-**Tool route** to **Connector-less**. The change applies to the next conversation the fleet creates, with
-no restart; conversations already running keep the route they started with. Then follow steps 2 to 5.
+## Moving an install that already uses the connector route
+
+There is no separate installer: it is the same product and the same `quickstart.bat` / `start_all.bat`.
+Your skills, fleet, memory and settings stay as they are. Only the agent and one setting change.
+
+1. **Keep the old agent and its connector as they are.** They are your way back (see "Switching back").
+   Write down the agent URL you use today (`MCP_IMPL_AGENT_URL`, and `MCP_FLEET_AGENT_URL` if you set one).
+2. In Copilot Studio create a new **Standard** agent with **no connector and no tool**, paste the
+   Instructions text (step 5 above), attach the Work IQ tools if you want mail and calendar, publish it,
+   add it to Microsoft 365 Copilot and copy its chat address. Taking the connector off the old agent
+   has not been tested; a new agent is the verified path.
+3. Run `configure_env.bat` and replace the agent URL (and the fleet agent URL, if set) with the new one.
+4. Open the cockpit's **Settings**, find **Tools**, set **Tool route** to **Connector-less**. It applies
+   to the next conversation the fleet creates, with no restart; conversations already running keep
+   the route they started with.
+5. The Dev Tunnel that is already running is left alone: the supervisor stops managing it but never
+   stops a live host. The old connector keeps pointing at it until you remove it.
+6. Check: `doctor.bat` shows "Tool route: connector-less"; then give the fleet one small task (read a
+   file, then a database read) before you rely on it.
+
+The Dev Tunnel and the connector are not needed any more on this route; remove them in Copilot Studio
+only when you are sure you will not switch back.
 
 ## What the agent is told
 
@@ -80,7 +103,7 @@ never started by this product.
 
 ## Switching back
 
-Open **Settings**, **Tools**, set **Tool route** to **Connector**. The next conversation uses the
+Open **Settings**, **Tools**, set **Tool route** to **Connector**, and put the old agent URL back with `configure_env.bat`. The next conversation uses the
 connector route again. If the machine has never had a tunnel, run `quickstart.bat` again and answer
 the access question with **A** or **T**; it sets up the Dev Tunnel step that was skipped.
 
