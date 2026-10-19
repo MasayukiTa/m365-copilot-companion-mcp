@@ -119,7 +119,8 @@ _DRIVER_HEADER = r"""
 param(
     [Parameter(Mandatory=$true)][string]$Scenario,
     [Parameter(Mandatory=$true)][string]$Dir,
-    [Parameter(Mandatory=$true)][string]$OutFile
+    [Parameter(Mandatory=$true)][string]$OutFile,
+    [double]$ColdCost = 0
 )
 $ErrorActionPreference = "Stop"
 $script:LogLines = New-Object System.Collections.Generic.List[string]
@@ -140,10 +141,38 @@ _DRIVER_FOOTER = r"""
 function Start-Writer {
     # Writes <prefix>NN.json at the given offsets (seconds after $T0) from ANOTHER runspace in
     # this process, the way fleet_submit does it: a .tmp first, then a rename into place.
-    param([string]$Dir, [double[]]$At, [datetime]$T0)
+    #
+    # THE SCHEDULE'S CLOCK STARTS WHEN THE WRITER IS READY, NOT BEFORE. The runspace is opened and
+    # the writer's own steps are run once against a scratch directory (the first use of a
+    # runspace is what costs: on a loaded CI host the file planned for 1.3 s was written at 6.5 s
+    # and at 8.8 s of a 7 s wait, so the wait returned before the file existed). T0 is taken
+    # after that, and returned for the caller to use. -ColdCost stands in for that first-use
+    # cost in a test of this very property.
+    param([string]$Dir, [double[]]$At, [double]$ColdCost)
+    $rs = [runspacefactory]::CreateRunspace()
+    $rs.Open()
+    $warm = [powershell]::Create()
+    $warm.Runspace = $rs
+    [void]$warm.AddScript({
+        param($ColdCost)
+        if ($ColdCost -gt 0) { Start-Sleep -Milliseconds ([int]($ColdCost * 1000)) }
+        $scratch = Join-Path ([System.IO.Path]::GetTempPath()) ("writer-warmup-" + [guid]::NewGuid().ToString("N"))
+        [void][System.IO.Directory]::CreateDirectory($scratch)
+        try {
+            $tmp = Join-Path $scratch "warm.json.tmp"
+            [System.IO.File]::WriteAllText($tmp, "{}")
+            [System.IO.File]::Move($tmp, (Join-Path $scratch "warm.json"))
+            [void](Get-Date); Start-Sleep -Milliseconds 1
+        } finally { [System.IO.Directory]::Delete($scratch, $true) }
+    }).AddArgument($ColdCost)
+    [void]$warm.Invoke()
+    $warm.Dispose()
+    $T0 = Get-Date
     $ps = [powershell]::Create()
+    $ps.Runspace = $rs
     [void]$ps.AddScript({
         param($Dir, $At, $T0)
+        $startedAt = ((Get-Date) - $T0).TotalSeconds
         $written = New-Object System.Collections.Generic.List[object]
         $i = 0
         foreach ($a in $At) {
@@ -153,12 +182,12 @@ function Start-Writer {
             $tmp = Join-Path $Dir ($name + ".tmp")
             [System.IO.File]::WriteAllText($tmp, "{}")
             [System.IO.File]::Move($tmp, (Join-Path $Dir $name))
-            $written.Add([PSCustomObject]@{ name = $name; at = ((Get-Date) - $T0).TotalSeconds })
+            $written.Add([PSCustomObject]@{ name = $name; at = ((Get-Date) - $T0).TotalSeconds; lag = $startedAt })
             $i++
         }
         return $written
     }).AddArgument($Dir).AddArgument($At).AddArgument($T0)
-    return @{ ps = $ps; handle = $ps.BeginInvoke() }
+    return @{ ps = $ps; rs = $rs; t0 = $T0; handle = $ps.BeginInvoke() }
 }
 
 $result = @{}
@@ -186,13 +215,14 @@ if ($Scenario -eq "cache") {
 } else {
     $plan = @{
         single   = @{ seconds = 7;  at = @(1.3) }
+        slowwriter = @{ seconds = 3; at = @(0.3) }
         burst    = @{ seconds = 12; at = @(1.0, 1.5, 2.0, 2.5, 3.0) }
         deadline = @{ seconds = 5;  at = @(0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 3.5, 4.0, 4.5, 5.0,
                                            5.5, 6.0, 6.5, 7.0, 7.5, 8.0, 8.5, 9.0) }
     }[$Scenario]
     $script:Passes = New-Object System.Collections.Generic.List[object]
-    $T0 = Get-Date
-    $w = Start-Writer -Dir $Dir -At $plan.at -T0 $T0
+    $w = Start-Writer -Dir $Dir -At $plan.at -ColdCost $ColdCost
+    $T0 = $w.t0
     Wait-ForNextTick -Seconds $plan.seconds -Dir $Dir -ExpressPass {
         # A stub pass that leaves every file where it is -- the "still pending after a pass"
         # case (blocked, awaiting approval, backoff) is the one that must not re-trigger.
@@ -204,6 +234,7 @@ if ($Scenario -eq "cache") {
     $returnedAt = ((Get-Date) - $T0).TotalSeconds
     $written = $w.ps.EndInvoke($w.handle)
     $w.ps.Dispose()
+    $w.rs.Dispose()
     $result.returned_at = $returnedAt
     $result.deadline = $plan.seconds
     $result.passes = $script:Passes
@@ -214,7 +245,7 @@ $result | ConvertTo-Json -Depth 6 | Set-Content -Path $OutFile -Encoding UTF8
 """
 
 
-def _run_scenario(tmp_path, scenario: str) -> dict:
+def _run_scenario(tmp_path, scenario: str, cold_cost: float = 0.0) -> dict:
     src = _supervisor_source()
     funcs = "\n\n".join(_extract_braced_block(src, m) for m in _FUNCTIONS)
     pending = tmp_path / "pending"
@@ -224,7 +255,8 @@ def _run_scenario(tmp_path, scenario: str) -> dict:
     driver.write_text(_DRIVER_HEADER + "\n\n" + funcs + "\n\n" + _DRIVER_FOOTER, encoding="utf-8")
     proc = childproc.run(
         [_POWERSHELL, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", str(driver),
-         "-Scenario", scenario, "-Dir", str(pending), "-OutFile", str(out)],
+         "-Scenario", scenario, "-Dir", str(pending), "-OutFile", str(out),
+         "-ColdCost", repr(float(cold_cost))],
         timeout=120,
         creationflags=childproc.headless_creationflags(),
     )
@@ -244,6 +276,13 @@ def _as_list(v):
 @pytest.fixture(scope="module")
 def single(tmp_path_factory):
     return _run_scenario(tmp_path_factory.mktemp("single"), "single")
+
+
+@pytest.fixture(scope="module")
+def slow_writer(tmp_path_factory):
+    # The writer's first use costs 2.5 s (a cold runspace on a loaded CI host: 6.5 s and
+    # 8.8 s were measured), against a 3 s wait with the file planned 0.3 s in.
+    return _run_scenario(tmp_path_factory.mktemp("slowwriter"), "slowwriter", cold_cost=2.5)
 
 
 @pytest.fixture(scope="module")
@@ -267,10 +306,29 @@ def cache(tmp_path_factory):
 def test_a_new_job_file_starts_a_pass_within_two_seconds(single):
     passes = _as_list(single["passes"])
     written = _as_list(single["written"])
-    assert passes, "no express pass ran for a job file written 1.3 s into a 7 s wait"
+    assert passes, (
+        "no express pass ran for a job file written 1.3 s into a 7 s wait (written at %s s, "
+        "writer start lag %s s, wait returned at %.2f s)"
+        % ([w["at"] for w in written], [w.get("lag") for w in written], single["returned_at"]))
     latency = passes[0]["at"] - written[0]["at"]
     print("file -> express pass latency: %.2f s" % latency)
     assert 0 <= latency <= 2.0, "express pass started %.2f s after the file appeared" % latency
+    assert written[0]["name"] in _as_list(passes[0]["names"])
+
+
+@windows_only
+def test_a_cold_start_of_the_test_writer_does_not_move_the_file_off_its_schedule(slow_writer):
+    """CI runs of PR #181 and #205 failed with the file written at 6.5 s and 8.8 s of a 7 s
+    wait, planned 1.3 s: the writer runspace came up that late, the schedule's clock had
+    started before it, and the file landed after the wait had returned. That is a fault of
+    the harness, not a missed file: Wait-ForNextTick cannot see a file that does not exist.
+    The schedule must start when the writer is ready."""
+    passes = _as_list(slow_writer["passes"])
+    written = _as_list(slow_writer["written"])
+    assert written and abs(written[0]["at"] - 0.3) <= 0.5, (
+        "the file was written at %s s, planned 0.3 s (writer start lag %s)"
+        % ([w["at"] for w in written], [w.get("lag") for w in written]))
+    assert passes, "no express pass ran for a file written at %.2f s of a 3 s wait" % written[0]["at"]
     assert written[0]["name"] in _as_list(passes[0]["names"])
 
 
