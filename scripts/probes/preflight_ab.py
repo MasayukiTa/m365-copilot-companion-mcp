@@ -40,8 +40,7 @@ PORT = 8100
 FORBIDDEN_PORTS = (8000, 8765, 9222, 9223, 9224)
 EDGE_PORT = 9350
 MIN_FREE_GB = 3.0
-DONOR = os.path.join(os.path.expanduser("~"), "resonac-mcp", ".fleet", "templates",
-                     "template_443df19d202e0936.json")     # read-only source of the request shape
+DONOR_NAME = "template_443df19d202e0936.json"     # read-only source of the request shape
 PY = sys.executable
 
 DENY = ("write_file", "edit_and_verify", "delete", "roll_back", "fleet_submit", "restore_point", "unlock",
@@ -194,9 +193,28 @@ def start_server(out_dir, key):
     env.update(SERVER_SETTINGS)
     env.pop("MCP_API_KEY_PROTECTED", None)
     logf = open(os.path.join(out_dir, "server.log"), "ab")
+    from tools.childproc import headless_creationflags
     proc = subprocess.Popen([PY, "-I", "-X", "utf8", os.path.join(HERE, "preflight_ab_server.py"), str(PORT)],
-                            cwd=ROOT, env=env, stdout=logf, stderr=logf)
+                            cwd=ROOT, env=env, stdout=logf, stderr=logf,
+                            creationflags=headless_creationflags())
     return proc
+
+
+def git_head_short():
+    from tools import childproc
+    r = childproc.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"], timeout=30,
+                      creationflags=childproc.headless_creationflags())
+    return (r.stdout or "").strip()
+
+
+def donor_template_path():
+    """The request-shape template to COPY: the main checkout's record directory, found through git
+    (the worktree's common dir), so no checkout name is written into this file."""
+    from tools import childproc
+    r = childproc.run(["git", "-C", ROOT, "rev-parse", "--path-format=absolute", "--git-common-dir"],
+                      timeout=30, creationflags=childproc.headless_creationflags())
+    main_root = os.path.dirname((r.stdout or "").strip())
+    return os.path.join(main_root, ".fleet", "templates", DONOR_NAME)
 
 
 def wait_server(proc, timeout_s=120):
@@ -226,8 +244,9 @@ def point_bridge_at_private_server(key):
 
 
 def fetch_token(url_file):
-    r = subprocess.run([PY, "-I", "-X", "utf8", os.path.abspath(__file__), "token", "--url-file", url_file],
-                       capture_output=True, text=True, timeout=240, cwd=ROOT)
+    from tools import childproc
+    r = childproc.run([PY, "-I", "-X", "utf8", os.path.abspath(__file__), "token", "--url-file", url_file],
+                      timeout=240, cwd=ROOT, creationflags=childproc.headless_creationflags())
     out = (r.stdout or "").strip().splitlines()
     tok = out[-1] if out else ""
     return tok if tok.startswith("eyJ") else ""
@@ -357,7 +376,7 @@ def setup_route(out_dir, token, url):
     tdir = os.path.join(out_dir, "templates")
     os.makedirs(tdir, exist_ok=True)
     standin = "https://donor.example.invalid/agent"
-    shutil.copy(DONOR, PT.template_path(standin, tdir))      # a COPY; the production .fleet is only read
+    shutil.copy(donor_template_path(), PT.template_path(standin, tdir))      # a COPY; the production .fleet is only read
     TS.seed(standin, url, tdir)
     template = PT.load_template(url, tdir)
     route = SocketRoute(enabled=True, connect_fn=websocket_connect,
@@ -367,7 +386,7 @@ def setup_route(out_dir, token, url):
     return route, template
 
 
-def cmd_run(args):
+def cmd_ab_run(args):
     out_dir = os.path.abspath(args.out)
     os.makedirs(out_dir, exist_ok=True)
     sys.path.insert(0, ROOT)
@@ -403,8 +422,7 @@ def cmd_run(args):
         exp = {g: expected(g) for g in goals}
         from relay import profile_token as PT
         log(res, {"event": "setup", "instructions_chars": len(instr), "goals": goals, "n": args.n, "expected": exp,
-                  "port": PORT, "code": subprocess.run(["git", "-C", ROOT, "rev-parse", "--short", "HEAD"],
-                                                       capture_output=True, text=True).stdout.strip()})
+                  "port": PORT, "code": git_head_short()})
         done = {(r["arm"], r["goal"], r["i"]) for r in read_rows(res) if r.get("event") == "run"}
         for i in range(1, args.n + 1):
             for g in goals:
@@ -502,7 +520,7 @@ def main(argv=None):
         p.add_argument("--n", type=int, default=10)
         p.add_argument("--goals", default="a,b,c")
     args = ap.parse_args(argv)
-    return {"smoke": cmd_smoke, "run": cmd_run, "summary": cmd_summary, "token": cmd_token}[args.cmd](args) or 0
+    return {"smoke": cmd_smoke, "run": cmd_ab_run, "summary": cmd_summary, "token": cmd_token}[args.cmd](args) or 0
 
 
 if __name__ == "__main__":
