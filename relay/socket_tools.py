@@ -60,6 +60,17 @@ class ToolProtocolError(RuntimeError):
     """The reply could not be read as a tool call. Callers fall back rather than guess."""
 
 
+#: The batching instruction. Each response costs about 10 s whatever it contains (measured
+#: 2026-10-19), so the number of responses is the lever. The English sentence is the one that was
+#: measured (dependent goals 5.0 -> 3.3 responses, n=3-4: small, not conclusive); the Japanese
+#: states the same rule and names the one exception, a call that needs an earlier call's result.
+BATCH_RULE = (
+    "互いの結果を必要としない呼び出しは、必ず1つの応答にすべてのブロックを並べて書くこと"
+    "(1応答に1ブロックずつ出すと、往復の回数だけ時間が延びる)。"
+    "前の呼び出しの結果が要るものだけ、次の応答にする。結果は書いた順に #番号 つきで返る。"
+    " When several tool calls do not depend on each other, put all their fenced blocks in ONE reply. ")
+
+
 def tools_block(catalogue) -> str:
     """The `<tools>` section describing what may be called.
 
@@ -92,8 +103,8 @@ def build_prompt(user_text: str, catalogue, *, protocol: str = "") -> str:
     return (
         (protocol or "")
         + "呼べるツールは以下。使うときは、info string をツール名にしたコードブロックを出し、"
-        "本文に引数の JSON オブジェクトだけを書くこと。独立した操作は複数ブロックを"
-        "1つの応答にまとめてよい。ツールが登録されているかを論じる必要はない -- 実在する。"
+        "本文に引数の JSON オブジェクトだけを書くこと。" + BATCH_RULE +
+        "ツールが登録されているかを論じる必要はない -- 実在する。"
         "結果が返る前に完了したと述べないこと。\n\n"
         "<tools>\n" + block + "\n</tools>\n\n"
         "依頼:\n" + user_text)
