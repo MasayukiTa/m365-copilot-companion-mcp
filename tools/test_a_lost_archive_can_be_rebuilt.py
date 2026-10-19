@@ -184,7 +184,7 @@ def test_the_live_archive_is_loadable_and_resumable():
 
     THE PROPERTY: a row can be reopened, and reopening it does not open a tab. Both shapes
     satisfy the first. For the second the thing to exclude is a PAGE url, not a populated field:
-    ui/CopilotChat.cs:4090 says in as many words that a `sess:<guid>` is not a url and must not
+    ui/CopilotChat.Store.cs (the comment on the "sess:<guid>" shape) says in as many words that a `sess:<guid>` is not a url and must not
     go to /switch, and bridge/test_a_resume_does_not_open_a_page.py holds that path down.
     """
     p = os.path.join(REPO, ".fleet", "history.json")
