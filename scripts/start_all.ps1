@@ -1569,6 +1569,22 @@ function Invoke-PostUpdateTail {
 # Runs BEFORE the supervisor is started, so a normal logon start installs first and the server
 # then starts on the new packages with nothing to restart.
 # ---------------------------------------------------------------------------
+function Write-SupervisorPlannedStopRecord {
+    # Writes the supervisor's own 'leaving its loop' line ON ITS BEHALF, because Stop-Process
+    # -Force runs no `finally` and the supervisor can never write it itself.
+    # MEASURED 2026-10-20: supervisor pid 23744 was stopped by this script's dependency sync
+    # (deps_sync 123 s in start_all_runs.jsonl, pip log stamped 00:26:58) and the next supervisor
+    # then logged 'no exit record -> it was killed or crashed hard' -- a PLANNED stop reported as
+    # a crash. Call this BEFORE the Stop-Process. The wording keeps the exact phrase
+    # supervisor.ps1's Test-SupervisorExitRecordedAfter looks for. Never throws.
+    param([int]$ProcessId, [string]$Reason, [string]$LogPath = "")
+    try {
+        if (-not $LogPath) { $LogPath = Join-Path $env:TEMP "m365-companion-supervisor.log" }
+        $line = ("{0}  supervisor pid {1} leaving its loop (stopped by start_all: {2})" -f
+                 (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $ProcessId, $Reason)
+        Add-Content -LiteralPath $LogPath -Value $line -Encoding UTF8 -ErrorAction Stop
+    } catch { }
+}
 function Get-ThisCheckoutSupervisorProcesses {
     # All Win32_Process entries whose command line launches THIS checkout's supervisor.ps1.
     # SCOPED -- this list is what gets STOPPED. A bare name match finds anything that mentions
@@ -1816,7 +1832,7 @@ function Invoke-DependencySync([string]$VenvPy, [string]$BootstrapPy) {
             $why = $(if ($w.Count) { $w -join "; " } else { "it could not be confirmed that nothing is running" })
         } else {
             Write-Host "[deps] nothing is in use -- stopping this checkout's supervisor, MCP server and bridge for the install; they are started again below"
-            foreach ($p in $sups) { try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch { } }
+            foreach ($p in $sups) { Write-SupervisorPlannedStopRecord -ProcessId $p.ProcessId -Reason "dependency sync"; try { Stop-Process -Id $p.ProcessId -Force -ErrorAction Stop } catch { } }
             $null = Invoke-ServerAction $pre "[deps]"
             if ($bridges.Count -gt 0) { Stop-Bridge-Processes }
             Start-Sleep -Seconds 1
@@ -2879,7 +2895,7 @@ function Invoke-Startup {
             Write-Host "[1/4] supervisor is hosting a STALE tunnel ('$runTn') != .env ('$envTn') -- stopping and restarting on the correct tunnel"
             try {
                 foreach ($p in $runningSupervisors) {
-                    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
+                    Write-SupervisorPlannedStopRecord -ProcessId $p.ProcessId -Reason "stale tunnel restart"; Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
                 }
                 # Also stop the stale devtunnel host process for the OLD (borrowed) name --
                 # same targeted match supervisor.ps1 itself uses -- so this machine stops
