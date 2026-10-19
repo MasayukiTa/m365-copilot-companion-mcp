@@ -107,21 +107,48 @@ def parse_calls(reply: str, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_
     whatever happened to parse. A block naming something outside `allowed` is skipped for the
     same reason at a higher stake.
     """
-    out = []
+    return [(name, args) for _pos, name, args in
+            read_reply(reply, allowed=allowed, max_calls=max_calls)["calls"]]
+
+
+def _short(text, limit=80) -> str:
+    """One line, bounded: a notice must not carry a model-sized payload back to the model."""
+    one = " ".join(str(text).split())
+    return one if len(one) <= limit else one[:limit] + "…"
+
+
+def read_reply(reply: str, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_REPLY):
+    """Everything the reply asked for, and everything that could NOT be carried out.
+
+    Returns {"calls": [(pos, name, args)], "unreadable": [(pos, reason)],
+    "not_run": [pos, ...]}. `pos` is the 1-based position of the block among the reply's
+    blocks whose info string is in `allowed`, so it is assigned here and the model's block
+    does not have to carry an id. Blocks naming something else (ordinary code) are not
+    counted, exactly as before.
+
+    Nothing is dropped silently: a block that does not parse is `unreadable` with a reason,
+    and a readable block past `max_calls` is `not_run` and is never executed.
+    """
+    calls, unreadable, not_run = [], [], []
+    pos = 0
     for match in _FENCE.finditer(reply or ""):
         name, body = match.group(1), match.group(2)
         if name not in allowed:
             continue
+        pos += 1
         try:
             args = json.loads(body)
-        except Exception:
+        except Exception as exc:
+            unreadable.append((pos, "JSON として読めない (%s)" % _short(exc, 60)))
             continue
         if not isinstance(args, dict):
+            unreadable.append((pos, "JSON オブジェクトではない (%s)" % type(args).__name__))
             continue
-        out.append((name, args))
-        if len(out) >= max_calls:
-            break
-    return out
+        if len(calls) >= max_calls:
+            not_run.append(pos)
+            continue
+        calls.append((pos, name, args))
+    return {"calls": calls, "unreadable": unreadable, "not_run": not_run}
 
 
 def strip_calls(reply: str, *, allowed=DEFAULT_ALLOWED) -> str:
@@ -144,7 +171,7 @@ def strip_calls(reply: str, *, allowed=DEFAULT_ALLOWED) -> str:
     return _FENCE.sub(_drop, reply or "").strip()
 
 
-def result_turn(results) -> str:
+def result_turn(results, notices=None) -> str:
     """The next turn: what the tools returned, framed so it is not mistaken for a new request.
 
     Bounded per result. A tool that returns a megabyte would otherwise put a megabyte into the
@@ -152,15 +179,40 @@ def result_turn(results) -> str:
     large enough to exhaust the model's budget ends the conversation regardless.
     """
     parts = []
-    for name, ok, text in results:
+    for item in results:
+        name, ok, text = item[0], item[1], item[2]
+        pos = item[3] if len(item) > 3 else None
+        label = item[4] if len(item) > 4 else ""
         head = "%s → %s" % (name, "ok" if ok else "失敗")
+        if pos is not None:
+            head = "#%d %s" % (pos, head)
+        if label:
+            head += " [%s]" % label
         body = str(text or "")
         if len(body) > 8000:
             body = body[:8000] + "\n…(切り詰め: %d 文字)" % len(str(text))
         parts.append(head + "\n" + body)
+    notes = [str(n) for n in (notices or ()) if n]
+    tail = ("\n\n--- 注意 ---\n" + "\n".join(notes)) if notes else ""
     return ("ツールの実行結果は以下。これを踏まえて続けること。"
             "結果が不十分なら、必要なツールを追加で呼ぶこと。\n\n"
-            "--- 実行結果 ---\n" + "\n\n".join(parts) + "\n--- ここまで ---")
+            "--- 実行結果 ---\n" + "\n\n".join(parts) + tail + "\n--- ここまで ---")
+
+
+def notices_for(unreadable, not_run, max_calls=MAX_CALLS_PER_REPLY) -> list:
+    """One short line per problem, so the model can resend exactly what did not happen.
+
+    Numbers are the blocks' positions among the reply's call blocks, counted from the top.
+    """
+    notes = []
+    for pos, reason in unreadable:
+        notes.append("ブロック%d は読めなかったので実行していない: %s。直して再送すること。"
+                     % (pos, reason))
+    if not_run:
+        notes.append("1回の応答で実行できるのは %d 件まで。ブロック%s の %d 件は"
+                     "実行していない(実行されていない)。再送すること。"
+                     % (max_calls, ",".join(str(p) for p in not_run), len(not_run)))
+    return notes
 
 
 def step(reply: str, run_tool, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_REPLY):
@@ -173,14 +225,16 @@ def step(reply: str, run_tool, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_P
     model as a failure rather than ending the turn: the model can often recover from a bad
     argument, and killing the goal over one is worse than telling it what happened.
     """
-    calls = parse_calls(reply, allowed=allowed, max_calls=max_calls)
-    if not calls:
+    read = read_reply(reply, allowed=allowed, max_calls=max_calls)
+    notes = notices_for(read["unreadable"], read["not_run"], max_calls)
+    if not read["calls"] and not notes:
         return None, []
     results = []
-    for name, args in calls:
+    for pos, name, args in read["calls"]:
         try:
             ok, text = run_tool(name, args)
         except Exception as exc:
             ok, text = False, "%s: %s" % (type(exc).__name__, exc)
-        results.append((name, bool(ok), text))
-    return result_turn(results), calls
+        label = _short(args.get("name"), 40) if isinstance(args.get("name"), str) else ""
+        results.append((name, bool(ok), text, pos, label))
+    return result_turn(results, notes), [(n, a) for _p, n, a in read["calls"]]

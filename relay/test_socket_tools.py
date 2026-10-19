@@ -158,3 +158,82 @@ def test_an_indented_fence_still_counts():
     """箇条書きの中でモデルがインデントすることはある。行頭要求は
     『行の先頭が空白のみ』まで許す。"""
     assert ST.parse_calls('- 手順:\n  ```call_tool\n  {"name": "ls"}\n  ```') != []
+
+
+# ---- 一括(バッチ)で返したとき、結果が呼び出しと取り違えられないこと -------------------------------
+
+def _blk(name):
+    return '```call_tool\n{"name": "%s"}\n```\n' % name
+
+
+def _echo(name, args):
+    return True, "out-" + args["name"]
+
+
+def _head_lines(nxt):
+    return [ln for ln in nxt.splitlines() if " → " in ln]
+
+
+def test_each_result_carries_the_position_of_its_call():
+    nxt, calls = ST.step(_blk("a") + _blk("b") + _blk("c"), _echo)
+    assert len(calls) == 3
+    heads = _head_lines(nxt)
+    assert [h.split(" ")[0] for h in heads] == ["#1", "#2", "#3"]
+    for h, tool in zip(heads, "abc"):
+        assert "[%s]" % tool in h
+    assert nxt.index("out-a") < nxt.index("out-b") < nxt.index("out-c")
+
+
+def test_an_unreadable_block_is_named_and_the_others_keep_their_ids():
+    reply = _blk("a") + '```call_tool\n{oops\n```\n' + _blk("c")
+    nxt, calls = ST.step(reply, _echo)
+    assert [a["name"] for _n, a in calls] == ["a", "c"]
+    heads = _head_lines(nxt)
+    assert [h.split(" ")[0] for h in heads] == ["#1", "#3"]
+    assert "[a]" in heads[0] and "[c]" in heads[1]
+    notice = nxt.split("--- 注意 ---")[1]
+    assert "ブロック2" in notice and "読めなかった" in notice
+    assert "ブロック1" not in notice and "ブロック3" not in notice
+
+
+def test_a_block_that_is_not_an_object_is_named_with_its_reason():
+    nxt, calls = ST.step(_blk("a") + '```call_tool\n[1, 2]\n```\n', _echo)
+    assert len(calls) == 1
+    assert "ブロック2" in nxt and "オブジェクトではない" in nxt
+
+
+def test_calls_past_the_limit_are_reported_and_never_run():
+    ran = []
+
+    def run(name, args):
+        ran.append(args["name"])
+        return True, "ok"
+    nxt, calls = ST.step("".join(_blk("t%d" % i) for i in range(1, 11)), run)
+    assert len(calls) == ST.MAX_CALLS_PER_REPLY == len(ran)
+    assert "t9" not in ran and "t10" not in ran
+    assert len(_head_lines(nxt)) == 8
+    notice = nxt.split("--- 注意 ---")[1]
+    assert "2 件" in notice and "実行していない" in notice
+    assert "ブロック9,10" in notice
+
+
+def test_a_single_call_works_as_before_apart_from_its_id():
+    nxt, calls = ST.step(_blk("a"), _echo)
+    assert len(calls) == 1 and "out-a" in nxt
+    assert "#1 call_tool → ok [a]" in nxt
+    assert "--- 注意 ---" not in nxt
+
+
+def test_only_unreadable_blocks_still_tell_the_model_instead_of_ending_silently():
+    nxt, calls = ST.step('```call_tool\n{oops\n```', _echo)
+    assert calls == [] and nxt is not None and "ブロック1" in nxt
+
+
+def test_ordinary_code_blocks_are_not_counted_as_positions():
+    reply = "```python\nprint(1)\n```\n" + _blk("a")
+    nxt, _calls = ST.step(reply, _echo)
+    assert "#1 call_tool → ok" in nxt
+
+
+def test_result_turn_without_ids_keeps_the_old_header():
+    assert "call_tool → ok\nx" in ST.result_turn([("call_tool", True, "x")])
