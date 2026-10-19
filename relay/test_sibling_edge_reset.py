@@ -99,6 +99,117 @@ def test_the_startup_recycle_asks_before_it_resets():
     assert "discretionary=True" in src[i:i + 300]
 
 
+# --- owns_edge: the (user-data-dir, port) owner key the ps1 kill path mirrors -----------
+# これらは実プロセス・pywin32 を使わず、偽のコマンドライン文字列だけで owns_edge を突く。
+# ps1 の Get-OwnedEdgeProcesses と同じ規則（プロファイル名の部分一致ではなく、
+# user-data-dir をトークン一致 ＋ --remote-debugging-port をトークン一致）を固定する。
+
+_DD = r"C:\ProgramData\fleet\profiles\copilot-companion-edge"
+
+
+def _main(dd, port, extra=""):
+    return ('"C:\\Program Files\\msedge.exe" --user-data-dir="' + dd + '" '
+            '--remote-debugging-address=127.0.0.1 --remote-debugging-port=' + str(port)
+            + (' ' + extra if extra else ''))
+
+
+def test_owns_edge_matches_our_profile_and_port():
+    assert ER.owns_edge(_main(_DD, 9222), _DD, 9222) is True
+
+
+def test_owns_edge_rejects_a_prefix_sibling_profile():
+    """copilot-companion-edge は copilot-companion-edge-2 の部分文字列。
+    旧コードの『プロファイル名 -match』だと隣プロファイルの Edge まで殺していた。"""
+    sibling = _DD + "-2"
+    assert ER.owns_edge(_main(sibling, 9222), _DD, 9222) is False
+
+
+def test_owns_edge_rejects_the_wrong_port():
+    """同じプロファイル文字列でも別ポートを駆動している Edge は我々のものではない。"""
+    assert ER.owns_edge(_main(_DD, 9223), _DD, 9222) is False
+
+
+def test_owns_edge_matches_a_bare_unquoted_user_data_dir():
+    bare = ("msedge --user-data-dir=" + _DD
+            + " --remote-debugging-port=9222 --no-first-run")
+    assert ER.owns_edge(bare, _DD, 9222) is True
+
+
+def test_owns_edge_rejects_port_that_is_only_a_prefix():
+    """--remote-debugging-port=92220 は 9222 ではない。トークン境界で見る。"""
+    assert ER.owns_edge(_main(_DD, 92220), _DD, 9222) is False
+
+
+def test_owns_edge_matches_a_child_process_that_inherited_both_flags():
+    """子プロセス（--type=renderer）も両フラグを継承する。kill 対象＝ツリー全体でよい。"""
+    child = _main(_DD, 9222, extra="--type=renderer --lang=ja")
+    assert ER.owns_edge(child, _DD, 9222) is True
+
+
+def test_owns_edge_empty_or_missing_is_not_ownership():
+    assert ER.owns_edge("", _DD, 9222) is False
+    assert ER.owns_edge(_main(_DD, 9222), "", 9222) is False
+
+
+# --- the ps1 kill path must mirror the same rule --------------------------------------------
+# owns_edge は Python 側の分類器だが、実際に Stop-Process するのは
+# scripts/start_companion_edge.ps1 の Get-OwnedEdgeProcesses。両者が同じ規則でないと意味がない。
+
+def _ps1_source():
+    import os as _os
+
+    here = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    with open(_os.path.join(here, "scripts", "start_companion_edge.ps1"),
+              encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _owned_fn_body(src):
+    """The text of the Get-OwnedEdgeProcesses function definition."""
+    start = src.index("function Get-OwnedEdgeProcesses")
+    return src[start:start + 900]
+
+
+def test_ps1_has_one_owner_helper_every_kill_path_uses():
+    src = _ps1_source()
+    assert src.count("function Get-OwnedEdgeProcesses") == 1
+    # Get-CompanionPids routes through it
+    assert "Get-OwnedEdgeProcesses | ForEach-Object { [int]$_.ProcessId }" in src
+    # Reset-CompanionSession kills what the helper returns
+    reset = src[src.index("function Reset-CompanionSession"):]
+    reset = reset[:reset.index("Start-Sleep")]
+    assert "Get-OwnedEdgeProcesses" in reset and "Stop-Process" in reset
+    # Test-CompanionHeadless reads the same owned set
+    headl = src[src.index("function Test-CompanionHeadless"):]
+    headl = headl[:headl.index("return $false")]
+    assert "Get-OwnedEdgeProcesses" in headl
+
+
+def test_ps1_owner_key_is_user_data_dir_token_not_profile_name():
+    body = _owned_fn_body(_ps1_source())
+    assert "--user-data-dir=" in body
+    assert "[regex]::Escape($dataDir)" in body
+    assert "[regex]::Escape($Profile)" not in body
+
+
+def test_ps1_owner_key_takes_the_child_tree_but_binds_the_main_process_to_our_port():
+    body = _owned_fn_body(_ps1_source())
+    assert "--remote-debugging-port=" in body and "$Port" in body
+    assert "--type=" in body
+
+
+def test_ps1_kill_path_no_longer_selects_by_bare_profile_name():
+    """旧欠陥そのもの: 三つの選択子が $Profile 部分一致で msedge を選んでいた。
+    どの関数にも [regex]::Escape($Profile) を使った msedge 選択が残っていないこと。"""
+    src = _ps1_source()
+    for anchor in ("function Get-CompanionPids", "function Test-CompanionHeadless",
+                   "function Reset-CompanionSession"):
+        seg = src[src.index(anchor):]
+        seg = seg[:seg.index("\n}\n")]
+        assert "[regex]::Escape($Profile)" not in seg, anchor
+
+
+
 def test_a_dead_browser_is_reset_without_asking():
     """cdp_alive が偽なら守るものは無い。ここで抑止すると走行が止まる。"""
     src = _runner_source()

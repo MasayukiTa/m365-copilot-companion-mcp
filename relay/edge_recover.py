@@ -134,6 +134,52 @@ def _cdp_port_of(cmdline, default=9222):
     return int(m.group(1)) if m else default
 
 
+def owns_edge(cmdline, data_dir, port):
+    """Does this msedge command line belong to the instance (profile dir + port) we RESET?
+
+    THE OWNER KEY IS (user-data-dir, port), NOT THE PROFILE NAME AS A SUBSTRING. The ps1
+    kill path used to select by `CommandLine -match [regex]::Escape($Profile)` alone --
+    a bare profile-NAME substring. Two things go wrong with that, and this predicate is
+    the single source of truth the ps1 mirrors (Get-OwnedEdgeProcesses) so a fix in one
+    place is a fix in both:
+
+      * PREFIX COLLISION. `copilot-companion-edge` is a substring of a sibling profile
+        folder `copilot-companion-edge-2`, so resetting the fleet would also kill that
+        other profile's Edge. We therefore require --user-data-dir to equal the data_dir
+        as a WHOLE token (quoted `--user-data-dir="<dir>"` or bare `--user-data-dir=<dir>`
+        up to the next whitespace), never as a substring of a longer path.
+      * WRONG PORT. The profile string can appear on a command line driving a DIFFERENT
+        CDP port; the port is the owner key the rest of this module already keys on
+        (see other_fleet_runs / _cdp_port_of and the ps1's own line-85 profile inference).
+        We require --remote-debugging-port=<port> at a token boundary -- BUT ONLY FOR THE
+        MAIN BROWSER PROCESS. Only the main process carries --remote-debugging-port; its
+        children (--type=renderer/gpu-process/utility/crashpad-handler) inherit
+        --user-data-dir but NOT the port. A reset must take the whole process tree, so a
+        child whose data_dir is ours counts as ours too, recognised by its `--type=`. Net:
+        a main process (no --type=) is ours iff it has our data_dir AND our port; a child
+        (--type=) is ours iff it has our data_dir. A foreign main process on another port,
+        a prefix-sibling profile, and an Edge with no --user-data-dir are all excluded.
+
+    Pure and side-effect free so it is exercised from fake command-line strings on any OS,
+    with no real processes and no pywin32 -- which is the integration evidence for it.
+    """
+    cmd = cmdline or ""
+    dd = str(data_dir or "").replace("/", chr(92))
+    if not dd:
+        return False
+    q = re.escape(dd)
+    # --user-data-dir as a whole token: quoted exactly, or bare up to whitespace/quote end.
+    udd = re.search(r'--user-data-dir="' + q + r'"', cmd) or \
+          re.search(r'--user-data-dir=' + q + r'(?:\s|"|$)', cmd)
+    if not udd:
+        return False
+    # A child process (carries --type=) of our data dir is part of the tree we kill.
+    if re.search(r'--type=', cmd):
+        return True
+    # The main browser process (no --type=) must also be bound to OUR port.
+    return bool(re.search(r'--remote-debugging-port=' + re.escape(str(port)) + r'(?:\s|"|$)', cmd))
+
+
 def other_fleet_runs(port=9222, exclude_pid=None):
     """PIDs of OTHER fleet runs driving the same companion Edge. [] if none or unknown.
 
