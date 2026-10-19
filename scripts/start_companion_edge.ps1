@@ -200,9 +200,7 @@ public class Cw {
 }
 "@
 function Get-CompanionPids {
-    return @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-             Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
-             ForEach-Object { [int]$_.ProcessId })
+    return @(Get-OwnedEdgeProcesses | ForEach-Object { [int]$_.ProcessId })
 }
 
 function Get-CompanionWindow {
@@ -227,14 +225,39 @@ function Park-CompanionWindowsOffscreen {
     return $count
 }
 
+# Select the msedge processes we OWN. Spec: identify by this fleet's OWN profile directory
+# (--user-data-dir) AND its OWN debugging port. The origin kill path used
+# `-match [regex]::Escape($Profile)` -- a bare profile-NAME substring -- which matches a PREFIX
+# SIBLING (`copilot-companion-edge` is a substring of `copilot-companion-edge-2`, so resetting
+# one killed the other) and, being only a name, matches any process that merely mentions it.
+#
+# Owner key, one rule: --user-data-dir equals $dataDir as a WHOLE token (quoted as the launcher
+# passes it ~line 455, or bare to a token boundary) AND the instance is bound to $Port. Only the
+# MAIN browser process carries --remote-debugging-port; its children (--type=renderer/gpu/
+# utility/crashpad) inherit --user-data-dir but NOT the port. A kill must take the whole tree, so
+# a child of our data dir counts as ours too (it has --type=). Net: a main process is ours iff it
+# has our data dir AND our port; a child is ours iff it has our data dir. A foreign main process
+# on another port, a prefix-sibling profile, and an Edge with no --user-data-dir are all excluded.
+# This is the ps1 mirror of relay/edge_recover.owns_edge: one rule, two places. ASCII only.
+function Get-OwnedEdgeProcesses {
+    $uddQuoted = '--user-data-dir="' + [regex]::Escape($dataDir) + '"'
+    $uddBare   = '--user-data-dir=' + [regex]::Escape($dataDir) + '(\s|"|$)'
+    $portTok   = '--remote-debugging-port=' + $Port + '(\s|"|$)'
+    return @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
+             Where-Object {
+                 $_.CommandLine -and
+                 ($_.CommandLine -match $uddQuoted -or $_.CommandLine -match $uddBare) -and
+                 (($_.CommandLine -match $portTok) -or ($_.CommandLine -match '--type='))
+             })
+}
+
 # True iff a msedge process for THIS profile is currently running with --headless.
 # Used to decide, on a -Foreground request, whether the running instance is a headless
 # one that must be killed + relaunched headed (a headless Edge holds the CDP port, so a
 # plain -Foreground would hit the "already reachable -> nothing to do" early-exit and do
 # nothing -- there is no window to raise).
 function Test-CompanionHeadless {
-    $procs = @(Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-               Where-Object { $_.CommandLine -match [regex]::Escape($Profile) })
+    $procs = Get-OwnedEdgeProcesses
     foreach ($p in $procs) {
         if ($p.CommandLine -match '--headless') { return $true }
     }
@@ -244,8 +267,7 @@ function Test-CompanionHeadless {
 # Kill every msedge for THIS profile and wipe its session-restore state (shared by
 # -HardReset and the headless->headed -Foreground swap), so the relaunch comes up clean.
 function Reset-CompanionSession {
-    Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" |
-        Where-Object { $_.CommandLine -match [regex]::Escape($Profile) } |
+    Get-OwnedEdgeProcesses |
         ForEach-Object { try { Stop-Process -Id $_.ProcessId -Force -ErrorAction Stop } catch {} }
     Start-Sleep -Seconds 2
     $def = Join-Path $dataDir "Default"
