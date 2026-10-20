@@ -82,6 +82,7 @@ from relay import load_routing
 from relay import team_formation
 from relay import agent_board
 from relay.org import versions as org_versions
+from relay.org import shadow_eval as org_shadow_eval
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
@@ -9469,6 +9470,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         run_id = "r%x" % int(time.time())
     agent_board.begin_run()   # agent_board_mode, read once per run (sweep_start)
     org_versions.record_run(run_id, transcript_dir)   # org_version_record: off by default; never raises
+    org_shadow_eval.record_run(run_id)   # org_shadow_eval: off by default, shadow only; never raises
     # busy_writer: flush a status snapshot on demand. A worker calls this right before a
     # BLOCKING acceptance eval freezes the sweep, so its 'verifying'/eval-busy marker reaches
     # status.json BEFORE on_tick stops firing -- the watchdog then waits instead of resetting.

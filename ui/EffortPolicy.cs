@@ -1440,3 +1440,53 @@ public static class OrgProposalView
                   : "Applies from the next proposal.";
     }
 }
+
+// The org shadow-evaluation selector's words and parsing, WPF-free. The Python side decides:
+// relay/org/shadow_eval.py reads `org_shadow_eval` ONCE when a run starts (sweep_start) and, in
+// shadow, appends one small line per proposal still on file to org_shadow_eval.jsonl (proposal id
+// and hashes only; never goal text or the proposed text). It counts the runs a proposal would
+// have touched and cannot show that a proposal is better. `on` is not implemented, so it is not
+// offered. No value changes a prompt or an admission.
+public static class OrgShadowView
+{
+    //: must equal tools/settings_keys.py and relay/org/shadow_eval.py KEY / MODES.
+    public const string Key = "org_shadow_eval";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+
+    /// <summary>The mode named by one org_shadow_eval= line; null when the line is not that key
+    /// or the value is not off|shadow (the caller keeps its value, off; `on` is not a mode). A
+    /// byte order mark is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "変更提案のシャドウ評価" : "Proposal shadow evaluation"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: 実行のたびに、提案が適用されたら触れたはずの実行を提案IDとハッシュだけで記録します。提案が良いかどうかは示せません。目標の文面も提案の文面も記録せず、プロンプトも割当も変わりません。"
+                  : "Record only: at each run, the proposals that would have touched it are noted by proposal id and hashes alone. It cannot show a proposal is better. No goal text or proposed text; prompts and assignment are unchanged.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の実行から有効(実行中のものは変わりません)。"
+                  : "Applies from the next run; a run in progress keeps its mode.";
+    }
+}

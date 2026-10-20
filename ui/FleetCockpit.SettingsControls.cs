@@ -220,6 +220,7 @@ partial class CockpitWindow
         PaintAgentBoard();
         PaintOrgVersion();
         PaintOrgProposal();
+        PaintOrgShadow();
         PaintAutoResume();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
@@ -871,6 +872,51 @@ partial class CockpitWindow
         _opBox.ToolTip = OrgProposalView.Help(_lang == 0) + "\n" + OrgProposalView.TakeEffectTip(_lang == 0);
         _opBox.Background = BtnBg; _opBox.Foreground = Fg; _opBox.BorderBrush = Border;
         StyleFlatCombo(_opBox);
+    }
+    // Org proposal shadow evaluation (off|shadow), beside the proposals. Persists through SaveKey
+    // only; relay/org/shadow_eval.py reads the key once when a run starts (sweep_start). It records
+    // which runs a proposal would have touched and applies nothing, so there is no "in effect" line:
+    // the words and parsing live in OrgShadowView.
+    UIElement OrgShadowControl()
+    {
+        _osLbl = new TextBlock(); _osLbl.VerticalAlignment = VerticalAlignment.Center;
+        _osLbl.FontSize = 12;
+
+        _osBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_osBox, "orgShadowBox");
+        _osBox.ToolTip = OrgShadowView.Help(_lang == 0) + "\n" + OrgShadowView.TakeEffectTip(_lang == 0);
+        _osBox.Cursor = Cursors.Hand; _osBox.FontSize = 12;
+        _osBox.FontWeight = FontWeights.SemiBold; _osBox.MinWidth = 78;
+        _osBox.Padding = new Thickness(8, 2, 4, 2);
+        _osBox.VerticalAlignment = VerticalAlignment.Center;
+        var osHelp = new Dictionary<string, string>();
+        foreach (string m in OrgShadowView.Modes) osHelp[m] = OrgShadowView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_osBox, OrgShadowView.Modes, osHelp, _osVal);
+        _osBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _osBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_osBox);
+            if (!OrgShadowView.IsMode(sel) || sel == _osVal) return;   // unchanged -> no write, no re-fire
+            _osVal = sel;
+            SaveKey(OrgShadowView.Key, _osVal);
+        };
+
+        _osNow = new TextBlock(); _osNow.Visibility = Visibility.Collapsed;
+        _osPending = new TextBlock(); _osPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_osLbl, _osBox, _osNow, _osPending);
+        PaintOrgShadow();
+        return wrap;
+    }
+    void PaintOrgShadow()
+    {
+        if (_osLbl != null) { _osLbl.Text = OrgShadowView.Label(_lang == 0); _osLbl.Foreground = Muted; }
+        if (_osBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_osBox), _osVal)) ComboSelectVal(_osBox, _osVal);
+        _osBox.ToolTip = OrgShadowView.Help(_lang == 0) + "\n" + OrgShadowView.TakeEffectTip(_lang == 0);
+        _osBox.Background = BtnBg; _osBox.Foreground = Fg; _osBox.BorderBrush = Border;
+        StyleFlatCombo(_osBox);
     }
     // Campaign board (off|p0), beside load-aware routing. Persists through SaveKey only; the
     // coordinator reads the key once when a run starts (sweep_start), so a run in progress keeps

@@ -282,6 +282,7 @@ partial class CockpitWindow
             case "session_max_mb":
                 return "bridge_start";
             case "agent_board_mode":
+            case "org_shadow_eval":
             case "org_version_record":
             case "autoscale":
             case "autoscale_max":
@@ -768,6 +769,7 @@ partial class CockpitWindow
         col.Children.Add(AgentBoardControl());
         col.Children.Add(OrgVersionControl());
         col.Children.Add(OrgProposalControl());
+        col.Children.Add(OrgShadowControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the

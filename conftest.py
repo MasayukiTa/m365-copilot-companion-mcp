@@ -143,6 +143,9 @@ LIVE_RECORD_REDIRECTS = {
     # CHANGE PROPOSALS FOR ROLE AND PROTOCOL TEXT. A test that submits one with org_proposals on
     # would leave a proposal in the file the operator reads to decide on real ones.
     "relay.org.proposals": {"LOG_PATH": "org_proposals.jsonl"},
+    # SHADOW EVALUATION OF THOSE PROPOSALS. A test run through run_relay_fleet with
+    # org_shadow_eval=shadow would count runs that never happened toward a proposal.
+    "relay.org.shadow_eval": {"LOG_PATH": "org_shadow_eval.jsonl"},
     # THE ONLY RECORD OF WHETHER THE NIGHTLY LOOP ACTUALLY RUNS. A test firing written here
     # would answer "has it run?" with yes on a machine where it never has -- which is precisely
     # the question the file was added to make answerable. NOT in ONLY_IF_ALREADY_IMPORTED with
