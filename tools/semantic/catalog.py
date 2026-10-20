@@ -10,6 +10,7 @@
 """
 from __future__ import annotations
 
+import re
 from collections import deque
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -29,6 +30,10 @@ W_KEYS = 1.0
 W_PERF = 0.5
 
 
+_STRUCTURE_WORDS = frozenset(norm(w) for w in (
+    "テーブル", "カラム", "ビュー", "データ", "データベース", "列", "表", "項目", "スキーマ"))
+
+
 def _query_tokens(query: str) -> List[Tuple[str, str]]:
     """[(kind, token)] from the query: latin words (stemmed) and kanji / katakana runs."""
     q = norm(query)
@@ -39,6 +44,11 @@ def _query_tokens(query: str) -> List[Tuple[str, str]]:
     for r in content_runs(q):
         if r.kind in ("han", "kata"):
             toks.append((r.kind, r.text))
+    # words that only say what KIND of thing is asked for ("which table and column ...") say
+    # nothing about the subject; dropped unless nothing else is left
+    subject = [t for t in toks if t[1] not in _STRUCTURE_WORDS]
+    if subject:
+        toks = subject
     if not toks and q:
         toks.append(("raw", q))
     seen, out = set(), []
@@ -101,6 +111,23 @@ def _fields(t: Dict[str, Any]) -> List[Tuple[str, float, str, str]]:
     return out
 
 
+_STUB_NOTE = ("named by the dictionary but has no catalogue file: columns and joins are unknown "
+              "here. Read its columns with odbc_columns before using it; do not conclude that "
+              "it does not exist.")
+
+
+def _stub_table(u: Dict[str, Any]) -> Dict[str, Any]:
+    """A searchable stand-in for a table that is only known from references to it."""
+    terms = [r.split(": ", 1)[-1] for r in u["referenced_by"]]
+    return {
+        "name": u["name"], "kind": "table", "_stub": True, "_referenced_by": u["referenced_by"],
+        "description": ("Referenced by %s. %s" % ("; ".join(u["referenced_by"]),
+                                                   u.get("meaning", ""))).strip(),
+        "columns": [{"name": c, "meaning": " ".join(terms)} for c in u.get("columns", [])],
+        "status": "draft",
+    }
+
+
 def catalog_search(query: str, limit: int = 10, store: Optional[Store] = None) -> Dict[str, Any]:
     """Rank catalogue tables by how well they match `query`."""
     st = store if store is not None else get_store()
@@ -113,7 +140,7 @@ def catalog_search(query: str, limit: int = 10, store: Optional[Store] = None) -
     limit = max(1, min(int(limit), 50))
 
     results = []
-    for t in st.tables.values():
+    for t in list(st.tables.values()) + [_stub_table(u) for u in st.uncatalogued.values()]:
         prepared = [(lab, w, col, text) + _prep(text) for lab, w, col, text in _fields(t)]
         total = 0.0
         matched_tokens = 0
@@ -141,11 +168,16 @@ def catalog_search(query: str, limit: int = 10, store: Optional[Store] = None) -
             continue
         coverage = matched_tokens / len(toks)
         score = total * (0.5 + 0.5 * coverage)
-        results.append({
+        row = {
             "table": t["name"], "kind": t["kind"], "score": round(score, 3),
             "coverage": round(coverage, 2), "description": t.get("description", ""),
             "status": t.get("status", "draft"), "matched": hits[:6],
-        })
+            "in_catalogue": not t.get("_stub"),
+        }
+        if t.get("_stub"):
+            row["referenced_by"] = t["_referenced_by"]
+            row["note"] = _STUB_NOTE
+        results.append(row)
     results.sort(key=lambda r: (-r["score"], r["table"]))
     return {"ok": True, "query": query, "count": len(results), "results": results[:limit],
             "store": st.status()}
@@ -153,16 +185,59 @@ def catalog_search(query: str, limit: int = 10, store: Optional[Store] = None) -
 
 # ---------------------------------------------------------------------------- joins graph
 
-def _edges(st: Store) -> Dict[str, List[Dict[str, Any]]]:
-    """Undirected adjacency: norm(table) -> [edge]. Each declared join appears both ways."""
-    adj: Dict[str, List[Dict[str, Any]]] = {}
+def _conjuncts(on: str) -> frozenset:
+    """The AND-separated conditions of a join, each normalised so that side order, case and
+    spacing do not matter."""
+    out = set()
+    for part in re.split(r"\bAND\b", on or "", flags=re.IGNORECASE):
+        sides = part.split("=")
+        if len(sides) == 2:
+            out.add(tuple(sorted(norm(s).replace(" ", "") for s in sides)))
+        elif part.strip():
+            out.add((norm(part).replace(" ", ""),))
+    return frozenset(out)
+
+
+def _declarations(st: Store) -> List[Dict[str, Any]]:
+    """Every declared join, with ``demoted`` set when it only ADDS conditions to another
+    declaration between the same two tables that is at least as trusted. The extra condition is
+    exactly what a wrong two-column key looks like (measured: it returned no rows), so such a
+    declaration is not offered as a join; the simpler, trusted one is."""
+    decls: List[Dict[str, Any]] = []
     for t in st.tables.values():
         for j in t.get("joins", []):
-            a, b = t["name"], j["to"]
-            decl = {"declared_in": a, "on": j.get("on", ""), "note": j.get("note", ""),
-                    "confidence": j.get("confidence")}
-            adj.setdefault(norm(a), []).append(dict(decl, **{"from": a, "to": b}))
-            adj.setdefault(norm(b), []).append(dict(decl, **{"from": b, "to": a}))
+            decls.append({"declared_in": t["name"], "from": t["name"], "to": j["to"],
+                          "on": j.get("on", ""), "note": j.get("note", ""),
+                          "confidence": j.get("confidence"), "demoted": False, "reason": "",
+                          "_pair": frozenset((norm(t["name"]), norm(j["to"]))),
+                          "_conj": _conjuncts(j.get("on", ""))})
+    for d in decls:
+        for o in decls:
+            if o is d or o["_pair"] != d["_pair"] or o["confidence"] is None:
+                continue
+            if o["_conj"] and o["_conj"] < d["_conj"] and \
+                    (d["confidence"] is None or o["confidence"] >= d["confidence"]):
+                extra = sorted(" = ".join(c) for c in d["_conj"] - o["_conj"])
+                d["demoted"] = True
+                d["reason"] = ("adds condition(s) %s to the declaration %r (confidence %s); the "
+                               "extra condition is unverified, so the simpler join is offered "
+                               "instead" % (", ".join(extra), o["on"], o["confidence"]))
+                break
+    return decls
+
+
+def _edges(st: Store) -> Dict[str, List[Dict[str, Any]]]:
+    """Undirected adjacency: norm(table) -> [edge]. Each declared join appears both ways.
+    Demoted declarations (see _declarations) are left out."""
+    adj: Dict[str, List[Dict[str, Any]]] = {}
+    for d in _declarations(st):
+        if d["demoted"]:
+            continue
+        a, b = d["from"], d["to"]
+        decl = {"declared_in": a, "on": d["on"], "note": d["note"],
+                "confidence": d["confidence"]}
+        adj.setdefault(norm(a), []).append(dict(decl, **{"from": a, "to": b}))
+        adj.setdefault(norm(b), []).append(dict(decl, **{"from": b, "to": a}))
     return adj
 
 
@@ -193,10 +268,24 @@ def catalog_describe(table: str, store: Optional[Store] = None) -> Dict[str, Any
         return {"ok": False, "configured": st.configured, "error": err}
     t = st.find_table(table)
     if t is None:
+        u = st.uncatalogued.get(norm(table))
+        if u is not None:
+            return {"ok": False, "in_catalogue": False, "referenced_by": u["referenced_by"],
+                    "error": "table %r is referenced (%s) but has no catalogue file; %s"
+                             % (u["name"], "; ".join(u["referenced_by"]), _STUB_NOTE)}
         return {"ok": False, "error": "no table %r in the catalogue" % table,
                 "did_you_mean": _suggest(st, table)}
     adj = _edges(st)
-    own = [dict(j, direction="declared here") for j in t.get("joins", [])]
+    dem = {(norm(d["from"]), d["to"], d["on"]): d["reason"]
+           for d in _declarations(st) if d["demoted"]}
+    own = []
+    for j in t.get("joins", []):
+        row = dict(j, direction="declared here")
+        reason = dem.get((norm(t["name"]), j["to"], j.get("on", "")))
+        if reason:
+            row["demoted"] = True
+            row["reason"] = reason
+        own.append(row)
     incoming = []
     for e in adj.get(norm(t["name"]), []):
         if norm(e["declared_in"]) != norm(t["name"]):
@@ -289,5 +378,12 @@ def catalog_joins(a: str, b: str, max_hops: int = 3, limit: int = 8,
                      "so absence here is not proof the tables are unrelated" % max_hops)
     if any(p["unrated_hops"] for p in out_paths):
         notes.append("some hops have no confidence value; treat them as unverified")
+    demoted = [{"from": d["from"], "to": d["to"], "on": d["on"], "note": d["note"],
+                "confidence": d["confidence"], "declared_in": d["declared_in"],
+                "reason": d["reason"]}
+               for d in _declarations(st) if d["demoted"] and d["_pair"] == frozenset((ka, kb))]
+    if demoted:
+        notes.append("%d declared join(s) not offered: they only add unverified conditions to a "
+                     "trusted join (see 'demoted')" % len(demoted))
     return {"ok": True, "a": _display(st, a), "b": _display(st, b), "direct": direct,
-            "paths": out_paths, "max_hops": max_hops, "notes": notes}
+            "demoted": demoted, "paths": out_paths, "max_hops": max_hops, "notes": notes}
