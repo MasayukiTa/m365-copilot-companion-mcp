@@ -155,13 +155,15 @@ def require_api_key(environ=None) -> str:
     value = materialize_api_key(env)
     if value:
         return value
-    protected = (env.get(API_KEY_PROTECTED_VAR) or "").strip()
-    if protected:
-        why = ("%s is set, but this Windows account cannot decrypt it. DPAPI values are bound to "
-               "one user on one machine, so an .env copied from another PC or account cannot be "
-               "opened here." % API_KEY_PROTECTED_VAR)
+    # Fixed text only. The branch is decided by whether the KEY is present, never by reading the
+    # value, and the key names are literals: nothing here is built from a secret or from the
+    # text of an exception that could carry one.
+    if "MCP_API_KEY_PROTECTED" in env:
+        why = ("MCP_API_KEY_PROTECTED is set, but this Windows account cannot decrypt it. DPAPI "
+               "values are bound to one user on one machine, so an .env copied from another PC or "
+               "account cannot be opened here.")
     else:
-        why = "neither %s nor %s is set in .env." % (API_KEY_PROTECTED_VAR, API_KEY_VAR)
+        why = "neither MCP_API_KEY_PROTECTED nor MCP_API_KEY is set in .env."
     import sys
     sys.stderr.write(
         "FATAL: the MCP server has no bearer token and cannot start: %s "

@@ -185,3 +185,13 @@ def test_a_real_traceback_is_still_quoted_and_no_supervisor_still_says_start_all
     died = "@{ lines = @('KeyError: boom'); started = $false; source = 'x' }"
     assert "KeyError: boom" in _advice(tmp_path, True, False, died)
     assert "start_all.bat" in _advice(tmp_path, False, False)
+
+
+def test_the_message_names_are_literals_that_match_the_constants():
+    """The text is built from fixed literals (no value read from the secret feeds it); this keeps
+    the literals from drifting away from the real variable names."""
+    assert S.API_KEY_PROTECTED_VAR == "MCP_API_KEY_PROTECTED"
+    assert S.API_KEY_VAR == "MCP_API_KEY"
+    src = _read(os.path.join("tools", "secret_store.py"))
+    body = src[src.index("def require_api_key"):src.index("def unlock_password_problem")]
+    assert "API_KEY_PROTECTED_VAR" not in body.split("materialize_api_key(env)", 1)[1]
