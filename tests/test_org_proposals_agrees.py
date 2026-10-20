@@ -48,7 +48,9 @@ def test_the_popup_has_the_control_the_parser_and_the_timing_word():
     assert "col.Children.Add(OrgProposalControl());" in src
     assert "SaveKey(OrgProposalView.Key" in src
     assert 'ln.StartsWith("org_proposals=")' in src
-    assert re.search(r'case "org_proposals":\s*return "each_gate";', src)
+    # in the each_gate group, beside team_mode, ahead of the contiguous fan-out budget cases
+    assert re.search(r'case "team_mode":\s*case "org_proposals":\s*case "fanout_max_depth":', src)
+    assert src.count('case "org_proposals":') == 1
     assert "orgProposalBox" in _read("scripts", "win", "set_setting_via_ui.ps1")
 
 

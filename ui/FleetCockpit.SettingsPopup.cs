@@ -270,13 +270,13 @@ partial class CockpitWindow
             case "fanout_write_scope":
             case "fanout_load_routing":
             case "team_mode":
+            case "org_proposals":
             case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
             case "fanout_max_turns":
             case "fanout_max_wall_min":
             case "effort_policy":
-            case "org_proposals":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
