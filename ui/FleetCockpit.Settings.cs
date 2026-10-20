@@ -200,6 +200,11 @@ partial class CockpitWindow
                     string osv = OrgShadowView.ParseLine(ln);   // off|shadow only; junk (and on) keeps the value
                     if (osv != null) _osVal = osv;
                 }
+                else if (ln.StartsWith("org_ab="))
+                {
+                    string abv = OrgAbView.ParseLine(ln);   // off|shadow only; junk (and on) keeps the value
+                    if (abv != null) _abVal = abv;
+                }
                 else if (ln.StartsWith("org_proposals="))
                 {
                     string opv = OrgProposalView.ParseLine(ln);   // off|on only; junk keeps the value
