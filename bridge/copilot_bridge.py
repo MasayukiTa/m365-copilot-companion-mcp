@@ -4208,6 +4208,11 @@ class Handler(BaseHTTPRequestHandler):
                 "ok": True,
                 "transport": "socket" if _on_socket() else ("page" if DRIVER else "none"),
                 "socket_enabled": BRIDGE_SOCKET,
+                # PROOF THAT THIS BRIDGE'S SESSION WORKS (additive, open route, a bool). True only
+                # while a socket driver exists that has not failed: a token was captured and the
+                # route is carrying the conversation. scripts/ensure_m365_signin.py reads it so a
+                # leftover sign-in-looking tab cannot outvote a session that demonstrably works.
+                "socket_live": bool(_on_socket() and not getattr(DRIVER, "failed", "")),
                 "release_startup_page": BRIDGE_RELEASE_STARTUP_PAGE,
                 "has_resident_page": PAGE is not None,
                 # IS ANYTHING IN FLIGHT RIGHT NOW. Anyone deciding whether to restart this

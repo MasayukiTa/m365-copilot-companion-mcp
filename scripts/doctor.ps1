@@ -949,7 +949,9 @@ $signinVerdict = "cannot_tell"
 if ($signinOut -match "VERDICT:\s*(\w+)") { $signinVerdict = $Matches[1] }
 
 if ($signinVerdict -eq "cannot_tell") {
-    $detail = if ($signinOut -match "VERDICT:") {
+    $detail = if ($signinOut -match "(?m)^\s*cannot tell \((conflicting evidence.+)\)\s*$") {
+        $Matches[1]
+    } elseif ($signinOut -match "VERDICT:") {
         "the companion Edge did not answer, so this could not be checked; the Edge checks above say why"
     } else {
         "the sign-in checker did not report a verdict (exit $signinCode) -- it failed before deciding, which is NOT the same as 'not signed in'. Run it directly to see why: python scripts\ensure_m365_signin.py --check-only"
@@ -1026,6 +1028,21 @@ foreach ($line in ($signinOut -split "`r?`n")) {
     $pPort = $m.Groups[1].Value
     $pName = $m.Groups[2].Value
     $pVerdict = $m.Groups[3].Value
+    # CONFLICTING TABS ARE SAID OUT LOUD (2026-10-20). "Not running" and "no page to judge
+    # from" say nothing worth a row (the line after this block skips them), but a browser whose
+    # tabs disagree (an M365 page open next to a sign-in-looking one) used to be reported as a
+    # confident FAIL "sign in", and after the person had signed in the line never changed. The
+    # checker now says "cannot tell" and lists every tab it saw (query removed); this row shows
+    # that list, as INFO, so the next occurrence names itself. Reads: "Cannot tell whether it
+    # is signed in."
+    if ($pVerdict -eq "cannot_tell" -and $m.Groups[5].Value -like "conflicting evidence*") {
+        $cantTellJa = -join (@(0x30B5,0x30A4,0x30F3,0x30A4,0x30F3,0x6E08,0x307F,0x304B,0x3069,0x3046,0x304B,0x5224,0x5B9A,0x3067,0x304D,0x307E,0x305B,0x3093,0x3002) | ForEach-Object { [char]$_ })
+        Check "m365_signin_$pPort" "M365 sign-in state of $pName (:$pPort) (could not be determined)" `
+            { $false } `
+            ($cantTellJa + " " + $m.Groups[5].Value) `
+            -Info
+        continue
+    }
     if ($pVerdict -eq "cannot_tell") { continue }   # not running, or no page to judge from
     if ($pPort -eq $bridgeCdpPort) {
         Check "m365_signin_$pPort" "M365 signed in on the chat bridge Edge $pName (:$pPort) -- the chat window needs it" `
