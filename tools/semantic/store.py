@@ -67,6 +67,9 @@ class Store:
     files: List[str] = field(default_factory=list)
     loaded_at: float = 0.0
     signature: Tuple = ()
+    # tables the glossary / metrics / joins point at that have no catalogue file:
+    # norm(name) -> {"name", "referenced_by": [...], "columns": [...], "meaning": str}
+    uncatalogued: Dict[str, Dict[str, Any]] = field(default_factory=dict)
 
     def error(self) -> Optional[str]:
         """A message when the store cannot answer at all, else None."""
@@ -88,6 +91,7 @@ class Store:
             "metrics": len(self.metrics),
             "tables": len(self.tables),
             "problems": len(self.problems),
+            "uncatalogued": len(self.uncatalogued),
         }
 
     def find_table(self, name: str) -> Optional[Dict[str, Any]]:
@@ -425,6 +429,44 @@ def _signature(directory: Path) -> Tuple:
     return tuple(sig)
 
 
+def _find_uncatalogued(store: Store) -> None:
+    """Tables that the glossary, the metrics or a declared join name, but that have no catalogue
+    file. Each is reported as a warning and kept in ``store.uncatalogued`` so search can still
+    answer from the reference instead of letting the caller conclude that nothing exists."""
+    found: Dict[str, Dict[str, Any]] = {}
+
+    def add(name: Any, who: str, file: str, where: str, column: str = "", meaning: str = "") -> None:
+        if not isinstance(name, str) or not name.strip() or norm(name) in store.tables:
+            return
+        e = found.setdefault(norm(name), {"name": name.strip(), "referenced_by": [],
+                                          "columns": [], "meaning": "", "_where": (file, where)})
+        if who not in e["referenced_by"]:
+            e["referenced_by"].append(who)
+        if column and column not in e["columns"]:
+            e["columns"].append(column)
+        if meaning and meaning not in e["meaning"]:
+            e["meaning"] = (e["meaning"] + " " + meaning).strip()
+
+    for i, t in enumerate(store.terms):
+        rt = t.get("resolves_to") or {}
+        label = "glossary: " + t["term"]
+        add(rt.get("table"), label, "glossary.json", "terms[%d].resolves_to.table" % i,
+            rt.get("column") or "", " ".join([t["term"]] + t.get("synonyms", [])
+                                              + [t.get("meaning", "")]))
+    for i, m in enumerate(store.metrics):
+        for tb in m.get("tables", []):
+            add(tb, "metric: " + m["name"], "metrics.json", "metrics[%d].tables" % i)
+    for t in store.tables.values():
+        for j in t.get("joins", []):
+            add(j["to"], "join from " + t["name"], t.get("_file") or "catalog", "joins")
+    for key, e in found.items():
+        file, where = e.pop("_where")
+        store.problems.append(Problem(
+            file, where, "table %r is referenced (%s) but has no catalogue file"
+            % (e["name"], "; ".join(e["referenced_by"][:3])), "warning"))
+    store.uncatalogued = found
+
+
 def load_directory(directory: Path) -> Store:
     """Read every file now (no cache). Never raises for content problems."""
     store = Store(directory=directory, configured=True, exists=directory.is_dir())
@@ -436,6 +478,7 @@ def load_directory(directory: Path) -> Store:
             store.files.append(fname)
             loader(p, store)
     _load_catalog(directory, store)
+    _find_uncatalogued(store)
     store.loaded_at = time.time()
     store.signature = _signature(directory)
     return store
