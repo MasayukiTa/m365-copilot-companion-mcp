@@ -233,12 +233,24 @@ def test_the_seen_set_is_bounded(tmp_path, monkeypatch):
 
 # ------------------------------------------------------------------ the real split is unchanged
 
+def _fixed_label(real):
+    import datetime
+    when = datetime.datetime(2026, 1, 1, 0, 0, 0, tzinfo=datetime.timezone.utc)
+    return lambda worker_name="", now=None: real(worker_name, when)
+
+
 def _split(tmp_path, monkeypatch, settings_text, log_path=None):
     """One worker driven through a split reply. Returns everything the split produced."""
     _settings(tmp_path, monkeypatch, settings_text)
     if log_path is not None:
         monkeypatch.setattr(TF, "LOG", log_path)
     TF._reset_for_test()
+    # THE FIRST PROMPT OF A WORKER OPENS WITH "[YYYY-MM-DD HH:MM:SS +00:00 | w0]" (the
+    # conversation start label, read from the wall clock at one-second resolution). Two runs
+    # that straddle a second boundary differ in that one field and nothing else (PR #228's CI:
+    # 06:41:20 vs 06:41:21). Give the label a fixed instant through its own `now` parameter, so
+    # the comparison still covers every other byte of every prompt.
+    monkeypatch.setattr(rf, "conversation_start_label", _fixed_label(rf.conversation_start_label))
     got = []
 
     def spawn(goal, kids, **kw):
