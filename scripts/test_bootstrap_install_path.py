@@ -67,9 +67,9 @@ def test_an_env_made_before_bootstrap_gets_every_template_key(repo):
     want.discard("MCP_UNLOCK_PASSWORD")          # stored in its protected form instead
     have = _active(text)
     assert want <= have, "template keys still missing: %s" % sorted(want - have)
-    for k in ("MCP_ALLOWED_BASE", "MCP_TOOL_MAP", "MCP_TOOL_MAP_MAX", "MCP_UNLOCK_TTL_DAYS"):
+    for k in ("MCP_TOOL_MAP", "MCP_TOOL_MAP_MAX", "MCP_UNLOCK_TTL_DAYS"):
         assert k in have, k
-    assert "MCP_ALLOWED_BASE=~" in text.splitlines()
+    assert "MCP_ALLOWED_BASE=~" not in text.splitlines(), "the template must not narrow the default"
     assert B.UNLOCK_PASSWORD_PROTECTED_VAR in have
     assert "MCP_IMPL_AGENT_URL=https://example.invalid/agent" in text.splitlines()
     # Nothing but the backfill and the two secrets was added.
@@ -94,9 +94,9 @@ def test_present_values_are_never_overwritten_and_commented_keys_stay_commented(
     assert len(keys) == len(set(keys))
 
 
-def test_without_a_template_the_fallback_still_scopes_the_file_tools():
+def test_without_a_template_the_fallback_does_not_narrow_the_file_tools():
     lines, _ = B.missing_template_lines("", None)
-    assert "MCP_ALLOWED_BASE=~" in lines and "MCP_TOOL_MAP=1" in lines
+    assert not any(l.startswith("MCP_ALLOWED_BASE") for l in lines) and "MCP_TOOL_MAP=1" in lines
 
 
 @needs_dpapi
