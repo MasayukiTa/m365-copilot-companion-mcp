@@ -221,6 +221,7 @@ AUDITED = {
     "relay/fleet_runner.py": "per-run status/goal snapshots",
     "relay/local_loop_controller.py": "controller marker, atomic tmp+replace, one file per job",
     "relay/profile_token.py": "captured token template, re-captured on demand",
+    "relay/resident_guard.py": "single-use lock file holding the owner pid, created with O_EXCL and removed on release",
     "relay/selfimprove/apply.py": "genome file written from a ledger row",
     "relay/selfimprove/branches.py": "at most 5 branch refs, recreated from the archive by genome_id",
     "relay/selfimprove/dashboard.py": "derived dashboard state",
