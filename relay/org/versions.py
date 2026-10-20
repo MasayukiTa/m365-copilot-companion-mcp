@@ -38,6 +38,15 @@ MODES = ("off", "on")
 FILENAME = "org_versions.jsonl"
 MAX_BYTES = 2 * 1024 * 1024
 
+#: A second, independent setting (relay/org/definitions.genotype_id). off|on, default off, read
+#: once when a run starts, exactly beside org_version_record. When on, record_run adds a single
+#: genotype_id field to the defs and run lines it already writes -- one name for the pair of
+#: hashes a run ran under. It never changes which lines are written or anything else about them,
+#: so load reads the lines whether or not the field is there. off reads one settings line and
+#: adds nothing.
+GENOTYPE_KEY = "org_genotype_record"
+GENOTYPE_MODES = ("off", "on")
+
 _LOCK = threading.Lock()
 _STATE = {"written_runs": 0, "write_errors": 0, "skipped_full": 0}
 _DEFS_WRITTEN = set()          # (path, roles_hash, workflows_hash) already in this process
@@ -53,6 +62,19 @@ def _reset_for_test():
 
 def mode(settings_path=None) -> str:
     """`org_version_record=` from settings.txt: "on" or "off". Anything else reads as off."""
+    return _read_mode(KEY, MODES, settings_path)
+
+
+def genotype_mode(settings_path=None) -> str:
+    """`org_genotype_record=` from settings.txt: "on" or "off". Anything else reads as off.
+
+    Read once beside `mode` when a run starts. on makes record_run add the genotype_id field;
+    it is a separate switch so naming the version and recording the run can be turned on apart."""
+    return _read_mode(GENOTYPE_KEY, GENOTYPE_MODES, settings_path)
+
+
+def _read_mode(key, modes, settings_path=None) -> str:
+    """One `key=` value from settings.txt, clamped to `modes` with off as the fallback."""
     try:
         path = settings_path
         if path is None:
@@ -64,9 +86,9 @@ def mode(settings_path=None) -> str:
         with io.open(path, encoding="utf-8-sig") as fh:
             for ln in fh:
                 ln = ln.strip()
-                if ln.startswith(KEY + "="):
+                if ln.startswith(key + "="):
                     v = ln.split("=", 1)[1].strip().lower()
-                    val = v if v in MODES else "off"
+                    val = v if v in modes else "off"
                     break
         return val
     except Exception:
@@ -93,17 +115,28 @@ def record_run(run_id, transcript_dir, settings_path=None, now=None) -> bool:
         from relay.org import definitions
         snap = definitions.snapshot()
         ts = float(time.time() if now is None else now)
+        # One name for the pair of hashes, added only when org_genotype_record is on. Empty when
+        # a part could not be read, so an unreadable version is never given a real id (and the
+        # field is simply omitted when the setting is off).
+        want_gid = genotype_mode(settings_path) == "on"
+        gid = definitions.genotype_id(snap) if want_gid else ""
         lines = []
         key = (path, snap["roles_hash"], snap["workflows_hash"])
         with _LOCK:
             first = key not in _DEFS_WRITTEN
         if first:
-            lines.append({"kind": "defs", "ts": ts, "roles_hash": snap["roles_hash"],
-                          "workflows_hash": snap["workflows_hash"],
-                          "roles": snap["roles"], "workflows": snap["workflows"]})
-        lines.append({"kind": "run", "ts": ts, "run_id": str(run_id or ""),
-                      "roles_hash": snap["roles_hash"],
-                      "workflows_hash": snap["workflows_hash"]})
+            defs_line = {"kind": "defs", "ts": ts, "roles_hash": snap["roles_hash"],
+                         "workflows_hash": snap["workflows_hash"],
+                         "roles": snap["roles"], "workflows": snap["workflows"]}
+            if want_gid:
+                defs_line["genotype_id"] = gid
+            lines.append(defs_line)
+        run_line = {"kind": "run", "ts": ts, "run_id": str(run_id or ""),
+                    "roles_hash": snap["roles_hash"],
+                    "workflows_hash": snap["workflows_hash"]}
+        if want_gid:
+            run_line["genotype_id"] = gid
+        lines.append(run_line)
         data = "".join(json.dumps(r, ensure_ascii=False, sort_keys=True) + "\n" for r in lines)
         try:
             size = os.path.getsize(path)

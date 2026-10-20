@@ -137,3 +137,21 @@ def snapshot() -> dict:
     roles, workflows = _section(ROLES), _section(WORKFLOWS)
     return {"roles": roles, "workflows": workflows,
             "roles_hash": _set_hash(roles), "workflows_hash": _set_hash(workflows)}
+
+
+def genotype_id(snap) -> str:
+    """One label for the organisation version a run ran under, derived from a snapshot.
+
+    The fleet already carries roles_hash and workflows_hash as a pair; this folds that pair
+    into a single deterministic id so a run can be named by one value instead of two. It reads
+    only the snapshot it is given and reads nothing else, sets nothing and does not touch a run.
+
+    EMPTY MEANS UNREADABLE, NOT A VERSION. When either half is empty -- a part of the roles or
+    the workflows could not be read, so _set_hash returned "" -- the id is empty too. A run
+    whose definitions could not be read must not share an id with one whose could, which is what
+    would happen if the empty half were hashed as if it were a real value."""
+    roles_hash = str((snap or {}).get("roles_hash") or "")
+    workflows_hash = str((snap or {}).get("workflows_hash") or "")
+    if not roles_hash or not workflows_hash:
+        return ""
+    return _digest([roles_hash, workflows_hash])
