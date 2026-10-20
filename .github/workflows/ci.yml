@@ -904,6 +904,9 @@ jobs:
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
             scripts/test_ab_compare.py \
+            scripts/test_exp_public_data.py \
+            scripts/test_exp_collect.py \
+            scripts/test_exp_fleet_launch.py \
             scripts/test_capability_profile.py \
             scripts/test_load_routing_report.py \
             bench/test_attempt_budget.py \
