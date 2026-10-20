@@ -128,6 +128,10 @@ LIVE_RECORD_REDIRECTS = {
     # is exactly what the tests use -- so the log could not distinguish a refusal that happened
     # from one a test simulated, and the evidence for the switch was not evidence.
     "relay.fleet_toolset": {"SHADOW_LOG": "toolset_shadow.jsonl"},
+    # RESULT-CACHE SHADOW RECORD, WRITTEN BESIDE EVERY READ-ONLY TOOL CALL. Tests that drive the
+    # tool path with result_cache=shadow would append rows for calls no operator made, and the
+    # estimate of the time a cache would save counts exactly these rows.
+    "relay.result_cache": {"LOG": "result_cache_shadow.jsonl"},
     # C3 SHADOW RECORD, WRITTEN ON THE ADMISSION PATH. Every test that drives run_relay_fleet with
     # fanout_load_routing=shadow would append rows for goals that were never queued in earnest, and
     # the report that decides whether the router is worth building counts exactly these rows. The

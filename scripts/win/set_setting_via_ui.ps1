@@ -35,6 +35,7 @@ $Boxes = @{
     'fanout'                    = 'fanoutBox'
     'tool_transport'            = 'toolRouteBox'
     'consent_auto_approve'      = 'consentApproveBox'
+    'result_cache'              = 'resultCacheBox'
     'resident_tools'            = 'residentToolsBox'
     'merge_conversation'        = 'mergeConversationBox'
     'fleet_auto_resume'         = 'autoResumeBox'
