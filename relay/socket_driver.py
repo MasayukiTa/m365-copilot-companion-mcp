@@ -317,6 +317,7 @@ class CopilotSocketDriver:
                     return
                 text = _rec.continue_text
                 _extra["replay"] = _rec.replay
+            self._wire_turn_end()
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    annotations=annotations,
                                    on_progress=on_progress,
@@ -352,6 +353,24 @@ class CopilotSocketDriver:
             self._answers_done += 1
             self._turn_answered = True
         self._emit_turn_stats("done")
+
+    def _wire_turn_end(self):
+        """Hand the conversation a sink that writes its one `turn_end` row through the route's
+        own `record()` (the route owns the log; this file only calls it). The route is found
+        through `stats_sink`, which is its bound method. Without a route nothing is written.
+        Never raises."""
+        try:
+            owner = getattr(getattr(self, "stats_sink", None), "__self__", None)
+            rec = getattr(owner, "record", None)
+            if rec is None or not hasattr(self.conv, "turn_end_sink"):
+                return
+            worker = getattr(self, "worker_name", "")
+
+            def sink(row, _rec=rec, _worker=worker):
+                _rec("turn_end", worker=_worker, turn=self._turn_seq, **row)
+            self.conv.turn_end_sink = sink
+        except Exception:
+            pass
 
     def _emit_turn_stats(self, outcome, detail=""):
         """One compact `socket_turn_stats` record per turn (via ``stats_sink``): time to first

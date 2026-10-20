@@ -657,6 +657,17 @@ class Conversation:
         #: while `socket_continue_recovery` is off: nothing is recorded and nothing is added to
         #: the wire.
         self.journal = None
+        #: MEASUREMENT of the sliding deadline (2026-10-20): no record showed it working. Counted
+        #: per exchange, no row per extension -- `deadline_extensions` is how many progress frames
+        #: actually moved the deadline, `last_progress_at` is the clock reading of the last frame
+        #: that counted as progress (0 = none). `turn_end_sink(dict)` receives ONE row per
+        #: exchange end; `last_turn_end` keeps the same dict. See `_emit_turn_end`.
+        self.deadline_extensions = 0
+        self.last_progress_at = 0.0
+        self.turn_end_sink = None
+        self.last_turn_end = None
+        self._tool_calls = 0
+        self._tool_done_at = None
 
     @property
     def conversation_id(self) -> str:
@@ -728,6 +739,7 @@ class Conversation:
         started = self.turns == 0 if started is None else bool(started)
         payload = ST.build_prompt(text, catalogue or [], protocol=protocol) if catalogue             else (protocol or "") + text
         answer, rounds = "", 0
+        self._tool_calls, self._tool_done_at = 0, None
         journal = self._journal_for_ask()
         while True:
             if journal is not None:
@@ -759,6 +771,7 @@ class Conversation:
                     run = CR.recording(journal, run_tool, replay if rounds == 0 else None)
             if run_tool is None:
                 break
+            run = self._timed_tool(run)
             nxt, calls = ST.step(answer, run)
             if nxt is None:
                 break
@@ -773,6 +786,47 @@ class Conversation:
             journal.end_ask()
         return ST.strip_calls(answer) if catalogue else answer
 
+    def _timed_tool(self, fn):
+        """`fn` wrapped so that the end of each call is counted and timed (measurement only)."""
+        def timed(name, args):
+            try:
+                return fn(name, args)
+            finally:
+                try:
+                    self._tool_calls += 1
+                    self._tool_done_at = self._clock()
+                except Exception:
+                    pass
+        return timed
+
+    def _emit_turn_end(self, outcome, t0, ceiling_at, ended_by):
+        """ONE row at the end of an exchange: how it ended and what the deadline did meanwhile.
+        Numbers and short labels only; the conversation appears as a hash, never as text. Never
+        raises: a measurement must not cost the turn."""
+        try:
+            import hashlib
+            now = self._clock()
+            cid = self.peek_conversation_id()
+            row = {"outcome": str(outcome)[:24],
+                   "ended_by": str(ended_by)[:12],
+                   "duration_s": round(now - t0, 2),
+                   "extensions": int(self.deadline_extensions),
+                   "seconds_since_progress": round(now - (self.last_progress_at or t0), 2),
+                   "progress_seen": bool(self.last_progress_at),
+                   "seconds_since_tool": (round(now - self._tool_done_at, 2)
+                                          if self._tool_done_at is not None else None),
+                   "tool_calls": int(self._tool_calls),
+                   "exchange": int(self.turns),
+                   "timeout_s": self.turn_timeout_s,
+                   "ceiling_s": self.turn_ceiling_s,
+                   "conv": hashlib.sha1(cid.encode("utf-8")).hexdigest()[:12] if cid else ""}
+            self.last_turn_end = row
+            sink = self.turn_end_sink
+            if sink is not None:
+                sink(dict(row))
+        except Exception:
+            pass
+
     def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None,
                       on_progress=None, annotations=None) -> str:
         """Send one payload and read until the turn completes. Returns the reply text.
@@ -783,6 +837,8 @@ class Conversation:
         """
         request_id = str(uuid.uuid4())
         sock = self._connect(request_id, connect)
+        _t0, _ceiling_at, _end_by = self._clock(), None, "error"   # for the turn_end row
+        self.deadline_extensions, self.last_progress_at = 0, 0.0
         try:
             sock.send(chat_frames(payload, session_id=self.session_id,
                                   conversation_id=self.conversation_id,
@@ -806,6 +862,8 @@ class Conversation:
             _ceiling_at = _t0 + self.turn_ceiling_s
             deadline = min(_t0 + self.turn_timeout_s, _ceiling_at)
             _extended = False
+            self.deadline_extensions = 0
+            self.last_progress_at = 0.0
             while self._clock() < deadline:
                 # A SILENT SOCKET IS NOT A FINISHED TURN. type-3 says the turn completed; it
                 # says nothing about a connection that died, so the read is bounded separately
@@ -865,6 +923,8 @@ class Conversation:
                         _new = min(max(deadline, _now + self.turn_timeout_s), _ceiling_at)
                         if _new > deadline:
                             _extended = True
+                            self.deadline_extensions += 1
+                        self.last_progress_at = _now
                         deadline = _new
                     if (_d or final) and self.first_content_s is None:
                         self.first_content_s = round(time.time() - self.turn_t0, 2)
@@ -887,14 +947,23 @@ class Conversation:
                         # caller fell back with no reason to record and nothing to fix.
                         if result and result != "Success":
                             raise ChatHubError("the backend declined the request: %s" % result)
+                        self._emit_turn_end("completed", _t0, _ceiling_at, "completion")
                         return final or "".join(deltas)
             if _extended and self._clock() >= _ceiling_at:
+                _end_by = "ceiling"
                 raise ChatHubError("turn ceiling exceeded (%.0fs) while the stream was still "
                                    "progressing: deadline exceeded before a completion "
                                    "frame"
                                    % self.turn_ceiling_s)
+            _end_by = "timeout"
             raise ChatHubError("turn deadline exceeded before a completion frame")
-        except Exception:
+        except Exception as _exc:
+            _msg = str(_exc)
+            if _end_by in ("ceiling", "timeout") and "deadline exceeded" in _msg:
+                _out = "ceiling_exceeded" if _end_by == "ceiling" else "deadline_exceeded"
+            else:
+                _out, _end_by = "error", "error"
+            self._emit_turn_end(_out, _t0, _ceiling_at, _end_by)
             # A TURN THAT FAILED LEAVES THE CONNECTION IN AN UNKNOWN STATE, so it is dropped
             # whatever the policy: reusing it would carry one failure into the next turn.
             self.close()
