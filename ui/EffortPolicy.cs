@@ -1196,7 +1196,7 @@ public static class ResultCacheView
     public static string Help(bool ja)
     {
         return ja ? "シャドウ=読み取り専用ツールの呼び出しごとに、同じ引数の前回応答をキャッシュが返せたか、何秒節約できたかを実際の呼び出しの横に記録します。キャッシュから応答を返すことはなく、プロンプトや出力は変わりません。記録のみ: 割当は変わりません。オフ=何も読まず記録しません。"
-                  : "Shadow records, beside each read-only tool call, whether a cache would have served the same answer and how long that would have saved. Nothing is served from a cache and no prompt or output changes. Record only: assignment is unchanged. Off reads and records nothing.";
+                  : "Shadow records, beside each read-only tool call, whether a cache would have held the same answer and how long that would have saved. Nothing is taken from a cache and no prompt or output changes. Record only: assignment is unchanged. Off reads and records nothing.";
     }
 
     public static string TakeEffectTip(bool ja)
