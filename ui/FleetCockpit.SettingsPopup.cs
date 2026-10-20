@@ -271,8 +271,8 @@ partial class CockpitWindow
             case "job_approval_mode":
             case "fanout_write_scope":
             case "fanout_load_routing":
-            case "team_mode":
             case "relay_findings":
+            case "team_mode":
             case "org_proposals":
             case "fanout_max_depth":
             case "fanout_max_total":
