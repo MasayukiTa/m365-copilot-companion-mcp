@@ -182,6 +182,56 @@ def _expand_keywords_with_aliases(keywords: list[str]) -> tuple[list[str], int]:
         return keywords, 0
 
 
+def catalogue_candidates(question: str, limit: int = 5) -> list[dict]:
+    """Objects of the semantic catalogue that match the question, best first.
+
+    Ranked so that an object whose DESCRIPTION, COLUMNS or value meanings match what is asked
+    comes before one that only has a matching NAME (measured: the table with the right word in
+    its name won while another held the measure). Within each group the catalogue score decides.
+    Empty when no catalogue is configured or nothing matches; never raises.
+    """
+    try:
+        from .semantic import catalog as _cat
+        from .semantic.store import get_store
+        st = get_store()
+        if st.error():
+            return []
+        res = _cat.catalog_search(question, limit=max(limit * 2, 10), store=st)
+        if not res.get("ok"):
+            return []
+        rows = []
+        for r in res["results"]:
+            fields = [h["field"] for h in r.get("matched", [])]
+            beyond_name = any(f != "table name" for f in fields)
+            why = []
+            for h in r.get("matched", []):
+                label = h.get("column") or h["field"]
+                if label not in why:
+                    why.append(label)
+            rows.append({"table": r["table"], "score": r["score"], "beyond_name": beyond_name,
+                         "in_catalogue": r.get("in_catalogue", True), "why": why[:4]})
+        rows.sort(key=lambda x: (not x["beyond_name"], -x["score"], x["table"]))
+        return rows[:limit]
+    except Exception:
+        return []
+
+
+def _split_memory_tables(tables: list[str]) -> tuple[list[str], list[str]]:
+    """(known, unverified): memory `table:` tags that are objects the catalogue knows, and the
+    rest. Only splits when a catalogue is configured; otherwise everything stays 'known'."""
+    try:
+        from .semantic.store import get_store
+        from .semantic._text import norm
+        st = get_store()
+        if st.error() or not tables:
+            return tables, []
+        known_names = set(st.tables) | set(getattr(st, "uncatalogued", {}))
+        known = [t for t in tables if norm(t) in known_names]
+        return known, [t for t in tables if norm(t) not in known_names]
+    except Exception:
+        return tables, []
+
+
 def _compose_answer(
     question: str,
     connection: str,
@@ -191,6 +241,8 @@ def _compose_answer(
     live_fallback: str | None = None,
     empty_reason: str | None = None,
     alias_added: int = 0,
+    catalogue: list[dict] | None = None,
+    unverified_tags: list[str] | None = None,
 ) -> str:
     """Assemble the final answer string from already-parsed pieces. Kept separate
     from find_db_objects so it (and the parsers above) are unit-testable without
@@ -198,6 +250,11 @@ def _compose_answer(
     lines = [f"question: {question}"]
     if connection:
         lines.append(f"connection: {connection}")
+    if catalogue:
+        lines.append("候補テーブル (catalogue, 説明・列の一致を表名の一致より優先):")
+        for c in catalogue:
+            mark = "" if c["in_catalogue"] else " [catalogue未登録: odbc_columns で列を確認]"
+            lines.append(f"  - {c['table']}{mark}  一致: {', '.join(c['why'])}")
     if tables:
         lines.append("候補テーブル (memory):")
         for t in tables:
@@ -212,6 +269,8 @@ def _compose_answer(
                 lines.append(f"  - {intent}")
             elif snip:
                 lines.append(f"  - {snip}")
+    if unverified_tags:
+        lines.append("未確認のタグ (memoryの語。表名とは限らない): " + ", ".join(unverified_tags))
     if srcs:
         lines.append("出典: " + ", ".join(srcs))
     if live_fallback is not None:
@@ -274,8 +333,12 @@ def find_db_objects(question: str, connection: str = "", limit: int = 8) -> str:
             srcs = _extract_tagged_tokens(result, "src")
             intents = [_intent_and_snippet_from_block(b) for b in _extract_match_blocks(result)]
 
-        if tables or intents:
-            return _compose_answer(question, connection, tables, intents, srcs, alias_added=alias_added)
+        catalogue = catalogue_candidates(question)
+        tables, unverified = _split_memory_tables(tables)
+        if tables or intents or catalogue:
+            return _compose_answer(question, connection, tables, intents, srcs,
+                                   alias_added=alias_added, catalogue=catalogue,
+                                   unverified_tags=unverified)
 
         # Memory had nothing usable.
         if connection:
