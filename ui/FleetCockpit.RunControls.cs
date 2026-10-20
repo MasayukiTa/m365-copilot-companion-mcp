@@ -545,6 +545,11 @@ partial class CockpitWindow
                     ? "RAMが少ないため、新しいタブを開かずに待機しています（空き " + availMb + "MB）。"
                     : "RAM is low, so new tabs are paused (free " + availMb + "MB).";
             }
+            // WHOSE NUMBER THIS IS. The banner named the floor and never said where it came from,
+            // so a 6 GB floor the panel (showing 0) did not set read as the panel's own. The
+            // runner writes disk_floor_source / ram_floor_source (cli|settings|env|default|live)
+            // and floor_warnings next to the numbers; both are shown here.
+            msg += FloorProvenanceText(root, diskGated, ramGated, floor, ramFloorNow);
             _capBannerLbl.Text = msg;
             _capBanner.Visibility = Visibility.Visible;
         }
@@ -552,6 +557,46 @@ partial class CockpitWindow
         {
             _capBanner.Visibility = Visibility.Collapsed;
         }
+    }
+
+    string FloorSourceWords(string src)
+    {
+        switch (src)
+        {
+            case "cli": return L("コマンドラインの指定", "command-line flag");
+            case "settings": return L("設定ファイル", "settings file");
+            case "env": return L("環境変数", "environment variable");
+            case "default": return L("既定値（設定ファイルにこの項目がありません）",
+                                     "built-in default (the settings file has no such line)");
+            case "live": return L("画面からの即時変更", "live change from the panel");
+        }
+        return "";
+    }
+
+    // The source of the floor that is blocking, a mismatch line when the panel's own value differs
+    // from the one this run applies, and every floor_warnings line the runner wrote.
+    string FloorProvenanceText(Dictionary<string, object> root, bool diskGated, bool ramGated,
+                               double diskFloor, double ramFloor)
+    {
+        if (root == null) return "";
+        var sb = new System.Text.StringBuilder();
+        string dsrc = S(root, "disk_floor_source");
+        string rsrc = S(root, "ram_floor_source");
+        if (diskGated && dsrc.Length > 0)
+            sb.Append(L(" 確保ディスクの出どころ：", " Disk floor from: ")).Append(FloorSourceWords(dsrc)).Append(L("。", "."));
+        if (ramGated && rsrc.Length > 0)
+            sb.Append(L(" 確保RAMの出どころ：", " RAM floor from: ")).Append(FloorSourceWords(rsrc)).Append(L("。", "."));
+        if (diskGated && dsrc != "live" && Math.Abs(_diskFloor - diskFloor) >= 0.05)
+            sb.Append(L(" 注意：パネルの値は " + _diskFloor + "GB ですが、この実行は " + diskFloor + "GB を使っています。",
+                        " Note: the panel shows " + _diskFloor + "GB but this run applies " + diskFloor + "GB."));
+        if (ramGated && rsrc != "live" && Math.Abs(_ramFloor - ramFloor) >= 0.5)
+            sb.Append(L(" 注意：パネルのRAM値は " + _ramFloor + "MB ですが、この実行は " + ramFloor + "MB を使っています。",
+                        " Note: the panel shows " + _ramFloor + "MB RAM but this run applies " + ramFloor + "MB."));
+        object wo;
+        if (root.TryGetValue("floor_warnings", out wo) && wo is object[])
+            foreach (object w in (object[])wo)
+                if (w != null && w.ToString().Length > 0) sb.Append(' ').Append(w.ToString());
+        return sb.ToString();
     }
 
     // 強制開始: disable the disk gate live. Capture the current floor first so 床を戻す can restore

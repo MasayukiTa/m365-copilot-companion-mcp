@@ -939,11 +939,13 @@ def build_settings_follower(disk_box, ram_box, mc_box, asc_box, path_fn=None, lo
         clamped = _clamp_and_log("disk_floor_gb", v, DISK_FLOOR_GB_BOUNDS)
         if clamped is not None:
             disk_box[0] = clamped
+            set_floor_provenance("disk", "settings", "adopted a change in settings.txt while running")
 
     def _set_ram_floor(v):
         clamped = _clamp_and_log("ram_floor_mb", v, RAM_FLOOR_MB_BOUNDS)
         if clamped is not None:
             ram_box[0] = clamped
+            set_floor_provenance("ram", "settings", "adopted a change in settings.txt while running")
 
     def _set_maxtabs(v):
         clamped = _clamp_and_log("maxtabs", v, TABS_BOUNDS, whole=True)
@@ -1107,6 +1109,59 @@ def operator_set_a_disk_floor():
         return float(settings_disk_floor(default=-1.0)) >= 0
     except Exception:
         return False
+
+
+def _file_has_key(key):
+    """Does settings.txt carry a parsable `key=` line? Reads through _settings_float's trace
+    (a sentinel default no real floor can equal). Never raises."""
+    try:
+        return float(_settings_float(key, -1.0)) >= 0
+    except Exception:
+        return False
+
+
+def floors_after_resume(disk_cli, ram_cli, resume):
+    """The (disk, ram) command-line floors that should still count on this launch.
+
+    On --resume the argv was replayed from fleet_run_active.json, so a floor flag in it is the
+    word of whoever started the ORIGINAL run, not of the operator now; when the file carries a
+    floor the file wins (return -1, "no flag"). Without --resume nothing changes: a flag typed
+    on this launch beats the file, as documented. Pure apart from the settings read.
+    """
+    if resume and disk_cli >= 0 and _file_has_key("disk_floor_gb"):
+        disk_cli = -1.0
+    if resume and ram_cli >= 0 and _file_has_key("ram_floor_mb"):
+        ram_cli = -1.0
+    return disk_cli, ram_cli
+
+
+def floor_source_of(cli_value, key, env_name=None, fallback_cli=None, trace=None):
+    """Which link of the chain decided a floor: cli | settings | env | default.
+
+    Read from SETTINGS_READ_TRACE, the record of the read that actually decided (not a second
+    read of a file the cockpit rewrites in place). `fallback_cli` is a lower-priority flag (the
+    RAM floor's --autoscale-headroom-mb), counted as cli only when the file had no value.
+    """
+    if cli_value is not None and cli_value >= 0:
+        return "cli"
+    t = (SETTINGS_READ_TRACE if trace is None else trace).get(key, "")
+    if str(t).startswith("read "):
+        return "settings"
+    if fallback_cli is not None and fallback_cli >= 0:
+        return "cli"
+    if env_name and env_name in os.environ:
+        return "env"
+    return "default"
+
+
+def set_floor_provenance(kind, source, detail=""):
+    """relay_fleet owns the store (its block message reads it); imported lazily because
+    relay_fleet imports this module's neighbours at load."""
+    try:
+        from relay.relay_fleet import set_floor_provenance as _set
+        _set(kind, source, detail)
+    except Exception as exc:   # a provenance note must never stop a run
+        print("[settings] floor provenance not recorded: %s" % exc, flush=True)
 
 
 def settings_ram_floor(default=2048.0):
@@ -1829,9 +1884,11 @@ def _sample_free_space(state_dir, floor_gb, now=None, force=False):
 
 def _disk_block(disk_floor_gb):
     from relay import fleet_resume as _fr
+    from relay.relay_fleet import floor_source
     return _fr.disk_status(_LAST_DISK.get("free_bytes"), _LAST_DISK.get("total_bytes"),
                            disk_floor_gb, _LAST_DISK.get("sampled_ts"),
-                           _FREE_RING.failures if _FREE_RING is not None else 0)
+                           _FREE_RING.failures if _FREE_RING is not None else 0,
+                           floor_source=floor_source("disk"))
 
 
 def _submitter_of(jid):
@@ -1846,7 +1903,9 @@ def _submitter_of(jid):
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
-    from relay.relay_fleet import free_disk_gb
+    from relay.relay_fleet import (free_disk_gb, floor_source as _floor_source,
+                                   floor_source_text as _floor_source_text,
+                                   floor_warning as _floor_warning)
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
     # open_tabs = ACTUAL browser tabs across the fleet: main agent tabs PLUS open sub-agent
@@ -1880,6 +1939,15 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "disk": _disk_block(disk_floor_gb),
         # RAM admission reserve (free RAM kept for the user) so the cockpit can show the RAM gate.
         "ram_floor_mb": round(ram_floor_mb),
+        # WHERE EACH FLOOR CAME FROM (cli | settings | env | default | live), next to the number
+        # it explains, plus the words and a WARNING when another settings file disagrees. The
+        # cockpit banner shows them; a floor that blocks work must say whose choice it is.
+        "disk_floor_source": _floor_source("disk"),
+        "ram_floor_source": _floor_source("ram"),
+        "disk_floor_source_text": _floor_source_text("disk"),
+        "ram_floor_source_text": _floor_source_text("ram"),
+        "floor_warnings": [w for w in (_floor_warning("disk", disk_floor_gb),
+                                       _floor_warning("ram", ram_floor_mb)) if w],
         # THE THIRD GATE, and the one that was invisible. Disk and RAM have been on this panel
         # for months; the quota that actually stopped a run -- 217 turns refused out of 237 --
         # had no gauge at all, so a fleet grinding to a halt looked like a fleet being slow.
@@ -4332,27 +4400,45 @@ def main():
     # NOT "CLI". This branch means the parsed namespace holds a non-negative value, which an
     # argparse default or a pre-populated namespace can produce with nothing on the command
     # line -- so the label says what was actually observed and leaves the cause open.
-    if args.disk_floor_gb >= 0:
-        disk_floor = args.disk_floor_gb
+    # A REPLAYED FLAG IS NOT THE OPERATOR'S CURRENT WORD. fleet_run_active.json keeps the argv of
+    # the run as it started and supervisor.ps1 replays it on --resume. task_router adds
+    # --disk-floor-gb only while settings.txt has no disk_floor_gb; if the operator then picks
+    # a floor in the panel and the run is interrupted, the replayed flag (CLI beats the file)
+    # would resurrect the old number for the whole resumed run while the panel shows the new one.
+    # On --resume a floor flag therefore yields to a floor the file carries.
+    _disk_cli, _ram_cli = floors_after_resume(args.disk_floor_gb, args.ram_floor_mb, args.resume)
+    if _disk_cli != args.disk_floor_gb:
+        print("[settings] --resume replayed --disk-floor-gb %.1f; settings.txt has disk_floor_gb "
+              "(chosen after that run started), so the file wins" % args.disk_floor_gb, flush=True)
+    if _ram_cli != args.ram_floor_mb:
+        print("[settings] --resume replayed --ram-floor-mb %.0f; settings.txt has ram_floor_mb "
+              "(chosen after that run started), so the file wins" % args.ram_floor_mb, flush=True)
+    if _disk_cli >= 0:
+        disk_floor = _disk_cli
         disk_floor_src = ("parsed namespace held %.1f (a typed flag, an argparse default, or "
                           "a later assignment -- argv is printed below so they can be told "
-                          "apart)" % args.disk_floor_gb)
+                          "apart)" % _disk_cli)
     else:
         disk_floor = settings_disk_floor()
         disk_floor_src = SETTINGS_READ_TRACE.get("disk_floor_gb", "(read not traced)")
-    disk_box = [disk_floor]                                   # live disk floor (cockpit-settable)
+    set_floor_provenance(
+        "disk", floor_source_of(_disk_cli, "disk_floor_gb", "SWE_DISK_FLOOR_GB"), disk_floor_src)
+    disk_box = [disk_floor]                                 # live disk floor (cockpit-settable)
     # ── RAM-floor admission reserve: keep this many MB free for the user. CLI --ram-floor-mb >= 0
     # -> cockpit settings.txt ram_floor_mb -> --autoscale-headroom-mb when given -> the ONE
     # declared default. That last step used to be --autoscale-headroom-mb's own default of
     # 1400, which is how this knob came to have three defaults that never had to agree.
-    if args.ram_floor_mb >= 0:
-        ram_floor = args.ram_floor_mb
-        ram_floor_src = "parsed namespace held %.0f (flag, default, or assignment)" % args.ram_floor_mb
+    if _ram_cli >= 0:
+        ram_floor = _ram_cli
+        ram_floor_src = "parsed namespace held %.0f (flag, default, or assignment)" % _ram_cli
     else:
         ram_floor = settings_ram_floor(
             default=(float(args.autoscale_headroom_mb) if args.autoscale_headroom_mb >= 0
                      else RAM_FLOOR_DEFAULT_MB))
         ram_floor_src = SETTINGS_READ_TRACE.get("ram_floor_mb", "(read not traced)")
+    set_floor_provenance(
+        "ram", floor_source_of(_ram_cli, "ram_floor_mb", None,
+                               fallback_cli=args.autoscale_headroom_mb), ram_floor_src)
     ram_box = [ram_floor]                                     # live RAM floor (cockpit-settable)
     eval_disk = None if args.eval_disk_gb < 0 else args.eval_disk_gb
 
@@ -4418,6 +4504,11 @@ def main():
     print("       disk floor: keep >= %.1f GB free on C: -- %s (free now %.1f GB)"
           % (disk_floor, disk_floor_src, free_disk_gb()))
     print("       RAM floor:  keep >= %.0f MB free -- %s" % (ram_floor, ram_floor_src))
+    from relay.relay_fleet import floor_source_text as _fst, floor_warning as _fw
+    print("       floor sources: disk = %s; RAM = %s" % (_fst("disk"), _fst("ram")))
+    for _w in (_fw("disk", disk_floor), _fw("ram", ram_floor)):
+        if _w:
+            print("       " + _w, flush=True)
     from relay.relay_fleet import SOCKET_SEND_BURST as _burst, SOCKET_SEND_RPM as _rpm
     from relay import socket_capacity as _sc
     print(_stamp("       capacity  : lane ceiling %d (derived from the cloud rate); RAM safeguard "
@@ -4524,6 +4615,7 @@ def main():
             if "set_disk_floor_gb" in cmd:
                 try:
                     disk_box[0] = max(0.0, float(cmd["set_disk_floor_gb"]))
+                    set_floor_provenance("disk", "live", "set_disk_floor_gb command")
                 except Exception:
                     pass
             # live RAM-floor control: {"set_ram_floor_mb": 3072} -- the reserved free RAM the
@@ -4531,6 +4623,7 @@ def main():
             if "set_ram_floor_mb" in cmd:
                 try:
                     ram_box[0] = max(0.0, float(cmd["set_ram_floor_mb"]))
+                    set_floor_provenance("ram", "live", "set_ram_floor_mb command")
                 except Exception:
                     pass
             # live autoscale control from the cockpit: {"set_autoscale": {"on":1,"max":4,
