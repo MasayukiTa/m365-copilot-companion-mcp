@@ -239,6 +239,20 @@ def org_label(pair):
     return "roles:%s workflows:%s" % (pair[0][:8], pair[1][:8])
 
 
+def load_records(fleet_dir):
+    """(records, unreadable) : the flat run records with their `kind` of work, read-only.
+
+    The same three sources as `load_profiles` (no tool_events), through `build_records`. The
+    kind module is imported here, in this report, and nowhere else (D4's report reads records
+    per run id through this instead of importing it)."""
+    from relay import task_kind as TK
+    camps, bad_ca = _read_jsonl_counted(os.path.join(fleet_dir, "campaigns.jsonl"))
+    history, bad_hi = _read_history(os.path.join(fleet_dir, "history.json"))
+    workers = S._read_status_workers(os.path.join(fleet_dir, "status.json"))
+    unreadable = {k: n for k, n in (("campaigns.jsonl", bad_ca), ("history.json", bad_hi)) if n}
+    return build_records(workers, camps, history, {}, TK.task_kind), unreadable
+
+
 def load_profiles(fleet_dir, min_n=DEFAULT_MIN_N):
     """{role: profile entry} for the runtime reader (relay/load_routing.py), read-only.
 
