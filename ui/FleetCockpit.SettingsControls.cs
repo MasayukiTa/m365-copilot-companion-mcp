@@ -227,6 +227,7 @@ partial class CockpitWindow
         PaintSupervisorSelfRestart();
         PaintToolProbe();
         PaintToolRoute();
+        PaintConsentApprove();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -568,6 +569,47 @@ partial class CockpitWindow
         _trBox.ToolTip = ToolRouteView.Help(_lang == 0) + "\n" + ToolRouteView.TakeEffectTip(_lang == 0);
         _trBox.Background = BtnBg; _trBox.Foreground = Fg; _trBox.BorderBrush = Border;
         StyleFlatCombo(_trBox);
+    }
+    // Consent-card auto-approval (on|off), under Tools. Persists through SaveKey only;
+    // relay/consent_approve.py re-reads the key whenever a connector-less turn ends on a card
+    // (each_gate). Words: ConsentApproveView.
+    UIElement ConsentApproveControl()
+    {
+        _caLbl = new TextBlock(); _caLbl.VerticalAlignment = VerticalAlignment.Center;
+        _caLbl.FontSize = 12;
+
+        _caBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_caBox, "consentApproveBox");
+        _caBox.ToolTip = ConsentApproveView.Help(_lang == 0) + "\n" + ConsentApproveView.TakeEffectTip(_lang == 0);
+        _caBox.Cursor = Cursors.Hand; _caBox.FontSize = 12;
+        _caBox.FontWeight = FontWeights.SemiBold; _caBox.MinWidth = 64;
+        _caBox.Padding = new Thickness(8, 2, 4, 2);
+        _caBox.VerticalAlignment = VerticalAlignment.Center;
+        var caHelp = new Dictionary<string, string>();
+        foreach (string m in ConsentApproveView.Modes) caHelp[m] = ConsentApproveView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_caBox, ConsentApproveView.Modes, caHelp, _caVal);
+        _caBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _caBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_caBox);
+            if (!ConsentApproveView.IsMode(sel) || sel == _caVal) return;   // unchanged -> no write, no re-fire
+            _caVal = sel;
+            SaveKey(ConsentApproveView.Key, _caVal);
+        };
+
+        var wrap = SettingsComboBlock(_caLbl, _caBox, new TextBlock(), new TextBlock());
+        PaintConsentApprove();
+        return wrap;
+    }
+    void PaintConsentApprove()
+    {
+        if (_caLbl != null) { _caLbl.Text = ConsentApproveView.Label(_lang == 0); _caLbl.Foreground = Muted; }
+        if (_caBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_caBox), _caVal)) ComboSelectVal(_caBox, _caVal);
+        _caBox.ToolTip = ConsentApproveView.Help(_lang == 0) + "\n" + ConsentApproveView.TakeEffectTip(_lang == 0);
+        _caBox.Background = BtnBg; _caBox.Foreground = Fg; _caBox.BorderBrush = Border;
+        StyleFlatCombo(_caBox);
     }
     // Merge conversation (fresh|parent), in the Fan-out section. Persists through SaveKey only; the
     // runner re-reads the key at every split and every merge (each_gate). Parent runs the merge in

@@ -220,6 +220,11 @@ partial class CockpitWindow
                     string trv = ToolRouteView.ParseLine(ln);   // connector|connector-less (bridge = old spelling); junk keeps the value
                     if (trv != null) _trVal = trv;
                 }
+                else if (ln.StartsWith("consent_auto_approve="))
+                {
+                    string cav = ConsentApproveView.ParseLine(ln);   // on|off only; junk keeps the value
+                    if (cav != null) _caVal = cav;
+                }
                 else if (ln.StartsWith("merge_conversation="))
                 {
                     string mcv = MergeConversationView.ParseLine(ln);   // fresh|parent only; junk keeps the value

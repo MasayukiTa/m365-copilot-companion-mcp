@@ -79,6 +79,9 @@ LIVE_RECORD_REDIRECTS = {
                          "_STATE_FILE": "lock_state.json",
                          "_TOKEN_GAP_FILE": "unlock_token_gap.json"},
     "relay.socket_route": {"DEFAULT_LOG": "socket_route.jsonl"},
+    # Approved/unknown Work IQ cards (counts, tool names, conversation ids). A test that drives
+    # the recorder would otherwise add rows to the operator's own approval record.
+    "relay.consent_approve": {"LOG_PATH": "consent_approvals.jsonl"},
     # READ-ONLY, AND REDIRECTED ANYWAY. fleet_tool_health only reads the ledger, so it
     # cannot corrupt the operator record -- but a test left unpatched would derive a
     # health verdict from whatever the operator happened to be doing, which is a test

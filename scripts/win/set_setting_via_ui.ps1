@@ -34,6 +34,7 @@ $Boxes = @{
     'effort_policy'             = 'effortPolicyBox'
     'fanout'                    = 'fanoutBox'
     'tool_transport'            = 'toolRouteBox'
+    'consent_auto_approve'      = 'consentApproveBox'
     'merge_conversation'        = 'mergeConversationBox'
     'fleet_auto_resume'         = 'autoResumeBox'
     'supervisor_self_restart'   = 'supervisorCodeBox'

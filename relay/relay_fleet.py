@@ -8791,6 +8791,15 @@ class RelayWorker:
                 # A STALL IS ONE CONVERSATION'S PROBLEM, NOT THE ROUTE'S: recycle it alone.
                 return self._recycle_stalled_conversation(failed)
             if failed:
+                # A TOOL-APPROVAL CARD ON THE CONNECTOR-LESS ROUTE is pressed by a helper process
+                # (relay/consent_approve.py), never by a turn and never in a fleet tab. Does
+                # nothing for the connector route, for `consent_auto_approve=off`, or for a
+                # failure that is not a text-less completed turn; never raises, never blocks.
+                try:
+                    from relay import consent_approve
+                    consent_approve.on_socket_failure(self, failed)
+                except Exception:
+                    pass
                 # PINNED TO THE SOCKET WHILE THE ROUTE IS OPEN. A tab is the answer to a card,
                 # not to a closed connection, and this branch used to make no distinction: the
                 # first dropped connection opened one.

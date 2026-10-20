@@ -262,6 +262,10 @@ partial class CockpitWindow : Window
     string _trVal = ToolRouteView.Default;
     ComboBox _trBox;
     TextBlock _trLbl;
+    // consent-card auto-approval on|off -> settings.txt consent_auto_approve ; absent key = on
+    string _caVal = ConsentApproveView.Default;
+    ComboBox _caBox;
+    TextBlock _caLbl;
     // tool-call check interval 0|15|30|60 minutes -> settings.txt tool_probe_idle_min ; absent key = 30
     string _tpVal = ToolProbeView.Default;
     ComboBox _tpBox;
