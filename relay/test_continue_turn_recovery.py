@@ -561,3 +561,54 @@ def test_the_journal_marks_what_was_sent_and_what_ran(tmp_path, monkeypatch):
 def test_the_ledger_tail_reader_returns_none_when_the_file_is_missing(tmp_path):
     from relay import continue_recovery as CR
     assert CR.read_ledger_tail(str(tmp_path / "missing.jsonl")) is None
+
+
+# ---- 7. 実行済みの呼び出しがあり、届いたかどうかは分からず、続きも認められない場合 -------------------
+# `landed` が偽でも、この側で呼び出しが実行されていれば、目標の本文をそのまま再送すると同じ呼び出しを
+# もう一度実行する。続きが認められないなら、再送せず STUCK で理由を残す。
+
+def _executed_but_not_known_to_have_landed(tmp_path, monkeypatch, *, used):
+    from relay import continue_recovery as CR
+    from relay.transport_policy import delivery_status
+    _mode(tmp_path, monkeypatch, "on")
+    tools = _Tools()
+    A = {"name": "edit_and_verify", "arguments": {"path": "a.py"}}
+    # 結果の送信が接続に失敗する: 呼び出しは実行済みで、次の返信の語は 1 つも届いていない
+    connect1 = _connect(["{}" + CH.RS, _update(_call(A)), _done()],
+                        CH.ChatHubError("could not open the socket: reset"))
+    drv1 = _driver(connect1, tools)
+    _run(drv1, "THE-JOB")
+    assert drv1.failed and tools.count("a.py") == 1
+    # `partial_text` is what `landed` reads. A driver whose buffer holds nothing (a fresh one, or one
+    # that cleared it for a new send) has seen no token of the next reply, so `landed` is False
+    # although the journal still shows the call that ran.
+    with drv1._lock:
+        drv1._partial = ""
+    route = _Route([_driver(_connect(), tools)])
+    w = _worker(monkeypatch, route, drv1)
+    w._continues_used = used
+    reason = "ChatHubError: no close frame received or sent"
+    # 前提: 届いたとは言えず、しかも実行済みの呼び出しは記録にある
+    assert delivery_status(reason) != "delivered"
+    assert not (drv1.partial_text() or getattr(drv1, "_turn_answered", False))
+    assert not getattr(w, "_landed_pending", False)
+    assert w._journal_shows_executed_calls() is True
+    return tools, route, w, reason
+
+
+def test_executed_calls_with_a_refused_plan_are_not_resent_on_the_socket(tmp_path, monkeypatch):
+    from relay import continue_recovery as CR
+    tools, route, w, reason = _executed_but_not_known_to_have_landed(
+        tmp_path, monkeypatch, used=CR.MAX_CONTINUES_PER_GOAL)
+    assert w._retry_socket(reason) is False
+    assert w.outcome == "STUCK" and "not re-sent" in w.reason
+    assert not route.asked, "目標を新しい接続へ再送しようとした"
+    assert tools.count("a.py") == 1
+
+
+def test_executed_calls_with_a_refused_plan_are_not_resent_on_a_tab(tmp_path, monkeypatch):
+    from relay import continue_recovery as CR
+    tools, route, w, reason = _executed_but_not_known_to_have_landed(
+        tmp_path, monkeypatch, used=CR.MAX_CONTINUES_PER_GOAL)
+    assert w._fall_back_to_tab() is False        # _open_fresh は呼ばれたら失敗する
+    assert w.outcome == "STUCK" and "not re-sent" in w.reason

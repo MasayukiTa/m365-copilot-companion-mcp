@@ -8204,7 +8204,8 @@ class RelayWorker:
         # counts as "may have landed": a verbatim resend would start the work again. With it OFF
         # `_journal_shows_executed_calls` is False and this is the condition it always was.
         recovery = None
-        if (landed or self._journal_shows_executed_calls()) and self._goal_may_act():
+        executed = self._journal_shows_executed_calls()
+        if (landed or executed) and self._goal_may_act():
             decision = "refuse"
             try:
                 from relay.transport_policy import resend_decision_for_landed_act
@@ -8214,7 +8215,9 @@ class RelayWorker:
                 decision = "refuse"
             if decision != "resend":
                 recovery = self._plan_continue(reason, delivery)
-                if recovery is None and landed:
+                # A call that RAN on this side is as good as a landed turn: with no continue turn
+                # to carry it, the verbatim resend below would run it again.
+                if recovery is None and (landed or executed):
                     self._refuse_resend(reason, delivery)
                     return False
 
@@ -8320,7 +8323,10 @@ class RelayWorker:
             _delivery = delivery_status(reason)
         except Exception:
             _delivery = "unknown"
-        if (_delivery == "delivered" or getattr(self, "_landed_pending", False))                 and self._goal_may_act():
+        # A call that already ran on this side counts too (continue-turn setting on): the tab
+        # re-sends the goal verbatim.
+        if (_delivery == "delivered" or getattr(self, "_landed_pending", False)
+                or self._journal_shows_executed_calls()) and self._goal_may_act():
             decision = "refuse"
             try:
                 from relay.transport_policy import resend_decision_for_landed_act
