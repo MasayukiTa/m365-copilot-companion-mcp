@@ -273,6 +273,17 @@ KEYS = OrderedDict([
        "definition, and the run id. Never goal text. off writes nothing. No prompt or "
        "admission changes either way."),
 
+    # Genotype id on that record (relay/org/versions.py). Read once when a run starts, beside
+    # org_version_record. Independent switch: it only labels the lines that record already writes.
+    _k("org_genotype_record", SWEEP_START, "off",
+       "relay/org/versions.py:record_run (once, at run start)",
+       "off|on. Takes effect on the NEXT run, and only when org_version_record is on (it adds a "
+       "field to the lines that record writes). on tags each defs and run line in "
+       "org_versions.jsonl with genotype_id: one 16-hex name for the pair of role and protocol "
+       "hashes that line already carries, so runs of one version share a label. An unreadable "
+       "version gets an empty id, never a real one. No new line, no goal text, off adds nothing. "
+       "No prompt or admission changes either way."),
+
     # Shadow evaluation of those proposals (relay/org/shadow_eval.py). Read once when a run starts.
     _k("org_shadow_eval", SWEEP_START, "off",
        "relay/org/shadow_eval.py:record_run (once, at run start)",

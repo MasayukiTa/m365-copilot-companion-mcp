@@ -28,6 +28,7 @@ $Boxes = @{
     'fanout_load_routing'       = 'loadRoutingBox'
     'agent_board_mode'          = 'agentBoardBox'
     'org_version_record'        = 'orgVersionBox'
+    'org_genotype_record'       = 'orgGenotypeBox'
     'team_mode'                 = 'teamModeBox'
     'relay_findings'            = 'relayFindingsBox'
     'org_proposals'             = 'orgProposalBox'

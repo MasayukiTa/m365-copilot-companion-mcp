@@ -195,6 +195,11 @@ partial class CockpitWindow
                     string ovv = OrgVersionView.ParseLine(ln);   // off|on only; junk keeps the value
                     if (ovv != null) _ovVal = ovv;
                 }
+                else if (ln.StartsWith("org_genotype_record="))
+                {
+                    string ogv = OrgGenotypeView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (ogv != null) _ogVal = ogv;
+                }
                 else if (ln.StartsWith("org_shadow_eval="))
                 {
                     string osv = OrgShadowView.ParseLine(ln);   // off|shadow only; junk (and on) keeps the value

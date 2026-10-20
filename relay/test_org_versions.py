@@ -331,3 +331,103 @@ def test_the_module_fixes_no_path_to_the_operators_record():
     with io.open(os.path.join(REPO, "relay", "org", "versions.py"), encoding="utf-8") as fh:
         code = fh.read()
     assert '".fleet"' not in code and "'.fleet'" not in code
+
+
+# ------------------------------------------------------------------ the genotype id (org_genotype_record)
+
+def test_genotype_id_is_one_deterministic_label_for_the_hash_pair():
+    s = D.snapshot()
+    gid = D.genotype_id(s)
+    assert re.fullmatch(r"[0-9a-f]{16}", gid)
+    assert D.genotype_id(s) == gid                              # same snapshot, same id
+    assert D.genotype_id({"roles_hash": s["roles_hash"],
+                          "workflows_hash": s["workflows_hash"]}) == gid
+
+
+def test_genotype_id_moves_when_either_half_moves(monkeypatch):
+    import relay.planner as planner
+    before = D.genotype_id(D.snapshot())
+    monkeypatch.setattr(planner, "PLAN_PROMPT", planner.PLAN_PROMPT + " (edited)")
+    assert D.genotype_id(D.snapshot()) != before
+
+
+def test_an_unreadable_half_has_no_genotype_id():
+    assert D.genotype_id({"roles_hash": "", "workflows_hash": "abc"}) == ""
+    assert D.genotype_id({"roles_hash": "abc", "workflows_hash": ""}) == ""
+    assert D.genotype_id({"roles_hash": "", "workflows_hash": ""}) == ""
+    assert D.genotype_id({}) == "" and D.genotype_id(None) == ""
+
+
+@pytest.mark.parametrize("text,want", [
+    ("", "off"), ("org_genotype_record=on\n", "on"), ("org_genotype_record=ON\n", "on"),
+    ("org_genotype_record=off\n", "off"), ("org_genotype_record=yes\n", "off"),
+    ("org_genotype_record=\n", "off"), ("\ufefforg_genotype_record=on\n", "on"),
+    ("org_version_record=on\n", "off")])
+def test_the_genotype_mode_reads_on_off_and_nothing_else(tmp_path, text, want):
+    p = tmp_path / "settings.txt"
+    p.write_text(text, encoding="utf-8")
+    assert V.genotype_mode(str(p)) == want
+
+
+def test_version_record_on_without_genotype_writes_no_genotype_field(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch, "org_version_record=on\n")
+    tdir = str(tmp_path / "fleet" / "transcripts")
+    assert V.record_run("r1_a0", tdir, now=10.0) is True
+    rows = _lines(str(tmp_path / "fleet" / V.FILENAME))
+    assert [r["kind"] for r in rows] == ["defs", "run"]
+    assert all("genotype_id" not in r for r in rows)
+
+
+def test_both_switches_on_tags_every_line_with_the_same_snapshot_id(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch,
+              "org_version_record=on\norg_genotype_record=on\n")
+    tdir = str(tmp_path / "fleet" / "transcripts")
+    assert V.record_run("r1_a0", tdir, now=10.0) is True
+    assert V.record_run("r2_a0", tdir, now=11.0) is True
+    rows = _lines(str(tmp_path / "fleet" / V.FILENAME))
+    assert [r["kind"] for r in rows] == ["defs", "run", "run"]
+    expected = D.genotype_id(D.snapshot())
+    assert expected and all(r["genotype_id"] == expected for r in rows)
+    for r in rows:
+        assert D.genotype_id({"roles_hash": r["roles_hash"],
+                              "workflows_hash": r["workflows_hash"]}) == r["genotype_id"]
+
+
+def test_genotype_on_does_not_change_run_line_shape_or_return(tmp_path, monkeypatch):
+    base = _settings(tmp_path, monkeypatch, "org_version_record=on\n")
+    tdir = str(tmp_path / "a" / "transcripts")
+    assert V.record_run("r1_a0", tdir, now=10.0) is True
+    plain = _lines(str(tmp_path / "a" / V.FILENAME))
+    V._reset_for_test()
+    with io.open(base, "w", encoding="utf-8") as fh:
+        fh.write("org_version_record=on\norg_genotype_record=on\n")
+    tdir2 = str(tmp_path / "b" / "transcripts")
+    assert V.record_run("r1_a0", tdir2, now=10.0) is True
+    tagged = _lines(str(tmp_path / "b" / V.FILENAME))
+    for p, t in zip(plain, tagged):
+        assert set(t) - set(p) == {"genotype_id"}
+        for k in p:
+            assert t[k] == p[k]
+
+
+def test_an_unreadable_version_writes_an_empty_genotype_id(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch,
+              "org_version_record=on\norg_genotype_record=on\n")
+
+    def boom():
+        raise RuntimeError("renamed")
+    boom.label = "relay.nowhere.GONE"
+    monkeypatch.setitem(D.ROLES, "planner", ("v1", (boom,)))
+    tdir = str(tmp_path / "fleet" / "transcripts")
+    assert V.record_run("r1_a0", tdir, now=10.0) is True
+    rows = _lines(str(tmp_path / "fleet" / V.FILENAME))
+    assert all(r.get("genotype_id") == "" for r in rows)
+
+
+def test_load_tolerates_the_genotype_field(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch,
+              "org_version_record=on\norg_genotype_record=on\n")
+    tdir = str(tmp_path / "fleet" / "transcripts")
+    V.record_run("r1_a0", tdir, now=10.0)
+    runs, defs, bad = V.load(str(tmp_path / "fleet" / V.FILENAME))
+    assert bad == 0 and "r1_a0" in runs and defs

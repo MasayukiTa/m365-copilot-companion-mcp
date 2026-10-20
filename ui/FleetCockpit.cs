@@ -234,6 +234,10 @@ partial class CockpitWindow : Window
     string _ovVal = OrgVersionView.Default;
     ComboBox _ovBox;
     TextBlock _ovLbl, _ovNow, _ovPending;
+    // genotype id record off|on -> settings.txt org_genotype_record ; absent key = off (OrgGenotypeView.Default)
+    string _ogVal = OrgGenotypeView.Default;
+    ComboBox _ogBox;
+    TextBlock _ogLbl, _ogNow, _ogPending;
     // org change proposals off|on -> settings.txt org_proposals ; absent key = off (OrgProposalView.Default)
     string _opVal = OrgProposalView.Default;
     ComboBox _opBox;
