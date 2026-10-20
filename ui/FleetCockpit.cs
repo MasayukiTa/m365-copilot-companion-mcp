@@ -230,6 +230,10 @@ partial class CockpitWindow : Window
     string _ovVal = OrgVersionView.Default;
     ComboBox _ovBox;
     TextBlock _ovLbl, _ovNow, _ovPending;
+    // org change proposals off|on -> settings.txt org_proposals ; absent key = off (OrgProposalView.Default)
+    string _opVal = OrgProposalView.Default;
+    ComboBox _opBox;
+    TextBlock _opLbl, _opNow, _opPending;
     // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
     string _hmVal = HierarchicalMergeView.Default;
     ComboBox _hmBox;
