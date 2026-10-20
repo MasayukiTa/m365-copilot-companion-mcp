@@ -219,6 +219,7 @@ partial class CockpitWindow
         PaintWriteScope();
         PaintLoadRouting();
         PaintTeamMode();
+        PaintRelayFindings();
         PaintAgentBoard();
         PaintOrgVersion();
         PaintOrgProposal();
@@ -1194,6 +1195,75 @@ partial class CockpitWindow
         _tmPending.Text = pend ?? "";
         _tmPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _tmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    UIElement RelayFindingsControl()
+    {
+        _rfLbl = new TextBlock(); _rfLbl.VerticalAlignment = VerticalAlignment.Center;
+        _rfLbl.FontSize = 12;
+
+        _rfBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_rfBox, "relayFindingsBox");
+        _rfBox.ToolTip = RelayFindingsView.Help(_lang == 0) + "\n" + RelayFindingsView.TakeEffectTip(_lang == 0);
+        _rfBox.Cursor = Cursors.Hand; _rfBox.FontSize = 12;
+        _rfBox.FontWeight = FontWeights.SemiBold; _rfBox.MinWidth = 78;
+        _rfBox.Padding = new Thickness(8, 2, 4, 2);
+        _rfBox.VerticalAlignment = VerticalAlignment.Center;
+        var rfHelp = new Dictionary<string, string>();
+        foreach (string m in RelayFindingsView.Modes) rfHelp[m] = RelayFindingsView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_rfBox, RelayFindingsView.Modes, rfHelp, _rfVal);
+        _rfBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _rfBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_rfBox);
+            if (!RelayFindingsView.IsMode(sel) || sel == _rfVal) return;   // unchanged -> no write, no re-fire
+            _rfVal = sel;
+            SaveKey(RelayFindingsView.Key, _rfVal);
+            PaintRelayFindingsInEffect(_lastRoot);
+        };
+
+        _rfNow = new TextBlock(); _rfNow.VerticalAlignment = VerticalAlignment.Center;
+        _rfNow.FontSize = 11.5;
+        _rfPending = new TextBlock(); _rfPending.VerticalAlignment = VerticalAlignment.Center;
+        _rfPending.FontSize = 11.5; _rfPending.FontWeight = FontWeights.SemiBold;
+        _rfPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_rfLbl, _rfBox, _rfNow, _rfPending);
+        PaintRelayFindings();
+        return wrap;
+    }
+    void PaintRelayFindings()
+    {
+        if (_rfLbl != null) { _rfLbl.Text = RelayFindingsView.Label(_lang == 0); _rfLbl.Foreground = Muted; }
+        if (_rfBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_rfBox), _rfVal)) ComboSelectVal(_rfBox, _rfVal);
+        _rfBox.ToolTip = RelayFindingsView.Help(_lang == 0) + "\n" + RelayFindingsView.TakeEffectTip(_lang == 0);
+        _rfBox.Background = BtnBg; _rfBox.Foreground = Fg; _rfBox.BorderBrush = Border;
+        StyleFlatCombo(_rfBox);
+        PaintRelayFindingsInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "relay_findings"). No report (old runner, no
+    // run yet) -> nothing shown, never a guess from the selection.
+    void PaintRelayFindingsInEffect(Dictionary<string, object> root)
+    {
+        if (_rfNow == null || _rfPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> rf = root != null ? Obj(root, "relay_findings") : null;
+        if (rf != null && rf.ContainsKey("mode") && rf["mode"] != null)
+        {
+            string rep = S(rf, "mode");
+            now = RelayFindingsView.Describe(rep,
+                rf.ContainsKey("recorded") && rf["recorded"] != null ? I(rf, "recorded") : 0,
+                rf.ContainsKey("with_findings") && rf["with_findings"] != null ? I(rf, "with_findings") : 0, ja);
+            pend = RelayFindingsView.PendingText(rep, _rfVal, ja);
+        }
+        _rfNow.Text = now ?? "";
+        _rfNow.Foreground = Muted;
+        _rfNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _rfPending.Text = pend ?? "";
+        _rfPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _rfPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     // Auto-resume of an interrupted run (off|on), in its own Recovery section. Persists through
     // SaveKey only; the supervisor re-reads the key every cycle (each_gate). What is IN EFFECT comes

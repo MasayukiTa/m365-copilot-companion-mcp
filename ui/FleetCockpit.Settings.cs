@@ -180,6 +180,11 @@ partial class CockpitWindow
                     string tmv = TeamModeView.ParseLine(ln);   // off|shadow only; junk keeps the value
                     if (tmv != null) _tmVal = tmv;
                 }
+                else if (ln.StartsWith("relay_findings="))
+                {
+                    string rfv = RelayFindingsView.ParseLine(ln);   // off|shadow|on only; junk keeps the value
+                    if (rfv != null) _rfVal = rfv;
+                }
                 else if (ln.StartsWith("agent_board_mode="))
                 {
                     string abv = AgentBoardView.ParseLine(ln);   // off|p0 only; junk (and p1) keeps the value
