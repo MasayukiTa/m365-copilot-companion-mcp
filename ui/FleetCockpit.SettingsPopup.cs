@@ -272,6 +272,7 @@ partial class CockpitWindow
             case "job_approval_mode":
             case "fanout_write_scope":
             case "fanout_load_routing":
+            case "relay_findings":
             case "team_mode":
             case "org_proposals":
             case "fanout_max_depth":
@@ -769,6 +770,7 @@ partial class CockpitWindow
         col.Children.Add(WriteScopeControl());
         col.Children.Add(LoadRoutingControl());
         col.Children.Add(TeamModeControl());
+        col.Children.Add(RelayFindingsControl());
         col.Children.Add(AgentBoardControl());
         col.Children.Add(OrgVersionControl());
         col.Children.Add(OrgProposalControl());

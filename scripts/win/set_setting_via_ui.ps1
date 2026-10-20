@@ -29,6 +29,7 @@ $Boxes = @{
     'agent_board_mode'          = 'agentBoardBox'
     'org_version_record'        = 'orgVersionBox'
     'team_mode'                 = 'teamModeBox'
+    'relay_findings'            = 'relayFindingsBox'
     'org_proposals'             = 'orgProposalBox'
     'org_shadow_eval'           = 'orgShadowBox'
     'effort_policy'             = 'effortPolicyBox'
