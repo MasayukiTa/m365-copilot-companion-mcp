@@ -26,6 +26,31 @@ This module is the one place that fixes the mechanism:
     refused (``StateShrinkRefused``) unless the caller says it is an explicit
     delete/prune (``allow_shrink=True``).
 
+  * a file that cannot be read is never silently lost: before anything is done
+    about it, a byte-for-byte copy is kept as ``<file>.corrupt-<timestamp>``
+    (``preserve_corrupt``), so even the fallback-to-backup path, which replaces
+    the damaged main file on the next save, leaves the damaged bytes for a human.
+
+Background (the incident this module exists for, 2026-10-18): the procedural
+memory ``.procedural_memory.json`` shrank from 725 entries to 90 during a
+measurement run and no copy existed. The old code read the whole file with a
+reader that returned EMPTY on any exception and wrote the whole file back in
+place with no lock; a reader that met a half-written file took "empty" as the
+truth and its next save persisted it. The loss was noticed hours later, which
+is why more than one previous version is kept: three generations cover three
+successive writes, so a bad write noticed one or two saves later is still
+recoverable. JSON stores keep BACKUP_GENERATIONS (5, at least that number;
+``.bak.1`` is a copy of the file as last written, ``.bak.2`` .. the earlier
+versions). Text stores that exist in the hundreds (one file per theme) use
+TEXT_BACKUP_GENERATIONS (3).
+
+The shrink guard is NOT a capability limit. It refuses a save that would drop
+the entry count by more than max(2, 10%) -- stricter than "more than half", so
+the 725 -> 90 case is far past it -- and logs an ERROR naming the file and both
+counts; the file on disk is left untouched, which keeps the previous version.
+A caller that really means to delete or prune passes ``allow_shrink=True`` and
+the write is performed.
+
 The on-disk format is whatever the caller serialises (JSON, indent=2,
 ensure_ascii=False -- the same as before), so existing files load unchanged.
 """
@@ -44,6 +69,7 @@ from typing import Any, Callable, Iterator, Optional
 log = logging.getLogger("state_store")
 
 BACKUP_GENERATIONS = 5
+TEXT_BACKUP_GENERATIONS = 3
 LOCK_WAIT_SECONDS = 15.0
 LOCK_STALE_SECONDS = 120.0
 READ_ATTEMPTS = 6
@@ -208,6 +234,81 @@ def _try_read(p: Path, validate: Callable[[Any], bool]) -> Any:
     return data
 
 
+def preserve_corrupt(path: Path) -> Optional[Path]:
+    """Keep a byte-for-byte copy of an unreadable file as ``<name>.corrupt-<timestamp>``.
+
+    Idempotent: if a copy with identical bytes already exists nothing new is written.
+    Never raises (a failure to copy is logged); returns the copy's path or None.
+    """
+    path = Path(path)
+    try:
+        data = path.read_bytes()
+        if not data:
+            return None
+        for existing in path.parent.glob(path.name + ".corrupt-*"):
+            try:
+                if existing.read_bytes() == data:
+                    return existing
+            except OSError:
+                continue
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        dest = path.with_name(f"{path.name}.corrupt-{stamp}")
+        n = 1
+        while dest.exists():
+            n += 1
+            dest = path.with_name(f"{path.name}.corrupt-{stamp}-{n}")
+        shutil.copyfile(str(path), str(dest))
+        log.error("state_store: %s is unreadable; kept the damaged bytes as %s", path, dest.name)
+        return dest
+    except OSError as e:
+        log.error("state_store: could not preserve unreadable %s: %s", path, e)
+        return None
+
+
+def read_text(path: Path, *, generations: int = TEXT_BACKUP_GENERATIONS) -> Optional[str]:
+    """Read a text store. Returns None if the file does not exist.
+
+    An existing file that cannot be read (or is zero bytes while a backup exists) is
+    retried, preserved as ``.corrupt-<timestamp>``, then answered from the newest
+    readable backup generation; with no backup it raises StateUnreadable. It never
+    answers "" for a file that could not be read.
+    """
+    path = Path(path)
+    baks = [b for b in backup_paths(path, generations) if b.exists()]
+    last_err: Optional[BaseException] = None
+    for _ in range(READ_ATTEMPTS):
+        last_err = None
+        try:
+            text = path.read_text(encoding="utf-8-sig")
+            if text or not baks:
+                return text
+            last_err = ValueError("zero-byte file while backups exist")
+        except FileNotFoundError:
+            if not baks:
+                return None
+            last_err = FileNotFoundError(str(path))
+            break
+        except Exception as e:  # sharing violation, bad encoding
+            last_err = e
+        time.sleep(READ_RETRY_SLEEP)
+    if path.exists():
+        preserve_corrupt(path)
+    for b in baks:
+        try:
+            text = b.read_text(encoding="utf-8-sig")
+        except Exception:
+            continue
+        if text:
+            log.warning("state_store: %s unreadable (%s); using backup %s", path, last_err, b.name)
+            return text
+    if not path.exists():
+        return None
+    raise StateUnreadable(
+        f"{path} exists but is unreadable and no valid backup exists "
+        f"({type(last_err).__name__}: {last_err}); refusing to treat it as empty"
+    )
+
+
 def read_json(
     path: Path,
     *,
@@ -238,6 +339,8 @@ def read_json(
         except Exception as e:  # torn read, sharing violation, bad shape
             last_err = e
             time.sleep(READ_RETRY_SLEEP)
+    if exists and last_err is not None:
+        preserve_corrupt(path)
     for b in baks:
         try:
             data = _try_read(b, validate)
@@ -282,12 +385,24 @@ def _rotate_backups(path: Path, payload: str, generations: int) -> None:
 
 def atomic_write_json(path: Path, data: Any, *, generations: int = BACKUP_GENERATIONS) -> None:
     """Write `data` atomically, then rotate generation backups. Caller holds the lock."""
+    atomic_write_text(path, json.dumps(data, indent=2, ensure_ascii=False),
+                      generations=generations)
+
+
+def atomic_write_text(
+    path: Path,
+    payload: str,
+    *,
+    generations: int = BACKUP_GENERATIONS,
+    newline: Optional[str] = None,
+) -> None:
+    """Write `payload` atomically (same-directory temp, flush + fsync, os.replace), then
+    rotate generation backups. Caller holds the lock."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, indent=2, ensure_ascii=False)
     tmp = path.with_name(f"{path.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
-        with open(tmp, "w", encoding="utf-8") as fh:
+        with open(tmp, "w", encoding="utf-8", newline=newline) as fh:
             fh.write(payload)
             fh.flush()
             os.fsync(fh.fileno())
@@ -329,6 +444,11 @@ def update_json(
         result = mutate(state)
         after = count(state)
         if not allow_shrink and after < before - max(SHRINK_FLOOR, int(SHRINK_FRACTION * before)):
+            log.error(
+                "state_store: REFUSED to save %s: %d -> %d entries; the file on disk (the "
+                "previous version) is kept. Pass allow_shrink=True for a real delete.",
+                path, before, after,
+            )
             raise StateShrinkRefused(
                 f"refusing to save {path.name}: {before} -> {after} entries "
                 "(use an explicit delete/prune to shrink)"
