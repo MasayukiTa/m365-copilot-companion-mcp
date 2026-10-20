@@ -299,7 +299,6 @@ def _drive(tmp_path, monkeypatch, settings_text):
                               transcript_dir=str(tmp_path / "fleet" / "transcripts"))
     finally:
         TA._restore_worker(orig)
-        RelayWorker.attach = inner
     return {"admitted": admitted, "built": built,
             "results": [{"name": r.get("name"), "outcome": r.get("outcome"),
                          "goal": r.get("goal")} for r in res]}
