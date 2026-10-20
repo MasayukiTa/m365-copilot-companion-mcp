@@ -139,3 +139,15 @@ def test_check_command_prints_the_grade(made, tmp_path, capsys):
     f.write_text("\n".join("%s=%d" % (k, v) for k, v in g["expected"].items()), encoding="utf-8")
     assert D.main(["check", "--root", root, "--goal", g["goal_id"], "--final", str(f)]) == 0
     assert json.loads(capsys.readouterr().out.strip().splitlines()[-1])["ok"] == 6
+
+
+def test_parse_answer_prefers_whole_answer_lines_over_numbers_quoted_in_prose():
+    """A merge worker's final answer repeats station names with OTHER numbers in a breakdown line
+    ('threshold: S07=5411, S08=5413'). 'The last value wins' then replaced the answers (0/6 and a
+    false 'merge loss' of 6 in run 07a_s14, whose answer lines were all correct)."""
+    text = "S07=57272\nS08=57514\n\n取得状況: 完了\nthreshold 内訳: S07=5411, S08=5413\nDONE"
+    assert D.parse_answer(text) == {"S07": 57272, "S08": 57514}
+    # a correction on its own line still wins over the earlier answer line
+    assert D.parse_answer("S07=1\nS07=2") == {"S07": 2}
+    # no whole-line answers at all: fall back to the in-text pairs
+    assert D.parse_answer("結果は S07=5 と S08=6") == {"S07": 5, "S08": 6}

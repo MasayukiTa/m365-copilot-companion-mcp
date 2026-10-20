@@ -316,10 +316,16 @@ def verify_data(root):
 _ITEM_LINE = re.compile(r"([A-Za-z][A-Za-z0-9_\-]*)\s*[=＝]\s*(-?[0-9][0-9,]*)")
 
 
+_WHOLE_LINE = re.compile(r"^\s*([A-Za-z][A-Za-z0-9_\-]*)\s*[=＝]\s*(-?[0-9][0-9,]*)\s*$", re.MULTILINE)
+
+
 def parse_answer(text):
-    """{name: int} from `name=integer` lines. The LAST value given for a name wins."""
+    """{name: int} from `name=integer`. Lines that hold only that pair are the answer lines and are
+    preferred (a breakdown line such as 'threshold: S07=5411, S08=5413' must not replace them); the
+    in-text pairs are used only when no whole line exists. The LAST value given for a name wins."""
     out = {}
-    for name, num in _ITEM_LINE.findall(text or ""):
+    pairs = _WHOLE_LINE.findall(text or "") or _ITEM_LINE.findall(text or "")
+    for name, num in pairs:
         try:
             out[name] = int(num.replace(",", ""))
         except ValueError:

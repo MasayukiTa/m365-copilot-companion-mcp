@@ -167,3 +167,19 @@ def test_collect_and_report_end_to_end(tmp_path, capsys):
     text = open(os.path.join(root, "analysis", "report.md"), encoding="utf-8").read()
     assert "INSUFFICIENT" in text                      # one campaign: far under the 20 the K2 rule asks for
     assert "complete pairs: 1" in text and "where fan-out split" in text
+
+
+def test_rows_of_the_next_run_inside_the_ledger_slack_are_not_pulled_in(tmp_path):
+    """Runs start one after another; the slack that waits for late outcome rows (180 s) reaches into the
+    next run, whose workers carry the same names (w1 ...). Its calls were counted as this run's
+    duplicates (a 17.8 s command of a LATER series run showed up in an earlier tree run)."""
+    root, ledger = str(tmp_path), str(tmp_path / "ledger.jsonl")
+    label = "01a_s01_r1_on"
+    sd = _write_run(root, label, ledger)
+    rows = [json.loads(x) for x in open(ledger, encoding="utf-8")]
+    rows += _call(98, "w3", 1350.0, "shell_exec", "AAAA", 17.8)         # starts at 1350: the next run
+    _jl(ledger, rows)
+    run = {"label": label, "pair_id": "s01#1", "goal_id": "s01", "arm": "on", "state_dir": sd}
+    fin = _finished(root, label, "on")
+    assert C.run_record(run, _goal(), fin, ledger)["dup_calls"] == 3          # without the bound: the bug
+    assert C.run_record(run, _goal(), fin, ledger, stop_at=1310.0)["dup_calls"] == 2
