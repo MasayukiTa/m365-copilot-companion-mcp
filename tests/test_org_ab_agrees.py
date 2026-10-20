@@ -54,9 +54,10 @@ def test_the_popup_has_the_control_the_parser_and_the_each_gate_timing_word():
     assert "SaveKey(OrgAbView.Key" in src
     assert 'ln.StartsWith("org_ab=")' in src
     assert src.count('case "org_ab":') == 1
-    # org_ab must sit in the each_gate arm, immediately after org_proposals (its sibling that
-    # also re-reads per run) -- NOT in the sweep_start arm next to org_shadow_eval.
-    assert re.search(r'case "org_proposals":\s*case "org_ab":', src)
+    # org_ab must sit in the each_gate arm, ahead of relay_findings and team_mode (the neighbour
+    # test for org_proposals needs team_mode, org_proposals and fanout_max_depth contiguous, so
+    # org_ab cannot sit between them) -- NOT in the sweep_start arm next to org_shadow_eval.
+    assert re.search(r'case "org_ab":\s*case "relay_findings":\s*case "team_mode":', src)
     assert not re.search(r'case "org_shadow_eval":\s*case "org_ab":', src)
     assert "orgAbBox" in _read("scripts", "win", "set_setting_via_ui.ps1")
 
