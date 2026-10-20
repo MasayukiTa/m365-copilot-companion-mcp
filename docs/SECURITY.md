@@ -27,7 +27,7 @@
 | 層 | 仕組み | 失敗時 |
 |---|---|---|
 | **認証** | 固定 Bearer トークン（`MCP_API_KEY`、40 桁のランダム hex） | 401 Unauthorized |
-| **場所の認可** | 全ファイルアクセスは `_validate_path` を通過。`MCP_ALLOWED_BASE` 配下以外はブロック | `PermissionError` |
+| **場所の認可** | 全ファイルアクセスは `_validate_path` を通過。既定は PC 全体。`MCP_ALLOWED_BASE` を設定した場合は、その配下以外をブロック | `PermissionError` |
 | **行為の認可** | 書込 / 実行系は `require_unlocked()` を呼ぶ。`X-Forwarded-For` か socket peer から取った IP をホワイトリストと突き合わせ（TTL あり） | "locked" メッセージで `unlock(password)` を要求 |
 
 ---
@@ -53,7 +53,7 @@
   アイドル時に再起動すると文面が揃う。`0` の間は `.setup/logs/access.log` に `UNLOCK_SWITCH` 行（状態遷移・起動時・
   5 分ごとの通過件数）が残る。**`0` はゲート全廃であり、API キーを持つ者は誰でも書込・実行系を使える**（セキュリティは後で）。
 - `127.0.0.1` / `::1` は自動的に信頼（ローカル開発用）。
-- ODBC は `readonly=True` で接続し、`SELECT / WITH / EXEC / SHOW / DESCRIBE` のみ許可。
+- ODBC は読み取り専用を強制しない。できることは DB アカウントの権限が決める。`MCP_DB_READONLY=1` を設定した場合だけ、`SELECT / WITH / EXEC / SHOW / DESCRIBE` のみ許可する。
 - DB 認証は Windows / Entra 統合認証なので、エージェントは **あなたの既存権限の範囲でしか SQL を投げられません**。DBA への新規アカウント申請は不要。
 - Bearer キーのローテーションは `.env` 編集 → 再起動だけ（`rotate_secrets.bat`）。古いキーは即死。
 - unlock した IP は `MCP_UNLOCK_TTL_DAYS` 日間（既定 30 日）解錠されます。Copilot Studio バックエンド経由だと送信元 IP が変わることがあり、その都度 `unlock` を要求されますが、これは正常動作です。

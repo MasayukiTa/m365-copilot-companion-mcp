@@ -9,7 +9,7 @@
     "bench/companionbench/runner.py": "e14f81439d6905e28f6d0493023e16c114a85fa8e76d1c589ee92e14d6f13b97",
     "bench/evalhost_batch_grade.py": "c8337b6b1530fd845803dffb88f3f5b61b8239c845ac837ce5c13331685ccade",
     "bench/swe_grade_swebench.py": "c37bfb68be6166e5fa3ce4fff7884a85e50b168a60ab504801c46a686cca2724",
-    "docs/SECURITY.md": "c4113d857abaadb2c81d24c73b64b70708508f6c52c487e3a67d3953248057b7",
+    "docs/SECURITY.md": "ce7ec3c59f7107c820992674108dda5b62269810c38a037379768d6d144df431",
     "relay/selfimprove/authority_ledger.py": "82c365a34fc13c7e910724859be7819ce9fcd48a276e2d4fa4c8688555c95621",
     "relay/selfimprove/decision.py": "a92fc06ca9f5ea51f5aac47c2aeaf93ed7cf66d2bf8068e2b39df976894c3f5c",
     "relay/selfimprove/frozen.py": "f2d2cfc3bc886a4f57e560176f0111b6d00ad31bdd1d4d220c3cf40758f158b0",
