@@ -75,7 +75,16 @@ THREE-VALUED METRICS. Each of `success` and `turns` is "good", "poor" or "unknow
 `confidence` is "unknown" (n < min-n), "low" (n < 4 * min-n) or "adequate". The numbers are
 still printed when the label is unknown, so a reader can see what was too thin to judge.
 
-  python scripts/capability_profile.py [--fleet-dir .fleet] [--min-n 5]
+SECOND AXIS: KIND OF WORK (slice D0). With `--by kind` (derive(with_kind=True)) every record
+also gets a `kind` from relay/task_kind.py; without it the module is not even imported,
+derived from its goal text (a child or aggregator takes the goal of the family it belongs to).
+The existing kinds were measured and cannot serve: job types are all `fleet_goal`, the split
+verdict is not stored per run, and solo/parent/child/aggregator is the role. `profiles_by_kind`
+(role -> kind -> the same entry, same --min-n and confidence rules, no tool mix) and
+`kind_coverage` are then in the JSON, and the text prints the (role, kind) table. A goal no rule
+recognises is "unknown". Nothing is written; no runtime module imports the kind module.
+
+  python scripts/capability_profile.py [--fleet-dir .fleet] [--min-n 5] [--by role|kind]
                                        [--success-good 0.8] [--turns-good 12]
                                        [--format both|json|text]
 """
@@ -218,16 +227,22 @@ def load_profiles(fleet_dir, min_n=DEFAULT_MIN_N):
 
 # --------------------------------------------------------------------------- records
 
-def build_records(workers, camp_rows, history, effort_by_run):
+def build_records(workers, camp_rows, history, effort_by_run, kind_of=None):
     """One flat list of run records from all sources, each counted once.
 
     A record has: role, outcome, turn (or None), source, effort (or None), and the ids used for
     tool-call attribution (jid, task_id, run_id, name)."""
     records = []
+    kind_of = kind_of or (lambda _goal: None)       # no kind unless the report asks for it
     seen_runs, seen_children, seen_merge_campaigns = set(), set(), set()
+    # The goal of a fan-out family, by campaign id: a child or an aggregator has no goal of its
+    # own in the ledger, and the kind of work it did is the kind of the goal that was split.
+    family_goal = {str(r["campaign_id"]): r.get("goal") for r in camp_rows
+                   if r.get("kind") == "campaign" and r.get("campaign_id") is not None}
     for w in workers:
         rec = dict(w)
         rec["source"] = SRC_STATUS
+        rec["kind"] = kind_of(w.get("goal") or family_goal.get(str(w.get("campaign_id"))))
         rec["effort"] = effort_by_run.get((str(w.get("run_id") or ""), str(w.get("name") or ""))) \
             if w.get("run_id") else None
         records.append(rec)
@@ -245,7 +260,7 @@ def build_records(workers, camp_rows, history, effort_by_run):
             continue
         records.append({"role": ROLE_PRODUCER, "outcome": e.get("outcome"), "turn": e.get("turn"),
                         "run_id": run, "name": name, "jid": e.get("jid"),
-                        "source": SRC_HISTORY,
+                        "source": SRC_HISTORY, "kind": kind_of(e.get("goal")),
                         "effort": effort_by_run.get((run, name)) if run else None})
 
     children = {}
@@ -257,7 +272,8 @@ def build_records(workers, camp_rows, history, effort_by_run):
             continue        # status.json knows this child; it wins
         records.append({"role": ROLE_SUBTASK, "outcome": r.get("outcome"), "turn": None,
                         "task_id": r.get("task_id"), "campaign_id": cid,
-                        "source": SRC_CHILD, "effort": None})
+                        "source": SRC_CHILD, "effort": None,
+                        "kind": kind_of(family_goal.get(cid))})
 
     merges = {}
     for r in camp_rows:
@@ -270,7 +286,8 @@ def build_records(workers, camp_rows, history, effort_by_run):
         if cid in seen_merge_campaigns:
             continue
         records.append({"role": ROLE_AGGREGATOR, "outcome": outcome, "turn": None,
-                        "campaign_id": cid, "source": SRC_MERGE, "effort": None})
+                        "campaign_id": cid, "source": SRC_MERGE, "effort": None,
+                        "kind": kind_of(family_goal.get(cid))})
     return records
 
 
@@ -321,29 +338,43 @@ def _success_rate(outcomes):
 
 def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
            success_good=DEFAULT_SUCCESS_GOOD, turns_good=DEFAULT_TURNS_GOOD,
-           history=None, effort_by_run=None):
-    records = build_records(workers, camp_rows, history or [], effort_by_run or {})
+           history=None, effort_by_run=None, with_kind=False):
+    kind_of = None
+    unknown_kind = "unknown"
+    if with_kind:
+        # Imported here, not at module top: load_profiles (the runtime reader in
+        # relay/load_routing.py) shares this module and must never load the kind module.
+        from relay import task_kind as TK
+        kind_of, unknown_kind = TK.task_kind, TK.UNKNOWN
+    records = build_records(workers, camp_rows, history or [], effort_by_run or {}, kind_of)
     groups = {}
 
     def grp(name):
         return groups.setdefault(name, {"outcomes": [], "turns": [], "tools": {}, "effort": {}})
 
     sources = {}
+    by_kind = {}        # (group, kind) -> same shape as a group, without tools
     for w in records:
         outcome = str(w.get("outcome") or "").upper()
         g = grp(group_of(w))
         sources[w["source"]] = sources.get(w["source"], 0) + 1
         if outcome:
-            g["outcomes"].append(outcome)
+            targets = [g]
+            if with_kind:
+                targets.append(by_kind.setdefault(
+                    (group_of(w), w.get("kind") or unknown_kind),
+                    {"outcomes": [], "turns": [], "tools": {}, "effort": {}}))
             has_turn = _is_num(w.get("turn"))
-            if has_turn:
-                g["turns"].append(w["turn"])
-            if w["source"] in (SRC_STATUS, SRC_HISTORY):   # the ledger rows have no policy
-                e = g["effort"].setdefault(w.get("effort") or NO_EFFORT,
-                                           {"outcomes": [], "turns": []})
-                e["outcomes"].append(outcome)
+            for tg in targets:
+                tg["outcomes"].append(outcome)
                 if has_turn:
-                    e["turns"].append(w["turn"])
+                    tg["turns"].append(w["turn"])
+                if w["source"] in (SRC_STATUS, SRC_HISTORY):   # the ledger rows have no policy
+                    e = tg["effort"].setdefault(w.get("effort") or NO_EFFORT,
+                                                {"outcomes": [], "turns": []})
+                    e["outcomes"].append(outcome)
+                    if has_turn:
+                        e["turns"].append(w["turn"])
 
     by_task, by_run_name = _attribution_maps(records)
     unattributed = 0
@@ -370,9 +401,7 @@ def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
         t = grp(name)["tools"]
         t[tool] = t.get(tool, 0) + 1
 
-    out = {}
-    for name in sorted(groups):
-        g = groups[name]
+    def entry_of(g, with_tools):
         n = len(g["outcomes"])
         rate = _success_rate(g["outcomes"])
         nt = len(g["turns"])
@@ -386,17 +415,31 @@ def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
             "turns": {"mean": mean_turns, "n": nt,
                       "label": label_cost(mean_turns, nt, min_n, turns_good)},
             "outcomes": dict(sorted(counts.items())),
-            "tool_calls": sum(g["tools"].values()),
-            "tool_mix": _tool_mix(g["tools"]),
             "confidence": confidence(n, min_n),
         }
+        if with_tools:
+            entry["tool_calls"] = sum(g["tools"].values())
+            entry["tool_mix"] = _tool_mix(g["tools"])
         if g["effort"]:
             entry["by_effort_reached"] = {
                 lvl: {"n": len(e["outcomes"]), "success_rate": _success_rate(e["outcomes"]),
                       "mean_turns": (sum(e["turns"]) / len(e["turns"])) if e["turns"] else None}
                 for lvl, e in sorted(g["effort"].items())}
-        out[name] = entry
-    return {"note": NOTE,
+        return entry
+
+    out = {name: entry_of(groups[name], True) for name in sorted(groups)}
+    # Second axis (slice D0): the same entry per (role, kind of work). Tool calls are not split
+    # by kind: a call row carries no goal, so attributing it to a kind would be a guess.
+    kinds = {}
+    for (name, kind) in sorted(by_kind):
+        kinds.setdefault(name, {})[kind] = entry_of(by_kind[(name, kind)], False)
+    coverage = {}
+    for (name, kind), g in by_kind.items():
+        coverage[kind] = coverage.get(kind, 0) + len(g["outcomes"])
+    extra = {"profiles_by_kind": kinds,
+             "kind_coverage": dict(sorted(coverage.items()))} if with_kind else {}
+    return {**extra,
+            "note": NOTE,
             "identity": "role (producer / subtask / aggregator); an explicit profile field wins",
             "thresholds": {"min_n": min_n, "success_good": success_good,
                            "turns_good": turns_good},
@@ -410,7 +453,7 @@ def _f(v, nd=2):
     return "n/a" if v is None else ("%.*f" % (nd, v))
 
 
-def render_text(rep, n_transcripts=0):
+def render_text(rep, n_transcripts=0, by="role"):
     t = rep["thresholds"]
     lines = ["# Capability profile (min n %d, success good >= %s, turns good <= %s)"
              % (t["min_n"], _f(t["success_good"]), _f(t["turns_good"])), "# " + rep["note"],
@@ -435,6 +478,18 @@ def render_text(rep, n_transcripts=0):
             for lvl, e in p.get("by_effort_reached", {}).items():
                 lines.append("    effort reached %-16s runs %5d success %s turns %s"
                              % (lvl, e["n"], _f(e["success_rate"]), _f(e["mean_turns"], 1)))
+    if by == "kind":
+        lines.append("# kind of work (relay/task_kind.py, derived from the goal text); "
+                     "coverage: " + ", ".join(
+                         "%s %d" % (k, v) for k, v in rep.get("kind_coverage", {}).items()))
+        lines.append("%-14s %-12s %6s %8s %-8s %7s %-8s %-10s"
+                     % ("role", "kind", "runs", "success", "", "turns", "", "confidence"))
+        for role, kinds in rep.get("profiles_by_kind", {}).items():
+            for kind, p in kinds.items():
+                lines.append("%-14s %-12s %6d %8s %-8s %7s %-8s %-10s" % (
+                    role[:14], kind, p["n_runs"], _f(p["success"]["rate"]),
+                    p["success"]["label"], _f(p["turns"]["mean"], 1), p["turns"]["label"],
+                    p["confidence"]))
     lines.append("# unattributed tool calls: %d; transcript files: %d"
                  % (rep["unattributed_tool_calls"], n_transcripts))
     return "\n".join(lines) + "\n"
@@ -448,18 +503,21 @@ def main(argv=None):
     ap.add_argument("--success-good", type=float, default=DEFAULT_SUCCESS_GOOD)
     ap.add_argument("--turns-good", type=float, default=DEFAULT_TURNS_GOOD)
     ap.add_argument("--format", choices=("both", "json", "text"), default="both")
+    ap.add_argument("--by", choices=("role", "kind"), default="role",
+                    help="kind: also print the profile per (role, kind of work)")
     args = ap.parse_args(argv)
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     events, workers, camps, n_tr, history, effort, unreadable = load_all(fleet_dir)
     rep = derive(events, workers, camps, min_n=args.min_n, success_good=args.success_good,
-                 turns_good=args.turns_good, history=history, effort_by_run=effort)
+                 turns_good=args.turns_good, history=history, effort_by_run=effort,
+                 with_kind=args.by == "kind")
     if unreadable:
         rep["unreadable"] = unreadable
     out = []
     if args.format in ("both", "json"):
         out.append(json.dumps(rep, ensure_ascii=False, indent=2, sort_keys=True) + "\n")
     if args.format in ("both", "text"):
-        out.append(render_text(rep, n_tr))
+        out.append(render_text(rep, n_tr, by=args.by))
     text = "".join(out)
     try:
         sys.stdout.write(text)

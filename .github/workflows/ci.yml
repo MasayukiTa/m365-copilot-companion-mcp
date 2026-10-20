@@ -908,6 +908,7 @@ jobs:
             scripts/test_sibling_dup_report.py \
             scripts/test_ab_compare.py \
             scripts/test_capability_profile.py \
+            scripts/test_task_kind.py \
             scripts/test_load_routing_report.py \
             scripts/test_team_formation_report.py \
             bench/test_attempt_budget.py \
