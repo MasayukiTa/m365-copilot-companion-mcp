@@ -314,6 +314,7 @@ jobs:
             scripts/test_each_edge_profile_is_its_own_sign_in.py \
             scripts/test_nothing_new_is_invisible.py \
             scripts/test_a_leftover_tab_is_not_a_locked_door.py \
+            scripts/test_a_leftover_wall_tab_does_not_contradict_the_session.py \
             scripts/test_a_silent_death_leaves_its_exit_code.py \
             scripts/test_a_runner_that_dies_before_argparse_is_recorded.py \
             scripts/test_supervisor_reresolves_python.py \

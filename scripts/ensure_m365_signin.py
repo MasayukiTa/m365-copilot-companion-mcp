@@ -113,10 +113,75 @@ def _bare(url: str) -> str:
         return "(unparseable url)"
     if not p.scheme and not p.netloc:
         return "(unparseable url)"
+    if not p.netloc:
+        return "%s:%s" % (p.scheme, p.path)       # about:blank, not about://blank
     return "%s://%s%s" % (p.scheme, p.netloc, p.path)
 
 
-def state(port: int):
+def _is_m365_page(url: str) -> bool:
+    """An M365 / Copilot page, by host and path only (the query is somebody else's business)."""
+    try:
+        p = urllib.parse.urlsplit(url or "")
+    except Exception:
+        return False
+    return bool(re.search(r"m365|copilot", (p.netloc or "") + (p.path or ""), re.I))
+
+
+def _bridge_session_live(status_url: str) -> bool:
+    """Does the bridge itself say its session works? GET /status "socket_live" (open route).
+
+    True means a socket driver exists that has not failed: a token was captured and the route is
+    carrying the conversation -- the only evidence that does not come from a tab URL. A bridge
+    that predates the field is judged by its "transport" ("socket"). A bridge that reports it is
+    stuck on a sign-in page (signin_wall) proves nothing. Anything unreadable is "no proof".
+    """
+    if not status_url:
+        return False
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+    try:
+        with opener.open(status_url, timeout=5) as r:
+            body = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception:
+        return False
+    if not isinstance(body, dict) or body.get("signin_wall") is True:
+        return False
+    if "socket_live" in body:
+        return body.get("socket_live") is True
+    return body.get("transport") == "socket"
+
+
+def _status_url_for(port: int) -> str:
+    """The bridge's /status when `port` is the bridge's browser, else "" (no bridge to ask).
+    Same two settings start_bridge.ps1 reads: MCP_BRIDGE_CDP_PORT (9223) and MCP_BRIDGE_PORT (8765)."""
+    try:
+        cdp = int(os.environ.get("MCP_BRIDGE_CDP_PORT") or 9223)
+        web = int(os.environ.get("MCP_BRIDGE_PORT") or 8765)
+    except ValueError:
+        return ""
+    return "http://127.0.0.1:%d/status" % web if int(port) == cdp else ""
+
+
+def _conflict_reason(port, urls, walls, settled, m365, live) -> str:
+    """The reason for "cannot tell" when the tabs disagree. It lists everything it saw -- tab
+    count and every tab as scheme://host/path, query removed (it carries login_hint=, an e-mail
+    address) -- so the next occurrence names itself instead of being guessed at."""
+    def kind(u):
+        if u in walls:
+            return "sign-in page"
+        if u in settled:
+            return "settled M365 page"
+        if u in m365:
+            return "M365 page still mid-authentication"
+        return "other"
+    listing = "; ".join("%s: %s" % (kind(u), _bare(u)) for u in urls)
+    return ("conflicting evidence on :%s, %d tab(s) [%s]; the bridge %s, so nothing proves "
+            "whether this browser is signed in" % (
+                port, len(urls), listing,
+                "reports a live session but no settled M365 page is open" if live
+                else "does not report a live session"))
+
+
+def state(port: int, status_url: str = None):
     """(ready, reason).
 
     ready=None means "cannot tell" -- the browser is unreachable. That is a THIRD answer, not a
@@ -127,6 +192,8 @@ def state(port: int):
     the fleet is websocket-driven and opens no tabs, so a signed-in machine shows none. Deciding
     from that is what made this surface the window on a machine that was already signed in.
     """
+    if status_url is None:
+        status_url = _status_url_for(port)
     t = tabs(port)
     if t is None:
         # NOT "companion Edge". This function is asked about :9223 (the bridge) and :9224 (the
@@ -135,7 +202,36 @@ def state(port: int):
         return None, "no Edge is answering on :%d" % port
     urls = [x.get("url") or "" for x in t]
     walls = [u for u in urls if _is_wall(u) and not _is_residue(u)]
+    # M365 PAGES ARE JUDGED BY HOST AND PATH, NEVER BY THE QUERY. The authorize endpoint's own
+    # query carries redirect_uri=https://m365.cloud.microsoft/..., so matching "m365|copilot" on
+    # the whole URL made a sign-in page count as an M365 page -- evidence of being signed in.
+    # A wall is never an app page, whatever its query says.
+    m365 = [u for u in urls if _is_m365_page(u) and u not in walls]
+    settled = [u for u in m365 if not MID_AUTH_RE.search(u)]
     if walls:
+        # A WALL-LOOKING TAB IS NOT ALWAYS A DOOR (2026-10-20, a colleague's PC: the doctor said
+        # "a sign-in page is open: https://login.microsoftonline.com/common/oauth2/v2.0/authorize"
+        # for as long as it was run, after the sign-in had been completed). The authorize
+        # endpoint stays open as a background tab after an authentication that finished, and
+        # it is the transient URL of a silent token request that is still in flight. The old
+        # code let ANY such tab outvote everything else, so one stale tab made the whole
+        # browser "not signed in" -- and start_bridge.ps1 read that and brought the window to the
+        # front again and again.
+        #
+        # THREE CASES, AND THE THIRD IS NOT A GUESS:
+        #   * nothing but the wall (no app page, no proof of a live session): a person is needed.
+        #   * the browser's own pages disagree (a settled app page next to a wall, or a page still
+        #     mid-authentication next to one): "cannot tell", with the tab list, because telling
+        #     somebody to sign in when they just did is the wrong instruction.
+        #   * the bridge itself reports a working session (GET /status socket_live) next to a
+        #     settled app page: the wall is a leftover, and the session is signed in.
+        live = _bridge_session_live(status_url)
+        if settled and live:
+            return True, ("an M365 page is open and the bridge reports a live session, so the "
+                          "sign-in page(s) left open (%s) are leftovers"
+                          % ", ".join(sorted({_bare(u) for u in walls})))
+        if settled or m365 or live:
+            return None, _conflict_reason(port, urls, walls, settled, m365, live)
         # NAME THE TAB. "a sign-in page is open" is not enough to act on, and on 2026-09-23 it
         # was the whole of what the operator's screen said while the same FAIL kept coming back
         # on a machine this box cannot reproduce. Which URL it is settles what the person is
@@ -146,13 +242,12 @@ def state(port: int):
         # (the account's e-mail address) and assorted state tokens, and this line is printed on
         # a console and pasted into screenshots.
         return False, "a sign-in page is open: %s" % ", ".join(sorted({_bare(u) for u in walls}))
-    m365 = [u for u in urls if re.search(r"m365|copilot", u, re.I)]
     if m365:
         # AN M365 TAB IS NOT PROOF ON ITS OWN. If every m365 tab is still on an
         # authentication-in-progress URL (account picker, consent bounce, CsrToSSR), we have
         # not reached the app -- reporting "signed in" here is the false positive #2 is about.
         # Only a settled m365/copilot URL counts.
-        if all(MID_AUTH_RE.search(u) for u in m365):
+        if not settled:
             return None, "an M365 tab is open but still mid-authentication, so nothing to confirm yet"
         return True, "an M365 page is open, past any sign-in wall and not mid-authentication"
     # AUTH-HOST TABS THAT ARE ONLY RESIDUE. Reached when nothing above decided: no wall, no
@@ -375,7 +470,7 @@ def bridge_signin_decision(port: int, status_url: str = "", latch_path: str = No
     """
     now = time.time() if now is None else now
     latch_path = latch_path or _latch_path(port)
-    ready, why = state(port)
+    ready, why = state(port, status_url or None)
     if ready is True:
         rearm(port, latch_path)
         return "signed_in", why
