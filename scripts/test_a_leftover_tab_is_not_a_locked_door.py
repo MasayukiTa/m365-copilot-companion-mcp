@@ -95,11 +95,12 @@ def test_a_real_wall_is_still_a_wall(monkeypatch):
     assert "login.microsoftonline.com/common/oauth2" in why
 
 
-def test_a_real_wall_outranks_a_stale_app_tab(monkeypatch):
-    """**安全側は変えない。**期限切れで古いアプリタブが残っていても、本物の壁が開いていれば
-    それは人が要る状態。ここを緩めると、働く時刻に認証エラーで落ちる。"""
+def test_a_real_wall_does_not_become_signed_in_next_to_an_app_tab(monkeypatch):
+    """**「もう大丈夫」側へは倒さない。**壁とアプリタブが並んでいて、生きたセッションの証拠が
+    無いときは、`True` にしない(2026-10-20 に `False` から `cannot_tell` へ変更。理由は
+    test_a_leftover_wall_tab_does_not_contradict_the_session.py)。"""
     ready, _ = _state(monkeypatch, [WALL, APP])
-    assert ready is False
+    assert ready is not True
 
 
 def test_the_wall_url_still_drops_its_query(monkeypatch):

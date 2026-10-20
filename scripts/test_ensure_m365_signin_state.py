@@ -102,11 +102,16 @@ def test_settled_m365_tab_wins_over_a_second_mid_auth_m365_tab(monkeypatch):
     assert ready is True, why
 
 
-def test_login_wall_beats_a_settled_m365_tab(monkeypatch):
-    # A real wall anywhere is decisive: report not-signed-in even if a stale m365 tab lingers.
+def test_login_wall_next_to_a_settled_m365_tab_is_cannot_tell_not_sign_in(monkeypatch):
+    # CHANGED 2026-10-20. A wall used to be decisive wherever it sat, so one leftover authorize
+    # tab next to the loaded app reported "sign in" for ever on a machine that had signed in
+    # (scripts/test_a_leftover_wall_tab_does_not_contradict_the_session.py has the whole story).
+    # With nothing to prove a live session the tabs disagree: that is "cannot tell", said with
+    # the tab list -- neither a confident "sign in" nor a confident "signed in".
     _patch_tabs(monkeypatch, [
         "https://m365.cloud.microsoft/chat",
         "https://login.microsoftonline.com/common/oauth2/authorize",
     ])
     ready, why = m.state(9222)
-    assert ready is False, why
+    assert ready is None, why
+    assert why.startswith("conflicting evidence"), why
