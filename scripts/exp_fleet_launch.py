@@ -90,6 +90,27 @@ def settings_problems(text):
     return ["%s=%s (found %s)" % (k, v, have.get(k)) for k, v in REQUIRED_SETTINGS.items() if have.get(k) != v]
 
 
+#: The operator's two admission floors. This checkout's settings file is private to the experiment,
+#: so a floor the operator chose in the panel is not in it, and the product default (6 GB) applied
+#: instead: 2026-10-20 an isolated run printed "admitting nothing: 5.14 GB free, floor 6.0 GB" while
+#: the panel showed 0. They are copied (values, not the file) so the run obeys the same floors.
+CARRIED_KEYS = ("disk_floor_gb", "ram_floor_mb")
+
+
+def carried_floor_lines(own_text, own_path, candidates=None):
+    """`key=value` lines for each floor the operator set elsewhere and this file lacks."""
+    from tools import settings_path as SP
+    have = {ln.split("=", 1)[0].strip() for ln in (own_text or "").splitlines() if "=" in ln}
+    out = []
+    for key in CARRIED_KEYS:
+        if key in have:
+            continue
+        found = SP.other_values(key, read_path=own_path, candidates=candidates)
+        if found:
+            out.append("%s=%s" % (key, found[0][1]))
+    return out
+
+
 def settings_body():
     return "".join("%s=%s\n" % kv for kv in REQUIRED_SETTINGS.items())
 
@@ -139,6 +160,11 @@ def cmd_prepare(a):
             fh.write(settings_body() + "".join(ln + "\n" for ln in cur.splitlines()
                                                if "=" in ln and ln.split("=", 1)[0].strip() not in REQUIRED_SETTINGS))
     print("settings:", "ok" if not settings_problems(open(path, encoding="utf-8-sig").read()) else "NOT ok")
+    carried = carried_floor_lines(open(path, encoding="utf-8-sig").read(), path)
+    if carried:
+        with open(path, "a", encoding="utf-8", newline="\n") as fh:
+            fh.write("".join(ln + "\n" for ln in carried))
+        print("floors carried from the operator's settings:", "; ".join(carried))
     from relay import profile_token as PT
     from relay import template_seed as TS
     donor = _read_url(a.donor_url_file)
