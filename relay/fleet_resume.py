@@ -1339,16 +1339,21 @@ def read_ring(path, slots=RING_SLOTS, slot_bytes=RING_SLOT_BYTES, with_slot=Fals
     return out
 
 
-def disk_status(free_bytes, total_bytes, floor_gb, sampled_ts, log_failures):
+def disk_status(free_bytes, total_bytes, floor_gb, sampled_ts, log_failures, floor_source=None):
     """status.json `disk` block. `below_floor` is None when the floor is unset/0, else the
-    plain comparison free_gb < floor_gb -- no threshold of its own."""
+    plain comparison free_gb < floor_gb -- no threshold of its own. `floor_source` (cli |
+    settings | env | default | live) says which link of the chain produced floor_gb; it is
+    carried here so a reader of only this block can tell a chosen floor from a default."""
     floor = _num(floor_gb)
     below = None
     if floor is not None and floor > 0 and free_bytes is not None:
         below = (free_bytes / GB) < floor
-    return {"free_bytes": free_bytes, "total_bytes": total_bytes,
-            "floor_gb": floor if (floor is not None and floor > 0) else None,
-            "below_floor": below, "sampled_ts": sampled_ts, "log_failures": log_failures}
+    blk = {"free_bytes": free_bytes, "total_bytes": total_bytes,
+           "floor_gb": floor if (floor is not None and floor > 0) else None,
+           "below_floor": below, "sampled_ts": sampled_ts, "log_failures": log_failures}
+    if floor_source is not None:
+        blk["floor_source"] = floor_source
+    return blk
 
 
 # --------------------------------------------------------------------------- fault log

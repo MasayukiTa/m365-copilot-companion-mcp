@@ -2842,6 +2842,87 @@ def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=None):
 # (env SWE_DISK_FLOOR_GB, default 6; the cockpit can write it later) because "always keep N GB
 # free" is a safety/usability win for normal use too, not just the bench.
 DEFAULT_DISK_FLOOR_GB = float(os.environ.get("SWE_DISK_FLOOR_GB", "6"))
+
+# ── WHERE EACH FLOOR CAME FROM ────────────────────────────────────────────────────────────────
+# The chain is CLI flag > settings.txt > env > default, and the number that wins used to be the
+# only thing anyone could see. An experiment fleet started from a worktree read a settings file
+# that had no floor line, applied the default 6 GB, and refused all work while the panel (reading
+# the main checkout's file) showed 0. One store, written by relay/fleet_runner.py where the chain
+# is resolved and by the live paths that change a floor later, read by the block message here
+# and by status.json, so the log, the toast and the cockpit cannot tell different stories.
+FLOOR_PROVENANCE = {}
+#: kind -> (settings key, command-line flag, env var or None)
+_FLOOR_NAMES = {"disk": ("disk_floor_gb", "--disk-floor-gb", "SWE_DISK_FLOOR_GB"),
+                "ram": ("ram_floor_mb", "--ram-floor-mb", None)}
+
+
+def set_floor_provenance(kind, source, detail=""):
+    """Record that the live `kind` floor ("disk"|"ram") now comes from `source`
+    (cli|settings|env|default|live). `detail` is free text such as the file read."""
+    FLOOR_PROVENANCE[kind] = {"source": source, "detail": str(detail or "")}
+
+
+def floor_source(kind):
+    """cli|settings|env|default|live. When nothing recorded it (a launcher that is not
+    fleet_runner), what the module itself did: env if the variable is set, else default."""
+    rec = FLOOR_PROVENANCE.get(kind)
+    if rec:
+        return rec["source"]
+    env = _FLOOR_NAMES[kind][2]
+    return "env" if env and env in os.environ else "default"
+
+
+def floor_source_text(kind):
+    """The source in words a person can act on, e.g. 'default: no disk_floor_gb in settings'."""
+    key, flag, env = _FLOOR_NAMES[kind]
+    src = floor_source(kind)
+    detail = (FLOOR_PROVENANCE.get(kind) or {}).get("detail", "")
+    if src == "default":
+        return "default: no %s in settings%s" % (key, (" -- " + detail) if detail else "")
+    if src == "settings":
+        return "settings.txt" + ((": " + detail) if detail else "")
+    if src == "cli":
+        return "command line %s" % flag
+    if src == "env":
+        return "environment %s" % env
+    return "live command from the cockpit"
+
+
+def _same_number(a, b):
+    try:
+        return abs(float(a) - float(b)) < 0.05
+    except (TypeError, ValueError):
+        return False
+
+
+def floor_warning(kind, applied, read_path=None, candidates=None):
+    """'' when nothing disagrees, else one WARNING line naming the file whose value differs.
+
+    Two disagreements are looked for: a settings file at a location this process did NOT read
+    carrying another number (the worktree/APPDATA split), and the file this process DID read
+    carrying another number than the one applied (a flag or the default beat the file). A live
+    cockpit command is the operator's own later choice, so it is not compared against the file.
+    Never raises.
+    """
+    try:
+        from tools import settings_path as _sp
+        key = _FLOOR_NAMES[kind][0]
+        src = floor_source(kind)
+        read = read_path or _sp.settings_file()
+        msgs = []
+        for p, raw in _sp.other_values(key, read_path=read, candidates=candidates):
+            if not _same_number(raw, applied):
+                msgs.append("%s has %s=%s but this process read %s" % (p, key, raw, read))
+        if src not in ("settings", "live"):
+            mine = _sp.read_key(read, key)
+            if mine is not None and not _same_number(mine, applied):
+                msgs.append("%s has %s=%s but %s applies" % (read, key, mine, src))
+        if not msgs:
+            return ""
+        return ("WARNING: applied %s floor %g (%s) differs from the panel's setting: %s"
+                % (kind, float(applied), src, "; ".join(msgs)))
+    except Exception:
+        return ""
 # Disk a single not-yet-started eval is assumed it MIGHT consume before its own per-instance
 # cleanup reclaims it (image layers etc.). Used to look ahead so we never open a tab that would
 # itself push C: under the floor. Env-tunable; conservative default. 0 disables look-ahead.
@@ -3070,6 +3151,10 @@ def _note_disk_defer(floor_gb, waiting, notify=None, now=None):
         # actually decides, already distinguishes them with `is None`; this is the sentence a
         # person reads, and it was the one that lied.
         floor = float(DEFAULT_DISK_FLOOR_GB if floor_gb is None else floor_gb)
+        # WHERE THE NUMBER CAME FROM, on the line that reports it: the block used to name only
+        # the winner, so a floor the panel did not show looked like a floor the panel set.
+        source_text = floor_source_text("disk")
+        warning = floor_warning("disk", floor)
 
         if _DISK_DEFER_SINCE[0] <= 0.0:
             _DISK_DEFER_SINCE[0] = now
@@ -3077,9 +3162,12 @@ def _note_disk_defer(floor_gb, waiting, notify=None, now=None):
 
         if now - _DISK_DEFER_LAST[0] >= DISK_DEFER_NOTICE_S:
             _DISK_DEFER_LAST[0] = now
-            print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB -- %d goal(s) "
-                  "waiting for %.0f min. Free disk; lowering the floor turns this refusal into "
-                  "a crash." % (free, floor, waiting, blocked_for / 60.0), flush=True)
+            print("[fleet] admitting nothing: %.2f GB free on C:, floor %.1f GB (%s) -- %d "
+                  "goal(s) waiting for %.0f min. Free disk; lowering the floor turns this "
+                  "refusal into a crash."
+                  % (free, floor, source_text, waiting, blocked_for / 60.0), flush=True)
+            if warning:
+                print("[fleet] " + warning, flush=True)
 
         if blocked_for < DISK_DEFER_ALERT_AFTER_S:
             return
@@ -3091,8 +3179,9 @@ def _note_disk_defer(floor_gb, waiting, notify=None, now=None):
             from tools.notify_ops import notify_desktop as notify
         notify("Fleet is admitting nothing",
                "%d goal(s) have been waiting %.0f minutes: C: has %.2f GB free and the floor "
-               "is %.1f GB. Free disk to let them start."
-               % (waiting, blocked_for / 60.0, free, floor))
+               "is %.1f GB (%s). Free disk to let them start.%s"
+               % (waiting, blocked_for / 60.0, free, floor, source_text,
+                  (" " + warning) if warning else ""))
     except Exception:
         pass
 

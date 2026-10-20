@@ -97,6 +97,73 @@ def settings_file_for_write() -> str:
     return NEW_PATH
 
 
+def main_checkout_root(repo: str | None = None) -> str | None:
+    """The main checkout's root when `repo` is a LINKED git worktree, else None.
+
+    A worktree has its own `.config/`, and `.config` is not tracked, so a fleet started from a
+    worktree reads a settings file the operator never touched while the panel edits the main
+    checkout's. Resolved from the `.git` pointer file alone (no subprocess): its `gitdir:` line
+    names <main>/.git/worktrees/<name>, and that directory's `commondir` names <main>/.git.
+    """
+    repo = repo or REPO
+    try:
+        pointer = os.path.join(repo, ".git")
+        if not os.path.isfile(pointer):
+            return None
+        with open(pointer, encoding="utf-8") as fh:
+            line = fh.read().strip()
+        if not line.startswith("gitdir:"):
+            return None
+        gitdir = os.path.normpath(os.path.join(repo, line.split(":", 1)[1].strip()))
+        common = ".." + os.sep + ".."
+        cfile = os.path.join(gitdir, "commondir")
+        if os.path.isfile(cfile):
+            with open(cfile, encoding="utf-8") as fh:
+                common = fh.read().strip() or common
+        return os.path.dirname(os.path.normpath(os.path.join(gitdir, common)))
+    except OSError:
+        return None
+
+
+def read_key(path: str, key: str) -> str | None:
+    """The raw value of `key=` in the settings file at `path`, or None. Never raises."""
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            for ln in fh.read().splitlines():
+                if ln.startswith(key + "="):
+                    return ln.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return None
+
+
+def other_values(key: str, read_path: str | None = None, candidates=None) -> list:
+    """[(path, raw)] for every OTHER known settings file that carries `key`.
+
+    "Other" means a file this process did not read: the %APPDATA% location and, from a
+    worktree, the main checkout's `.config`. A value that differs between them is the
+    panel-shows-one-number, run-applies-another defect, so callers compare and warn.
+    `read_path` and `candidates` exist for tests (they must not be steered by the developer's
+    own files).
+    """
+    read = os.path.normcase(os.path.abspath(read_path or settings_file()))
+    if candidates is None:
+        candidates = [old_path()]
+        mc = main_checkout_root()
+        if mc:
+            candidates.append(os.path.join(mc, ".config", "settings.txt"))
+    out, seen = [], {read}
+    for p in candidates:
+        norm = os.path.normcase(os.path.abspath(p))
+        if norm in seen:
+            continue
+        seen.add(norm)
+        raw = read_key(p, key)
+        if raw is not None:
+            out.append((p, raw))
+    return out
+
+
 def describe() -> str:
     """One line naming the file, its size and its mtime -- the identity, not just the path.
 
