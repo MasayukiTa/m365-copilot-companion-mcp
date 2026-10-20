@@ -218,6 +218,10 @@ partial class CockpitWindow : Window
     string _lrVal = LoadRoutingView.Default;
     ComboBox _lrBox;
     TextBlock _lrLbl, _lrNow, _lrPending;
+    // team formation off|shadow -> settings.txt team_mode ; absent key = off (TeamModeView.Default)
+    string _tmVal = TeamModeView.Default;
+    ComboBox _tmBox;
+    TextBlock _tmLbl, _tmNow, _tmPending;
     // campaign board off|p0 -> settings.txt agent_board_mode ; absent key = off (AgentBoardView.Default)
     string _abVal = AgentBoardView.Default;
     ComboBox _abBox;

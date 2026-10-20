@@ -235,6 +235,7 @@ jobs:
             relay/test_cockpit_header_controls.py \
             relay/test_write_scope.py \
             relay/test_load_routing.py \
+            relay/test_team_formation.py \
             relay/test_agent_board.py \
             relay/test_verification_survives_the_archive.py \
             relay/test_fleet_autostart.py \
@@ -624,6 +625,7 @@ jobs:
             tests/test_fanout_default_on_agrees.py \
             tests/test_fanout_write_scope_agrees.py \
             tests/test_fanout_load_routing_agrees.py \
+            tests/test_team_mode_agrees.py \
             tests/test_agent_board_agrees.py \
             tests/test_fanout_budget.py \
             tests/test_fanout_budget_large_ledger.py \
@@ -906,6 +908,7 @@ jobs:
             scripts/test_ab_compare.py \
             scripts/test_capability_profile.py \
             scripts/test_load_routing_report.py \
+            scripts/test_team_formation_report.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \

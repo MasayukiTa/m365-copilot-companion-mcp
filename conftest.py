@@ -131,6 +131,11 @@ LIVE_RECORD_REDIRECTS = {
     # profile it reads is derived from the directory of this same file, so the redirect also keeps
     # a test from deriving a profile out of the operator's records.
     "relay.load_routing": {"LOG": "load_routing_shadow.jsonl"},
+    # C4 SHADOW RECORD, WRITTEN ON THE SPLIT PATH. A test that drives a worker through a split with
+    # team_mode=shadow would append a row for a split nobody asked for, and the report that decides
+    # whether team formation is worth building counts exactly these rows. The profile is derived
+    # from this file's directory, so the redirect also keeps a test off the operator's records.
+    "relay.team_formation": {"LOG": "team_formation_shadow.jsonl"},
     # THE CAMPAIGN BOARD. A test that drives a child to DONE with agent_board_mode on would
     # append pointer rows for children that never ran, and board_digest would show them to a
     # real sibling as settled work.

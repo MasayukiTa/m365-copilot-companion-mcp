@@ -269,6 +269,7 @@ partial class CockpitWindow
             case "job_approval_mode":
             case "fanout_write_scope":
             case "fanout_load_routing":
+            case "team_mode":
             case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
@@ -761,6 +762,7 @@ partial class CockpitWindow
         col.Children.Add(HierarchicalMergeControl());
         col.Children.Add(WriteScopeControl());
         col.Children.Add(LoadRoutingControl());
+        col.Children.Add(TeamModeControl());
         col.Children.Add(AgentBoardControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
@@ -770,6 +772,7 @@ partial class CockpitWindow
         PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
         PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
         PaintLoadRoutingInEffect(_lastRoot); PaintAgentBoardInEffect(_lastRoot);
+        PaintTeamModeInEffect(_lastRoot);
         PaintMergeConversationInEffect(_lastRoot);
 
         // ── Recovery / 復旧: what happens to a run whose coordinator died. One control for now;

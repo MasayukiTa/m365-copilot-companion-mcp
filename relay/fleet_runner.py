@@ -1462,6 +1462,16 @@ def _agent_board_block():
         return {}
 
 
+def _team_formation_block():
+    """`team_mode`: {mode, recorded, differed}, additive. The production caller of
+    relay.team_formation.status_block (and so of its mode reader). {} on any failure."""
+    try:
+        from relay import team_formation as _tf
+        return _tf.status_block()
+    except Exception:
+        return {}
+
+
 def _auto_resume_block():
     """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
     of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
@@ -2008,6 +2018,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_fanout_depth_block())
     _snap.update(_write_scope_block())
     _snap.update(_load_routing_block())
+    _snap.update(_team_formation_block())
     _snap.update(_agent_board_block())
     _snap.update(_auto_resume_block())
     _snap.update(_conversation_saving_block())

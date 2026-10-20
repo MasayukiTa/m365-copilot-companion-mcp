@@ -189,6 +189,15 @@ KEYS = OrderedDict([
        "would have admitted, the margins); nothing is reordered and no prompt or output "
        "changes."),
 
+    # Dynamic team formation (relay/team_formation.py). SHADOW ONLY: at each split it records the
+    # team (roles and member counts) a team-forming rule would have proposed beside the static
+    # one that was built. There is deliberately no value that forms a team.
+    _k("team_mode", EACH_GATE, "off",
+       "relay/team_formation.py:mode (every split decision, mtime-cached)",
+       "off|shadow. Re-read at every split with no restart. shadow appends one row per split "
+       "to .fleet/team_formation_shadow.jsonl (roles and counts, no goal text); the children, "
+       "prompts, queue and merge are unchanged."),
+
     # Campaign board (relay/agent_board.py). The coordinator reads it once when it starts.
     # p1 (workers write) is declared and NOT implemented: it behaves as p0.
     _k("agent_board_mode", SWEEP_START, "off",
