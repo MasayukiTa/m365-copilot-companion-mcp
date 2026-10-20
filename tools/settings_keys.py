@@ -169,6 +169,18 @@ KEYS = OrderedDict([
        "conversations already running keep the transport they started with. Anything else "
        "reads as connector. No environment variable overrides it."),
 
+    # Continue turn after an unknown delivery (relay/continue_recovery.py). OFF by default.
+    _k("socket_continue_recovery", EACH_GATE, "off",
+       "relay/continue_recovery.py:mode (every send on the socket route and every retry "
+       "decision, mtime-cached)",
+       "off|on. off: a socket goal whose turn was cut after unknown delivery and that performs "
+       "an action ends STUCK, exactly as before. on: for connector-less (bridged) repository "
+       "work, the worker opens a continue turn in the SAME conversation instead -- it first "
+       "checks that the conversation still holds its history, re-quotes the results of calls "
+       "this process already ran, and never runs the same call twice. Read at each send and "
+       "retry decision, so a change reaches the next turn with no restart; only conversations "
+       "created while it is on carry the refs the check needs. Anything but on reads as off."),
+
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
     # enforcing a write scope would go through the folder policy (frozen) and needs a separate

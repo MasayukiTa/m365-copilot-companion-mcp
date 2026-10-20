@@ -652,6 +652,11 @@ class Conversation:
         #: refused (InvalidRequest) and only recovered once the socket had been dropped.
         #: Continuity lives in the conversation id, not in the wire.
         self._sock = None
+        #: What THIS side did in the conversation (relay/continue_recovery.py TurnJournal), so a
+        #: turn cut after unknown delivery can be continued without re-executing a call. None
+        #: while `socket_continue_recovery` is off: nothing is recorded and nothing is added to
+        #: the wire.
+        self.journal = None
 
     @property
     def conversation_id(self) -> str:
@@ -678,9 +683,34 @@ class Conversation:
             h["User-Agent"] = self.user_agent
         return h
 
+    def _journal_for_ask(self):
+        """The journal for this ask, started; None while the recovery setting is off.
+
+        An existing journal keeps being written even if the setting is switched off midway: it
+        belongs to a conversation whose payloads already carry refs.
+        """
+        try:
+            j = self.journal
+            if j is None:
+                from relay import continue_recovery as CR
+                if not CR.recovery_on():
+                    return None
+                j = self.journal = CR.TurnJournal()
+            j.begin_ask()
+            return j
+        except Exception:
+            return None
+
+    def probe(self, text: str, *, connect) -> str:
+        """One exchange with NO tools: ask something and read the answer. Used to check that a
+        conversation still holds its history before it is continued."""
+        answer = self._one_exchange(text, connect=connect, started=False)
+        self.turns += 1
+        return answer
+
     def ask(self, text: str, *, connect, run_tool=None, catalogue=None, protocol="",
             started=None, on_text=None, on_progress=None, annotations=None,
-            on_payload=None):
+            on_payload=None, replay=None):
         """One turn: connect, send, read frames until the turn completes, return the answer.
 
         `connect(url, headers, timeout_s)` is supplied by the caller and must return an object
@@ -698,7 +728,12 @@ class Conversation:
         started = self.turns == 0 if started is None else bool(started)
         payload = ST.build_prompt(text, catalogue or [], protocol=protocol) if catalogue             else (protocol or "") + text
         answer, rounds = "", 0
+        journal = self._journal_for_ask()
         while True:
+            if journal is not None:
+                # A REF ON EVERY PAYLOAD: the one thing an empty conversation cannot quote back.
+                from relay import continue_recovery as CR
+                payload = payload + CR.ref_suffix(journal.begin_round(rounds, payload))
             # THE EXACT STRING ABOUT TO GO ON THE WIRE (protocol preamble + tool catalogue +
             # request on round 0; the tool-result payload on later rounds). Reported so the
             # fleet can store what the agent actually received, not the job text it started
@@ -715,9 +750,16 @@ class Conversation:
                                         on_text=on_text, on_progress=on_progress)
             started = False
             self.turns += 1
+            run = run_tool
+            if journal is not None:
+                journal.mark_completed()
+                if run_tool is not None:
+                    # Every call is written down before it runs; on the first reply of a
+                    # continue turn, a call this side already ran is answered from the record.
+                    run = CR.recording(journal, run_tool, replay if rounds == 0 else None)
             if run_tool is None:
                 break
-            nxt, calls = ST.step(answer, run_tool)
+            nxt, calls = ST.step(answer, run)
             if nxt is None:
                 break
             rounds += 1
@@ -727,6 +769,8 @@ class Conversation:
                 raise ChatHubError("tool rounds exceeded %d without a final answer"
                                    % self.max_tool_rounds)
             payload = nxt
+        if journal is not None:
+            journal.end_ask()
         return ST.strip_calls(answer) if catalogue else answer
 
     def _one_exchange(self, payload: str, *, connect, started: bool, on_text=None,
@@ -746,6 +790,8 @@ class Conversation:
                                   gpt_id=self.gpt_id, template=self.template,
                                   invocation_id=str(self.turns),
                                   annotations=annotations))
+            if self.journal is not None:
+                self.journal.mark_sent()
             # DELTAS ACCUMULATE, SNAPSHOTS REPLACE. Keeping them apart is what stops the same
             # answer being counted once per channel it arrives on.
             deltas, final, result, seen = [], "", "", 0
