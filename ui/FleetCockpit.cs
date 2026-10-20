@@ -218,6 +218,10 @@ partial class CockpitWindow : Window
     string _lrVal = LoadRoutingView.Default;
     ComboBox _lrBox;
     TextBlock _lrLbl, _lrNow, _lrPending;
+    // campaign board off|p0 -> settings.txt agent_board_mode ; absent key = off (AgentBoardView.Default)
+    string _abVal = AgentBoardView.Default;
+    ComboBox _abBox;
+    TextBlock _abLbl, _abNow, _abPending;
     // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
     string _hmVal = HierarchicalMergeView.Default;
     ComboBox _hmBox;

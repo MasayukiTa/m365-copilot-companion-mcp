@@ -26,6 +26,7 @@ $Boxes = @{
     'fanout_hierarchical_merge' = 'hierarchicalMergeBox'
     'fanout_write_scope'        = 'writeScopeBox'
     'fanout_load_routing'       = 'loadRoutingBox'
+    'agent_board_mode'          = 'agentBoardBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]

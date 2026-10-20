@@ -189,6 +189,14 @@ KEYS = OrderedDict([
        "would have admitted, the margins); nothing is reordered and no prompt or output "
        "changes."),
 
+    # Campaign board (relay/agent_board.py). The coordinator reads it once when it starts.
+    # p1 (workers write) is declared and NOT implemented: it behaves as p0.
+    _k("agent_board_mode", SWEEP_START, "off",
+       "relay/agent_board.py:begin_run (once, at coordinator start)",
+       "off|p0|p1. Takes effect on the NEXT run. p0 appends one pointer row per finished "
+       "child to .fleet/board.jsonl and adds two pointer lines to the merge prompt; off "
+       "changes no prompt or output. p1 is not implemented and behaves as p0."),
+
     # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
     # already running keeps going, and the next split uses the new values.
     _k("fanout_max_total", EACH_GATE, 24,

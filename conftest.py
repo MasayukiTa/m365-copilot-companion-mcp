@@ -131,6 +131,10 @@ LIVE_RECORD_REDIRECTS = {
     # profile it reads is derived from the directory of this same file, so the redirect also keeps
     # a test from deriving a profile out of the operator's records.
     "relay.load_routing": {"LOG": "load_routing_shadow.jsonl"},
+    # THE CAMPAIGN BOARD. A test that drives a child to DONE with agent_board_mode on would
+    # append pointer rows for children that never ran, and board_digest would show them to a
+    # real sibling as settled work.
+    "relay.agent_board": {"BOARD_PATH": "board.jsonl"},
     # THE ONLY RECORD OF WHETHER THE NIGHTLY LOOP ACTUALLY RUNS. A test firing written here
     # would answer "has it run?" with yes on a machine where it never has -- which is precisely
     # the question the file was added to make answerable. NOT in ONLY_IF_ALREADY_IMPORTED with

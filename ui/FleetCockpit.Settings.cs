@@ -175,6 +175,11 @@ partial class CockpitWindow
                     string lrv = LoadRoutingView.ParseLine(ln);   // off|shadow only; junk keeps the value
                     if (lrv != null) _lrVal = lrv;
                 }
+                else if (ln.StartsWith("agent_board_mode="))
+                {
+                    string abv = AgentBoardView.ParseLine(ln);   // off|p0 only; junk (and p1) keeps the value
+                    if (abv != null) _abVal = abv;
+                }
                 else if (ln.StartsWith("fleet_auto_resume="))
                 {
                     string arv = AutoResumeView.ParseLine(ln);   // off|on only; junk keeps the value
