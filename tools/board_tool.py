@@ -35,6 +35,23 @@ def _caller(ts=None):
     return "", ""
 
 
+def _roster_lines(cid):
+    """The roster lines (relay/roster.py) of campaign `cid`, derived from the workers already in
+    status.json. [] unless the board mode setting is p0 or p1; nothing is written."""
+    try:
+        import json
+        import os
+        from relay import agent_board, roster
+        from relay import task_router as TR
+        if agent_board.setting_mode() == "off":
+            return []
+        with open(os.path.join(TR.FLEET_STATE_DIR, "status.json"), encoding="utf-8-sig") as fh:
+            workers = (json.load(fh) or {}).get("workers")
+        return roster.lines_for_campaign(workers, cid)
+    except Exception:
+        return []
+
+
 def board_digest() -> str:
     """Read-only. The shared notes of the fan-out campaign this worker belongs to, as one short
     text (newest first, at most a few lines per kind, always ending with a line that says it is
@@ -45,6 +62,6 @@ def board_digest() -> str:
         cid, worker = _caller()
         if not cid:
             return ""
-        return agent_board.digest(cid, worker)
+        return agent_board.digest(cid, worker, roster_lines=_roster_lines(cid))
     except Exception:
         return ""
