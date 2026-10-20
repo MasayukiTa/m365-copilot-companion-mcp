@@ -244,3 +244,21 @@ def test_ordinary_code_blocks_are_not_counted_as_positions():
 
 def test_result_turn_without_ids_keeps_the_old_header():
     assert "call_tool → ok\nx" in ST.result_turn([("call_tool", True, "x")])
+
+
+# ---- 最初のプロンプトの下調べ結果は切り詰めずに全文渡す -----------------------------------------
+
+def test_preflight_passes_a_large_lookup_through_in_full():
+    """上限なしの挙動: 索引やスキル本文がどれだけ大きくても、preflight_block は
+    切り詰めずにそのまま通す。"""
+    big = "Z" * 50_000
+    out = ST.preflight_block([("index", True, big)])
+    assert big in out
+    assert "切り詰め" not in out
+
+
+def test_preflight_does_not_cap_the_lookup_length():
+    """何文字来ても一定の数で打ち切らない: 入力が増えれば出力もその分増える。"""
+    short = ST.preflight_block([("index", True, "Y" * 1_000)])
+    long = ST.preflight_block([("index", True, "Y" * 100_000)])
+    assert len(long) - len(short) == 99_000
