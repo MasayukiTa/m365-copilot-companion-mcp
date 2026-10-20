@@ -140,7 +140,7 @@ def expected_glob_count(tree, pattern="relay/test_*.py", task_id="glob_count") -
     return str(len(_require_matches(task_id, pattern, _glob(tree, pattern))))
 
 
-def expected_const_value(tree, name="MAX_CALLS_PER_REPLY", rel="relay/socket_tools.py",
+def expected_const_value(tree, name="DEFAULT_ALLOWED", rel="relay/socket_tools.py",
                          task_id="const_value") -> str:
     """The value assigned to `name` in `rel`, as written.
 
@@ -264,8 +264,9 @@ def _short_tasks(tree):
          "How many files match relay/test_*.py ? Use the tools.",
          lambda: expected_glob_count(tree)),
         ("const_value",
-         "In relay/socket_tools.py what is the value of MAX_CALLS_PER_REPLY? Use the tools.",
-         lambda: expected_const_value(tree)),
+         "In relay/socket_tools.py what is the value of DEFAULT_ALLOWED? Use the tools.",
+         # the assigned tuple is ("call_tool",); the answer must carry its one element
+         lambda: expected_const_value(tree).strip("(),\"'")),
         ("def_count",
          "How many lines in relay/socket_tools.py start with 'def ' ? Use run_python or grep.",
          lambda: expected_def_count(tree)),
