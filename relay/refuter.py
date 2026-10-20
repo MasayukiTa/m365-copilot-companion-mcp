@@ -54,6 +54,22 @@ SOURCE_CHECK_RULE = (
     "照合項目)どおりに作られたかを本文と突き合わせて確認し、突き合わせずに UNCLEAR としない。"
 )
 
+#: THE SUBJECT CHECK (2026-10-20). Generic on purpose, like the source check above. Measured
+#: 2026-10-18: a count question was answered from a look-alike source (3,818 where the named
+#: source gives 13,218) on both routes, and the reviewer recomputed the number from that same
+#: look-alike, found it consistent and UPHELD. This covers the case with no matched procedure:
+#: the question itself names the object, and the answer must come from that object.
+SUBJECT_CHECK_RULE = (
+    "【対象チェック(必須)】ゴールの文が**名指ししている対象**(表・ファイル・システム・期間・"
+    "単位・集計の単位など)を先に書き出し、回答の数字がその対象から取られたかを、報告に書かれた"
+    "クエリ・ファイル名・手順で確認すること。名前や中身が似た別の対象や、同じ量を持つ別の集計元"
+    "から取った数字は、内部で整合していても REFUTED とし、理由を "
+    "『対象違い: ゴールは <名指しの対象> を指定、回答は <実際に使った対象> を使用』の形で書く"
+    "こと。ゴールが対象を名指ししていない場合は、回答が使った対象を明記しているか、同じ量を"
+    "持つ他の対象との違いに触れているかを確認する。回答に使った対象が書かれておらず確認でき"
+    "ない場合は UPHELD にせず、INCONCLUSIVE: 使った対象が不明 とすること。"
+)
+
 # Nudge sent when the reviewer answered without a clear verdict (e.g. it only said
 # "I'll check the files"). Asks it to finish and emit the marker now.
 REFUTER_NUDGE = (
@@ -220,7 +236,7 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
     `procedure` is the matched approved procedure's one-line identity ("name: description"), or
     "" when the harness matched none; SOURCE_CHECK_RULE is present either way.
     """
-    base = REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE
+    base = REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE + "\n" + SUBJECT_CHECK_RULE
     if unverifiable:
         base = UNVERIFIABLE_PREAMBLE + "\n\n" + base
     if lens and lens in LENS_PROMPTS:
@@ -238,7 +254,7 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
 def _preamble_id(lens="", unverifiable=False):
     """A short id of the instruction text a reviewer is given (base + lens + unverifiable framing)."""
     import hashlib
-    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE
+    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE + SUBJECT_CHECK_RULE
             + (LENS_PROMPTS.get(lens, "") if lens else ""))
     if unverifiable:
         text = UNVERIFIABLE_PREAMBLE + text

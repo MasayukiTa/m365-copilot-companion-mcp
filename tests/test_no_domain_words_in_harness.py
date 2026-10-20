@@ -57,6 +57,7 @@ TEXTS = {
     "completion steer": SP.STEER_TEXT,
     "stuck cause text": SP.STUCK_CAUSE_TEXT,
     "reviewer source check": R.SOURCE_CHECK_RULE,
+    "reviewer subject check": R.SUBJECT_CHECK_RULE,
     "frame header": F._SKILL_HEADER,
 }
 
