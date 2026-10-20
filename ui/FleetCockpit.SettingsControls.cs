@@ -228,6 +228,7 @@ partial class CockpitWindow
         PaintToolProbe();
         PaintToolRoute();
         PaintConsentApprove();
+        PaintResidentTools();
     }
     // What the COORDINATOR says it was started with (status.json "fanout_run"), beside the combo.
     // No report (old runner, no run yet) -> nothing shown, never a guess from the combo.
@@ -610,6 +611,47 @@ partial class CockpitWindow
         _caBox.ToolTip = ConsentApproveView.Help(_lang == 0) + "\n" + ConsentApproveView.TakeEffectTip(_lang == 0);
         _caBox.Background = BtnBg; _caBox.Foreground = Fg; _caBox.BorderBrush = Border;
         StyleFlatCombo(_caBox);
+    }
+    // Resident tools in my own chats (off|on), in the Tools section under the tool route. Persists
+    // through SaveKey only. Nothing acts on the value yet: relay/resident_guard.py reads it and
+    // status.json reports it (each_gate). Words: ResidentToolsView.
+    UIElement ResidentToolsControl()
+    {
+        _rtLbl = new TextBlock(); _rtLbl.VerticalAlignment = VerticalAlignment.Center;
+        _rtLbl.FontSize = 12;
+
+        _rtBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_rtBox, "residentToolsBox");
+        _rtBox.ToolTip = ResidentToolsView.Help(_lang == 0) + "\n" + ResidentToolsView.TakeEffectTip(_lang == 0);
+        _rtBox.Cursor = Cursors.Hand; _rtBox.FontSize = 12;
+        _rtBox.FontWeight = FontWeights.SemiBold; _rtBox.MinWidth = 64;
+        _rtBox.Padding = new Thickness(8, 2, 4, 2);
+        _rtBox.VerticalAlignment = VerticalAlignment.Center;
+        var rtHelp = new Dictionary<string, string>();
+        foreach (string m in ResidentToolsView.Modes) rtHelp[m] = ResidentToolsView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_rtBox, ResidentToolsView.Modes, rtHelp, _rtVal);
+        _rtBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _rtBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_rtBox);
+            if (!ResidentToolsView.IsMode(sel) || sel == _rtVal) return;   // unchanged -> no write, no re-fire
+            _rtVal = sel;
+            SaveKey(ResidentToolsView.Key, _rtVal);
+        };
+
+        var wrap = SettingsComboBlock(_rtLbl, _rtBox, new TextBlock(), new TextBlock());
+        PaintResidentTools();
+        return wrap;
+    }
+    void PaintResidentTools()
+    {
+        if (_rtLbl != null) { _rtLbl.Text = ResidentToolsView.Label(_lang == 0); _rtLbl.Foreground = Muted; }
+        if (_rtBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_rtBox), _rtVal)) ComboSelectVal(_rtBox, _rtVal);
+        _rtBox.ToolTip = ResidentToolsView.Help(_lang == 0) + "\n" + ResidentToolsView.TakeEffectTip(_lang == 0);
+        _rtBox.Background = BtnBg; _rtBox.Foreground = Fg; _rtBox.BorderBrush = Border;
+        StyleFlatCombo(_rtBox);
     }
     // Merge conversation (fresh|parent), in the Fan-out section. Persists through SaveKey only; the
     // runner re-reads the key at every split and every merge (each_gate). Parent runs the merge in

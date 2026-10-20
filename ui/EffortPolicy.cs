@@ -1110,6 +1110,53 @@ public static class ConsentApproveView
     }
 }
 
+// The resident-tools selector's words and parsing, WPF-free. The Python side decides:
+// relay/resident_guard.py reads `resident_tools` (off|on, default off) and status.json reports it as
+// "resident_tools". In this version nothing acts on the value: it reserves the switch for the
+// component that would run tool blocks from the configured user's own chats with the configured agent.
+public static class ResidentToolsView
+{
+    //: must equal tools/settings_keys.py and relay/resident_guard.py KEY / DEFAULT / MODES.
+    public const string Key = "resident_tools";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one resident_tools= line; null when the line is not that key or the
+    /// value is not off|on (the caller keeps its value).</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "自分のチャットでのツール実行" : "Tools in my own chats"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン" : "On";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "Copilotアプリ・Teams・スマホで、設定したエージェントと直接チャットしたときに、このPCでツールを動かすための切り替えです。今の版では何も動かしません(状態を表示するだけ)。"
+                  : "The switch for running tools on this PC when you chat with the configured agent directly in the Copilot app, Teams or mobile. In this version it changes nothing; the value is only reported.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の状態更新で反映。再起動不要。"
+                  : "Shown from the next status update, no restart.";
+    }
+}
+
 // The merge-conversation selector's words and parsing, WPF-free. KEPT AT THE END OF THE FILE on
 // purpose: shape tests slice this file from one view class to the end of the next, and a view
 // dropped between two of them has already broken one. The Python side decides:
