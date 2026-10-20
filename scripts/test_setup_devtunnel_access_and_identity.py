@@ -122,6 +122,8 @@ if a[:1] == ["show"]:
     if n not in owned:
         print("Tunnel not found."); sys.exit(1)
     print("Tunnel ID             : %s.jpe1" % n)
+    if "hosts" in owned[n]:
+        print("Host connections      : %s" % owned[n]["hosts"])
     for p in owned[n]["ports"]:
         print("  %s  http  https://%s-%s.jpe1.devtunnels.ms/" % (p, n, p))
     sys.exit(0)
