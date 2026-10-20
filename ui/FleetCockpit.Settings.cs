@@ -185,6 +185,11 @@ partial class CockpitWindow
                     string abv = AgentBoardView.ParseLine(ln);   // off|p0 only; junk (and p1) keeps the value
                     if (abv != null) _abVal = abv;
                 }
+                else if (ln.StartsWith("org_version_record="))
+                {
+                    string ovv = OrgVersionView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (ovv != null) _ovVal = ovv;
+                }
                 else if (ln.StartsWith("fleet_auto_resume="))
                 {
                     string arv = AutoResumeView.ParseLine(ln);   // off|on only; junk keeps the value
