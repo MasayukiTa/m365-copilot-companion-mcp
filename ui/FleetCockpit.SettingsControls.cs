@@ -222,6 +222,7 @@ partial class CockpitWindow
         PaintRelayFindings();
         PaintAgentBoard();
         PaintOrgVersion();
+        PaintOrgGenotype();
         PaintOrgProposal();
         PaintOrgShadow();
         PaintOrgAb();
@@ -957,6 +958,51 @@ partial class CockpitWindow
         _ovBox.ToolTip = OrgVersionView.Help(_lang == 0) + "\n" + OrgVersionView.TakeEffectTip(_lang == 0);
         _ovBox.Background = BtnBg; _ovBox.Foreground = Fg; _ovBox.BorderBrush = Border;
         StyleFlatCombo(_ovBox);
+    }
+    // Genotype id record (off|on), beside the version record. Persists through SaveKey only;
+    // relay/org/versions.py reads the key once when a run starts (sweep_start), and only labels the
+    // lines the version record already writes -- it adds no line and changes no prompt or admission,
+    // so there is no "in effect" line: the words and parsing live in OrgGenotypeView.
+    UIElement OrgGenotypeControl()
+    {
+        _ogLbl = new TextBlock(); _ogLbl.VerticalAlignment = VerticalAlignment.Center;
+        _ogLbl.FontSize = 12;
+
+        _ogBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_ogBox, "orgGenotypeBox");
+        _ogBox.ToolTip = OrgGenotypeView.Help(_lang == 0) + "\n" + OrgGenotypeView.TakeEffectTip(_lang == 0);
+        _ogBox.Cursor = Cursors.Hand; _ogBox.FontSize = 12;
+        _ogBox.FontWeight = FontWeights.SemiBold; _ogBox.MinWidth = 78;
+        _ogBox.Padding = new Thickness(8, 2, 4, 2);
+        _ogBox.VerticalAlignment = VerticalAlignment.Center;
+        var ogHelp = new Dictionary<string, string>();
+        foreach (string m in OrgGenotypeView.Modes) ogHelp[m] = OrgGenotypeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_ogBox, OrgGenotypeView.Modes, ogHelp, _ogVal);
+        _ogBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _ogBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_ogBox);
+            if (!OrgGenotypeView.IsMode(sel) || sel == _ogVal) return;   // unchanged -> no write, no re-fire
+            _ogVal = sel;
+            SaveKey(OrgGenotypeView.Key, _ogVal);
+        };
+
+        _ogNow = new TextBlock(); _ogNow.Visibility = Visibility.Collapsed;
+        _ogPending = new TextBlock(); _ogPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_ogLbl, _ogBox, _ogNow, _ogPending);
+        PaintOrgGenotype();
+        return wrap;
+    }
+    void PaintOrgGenotype()
+    {
+        if (_ogLbl != null) { _ogLbl.Text = OrgGenotypeView.Label(_lang == 0); _ogLbl.Foreground = Muted; }
+        if (_ogBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_ogBox), _ogVal)) ComboSelectVal(_ogBox, _ogVal);
+        _ogBox.ToolTip = OrgGenotypeView.Help(_lang == 0) + "\n" + OrgGenotypeView.TakeEffectTip(_lang == 0);
+        _ogBox.Background = BtnBg; _ogBox.Foreground = Fg; _ogBox.BorderBrush = Border;
+        StyleFlatCombo(_ogBox);
     }
     // Org change proposals (off|on), beside the version record. Persists through SaveKey only;
     // the propose_org_change tool reads the key on each call. A proposal is a record and a decision
