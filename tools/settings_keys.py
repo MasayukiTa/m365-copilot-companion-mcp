@@ -235,6 +235,18 @@ KEYS = OrderedDict([
        "to .fleet/team_formation_shadow.jsonl (roles and counts, no goal text); the children, "
        "prompts, queue and merge are unchanged."),
 
+    # Relay findings between fan-out stages (relay/relay_findings.py). SHADOW ONLY: when a
+    # single-stage child finishes it records the findings a SECOND stage could have been handed
+    # (discovered paths, confirmed facts, unresolved gaps), beside nothing being changed. There
+    # is deliberately no value that builds a second stage; `on` is reserved and behaves as off.
+    _k("relay_findings", EACH_GATE, "off",
+       "relay/relay_findings.py:mode (every child settle, mtime-cached)",
+       "off|shadow|on. Re-read at every child settle with no restart. shadow appends one row per "
+       "finished child to .fleet/relay_findings_shadow.jsonl (the findings carried forward and "
+       "the hand-off text a second stage would have gotten -- the child's own lines, never the "
+       "goal text); nothing is queued and no prompt or output changes. on is reserved (no "
+       "second-stage builder yet) and behaves as off."),
+
     # Campaign board (relay/agent_board.py). The coordinator reads it once when it starts.
     # p1 (workers write) is declared and NOT implemented: it behaves as p0.
     _k("agent_board_mode", SWEEP_START, "off",

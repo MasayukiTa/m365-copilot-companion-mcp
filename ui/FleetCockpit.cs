@@ -222,6 +222,10 @@ partial class CockpitWindow : Window
     string _tmVal = TeamModeView.Default;
     ComboBox _tmBox;
     TextBlock _tmLbl, _tmNow, _tmPending;
+    // relay findings off|shadow|on -> settings.txt relay_findings ; absent key = off (RelayFindingsView.Default)
+    string _rfVal = RelayFindingsView.Default;
+    ComboBox _rfBox;
+    TextBlock _rfLbl, _rfNow, _rfPending;
     // campaign board off|p0 -> settings.txt agent_board_mode ; absent key = off (AgentBoardView.Default)
     string _abVal = AgentBoardView.Default;
     ComboBox _abBox;

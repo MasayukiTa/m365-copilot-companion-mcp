@@ -642,6 +642,7 @@ jobs:
             scripts/probes/test_resident_observe.py \
             tests/test_fanout_load_routing_agrees.py \
             tests/test_team_mode_agrees.py \
+            tests/test_relay_findings_agrees.py \
             tests/test_agent_board_agrees.py \
             tests/test_org_version_record_agrees.py \
             tests/test_org_proposals_agrees.py \

@@ -175,6 +175,11 @@ def _reader_resident_tools():
     return mode()
 
 
+def _reader_relay_findings():
+    from relay.relay_findings import mode
+    return mode()
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -207,6 +212,7 @@ _LIVE_READERS = {
     "socket_continue_recovery": (_reader_continue_recovery, "on", "off"),
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
+    "relay_findings": (_reader_relay_findings, "shadow", "off"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),

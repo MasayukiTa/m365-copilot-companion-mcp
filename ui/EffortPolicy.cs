@@ -1489,6 +1489,82 @@ public static class TeamModeView
     }
 }
 
+// The relay-findings selector's words and parsing, WPF-free. The Python side decides:
+// relay/relay_findings.py reads `relay_findings` at every child settle (each_gate) and, in
+// shadow, appends one line per finished fan-out child to relay_findings_shadow.jsonl -- the
+// findings a SECOND stage COULD have been handed (discovered paths, confirmed facts, unresolved
+// gaps, the child's own lines) and the hand-off text that stage would have carried. It builds
+// no second-stage child, queues nothing and changes no prompt or merge. `on` is reserved (there
+// is no second-stage builder yet) and behaves as off; it is offered but labelled reserved.
+public static class RelayFindingsView
+{
+    //: must equal tools/settings_keys.py and relay/relay_findings.py KEY / MODES.
+    public const string Key = "relay_findings";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow" || v == "on"; }
+
+    /// <summary>The mode named by one relay_findings= line; null when the line is not that key or
+    /// the value is not off|shadow|on (the caller keeps its value, off). A byte order mark is
+    /// tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "扁研究成果の引き継ぎ" : "Relay findings between stages"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        if (mode == "on") return ja ? "オン(予約・未実装)" : "On (reserved, not yet built)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: ファンアウトの子が終わるたびに、二段目に引き継げた場合の所見(成果物のパス、確認済みの事実、未解決の点)と引き継ぎ文を記録します。二段目は作らず、キューもプロンプトもマージも変わりません。オンは予約(未実装)で、オフと同じ振る舞いです。"
+                  : "Record only: when a fan-out child finishes, records the findings (discovered paths, confirmed facts, unresolved gaps) and the hand-off text a second stage would have gotten. No second stage is built; the queue, prompts and merge are unchanged. On is reserved (not yet built) and behaves as off.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の子の終了から有効。再起動不要。"
+                  : "Applies from the next child settle, no restart.";
+    }
+
+    /// <summary>What the coordinator reports (mode / rows recorded / rows that carried a finding);
+    /// null when the mode is not usable (old runner): the cockpit then shows nothing, not a guess.</summary>
+    public static string Describe(string mode, int recorded, int withFindings, bool ja)
+    {
+        if (!IsMode(mode)) return null;
+        string word;
+        if (mode == "shadow") word = ja ? "シャドウ(記録のみ)" : "shadow (record only)";
+        else if (mode == "on") word = ja ? "オン(予約・オフと同じ)" : "on (reserved, acts as off)";
+        else word = ja ? "オフ" : "off";
+        string head = (ja ? "稼働中: " : "In effect: ") + word;
+        if (mode == "shadow")
+            head += ja ? " / 記録 " + recorded + " 件、うち所見あり " + withFindings + " 件"
+                       : " / " + recorded + " recorded, " + withFindings + " with findings";
+        return head;
+    }
+
+    /// <summary>The note shown when the mode the runner reports differs from the selection (the
+    /// runner re-reads the key at its next child settle); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
+        return ja ? "選択は次の子の終了から反映" : "selection applies from the next child settle";
+    }
+}
+
 // The org change proposal selector's words and parsing, WPF-free. The Python side decides:
 // the propose_org_change tool reads `org_proposals` on each call and, when on, files a proposal
 // for a role or protocol text (one line in org_proposals.jsonl and a decision card). A proposal

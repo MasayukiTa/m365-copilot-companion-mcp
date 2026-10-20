@@ -1549,6 +1549,16 @@ def _team_formation_block():
         return {}
 
 
+def _relay_findings_block():
+    """`relay_findings`: {mode, recorded, with_findings}, additive. The production caller of
+    relay.relay_findings.status_block (and so of its mode reader). {} on any failure."""
+    try:
+        from relay import relay_findings as _rf
+        return _rf.status_block()
+    except Exception:
+        return {}
+
+
 def _auto_resume_block():
     """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
     of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
@@ -2113,6 +2123,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_resident_tools_block())
     _snap.update(_load_routing_block())
     _snap.update(_team_formation_block())
+    _snap.update(_relay_findings_block())
     _snap.update(_agent_board_block())
     _snap.update(_roster_block(_snap["workers"]))
     _snap.update(_auto_resume_block())

@@ -139,6 +139,12 @@ LIVE_RECORD_REDIRECTS = {
     # whether team formation is worth building counts exactly these rows. The profile is derived
     # from this file's directory, so the redirect also keeps a test off the operator's records.
     "relay.team_formation": {"LOG": "team_formation_shadow.jsonl"},
+    # C5 SHADOW RECORD, WRITTEN ON THE CHILD-SETTLE PATH. A test that drives a fan-out child to
+    # finish with relay_findings=shadow would append a row for a hand-off nobody asked for, and
+    # the report that decides whether a second stage is worth building counts exactly these rows.
+    # The log lives under this file's .fleet directory, so the redirect also keeps a test off the
+    # operator's records.
+    "relay.relay_findings": {"LOG": "relay_findings_shadow.jsonl"},
     # THE CAMPAIGN BOARD. A test that drives a child to DONE with agent_board_mode on would
     # append pointer rows for children that never ran, and board_digest would show them to a
     # real sibling as settled work.

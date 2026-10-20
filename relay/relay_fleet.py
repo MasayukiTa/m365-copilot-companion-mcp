@@ -9788,6 +9788,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           "result": ((getattr(_w, "display_result", "")
                                       or getattr(_w, "last_response", "") or "")[:1200])})
             agent_board.post_result(_cid, _idx, getattr(_env, "task_id", None))
+            # SHADOW ONLY (relay_findings=shadow): record the findings a second stage COULD have
+            # been handed from this child -- discovered paths, confirmed facts, unresolved gaps --
+            # beside the child_result just written. Builds nothing, queues nothing, never raises;
+            # off (and reserved on) is a no-op.
+            try:
+                from relay import relay_findings as _rf
+                _rf.hand_off(_cid, _idx,
+                             (getattr(_w, "display_result", "") or getattr(_w, "last_response", "") or ""),
+                             run_id=(getattr(_w, "run_id", "") or getattr(_env, "run_id", "") or ""))
+            except Exception:
+                pass
 
     def _note_finished_workers():
         """G3 + G2 evidence: write `merge_done` when an aggregator worker ends DONE, and a
