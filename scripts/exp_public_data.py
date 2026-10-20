@@ -409,7 +409,7 @@ def _read(path):
         return fh.read()
 
 
-def cmd_check(a):
+def check_goal_answer(a):
     with open(os.path.join(os.path.abspath(a.root), "goals.json"), encoding="utf-8") as fh:
         goals = {g["goal_id"]: g for g in json.load(fh)}
     g = goals.get(a.goal)
@@ -442,7 +442,7 @@ def main(argv=None):
     c.add_argument("--final", required=True)
     c.add_argument("--child", action="append")
     a = ap.parse_args(argv)
-    return {"make": cmd_make, "verify": cmd_verify, "check": cmd_check}[a.cmd](a)
+    return {"make": cmd_make, "verify": cmd_verify, "check": check_goal_answer}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -205,7 +205,7 @@ def _record(root, row):
     _append(os.path.join(root, "runs.jsonl"), row)
 
 
-def cmd_run(a):
+def run_one_goal(a):
     check_ports(SERVER_PORT, CDP_PORT)
     root = os.path.abspath(a.root)
     with open(os.path.join(root, "plan.json"), encoding="utf-8") as fh:
@@ -314,7 +314,7 @@ def main(argv=None):
     t = sub.add_parser("stop")
     t.add_argument("--root", required=True)
     a = ap.parse_args(argv)
-    return {"prepare": cmd_prepare, "server": cmd_server, "run": cmd_run, "stop": cmd_stop}[a.cmd](a)
+    return {"prepare": cmd_prepare, "server": cmd_server, "run": run_one_goal, "stop": cmd_stop}[a.cmd](a)
 
 
 if __name__ == "__main__":

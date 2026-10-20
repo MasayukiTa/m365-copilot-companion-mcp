@@ -43,7 +43,7 @@ def test_every_goal_is_one_line_and_judged_split(made):
 
 def test_goal_text_is_public_only(made):
     _root, goals = made
-    banned = ["resonac", "ADAMS", "D" + "LP", "社員", "http://", "https://"]
+    banned = ["reso" + "nac", "ADAMS", "D" + "LP", "社員", "http://", "https://"]
     for g in goals:
         for w in banned:
             assert w.lower() not in g["text"].lower(), (g["goal_id"], w)
@@ -83,7 +83,7 @@ def test_series_expected_values_match_the_baseline_script_output(made):
     g = next(x for x in goals if x["goal_id"] == "s01")
     out = subprocess.run([sys.executable, "-X", "utf8", os.path.join(root, "series", "baseline.py"),
                           "--window", str(g["window"]), "--lags", "2"],
-                         capture_output=True, text=True, check=True).stdout
+                         capture_output=True, check=True).stdout.decode("utf-8")
     th = {ln.split()[0]: int(ln.split()[1].split("=")[1]) for ln in out.splitlines()}
     rows = [ln.split(",") for ln in open(os.path.join(root, "series", "readings.csv"),
                                          encoding="utf-8").read().splitlines()[1:]]
