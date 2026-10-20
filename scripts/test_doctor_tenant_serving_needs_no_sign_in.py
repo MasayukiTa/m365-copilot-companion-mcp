@@ -47,9 +47,15 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         mode = self.server.mode
-        if mode == "signin":
+        redirects = {
+            "signin": "https://login.microsoftonline.com/common/oauth2/authorize",
+            "relay-signin": "https://global.rel.tunnels.api.visualstudio.com/api/v1/auth/login",
+            "lookalike": "https://evil-tunnels.api.visualstudio.com.example.com/login",
+            "lookalike2": "https://evil-tunnels.api.visualstudio.com/login",
+        }
+        if mode in redirects:
             self.send_response(302)
-            self.send_header("Location", "https://login.microsoftonline.com/common/oauth2/authorize")
+            self.send_header("Location", redirects[mode])
             self.end_headers()
             return
         pid = 999 if mode == "other-pid" else 4242
@@ -116,6 +122,37 @@ def test_tenant_grant_with_a_hosted_tunnel_passes_without_probing_the_sign_in_pa
     shown = "\n".join(l for l in out.splitlines() if not l.startswith("RESULT|"))
     assert "start_all.bat" not in shown, out   # the stored fix text is not printed on a pass
     assert "cannot be probed anonymously" in out and "host connection count (1)" in out, out
+
+
+def test_relay_sign_in_host_passes_under_tenant_with_a_host_connection(tmp_path):
+    out, row = _run_doctor_block(tmp_path, TENANT_LISTING, 1, "relay-signin")
+    assert "[ OK ] Dev Tunnel host serving" in out, out
+    assert row[1] == "True", out
+    assert "[FAIL]" not in out, out
+    assert "host connection count (1)" in out, out
+
+
+def test_relay_sign_in_host_with_zero_host_connections_stays_a_fail(tmp_path):
+    out, row = _run_doctor_block(tmp_path, TENANT_LISTING, 0, "relay-signin")
+    assert "[FAIL] Dev Tunnel host serving" in out, out
+    assert row[1] == "False", out
+    assert "0 host connections" in row[4], row
+
+
+@pytest.mark.parametrize("mode", ["lookalike", "lookalike2"])
+def test_a_lookalike_relay_host_stays_a_fail_under_tenant(tmp_path, mode):
+    out, row = _run_doctor_block(tmp_path, TENANT_LISTING, 1, mode)
+    assert "[FAIL] Dev Tunnel host serving" in out, out
+    assert row[1] == "False", out
+    assert "host connection count" not in out, out
+
+
+def test_anonymous_grant_with_the_relay_redirect_stays_a_fail(tmp_path):
+    out, row = _run_doctor_block(tmp_path, ANON_LISTING, 1, "relay-signin")
+    assert "[FAIL] Dev Tunnel host serving" in out, out
+    assert row[1] == "False", out
+    assert "redirected to global.rel.tunnels.api.visualstudio.com" in row[4], row
+    assert "host connection count" not in out, out
 
 
 def test_tenant_grant_with_zero_host_connections_stays_a_fail(tmp_path):
