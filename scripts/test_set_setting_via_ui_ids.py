@@ -37,3 +37,44 @@ def test_the_script_is_ascii_and_never_writes_settings_directly():
     raw.decode("ascii")
     low = raw.decode("ascii").lower()
     assert "set-content" not in low and "out-file" not in low
+
+
+def _declared_ids() -> dict:
+    """Every combo AutomationId the cockpit source sets."""
+    cs = cockpit_source.read(encoding="utf-8")
+    return set(re.findall(r'SetAutomationId\(\w+,\s*"(\w+Box)"\)', cs))
+
+
+def test_the_script_covers_every_combo_id_the_cockpit_declares():
+    declared = _declared_ids()
+    driven = set(_boxes().values())
+    assert declared, "no combo AutomationIds found in the cockpit source"
+    assert declared <= driven, sorted(declared - driven)
+
+
+def test_every_settings_combo_has_an_id_and_is_driven():
+    # each settings-popup combo is paired with a *View class whose Key it saves
+    cs = cockpit_source.read(encoding="utf-8")
+    boxes = _boxes()
+    for view_key in ("effort_policy", "fanout", "tool_transport", "merge_conversation",
+                     "fleet_auto_resume", "supervisor_self_restart", "tool_probe_idle_min",
+                     "fanout_load_routing", "team_mode", "agent_board_mode",
+                     "org_version_record", "org_proposals", "org_shadow_eval",
+                     "fanout_max_depth", "fanout_hierarchical_merge", "fanout_write_scope"):
+        assert view_key in boxes, view_key
+    assert len(set(boxes.values())) == len(boxes)
+    for aid in boxes.values():
+        assert cs.count('"%s")' % aid) == 1, aid
+
+
+def test_success_line_only_after_a_read_back_and_failures_exit_nonzero():
+    text = SCRIPT.read_text(encoding="ascii")
+    ok = text.index("through the cockpit (read back)")
+    assert text.rindex("Read-Combo", 0, ok) < ok
+    assert "Read-SettingsFile" in text
+    # the combo found after the pick is null-checked before it is read (the InvokeMethodOnNull)
+    assert "if ($null -ne $c2) { $after = Read-Combo $c2 }" in text
+    assert "if ($null -eq $combo) { throw" in text
+    assert 'Write-Output ("FAILED:' in text and "exit 1" in text
+    # nothing prints a success line outside the final read-back
+    assert text.count("through the cockpit") == 1

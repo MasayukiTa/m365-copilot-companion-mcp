@@ -102,6 +102,7 @@ partial class CockpitWindow
         _effortPolicyLbl.FontSize = 12;
 
         _effortPolicyBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_effortPolicyBox, "effortPolicyBox");
         _effortPolicyBox.ToolTip = EffortPolicyView.Help(_lang == 0) + "\n" + EffortPolicyView.TakeEffectTip(_lang == 0);
         _effortPolicyBox.Cursor = Cursors.Hand; _effortPolicyBox.FontSize = 12;
         _effortPolicyBox.FontWeight = FontWeights.SemiBold; _effortPolicyBox.MinWidth = 78;
@@ -173,6 +174,7 @@ partial class CockpitWindow
         _fanoutLbl.FontSize = 12;
 
         _fanoutBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_fanoutBox, "fanoutBox");
         _fanoutBox.ToolTip = FanoutView.Help(_lang == 0) + "\n" + FanoutView.TakeEffectTip(_lang == 0);
         _fanoutBox.Cursor = Cursors.Hand; _fanoutBox.FontSize = 12;
         _fanoutBox.FontWeight = FontWeights.SemiBold; _fanoutBox.MinWidth = 64;
@@ -535,6 +537,7 @@ partial class CockpitWindow
         _trLbl.FontSize = 12;
 
         _trBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_trBox, "toolRouteBox");
         _trBox.ToolTip = ToolRouteView.Help(_lang == 0) + "\n" + ToolRouteView.TakeEffectTip(_lang == 0);
         _trBox.Cursor = Cursors.Hand; _trBox.FontSize = 12;
         _trBox.FontWeight = FontWeights.SemiBold; _trBox.MinWidth = 64;
@@ -576,6 +579,7 @@ partial class CockpitWindow
         _mcLbl.FontSize = 12;
 
         _mcBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_mcBox, "mergeConversationBox");
         _mcBox.ToolTip = MergeConversationView.Help(_lang == 0) + "\n" + MergeConversationView.TakeEffectTip(_lang == 0);
         _mcBox.Cursor = Cursors.Hand; _mcBox.FontSize = 12;
         _mcBox.FontWeight = FontWeights.SemiBold; _mcBox.MinWidth = 64;
@@ -1076,6 +1080,7 @@ partial class CockpitWindow
         _arLbl.FontSize = 12;
 
         _arBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_arBox, "autoResumeBox");
         _arBox.ToolTip = AutoResumeView.Help(_lang == 0) + "\n" + AutoResumeView.TakeEffectTip(_lang == 0);
         _arBox.Cursor = Cursors.Hand; _arBox.FontSize = 12;
         _arBox.FontWeight = FontWeights.SemiBold; _arBox.MinWidth = 64;
@@ -1150,6 +1155,7 @@ partial class CockpitWindow
         _srLbl.FontSize = 12;
 
         _srBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_srBox, "supervisorCodeBox");
         _srBox.ToolTip = SupervisorCodeView.Help(_lang == 0) + "\n" + SupervisorCodeView.TakeEffectTip(_lang == 0);
         _srBox.Cursor = Cursors.Hand; _srBox.FontSize = 12;
         _srBox.FontWeight = FontWeights.SemiBold; _srBox.MinWidth = 64;
@@ -1240,6 +1246,7 @@ partial class CockpitWindow
         _tpLbl.FontSize = 12;
 
         _tpBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_tpBox, "toolProbeBox");
         _tpBox.ToolTip = ToolProbeView.Help(_lang == 0) + "\n" + ToolProbeView.TakeEffectTip(_lang == 0);
         _tpBox.Cursor = Cursors.Hand; _tpBox.FontSize = 12;
         _tpBox.FontWeight = FontWeights.SemiBold; _tpBox.MinWidth = 64;
