@@ -216,6 +216,7 @@ partial class CockpitWindow
         PaintMergeConversation();
         PaintWriteScope();
         PaintLoadRouting();
+        PaintTeamMode();
         PaintAgentBoard();
         PaintAutoResume();
         PaintSupervisorSelfRestart();
@@ -853,6 +854,79 @@ partial class CockpitWindow
         _abPending.Text = pend ?? "";
         _abPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _abPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Team formation (off|shadow), beside the load-aware routing. Persists through SaveKey only; the
+    // coordinator re-reads the key at every split (each_gate). SHADOW ONLY: it records the team a
+    // team-forming rule would have proposed and changes nothing, and there is no option that forms one.
+    // What is IN EFFECT comes from status.json "team_mode"; the words and parsing live in TeamModeView.
+    UIElement TeamModeControl()
+    {
+        _tmLbl = new TextBlock(); _tmLbl.VerticalAlignment = VerticalAlignment.Center;
+        _tmLbl.FontSize = 12;
+
+        _tmBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_tmBox, "teamModeBox");
+        _tmBox.ToolTip = TeamModeView.Help(_lang == 0) + "\n" + TeamModeView.TakeEffectTip(_lang == 0);
+        _tmBox.Cursor = Cursors.Hand; _tmBox.FontSize = 12;
+        _tmBox.FontWeight = FontWeights.SemiBold; _tmBox.MinWidth = 78;
+        _tmBox.Padding = new Thickness(8, 2, 4, 2);
+        _tmBox.VerticalAlignment = VerticalAlignment.Center;
+        var tmHelp = new Dictionary<string, string>();
+        foreach (string m in TeamModeView.Modes) tmHelp[m] = TeamModeView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_tmBox, TeamModeView.Modes, tmHelp, _tmVal);
+        _tmBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _tmBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_tmBox);
+            if (!TeamModeView.IsMode(sel) || sel == _tmVal) return;   // unchanged -> no write, no re-fire
+            _tmVal = sel;
+            SaveKey(TeamModeView.Key, _tmVal);
+            PaintTeamModeInEffect(_lastRoot);
+        };
+
+        _tmNow = new TextBlock(); _tmNow.VerticalAlignment = VerticalAlignment.Center;
+        _tmNow.FontSize = 11.5;
+        _tmPending = new TextBlock(); _tmPending.VerticalAlignment = VerticalAlignment.Center;
+        _tmPending.FontSize = 11.5; _tmPending.FontWeight = FontWeights.SemiBold;
+        _tmPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_tmLbl, _tmBox, _tmNow, _tmPending);
+        PaintTeamMode();
+        return wrap;
+    }
+    void PaintTeamMode()
+    {
+        if (_tmLbl != null) { _tmLbl.Text = TeamModeView.Label(_lang == 0); _tmLbl.Foreground = Muted; }
+        if (_tmBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_tmBox), _tmVal)) ComboSelectVal(_tmBox, _tmVal);
+        _tmBox.ToolTip = TeamModeView.Help(_lang == 0) + "\n" + TeamModeView.TakeEffectTip(_lang == 0);
+        _tmBox.Background = BtnBg; _tmBox.Foreground = Fg; _tmBox.BorderBrush = Border;
+        StyleFlatCombo(_tmBox);
+        PaintTeamModeInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "team_mode"). No report (old runner, no run
+    // yet) -> nothing shown, never a guess from the selection.
+    void PaintTeamModeInEffect(Dictionary<string, object> root)
+    {
+        if (_tmNow == null || _tmPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> tm = root != null ? Obj(root, "team_mode") : null;
+        if (tm != null && tm.ContainsKey("mode") && tm["mode"] != null)
+        {
+            string rep = S(tm, "mode");
+            now = TeamModeView.Describe(rep,
+                tm.ContainsKey("recorded") && tm["recorded"] != null ? I(tm, "recorded") : 0,
+                tm.ContainsKey("differed") && tm["differed"] != null ? I(tm, "differed") : 0, ja);
+            pend = TeamModeView.PendingText(rep, _tmVal, ja);
+        }
+        _tmNow.Text = now ?? "";
+        _tmNow.Foreground = Muted;
+        _tmNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _tmPending.Text = pend ?? "";
+        _tmPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _tmPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     // Auto-resume of an interrupted run (off|on), in its own Recovery section. Persists through
     // SaveKey only; the supervisor re-reads the key every cycle (each_gate). What is IN EFFECT comes

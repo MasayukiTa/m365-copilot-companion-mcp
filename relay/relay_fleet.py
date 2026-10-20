@@ -79,6 +79,7 @@ from relay import stuck_cause as stuck_cause_mod
 from relay import conversation_saving as conv_saving_mod
 from relay import tool_bridge
 from relay import load_routing
+from relay import team_formation
 from relay import agent_board
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
@@ -6919,6 +6920,9 @@ class RelayWorker:
                     if self._midrun_split_asked:
                         _partial = (getattr(self, "display_result", "")
                                     or self.last_response or "")[:4000]
+                    # C4, SHADOW ONLY: records the team a team-forming rule would have proposed
+                    # beside the static one just built. Returns nothing, changes nothing.
+                    team_formation.shadow_propose(kids, steps, run_id=getattr(self, "run_id", "") or "")
                     self._spawn_fn(self.goal, kids,
                                    parent_checks=getattr(self, "checks", None) or None,
                                    parent_partial=_partial,

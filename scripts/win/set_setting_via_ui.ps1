@@ -27,6 +27,7 @@ $Boxes = @{
     'fanout_write_scope'        = 'writeScopeBox'
     'fanout_load_routing'       = 'loadRoutingBox'
     'agent_board_mode'          = 'agentBoardBox'
+    'team_mode'                 = 'teamModeBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]

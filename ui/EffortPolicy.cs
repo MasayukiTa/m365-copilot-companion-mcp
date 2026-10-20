@@ -1274,3 +1274,72 @@ public static class AgentBoardView
         return ja ? "選択は次の実行から反映" : "selection applies from the next run";
     }
 }
+
+// The team-formation selector's words and parsing, WPF-free. The Python side decides:
+// relay/team_formation.py reads `team_mode` at every split decision and, in shadow, records the
+// team (roles and member counts) a team-forming rule would have proposed beside the static one that
+// was built; relay/fleet_runner.py exports {mode, recorded, differed} as status.json "team_mode".
+// SHADOW ONLY: no value forms a team, so the children, prompts, queue and merge are never changed.
+public static class TeamModeView
+{
+    //: must equal tools/settings_keys.py and relay/team_formation.py KEY / MODES.
+    public const string Key = "team_mode";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+
+    /// <summary>The mode named by one team_mode= line; null when the line is not that key or the
+    /// value is not off|shadow (the caller keeps its value, off). A byte order mark is tolerated
+    /// and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "チーム編成" : "Team formation"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: 分割の中身は変わりません。分割するたびに、役割ごとの実績から編成した場合のチーム案(役割と人数)を記録します。"
+                  : "Record only: the split is unchanged. At each split, records the team (roles and member counts) a team-forming rule would have proposed from the per-role record.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の分割から有効。再起動不要。"
+                  : "Applies from the next split, no restart.";
+    }
+
+    /// <summary>What the coordinator reports (mode / rows recorded / rows that differed); null
+    /// when the mode is not usable (old runner): the cockpit then shows nothing, not a guess.</summary>
+    public static string Describe(string mode, int recorded, int differed, bool ja)
+    {
+        if (!IsMode(mode)) return null;
+        string head = (ja ? "稼働中: " : "In effect: ") + (mode == "shadow" ? (ja ? "シャドウ(記録のみ)" : "shadow (record only)") : (ja ? "オフ" : "off"));
+        if (mode == "shadow")
+            head += ja ? " / 記録 " + recorded + " 件、うち案が異なる " + differed + " 件"
+                       : " / " + recorded + " recorded, " + differed + " would differ";
+        return head;
+    }
+
+    /// <summary>The note shown when the mode the runner reports differs from the selection (the
+    /// runner re-reads the key at its next split); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (!IsMode(reported) || reported == selected) return null;
+        return ja ? "選択は次の分割から反映" : "selection applies from the next split";
+    }
+}
