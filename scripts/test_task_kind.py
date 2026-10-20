@@ -6,7 +6,6 @@ the default profile is unchanged, and that nothing is written."""
 import ast
 import json
 import os
-import subprocess
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -14,6 +13,7 @@ sys.path.insert(0, REPO)
 
 from relay import task_kind as TK  # noqa: E402
 from scripts import capability_profile as CP  # noqa: E402
+from tools import childproc  # noqa: E402
 
 
 def test_known_wordings_get_their_kind():
@@ -89,7 +89,7 @@ def test_default_report_is_unchanged_and_never_loads_the_kind_module():
     code = ("import sys; sys.path.insert(0, %r); from scripts import capability_profile as C; "
             "C.load_profiles(%r); print('relay.task_kind' in sys.modules)"
             % (REPO, os.path.join(REPO, "no_such_fleet_dir")))
-    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=60)
+    out = childproc.run([sys.executable, "-c", code], timeout=60)
     assert out.stdout.strip() == "False", out.stderr
 
 
