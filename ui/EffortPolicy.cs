@@ -1157,6 +1157,55 @@ public static class ResidentToolsView
     }
 }
 
+// The read-only result-cache selector's words and parsing, WPF-free. The Python side decides:
+// relay/result_cache.py reads `result_cache` at every read-only tool call and, for `shadow`,
+// records beside the real call whether a cache would have served the same answer and the time it
+// would have saved; relay/fleet_runner.py exports {mode, seen, hits, differed} as status.json
+// "result_cache". SHADOW ONLY: nothing is served from a cache, so no prompt or output changes.
+public static class ResultCacheView
+{
+    //: must equal tools/settings_keys.py and relay/result_cache.py KEY / MODES.
+    public const string Key = "result_cache";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+
+    /// <summary>The mode named by one result_cache= line; null when the line is not that key
+    /// or the value is not off|shadow (the caller keeps its value, off). A byte order mark is
+    /// tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "読み取り結果キャッシュ" : "Read-only result cache"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "シャドウ=読み取り専用ツールの呼び出しごとに、同じ引数の前回応答をキャッシュが返せたか、何秒節約できたかを実際の呼び出しの横に記録します。キャッシュから応答を返すことはなく、プロンプトや出力は変わりません。記録のみ: 割当は変わりません。オフ=何も読まず記録しません。"
+                  : "Shadow records, beside each read-only tool call, whether a cache would have served the same answer and how long that would have saved. Nothing is served from a cache and no prompt or output changes. Record only: assignment is unchanged. Off reads and records nothing.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次のツール呼び出しから有効。再起動不要。"
+                  : "Applies at the next tool call, no restart.";
+    }
+}
+
 // The merge-conversation selector's words and parsing, WPF-free. KEPT AT THE END OF THE FILE on
 // purpose: shape tests slice this file from one view class to the end of the next, and a view
 // dropped between two of them has already broken one. The Python side decides:

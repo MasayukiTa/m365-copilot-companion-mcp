@@ -264,6 +264,7 @@ partial class CockpitWindow
             case "tool_transport":
             case "consent_auto_approve":
             case "resident_tools":
+            case "result_cache":
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
             case "rate_ceiling_rpm":
@@ -797,6 +798,7 @@ partial class CockpitWindow
         col.Children.Add(ToolRouteControl());
         col.Children.Add(ConsentApproveControl());
         col.Children.Add(ResidentToolsControl());
+        col.Children.Add(ResultCacheControl());
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //

@@ -230,6 +230,11 @@ partial class CockpitWindow
                     string cav = ConsentApproveView.ParseLine(ln);   // on|off only; junk keeps the value
                     if (cav != null) _caVal = cav;
                 }
+                else if (ln.StartsWith("result_cache="))
+                {
+                    string rcv = ResultCacheView.ParseLine(ln);   // off|shadow only; junk keeps the value
+                    if (rcv != null) _rcVal = rcv;
+                }
                 else if (ln.StartsWith("merge_conversation="))
                 {
                     string mcv = MergeConversationView.ParseLine(ln);   // fresh|parent only; junk keeps the value

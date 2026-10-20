@@ -38,6 +38,7 @@ from __future__ import annotations
 import asyncio
 import os
 import threading
+import time
 
 CONNECTOR = "connector"
 CONNECTOR_LESS = "connector-less"
@@ -406,6 +407,23 @@ def server_instructions(client_factory=None, now=None, ttl_s=None) -> str:
         return c["text"]
 
 
+def _shadow_result_cache(payload, text, ok, duration_s, worker_name):
+    """Hand one completed inner tool call to the read-only result cache in shadow. Only a
+    successful call is a candidate (a failed read answers nothing a cache would serve). Never
+    raises: the recorder runs inside run_tool and must not break a worker's turn."""
+    try:
+        if not ok:
+            return
+        inner = payload.get("name")
+        from relay import result_cache as _rc
+        if not _rc.is_read_only(inner):
+            return
+        _rc.shadow_observe(inner, (payload.get("arguments") or {}), text,
+                           read_only=True, duration_s=duration_s, run_id=str(worker_name or ""))
+    except Exception:
+        return
+
+
 def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):
     """A `run_tool(name, args) -> (ok, text)` for one worker's driver.
 
@@ -434,11 +452,14 @@ def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):
                 return False, ("[call_tool: no tool or category named '%s'. "
                                "For mail and calendar use the Microsoft Work IQ tools.]"
                                % str(payload.get("name"))[:60])
+            _t0 = time.time()
             result = _run_coroutine(_call(factory, payload, limit))
             text = _text_of(result)
             if _is_discovery(payload):
                 text = scrub_listing(text)
-            return (not _is_error(result)), text
+            ok = not _is_error(result)
+            _shadow_result_cache(payload, text, ok, time.time() - _t0, worker_name)
+            return ok, text
         except asyncio.TimeoutError:
             return False, "TimeoutError: the tool call took longer than %d s" % int(limit)
         except Exception as exc:

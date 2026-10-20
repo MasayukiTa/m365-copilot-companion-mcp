@@ -226,6 +226,16 @@ KEYS = OrderedDict([
        "would have admitted, the margins); nothing is reordered and no prompt or output "
        "changes."),
 
+    # Read-only tool result cache (relay/result_cache.py). SHADOW ONLY: at each read-only tool
+    # call it records whether a cache would have had the same answer to serve and how long that
+    # would have saved, beside the real call. There is deliberately no value that serves.
+    _k("result_cache", EACH_GATE, "off",
+       "relay/result_cache.py:mode (every tool call, mtime-cached)",
+       "off|shadow. Re-read at every tool call with no restart. shadow appends one row per "
+       "read-only call to .fleet/result_cache_shadow.jsonl (the tool, an argument hash, whether "
+       "a cache would have hit and matched, the time saved); nothing is served from a cache and "
+       "no prompt or output changes."),
+
     # Dynamic team formation (relay/team_formation.py). SHADOW ONLY: at each split it records the
     # team (roles and member counts) a team-forming rule would have proposed beside the static
     # one that was built. There is deliberately no value that forms a team.

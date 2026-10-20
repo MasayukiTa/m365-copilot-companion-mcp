@@ -1519,6 +1519,16 @@ def _load_routing_block():
         return {}
 
 
+def _result_cache_block():
+    """`result_cache`: {mode, seen, hits, differed}, additive. The production caller of
+    relay.result_cache.status_block (and so of its mode reader). {} on any failure."""
+    try:
+        from relay import result_cache as _rc
+        return _rc.status_block()
+    except Exception:
+        return {}
+
+
 def _agent_board_block():
     """`agent_board`: {mode, posted, refused, write_errors}, additive. The production caller of
     relay.agent_board.status_block; {} before a run began or on any failure."""
@@ -2112,6 +2122,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_write_scope_block())
     _snap.update(_resident_tools_block())
     _snap.update(_load_routing_block())
+    _snap.update(_result_cache_block())
     _snap.update(_team_formation_block())
     _snap.update(_agent_board_block())
     _snap.update(_roster_block(_snap["workers"]))
