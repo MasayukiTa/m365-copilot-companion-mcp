@@ -53,7 +53,7 @@ relay / fleet の細かい制御、bridge UI、ODBC 接続、ツール自己生�
 2. `write_file` で `tools/your_ops.py` を生成する
 3. `run_python` でロジックを動作確認する
 
-ここまでをチャットの中で完結し、あとは `main.py` の `TOOLS` に 1 行足して再起動すれば、自分で書いたツールが常設化します。「◯◯の API を叩くツールが欲しい」と頼めば、エージェントが雛形を書いて検証し、登録手順まで提示します。
+ここまでをチャットの中で完結し、あとは `main.py` の `TOOLS` に 1 行足して再起動すれば自分で書いたツールが常設化します。「◯◯の API を叩くツールが欲しい」と頼めば、エージェントが雛形を書いて検証し、登録手順まで提示します。
 
 コーディングループの中では `FORGE: <名前>` ＋ Python ブロックで再利用ツールを自作し、構文検証して `tools/auto/` に常設化できます（`--forge`）。
 
@@ -82,7 +82,7 @@ system prompt にこの順序を 1 行入れておけば「画像なし pptx を
 
 ## 自動起動（ログオン時にスタック全体を起動）
 
-`scripts\register-supervisor.ps1` を 1 回実行すると、次回ログオンから `start_all_hidden.vbs`（＝サーバー・トンネル・bridge・全 UI）が管理者権限不要で自動起動します。仕組みは per-user Startup フォルダのショートカット（Task Scheduler が組織ポリシーで弾かれる環境でも通る）。
+`scripts\register-supervisor.ps1` を 1 回実行すると次回ログオンから `start_all_hidden.vbs`（＝サーバー・トンネル・bridge・全 UI）が管理者権限不要で自動起動します。仕組みは per-user Startup フォルダのショートカット（Task Scheduler が組織ポリシーで弾かれる環境でも通る）。
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File scripts\register-supervisor.ps1   # 登録
@@ -180,7 +180,7 @@ FleetCockpitは同じ`.fleet/status.json`を読み、LOCAL_LOOPジョブのタ�
 だけを見て自動操作します。安全に一意選択できない場合は`WAITING_AUTH`または
 `WAITING_CONSENT`として停止し、ユーザー対応後に同じseqを新しいfencing tokenで再開します。
 
-会話コンテキストのcompactは、各commitの短いsummaryを次ターンへ渡し、詳細をartifactと
+会話コンテキストのcompactは各commitの短いsummaryを次ターンへ渡し、詳細をartifactと
 eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑え、実行中にVACUUMは行いません。
 
 ---
@@ -198,7 +198,7 @@ eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑�
 
 `checks` を持つゴールは単一 relay と同じ acceptance gate を通ります。`--refuter` / `--panel` で独立レビュアー / 3観点パネルを追加。
 
-**RAM 連動 autoscale**: M365 Copilot タブは重い SPA（各 ~0.3–0.6 GB）なので、多数同時に開くと RAM が枯渇します。`--autoscale`（またはコックピットのトグル）で、毎ループ空き物理メモリから並列数上限を再計算します（`relay/relay_fleet.py` の `ram_target_cap` / `auto_concurrency`）。RAM に余裕がある間は 1 ループにつき最大 1 タブずつ増やし、逼迫したら緩やかに減らします（走行中のワーカーは殺さず、新規を開くのを止めるだけ）。`--autoscale-headroom-mb` / `--autoscale-per-tab-mb` / `--autoscale-max` で境界を調整。autoscale 無しなら `--max-concurrent` が固定上限（`0` = 起動時の空き RAM から自動）。
+**RAM 連動 autoscale**: M365 Copilot タブは重い SPA（各 ~0.3–0.6 GB）なので、多数同時に開くと RAM が枯渇します。`--autoscale`（またはコックピットのトグル）で毎ループ空き物理メモリから並列数上限を再計算します（`relay/relay_fleet.py` の `ram_target_cap` / `auto_concurrency`）。RAM に余裕がある間は 1 ループにつき最大 1 タブずつ増やし、逼迫したら緩やかに減らします（走行中のワーカーは殺さず、新規を開くのを止めるだけ）。`--autoscale-headroom-mb` / `--autoscale-per-tab-mb` / `--autoscale-max` で境界を調整。autoscale 無しなら `--max-concurrent` が固定上限（`0` = 起動時の空き RAM から自動）。
 
 **watchdog・復旧・再開**: 別の watchdog スレッドが `status.json` を tail し、`--stall-s` を超えて進まなければ専用 Edge を wedge とみなしハードリセット。run ループは死んだ CDP コンテキスト（`FleetContextLost`）を検知して新しい Edge に再接続し、未完のゴールを（acceptance checks 込みで）再開します。ただし acceptance eval 中（`verifying` 状態や未来の `eval_busy_until`）はリセットしないので、長い正当な検証（Docker テスト等）を wedge と誤認しません。起動前の auto-recycle（肥大/低 RAM なら run 前にハードリセット）もあります（`relay/edge_recover.py`）。
 
@@ -218,7 +218,7 @@ eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑�
 
 ゴール欄はコーディング用スラッシュコマンド（`/code`, `/fix`, `/test`, `/refactor`, `/doc`, `/review`, `/research`）を、メインチャットはプロンプトテンプレート（`/help`, `/summarize`, `/translate`, `/plan`, `/critique`, `/proofread`, `/rewrite`, `/brainstorm`, `/steps`, `/eli5`, `/proscons`, `/table`）＋ `/research` `/analyze` を出します。
 
-各 fleet 会話は `.fleet/conversations.json` に登録され、各ワーカーの全ターン transcript が `.fleet/transcripts/` に書かれます。会話を開くと、チャット UI はライブ DOM スクレイピングより on-disk transcript を優先するので、動作中の fleet タスクを active な companion Edge を乱さず閲覧できます。
+各 fleet 会話は `.fleet/conversations.json` に登録され、各ワーカーの全ターン transcript が `.fleet/transcripts/` に書かれます。会話を開くとチャット UI はライブ DOM スクレイピングより on-disk transcript を優先するので、動作中の fleet タスクを active な companion Edge を乱さず閲覧できます。
 
 ---
 
@@ -231,7 +231,7 @@ eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑�
 .\scripts\start_bridge.ps1 -Keepalive    # 常時稼働（クラッシュ時も自動再起動）
 ```
 
-`start_bridge.ps1` は bridge 専用 Edge（`:9223`）を立て、`bridge/copilot_bridge.py` を起動します。チャットは CopilotChat ウィンドウ（`ui\CopilotChat.exe`）か `python bridge\session_cli.py` から使います。bridge への要求はすべて起動ごとのトークン（`X-Bridge-Token`、`%LOCALAPPDATA%\m365-copilot-companion\bridge\token-<port>`、本人のみ読める ACL）付きの POST が必要で、ブラウザからの要求は拒否されます（`bridge/bridge_auth.py`）。fleet の Edge（`:9222`）とは完全に別プロファイルなので、fleet 走行中でも同時に使えます。
+`start_bridge.ps1` は bridge 専用 Edge（`:9223`）を立て、`bridge/copilot_bridge.py` を起動します。チャットは CopilotChat ウィンドウ（`ui\CopilotChat.exe`）か `python bridge\session_cli.py` から使います。bridge への要求はすべて起動ごとのトークン（`X-Bridge-Token`、`%LOCALAPPDATA%\m365-copilot-companion\bridge\token-<port>`、本人のみ読める ACL）付きの POST が必要で、ブラウザからの要求は拒否されます（`bridge/bridge_auth.py`）。fleet の Edge（`:9222`）とは完全に別プロファイルなので fleet 走行中でも同時に使えます。
 
 ---
 
@@ -262,7 +262,7 @@ MCP_DB_SAMPLE_AZURE=Driver={ODBC Driver 18 for SQL Server};Server=tcp:YOUR-SERVE
 
 ## Claude Desktop / Claude Code に繋ぐ（M365 なし）
 
-Dev Tunnel は不要です。`.\scripts\start.ps1` でサーバーを起動したら、次を `~/.claude/claude_desktop_config.json`（Claude Desktop）または `.claude/settings.json`（Claude Code）に追記:
+Dev Tunnel は不要です。`.\scripts\start.ps1` でサーバーを起動したら次を `~/.claude/claude_desktop_config.json`（Claude Desktop）または `.claude/settings.json`（Claude Code）に追記:
 
 ```json
 {
