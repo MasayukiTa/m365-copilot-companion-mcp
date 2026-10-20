@@ -42,13 +42,13 @@ def _bench():
     return _CACHED["m"]
 
 
-#: The synthetic file every expectation is checked against. Two `def ` lines, an assignment of 8,
+#: The synthetic file every expectation is checked against. Two `def ` lines, an assignment of a one-element tuple,
 #: and a comment that MENTIONS the constant -- the anchored regex has to skip the comment, or a
 #: benchmark would score the model against the value in its own prose.
 SOCKET_TOOLS = '''"""Tool calling over a plain socket, where the model asks and THIS side executes.
 """
-# MAX_CALLS_PER_REPLY is the cap this module applies; this comment is not the assignment.
-MAX_CALLS_PER_REPLY = 8
+# DEFAULT_ALLOWED is what this module lets a model call; this comment is not the assignment.
+DEFAULT_ALLOWED = ("call_tool",)
 
 
 def step(reply, run_tool):
@@ -85,7 +85,7 @@ def test_expected_const_value_reads_the_assignment_and_ignores_the_comment(tmp_p
     """THE ANCHOR, PINNED BY SHAPE. The synthetic file's comment names the constant first; an
     unanchored search would find the comment's words, or the wrong value, and report it as the
     model's error."""
-    assert _bench().expected_const_value(_tree(tmp_path)) == "8"
+    assert _bench().expected_const_value(_tree(tmp_path)) == '("call_tool",)'
 
 
 def test_expected_def_count_counts_only_lines_that_start_with_def(tmp_path):

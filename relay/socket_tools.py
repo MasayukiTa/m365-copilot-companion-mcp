@@ -47,9 +47,17 @@ import re
 #: named for something else would be a request this side carried out.
 DEFAULT_ALLOWED = ("call_tool",)
 
-#: A model that keeps talking instead of calling is not making progress. Bounded so a turn
-#: cannot loop forever on a model that will not commit.
-MAX_CALLS_PER_REPLY = 8
+# NO PER-REPLY CAP (owner decision 2026-10-20). A reply used to execute at most 8 call blocks
+# and report the rest as "not run, resend". The number had no measurement behind it, and the
+# cap cost a whole extra round (about 10 s) every time a model batched more than 8 independent
+# calls, which is the very thing BATCH_RULE asks it to do. Every readable call block in a reply
+# is now executed, in the order written, and its result comes back under the same #position.
+#
+# WHAT BOUNDS A TURN INSTEAD. This module has no bound of its own and does not need one for a
+# single reply: a reply is finite, and each block runs through run_tool, whose own gates apply.
+# The time of a turn is bounded by the deadline and ceiling of the exchange in
+# relay/chathub.py (`turn_timeout_s`, `turn_ceiling_s`). Independent calls should be put in ONE
+# reply (see BATCH_RULE): that is fewer turns, and a turn is where the time goes.
 
 _FENCE = re.compile(
     r"^[ \t]*```[ \t]*([A-Za-z_][A-Za-z0-9_.\-]*)[ \t]*\r?\n(.*?)\r?\n[ \t]*```",
@@ -141,19 +149,18 @@ def _short(text, limit=80) -> str:
     return one if len(one) <= limit else one[:limit] + "…"
 
 
-def read_reply(reply: str, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_REPLY):
+def read_reply(reply: str, *, allowed=DEFAULT_ALLOWED):
     """Everything the reply asked for, and everything that could NOT be carried out.
 
-    Returns {"calls": [(pos, name, args)], "unreadable": [(pos, reason)],
-    "not_run": [pos, ...]}. `pos` is the 1-based position of the block among the reply's
-    blocks whose info string is in `allowed`, so it is assigned here and the model's block
-    does not have to carry an id. Blocks naming something else (ordinary code) are not
-    counted, exactly as before.
+    Returns {"calls": [(pos, name, args)], "unreadable": [(pos, reason)]}. `pos` is the
+    1-based position of the block among the reply's blocks whose info string is in `allowed`,
+    so it is assigned here and the model's block does not have to carry an id. Blocks naming
+    something else (ordinary code) are not counted, exactly as before.
 
-    Nothing is dropped silently: a block that does not parse is `unreadable` with a reason,
-    and a readable block past `max_calls` is `not_run` and is never executed.
+    Nothing is dropped silently: a block that does not parse is `unreadable` with a reason.
+    Every readable block is a call; there is no limit on how many a reply may carry.
     """
-    calls, unreadable, not_run = [], [], []
+    calls, unreadable = [], []
     pos = 0
     for match in _FENCE.finditer(reply or ""):
         name, body = match.group(1), match.group(2)
@@ -168,11 +175,8 @@ def read_reply(reply: str, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_R
         if not isinstance(args, dict):
             unreadable.append((pos, "JSON オブジェクトではない (%s)" % type(args).__name__))
             continue
-        if len(calls) >= max_calls:
-            not_run.append(pos)
-            continue
         calls.append((pos, name, args))
-    return {"calls": calls, "unreadable": unreadable, "not_run": not_run}
+    return {"calls": calls, "unreadable": unreadable}
 
 
 def strip_calls(reply: str, *, allowed=DEFAULT_ALLOWED) -> str:
@@ -223,7 +227,7 @@ def result_turn(results, notices=None) -> str:
             "--- 実行結果 ---\n" + "\n\n".join(parts) + tail + "\n--- ここまで ---")
 
 
-def notices_for(unreadable, not_run, max_calls=MAX_CALLS_PER_REPLY) -> list:
+def notices_for(unreadable) -> list:
     """One short line per problem, so the model can resend exactly what did not happen.
 
     Numbers are the blocks' positions among the reply's call blocks, counted from the top.
@@ -232,14 +236,10 @@ def notices_for(unreadable, not_run, max_calls=MAX_CALLS_PER_REPLY) -> list:
     for pos, reason in unreadable:
         notes.append("ブロック%d は読めなかったので実行していない: %s。直して再送すること。"
                      % (pos, reason))
-    if not_run:
-        notes.append("1回の応答で実行できるのは %d 件まで。ブロック%s の %d 件は"
-                     "実行していない(実行されていない)。再送すること。"
-                     % (max_calls, ",".join(str(p) for p in not_run), len(not_run)))
     return notes
 
 
-def step(reply: str, run_tool, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_PER_REPLY):
+def step(reply: str, run_tool, *, allowed=DEFAULT_ALLOWED):
     """One turn of the loop: read the reply, run what it asked for, return the next turn.
 
     Returns (next_turn_text, calls_made). `next_turn_text` is None when the model asked for
@@ -249,8 +249,8 @@ def step(reply: str, run_tool, *, allowed=DEFAULT_ALLOWED, max_calls=MAX_CALLS_P
     model as a failure rather than ending the turn: the model can often recover from a bad
     argument, and killing the goal over one is worse than telling it what happened.
     """
-    read = read_reply(reply, allowed=allowed, max_calls=max_calls)
-    notes = notices_for(read["unreadable"], read["not_run"], max_calls)
+    read = read_reply(reply, allowed=allowed)
+    notes = notices_for(read["unreadable"])
     if not read["calls"] and not notes:
         return None, []
     results = []
