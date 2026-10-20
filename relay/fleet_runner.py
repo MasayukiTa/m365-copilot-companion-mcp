@@ -43,6 +43,7 @@ import sys
 
 from relay import outcomes as _outcomes
 from relay import token_provider as _token_provider
+from relay.consent_approve import status_block as _consent_status_block
 import time
 
 # allow running both as `python -m relay.fleet_runner` and `python relay/fleet_runner.py`
@@ -1958,6 +1959,9 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "quota": _quota_snapshot(),
         # Why goals are held in the queue with no token (empty when none are).
         "token_wait": _token_provider.status_block(),
+        # Work IQ approval cards pressed for the connector-less route (relay/consent_approve.py):
+        # counts and the last row, never content.
+        "consent_approvals": _consent_status_block(),
         # THE FALLBACK BUTTON'S OWN RECEIPT. None until a {"reunlock":...} command has been
         # applied at least once this run; after that,
         # {"ts","target","ok","delivered","reason"} from apply_reunlock -- so "I pressed the
