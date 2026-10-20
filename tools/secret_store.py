@@ -136,6 +136,42 @@ def materialize_api_key(environ=None) -> str:
     return value
 
 
+#: Exit code main.py ends with when it has no usable bearer token. The supervisor reads it from the
+#: server's exit record and re-makes the token (scripts/bootstrap.py --only gen_env) before the next
+#: launch, instead of relaunching the same failure every minute. 78 is EX_CONFIG.
+EXIT_NO_API_KEY = 78
+
+
+def require_api_key(environ=None) -> str:
+    """The bearer token, or a loud, specific end of the process when this machine has none.
+
+    A .env copied from another PC holds MCP_API_KEY_PROTECTED as a DPAPI blob that only the
+    original Windows account could open. materialize_api_key() then returns "" and main.py used
+    to die on a bare `KeyError: 'MCP_API_KEY'` that names neither the real key nor the cause nor
+    the cure. This says which key, why, and what repairs it, on stderr (never the value), and
+    ends with a code the supervisor recognises.
+    """
+    env = environ if environ is not None else os.environ
+    value = materialize_api_key(env)
+    if value:
+        return value
+    protected = (env.get(API_KEY_PROTECTED_VAR) or "").strip()
+    if protected:
+        why = ("%s is set, but this Windows account cannot decrypt it. DPAPI values are bound to "
+               "one user on one machine, so an .env copied from another PC or account cannot be "
+               "opened here." % API_KEY_PROTECTED_VAR)
+    else:
+        why = "neither %s nor %s is set in .env." % (API_KEY_PROTECTED_VAR, API_KEY_VAR)
+    import sys
+    sys.stderr.write(
+        "FATAL: the MCP server has no bearer token and cannot start: %s "
+        "FIX: run start_all.bat (or quickstart.bat); it re-makes the token on this PC "
+        "(scripts\\bootstrap.py --only gen_env). Copilot Studio then needs the new value: "
+        "scripts\\copilot_studio_values.ps1 shows it.\n" % why)
+    sys.stderr.flush()
+    raise SystemExit(EXIT_NO_API_KEY)
+
+
 def unlock_password_problem() -> str:
     """The reason the last read failed: "", PROBLEM_UNSET or PROBLEM_UNDECRYPTABLE."""
     return _LAST_PROBLEM[0]

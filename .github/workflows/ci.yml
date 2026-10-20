@@ -318,6 +318,7 @@ jobs:
             scripts/test_supervisor_rotates_its_log.py \
             scripts/test_a_hard_killed_supervisor_leaves_a_last_breath.py \
             scripts/test_supervisor_death_is_explained.py \
+            scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
             scripts/test_dialogs_use_japanese_font.py \
