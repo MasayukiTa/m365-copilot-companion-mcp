@@ -7919,6 +7919,71 @@ class RelayWorker:
             pass
         print("[relay_fleet] %s: %s" % (self.name, self.reason), flush=True)
 
+    def _journal_shows_executed_calls(self):
+        """True when the continue-turn setting is on and this side finished a call in the cut turn.
+
+        The journal is the stronger evidence than `partial_text`: a call RAN here whether or not
+        any token of the next reply arrived. False for every worker while the setting is off.
+        """
+        try:
+            from relay import continue_recovery as CR
+            if not CR.recovery_on():
+                return False
+            journal = getattr(getattr(self.drv, "conv", None), "journal", None)
+            return CR.executed_calls_in_failed_ask(journal) > 0
+        except Exception:
+            return False
+
+    def _plan_continue(self, reason, delivery):
+        """A `Recovery` for the cut turn, or None. The cause of a None is recorded.
+
+        Every unsafe case is a named refusal in `continue_recovery.plan`; this method only gathers
+        what the plan needs from the worker: the old driver's journal, whether its turn thread has
+        really ended, the conversation id and whether the tools run on this side.
+        """
+        try:
+            from relay import continue_recovery as CR
+            if not CR.recovery_on():
+                return None
+            drv = self.drv
+            thread = getattr(drv, "_thread", None)
+            if thread is not None and thread.is_alive():
+                thread.join(2.0)              # `failed` is set a few ms before the thread returns
+            alive = bool(thread is not None and thread.is_alive())
+            try:
+                ids = drv.conversation_ids() or {}
+            except Exception:
+                ids = {}
+            verdict = CR.plan(
+                getattr(getattr(drv, "conv", None), "journal", None),
+                goal=self.goal or "", reason=reason,
+                used=getattr(self, "_continues_used", 0),
+                bridged=tool_bridge.worker_is_bridged(self), thread_alive=alive,
+                conv_id=ids.get("server") or ids.get("client") or "", worker=self.name)
+            try:
+                _socket_route().record("continue_plan", worker=self.name, turn=self.turn,
+                                       ok=verdict.ok, why=verdict.why[:300],
+                                       delivery=delivery, reason=reason[:300])
+            except Exception:
+                pass
+            return verdict.recovery if verdict.ok else None
+        except Exception as exc:
+            print("[relay_fleet] %s: continue plan unavailable (%s); not continuing"
+                  % (getattr(self, "name", "worker"), type(exc).__name__), flush=True)
+            return None
+
+    def _refuse_continue(self, reason):
+        """End the worker after a refused continue turn. No resend, no new conversation."""
+        self.status, self.outcome = "stuck", "STUCK"
+        self.reason = ("continue turn refused; not re-sent and no new conversation was opened "
+                       "(%s)" % str(reason)[:200])
+        try:
+            _socket_route().record("continue_refused", worker=self.name, turn=self.turn,
+                                   reason=str(reason)[:300])
+        except Exception:
+            pass
+        print("[relay_fleet] %s: %s" % (self.name, self.reason), flush=True)
+
     def _effect_checker(self):
         """A callable that says whether this goal's effect is already in the world, or None.
 
@@ -8133,7 +8198,18 @@ class RelayWorker:
         # effect with a working checker does it replace the guess with a look -- re-sending an
         # already-present commit as a safe no-op, or re-sending a genuinely-absent one as the
         # recovery the reconnect budget was for.
-        if landed and self._goal_may_act():
+        if str(reason or "").startswith("continue refused"):
+            # THE CONTINUE TURN WAS REFUSED (relay/continue_recovery.py): the conversation did not
+            # prove it holds its history, or the model reported an action of its own. Neither a
+            # resend nor a new conversation is safe now.
+            self._refuse_continue(reason)
+            return False
+        # With the continue-turn setting ON, a call this side already ran in the cut turn also
+        # counts as "may have landed": a verbatim resend would start the work again. With it OFF
+        # `_journal_shows_executed_calls` is False and this is the condition it always was.
+        recovery = None
+        executed = self._journal_shows_executed_calls()
+        if (landed or executed) and self._goal_may_act():
             decision = "refuse"
             try:
                 from relay.transport_policy import resend_decision_for_landed_act
@@ -8142,11 +8218,18 @@ class RelayWorker:
             except Exception:
                 decision = "refuse"
             if decision != "resend":
-                self._refuse_resend(reason, delivery)
-                return False
+                recovery = self._plan_continue(reason, delivery)
+                # A call that RAN on this side is as good as a landed turn: with no continue turn
+                # to carry it, the verbatim resend below would run it again.
+                if recovery is None and (landed or executed):
+                    self._refuse_resend(reason, delivery)
+                    return False
 
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
+        if recovery is not None:
+            # A continue has its own budget (MAX_CONTINUES_PER_GOAL); the goal-wide ceiling stays.
+            cap = max(cap, SOCKET_RECONNECTS_PER_GOAL)
         if spent >= cap:
             print("[relay_fleet] %s: not reconnecting (%d spent, cap %d, delivery=%s, "
                   "saw_output=%s)" % (self.name, spent, cap, delivery, saw_output), flush=True)
@@ -8183,6 +8266,19 @@ class RelayWorker:
         self.drv, self.socket = drv, True
         self._socket_turns_seen = 0
         self.status = "ready"
+        if recovery is not None:
+            # The next `drv.send` CONTINUES the interrupted turn: probe, then the continue text.
+            # `self.job` becomes a short note, so the goal's text is not sent again.
+            drv._recovery = recovery
+            try:
+                drv.conv.journal = recovery.carry
+            except Exception:
+                pass
+            self.job = recovery.job_note
+            self._continues_used = getattr(self, "_continues_used", 0) + 1
+            route.record("continue_turn", worker=self.name, turn=self.turn,
+                         executed=recovery.executed, resumed=bool(conv_id),
+                         used=self._continues_used, reason=reason[:300])
         self._last_text, self._stable_since = None, None
         self._count_before = 0
         # THE SWEEP HOLDS THIS WORKER BACK, not the thread. `_cooldown_until` is the loop's
@@ -8218,6 +8314,9 @@ class RelayWorker:
         failure and is treated as one.
         """
         reason = getattr(self.drv, "failed", "") or "unknown"
+        if str(reason).startswith("continue refused"):
+            self._refuse_continue(reason)           # see _retry_socket
+            return False
         route = _socket_route()
         report_route_fault("%s: %s" % (self.name, reason))
         self._socket_fell_back = True
@@ -8228,7 +8327,10 @@ class RelayWorker:
             _delivery = delivery_status(reason)
         except Exception:
             _delivery = "unknown"
-        if (_delivery == "delivered" or getattr(self, "_landed_pending", False))                 and self._goal_may_act():
+        # A call that already ran on this side counts too (continue-turn setting on): the tab
+        # re-sends the goal verbatim.
+        if (_delivery == "delivered" or getattr(self, "_landed_pending", False)
+                or self._journal_shows_executed_calls()) and self._goal_may_act():
             decision = "refuse"
             try:
                 from relay.transport_policy import resend_decision_for_landed_act
@@ -8499,6 +8601,9 @@ class RelayWorker:
     def _recycle_stalled_conversation(self, failed):
         """A per-conversation stall: tell the route (it does NOT count as a connection failure),
         then recycle only THIS worker's conversation. Returns True when the worker is terminal."""
+        if str(failed or "").startswith("continue refused"):
+            self._refuse_continue(failed)
+            return True
         route = _socket_route()
         try:
             route.note_stall(self.name, failed)

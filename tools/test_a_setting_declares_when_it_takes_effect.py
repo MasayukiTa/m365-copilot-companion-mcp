@@ -155,6 +155,11 @@ def _reader_tool_transport():
     return transport()
 
 
+def _reader_continue_recovery():
+    from relay.continue_recovery import mode
+    return mode()
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -183,6 +188,7 @@ _LIVE_READERS = {
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),
     "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
     "tool_transport": (_reader_tool_transport, "connector-less", "connector"),
+    "socket_continue_recovery": (_reader_continue_recovery, "on", "off"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),

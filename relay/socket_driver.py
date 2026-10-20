@@ -78,6 +78,9 @@ class CopilotSocketDriver:
         self._protocol = protocol or ""
         self._run_tool = run_tool
         self._preflight = None
+        #: Set by the fleet (relay/continue_recovery.py Recovery) on a driver that is to CONTINUE
+        #: an interrupted turn instead of starting one. Consumed by the next `_run_turn`.
+        self._recovery = None
 
         self._lock = threading.Lock()
         self._thread = None
@@ -301,6 +304,19 @@ class CopilotSocketDriver:
             _sink = getattr(self, "payload_sink", None)
             if _sink is not None:
                 _extra["on_payload"] = _sink
+            # A CONTINUE TURN: first prove the conversation still holds its history (a probe with
+            # no tools), then send the continue text instead of the job. A refusal ends the turn
+            # here -- the fleet then neither resends nor opens a new conversation.
+            _rec, self._recovery = self._recovery, None
+            if _rec is not None:
+                from relay import continue_recovery as CR
+                _ok, _why = CR.verify(self.conv, _rec, connect=self._connect)
+                if not _ok:
+                    self.failed = ("%s: %s" % (CR.REFUSED_PREFIX, _why))[:300]
+                    self._emit_turn_stats("continue_refused", _why[:120])
+                    return
+                text = _rec.continue_text
+                _extra["replay"] = _rec.replay
             answer = self.conv.ask(text, connect=self._connect, on_text=on_text,
                                    annotations=annotations,
                                    on_progress=on_progress,
