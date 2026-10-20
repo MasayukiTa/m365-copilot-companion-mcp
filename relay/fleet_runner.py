@@ -1462,6 +1462,16 @@ def _agent_board_block():
         return {}
 
 
+def _roster_block(workers):
+    """`roster`: who works on what, per campaign, derived from `workers` (relay/roster.py, the
+    production caller of roster_block). Not stored anywhere else. {} on any failure."""
+    try:
+        from relay import roster as _roster
+        return _roster.roster_block(workers)
+    except Exception:
+        return {}
+
+
 def _team_formation_block():
     """`team_mode`: {mode, recorded, differed}, additive. The production caller of
     relay.team_formation.status_block (and so of its mode reader). {} on any failure."""
@@ -2020,6 +2030,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_load_routing_block())
     _snap.update(_team_formation_block())
     _snap.update(_agent_board_block())
+    _snap.update(_roster_block(_snap["workers"]))
     _snap.update(_auto_resume_block())
     _snap.update(_conversation_saving_block())
     return _snap
