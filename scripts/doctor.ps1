@@ -282,6 +282,50 @@ Check "python_runnable" "Python the supervisor would use (.venv, else PATH)" `
     { [bool]$script:pyPath -and -not $script:pyProblem } `
     $(if ($script:pyProblem) { $script:pyProblem } else { "run setup.bat to create the .venv" })
 
+# WHAT THE SUPERVISOR'S OWN LOG SAYS ABOUT THE SERVER. "The server check failed and a supervisor
+# exists" does not mean a crash loop: right after a git pull the supervisor cycles a stale server
+# on purpose ("server is running stale code ... cycling it"), and for a few seconds the server is
+# down BY DESIGN (colleague's PC, 2026-10-20: planned stale-code cycle, no crash anywhere). The
+# supervisor writes each exit as "previous server pid=N exited code=... -- planned: <why>" or
+# "-- unplanned", each start as "MCP server process launched", each miss as "server check failed".
+# Returns @{ kind = 'planned' | 'loop' | 'none'; lines = <last server lines> }.
+#   loop    = >= 3 launches within 10 minutes AND >= 2 exit records that are not planned
+#   planned = within 90 seconds a planned exit or a launch, and no unplanned exit
+function Get-SupervisorServerVerdict {
+    param([string]$Path, [datetime]$Now = (Get-Date))
+    $none = @{ kind = 'none'; lines = @() }
+    try {
+        if ((-not $Path) -or (-not (Test-Path $Path))) { return $none }
+        $raw = @(Get-Content $Path -Tail 400 -ErrorAction Stop)
+    } catch { return $none }
+    $ev = @()
+    foreach ($l in $raw) {
+        if ($l -notmatch '^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(.*)$') { continue }
+        $t = $null
+        try { $t = [datetime]::ParseExact($Matches[1], 'yyyy-MM-dd HH:mm:ss', [Globalization.CultureInfo]::InvariantCulture) } catch { continue }
+        $msg = $Matches[2]
+        $kind = ""
+        if ($msg -match '^MCP server process launched') { $kind = 'launch' }
+        elseif ($msg -match '^previous server .* -- planned') { $kind = 'planned' }
+        elseif ($msg -match '^previous server .* -- unplanned') { $kind = 'unplanned' }
+        elseif ($msg -match '^server check failed') { $kind = 'miss' }
+        elseif ($msg -match 'stale code') { $kind = 'stale' }
+        if ($kind) { $ev += ,@{ t = $t; kind = $kind; text = $l } }
+    }
+    if ($ev.Count -eq 0) { return $none }
+    $last = @($ev | Select-Object -Last 6 | ForEach-Object { $_.text })
+    $win10 = @($ev | Where-Object { ($Now - $_.t).TotalSeconds -le 600 })
+    $launches10 = @($win10 | Where-Object { $_.kind -eq 'launch' }).Count
+    $unplanned10 = @($win10 | Where-Object { $_.kind -eq 'unplanned' }).Count
+    if (($launches10 -ge 3) -and ($unplanned10 -ge 2)) { return @{ kind = 'loop'; lines = $last } }
+    $win90 = @($ev | Where-Object { ($Now - $_.t).TotalSeconds -le 90 })
+    $unplanned90 = @($win90 | Where-Object { $_.kind -eq 'unplanned' }).Count
+    $okEv = @($win90 | Where-Object { $_.kind -in @('planned', 'launch') }).Count
+    if (($unplanned90 -eq 0) -and ($okEv -gt 0)) { return @{ kind = 'planned'; lines = $last } }
+    return $none
+}
+$script:supervisorLog = Join-Path $env:TEMP "m365-companion-supervisor.log"
+
 # PURE. What to tell the reader when /health did not answer. $Listening is whether ANY process holds
 # :8000 right now. THE OLD TEXT SAID "dying" WITHOUT LOOKING: server_up FAIL was enough for
 # "the supervisor is relaunching the server and it is dying ... producing no output at all". A
@@ -289,7 +333,7 @@ Check "python_runnable" "Python the supervisor would use (.venv, else PATH)" `
 # with no output -- the log of such a server holds only its normal start lines, which is exactly
 # what an ALIVE server's log looks like. Only a port nobody listens on can mean "down".
 function Get-ServerDownAdvice {
-    param([bool]$SupervisorRunning, $out, [string]$PyProblem, [bool]$Listening)
+    param([bool]$SupervisorRunning, $out, [string]$PyProblem, [bool]$Listening, $Verdict = $null)
     if (-not $SupervisorRunning) {
         return ("the stack has not been started on this machine -- nothing is " +
                 "relaunching the server. Double-click start_all.bat.")
@@ -308,6 +352,20 @@ function Get-ServerDownAdvice {
                 "STARTUP. Its last output was:" + [Environment]::NewLine +
                 "           " +
                 ($out.lines -join ([Environment]::NewLine + "           ")))
+    }
+    # THE SUPERVISOR'S OWN LOG DECIDES "PLANNED" vs "DYING" (Get-SupervisorServerVerdict above).
+    if ($Verdict -and ($Verdict.kind -eq 'planned')) {
+        return ("the supervisor is restarting the server after an update (planned). " +
+                "Wait about 30 seconds and run doctor.bat again. Do NOT run start_all.bat.")
+    }
+    if ($Verdict -and ($Verdict.kind -eq 'loop')) {
+        return ("the supervisor is relaunching the server and it keeps dying: 3 or " +
+                "more launches in 10 minutes with exits that were not planned. " +
+                "Last supervisor log lines:" + [Environment]::NewLine +
+                "           " +
+                ($Verdict.lines -join ([Environment]::NewLine + "           ")) +
+                [Environment]::NewLine +
+                "           Do NOT run start_all.bat: the supervisor is already doing that on a loop.")
     }
     if ($out -and $out.started) {
         return ("nothing is listening on :8000 and the only output on record is from an earlier " +
@@ -332,7 +390,8 @@ try {
     $script:serverListening = [bool](Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop)
 } catch { $script:serverListening = $false }
 $script:serverFix = Get-ServerDownAdvice -SupervisorRunning ([bool]$script:supervisorCmdLine) `
-    -Out (Get-ServerLastOutput) -PyProblem $script:pyProblem -Listening $script:serverListening
+    -Out (Get-ServerLastOutput) -PyProblem $script:pyProblem -Listening $script:serverListening `
+    -Verdict (Get-SupervisorServerVerdict -Path $script:supervisorLog)
 
 # 2. local MCP server
 Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
@@ -682,7 +741,7 @@ function Test-TunnelHealthAnswer([string]$tunnelUrl, $localPid, [int]$timeoutSec
         if ($nextUri) {
             if ($nextUri.Host -ne $u.Host) {
                 $res.Why = "the public URL redirected to " + $nextUri.Host + " (a sign-in page), not the server -- the tunnel does not admit anonymous callers"
-                if ($nextUri.Host -match '(?i)^(login\.(microsoftonline\.(com|us)|microsoft\.com|live\.com|windows\.net)|sts\.windows\.net)$') {
+                if ($nextUri.Host -match '(?i)^(login\.(microsoftonline\.(com|us)|microsoft\.com|live\.com|windows\.net)|sts\.windows\.net|([a-z0-9-]+\.)*tunnels\.api\.visualstudio\.com)$') {
                     $res.SignInHost = $nextUri.Host
                 }
                 return $res
