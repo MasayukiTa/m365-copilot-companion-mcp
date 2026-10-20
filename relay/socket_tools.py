@@ -202,9 +202,15 @@ def strip_calls(reply: str, *, allowed=DEFAULT_ALLOWED) -> str:
 def result_turn(results, notices=None) -> str:
     """The next turn: what the tools returned, framed so it is not mistaken for a new request.
 
-    Bounded per result. A tool that returns a megabyte would otherwise put a megabyte into the
-    conversation, and cost here is charged per message rather than per byte -- but a message
-    large enough to exhaust the model's budget ends the conversation regardless.
+    NO LENGTH CUT (owner decision 2026-10-20; results used to be cut at 8000 characters). The
+    cut had no measurement behind it. Each result goes back whole.
+
+    WHAT THIS RELIES ON. If a tool returns something huge, the model's own context limit
+    applies: the failure mode is a turn that the service ends or answers badly, not a
+    truncated result that looks complete. If that ever needs a mitigation it is a separate
+    change and must carry a measured background (the size at which a turn failed, and the
+    record of it). Tools that can return very large output have their own limits (for
+    example `max_rows`, `read_file` ranges), which are not touched here.
     """
     parts = []
     for item in results:
@@ -217,8 +223,6 @@ def result_turn(results, notices=None) -> str:
         if label:
             head += " [%s]" % label
         body = str(text or "")
-        if len(body) > 8000:
-            body = body[:8000] + "\n…(切り詰め: %d 文字)" % len(str(text))
         parts.append(head + "\n" + body)
     notes = [str(n) for n in (notices or ()) if n]
     tail = ("\n\n--- 注意 ---\n" + "\n".join(notes)) if notes else ""

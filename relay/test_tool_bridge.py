@@ -194,13 +194,13 @@ def test_a_hung_call_is_cut_off_and_reported():
     assert ok is False and text.startswith("TimeoutError")
 
 
-def test_a_huge_result_passes_through_and_the_loop_truncates_it_and_says_so():
+def test_a_huge_result_passes_through_and_the_loop_sends_it_whole():
     big = "r" * 50000
     run = TB.make_run_tool("w", client_factory=_factory(_FakeClient(_Result(big))))
     ok, text = run("call_tool", {"name": "t", "arguments": {}})
     assert ok is True and len(text) == 50000
     turn = ST.result_turn([("call_tool", ok, text)])
-    assert "切り詰め" in turn and "50000" in turn and len(turn) < 20000
+    assert "切り詰め" not in turn and big in turn
 
 
 def test_run_tool_works_from_inside_a_running_event_loop():
