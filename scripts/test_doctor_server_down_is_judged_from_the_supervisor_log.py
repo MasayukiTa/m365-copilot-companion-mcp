@@ -94,16 +94,29 @@ def test_verdicts_from_stub_supervisor_logs(tmp_path):
     assert r["missing"][0] == "none", r
 
 
-def test_the_planned_branch_says_wait_and_never_dying():
+def test_one_advice_function_combines_listener_rule_and_supervisor_verdict(tmp_path):
+    """ONE explanation: Get-ServerDownAdvice (listener rule of #218) takes the verdict as well."""
     src = open(DOCTOR_PS1, encoding="utf-8").read()
-    i = src.index("elseif ($verdict.kind -eq 'planned')")
-    j = src.index("elseif ($verdict.kind -eq 'loop')")
-    planned = src[i:j]
-    assert "restarting the server after an update (planned)" in planned
-    assert "Wait about 30 seconds and run doctor.bat again" in planned
-    assert "dying" not in planned.lower()
-    # the startup-crash branch with its last output still comes first
-    assert src.index("DYING ON") < i
+    assert src.count("$script:serverFix = ") == 1   # the single call below
+    fn = _extract(src, "function Get-ServerDownAdvice")
+    body = fn + "\n"
+    cases = [
+        ("planned_down", "$false", "@{ kind = 'planned'; lines = @() }"),
+        ("planned_alive", "$true", "@{ kind = 'planned'; lines = @() }"),
+        ("loop_down", "$false", "@{ kind = 'loop'; lines = @('L1','L2') }"),
+        ("none_down", "$false", "$null"),
+    ]
+    for name, listening, verdict in cases:
+        body += ("$t = Get-ServerDownAdvice -SupervisorRunning $true -Out $null -PyProblem '' "
+                 "-Listening %s -Verdict %s\nWrite-Output ('ADV|%s|' + ($t -replace '\\s+', ' '))\n"
+                 % (listening, verdict, name))
+    out = _run_ps(tmp_path, body)
+    adv = dict(l.split("|", 2)[1:] for l in out.splitlines() if l.startswith("ADV|"))
+    assert "restarting the server after an update (planned)" in adv["planned_down"], adv
+    assert "dying" not in adv["planned_down"].lower(), adv
+    assert "IS listening on :8000" in adv["planned_alive"], adv     # the listener rule comes first
+    assert "keeps dying" in adv["loop_down"] and "L1" in adv["loop_down"], adv
+    assert "restarting the server after an update" not in adv["none_down"], adv
 
 
 def test_doctor_stays_ascii_only():
