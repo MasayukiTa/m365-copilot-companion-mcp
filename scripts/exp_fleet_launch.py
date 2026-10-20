@@ -111,6 +111,18 @@ def carried_floor_lines(own_text, own_path, candidates=None):
     return out
 
 
+def own_disk_floor(text):
+    """The disk floor the run will use: the operator's value carried into this settings file by `prepare`;
+    the launcher's own MIN_FREE_GB only when the file has none. 0 means the operator turned it off."""
+    for ln in (text or "").splitlines():
+        if "=" in ln and not ln.strip().startswith("#") and ln.split("=", 1)[0].strip() == "disk_floor_gb":
+            try:
+                return float(ln.split("=", 1)[1].strip())
+            except ValueError:
+                break
+    return MIN_FREE_GB
+
+
 def settings_body():
     return "".join("%s=%s\n" % kv for kv in REQUIRED_SETTINGS.items())
 
@@ -249,8 +261,11 @@ def run_one_goal(a):
     if os.path.exists(run["state_dir"]) and os.listdir(run["state_dir"]):
         print("refused: state directory is not empty")
         return 2
-    if not disk_ok(root):
-        print("STOP: C: has under %.1f GB free" % MIN_FREE_GB)
+    with open(os.path.join(REPO, ".config", "settings.txt"), encoding="utf-8-sig") as fh:
+        own_text = fh.read()
+    floor = own_disk_floor(own_text)
+    if floor > 0 and not disk_ok(root, floor):
+        print("STOP: C: has under %.1f GB free (floor %.1f)" % (floor, floor))
         return 3
     with open(os.path.join(REPO, ".config", "settings.txt"), encoding="utf-8-sig") as fh:
         bad = settings_problems(fh.read())
