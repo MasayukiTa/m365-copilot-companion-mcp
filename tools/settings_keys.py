@@ -183,6 +183,17 @@ KEYS = OrderedDict([
        "next card with no restart. The connector route never reads it. Anything but off reads "
        "as on."),
 
+    # Resident tools for a person's own chat (relay/resident_guard.py). Nothing acts on it yet: the
+    # first slice adds only the refusal rules and an observation probe, and status.json reports it.
+    _k("resident_tools", EACH_GATE, "off",
+       "relay/resident_guard.py:mode (reported in status.json every snapshot, mtime-cached; "
+       "no component acts on it yet)",
+       "off|on. Reserved for the resident component that would run tool blocks found in the "
+       "configured user's own conversations with the configured agent (Copilot app, Teams, "
+       "mobile) on this PC. In this version it changes nothing: the value is only reported in "
+       "status.json. Read at each status snapshot, so a change shows with no restart. Anything "
+       "but on reads as off."),
+
     # Continue turn after an unknown delivery (relay/continue_recovery.py). OFF by default.
     _k("socket_continue_recovery", EACH_GATE, "off",
        "relay/continue_recovery.py:mode (every send on the socket route and every retry "

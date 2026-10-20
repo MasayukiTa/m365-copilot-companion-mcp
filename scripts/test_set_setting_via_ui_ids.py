@@ -56,7 +56,7 @@ def test_every_settings_combo_has_an_id_and_is_driven():
     # each settings-popup combo is paired with a *View class whose Key it saves
     cs = cockpit_source.read(encoding="utf-8")
     boxes = _boxes()
-    for view_key in ("effort_policy", "fanout", "tool_transport", "merge_conversation",
+    for view_key in ("effort_policy", "fanout", "tool_transport", "resident_tools", "merge_conversation",
                      "fleet_auto_resume", "supervisor_self_restart", "tool_probe_idle_min",
                      "fanout_load_routing", "team_mode", "agent_board_mode",
                      "org_version_record", "org_proposals", "org_shadow_eval",

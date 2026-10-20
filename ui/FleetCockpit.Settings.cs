@@ -215,6 +215,11 @@ partial class CockpitWindow
                     string tpv = ToolProbeView.ParseLine(ln);   // 0|15|30|60 only; junk keeps the value
                     if (tpv != null) _tpVal = tpv;
                 }
+                else if (ln.StartsWith("resident_tools="))
+                {
+                    string rtv = ResidentToolsView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (rtv != null) _rtVal = rtv;
+                }
                 else if (ln.StartsWith("tool_transport="))
                 {
                     string trv = ToolRouteView.ParseLine(ln);   // connector|connector-less (bridge = old spelling); junk keeps the value

@@ -1498,6 +1498,17 @@ def _write_scope_tick(workers):
         pass
 
 
+def _resident_tools_block():
+    """`resident_tools`: "off"|"on", additive. The production caller of
+    relay.resident_guard.status_block (and so of its mode reader). Nothing acts on the value
+    yet. {} on any failure."""
+    try:
+        from relay import resident_guard as _rg
+        return _rg.status_block()
+    except Exception:
+        return {}
+
+
 def _load_routing_block():
     """`fanout_load_routing`: {mode, recorded, differed}, additive. The production caller of
     relay.load_routing.status_block (and so of its mode reader). {} on any failure."""
@@ -2099,6 +2110,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_tree_budget_block(_snap["workers"]))
     _snap.update(_fanout_depth_block())
     _snap.update(_write_scope_block())
+    _snap.update(_resident_tools_block())
     _snap.update(_load_routing_block())
     _snap.update(_team_formation_block())
     _snap.update(_agent_board_block())

@@ -636,6 +636,9 @@ jobs:
             tests/test_retry_sets_agree.py \
             tests/test_fanout_default_on_agrees.py \
             tests/test_fanout_write_scope_agrees.py \
+            tests/test_resident_tools_agrees.py \
+            relay/test_resident_guard.py \
+            scripts/probes/test_resident_observe.py \
             tests/test_fanout_load_routing_agrees.py \
             tests/test_team_mode_agrees.py \
             tests/test_agent_board_agrees.py \

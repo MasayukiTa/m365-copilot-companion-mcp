@@ -266,6 +266,10 @@ partial class CockpitWindow : Window
     string _caVal = ConsentApproveView.Default;
     ComboBox _caBox;
     TextBlock _caLbl;
+    // resident tools in my own chats off|on -> settings.txt resident_tools ; absent key = off
+    string _rtVal = ResidentToolsView.Default;
+    ComboBox _rtBox;
+    TextBlock _rtLbl;
     // tool-call check interval 0|15|30|60 minutes -> settings.txt tool_probe_idle_min ; absent key = 30
     string _tpVal = ToolProbeView.Default;
     ComboBox _tpBox;
