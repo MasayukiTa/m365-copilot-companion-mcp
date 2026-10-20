@@ -6,7 +6,7 @@ from .file_ops import _validate_path
 from .security import require_unlocked
 
 CONN_PREFIX = "MCP_DB_"
-DEFAULT_TIMEOUT = 30
+DEFAULT_TIMEOUT = 0  # 0 = driver default: no connect/login-wait cap imposed by this tool
 READ_VERBS = {"select", "with", "exec", "execute", "show", "describe", "desc"}
 
 #: Opt-IN switch for people who want the tool itself to refuse everything but reads. Default
@@ -119,7 +119,7 @@ def odbc_query(
     connection: str,
     query: str,
     params: Optional[list[Any]] = None,
-    max_rows: int = 200,
+    max_rows: Optional[int] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
     """Execute a SQL statement over ODBC and return a text table.
@@ -137,8 +137,11 @@ def odbc_query(
             a full ODBC connection string (must contain '=' and ';').
         query: SQL statement.
         params: Optional positional parameters bound with '?' placeholders.
-        max_rows: Truncate result set to this many rows.
-        timeout: Connection / login timeout in seconds.
+        max_rows: Truncate result set to this many rows. Default None means no cut:
+            every row is fetched and rendered, so a large result lands in full.
+            Pass an integer to opt in to a row cap.
+        timeout: Connection / login timeout in seconds. Default 0 is the driver
+            default (no wait cap imposed here).
     """
     locked = require_unlocked()
     if locked:
@@ -153,7 +156,7 @@ def odbc_query(
             if cur.description is None:
                 return "(statement returned no result set)"
             columns = [d[0] for d in cur.description]
-            rows = cur.fetchmany(max_rows)
+            rows = cur.fetchall() if max_rows is None else cur.fetchmany(max_rows)
         finally:
             con.close()
         result = _format_table(columns, rows, max_rows)
@@ -401,7 +404,7 @@ def _format_table(columns: list[str], rows: list, max_rows: int) -> str:
     lines = [header, sep]
     for srow in str_rows:
         lines.append("  ".join(srow[i].ljust(widths[i])[:widths[i]] for i in range(len(columns))))
-    if len(rows) == max_rows:
+    if max_rows is not None and len(rows) == max_rows:
         lines.append(f"... (truncated at max_rows={max_rows})")
     lines.append(f"--- {len(rows)} row(s)")
     return "\n".join(lines)

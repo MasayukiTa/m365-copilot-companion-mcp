@@ -983,6 +983,7 @@ jobs:
             tools/test_lock_refusal_hands_off_to_fleet.py \
             tools/test_odbc_ops_unlock_gate.py \
             tools/test_odbc_ops_permissions_decide.py \
+            tools/test_odbc_ops_no_default_row_or_connect_caps.py \
             tools/test_chart_ops.py \
             tools/test_chart_ops_dependencies.py \
             tools/test_outlook_ops_unlock_gate.py \
