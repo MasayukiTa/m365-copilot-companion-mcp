@@ -680,6 +680,7 @@ jobs:
             tests/test_skill_match_japanese.py \
             tests/test_skill_requires_tools.py \
             tests/test_refuter_source_check.py \
+            tests/test_refuter_subject_check.py \
             tests/test_no_domain_words_in_harness.py \
             tests/test_skills_business_draft.py \
             tests/test_skills_business_lifecycle.py \
