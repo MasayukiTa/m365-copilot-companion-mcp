@@ -66,5 +66,5 @@ def test_the_launcher_runs_from_a_bare_command_line_with_isolated_python(tmp_pat
     code = ("import runpy, sys; runpy.run_path(sys.argv[1], run_name='probe'); "
             "import tools.childproc, scripts.sibling_dup_report; print('ok')")
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, script], capture_output=True,
-                       text=True, timeout=120, cwd=str(tmp_path))
+                       encoding="utf-8", errors="replace", timeout=120, cwd=str(tmp_path))
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-400:]
