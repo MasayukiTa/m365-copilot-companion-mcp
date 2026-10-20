@@ -31,7 +31,7 @@ relay / fleet の細かい制御、bridge UI、ODBC 接続、ツール自己生�
 | **図 / 数式** | `render_diagram`☁, `render_mermaid_png`☁, `render_math`🟢 | ☁ Kroki / `render_math` は外部不要 | アーキ図と数式を生成。社外秘は render_diagram に出さない |
 | **Web** | `web_fetch`, `web_search`, `web_search_news`, `github_file` | ☁ | DuckDuckGo 検索・URL 取得。Copilot 標準検索が使えれば不要 |
 | **DB (SQLite)** | `sqlite_tables`, `sqlite_schema`, `sqlite_query`, `sqlite_to_excel` | 🟢 | ローカル `.sqlite` を read-only で |
-| **DB (ODBC)** | `odbc_drivers`, `odbc_connections`, `odbc_tables`, `odbc_columns`, `odbc_query`, `odbc_to_excel` | 📦`ODBC ドライバ`+接続設定 | 社内 SQL Server / Azure SQL。Windows/Entra 認証継承、read-only 強制。実データ/スキーマを返す `odbc_query`/`odbc_tables`/`odbc_columns`/`odbc_to_excel` は unlock 必須（`odbc_drivers`/`odbc_connections` は接続の存在確認のみなので不要） |
+| **DB (ODBC)** | `odbc_drivers`, `odbc_connections`, `odbc_tables`, `odbc_columns`, `odbc_query`, `odbc_to_excel` | 📦`ODBC ドライバ`+接続設定 | 社内 SQL Server / Azure SQL。Windows/Entra 認証継承。DB アカウントの権限で動作（`MCP_DB_READONLY=1` で読み取り専用に）。実データ/スキーマを返す `odbc_query`/`odbc_tables`/`odbc_columns`/`odbc_to_excel` は unlock 必須（`odbc_drivers`/`odbc_connections` は接続の存在確認のみなので不要） |
 | **永続記憶** | `memory_save`, `memory_load`, `memory_list`, `memory_delete` | 🟢 | セッション横断のメモ |
 | **スケジュール** | `schedule_create`, `schedule_list`, `schedule_info`, `schedule_run_now`, `schedule_delete` | 🪟 | 「毎週金曜 9 時に週報生成」 |
 | **ファイル監視** | `watcher_start`, `watcher_events`, `watcher_stop` | 📦`watchdog` | フォルダ変更検知 |
@@ -249,7 +249,7 @@ eventsへ退避する方式です。DB容量は完了時のWAL checkpointで抑�
 
 ## ODBC 接続（社内 DB）
 
-`.env` に `MCP_DB_<NAME>=` を追記すると `odbc_query` の名前付き接続になります。認証は Windows / Entra ID（`Trusted_Connection=Yes` または `Authentication=ActiveDirectoryIntegrated`）なのでパスワードは保存しません。エージェントはログイン中ユーザーの権限の範囲でしか SQL を投げられません。read-only 強制で `SELECT / WITH / EXEC / SHOW / DESCRIBE` のみ許可。
+`.env` に `MCP_DB_<NAME>=` を追記すると `odbc_query` の名前付き接続になります。認証は Windows / Entra ID（`Trusted_Connection=Yes` または `Authentication=ActiveDirectoryIntegrated`）なのでパスワードは保存しません。エージェントはログイン中ユーザーの権限の範囲で SQL を投げます。ツール側では文の種類を制限せず、DB アカウントの権限がそのまま効きます。権限が足りないときは DB のエラー文がそのまま返ります。`.env` に `MCP_DB_READONLY=1` を書くと、`SELECT / WITH / EXEC / SHOW / DESCRIBE` 以外をツールが断り、接続も読み取り専用で開きます（任意の設定で、既定は無効）。
 
 ```
 # Windows 認証（オンプレ SQL Server）

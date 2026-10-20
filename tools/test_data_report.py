@@ -562,7 +562,8 @@ def test_odbc_helper_xlsx_is_not_truncated_at_old_200_cap(monkeypatch, every_dri
     assert "--- 15 row(s)" in result["preview"]
 
 
-def test_odbc_helper_rejects_non_read_only(monkeypatch):
+def test_odbc_helper_rejects_non_read_only_when_the_opt_in_is_set(monkeypatch):
+    monkeypatch.setenv("MCP_DB_READONLY", "1")
     monkeypatch.setattr(odbc_ops, "require_unlocked", lambda: None)
     monkeypatch.setattr(odbc_ops, "_connect", lambda connection, timeout=30: (_ for _ in ()).throw(AssertionError("must not connect")))
     result = odbc_ops.odbc_query_to_excel_and_preview("demo_db", "DELETE FROM FAKE_TABLE_A", "C:/fake/out.xlsx")

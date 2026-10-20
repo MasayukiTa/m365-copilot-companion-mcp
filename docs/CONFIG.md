@@ -38,6 +38,7 @@
 | `MCP_TUNNEL_NAME` | devtunnel のトンネル名 | `setup_devtunnel.ps1` が記録 |
 | `MCP_TUNNEL_URL` | devtunnel の公開 URL | `setup_devtunnel.ps1` が記録 |
 | `MCP_DB_<NAME>` | 名前付き ODBC 接続文字列（社内 DB を使うなら追記） | 任意。[ADVANCED.md](ADVANCED.md) |
+| `MCP_DB_READONLY` | `1` にすると ODBC ツールが読み取り以外の文を断り、接続も読み取り専用で開く（任意） | 未設定 = 制限なし。DB アカウントの権限で決まる |
 
 ---
 
