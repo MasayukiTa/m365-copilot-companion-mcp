@@ -192,12 +192,14 @@ def final_and_children(transcripts, mapped, camp_rows):
 
 # --------------------------------------------------------------------------- one run's record
 
-def run_record(run, goal, finished, ledger_path):
+def run_record(run, goal, finished, ledger_path, stop_at=None):
     sd = run["state_dir"]
     camp = S._read_jsonl(os.path.join(sd, "campaigns.jsonl"))
     trs = load_transcripts(sd)
     mapped = map_workers(trs, camp)
     t0, t1 = float(finished["ts_start"]), float(finished["ts_end"]) + LEDGER_SLACK_S
+    if stop_at is not None:     # the next run's workers reuse the names w0, w1 ...: never reach into it
+        t1 = min(t1, float(stop_at) - 1e-6)
     rows = enrich(ledger_slice(ledger_path, t0, t1), mapped)
     pairs = [(c, o) for c, o in S.pair_events(rows) if not str(c.get("tool") or "").startswith(S.DISCOVERY_PREFIX)]
     durs = [S._duration(o) for _c, o in pairs]
@@ -334,10 +336,12 @@ def cmd_collect(a):
     ledger = a.ledger or os.path.join(REPO, ".fleet", "tool_events.jsonl")
     finished = _finished_runs(root)
     records = []
+    starts = sorted(float(f["ts_start"]) for f in finished.values())
     for run in plan["runs"]:
         fin = finished.get(run["label"])
         if fin:
-            records.append(run_record(run, goals[run["goal_id"]], fin, ledger))
+            nxt = [t for t in starts if t > float(fin["ts_start"])]
+            records.append(run_record(run, goals[run["goal_id"]], fin, ledger, stop_at=nxt[0] if nxt else None))
     adir = os.path.join(root, "analysis")
     os.makedirs(adir, exist_ok=True)
     # the pooled view the stock reports can read: enriched ledger, concatenated campaign rows
