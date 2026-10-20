@@ -1061,6 +1061,55 @@ public static class ToolRouteView
     }
 }
 
+// The consent-card selector's words and parsing, WPF-free. The Python side decides:
+// relay/consent_approve.py reads `consent_auto_approve` when a connector-less turn ends without text
+// (a Work IQ tool-approval card) and, for `on`, presses ONLY the known Work IQ tool cards of the
+// configured agent's conversation; everything it does is counted in status.json "consent_approvals".
+// The connector route never reads it. Default on.
+public static class ConsentApproveView
+{
+    //: must equal tools/settings_keys.py and relay/consent_approve.py (KEY / DEFAULT).
+    public const string Key = "consent_auto_approve";
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "on", "off" };
+
+    public static bool IsMode(string v) { return v == "on" || v == "off"; }
+
+    /// <summary>The mode named by one consent_auto_approve= line; null when the line is not that key
+    /// or the value is not on|off (the caller keeps its value, on). A byte order mark is tolerated
+    /// and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "同意カードの自動承認" : "Auto-approve consent cards"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "on") return ja ? "オン(Work IQ の7ツールだけ)" : "On (the 7 Work IQ tools only)";
+        if (mode == "off") return ja ? "オフ(人が押す)" : "Off (a person clicks)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "コネクタなし経路で、エージェントの会話に Work IQ の承認カード(Calendar、Copilot、Mail、OneDrive、SharePoint、Teams、User)が出たとき、製品が代わりに押します。ほかのツール名のカードや、設定したエージェント以外の会話では押さず、記録だけ残します。承認はメール・予定・Teams・ファイルへのアクセスを許可する操作です。コネクタ経路には影響しません。"
+                  : "On the connector-less route, when the agent's conversation shows a Work IQ approval card (Calendar, Copilot, Mail, OneDrive, SharePoint, Teams, User) the product presses it. Cards for any other tool name, or in a conversation of another agent, are not pressed and only recorded. Approving grants access to mail, calendar, Teams and files. The connector route is not affected.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次に同意カードが出たときから有効。再起動不要。"
+                  : "Applies the next time a consent card appears, no restart.";
+    }
+}
+
 // The merge-conversation selector's words and parsing, WPF-free. KEPT AT THE END OF THE FILE on
 // purpose: shape tests slice this file from one view class to the end of the next, and a view
 // dropped between two of them has already broken one. The Python side decides:

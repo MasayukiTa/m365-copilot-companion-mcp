@@ -262,6 +262,7 @@ partial class CockpitWindow
             case "tool_probe_idle_min":
             case "merge_conversation":
             case "tool_transport":
+            case "consent_auto_approve":
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
             case "rate_ceiling_rpm":
@@ -793,6 +794,7 @@ partial class CockpitWindow
         // ── Tool route / ツール: how a fleet conversation reaches its tools (connector or connector-less).
         col.Children.Add(SectionHeader(L("ツール", "Tools")));
         col.Children.Add(ToolRouteControl());
+        col.Children.Add(ConsentApproveControl());
 
         // THE RE-UNLOCK CONTROL WAS REMOVED HERE, DELIBERATELY, AND MUST NOT COME BACK.
         //

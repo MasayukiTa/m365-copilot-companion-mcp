@@ -169,6 +169,20 @@ KEYS = OrderedDict([
        "conversations already running keep the transport they started with. Anything else "
        "reads as connector. No environment variable overrides it."),
 
+    # Work IQ consent cards on the connector-less route (relay/consent_approve.py). ON by default
+    # because the owner's standing requirement is that nobody clicks these cards by hand.
+    _k("consent_auto_approve", EACH_GATE, "on",
+       "relay/consent_approve.py:mode (every connector-less turn that ends without text, "
+       "mtime-cached)",
+       "on|off. on: when a connector-less turn ends on a tool-approval card, a helper process "
+       "opens that conversation in a light page of the product's own Edge (no Copilot turn is "
+       "sent) and presses the card ONLY when its tool name is one of the 7 Work IQ tools "
+       "(Calendar, Copilot, Mail, OneDrive, SharePoint, Teams, User) and the page is the "
+       "configured agent's conversation; any other card is left alone and recorded in "
+       ".fleet/consent_approvals.jsonl. Read when a turn ends on a card, so a change reaches the "
+       "next card with no restart. The connector route never reads it. Anything but off reads "
+       "as on."),
+
     # Continue turn after an unknown delivery (relay/continue_recovery.py). OFF by default.
     _k("socket_continue_recovery", EACH_GATE, "off",
        "relay/continue_recovery.py:mode (every send on the socket route and every retry "
