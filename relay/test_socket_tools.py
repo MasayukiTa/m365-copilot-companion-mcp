@@ -55,9 +55,12 @@ def test_several_independent_calls_in_one_reply_are_all_read():
     assert [a["name"] for _n, a in _parse_calls(reply)] == ["a", "b"]
 
 
-def test_the_number_of_calls_is_bounded():
+def test_every_call_block_in_a_reply_is_read_however_many_there_are():
+    # There is no per-reply cap (owner decision 2026-10-20): 50 blocks are 50 calls, in order.
     reply = "".join('```call_tool\n{"name": "t%d"}\n```\n' % i for i in range(50))
-    assert len(_parse_calls(reply)) == ST.MAX_CALLS_PER_REPLY
+    got = [a["name"] for _n, a in _parse_calls(reply)]
+    assert got == ["t%d" % i for i in range(50)]
+    assert not hasattr(ST, "MAX_CALLS_PER_REPLY")
 
 
 def test_a_reply_with_no_calls_ends_the_turn():
@@ -207,19 +210,18 @@ def test_a_block_that_is_not_an_object_is_named_with_its_reason():
     assert "ブロック2" in nxt and "オブジェクトではない" in nxt
 
 
-def test_calls_past_the_limit_are_reported_and_never_run():
+def test_more_than_eight_calls_in_one_reply_are_all_run_in_order():
     ran = []
 
     def run(name, args):
         ran.append(args["name"])
         return True, "ok"
-    nxt, calls = ST.step("".join(_blk("t%d" % i) for i in range(1, 11)), run)
-    assert len(calls) == ST.MAX_CALLS_PER_REPLY == len(ran)
-    assert "t9" not in ran and "t10" not in ran
-    assert len(_head_lines(nxt)) == 8
-    notice = nxt.split("--- 注意 ---")[1]
-    assert "2 件" in notice and "実行していない" in notice
-    assert "ブロック9,10" in notice
+    nxt, calls = ST.step("".join(_blk("t%d" % i) for i in range(1, 21)), run)
+    want = ["t%d" % i for i in range(1, 21)]
+    assert ran == want and [a["name"] for _n, a in calls] == want
+    heads = _head_lines(nxt)
+    assert [h.split(" ")[0] for h in heads] == ["#%d" % i for i in range(1, 21)]
+    assert "--- 注意 ---" not in nxt, "nothing was left unrun, so there is nothing to resend"
 
 
 def test_a_single_call_works_as_before_apart_from_its_id():
