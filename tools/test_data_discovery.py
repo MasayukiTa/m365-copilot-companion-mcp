@@ -295,3 +295,68 @@ def test_alias_expansion_not_attempted_when_no_keywords_extracted(monkeypatch):
     dd.find_db_objects("...")  # punctuation-only -> extract_keywords yields []
 
     assert called["n"] == 0
+
+
+# ===========================================================================
+# catalogue-ranked candidates (measured: memory tags were a bag of words and the
+# table whose NAME matched won over the table that holds the measure)
+# ===========================================================================
+
+import json as _json
+
+
+def _catalogue(tmp_path, monkeypatch):
+    cat = tmp_path / "catalog"
+    cat.mkdir()
+    (cat / "a.json").write_text(_json.dumps({
+        "name": "defect_notes", "kind": "table",
+        "description": "Free-text remarks written by staff",
+        "columns": [{"name": "remark", "meaning": "free text"}]}), encoding="utf-8")
+    (cat / "b.json").write_text(_json.dumps({
+        "name": "qc_results", "kind": "view",
+        "description": "Inspection results per lot",
+        "columns": [{"name": "defect_qty", "meaning": "number of defective units"}]}),
+        encoding="utf-8")
+    monkeypatch.setenv("MCP_SEMANTIC_DIR", str(tmp_path))
+
+
+NOISY_MEMORY = (
+    "1 match(es) for 'x':\n"
+    "- [s] score=3 tags=[table:decimal,table:lotno,table:qc_results,src:memo.md] intent='q'\n"
+    "    snippet"
+)
+
+
+def test_the_object_whose_columns_match_the_measure_beats_a_name_only_match(
+        tmp_path, monkeypatch):
+    _catalogue(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: "(no matches)")
+    out = dd.find_db_objects("defect")
+    cand = out.split("候補テーブル (catalogue")[1]
+    assert cand.index("qc_results") < cand.index("defect_notes")
+    assert "defect_qty" in cand            # the reason shown is the column, not the name
+
+
+def test_candidates_from_memory_are_split_into_known_objects_and_unverified_tags(
+        tmp_path, monkeypatch):
+    _catalogue(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: NOISY_MEMORY)
+    out = dd.find_db_objects("defect")
+    main, _, rest = out.partition("未確認のタグ")
+    assert "decimal" not in main and "lotno" not in main
+    assert "decimal" in rest and "lotno" in rest
+
+
+def test_without_a_catalogue_the_memory_candidates_are_unchanged(monkeypatch):
+    monkeypatch.delenv("MCP_SEMANTIC_DIR", raising=False)
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: NOISY_MEMORY)
+    out = dd.find_db_objects("defect")
+    assert "  - decimal" in out and "未確認のタグ" not in out and "catalogue" not in out
+
+
+def test_a_catalogue_hit_alone_is_an_answer_even_when_memory_is_empty(tmp_path, monkeypatch):
+    _catalogue(tmp_path, monkeypatch)
+    monkeypatch.setattr(pm, "procedural_memory_search", lambda query, limit=10: "(no matches)")
+    monkeypatch.setattr(odbc_ops, "odbc_tables", _raise_if_called)
+    out = dd.find_db_objects("defective units", connection="demo_db")
+    assert "qc_results" in out and "ライブ探索" not in out
