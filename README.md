@@ -25,7 +25,7 @@ API 契約は不要。会社アカウントのまま。管理者権限も不要�
 - **Excel / CSV / JSON** を集計する、**Word / PowerPoint / PDF** を作る・読む
 - **OCR** で画像・スキャン PDF を文字起こしする
 - **Python** をその場で走らせてグラフを描く
-- **社内 SQL(ODBC)** を Windows 認証のまま読み取る（read-only）
+- **社内 SQL(ODBC)** を Windows 認証のまま扱う（DB アカウントの権限に従う。読み取り専用にしたいときは `MCP_DB_READONLY=1`）
 - 複数の作業を**並列で無人自走**させる（フリート）
 - **チャット UI** で手元のアプリのように話しかける
 - 自分が作った画像を**見返して自己検証**する
@@ -314,7 +314,7 @@ A. `quickstart.bat` も `start_all.bat` も冪等です。**いつ何度実行�
 - Aggregate **Excel / CSV / JSON**, and create/read **Word / PowerPoint / PDF**
 - **OCR** images and scanned PDFs into text
 - Run **Python** on the spot to draw charts
-- Read **internal SQL (ODBC)** with Windows auth, read-only
+- Read **internal SQL (ODBC)** with Windows auth (the DB account's own permissions apply; set `MCP_DB_READONLY=1` for read-only)
 - Run multiple jobs **unattended and in parallel** (fleet)
 - Talk to it through a **chat UI** like a local app
 - **Self-check** images it produced by looking at them again

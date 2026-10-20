@@ -9,11 +9,27 @@ CONN_PREFIX = "MCP_DB_"
 DEFAULT_TIMEOUT = 30
 READ_VERBS = {"select", "with", "exec", "execute", "show", "describe", "desc"}
 
+#: Opt-IN switch for people who want the tool itself to refuse everything but reads. Default
+#: OFF (owner decision 2026-10-20): what the database account's own permissions allow must be
+#: possible, and a refusal from the database is passed to the caller as the database wrote it.
+READONLY_ENV = "MCP_DB_READONLY"
+_TRUE = {"1", "true", "yes", "on"}
+
+
+def readonly_enforced() -> bool:
+    """True only when MCP_DB_READONLY is set to 1/true/yes/on. Read on every call."""
+    return os.environ.get(READONLY_ENV, "").strip().lower() in _TRUE
+
 
 def _list_connections() -> dict[str, str]:
-    """Read connection strings from MCP_DB_<NAME> env vars (set in .env)."""
+    """Read connection strings from MCP_DB_<NAME> env vars (set in .env).
+
+    MCP_DB_READONLY is the switch above, not a connection named "readonly".
+    """
     out: dict[str, str] = {}
     for key, value in os.environ.items():
+        if key == READONLY_ENV:
+            continue
         if key.startswith(CONN_PREFIX) and value:
             name = key[len(CONN_PREFIX):].lower()
             out[name] = value
@@ -80,7 +96,8 @@ def _connect(connection_name_or_string: str, timeout: int = DEFAULT_TIMEOUT):
             f"unknown connection {connection_name_or_string!r}. "
             f"Named connections in .env: {names}"
         )
-    return pyodbc.connect(cs, timeout=timeout, readonly=True, autocommit=True)
+    # readonly follows MCP_DB_READONLY (default off): the account's permissions decide.
+    return pyodbc.connect(cs, timeout=timeout, readonly=readonly_enforced(), autocommit=True)
 
 
 def _is_read_only(query: str) -> bool:
@@ -105,11 +122,12 @@ def odbc_query(
     max_rows: int = 200,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
-    """Execute a read-only SQL statement over ODBC and return a text table.
+    """Execute a SQL statement over ODBC and return a text table.
 
-    Only statements starting with SELECT, WITH, EXEC, SHOW, DESCRIBE are
-    accepted. The connection is opened with readonly=True; DML/DDL is rejected
-    at the driver layer for compliant drivers and at the query verb layer here.
+    Any statement is sent as written; what the database account may do is decided by the
+    database, and its error text (for example permission denied) comes back unchanged.
+    Setting MCP_DB_READONLY=1 makes this tool refuse everything except SELECT, WITH, EXEC,
+    SHOW, DESCRIBE and opens the connection with readonly=True (opt-in, default off).
 
     GATED: returns real rows from a corporate database, so it requires the same
     per-IP unlock as a write. Call unlock(password=...) first if refused.
@@ -126,8 +144,8 @@ def odbc_query(
     if locked:
         return locked
     try:
-        if not _is_read_only(query):
-            return "[odbc_query error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed]"
+        if readonly_enforced() and not _is_read_only(query):
+            return "[odbc_query error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed (MCP_DB_READONLY=1)]"
         con = _connect(connection, timeout=timeout)
         try:
             cur = con.cursor()
@@ -255,13 +273,13 @@ def odbc_to_excel(
     params: Optional[list[Any]] = None,
     timeout: int = DEFAULT_TIMEOUT,
 ) -> str:
-    """Run a read-only query over ODBC and dump the full result set to .xlsx.
+    """Run a query over ODBC and dump the full result set to .xlsx.
 
     Use for large result sets where text rendering is not useful.
 
     Args:
         connection: Named connection or full connection string.
-        query: SELECT/WITH statement.
+        query: a statement that returns a result set (MCP_DB_READONLY=1 restricts it to reads).
         output_path: .xlsx output path under the allowed base.
         params: Optional positional parameters.
         timeout: Connection timeout.
@@ -272,8 +290,8 @@ def odbc_to_excel(
     try:
         import pandas as pd
 
-        if not _is_read_only(query):
-            return "[odbc_to_excel error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed]"
+        if readonly_enforced() and not _is_read_only(query):
+            return "[odbc_to_excel error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed (MCP_DB_READONLY=1)]"
         out = _validate_path(output_path)
         if out.suffix.lower() != ".xlsx":
             return "[odbc_to_excel error: output_path must end with .xlsx]"
@@ -314,7 +332,7 @@ def odbc_query_to_excel_and_preview(
     Args:
         connection: Named connection (from .env MCP_DB_<NAME>=...) or a full
             ODBC connection string.
-        sql: SELECT/WITH/EXEC/SHOW/DESCRIBE statement (read-only enforced).
+        sql: a statement that returns a result set (reads only when MCP_DB_READONLY=1).
         xlsx_path: .xlsx output path under the allowed base.
         preview_rows: How many of the fetched rows to render in the preview
             text table (does not affect how many rows are fetched/written).
@@ -332,10 +350,10 @@ def odbc_query_to_excel_and_preview(
     try:
         import pandas as pd
 
-        if not _is_read_only(sql):
+        if readonly_enforced() and not _is_read_only(sql):
             return {
                 "ok": False,
-                "error": "[odbc_query_to_excel_and_preview error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed]",
+                "error": "[odbc_query_to_excel_and_preview error: only SELECT/WITH/EXEC/SHOW/DESCRIBE allowed (MCP_DB_READONLY=1)]",
             }
         out = _validate_path(xlsx_path)
         if out.suffix.lower() != ".xlsx":
