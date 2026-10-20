@@ -16,12 +16,12 @@ import json
 import logging
 import os
 import re
-import subprocess
 import threading
 from pathlib import Path
 
 import pytest
 
+from tools import childproc
 from tools import state_store as ss
 
 REPO = Path(__file__).resolve().parent.parent
@@ -262,8 +262,8 @@ _PATTERN = re.compile(r"json\.dump\(|write_text\(\s*json\.dumps")
 
 
 def _tracked_py():
-    out = subprocess.run(["git", "ls-files", "*.py"], cwd=REPO, capture_output=True, text=True,
-                         check=True).stdout.split()
+    out = childproc.run(["git", "ls-files", "*.py"], cwd=REPO,
+                        check=True).stdout.split()
     return [f for f in out
             if not re.search(r"(^|/)test_|^tests/|conftest|^thirdparty/", f)]
 
