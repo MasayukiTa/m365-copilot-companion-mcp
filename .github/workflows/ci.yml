@@ -446,6 +446,7 @@ jobs:
             scripts/test_no_direct_ps1_py_advice.py \
             scripts/test_setup_devtunnel_access_and_identity.py \
             scripts/test_doctor_tenant_serving_needs_no_sign_in.py \
+            scripts/test_doctor_server_down_is_judged_from_the_supervisor_log.py \
             scripts/test_doctor_reports_the_last_start.py \
             scripts/test_unlock_password_is_retrievable.py \
             tools/test_env_portability_names_what_cannot_move.py \
