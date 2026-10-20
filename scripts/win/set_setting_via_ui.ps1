@@ -31,6 +31,13 @@ $Boxes = @{
     'team_mode'                 = 'teamModeBox'
     'org_proposals'             = 'orgProposalBox'
     'org_shadow_eval'           = 'orgShadowBox'
+    'effort_policy'             = 'effortPolicyBox'
+    'fanout'                    = 'fanoutBox'
+    'tool_transport'            = 'toolRouteBox'
+    'merge_conversation'        = 'mergeConversationBox'
+    'fleet_auto_resume'         = 'autoResumeBox'
+    'supervisor_self_restart'   = 'supervisorCodeBox'
+    'tool_probe_idle_min'       = 'toolProbeBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]
@@ -72,44 +79,89 @@ function Open-Settings {
 }
 
 function Read-Combo($combo) {
+    if ($null -eq $combo) { throw "internal: Read-Combo got no combo box" }
     $sel = $combo.GetCurrentPattern([System.Windows.Automation.SelectionPattern]::Pattern)
     $cur = $sel.Current.GetSelection()
     if ($cur.Count -gt 0) { return $cur[0].Current.Name }
     return ""
 }
 
-Open-Settings
-
-if ($ReadOnly -or -not $Setting) {
-    foreach ($k in $Boxes.Keys) {
-        $c = Find-Anywhere $Boxes[$k]
-        if ($null -eq $c) { Write-Output ("{0}: combo {1} not found" -f $k, $Boxes[$k]); continue }
-        Write-Output ("{0}: current={1}" -f $k, (Read-Combo $c))
+# Find a combo box; if the popup closed (the cockpit repaints after a save), open it again.
+function Get-Combo([string]$id) {
+    $c = Find-Anywhere $id
+    if ($null -eq $c) {
+        Open-Settings
+        $c = Find-Anywhere $id
     }
+    return $c
+}
+
+# What settings.txt says now (read only). $null when the file or the key is not there.
+function Read-SettingsFile([string]$key) {
+    $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+    $f = Join-Path $root ".config\settings.txt"
+    if (-not (Test-Path -LiteralPath $f)) { return $null }
+    $hit = $null
+    foreach ($ln in [System.IO.File]::ReadAllLines($f)) {
+        if ($ln.StartsWith($key + "=")) { $hit = $ln.Substring($key.Length + 1) }
+    }
+    return $hit
+}
+
+function Invoke-Main {
+    Open-Settings
+
+    if ($ReadOnly -or -not $Setting) {
+        foreach ($k in $Boxes.Keys) {
+            $c = Find-Anywhere $Boxes[$k]
+            if ($null -eq $c) { Write-Output ("{0}: combo {1} not found" -f $k, $Boxes[$k]); continue }
+            Write-Output ("{0}: current={1}" -f $k, (Read-Combo $c))
+        }
+        return
+    }
+
+    if (-not $Boxes.ContainsKey($Setting)) { throw ("unknown setting '{0}'; known: {1}" -f $Setting, ($Boxes.Keys -join ', ')) }
+    $combo = Get-Combo $Boxes[$Setting]
+    if ($null -eq $combo) { throw ("combo {0} not found in the settings popup" -f $Boxes[$Setting]) }
+    if ((Read-Combo $combo) -eq $Value) { Write-Output ("{0} already {1}" -f $Setting, $Value); return }
+
+    $ec = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
+    $ec.Expand()
+    Start-Sleep -Milliseconds 400
+    $item = $null
+    $nameCond = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $Value)
+    $deadline = (Get-Date).AddSeconds(5)
+    while ((Get-Date) -lt $deadline -and $null -eq $item) {
+        $item = $combo.FindFirst($TS::Descendants, $nameCond)
+        if ($null -eq $item) { Start-Sleep -Milliseconds 200 }
+    }
+    if ($null -eq $item) { try { $ec.Collapse() } catch {}; throw ("no entry '{0}' in {1}" -f $Value, $Setting) }
+    $item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
+    Start-Sleep -Milliseconds 500
+    try { $ec.Collapse() } catch {}
+
+    # Read back. The cockpit's SelectionChanged handler is what saves the key; it may also
+    # repaint or close the popup, so the combo can be gone here (that was the null call).
+    $fileVal = Read-SettingsFile $Setting
+    $after = $null
+    $c2 = Get-Combo $Boxes[$Setting]
+    if ($null -ne $c2) { $after = Read-Combo $c2 }
+    if ($null -ne $fileVal -and $fileVal -ne $Value) {
+        throw ("{0}: wanted {1} but settings.txt has {2}" -f $Setting, $Value, $fileVal)
+    }
+    if ($null -eq $after -and $fileVal -ne $Value) {
+        throw ("{0}: could not read the value back (popup gone and no settings.txt line)" -f $Setting)
+    }
+    if ($null -ne $after -and $after -ne $Value) {
+        throw ("{0}: wanted {1} but the combo shows {2}" -f $Setting, $Value, $after)
+    }
+    Write-Output ("{0} set to {1} through the cockpit (read back)" -f $Setting, $Value)
+}
+
+try {
+    Invoke-Main
     exit 0
+} catch {
+    Write-Output ("FAILED: {0}" -f $_.Exception.Message)
+    exit 1
 }
-
-if (-not $Boxes.ContainsKey($Setting)) { throw ("unknown setting '{0}'; known: {1}" -f $Setting, ($Boxes.Keys -join ', ')) }
-$combo = Find-Anywhere $Boxes[$Setting]
-if ($null -eq $combo) { throw ("combo {0} not found in the settings popup" -f $Boxes[$Setting]) }
-if ((Read-Combo $combo) -eq $Value) { Write-Output ("{0} already {1}" -f $Setting, $Value); exit 0 }
-
-$ec = $combo.GetCurrentPattern([System.Windows.Automation.ExpandCollapsePattern]::Pattern)
-$ec.Expand()
-Start-Sleep -Milliseconds 400
-$item = $null
-$nameCond = New-Object System.Windows.Automation.PropertyCondition($AE::NameProperty, $Value)
-$deadline = (Get-Date).AddSeconds(5)
-while ((Get-Date) -lt $deadline -and $null -eq $item) {
-    $item = $combo.FindFirst($TS::Descendants, $nameCond)
-    if ($null -eq $item) { Start-Sleep -Milliseconds 200 }
-}
-if ($null -eq $item) { try { $ec.Collapse() } catch {}; throw ("no entry '{0}' in {1}" -f $Value, $Setting) }
-$item.GetCurrentPattern([System.Windows.Automation.SelectionItemPattern]::Pattern).Select()
-Start-Sleep -Milliseconds 500
-try { $ec.Collapse() } catch {}
-
-# Read back through the screen. The cockpit's SelectionChanged handler is what saves the key.
-$after = Read-Combo (Find-Anywhere $Boxes[$Setting])
-if ($after -ne $Value) { throw ("{0}: wanted {1} but the combo shows {2}" -f $Setting, $Value, $after) }
-Write-Output ("{0} set to {1} through the cockpit" -f $Setting, $after)
