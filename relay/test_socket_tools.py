@@ -87,14 +87,14 @@ def test_a_failing_tool_is_reported_rather_than_ending_the_goal():
     assert "失敗" in nxt and "ValueError" in nxt and "no such path" in nxt
 
 
-def test_a_huge_result_is_truncated_and_says_so():
-    """1メガバイト返すツールが会話に1メガバイト載せると、モデルの予算が尽きて
-    会話ごと終わる。切ったことを黙ると、モデルは全部見たつもりで進む。"""
+def test_a_huge_result_goes_back_whole():
+    """結果の長さの切り詰めはない(2026-10-20 オーナー判断。以前は8000文字で切っていた)。
+    末尾まで届くことを、末尾の目印で確かめる。"""
     def run(name, args):
-        return True, "x" * 50_000
+        return True, "x" * 50_000 + "END-MARK"
     nxt, _ = ST.step('```call_tool\n{"name": "big"}\n```', run)
-    assert "切り詰め" in nxt and "50000" in nxt
-    assert len(nxt) < 20_000
+    assert "切り詰め" not in nxt
+    assert "x" * 50_000 + "END-MARK" in nxt
 
 
 # ---- プロンプト --------------------------------------------------------------------------------
