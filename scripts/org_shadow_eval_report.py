@@ -80,9 +80,7 @@ def _cells(recs, org_runs, org_label):
 def build(fleet_dir, min_n=5, delta=DEFAULT_DELTA):
     """The whole report as a dict. Read-only; a missing or damaged file leaves its part empty."""
     from relay.org import proposals, shadow_eval
-    from relay import task_kind as TK
     from scripts import capability_profile as CP
-    from scripts import sibling_dup_report as S
 
     props, bad_prop = proposals.read(os.path.join(fleet_dir, proposals.FILENAME))
     touches, bad_touch = shadow_eval.load(os.path.join(fleet_dir, shadow_eval.FILENAME))
@@ -90,10 +88,7 @@ def build(fleet_dir, min_n=5, delta=DEFAULT_DELTA):
         current = proposals.targets()
     except Exception:
         current = {}
-    camps, bad_ca = CP._read_jsonl_counted(os.path.join(fleet_dir, "campaigns.jsonl"))
-    history, bad_hi = CP._read_history(os.path.join(fleet_dir, "history.json"))
-    workers = S._read_status_workers(os.path.join(fleet_dir, "status.json"))
-    records = CP.build_records(workers, camps, history, {}, TK.task_kind)
+    records, bad_rec = CP.load_records(fleet_dir)
     joinable = [r for r in records if r.get("run_id")]
     by_base = {}
     for r in joinable:
@@ -133,8 +128,8 @@ def build(fleet_dir, min_n=5, delta=DEFAULT_DELTA):
                     "touched_runs_per_day": per_day, "cells": cells})
     unreadable = {k: v for k, v in (("org_proposals.jsonl", bad_prop),
                                     ("org_shadow_eval.jsonl", bad_touch),
-                                    ("campaigns.jsonl", bad_ca), ("history.json", bad_hi),
                                     ("org_versions.jsonl", bad_org)) if v}
+    unreadable.update(bad_rec)
     return {"note": NOTE, "proposals": out, "count": len(out),
             "records_without_run_id": len(records) - len(joinable),
             "thresholds": {"min_n": min_n, "delta": delta, "alpha": 0.05, "power": 0.8},
