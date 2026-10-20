@@ -226,6 +226,15 @@ KEYS = OrderedDict([
        "definition, and the run id. Never goal text. off writes nothing. No prompt or "
        "admission changes either way."),
 
+    # Change proposals for role and protocol definitions (relay/org/proposals.py). Read on each
+    # call of the propose_org_change tool, so a change applies to the next proposal.
+    _k("org_proposals", EACH_GATE, "off",
+       "relay/org/proposals.py:submit (each propose_org_change call)",
+       "off|on. Applies to the NEXT propose_org_change call. on lets that tool file a "
+       "proposal: one line in .fleet/org_proposals.jsonl and a decision card; off makes the tool "
+       "refuse and writes nothing. A proposal applies nothing and is never read by a prompt, "
+       "role or admission. No prompt or admission changes either way."),
+
     # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
     # already running keeps going, and the next split uses the new values.
     _k("fanout_max_total", EACH_GATE, 24,

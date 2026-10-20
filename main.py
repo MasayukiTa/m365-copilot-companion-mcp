@@ -78,6 +78,7 @@ from tools.agent_memory_ops import (
 from tools.data_discovery import find_db_objects
 from tools.data_memory_hook import data_memory_status
 from tools.board_tool import board_digest
+from tools.org_proposal_tool import propose_org_change
 from tools.data_aliases import data_aliases_add, data_aliases_list
 from tools.semantic.ops import (
     semantic_resolve, metric_sql, catalog_search, catalog_describe, catalog_joins,
@@ -683,6 +684,10 @@ TOOLS = (
     # campaign board digest (read-only, no unlock needed; gateway-only -- reachable only via
     # call_tool("board_digest", {}); the campaign comes from the calling session, not an argument).
     board_digest,
+    # change proposal for a role/protocol definition (read-write to its own log and the decision
+    # queue only; refuses unless the org_proposals setting is on; gateway-only -- reachable only
+    # via call_tool("propose_org_change", {...}); the author comes from the calling session).
+    propose_org_change,
     # DB aliases: synonym/abbreviation store widening find_db_objects queries
     # (gateway-only; add is unlock-gated, list is read-only).
     data_aliases_add, data_aliases_list,

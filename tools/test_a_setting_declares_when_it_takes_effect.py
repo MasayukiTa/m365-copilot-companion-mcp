@@ -132,6 +132,11 @@ def _reader_team_mode():
     return mode()
 
 
+def _reader_org_proposals():
+    from relay.org.proposals import mode
+    return mode()
+
+
 def _reader_auto_resume():
     from relay.fleet_resume import auto_resume_setting
     return auto_resume_setting()
@@ -183,6 +188,7 @@ _LIVE_READERS = {
     "fanout_write_scope": (_reader_write_scope, "shadow", "off"),
     "fanout_load_routing": (_reader_load_routing, "shadow", "off"),
     "team_mode": (_reader_team_mode, "shadow", "off"),
+    "org_proposals": (_reader_org_proposals, "off", "on"),
     "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
     "supervisor_self_restart": (_reader_supervisor_self_restart, "off", "on"),
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),

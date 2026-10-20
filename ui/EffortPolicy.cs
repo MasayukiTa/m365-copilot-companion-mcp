@@ -1392,3 +1392,51 @@ public static class TeamModeView
         return ja ? "選択は次の分割から反映" : "selection applies from the next split";
     }
 }
+
+// The org change proposal selector's words and parsing, WPF-free. The Python side decides:
+// the propose_org_change tool reads `org_proposals` on each call and, when on, files a proposal
+// for a role or protocol text (one line in org_proposals.jsonl and a decision card). A proposal
+// applies nothing and no prompt or assignment reads it. Off makes the tool refuse.
+public static class OrgProposalView
+{
+    //: must equal tools/settings_keys.py and relay/org/proposals.py KEY / MODES.
+    public const string Key = "org_proposals";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one org_proposals= line; null when the line is not that key or
+    /// the value is not off|on (the caller keeps its value, off). A byte order mark is tolerated
+    /// and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "役割・手順の変更提案" : "Role/protocol change proposals"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン(提案のみ)" : "On (proposals only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "提案のみ: エージェントや人が役割・手順の文面の変更を提案できます。提案は記録と判断カードになるだけで、適用はされず、プロンプトも割当も変わりません。"
+                  : "Proposals only: an agent or a person can propose a change to a role or protocol text. A proposal becomes a record and a decision card and is never applied; prompts and assignment are unchanged.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の提案から有効。"
+                  : "Applies from the next proposal.";
+    }
+}
