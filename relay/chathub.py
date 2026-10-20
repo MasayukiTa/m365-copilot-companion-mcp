@@ -582,7 +582,7 @@ class Conversation:
 
     def __init__(self, token_supplier, *, send_origin=False, user_agent=None,
                  connect_timeout_s=15.0, frame_timeout_s=30.0, turn_timeout_s=300.0,
-                 max_frames=2000, max_tool_rounds=16, gpt_id="", template=None,
+                 max_frames=2000, gpt_id="", template=None,
                  turn_ceiling_s=None, clock=None):
         if not callable(token_supplier):
             raise ChatHubError(
@@ -608,7 +608,6 @@ class Conversation:
         #: Injectable so the deadline can be tested without sleeping.
         self._clock = clock if callable(clock) else time.time
         self.max_frames = int(max_frames)
-        self.max_tool_rounds = int(max_tool_rounds)
         #: The agent to talk to. Empty reaches the default Copilot -- no connector, no tenant
         #: grounding, none of our tools.
         self.gpt_id = str(gpt_id or "") or (template.gpt_id if template is not None else "")
@@ -762,12 +761,13 @@ class Conversation:
             nxt, calls = ST.step(answer, run)
             if nxt is None:
                 break
+            # NO ROUND LIMIT (owner decision 2026-10-20; there used to be 16). The number had no
+            # measurement behind it, and a long task that legitimately needs more tool rounds
+            # was cut off with an error. What bounds the work instead: each exchange runs under
+            # the turn deadline and its ceiling (`turn_timeout_s` / `turn_ceiling_s` in
+            # _one_exchange), and the caller (fleet runner) has its own per-goal limits.
+            # NOTE the ceiling is per exchange, not per ask(): many quick rounds are not cut by it.
             rounds += 1
-            if rounds > self.max_tool_rounds:
-                # A model that keeps calling and never concludes is not making progress, and
-                # an unbounded loop here would spend a whole goal's budget on one turn.
-                raise ChatHubError("tool rounds exceeded %d without a final answer"
-                                   % self.max_tool_rounds)
             payload = nxt
         if journal is not None:
             journal.end_ask()

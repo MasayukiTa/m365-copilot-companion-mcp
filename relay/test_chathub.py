@@ -284,16 +284,20 @@ def test_the_tool_result_is_what_the_second_turn_carries():
     assert "RESULT-MARKER" in connect.made[1].sent[1]
 
 
-def test_a_model_that_never_stops_calling_is_bounded():
-    """呼び続けて結論しないモデルは進捗していない。無限ループはゴール1本の予算を
-    1ターンで使い切る。"""
+def test_the_round_after_the_old_limit_of_sixteen_proceeds():
+    """ラウンド数の上限はない(2026-10-20 オーナー判断。以前は16)。17回目も実行され、
+    結論の返答で終わる。"""
     call = ["{}" + CH.RS, _update('```call_tool\n{"name": "again"}\n```'), _done()]
-    connect = _connect_returning(*([call] * 10))
-    conv = CH.Conversation(lambda: _token(), max_tool_rounds=3)
-    with pytest.raises(CH.ChatHubError) as exc:
-        conv.ask("x", connect=connect, run_tool=lambda n, a: (True, "r"),
-                 catalogue=[{"name": "call_tool", "description": "d"}])
-    assert "tool rounds exceeded" in str(exc.value)
+    final = ["{}" + CH.RS, _update("終わりました。"), _done()]
+    connect = _connect_returning(*([call] * 20 + [final]))
+    conv = CH.Conversation(lambda: _token())
+    ran = []
+    answer = conv.ask("x", connect=connect,
+                      run_tool=lambda n, a: (ran.append(a["name"]) or (True, "r")),
+                      catalogue=[{"name": "call_tool", "description": "d"}])
+    assert len(ran) == 20, "every round's call must run, including those past the old limit"
+    assert "終わりました" in answer
+    assert not hasattr(conv, "max_tool_rounds")
 
 
 def test_only_the_first_exchange_of_a_conversation_says_it_is_the_start():
