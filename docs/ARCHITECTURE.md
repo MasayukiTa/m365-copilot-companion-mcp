@@ -24,7 +24,7 @@
 
 本来の使い方は **「Copilot Studio の純正コネクタ（クラウド側）」＋「この companion（ローカル側）」の二枚重ね** です。メール・カレンダー・SharePoint をエージェントに触らせたいなら、Copilot Studio 側でその純正コネクタをオンにするのが正解。Microsoft が認証・監査を持つので社内承認も通しやすい。
 
-本リポに `outlook_*`（メール/カレンダー）や `web_search` があるのは、**純正コネクタを設定できない／したくない環境向けのローカル退避路** だからです。`outlook_*` は Graph API 登録なしに、いま PC にログイン中の Outlook を COM 経由で借ります。`web_search` も Copilot 標準の Web 検索が使えるなら不要です。
+本リポに `outlook_*`（メール/カレンダー）や `web_search` があるのは、**純正コネクタを設定できない／したくない環境向けのローカル退避路** だからです。`outlook_*` は Graph API 登録なしにいま PC にログイン中の Outlook を COM 経由で借ります。`web_search` も Copilot 標準の Web 検索が使えるなら不要です。
 
 迷ったら原則: **クラウドで完結する仕事は純正コネクタ、ローカル PC を触る仕事はこの companion。**
 
@@ -40,7 +40,7 @@
                           ファイル · Python · DB · Office生成 · OCR …
 ```
 
-relay / fleet はこの経路とは別に、Edge 上の Copilot Web UI を CDP で駆動して会話を無人で回します。
+relay / fleet はこの経路とは別に Edge 上の Copilot Web UI を CDP で駆動して会話を無人で回します。
 
 ---
 
@@ -50,13 +50,13 @@ relay / fleet はこの経路とは別に、Edge 上の Copilot Web UI を CDP �
 
 FastMCP のエントリポイント。`tools/*.py` の関数を `TOOLS` タプルに登録し、MCP ツールとして公開します。LLM はツールごとの docstring を読んで自分で選びます。`http://127.0.0.1:8000/mcp`（Streamable HTTP）で待受します。
 
-既定の **map mode**（`MCP_TOOL_MAP=1`）では、最小コア＋`call_tool` ゲートウェイのみを MCP に登録し、残りのツールはゲートウェイ経由で呼びます。これは Copilot Studio の 70 ツール上限とトークン枠を回避するためです（詳細は [CONFIG.md](CONFIG.md)）。
+既定の **map mode**（`MCP_TOOL_MAP=1`）では最小コア＋`call_tool` ゲートウェイのみを MCP に登録し、残りのツールはゲートウェイ経由で呼びます。これは Copilot Studio の 70 ツール上限とトークン枠を回避するためです（詳細は [CONFIG.md](CONFIG.md)）。
 
 `main.py` には執筆時点で 138 個のツールが収録されています。実行中に有効なツールは `list_my_tools` で確認できます。
 
 ### relay（自動中継器・`relay/copilot_autopilot_relay.py`）
 
-ゴールを 1 個渡すと、Edge 上の Copilot 会話を **CDP 経由で完了まで自律駆動** するスタンドアロンのコントローラです。OS のマウス・キーボードフォーカスを奪わないので、裏で回っている間もあなたは別ウィンドウで作業できます。唯一の知能は Copilot エージェント自身で、relay 側は「完了を検知して次の job を投げる」決定的な配管だけ（生成 AI を使わない＝完全無人）。
+ゴールを 1 個渡すと Edge 上の Copilot 会話を **CDP 経由で完了まで自律駆動** するスタンドアロンのコントローラです。OS のマウス・キーボードフォーカスを奪わないので裏で回っている間もあなたは別ウィンドウで作業できます。唯一の知能は Copilot エージェント自身で、relay 側は「完了を検知して次の job を投げる」決定的な配管だけ（生成 AI を使わない＝完全無人）。
 
 - 各ターンをクロスセッション memory と監査ランログ（operator D）に保存
 - `stop_request()`（kill-switch）を毎ターン＆長時間待機中もポーリング
@@ -72,17 +72,17 @@ FastMCP のエントリポイント。`tools/*.py` の関数を `TOOLS` タプ�
 
 ### bridge（チャット UI・`bridge/copilot_bridge.py`）
 
-Premium / Direct Line を使わず、stdlib の `http.server` だけで Copilot の応答を差分スクレイピングでトークン単位ストリーミングします。クライアントは CopilotChat ウィンドウと `bridge/session_cli.py`。状態を変える要求とページを読む要求はすべて POST + 起動ごとのトークン（`X-Bridge-Token`、本人のみ読めるファイル）必須で、Origin / Referer / cross-site の Sec-Fetch-Site / loopback 以外の Host を持つ要求は拒否します（`bridge/bridge_auth.py`）。ブラウザ用のチャットページは廃止しました。bridge は専用プロファイル `copilot-bridge-edge`（CDP `:9223`）で立つので、fleet の Edge（`:9222`）と取り合わず同時に使えます。
+Premium / Direct Line を使わず、stdlib の `http.server` だけで Copilot の応答を差分スクレイピングでトークン単位ストリーミングします。クライアントは CopilotChat ウィンドウと `bridge/session_cli.py`。状態を変える要求とページを読む要求はすべて POST + 起動ごとのトークン（`X-Bridge-Token`、本人のみ読めるファイル）必須で、Origin / Referer / cross-site の Sec-Fetch-Site / loopback 以外の Host を持つ要求は拒否します（`bridge/bridge_auth.py`）。ブラウザ用のチャットページは廃止しました。bridge は専用プロファイル `copilot-bridge-edge`（CDP `:9223`）で立つので fleet の Edge（`:9222`）と取り合わず同時に使えます。
 
 ネイティブ WPF チャット `ui/CopilotChat.cs` も裏は同じ経路です。
 
 ### supervisor（常時公開・`scripts/supervisor.ps1`）
 
-devtunnel の host 接続は、プロセスが生きていても relay 接続だけが静かに落ちることがあります。supervisor はポート 8000 とトンネルの `Host connections` を定期監視し、落ちていれば自動で張り直します（デバウンス＋接続確立待ち付き）。ログオン時自動起動の登録方法は [scripts/AUTOSTART.md](../scripts/AUTOSTART.md)（実体は `scripts\register-supervisor.ps1`）。
+devtunnel の host 接続はプロセスが生きていても relay 接続だけが静かに落ちることがあります。supervisor はポート 8000 とトンネルの `Host connections` を定期監視し、落ちていれば自動で張り直します（デバウンス＋接続確立待ち付き）。ログオン時自動起動の登録方法は [scripts/AUTOSTART.md](../scripts/AUTOSTART.md)（実体は `scripts\register-supervisor.ps1`）。
 
 ### 専用 companion Edge（`scripts/start_companion_edge.ps1`）
 
-`copilot-companion-edge` という専用プロファイル（`%LOCALAPPDATA%\copilot-companion-edge`）で Edge を起動し、CDP を `:9222` でバインドします。普段使いの Edge とは完全分離するので、本体 Edge に M365 タブを何枚開いても RAM を奪い合わず、本体クラッシュにも巻き込まれません。ウィンドウモード（`-Foreground` / `-Headless` / `-Background` / `-Surface` / `-HardReset`）の詳細は [ADVANCED.md](ADVANCED.md)。
+`copilot-companion-edge` という専用プロファイル（`%LOCALAPPDATA%\copilot-companion-edge`）で Edge を起動し、CDP を `:9222` でバインドします。普段使いの Edge とは完全分離するので本体 Edge に M365 タブを何枚開いても RAM を奪い合わず、本体クラッシュにも巻き込まれません。ウィンドウモード（`-Foreground` / `-Headless` / `-Background` / `-Surface` / `-HardReset`）の詳細は [ADVANCED.md](ADVANCED.md)。
 
 ---
 

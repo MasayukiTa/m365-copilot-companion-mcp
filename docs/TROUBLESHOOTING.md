@@ -6,7 +6,7 @@
 
 ## 🔌 まず最初に疑うこと — Copilot がこう言い出したら、ほぼ MCP/トンネル切れ
 
-Copilot が次を返したら、エージェントの故障ではなく **MCP サーバーか Dev Tunnel が落ちている**可能性が高いです:
+Copilot が次を返したらエージェントの故障ではなく **MCP サーバーか Dev Tunnel が落ちている**可能性が高いです:
 
 > **「申し訳ございません。それに応答できませんでした。他に何かお手伝いできることはありますか?」**
 > （英語も同等の "Sorry, I couldn't respond to that…" 系）
@@ -59,16 +59,16 @@ powershell -ExecutionPolicy Bypass -File scripts\register-supervisor.ps1
 
 ## `start_all.bat` の更新と force-push 復旧
 
-Gitで導入した環境では、`start_all.bat` が起動前に更新を確認します。通常の更新はfast-forwardで取り込みます。公開履歴がforce-pushなどで書き換えられ、ローカル履歴と分岐した場合は、次の順序で自動復旧します。
+Gitで導入した環境では、`start_all.bat` が起動前に更新を確認します。通常の更新はfast-forwardで取り込みます。公開履歴がforce-pushなどで書き換えられ、ローカル履歴と分岐した場合は次の順序で自動復旧します。
 
 1. 現在のHEADを `backup/pre-reset-<日時>` というローカルブランチへ退避
 2. 追跡中・未追跡の作業ファイルがあればstashへ退避
 3. 書き換え後のupstreamへ作業ツリーを合わせる
 4. 更新後の `start_all.ps1` を再実行して通常起動を継続
 
-バックアップブランチまたはstashを作れない場合はresetせず、現在の環境を維持します。ネットワーク切替直後の一時的なfetch失敗には、時間制限付きで3回まで再試行します。
+バックアップブランチまたはstashを作れない場合はresetせず、現在の環境を維持します。ネットワーク切替直後の一時的なfetch失敗には時間制限付きで3回まで再試行します。
 
-この自動復旧は、この機能を含む版へ一度到達した環境から有効です。それ以前のFF-only版は、分岐したクリーン履歴を自分自身だけで取得できません。その場合は一度だけ `update.bat` で最新Releaseを適用するか、管理者がクリーン版へ移行してください。
+この自動復旧はこの機能を含む版へ一度到達した環境から有効です。それ以前のFF-only版は分岐したクリーン履歴を自分自身だけで取得できません。その場合は一度だけ `update.bat` で最新Releaseを適用するか、管理者がクリーン版へ移行してください。
 
 ---
 
@@ -110,7 +110,7 @@ Test-NetConnection localhost -Port 8000
 
 **② エージェントから `list_my_tools` を叩く:** Copilot Studio のエージェント（または `CopilotChat.exe`）に「`list_my_tools` を呼んで。」と伝える。一覧が返れば配線 OK。🟢 のものはすぐ使え、🪟 / 📦 のものは依存が揃っていなければエラーになりますがサーバー全体は落ちません。
 
-**③ 書込・実行系ツールのアンロック（初回のみ）:** `write_file` 等を初めて呼ぶと `[locked client IP: '...'] Call unlock(password='...') first.` と言われます。「`unlock(password="<MCP_UNLOCK_PASSWORD>")` を呼んで。」と伝えると、その IP が `MCP_UNLOCK_TTL_DAYS` 日間解錠されます。
+**③ 書込・実行系ツールのアンロック（初回のみ）:** `write_file` 等を初めて呼ぶと `[locked client IP: '...'] Call unlock(password='...') first.` と言われます。「`unlock(password="<MCP_UNLOCK_PASSWORD>")` を呼んで。」と伝えるとその IP が `MCP_UNLOCK_TTL_DAYS` 日間解錠されます。
 
 **④ Dev Tunnel を通る接続:** Copilot Studio のバックエンドから呼ぶと IP が毎回変わることがあり `unlock` を再要求されます。これは正常動作です。
 
