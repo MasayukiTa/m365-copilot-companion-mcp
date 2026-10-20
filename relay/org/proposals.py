@@ -95,11 +95,13 @@ def mode(settings_path=None) -> str:
         return "off"
 
 
-def targets() -> dict:
+def targets(snap=None) -> dict:
     """{"role:planner": current hash, "workflow:worker_protocol": ...}. An unreadable definition
-    has hash "" (it can be named but not proposed against)."""
+    has hash "" (it can be named but not proposed against). `snap` is a definitions.snapshot()
+    the caller already has (the shadow evaluator hashes the prompts once per run, not twice)."""
     from relay.org import definitions
-    snap = definitions.snapshot()
+    if snap is None:
+        snap = definitions.snapshot()
     out = {}
     for kind, section in (("role", snap["roles"]), ("workflow", snap["workflows"])):
         for name, entry in section.items():

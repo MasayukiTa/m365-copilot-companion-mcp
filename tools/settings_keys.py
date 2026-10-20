@@ -226,6 +226,15 @@ KEYS = OrderedDict([
        "definition, and the run id. Never goal text. off writes nothing. No prompt or "
        "admission changes either way."),
 
+    # Shadow evaluation of those proposals (relay/org/shadow_eval.py). Read once when a run starts.
+    _k("org_shadow_eval", SWEEP_START, "off",
+       "relay/org/shadow_eval.py:record_run (once, at run start)",
+       "off|shadow. Takes effect on the NEXT run. shadow appends one small line per run and "
+       "per proposal still on file to .fleet/org_shadow_eval.jsonl: the proposal id and hashes "
+       "only, never goal text or the proposed text. It counts the runs a proposal would have "
+       "touched; it cannot show a proposal is better. off writes nothing. `on` is not "
+       "implemented. No prompt or admission changes either way."),
+
     # Change proposals for role and protocol definitions (relay/org/proposals.py). Read on each
     # call of the propose_org_change tool, so a change applies to the next proposal.
     _k("org_proposals", EACH_GATE, "off",

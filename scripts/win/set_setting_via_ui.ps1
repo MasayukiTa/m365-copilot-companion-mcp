@@ -30,6 +30,7 @@ $Boxes = @{
     'org_version_record'        = 'orgVersionBox'
     'team_mode'                 = 'teamModeBox'
     'org_proposals'             = 'orgProposalBox'
+    'org_shadow_eval'           = 'orgShadowBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]
