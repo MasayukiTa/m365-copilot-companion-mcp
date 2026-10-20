@@ -238,6 +238,7 @@ jobs:
             relay/test_cockpit_header_controls.py \
             relay/test_write_scope.py \
             relay/test_load_routing.py \
+            relay/test_result_cache.py \
             relay/test_team_formation.py \
             relay/test_agent_board.py \
             relay/test_roster.py \
@@ -641,6 +642,7 @@ jobs:
             relay/test_resident_guard.py \
             scripts/probes/test_resident_observe.py \
             tests/test_fanout_load_routing_agrees.py \
+            tests/test_result_cache_agrees.py \
             tests/test_team_mode_agrees.py \
             tests/test_agent_board_agrees.py \
             tests/test_org_version_record_agrees.py \

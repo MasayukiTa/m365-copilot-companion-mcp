@@ -653,6 +653,47 @@ partial class CockpitWindow
         _rtBox.Background = BtnBg; _rtBox.Foreground = Fg; _rtBox.BorderBrush = Border;
         StyleFlatCombo(_rtBox);
     }
+    // Read-only result cache (off|shadow), under Tools. Persists through SaveKey only;
+    // relay/result_cache.py re-reads the key at every read-only tool call (each_gate).
+    // Words: ResultCacheView.
+    UIElement ResultCacheControl()
+    {
+        _rcLbl = new TextBlock(); _rcLbl.VerticalAlignment = VerticalAlignment.Center;
+        _rcLbl.FontSize = 12;
+
+        _rcBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_rcBox, "resultCacheBox");
+        _rcBox.ToolTip = ResultCacheView.Help(_lang == 0) + "\n" + ResultCacheView.TakeEffectTip(_lang == 0);
+        _rcBox.Cursor = Cursors.Hand; _rcBox.FontSize = 12;
+        _rcBox.FontWeight = FontWeights.SemiBold; _rcBox.MinWidth = 64;
+        _rcBox.Padding = new Thickness(8, 2, 4, 2);
+        _rcBox.VerticalAlignment = VerticalAlignment.Center;
+        var rcHelp = new Dictionary<string, string>();
+        foreach (string m in ResultCacheView.Modes) rcHelp[m] = ResultCacheView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_rcBox, ResultCacheView.Modes, rcHelp, _rcVal);
+        _rcBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _rcBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_rcBox);
+            if (!ResultCacheView.IsMode(sel) || sel == _rcVal) return;   // unchanged -> no write, no re-fire
+            _rcVal = sel;
+            SaveKey(ResultCacheView.Key, _rcVal);
+        };
+
+        var wrap = SettingsComboBlock(_rcLbl, _rcBox, new TextBlock(), new TextBlock());
+        PaintResultCache();
+        return wrap;
+    }
+    void PaintResultCache()
+    {
+        if (_rcLbl != null) { _rcLbl.Text = ResultCacheView.Label(_lang == 0); _rcLbl.Foreground = Muted; }
+        if (_rcBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_rcBox), _rcVal)) ComboSelectVal(_rcBox, _rcVal);
+        _rcBox.ToolTip = ResultCacheView.Help(_lang == 0) + "\n" + ResultCacheView.TakeEffectTip(_lang == 0);
+        _rcBox.Background = BtnBg; _rcBox.Foreground = Fg; _rcBox.BorderBrush = Border;
+        StyleFlatCombo(_rcBox);
+    }
     // Merge conversation (fresh|parent), in the Fan-out section. Persists through SaveKey only; the
     // runner re-reads the key at every split and every merge (each_gate). Parent runs the merge in
     // the splitting worker's own conversation; what is IN EFFECT, and the savings so far, come from

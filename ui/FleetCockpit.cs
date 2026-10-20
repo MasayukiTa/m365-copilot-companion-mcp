@@ -270,6 +270,10 @@ partial class CockpitWindow : Window
     string _rtVal = ResidentToolsView.Default;
     ComboBox _rtBox;
     TextBlock _rtLbl;
+    // read-only tool result cache off|shadow -> settings.txt result_cache ; absent key = off
+    string _rcVal = ResultCacheView.Default;
+    ComboBox _rcBox;
+    TextBlock _rcLbl;
     // tool-call check interval 0|15|30|60 minutes -> settings.txt tool_probe_idle_min ; absent key = 30
     string _tpVal = ToolProbeView.Default;
     ComboBox _tpBox;
