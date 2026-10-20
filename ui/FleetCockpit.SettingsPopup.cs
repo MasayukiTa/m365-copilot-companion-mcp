@@ -276,6 +276,7 @@ partial class CockpitWindow
             case "fanout_max_turns":
             case "fanout_max_wall_min":
             case "effort_policy":
+            case "org_proposals":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
@@ -766,6 +767,7 @@ partial class CockpitWindow
         col.Children.Add(TeamModeControl());
         col.Children.Add(AgentBoardControl());
         col.Children.Add(OrgVersionControl());
+        col.Children.Add(OrgProposalControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the

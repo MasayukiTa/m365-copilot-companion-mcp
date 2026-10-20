@@ -29,6 +29,7 @@ $Boxes = @{
     'agent_board_mode'          = 'agentBoardBox'
     'org_version_record'        = 'orgVersionBox'
     'team_mode'                 = 'teamModeBox'
+    'org_proposals'             = 'orgProposalBox'
 }
 
 $AE = [System.Windows.Automation.AutomationElement]

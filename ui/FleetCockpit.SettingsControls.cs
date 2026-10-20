@@ -219,6 +219,7 @@ partial class CockpitWindow
         PaintTeamMode();
         PaintAgentBoard();
         PaintOrgVersion();
+        PaintOrgProposal();
         PaintAutoResume();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
@@ -825,6 +826,51 @@ partial class CockpitWindow
         _ovBox.ToolTip = OrgVersionView.Help(_lang == 0) + "\n" + OrgVersionView.TakeEffectTip(_lang == 0);
         _ovBox.Background = BtnBg; _ovBox.Foreground = Fg; _ovBox.BorderBrush = Border;
         StyleFlatCombo(_ovBox);
+    }
+    // Org change proposals (off|on), beside the version record. Persists through SaveKey only;
+    // the propose_org_change tool reads the key on each call. A proposal is a record and a decision
+    // card and applies nothing, so there is no "in effect" line: the words and parsing live in
+    // OrgProposalView.
+    UIElement OrgProposalControl()
+    {
+        _opLbl = new TextBlock(); _opLbl.VerticalAlignment = VerticalAlignment.Center;
+        _opLbl.FontSize = 12;
+
+        _opBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_opBox, "orgProposalBox");
+        _opBox.ToolTip = OrgProposalView.Help(_lang == 0) + "\n" + OrgProposalView.TakeEffectTip(_lang == 0);
+        _opBox.Cursor = Cursors.Hand; _opBox.FontSize = 12;
+        _opBox.FontWeight = FontWeights.SemiBold; _opBox.MinWidth = 78;
+        _opBox.Padding = new Thickness(8, 2, 4, 2);
+        _opBox.VerticalAlignment = VerticalAlignment.Center;
+        var opHelp = new Dictionary<string, string>();
+        foreach (string m in OrgProposalView.Modes) opHelp[m] = OrgProposalView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_opBox, OrgProposalView.Modes, opHelp, _opVal);
+        _opBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _opBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_opBox);
+            if (!OrgProposalView.IsMode(sel) || sel == _opVal) return;   // unchanged -> no write, no re-fire
+            _opVal = sel;
+            SaveKey(OrgProposalView.Key, _opVal);
+        };
+
+        _opNow = new TextBlock(); _opNow.Visibility = Visibility.Collapsed;
+        _opPending = new TextBlock(); _opPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_opLbl, _opBox, _opNow, _opPending);
+        PaintOrgProposal();
+        return wrap;
+    }
+    void PaintOrgProposal()
+    {
+        if (_opLbl != null) { _opLbl.Text = OrgProposalView.Label(_lang == 0); _opLbl.Foreground = Muted; }
+        if (_opBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_opBox), _opVal)) ComboSelectVal(_opBox, _opVal);
+        _opBox.ToolTip = OrgProposalView.Help(_lang == 0) + "\n" + OrgProposalView.TakeEffectTip(_lang == 0);
+        _opBox.Background = BtnBg; _opBox.Foreground = Fg; _opBox.BorderBrush = Border;
+        StyleFlatCombo(_opBox);
     }
     // Campaign board (off|p0), beside load-aware routing. Persists through SaveKey only; the
     // coordinator reads the key once when a run starts (sweep_start), so a run in progress keeps

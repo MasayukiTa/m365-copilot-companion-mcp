@@ -58,6 +58,7 @@ FLEET_TOOLS = {
     "git_status":       "what have I changed",
     "git_diff":         "the answer it is being asked for IS this diff",
     "board_digest":     "read-only: what the siblings of its campaign have settled, as unverified data",
+    "propose_org_change": "read-write to its own proposals log only: lets a worker that sees a role or protocol text failing propose a change for a person to decide; applies nothing, refuses unless org_proposals is on",
 
     # -- drive the desktop ---------------------------------------------------------------
     #
