@@ -300,6 +300,7 @@ partial class CockpitWindow
             case "fleet_store_days":
             case "fleet_scratch_days":
             case "fleet_compress_hours":
+            case "org_genotype_record":
                 return "sweep_start";
             default:
                 return "ui_only";
@@ -774,6 +775,7 @@ partial class CockpitWindow
         col.Children.Add(RelayFindingsControl());
         col.Children.Add(AgentBoardControl());
         col.Children.Add(OrgVersionControl());
+        col.Children.Add(OrgGenotypeControl());
         col.Children.Add(OrgProposalControl());
         col.Children.Add(OrgShadowControl());
         col.Children.Add(OrgAbControl());
