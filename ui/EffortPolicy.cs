@@ -1711,3 +1711,48 @@ public static class OrgShadowView
                   : "Applies from the next run; a run in progress keeps its mode.";
     }
 }
+
+
+public static class OrgAbView
+{
+    //: must equal tools/settings_keys.py and relay/org/ab.py KEY / MODES.
+    public const string Key = "org_ab";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "shadow" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+
+    /// <summary>The mode named by one org_ab= line; null when the line is not that key
+    /// or the value is not off|shadow (the caller keeps its value, off; `on` is not a mode). A
+    /// byte order mark is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "A/Bアーム割当" : "A/B arm assignment"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: 実行のたびに、A/Bが動いていたらこの実行がどちらのアーム(baseline|proposed)に入るかを、実行IDのハッシュから決めて記録します。アームを記録するだけで、プロンプトは入れ替えず割当も変えません。目標の文面もプロンプトの文面も記録しません。"
+                  : "Record only: at each run, which arm (baseline|proposed) the run would land on if an A/B were running is chosen from a hash of the run id and noted. It only records the arm; it swaps no prompt and changes no assignment. No goal text or prompt text.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の実行から有効(実行中のものは変わりません)。"
+                  : "Applies from the next run; a run in progress keeps its mode.";
+    }
+}

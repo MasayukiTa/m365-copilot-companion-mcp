@@ -32,6 +32,7 @@ $Boxes = @{
     'relay_findings'            = 'relayFindingsBox'
     'org_proposals'             = 'orgProposalBox'
     'org_shadow_eval'           = 'orgShadowBox'
+    'org_ab'                    = 'orgAbBox'
     'effort_policy'             = 'effortPolicyBox'
     'fanout'                    = 'fanoutBox'
     'tool_transport'            = 'toolRouteBox'

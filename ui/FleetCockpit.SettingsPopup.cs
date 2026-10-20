@@ -272,6 +272,7 @@ partial class CockpitWindow
             case "job_approval_mode":
             case "fanout_write_scope":
             case "fanout_load_routing":
+            case "org_ab":
             case "relay_findings":
             case "team_mode":
             case "org_proposals":
@@ -775,6 +776,7 @@ partial class CockpitWindow
         col.Children.Add(OrgVersionControl());
         col.Children.Add(OrgProposalControl());
         col.Children.Add(OrgShadowControl());
+        col.Children.Add(OrgAbControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the

@@ -79,7 +79,7 @@ def _cells(recs, org_runs, org_label):
 
 def build(fleet_dir, min_n=5, delta=DEFAULT_DELTA):
     """The whole report as a dict. Read-only; a missing or damaged file leaves its part empty."""
-    from relay.org import proposals, shadow_eval
+    from relay.org import ab, proposals, shadow_eval
     from scripts import capability_profile as CP
 
     props, bad_prop = proposals.read(os.path.join(fleet_dir, proposals.FILENAME))
@@ -126,12 +126,17 @@ def build(fleet_dir, min_n=5, delta=DEFAULT_DELTA):
                     "runs_would_touch": len(bases), "runs_with_outcome": len(with_outcome),
                     "runs_without_outcome": len(bases) - len(with_outcome),
                     "touched_runs_per_day": per_day, "cells": cells})
+    # D5: how many runs the recorded A/B assignment put on each arm so far (record only).
+    assigned, bad_ab = ab.load(os.path.join(fleet_dir, ab.FILENAME))
+    ab_runs = {arm: sum(1 for a in assigned.values() if a == arm) for arm in ab.ARMS}
     unreadable = {k: v for k, v in (("org_proposals.jsonl", bad_prop),
                                     ("org_shadow_eval.jsonl", bad_touch),
+                                    ("org_ab_assign.jsonl", bad_ab),
                                     ("org_versions.jsonl", bad_org)) if v}
     unreadable.update(bad_rec)
     return {"note": NOTE, "proposals": out, "count": len(out),
             "records_without_run_id": len(records) - len(joinable),
+            "ab_assigned_runs": ab_runs,
             "thresholds": {"min_n": min_n, "delta": delta, "alpha": 0.05, "power": 0.8},
             "unreadable": unreadable}
 

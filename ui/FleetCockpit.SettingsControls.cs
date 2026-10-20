@@ -224,7 +224,7 @@ partial class CockpitWindow
         PaintOrgVersion();
         PaintOrgProposal();
         PaintOrgShadow();
-        PaintAutoResume();
+        PaintOrgAb();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
         PaintToolRoute();
@@ -1038,6 +1038,38 @@ partial class CockpitWindow
         PaintOrgShadow();
         return wrap;
     }
+
+    UIElement OrgAbControl()
+    {
+        _abLbl = new TextBlock(); _abLbl.VerticalAlignment = VerticalAlignment.Center;
+        _abLbl.FontSize = 12;
+
+        _abBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_abBox, "orgAbBox");
+        _abBox.ToolTip = OrgAbView.Help(_lang == 0) + "\n" + OrgAbView.TakeEffectTip(_lang == 0);
+        _abBox.Cursor = Cursors.Hand; _abBox.FontSize = 12;
+        _abBox.FontWeight = FontWeights.SemiBold; _abBox.MinWidth = 78;
+        _abBox.Padding = new Thickness(8, 2, 4, 2);
+        _abBox.VerticalAlignment = VerticalAlignment.Center;
+        var abHelp = new Dictionary<string, string>();
+        foreach (string m in OrgAbView.Modes) abHelp[m] = OrgAbView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_abBox, OrgAbView.Modes, abHelp, _abVal);
+        _abBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _abBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_abBox);
+            if (!OrgAbView.IsMode(sel) || sel == _abVal) return;   // unchanged -> no write, no re-fire
+            _abVal = sel;
+            SaveKey(OrgAbView.Key, _abVal);
+        };
+
+        _abNow = new TextBlock(); _abNow.Visibility = Visibility.Collapsed;
+        _abPending = new TextBlock(); _abPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_abLbl, _abBox, _abNow, _abPending);
+        PaintOrgAb();
+        return wrap;
+    }
     void PaintOrgShadow()
     {
         if (_osLbl != null) { _osLbl.Text = OrgShadowView.Label(_lang == 0); _osLbl.Foreground = Muted; }
@@ -1047,6 +1079,17 @@ partial class CockpitWindow
         _osBox.ToolTip = OrgShadowView.Help(_lang == 0) + "\n" + OrgShadowView.TakeEffectTip(_lang == 0);
         _osBox.Background = BtnBg; _osBox.Foreground = Fg; _osBox.BorderBrush = Border;
         StyleFlatCombo(_osBox);
+    }
+
+    void PaintOrgAb()
+    {
+        if (_abLbl != null) { _abLbl.Text = OrgAbView.Label(_lang == 0); _abLbl.Foreground = Muted; }
+        if (_abBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_abBox), _abVal)) ComboSelectVal(_abBox, _abVal);
+        _abBox.ToolTip = OrgAbView.Help(_lang == 0) + "\n" + OrgAbView.TakeEffectTip(_lang == 0);
+        _abBox.Background = BtnBg; _abBox.Foreground = Fg; _abBox.BorderBrush = Border;
+        StyleFlatCombo(_abBox);
     }
     // Campaign board (off|p0), beside load-aware routing. Persists through SaveKey only; the
     // coordinator reads the key once when a run starts (sweep_start), so a run in progress keeps
