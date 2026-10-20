@@ -218,6 +218,14 @@ KEYS = OrderedDict([
        "child to .fleet/board.jsonl and adds two pointer lines to the merge prompt; off "
        "changes no prompt or output. p1 is not implemented and behaves as p0."),
 
+    # Role and protocol version record (relay/org/versions.py). Read once when a run starts.
+    _k("org_version_record", SWEEP_START, "off",
+       "relay/org/versions.py:record_run (once, at run start)",
+       "off|on. Takes effect on the NEXT run. on appends two small lines per run to "
+       "org_versions.jsonl beside the transcripts: a content hash of each role and protocol "
+       "definition, and the run id. Never goal text. off writes nothing. No prompt or "
+       "admission changes either way."),
+
     # Per-tree fan-out budget (relay/fanout_budget.py). Read at each split decision; a tree
     # already running keeps going, and the next split uses the new values.
     _k("fanout_max_total", EACH_GATE, 24,

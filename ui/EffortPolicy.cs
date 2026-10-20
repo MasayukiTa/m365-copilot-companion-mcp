@@ -1275,6 +1275,55 @@ public static class AgentBoardView
     }
 }
 
+// The role/protocol version record selector's words and parsing, WPF-free. The Python side decides:
+// relay/org/versions.py reads `org_version_record` ONCE when a run starts (sweep_start) and, when
+// on, appends two small lines per run to org_versions.jsonl beside the transcripts (a content hash
+// of each role and protocol definition, and the run id; never goal text). Off writes nothing. No
+// value changes a prompt or an admission.
+public static class OrgVersionView
+{
+    //: must equal tools/settings_keys.py and relay/org/versions.py KEY / MODES.
+    public const string Key = "org_version_record";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one org_version_record= line; null when the line is not that
+    /// key or the value is not off|on (the caller keeps its value, off). A byte order mark is
+    /// tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "役割・手順の版の記録" : "Role/protocol version record"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン(記録のみ)" : "On (record only)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "記録のみ: 実行のたびに、役割と手順の文面の内容ハッシュと実行IDを2行だけ記録します。目標の文面は記録せず、プロンプトも割当も変わりません。"
+                  : "Record only: at each run, two small lines are written with a content hash of each role and protocol text and the run id. No goal text; prompts and assignment are unchanged.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の実行から有効(実行中のものは変わりません)。"
+                  : "Applies from the next run; a run in progress keeps its mode.";
+    }
+}
+
 // The team-formation selector's words and parsing, WPF-free. The Python side decides:
 // relay/team_formation.py reads `team_mode` at every split decision and, in shadow, records the
 // team (roles and member counts) a team-forming rule would have proposed beside the static one that

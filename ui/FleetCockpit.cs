@@ -226,6 +226,10 @@ partial class CockpitWindow : Window
     string _abVal = AgentBoardView.Default;
     ComboBox _abBox;
     TextBlock _abLbl, _abNow, _abPending;
+    // role and protocol version record off|on -> settings.txt org_version_record ; absent key = off (OrgVersionView.Default)
+    string _ovVal = OrgVersionView.Default;
+    ComboBox _ovBox;
+    TextBlock _ovLbl, _ovNow, _ovPending;
     // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
     string _hmVal = HierarchicalMergeView.Default;
     ComboBox _hmBox;

@@ -75,6 +75,15 @@ THREE-VALUED METRICS. Each of `success` and `turns` is "good", "poor" or "unknow
 `confidence` is "unknown" (n < min-n), "low" (n < 4 * min-n) or "adequate". The numbers are
 still printed when the label is unknown, so a reader can see what was too thin to judge.
 
+BY ROLE AND PROTOCOL VERSION (slices D1 and D2). When `org_versions.jsonl` exists in the fleet
+directory (written by relay/org/versions.py when the setting `org_version_record` is on), every
+profile whose records carry a run id also gets `by_org_version`: the same success rate and mean
+turns, split by the content hash of the role and protocol definitions the run started under.
+Only records from status.json and history.json carry a run id, so campaign-ledger children and
+merges are not split and stay in the group total. A run with no line in the file (before the
+setting was turned on) is counted under "(not recorded)", never guessed. Without the file the
+output is exactly what it was. Which wording each hash stands for is in `org_definitions`.
+
 SECOND AXIS: KIND OF WORK (slice D0). With `--by kind` (derive(with_kind=True)) every record
 also gets a `kind` from relay/task_kind.py; without it the module is not even imported,
 derived from its goal text (a child or aggregator takes the goal of the family it belongs to).
@@ -93,6 +102,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -111,6 +121,8 @@ ROLE_PRODUCER = "producer"
 ROLE_SUBTASK = S.CHILD_ROLE
 ROLE_AGGREGATOR = S.MERGE_ROLE
 NO_EFFORT = "(none recorded)"
+NO_ORG = "(not recorded)"
+NO_ORG_READ = "(definitions unreadable)"
 SRC_STATUS = "status.json workers"
 SRC_HISTORY = "history.json"
 SRC_CHILD = "campaigns.jsonl child_result"
@@ -207,6 +219,24 @@ def load_all(fleet_dir):
                                           ("mechanisms.jsonl", bad_me),
                                           ("history.json", bad_hi)) if n}
     return events, workers, camps, n_tr, history, effort_reached_by_run(mech), unreadable
+
+
+def load_org(fleet_dir):
+    """({run base id: (roles_hash, workflows_hash)}, {(roles_hash, workflows_hash): definitions},
+    unreadable count) from `org_versions.jsonl`. Empty when the file is absent. Never raises."""
+    try:
+        from relay.org import versions as V
+        runs, defs, bad = V.load(os.path.join(fleet_dir, V.FILENAME))
+        return {V.run_base(k): v for k, v in runs.items()}, defs, bad
+    except Exception:
+        return {}, {}, 0
+
+
+def org_label(pair):
+    """Short, stable name for a (roles_hash, workflows_hash) pair."""
+    if not pair or not pair[0] or not pair[1]:
+        return NO_ORG_READ
+    return "roles:%s workflows:%s" % (pair[0][:8], pair[1][:8])
 
 
 def load_profiles(fleet_dir, min_n=DEFAULT_MIN_N):
@@ -338,7 +368,7 @@ def _success_rate(outcomes):
 
 def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
            success_good=DEFAULT_SUCCESS_GOOD, turns_good=DEFAULT_TURNS_GOOD,
-           history=None, effort_by_run=None, with_kind=False):
+           history=None, effort_by_run=None, with_kind=False, org_by_run=None, org_defs=None):
     kind_of = None
     unknown_kind = "unknown"
     if with_kind:
@@ -350,8 +380,10 @@ def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
     groups = {}
 
     def grp(name):
-        return groups.setdefault(name, {"outcomes": [], "turns": [], "tools": {}, "effort": {}})
+        return groups.setdefault(name, {"outcomes": [], "turns": [], "tools": {}, "effort": {},
+                                        "org": {}})
 
+    org_labels = {}                     # label -> (roles_hash, workflows_hash), for the report
     sources = {}
     by_kind = {}        # (group, kind) -> same shape as a group, without tools
     for w in records:
@@ -375,6 +407,16 @@ def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
                     e["outcomes"].append(outcome)
                     if has_turn:
                         e["turns"].append(w["turn"])
+                    if org_by_run and tg is g:
+                        base = re.sub(r"_a\d+$", "", str(w.get("run_id") or ""))
+                        pair = org_by_run.get(base) if base else None
+                        label = org_label(pair) if pair else NO_ORG
+                        if pair:
+                            org_labels[label] = pair
+                        o = g["org"].setdefault(label, {"outcomes": [], "turns": []})
+                        o["outcomes"].append(outcome)
+                        if has_turn:
+                            o["turns"].append(w["turn"])
 
     by_task, by_run_name = _attribution_maps(records)
     unattributed = 0
@@ -425,6 +467,11 @@ def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
                 lvl: {"n": len(e["outcomes"]), "success_rate": _success_rate(e["outcomes"]),
                       "mean_turns": (sum(e["turns"]) / len(e["turns"])) if e["turns"] else None}
                 for lvl, e in sorted(g["effort"].items())}
+        if any(lbl != NO_ORG for lbl in g.get("org", {})):
+            entry["by_org_version"] = {
+                lbl: {"n": len(o["outcomes"]), "success_rate": _success_rate(o["outcomes"]),
+                      "mean_turns": (sum(o["turns"]) / len(o["turns"])) if o["turns"] else None}
+                for lbl, o in sorted(g["org"].items())}
         return entry
 
     out = {name: entry_of(groups[name], True) for name in sorted(groups)}
@@ -438,13 +485,18 @@ def derive(events, workers, camp_rows, min_n=DEFAULT_MIN_N,
         coverage[kind] = coverage.get(kind, 0) + len(g["outcomes"])
     extra = {"profiles_by_kind": kinds,
              "kind_coverage": dict(sorted(coverage.items()))} if with_kind else {}
-    return {**extra,
+    result = {**extra,
             "note": NOTE,
             "identity": "role (producer / subtask / aggregator); an explicit profile field wins",
             "thresholds": {"min_n": min_n, "success_good": success_good,
                            "turns_good": turns_good},
             "sources": dict(sorted(sources.items())),
             "profiles": out, "unattributed_tool_calls": unattributed}
+    rep_org = {lbl: org_defs[pair] for lbl, pair in sorted(org_labels.items())
+               if pair in (org_defs or {})}
+    if rep_org:
+        result["org_definitions"] = rep_org
+    return result
 
 
 # --------------------------------------------------------------------------- output
@@ -478,6 +530,9 @@ def render_text(rep, n_transcripts=0, by="role"):
             for lvl, e in p.get("by_effort_reached", {}).items():
                 lines.append("    effort reached %-16s runs %5d success %s turns %s"
                              % (lvl, e["n"], _f(e["success_rate"]), _f(e["mean_turns"], 1)))
+            for lbl, e in p.get("by_org_version", {}).items():
+                lines.append("    org %-44s runs %5d success %s turns %s"
+                             % (lbl, e["n"], _f(e["success_rate"]), _f(e["mean_turns"], 1)))
     if by == "kind":
         lines.append("# kind of work (relay/task_kind.py, derived from the goal text); "
                      "coverage: " + ", ".join(
@@ -508,9 +563,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     events, workers, camps, n_tr, history, effort, unreadable = load_all(fleet_dir)
+    org_runs, org_defs, org_bad = load_org(fleet_dir)
+    if org_bad:
+        unreadable["org_versions.jsonl"] = org_bad
     rep = derive(events, workers, camps, min_n=args.min_n, success_good=args.success_good,
                  turns_good=args.turns_good, history=history, effort_by_run=effort,
-                 with_kind=args.by == "kind")
+                 with_kind=args.by == "kind", org_by_run=org_runs, org_defs=org_defs)
     if unreadable:
         rep["unreadable"] = unreadable
     out = []
