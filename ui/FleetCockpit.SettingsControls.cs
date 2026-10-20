@@ -218,6 +218,7 @@ partial class CockpitWindow
         PaintLoadRouting();
         PaintTeamMode();
         PaintAgentBoard();
+        PaintOrgVersion();
         PaintAutoResume();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
@@ -779,6 +780,51 @@ partial class CockpitWindow
         _lrPending.Text = pend ?? "";
         _lrPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _lrPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Role and protocol version record (off|on), beside the campaign board. Persists through SaveKey
+    // only; relay/org/versions.py reads the key once when a run starts (sweep_start). It appends
+    // two small lines per run (definition hashes and the run id) and changes no prompt or admission,
+    // so there is no "in effect" line: the words and parsing live in OrgVersionView.
+    UIElement OrgVersionControl()
+    {
+        _ovLbl = new TextBlock(); _ovLbl.VerticalAlignment = VerticalAlignment.Center;
+        _ovLbl.FontSize = 12;
+
+        _ovBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_ovBox, "orgVersionBox");
+        _ovBox.ToolTip = OrgVersionView.Help(_lang == 0) + "\n" + OrgVersionView.TakeEffectTip(_lang == 0);
+        _ovBox.Cursor = Cursors.Hand; _ovBox.FontSize = 12;
+        _ovBox.FontWeight = FontWeights.SemiBold; _ovBox.MinWidth = 78;
+        _ovBox.Padding = new Thickness(8, 2, 4, 2);
+        _ovBox.VerticalAlignment = VerticalAlignment.Center;
+        var ovHelp = new Dictionary<string, string>();
+        foreach (string m in OrgVersionView.Modes) ovHelp[m] = OrgVersionView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_ovBox, OrgVersionView.Modes, ovHelp, _ovVal);
+        _ovBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _ovBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_ovBox);
+            if (!OrgVersionView.IsMode(sel) || sel == _ovVal) return;   // unchanged -> no write, no re-fire
+            _ovVal = sel;
+            SaveKey(OrgVersionView.Key, _ovVal);
+        };
+
+        _ovNow = new TextBlock(); _ovNow.Visibility = Visibility.Collapsed;
+        _ovPending = new TextBlock(); _ovPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_ovLbl, _ovBox, _ovNow, _ovPending);
+        PaintOrgVersion();
+        return wrap;
+    }
+    void PaintOrgVersion()
+    {
+        if (_ovLbl != null) { _ovLbl.Text = OrgVersionView.Label(_lang == 0); _ovLbl.Foreground = Muted; }
+        if (_ovBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_ovBox), _ovVal)) ComboSelectVal(_ovBox, _ovVal);
+        _ovBox.ToolTip = OrgVersionView.Help(_lang == 0) + "\n" + OrgVersionView.TakeEffectTip(_lang == 0);
+        _ovBox.Background = BtnBg; _ovBox.Foreground = Fg; _ovBox.BorderBrush = Border;
+        StyleFlatCombo(_ovBox);
     }
     // Campaign board (off|p0), beside load-aware routing. Persists through SaveKey only; the
     // coordinator reads the key once when a run starts (sweep_start), so a run in progress keeps

@@ -27,6 +27,7 @@ $Boxes = @{
     'fanout_write_scope'        = 'writeScopeBox'
     'fanout_load_routing'       = 'loadRoutingBox'
     'agent_board_mode'          = 'agentBoardBox'
+    'org_version_record'        = 'orgVersionBox'
     'team_mode'                 = 'teamModeBox'
 }
 
