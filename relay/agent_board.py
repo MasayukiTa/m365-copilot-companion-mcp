@@ -369,7 +369,8 @@ def _line(e, now):
     return s if len(s) <= DIGEST_LINE_CHARS else s[:DIGEST_LINE_CHARS - 1] + "…"
 
 
-def digest(campaign_id, viewer="", *, max_chars=DIGEST_CHARS, now=None, path=None):
+def digest(campaign_id, viewer="", *, max_chars=DIGEST_CHARS, now=None, path=None,
+          roster_lines=()):
     """The board of one campaign as a short string, never longer than `max_chars` (at least
     DIGEST_MIN_CHARS). "" when the campaign is not known. Newest first, at most DIGEST_PER_KIND
     lines of a kind, the viewer's own entries left out, always ending with the data line."""
@@ -392,14 +393,22 @@ def digest(campaign_id, viewer="", *, max_chars=DIGEST_CHARS, now=None, path=Non
                 continue
             picked.append(_line(e, t))
 
+        # The roster (relay/roster.py) is optional and the first thing dropped when the digest
+        # is too long. With none given, `roster` is [] and the text is exactly what it was.
+        roster = ([" 担当(参考):"] + [str(x) for x in roster_lines]) if roster_lines else []
+
         def build(lines, omitted):
             out = [head] + lines
             if omitted:
                 out.append(" (他%d件)" % omitted)
+            out.extend(roster)
             out.append(DATA_LINE)
             return "\n".join(out)
 
         text = build(picked, skipped)
+        if len(text) > n and roster:
+            roster = []
+            text = build(picked, skipped)
         while len(text) > n and picked:
             picked.pop()
             skipped += 1

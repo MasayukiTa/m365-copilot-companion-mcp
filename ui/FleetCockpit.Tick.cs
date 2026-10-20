@@ -138,6 +138,7 @@ partial class CockpitWindow
             int openTabs = I(root, "open_tabs");
             int liveCap = I(root, "max_concurrent");
             UpdateWorkerChip(openTabs, liveCap, runningNow);
+            if (runningNow) ApplyRosterToChip(root);   // who works on what: the chip's tooltip
         }
         // only archive while the run is LIVE -- otherwise the finished run's final
         // snapshot would re-add cleared tasks every tick (Clear would never stick).
