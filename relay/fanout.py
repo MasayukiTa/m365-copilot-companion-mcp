@@ -951,8 +951,12 @@ def merge_acceptance_checks(records):
 
 def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
                      limit_each=1200, cwd=None, parent_checks=None, parent_partial="",
-                     parent_level=None, run_id="", depth=None):
+                     parent_level=None, run_id="", depth=None, board_lines=""):
     """The goal item that merges a finished campaign.
+
+    `board_lines`: text appended to the prompt after a newline (the campaign-board pointer,
+    relay/agent_board.pointer_lines()). "" appends nothing, so the prompt is unchanged to the
+    character.
 
     `depth` is the depth of the merge worker: the splitting worker's depth plus one, i.e. the
     depth its children were given. None keeps MAX_DEPTH, the value for a top-level split.
@@ -975,6 +979,8 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
         "depth": MAX_DEPTH if depth is None else int(depth),   # never splits again
         "priority": True,            # the campaign is finished; do not queue behind new work
     }
+    if board_lines:
+        item["text"] = item["text"] + "\n" + board_lines
     # THE SAME WORKING DIRECTORY THE CHILDREN HAD. child_goals passes cwd down; this did
     # not, and the merge is asked to write a combined file and report its path -- from
     # whatever directory it happened to start in.

@@ -279,6 +279,7 @@ partial class CockpitWindow
             case "session_retention_days":
             case "session_max_mb":
                 return "bridge_start";
+            case "agent_board_mode":
             case "autoscale":
             case "autoscale_max":
             case "autoscale_per_tab_mb":
@@ -760,6 +761,7 @@ partial class CockpitWindow
         col.Children.Add(HierarchicalMergeControl());
         col.Children.Add(WriteScopeControl());
         col.Children.Add(LoadRoutingControl());
+        col.Children.Add(AgentBoardControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the
@@ -767,7 +769,7 @@ partial class CockpitWindow
         PaintEffortPolicyInEffect(_lastRoot); PaintFanoutInEffect(_lastRoot);
         PaintFanoutBudgetInEffect(_lastRoot); PaintFanoutDepthInEffect(_lastRoot);
         PaintHierarchicalMergeInEffect(_lastRoot); PaintWriteScopeInEffect(_lastRoot);
-        PaintLoadRoutingInEffect(_lastRoot);
+        PaintLoadRoutingInEffect(_lastRoot); PaintAgentBoardInEffect(_lastRoot);
         PaintMergeConversationInEffect(_lastRoot);
 
         // ── Recovery / 復旧: what happens to a run whose coordinator died. One control for now;

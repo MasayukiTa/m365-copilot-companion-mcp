@@ -216,6 +216,7 @@ partial class CockpitWindow
         PaintMergeConversation();
         PaintWriteScope();
         PaintLoadRouting();
+        PaintAgentBoard();
         PaintAutoResume();
         PaintSupervisorSelfRestart();
         PaintToolProbe();
@@ -777,6 +778,81 @@ partial class CockpitWindow
         _lrPending.Text = pend ?? "";
         _lrPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _lrPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
+    }
+    // Campaign board (off|p0), beside load-aware routing. Persists through SaveKey only; the
+    // coordinator reads the key once when a run starts (sweep_start), so a run in progress keeps
+    // its mode. p1 (workers write) exists in the key's value set but is not offered here.
+    // What is IN EFFECT comes from status.json "agent_board"; the words and parsing live in
+    // AgentBoardView.
+    UIElement AgentBoardControl()
+    {
+        _abLbl = new TextBlock(); _abLbl.VerticalAlignment = VerticalAlignment.Center;
+        _abLbl.FontSize = 12;
+
+        _abBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_abBox, "agentBoardBox");
+        _abBox.ToolTip = AgentBoardView.Help(_lang == 0) + "\n" + AgentBoardView.TakeEffectTip(_lang == 0);
+        _abBox.Cursor = Cursors.Hand; _abBox.FontSize = 12;
+        _abBox.FontWeight = FontWeights.SemiBold; _abBox.MinWidth = 78;
+        _abBox.Padding = new Thickness(8, 2, 4, 2);
+        _abBox.VerticalAlignment = VerticalAlignment.Center;
+        var abHelp = new Dictionary<string, string>();
+        foreach (string m in AgentBoardView.Modes) abHelp[m] = AgentBoardView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_abBox, AgentBoardView.Modes, abHelp, _abVal);
+        _abBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _abBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_abBox);
+            if (!AgentBoardView.IsMode(sel) || sel == _abVal) return;   // unchanged -> no write, no re-fire
+            _abVal = sel;
+            SaveKey(AgentBoardView.Key, _abVal);
+            PaintAgentBoardInEffect(_lastRoot);
+        };
+
+        _abNow = new TextBlock(); _abNow.VerticalAlignment = VerticalAlignment.Center;
+        _abNow.FontSize = 11.5;
+        _abPending = new TextBlock(); _abPending.VerticalAlignment = VerticalAlignment.Center;
+        _abPending.FontSize = 11.5; _abPending.FontWeight = FontWeights.SemiBold;
+        _abPending.Visibility = Visibility.Collapsed;
+
+        var wrap = SettingsComboBlock(_abLbl, _abBox, _abNow, _abPending);
+        PaintAgentBoard();
+        return wrap;
+    }
+    void PaintAgentBoard()
+    {
+        if (_abLbl != null) { _abLbl.Text = AgentBoardView.Label(_lang == 0); _abLbl.Foreground = Muted; }
+        if (_abBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_abBox), _abVal)) ComboSelectVal(_abBox, _abVal);
+        _abBox.ToolTip = AgentBoardView.Help(_lang == 0) + "\n" + AgentBoardView.TakeEffectTip(_lang == 0);
+        _abBox.Background = BtnBg; _abBox.Foreground = Fg; _abBox.BorderBrush = Border;
+        StyleFlatCombo(_abBox);
+        PaintAgentBoardInEffect(_lastRoot);
+    }
+    // What the COORDINATOR says it applies (status.json "agent_board"). No report (old runner, no
+    // run yet) -> nothing shown, never a guess from the selection.
+    void PaintAgentBoardInEffect(Dictionary<string, object> root)
+    {
+        if (_abNow == null || _abPending == null) return;
+        bool ja = _lang == 0;
+        string now = null, pend = null;
+        Dictionary<string, object> ab = root != null ? Obj(root, "agent_board") : null;
+        if (ab != null && ab.ContainsKey("mode") && ab["mode"] != null)
+        {
+            string rep = S(ab, "mode");
+            now = AgentBoardView.Describe(rep,
+                ab.ContainsKey("posted") && ab["posted"] != null ? I(ab, "posted") : 0,
+                ab.ContainsKey("refused") && ab["refused"] != null ? I(ab, "refused") : 0,
+                ab.ContainsKey("write_errors") && ab["write_errors"] != null ? I(ab, "write_errors") : 0, ja);
+            pend = AgentBoardView.PendingText(rep, _abVal, ja);
+        }
+        _abNow.Text = now ?? "";
+        _abNow.Foreground = Muted;
+        _abNow.Visibility = now != null ? Visibility.Visible : Visibility.Collapsed;
+        _abPending.Text = pend ?? "";
+        _abPending.Foreground = Theme.Br(Theme.Warning(_dark));
+        _abPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
     // Auto-resume of an interrupted run (off|on), in its own Recovery section. Persists through
     // SaveKey only; the supervisor re-reads the key every cycle (each_gate). What is IN EFFECT comes

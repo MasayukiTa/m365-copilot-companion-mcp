@@ -1452,6 +1452,16 @@ def _load_routing_block():
         return {}
 
 
+def _agent_board_block():
+    """`agent_board`: {mode, posted, refused, write_errors}, additive. The production caller of
+    relay.agent_board.status_block; {} before a run began or on any failure."""
+    try:
+        from relay import agent_board as _ab
+        return _ab.status_block()
+    except Exception:
+        return {}
+
+
 def _auto_resume_block():
     """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
     of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
@@ -1998,6 +2008,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_fanout_depth_block())
     _snap.update(_write_scope_block())
     _snap.update(_load_routing_block())
+    _snap.update(_agent_board_block())
     _snap.update(_auto_resume_block())
     _snap.update(_conversation_saving_block())
     return _snap

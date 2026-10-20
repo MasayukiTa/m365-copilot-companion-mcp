@@ -1201,3 +1201,76 @@ public static class LoadRoutingView
         return ja ? "選択は次の割当から反映" : "selection applies from the next admission";
     }
 }
+
+// The campaign-board selector's words and parsing, WPF-free. The Python side decides:
+// relay/agent_board.py reads `agent_board_mode` ONCE when a coordinator starts (sweep_start) and,
+// in p0, appends one pointer row per finished child to .fleet/board.jsonl and adds two pointer
+// lines to the merge prompt; relay/fleet_runner.py exports {mode, posted, refused, write_errors}
+// as status.json "agent_board". Off changes no prompt or output. The file may also say p1
+// (workers write), which is declared and not implemented and behaves as p0; the selector offers
+// off and p0 only, and a file value of p1 is left alone (ParseLine returns null for it).
+public static class AgentBoardView
+{
+    //: must equal tools/settings_keys.py and the first two of relay/agent_board.py MODES.
+    public const string Key = "agent_board_mode";
+    public const string Default = "off";
+
+    public static readonly string[] Modes = { "off", "p0" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "p0"; }
+
+    /// <summary>The mode named by one agent_board_mode= line; null when the line is not that
+    /// key or the value is not off|p0 (the caller keeps its value). A byte order mark is
+    /// tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('﻿').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "共有ボード" : "Campaign board"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "p0") return ja ? "P0(統合役が書く)" : "P0 (coordinator writes)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "P0: 子が完了するたびに、その結果の置き場所を1行だけ共有ボードに記録し、統合役に読み方を2行で伝えます。ワーカーは書けません。オフでは何も変わりません。"
+                  : "P0: when a child finishes, one line saying where its result is goes on the shared board, and the merge worker is told how to read it in two lines. Workers cannot write. Off changes nothing.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次の実行から有効(実行中のものは変わりません)。"
+                  : "Applies from the next run; a run in progress keeps its mode.";
+    }
+
+    /// <summary>What the coordinator reports; null when the mode is not usable (old runner, no
+    /// run yet): the cockpit then shows nothing, not a guess.</summary>
+    public static string Describe(string mode, int posted, int refused, int writeErrors, bool ja)
+    {
+        if (mode != "off" && mode != "p0" && mode != "p1") return null;
+        string head = (ja ? "稼働中: " : "In effect: ") + (mode == "off" ? (ja ? "オフ" : "off")
+                      : (mode == "p0" ? "P0" : (ja ? "P1(未実装・P0として動作)" : "P1 (not implemented, runs as P0)")));
+        if (mode != "off")
+            head += ja ? " / 記録 " + posted + " 件、拒否 " + refused + " 件、書き込み失敗 " + writeErrors + " 件"
+                       : " / " + posted + " posted, " + refused + " refused, " + writeErrors + " write errors";
+        return head;
+    }
+
+    /// <summary>The note shown when the mode the runner reports differs from the selection (the
+    /// runner reads the key when it starts); null when they agree.</summary>
+    public static string PendingText(string reported, string selected, bool ja)
+    {
+        if (reported != "off" && reported != "p0" && reported != "p1") return null;
+        if (reported == selected) return null;
+        return ja ? "選択は次の実行から反映" : "selection applies from the next run";
+    }
+}

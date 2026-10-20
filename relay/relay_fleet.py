@@ -79,6 +79,7 @@ from relay import stuck_cause as stuck_cause_mod
 from relay import conversation_saving as conv_saving_mod
 from relay import tool_bridge
 from relay import load_routing
+from relay import agent_board
 from .planner import PLAN_PROMPT, extract_plan, opening_turn, plan_ready
 from .review_resilience import (
     RecoveryAction, diagnose_after_fresh_replay, freeze_goal_dict,
@@ -9356,6 +9357,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     # one, derive a run-unique id from the start time so resumes/rounds don't collide.
     if not run_id:
         run_id = "r%x" % int(time.time())
+    agent_board.begin_run()   # agent_board_mode, read once per run (sweep_start)
     # busy_writer: flush a status snapshot on demand. A worker calls this right before a
     # BLOCKING acceptance eval freezes the sweep, so its 'verifying'/eval-busy marker reaches
     # status.json BEFORE on_tick stops firing -- the watchdog then waits instead of resetting.
@@ -9574,6 +9576,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                           "task_id": getattr(_env, "task_id", None),
                           "result": ((getattr(_w, "display_result", "")
                                       or getattr(_w, "last_response", "") or "")[:1200])})
+            agent_board.post_result(_cid, _idx, getattr(_env, "task_id", None))
 
     def _note_finished_workers():
         """G3 + G2 evidence: write `merge_done` when an aggregator worker ends DONE, and a
@@ -10000,6 +10003,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                                parent_partial=_camp.get("partial"),
                                                parent_level=_camp.get("parent_level"),
                                                run_id=run_id,
+                                               board_lines=agent_board.pointer_lines(),
                                                **({"depth": _camp["depth"]}
                                                   if _camp.get("depth") else {}))
             # WHICH CONVERSATION THE MERGE RUNS IN (setting merge_conversation): fresh, as ever,

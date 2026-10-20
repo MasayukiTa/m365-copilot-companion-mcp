@@ -72,6 +72,7 @@ partial class CockpitWindow
         PaintMergeConversationInEffect(root);   // the merge-conversation state and the savings so far
         PaintWriteScopeInEffect(root);     // the sibling write-scope mode the coordinator applies
         PaintLoadRoutingInEffect(root);    // the load-aware routing mode the coordinator applies
+        PaintAgentBoardInEffect(root);     // the campaign-board mode the coordinator applies
         PaintAutoResumeInEffect(root);     // the auto-resume setting and the gate's last decision
         PaintSupervisorCodeNote();         // "supervisor is running older code" (supervisor_state.json)
         PaintToolProbeInEffect();          // why the tool-call check did or did not send a message
