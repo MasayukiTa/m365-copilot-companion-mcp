@@ -133,3 +133,26 @@ def test_unrelated_joins_between_the_same_tables_are_both_kept(tmp_path):
     _write(tmp_path, "catalog/b.json", {"name": "b"})
     r = catalog.catalog_joins("a", "b", store=store.load_directory(tmp_path))
     assert len(r["direct"]) == 2 and r["demoted"] == []
+
+
+# ------------------------------------------------- 3. words that only name the kind of thing asked
+
+def test_structure_words_in_the_question_do_not_outweigh_the_subject(tmp_path):
+    """'テーブル' and '列' say what KIND of answer is wanted, not what it is about. Tables whose text
+    merely mentions them used to outrank the table that matches the subject."""
+    _write(tmp_path, "catalog/decoy.json", {
+        "name": "decoy", "description": "注文の控え",
+        "pitfalls": ["このテーブルの列は一致確認済み。"],
+        "columns": [{"name": "c1", "meaning": "列の説明"}]})
+    _write(tmp_path, "catalog/target.json", {
+        "name": "target", "description": "不良の数量を持つ",
+        "columns": [{"name": "qty", "meaning": "不良の枚数"}]})
+    st = store.load_directory(tmp_path)
+    r = catalog.catalog_search("不良が入っているテーブルと列はどれですか", store=st)
+    assert r["results"][0]["table"] == "target"
+
+
+def test_a_question_made_only_of_structure_words_still_searches(tmp_path):
+    _write(tmp_path, "catalog/decoy.json", {"name": "decoy", "description": "テーブルの列"})
+    st = store.load_directory(tmp_path)
+    assert catalog.catalog_search("テーブル", store=st)["results"]

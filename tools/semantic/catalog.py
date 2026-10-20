@@ -30,6 +30,10 @@ W_KEYS = 1.0
 W_PERF = 0.5
 
 
+_STRUCTURE_WORDS = frozenset(norm(w) for w in (
+    "テーブル", "カラム", "ビュー", "データ", "データベース", "列", "表", "項目", "スキーマ"))
+
+
 def _query_tokens(query: str) -> List[Tuple[str, str]]:
     """[(kind, token)] from the query: latin words (stemmed) and kanji / katakana runs."""
     q = norm(query)
@@ -40,6 +44,11 @@ def _query_tokens(query: str) -> List[Tuple[str, str]]:
     for r in content_runs(q):
         if r.kind in ("han", "kata"):
             toks.append((r.kind, r.text))
+    # words that only say what KIND of thing is asked for ("which table and column ...") say
+    # nothing about the subject; dropped unless nothing else is left
+    subject = [t for t in toks if t[1] not in _STRUCTURE_WORDS]
+    if subject:
+        toks = subject
     if not toks and q:
         toks.append(("raw", q))
     seen, out = set(), []
