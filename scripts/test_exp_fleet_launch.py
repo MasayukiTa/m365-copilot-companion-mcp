@@ -68,3 +68,20 @@ def test_the_launcher_runs_from_a_bare_command_line_with_isolated_python(tmp_pat
     r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", code, script], capture_output=True,
                        encoding="utf-8", errors="replace", timeout=120, cwd=str(tmp_path))
     assert r.returncode == 0 and "ok" in r.stdout, r.stderr[-400:]
+
+
+def test_the_launcher_floor_follows_the_operators_value_and_a_run_inherits_it(tmp_path):
+    """prepare copies the operator's two floors into the run's settings (one implementation:
+    carried_floor_lines); the launcher's own refusal then follows that value, 0 meaning off."""
+    prod = tmp_path / "prod.txt"
+    prod_body = "a=1" + chr(10) + "disk_floor_gb=0" + chr(10) + "ram_floor_mb=0" + chr(10)
+    prod.write_text(prod_body, encoding="utf-8")
+    own = tmp_path / "own.txt"
+    own.write_text(L.settings_body(), encoding="utf-8")
+    lines = L.carried_floor_lines(L.settings_body(), str(own), candidates=[str(prod)])
+    assert sorted(lines) == ["disk_floor_gb=0", "ram_floor_mb=0"]
+    assert prod.read_text(encoding="utf-8") == prod_body                    # read only
+    nl = chr(10)
+    assert L.own_disk_floor(L.settings_body() + "disk_floor_gb=0" + nl) == 0.0
+    assert L.own_disk_floor(L.settings_body() + "disk_floor_gb=2.5" + nl) == 2.5
+    assert L.own_disk_floor(L.settings_body()) == L.MIN_FREE_GB            # none carried: the launcher's own
