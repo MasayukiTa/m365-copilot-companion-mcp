@@ -187,7 +187,12 @@ def test_approved_jobs_store():
     tr._approve_class(key, example="echo hi")
     check("approved after add", tr._is_class_approved(key))
     check("unrelated class still not approved", not tr._is_class_approved("shell::rm -rf"))
-    # corrupt file -> tolerated, treated as empty (never raises)
+    # corrupt file -> tolerated, treated as empty (never raises). The generation backups the
+    # store now keeps would answer instead (tools/test_state_store_integrity.py covers that),
+    # so drop them to test the no-backup reader contract.
+    for _b in os.listdir(os.path.dirname(tr.APPROVED_JOBS_FILE)):
+        if ".bak." in _b:
+            os.remove(os.path.join(os.path.dirname(tr.APPROVED_JOBS_FILE), _b))
     with open(tr.APPROVED_JOBS_FILE, "w", encoding="utf-8") as f:
         f.write("{not valid json")
     check("corrupt store tolerated as empty", tr._load_approved_jobs() == {"classes": {}})

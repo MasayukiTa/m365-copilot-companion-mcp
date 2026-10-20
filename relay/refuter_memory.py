@@ -22,6 +22,9 @@ from __future__ import annotations
 import json
 import math
 import os
+from pathlib import Path
+
+from tools import state_store
 
 # Smoothing / backoff knobs. Kept module-level so tests can reason about them.
 _PRIOR = 0.5                # rejection prob with no data at all (max entropy)
@@ -104,8 +107,9 @@ class RefuterMemory:
     """Persistent, smoothed per-(bucket,lens) rejection-rate store with selective ranking.
 
     Counts live as {key: {"refute": int, "total": int}} where key encodes both the feature
-    bucket and the lens. Reads tolerate a missing/corrupt file (start empty); writes are
-    atomic and BOM-less (this repo has been bitten by BOMs in json control files).
+    bucket and the lens. A missing file starts empty; an unreadable one is kept as
+    `.corrupt-<timestamp>` and never written over. Every write is a locked, atomic
+    read-modify-write with generation backups (tools/state_store.py).
     """
 
     def __init__(self, path=None):
@@ -116,38 +120,60 @@ class RefuterMemory:
         self._load()
 
     # --- persistence ---
-    def _load(self):
-        try:
-            # utf-8-sig tolerates a BOM if some other tool wrote one.
-            with open(self.path, "r", encoding="utf-8-sig") as fh:
-                raw = json.load(fh)
-            if isinstance(raw, dict):
-                cells = raw.get("cells")
-                if isinstance(cells, dict):
-                    self.data["cells"] = {
-                        k: {"refute": int(v.get("refute", 0)),
-                            "total": int(v.get("total", 0))}
-                        for k, v in cells.items() if isinstance(v, dict)
-                    }
-                self.data["selects"] = int(raw.get("selects", 0))
-        except (FileNotFoundError, ValueError, OSError, TypeError):
-            # missing or corrupt -> start empty (already initialised above)
-            pass
+    @staticmethod
+    def _valid(raw) -> bool:
+        return isinstance(raw, dict) and isinstance(raw.get("cells", {}), dict)
 
-    def _save(self):
-        # Atomic, BOM-less utf-8 write: tmp file then os.replace. newline="" so no platform
-        # translation sneaks bytes into a control file.
+    @staticmethod
+    def _normalise(raw: dict) -> dict:
+        cells = raw.get("cells") or {}
+        return {
+            "cells": {k: {"refute": int(v.get("refute", 0)), "total": int(v.get("total", 0))}
+                      for k, v in cells.items() if isinstance(v, dict)},
+            "selects": int(raw.get("selects", 0)),
+        }
+
+    def _load(self):
+        """Read the store. A MISSING file starts empty. A file that exists but cannot be read
+        (torn, invalid) is NEVER taken as "no history": the instance runs in memory only
+        (`_unreadable`), refuses to write, and tools.state_store keeps the damaged bytes as
+        `<name>.corrupt-<timestamp>` -- the learned rates are irreplaceable and the next save
+        would otherwise replace them with one observation."""
+        self._unreadable = False
         try:
-            d = os.path.dirname(self.path)
-            if d:
-                os.makedirs(d, exist_ok=True)
-            tmp = self.path + ".tmp"
-            with open(tmp, "w", encoding="utf-8", newline="") as fh:
-                json.dump(self.data, fh, ensure_ascii=False, sort_keys=True)
-            os.replace(tmp, self.path)
-        except OSError:
+            raw = state_store.read_json(
+                Path(self.path), validate=self._valid, default=lambda: {"cells": {}, "selects": 0})
+            self.data = self._normalise(raw)
+        except state_store.StateUnreadable:
+            self._unreadable = True
+        except (ValueError, OSError, TypeError):
+            self._unreadable = True
+
+    def _update(self, mutate):
+        """Apply `mutate(data)` to the freshest on-disk state under the cross-process lock
+        and write it atomically (generation backups, shrink guard). In-memory `self.data`
+        follows what was written, so another process's observations are not lost."""
+        if self._unreadable:
+            mutate(self.data)            # advisory only; nothing is written over an unreadable file
+            return
+        applied = []
+
+        def _m(state):
+            norm = self._normalise(state)
+            state.clear()
+            state.update(norm)
+            mutate(state)
+            applied.append(True)
+            self.data = state
+        try:
+            state_store.update_json(
+                Path(self.path), _m, validate=self._valid,
+                count=lambda s: len(s.get("cells") or {}),
+                default=lambda: {"cells": {}, "selects": 0})
+        except (state_store.StateStoreError, OSError):
             # persistence is best-effort: never let a disk hiccup break the review loop.
-            pass
+            if not applied:
+                mutate(self.data)
 
     # --- internal cell access ---
     @staticmethod
@@ -184,14 +210,16 @@ class RefuterMemory:
         """Increment the (bucket, lens) counts with this observed verdict and persist."""
         bkey = bucket_key(features)
         ck = self._cell_key(bkey, lens)
-        cell = self.data["cells"].get(ck)
-        if cell is None:
-            cell = {"refute": 0, "total": 0}
-            self.data["cells"][ck] = cell
-        cell["total"] += 1
-        if refuted:
-            cell["refute"] += 1
-        self._save()
+
+        def _inc(data):
+            cell = data["cells"].get(ck)
+            if cell is None:
+                cell = {"refute": 0, "total": 0}
+                data["cells"][ck] = cell
+            cell["total"] += 1
+            if refuted:
+                cell["refute"] += 1
+        self._update(_inc)
 
     def rejection_prob(self, features: dict, lens: str) -> float:
         """Smoothed P(this lens refutes a candidate in this bucket).
@@ -239,9 +267,13 @@ class RefuterMemory:
         if not cands:
             return []
         # advance the select counter first so the period is observable/deterministic.
-        n_select = self.data.get("selects", 0)
-        self.data["selects"] = n_select + 1
-        self._save()
+        seen = []
+
+        def _tick(data):
+            seen.append(data.get("selects", 0))
+            data["selects"] = seen[0] + 1
+        self._update(_tick)
+        n_select = seen[0]
 
         if k >= len(cands):
             return cands

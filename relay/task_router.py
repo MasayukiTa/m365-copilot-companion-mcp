@@ -150,6 +150,7 @@ if REPO not in sys.path:
 from relay.control_envelopes import is_local_loop_control_submission
 
 from tools import childproc
+from tools import state_store
 
 # These helpers are reused, not reimplemented (see module docstring / design notes below).
 # Imports are defensive: the router must stay importable even if tools/relay siblings are
@@ -528,28 +529,20 @@ def _job_class_key(job_type, payload):
 
 
 def _load_approved_jobs():
-    """Return {"classes": {key: {approved_at, example}}}. Tolerates a missing or corrupt
-    store file -- always returns a well-formed dict, never raises."""
+    """Return {"classes": {key: {approved_at, example}}}. Never raises. A missing file is an
+    empty store; a file that cannot be read answers from the newest generation backup, else
+    empty -- the safe answer for a READER (nothing approved, so the human is asked again).
+    tools.state_store keeps the unreadable bytes as `.corrupt-<timestamp>` and
+    _approve_class refuses to write over them."""
     try:
-        with open(APPROVED_JOBS_FILE, encoding="utf-8") as f:
-            data = json.load(f)
-        if isinstance(data, dict) and isinstance(data.get("classes"), dict):
-            return data
+        return state_store.read_json(
+            Path(APPROVED_JOBS_FILE), validate=_approved_valid, default=lambda: {"classes": {}})
     except Exception:
-        pass
-    return {"classes": {}}
+        return {"classes": {}}
 
 
-def _save_approved_jobs(data):
-    """Atomic write (tmp + os.replace) so a crash mid-write can't corrupt the store."""
-    try:
-        os.makedirs(os.path.dirname(APPROVED_JOBS_FILE) or ".", exist_ok=True)
-        tmp = APPROVED_JOBS_FILE + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, APPROVED_JOBS_FILE)
-    except Exception:
-        pass
+def _approved_valid(data):
+    return isinstance(data, dict) and isinstance(data.get("classes"), dict)
 
 
 def _is_class_approved(key):
@@ -557,10 +550,18 @@ def _is_class_approved(key):
 
 
 def _approve_class(key, example=""):
-    data = _load_approved_jobs()
-    classes = data.setdefault("classes", {})
-    classes[key] = {"approved_at": time.time(), "example": str(example)[:200]}
-    _save_approved_jobs(data)
+    """Record a human approval as a locked, atomic read-modify-write (tools.state_store): a
+    concurrent approval is not lost and an unreadable store is never overwritten by a
+    one-entry store. A failure to persist only means the human is asked again."""
+    def _add(data):
+        data.setdefault("classes", {})[key] = {
+            "approved_at": time.time(), "example": str(example)[:200]}
+    try:
+        state_store.update_json(
+            Path(APPROVED_JOBS_FILE), _add, validate=_approved_valid,
+            count=lambda d: len(d.get("classes") or {}), default=lambda: {"classes": {}})
+    except Exception:
+        pass
 
 
 def _static_risk(job_type, payload):

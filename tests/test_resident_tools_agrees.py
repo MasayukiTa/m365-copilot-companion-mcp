@@ -74,7 +74,9 @@ def test_nothing_in_the_product_decides_anything_from_the_value():
         "relay/resident_guard.py", "relay/fleet_runner.py", "relay/test_resident_guard.py",
         "tools/test_a_setting_declares_when_it_takes_effect.py", "tests/test_resident_tools_agrees.py",
         "scripts/probes/resident_observe.py", "scripts/probes/test_resident_observe.py",
-        "tools/settings_keys.py", "scripts/test_set_setting_via_ui_ids.py")}
+        "tools/settings_keys.py", "scripts/test_set_setting_via_ui_ids.py",
+        # names the guard's lock file in its list of audited JSON writers; decides nothing
+        "tools/test_state_store_integrity.py")}
     hits = []
     for base in ("relay", "bridge", "tools", "scripts"):
         for root, _dirs, files in os.walk(os.path.join(REPO, base)):

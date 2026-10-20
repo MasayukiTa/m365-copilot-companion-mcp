@@ -422,6 +422,7 @@ jobs:
             tools/test_procedural_memory.py \
             tools/test_procedural_memory_concurrency.py \
             tools/test_state_store.py \
+            tools/test_state_store_integrity.py \
             tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
             tools/test_an_alert_you_cannot_act_on.py \

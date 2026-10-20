@@ -23,6 +23,7 @@ sys.path.insert(0, str(ROOT))
 
 from bench.companionbench.calibration import CALIBRATION_KEY   # noqa: E402
 from relay.selfimprove import reviewer_allocation as A         # noqa: E402
+from tools import state_store                                  # noqa: E402
 
 
 def load(path):
@@ -136,8 +137,17 @@ def warm_memory(rows, path):
     # same path warms it twice -- observed: 54 observations became 108 on the second run, off
     # the same corpus. The adaptive arm would then look better the more often the analysis was
     # re-run, which is the least defensible way to move a number.
-    if os.path.exists(str(path)):
-        os.remove(str(path))
+    #
+    # REMOVING ONLY THE MAIN FILE IS NOT FRESH. tools.state_store keeps generation backups
+    # (<name>.bak.N), and its reader falls back to the newest backup when the main file is
+    # gone -- so the first record() after os.remove(path) restores the previous run's counts
+    # from mem.json.bak.1 and the observations double (18 -> 36, measured 2026-10-20). Clear
+    # the backups too so the store is genuinely empty.
+    for p in [Path(path), *state_store.backup_paths(Path(path))]:
+        try:
+            p.unlink()
+        except FileNotFoundError:
+            pass
     memory = RefuterMemory(path=str(path))
     for row in rows:
         features = row.get("features") or {}
