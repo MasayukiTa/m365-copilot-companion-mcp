@@ -609,7 +609,10 @@ if ($script:tunnelChainBroken) {
 # the documented way for a non-browser client to skip the relay's warning page; Copilot Studio
 # (server-to-server) never sees that page.
 function Test-TunnelHealthAnswer([string]$tunnelUrl, $localPid, [int]$timeoutSec = 7) {
-    $res = [PSCustomObject]@{ Ok = $false; Why = "" }
+    # SignInHost is set ONLY when the one complaint is a redirect to a Microsoft sign-in host:
+    # that is what a healthy tenant-only tunnel answers an anonymous caller with, so the caller
+    # (tunnel_serving) may confirm hosting another way. Any other failure leaves it empty.
+    $res = [PSCustomObject]@{ Ok = $false; Why = ""; SignInHost = "" }
     if (-not $tunnelUrl) { $res.Why = "MCP_TUNNEL_URL is not set in .env"; return $res }
     # MCP_TUNNEL_URL points at the /mcp path (e.g. https://host.devtunnels.ms/mcp);
     # /health is a SIBLING route at the tunnel origin, not nested under /mcp -- so
@@ -618,19 +621,59 @@ function Test-TunnelHealthAnswer([string]$tunnelUrl, $localPid, [int]$timeoutSec
     # origin (scheme+host) instead.
     $u = [Uri]$tunnelUrl
     $origin = $u.GetLeftPart([UriPartial]::Authority)
-    try {
-        $r = Invoke-WebRequest -Uri ($origin + '/health') -TimeoutSec $timeoutSec -UseBasicParsing `
-                               -Headers @{ 'X-Tunnel-Skip-AntiPhishing-Page' = 'true' }
-    } catch {
-        $code = $null
-        try { $code = [int]$_.Exception.Response.StatusCode } catch { }
-        if ($code) {
-            $res.Why = "the public URL answered HTTP $code instead of the server's /health -- the tunnel relay refused the call (a tunnel without an anonymous grant does this to every caller without an Entra sign-in)"
-        } else {
-            $res.Why = "no answer from the public URL: " + $_.Exception.Message
+    # Redirects are followed BY HAND (up to 5 hops on the tunnel's own host): the first hop that
+    # leaves the tunnel host is the answer ("sent to a sign-in page") and is not fetched, so doctor
+    # never calls the sign-in host and the verdict does not depend on that host being reachable.
+    $current = $origin + '/health'
+    $r = $null
+    for ($hop = 0; ($hop -le 5) -and (-not $r); $hop++) {
+        $nextUri = $null
+        try {
+            $r = Invoke-WebRequest -Uri $current -TimeoutSec $timeoutSec -UseBasicParsing -MaximumRedirection 0 `
+                                   -Headers @{ 'X-Tunnel-Skip-AntiPhishing-Page' = 'true' }
+        } catch {
+            $err = $_
+            $code = $null
+            try { $code = [int]$err.Exception.Response.StatusCode } catch { }
+            $loc = $null
+            if ($code -ge 300 -and $code -lt 400) {
+                try { $loc = [string]$err.Exception.Response.Headers['Location'] } catch { }
+                if (-not $loc) { try { $loc = [string]$err.Exception.Response.Headers.Location } catch { } }
+            }
+            if ($loc) {
+                try { $nextUri = New-Object System.Uri -ArgumentList ([Uri]$current), $loc } catch { $nextUri = $null }
+            }
+            if (-not $nextUri) {
+                if ($code) {
+                    $res.Why = "the public URL answered HTTP $code instead of the server's /health -- the tunnel relay refused the call (a tunnel without an anonymous grant does this to every caller without an Entra sign-in)"
+                } else {
+                    $res.Why = "no answer from the public URL: " + $err.Exception.Message
+                }
+                return $res
+            }
         }
-        return $res
+        # Windows PowerShell 5.1 hands a 3xx back as a RESPONSE when redirects are off, where
+        # PowerShell 7 throws; both end up here as a Location to follow or refuse.
+        if ($r -and ([int]$r.StatusCode -ge 300) -and ([int]$r.StatusCode -lt 400)) {
+            $loc = $null
+            try { $loc = [string]$r.Headers['Location'] } catch { }
+            if ($loc) {
+                try { $nextUri = New-Object System.Uri -ArgumentList ([Uri]$current), $loc } catch { $nextUri = $null }
+            }
+            if ($nextUri) { $r = $null }
+        }
+        if ($nextUri) {
+            if ($nextUri.Host -ne $u.Host) {
+                $res.Why = "the public URL redirected to " + $nextUri.Host + " (a sign-in page), not the server -- the tunnel does not admit anonymous callers"
+                if ($nextUri.Host -match '(?i)^(login\.(microsoftonline\.(com|us)|microsoft\.com|live\.com|windows\.net)|sts\.windows\.net)$') {
+                    $res.SignInHost = $nextUri.Host
+                }
+                return $res
+            }
+            $current = $nextUri.AbsoluteUri
+        }
     }
+    if (-not $r) { $res.Why = "the public URL kept redirecting on its own host (more than 5 hops)"; return $res }
     $finalUri = $null
     try { $finalUri = $r.BaseResponse.ResponseUri } catch { }
     if (-not $finalUri) { try { $finalUri = $r.BaseResponse.RequestMessage.RequestUri } catch { } }
@@ -655,15 +698,51 @@ function Test-TunnelHealthAnswer([string]$tunnelUrl, $localPid, [int]$timeoutSec
     return $res
 }
 $script:tunnelServingWhy = ""
+$script:tunnelServingNote = ""
+if (-not $localHealthUrl) { $localHealthUrl = 'http://127.0.0.1:8000/health' }
+# UNDER A TENANT-ONLY GRANT THE PUBLIC URL CANNOT BE PROBED ANONYMOUSLY. A healthy tenant-only
+# tunnel answers an anonymous caller with a redirect to the Microsoft sign-in page -- exactly what
+# a broken one would show -- so the probe above reads a correct setup as broken (colleague's PC,
+# 2026-10-20: every other check green, "Running supervisor hosts the tunnel" green). When that
+# redirect is the probe's ONLY complaint and the grant read back is 'tenant', hosting is judged
+# from what needs no sign-in: the relay's "Host connections" count (devtunnel show, the same parse
+# the supervisor uses: Get-HostConnectionsFromShow) must be >= 1 AND this machine's server must
+# answer /health. A count of 0 or one that cannot be read stays a FAIL. An anonymous grant never
+# takes this path, and another host's pid is still caught by the probe itself.
 TunnelCheck "tunnel_serving" "Dev Tunnel host serving (public URL -> THIS server's /health)" `
     {
         $localPid = $null
-        try { $localPid = (Invoke-RestMethod -Uri 'http://127.0.0.1:8000/health' -TimeoutSec 4 -UseBasicParsing).server_pid } catch { }
+        $localOk = $false
+        try {
+            $h = Invoke-RestMethod -Uri $localHealthUrl -TimeoutSec 4 -UseBasicParsing
+            $localPid = $h.server_pid
+            $localOk = ("" + $h.status -eq "ok")
+        } catch { }
         $probe = Test-TunnelHealthAnswer $turl $localPid
         $script:tunnelServingWhy = $probe.Why
+        if ((-not $probe.Ok) -and $probe.SignInHost -and ($script:tunnelAccess -eq "tenant")) {
+            $show = Invoke-DevTunnelBounded @('show', $tname) 8
+            $hc = Get-HostConnectionsFromShow @(("" + $show) -split "`r?`n")
+            $lead = "tenant-only grant: the public URL cannot be probed anonymously (it redirects to " + $probe.SignInHost + "), so the relay's host connection count was used instead"
+            if ($null -eq $hc) {
+                $script:tunnelServingWhy = $lead + " -- but 'devtunnel show " + $tname + "' gave no readable count (offline or slow). Re-run doctor.bat."
+            } elseif ($hc -lt 1) {
+                $script:tunnelServingWhy = $lead + ": " + $hc + " host connections, so nothing hosts the tunnel."
+            } elseif (-not $localOk) {
+                $script:tunnelServingWhy = $lead + ": " + $hc + " host connection(s), but this machine's server does not answer " + $localHealthUrl + " -- start it."
+            } else {
+                $script:tunnelServingNote = "tenant-only grant: the public URL cannot be probed anonymously (it redirects to a sign-in page), so hosting was confirmed by the relay's host connection count (" + $hc + ") and this server answering /health"
+                $script:tunnelServingWhy = ""
+                return $true
+            }
+            return $false
+        }
         $probe.Ok
     } `
     "the tunnel exists but is not being served -- run start_all.bat (the supervisor hosts it). If this stays red while the checks above are green, MCP_TUNNEL_URL in .env may be stale -- compare it to the URL shown by 'devtunnel show <name>'."
+if ($script:tunnelServingNote -and $script:results[-1].id -eq "tunnel_serving" -and $script:results[-1].ok) {
+    Write-Host ("         note: " + $script:tunnelServingNote) -ForegroundColor DarkYellow
+}
 # WHAT THE SUPERVISOR CONCLUDED. When another PC hosts this PC's tunnel, the probe above sees only
 # a timeout ("no answer from the public URL") -- measured 2026-09-24 -- which reads like "not
 # hosted" and sends the operator to start_all, i.e. to re-host, which is the fight the supervisor
@@ -706,6 +785,7 @@ if ($lastResult.id -eq "tunnel_serving" -and -not $lastResult.ok -and -not $last
     }
     $lastResult.fix = $script:tunnelServingWhy + " | " + $lastResult.fix
 }
+# END tunnel_serving
 
 # 3d. Supervisor/env match -- catches a RUNNING supervisor that is hosting a different
 # (stale/borrowed) tunnel than .env currently names. This happens when .env was copied
