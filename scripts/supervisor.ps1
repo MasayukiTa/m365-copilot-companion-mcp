@@ -1794,6 +1794,27 @@ function Get-ServerExitRecord {
     }
 }
 
+function Invoke-ApiKeyRepair {
+    # The server ends with code 78 (tools/secret_store.EXIT_NO_API_KEY) when its bearer token cannot
+    # be read on this account -- the case of an .env copied from another PC (the DPAPI blob is bound
+    # to the original account). Relaunching the same server every minute cannot change that, so the
+    # token is re-made first by the step quickstart and start_all use (bootstrap.py --only gen_env;
+    # it keeps the old file as .env.before-secret-repair and touches nothing that works). Returns
+    # @{ Ok; Code; Remade }. It never reads or prints any secret: the bootstrap output is discarded
+    # and only its exit code and the no-secret marker .setup\bearer_remade are reported.
+    param([string]$Python, [string]$Bootstrap, [string]$RootDir)
+    if (-not (Test-Path -LiteralPath $Bootstrap)) {
+        return @{ Ok = $false; Code = $null; Remade = $false }
+    }
+    $code = $null
+    try {
+        $null = @(& $Python $Bootstrap --only gen_env 2>&1)
+        $code = $LASTEXITCODE
+    } catch { }
+    $remade = Test-Path -LiteralPath (Join-Path $RootDir ".setup\bearer_remade")
+    return @{ Ok = ($code -eq 0); Code = $code; Remade = $remade }
+}
+
 function Start-Server {
     # CAPTURE THE PREVIOUS LAUNCH'S STATE BEFORE TOUCHING ANYTHING BELOW. Everything past this
     # point can end the previous process -- deliberately, via the kill-by-port/kill-stale-
@@ -1873,6 +1894,13 @@ function Start-Server {
     $script:ServerPlannedEndReason = $null   # consumed -- the next relaunch starts undeclared again
     if ($exitRecord.Detail -ne "no record: not launched by this supervisor") {
         Write-Log "previous server $($exitRecord.Detail)"
+    }
+    if ($exitRecord.HasExited -and $exitRecord.ExitCode -eq 78) {
+        $fix = Invoke-ApiKeyRepair -Python $Py -Bootstrap (Join-Path $Root "scripts\bootstrap.py") -RootDir $Root
+        Write-Log ("the previous server had no usable bearer token (exit 78: .env copied from another PC or " +
+                   "account); re-made it with bootstrap.py --only gen_env: exit code $($fix.Code), " +
+                   "marker .setup\bearer_remade present: $($fix.Remade). Copilot Studio needs the new value " +
+                   "(scripts\copilot_studio_values.ps1).")
     }
 
     # PRESERVE THE PREVIOUS LAUNCH BEFORE TRUNCATING IT. -RedirectStandardError truncates, and

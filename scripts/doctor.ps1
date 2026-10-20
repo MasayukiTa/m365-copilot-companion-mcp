@@ -282,40 +282,57 @@ Check "python_runnable" "Python the supervisor would use (.venv, else PATH)" `
     { [bool]$script:pyPath -and -not $script:pyProblem } `
     $(if ($script:pyProblem) { $script:pyProblem } else { "run setup.bat to create the .venv" })
 
-$script:serverFix = ""
-if (-not $script:supervisorCmdLine) {
-    $script:serverFix = ("the stack has not been started on this machine -- nothing is " +
-                         "relaunching the server. Double-click start_all.bat.")
-} else {
-    $out = Get-ServerLastOutput
-    if ($out -and -not $out.started) {
-        $script:serverFix = ("the supervisor is relaunching the server and it is DYING ON " +
-                             "STARTUP. Its last output was:" + [Environment]::NewLine +
-                             "           " +
-                             ($out.lines -join ([Environment]::NewLine + "           ")))
-    } elseif ($out -and $out.started) {
-        # SAY WHAT THIS LOG ACTUALLY SHOWS. It records a launch that reached "startup complete",
-        # so it describes a server that came UP -- it cannot be the reason one is down now.
-        $script:serverFix = ("the supervisor is relaunching the server and it is dying, but " +
-                             "the only output on record is from a launch that STARTED " +
-                             "SUCCESSFULLY, so it does not explain this failure. The current " +
-                             "crash is producing no output at all. Do NOT run start_all.bat: " +
-                             "the supervisor is already doing that on a loop.")
-    } else {
-        if ($script:pyProblem) {
-            # The Python check above already found the cause; repeat it here rather than send
-            # the reader hunting up the list for a red line they may not connect to this one.
-            $script:serverFix = ("the supervisor is relaunching the server and it dies without " +
-                                 "writing anything, because " + $script:pyProblem)
-        } else {
-            $script:serverFix = ("the supervisor is relaunching the server and it is dying on " +
-                                 "startup, but it produced no output to explain why. The " +
-                                 "interpreter check above passed, so this is not a missing " +
-                                 "Python. Do NOT run start_all.bat: the supervisor is already " +
-                                 "doing that on a loop.")
-        }
+# PURE. What to tell the reader when /health did not answer. $Listening is whether ANY process holds
+# :8000 right now. THE OLD TEXT SAID "dying" WITHOUT LOOKING: server_up FAIL was enough for
+# "the supervisor is relaunching the server and it is dying ... producing no output at all". A
+# server that is alive and listening but slow to answer (doctor waits 4 s) was reported as a crash
+# with no output -- the log of such a server holds only its normal start lines, which is exactly
+# what an ALIVE server's log looks like. Only a port nobody listens on can mean "down".
+function Get-ServerDownAdvice {
+    param([bool]$SupervisorRunning, $out, [string]$PyProblem, [bool]$Listening)
+    if (-not $SupervisorRunning) {
+        return ("the stack has not been started on this machine -- nothing is " +
+                "relaunching the server. Double-click start_all.bat.")
     }
+    if ($Listening) {
+        return ("a process IS listening on :8000, so the server is alive -- it is not crashing at " +
+                "startup. It did not answer /health within 4 seconds (busy, still starting, or " +
+                "wedged). The supervisor restarts it after 4 failed checks in a row (about a " +
+                "minute); a restart loop shows as repeated 'server check failed (n/4)' lines in " +
+                "%TEMP%\m365-companion-supervisor.log, whose reason names what it saw. A server " +
+                "it stops itself leaves no output of its own, so an empty crash log is expected " +
+                "here. Do NOT run start_all.bat: the supervisor is already managing it.")
+    }
+    if ($out -and -not $out.started) {
+        return ("the supervisor is relaunching the server and it is DYING ON " +
+                "STARTUP. Its last output was:" + [Environment]::NewLine +
+                "           " +
+                ($out.lines -join ([Environment]::NewLine + "           ")))
+    }
+    if ($out -and $out.started) {
+        return ("nothing is listening on :8000 and the only output on record is from an earlier " +
+                "launch that STARTED SUCCESSFULLY, so it does not explain this failure: the " +
+                "server was stopped or died without writing anything. The supervisor's own log " +
+                "(%TEMP%\m365-companion-supervisor.log) records each launch and the exit code " +
+                "of the previous one. Do NOT run start_all.bat: the supervisor is already " +
+                "doing that on a loop.")
+    }
+    if ($PyProblem) {
+        return ("the supervisor is relaunching the server and it dies without " +
+                "writing anything, because " + $PyProblem)
+    }
+    return ("nothing is listening on :8000 and the server produced no output to explain why. The " +
+            "interpreter check above passed, so this is not a missing Python. Read " +
+            "%TEMP%\m365-companion-supervisor.log (each launch and the previous exit code). " +
+            "Do NOT run start_all.bat: the supervisor is already doing that on a loop.")
 }
+
+$script:serverListening = $false
+try {
+    $script:serverListening = [bool](Get-NetTCPConnection -LocalPort 8000 -State Listen -ErrorAction Stop)
+} catch { $script:serverListening = $false }
+$script:serverFix = Get-ServerDownAdvice -SupervisorRunning ([bool]$script:supervisorCmdLine) `
+    -Out (Get-ServerLastOutput) -PyProblem $script:pyProblem -Listening $script:serverListening
 
 # 2. local MCP server
 Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
