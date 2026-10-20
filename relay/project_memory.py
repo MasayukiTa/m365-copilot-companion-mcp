@@ -29,8 +29,10 @@ from __future__ import annotations
 import os
 import re
 import time
+from pathlib import Path
 
 from relay import provenance as P
+from tools import state_store
 
 _MAX_PER_THEME = 20           # keep the most recent N entries per theme
 _NOTE_CAP = 280               # chars per note snippet
@@ -147,23 +149,31 @@ def _read(path):
         return ""
 
 
+def _read_strict(path):
+    """The file's text; "" ONLY when the file does not exist. Raises when it exists and
+    cannot be read.
+
+    `_read` above answers "" for any failure, which is right for a reader that only builds a
+    prompt but WRONG for a writer: record_task read the theme, added one entry and wrote the
+    whole file back, so a failed read became "this theme has no history" and the next write
+    replaced the history with one line (the same mechanism that took the procedural memory
+    from 725 entries to 90 on 2026-10-18; see tools/state_store.py). A writer reads through
+    this function, which retries, keeps an unreadable file as `<name>.corrupt-<timestamp>`,
+    falls back to a generation backup, and otherwise raises so the caller refuses to write."""
+    text = state_store.read_text(Path(path), generations=state_store.TEXT_BACKUP_GENERATIONS)
+    return "" if text is None else text
+
+
 def _write_atomic(path, text):
-    """Write via a temp file in the same directory, then replace. A half-written memory
-    file would be read back on the next task, so a crash mid-write must not be able to
-    leave one."""
+    """Write via a same-directory temp file (fsync) and os.replace, keeping the previous
+    versions as `<name>.bak.1..3`. The caller holds `state_store.file_lock(path)`. A
+    half-written memory file would be read back on the next task, so a crash mid-write must
+    not be able to leave one."""
     try:
-        os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            fh.write(text)
-        os.replace(tmp, path)
+        state_store.atomic_write_text(
+            Path(path), text, generations=state_store.TEXT_BACKUP_GENERATIONS, newline="\n")
         return True
     except Exception:
-        try:
-            if os.path.exists(path + ".tmp"):
-                os.remove(path + ".tmp")
-        except Exception:
-            pass
         return False
 
 
@@ -525,22 +535,26 @@ def record_task(theme, goal, outcome, note="", state_dir=None, ts=None, folder="
             "  <!-- %s -->" % _fmt_ts(when),
         )
         path = _theme_path(slug, state_dir)
-        old = _entry_lines(_read(path))
-        # DEDUPED BEFORE THE CAP, not after. Twenty slots filled with one fact repeated is a
-        # theme that remembers nothing while looking full -- and the cap would then evict the
-        # genuinely different entries first, because they are the older ones.
-        entries = dedupe_entries([line] + old)[:_MAX_PER_THEME]      # newest first
-        text = (
-            "---\n"
-            "theme: %s\n"
-            "updated: %s\n"
-            "entries: %d\n"
-            "---\n\n"
-            "# %s\n\n"
-            "%s\n"
-        ) % (theme, _fmt_ts(when), len(entries), theme, "\n".join(entries))
-        if not _write_atomic(path, text):
-            return False
+        # READ-MODIFY-WRITE UNDER A CROSS-PROCESS LOCK, with a strict read: two finished
+        # tasks on one theme used to read the same history and the later write dropped the
+        # earlier entry, and an unreadable file read as "" replaced the whole history.
+        with state_store.file_lock(Path(path)):
+            old = _entry_lines(_read_strict(path))
+            # DEDUPED BEFORE THE CAP, not after. Twenty slots filled with one fact repeated
+            # is a theme that remembers nothing while looking full -- and the cap would then
+            # evict the genuinely different entries first, because they are the older ones.
+            entries = dedupe_entries([line] + old)[:_MAX_PER_THEME]      # newest first
+            text = (
+                "---\n"
+                "theme: %s\n"
+                "updated: %s\n"
+                "entries: %d\n"
+                "---\n\n"
+                "# %s\n\n"
+                "%s\n"
+            ) % (theme, _fmt_ts(when), len(entries), theme, "\n".join(entries))
+            if not _write_atomic(path, text):
+                return False
         _upsert_index(theme, slug, len(entries), when, state_dir)
         return True
     except Exception:
@@ -550,16 +564,19 @@ def record_task(theme, goal, outcome, note="", state_dir=None, ts=None, folder="
 def _upsert_index(theme, slug, count, when, state_dir):
     """Keep INDEX.md as one line per theme, most recently touched first."""
     try:
-        keep = []
-        for ln in _read(_index_path(state_dir)).splitlines():
-            if ln.startswith("- [") and ("(%s.md)" % slug) not in ln:
-                keep.append(ln)
-        line = "- [%s](%s.md) — %d件 / 最終 %s" % (theme, slug, count, _fmt_ts(when))
-        lines = ([line] + keep)[:_INDEX_MAX_THEMES]
-        text = ("# 実施済みの作業（テーマ別）\n\n"
-                "各テーマの詳細は同じディレクトリの .md を読むこと。\n\n"
-                "%s\n") % "\n".join(lines)
-        _write_atomic(_index_path(state_dir), text)
+        ipath = _index_path(state_dir)
+        with state_store.file_lock(Path(ipath)):
+            keep = []
+            # strict: an index that exists but cannot be read is kept, not rebuilt from nothing
+            for ln in _read_strict(ipath).splitlines():
+                if ln.startswith("- [") and ("(%s.md)" % slug) not in ln:
+                    keep.append(ln)
+            line = "- [%s](%s.md) — %d件 / 最終 %s" % (theme, slug, count, _fmt_ts(when))
+            lines = ([line] + keep)[:_INDEX_MAX_THEMES]
+            text = ("# 実施済みの作業（テーマ別）\n\n"
+                    "各テーマの詳細は同じディレクトリの .md を読むこと。\n\n"
+                    "%s\n") % "\n".join(lines)
+            _write_atomic(ipath, text)
     except Exception:
         pass
 

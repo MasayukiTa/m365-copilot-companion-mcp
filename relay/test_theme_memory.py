@@ -33,7 +33,8 @@ LOOP_SRC = (REPO / "relay" / "local_loop_controller.py").read_text(encoding="utf
 def test_a_theme_gets_its_own_file_and_an_index_entry():
     sd = tempfile.mkdtemp(prefix="tm_")
     assert record_task("OGF 異物解析", "分類を自動化する", "DONE", note="69件を4分類", state_dir=sd)
-    files = {p.name for p in (Path(sd) / "memory").iterdir()}
+    # the generation backups (`.md.bak.N`) kept by tools/state_store are not themes
+    files = {p.name for p in (Path(sd) / "memory").iterdir() if p.name.endswith(".md")}
     assert "INDEX.md" in files
     assert len(files) == 2, files
     index = (Path(sd) / "memory" / "INDEX.md").read_text(encoding="utf-8")
