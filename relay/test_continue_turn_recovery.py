@@ -612,3 +612,22 @@ def test_executed_calls_with_a_refused_plan_are_not_resent_on_a_tab(tmp_path, mo
         tmp_path, monkeypatch, used=CR.MAX_CONTINUES_PER_GOAL)
     assert w._fall_back_to_tab() is False        # _open_fresh は呼ばれたら失敗する
     assert w.outcome == "STUCK" and "not re-sent" in w.reason
+
+
+def test_executed_calls_with_a_goal_class_refusal_are_not_resent(tmp_path, monkeypatch):
+    """Same hole, refused for a different cause: the goal names mail, so `plan` says goal_class."""
+    _mode(tmp_path, monkeypatch, "on")
+    tools = _Tools()
+    A = {"name": "edit_and_verify", "arguments": {"path": "a.py"}}
+    connect1 = _connect(["{}" + CH.RS, _update(_call(A)), _done()],
+                        CH.ChatHubError("could not open the socket: reset"))
+    drv1 = _driver(connect1, tools)
+    _run(drv1, "THE-JOB")
+    drv1._partial = ""        # nothing else says "landed"
+    assert tools.count("a.py") == 1 and not drv1.partial_text() and not drv1._turn_answered
+    route = _Route([_driver(_connect(), tools)])
+    w = _worker(monkeypatch, route, drv1, goal="結果を渡部さんにメールで送信してください")
+    assert w._journal_shows_executed_calls() is True
+    assert w._retry_socket("ChatHubError: no close frame received or sent") is False
+    assert w.outcome == "STUCK" and "not re-sent" in w.reason
+    assert not route.asked
