@@ -38,6 +38,8 @@ import threading
 import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:   # `python -I script.py` puts neither the script's folder nor the checkout on the path
+    sys.path.insert(0, REPO)
 FORBIDDEN_PORTS = (8000, 8765, 9222, 9223, 9224)
 SERVER_PORT = 8100
 CDP_PORT = 9340
