@@ -1194,7 +1194,6 @@ _FALLBACK_DEFAULTS = (
     ("MCP_UNLOCK_TTL_DAYS", "30"),
     # SEC-02: an unlocked identity alone never suffices. Also tools/security.py's own default.
     ("MCP_REQUIRE_UNLOCK_TOKEN", "1"),
-    ("MCP_ALLOWED_BASE", "~"),
     ("TASK_JOB_APPROVAL_MODE", "default"),
     ("MCP_TOOL_MAP", "1"),
     ("MCP_TOOL_MAP_MAX", "8"),
@@ -1217,7 +1216,7 @@ def missing_template_lines(current: str, example_text: str | None) -> tuple:
     EVERY ACTIVE KEY OF THE TEMPLATE, NOT A HAND-KEPT SUBSET (D6). This used to append seven
     named defaults, so a .env that existed before bootstrap ran -- configure_env.ps1 creates
     one holding only the agent URLs when start_all runs first -- never received the other
-    template keys: MCP_ALLOWED_BASE=~ (absent, the file tools reached every drive),
+    template keys: MCP_ALLOWED_BASE (a commented template line now: absent means every drive),
     MCP_TOOL_MAP=1 / MCP_TOOL_MAP_MAX (absent, Copilot Studio's tool budget overflowed) and
     MCP_UNLOCK_TTL_DAYS. The list had to be remembered and was not; deriving it cannot drift.
 
@@ -1530,7 +1529,6 @@ def step_gen_env() -> None:
             "MCP_API_KEY_PROTECTED=dpapi:generated-by-setup",
             "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:generated-by-setup",
             "MCP_UNLOCK_TTL_DAYS=30",
-            "MCP_ALLOWED_BASE=~",
         ]
 
     out_lines = []
@@ -1541,7 +1539,7 @@ def step_gen_env() -> None:
         elif stripped.startswith("MCP_UNLOCK_PASSWORD=") or stripped.startswith(UNLOCK_PASSWORD_PROTECTED_VAR + "="):
             out_lines.append(UNLOCK_PASSWORD_PROTECTED_VAR + "=" + protected_unlock_code)
         else:
-            # Keep MCP_ALLOWED_BASE=~ and leave the agent-URL vars commented as-is.
+            # Leave the agent-URL vars commented as-is.
             out_lines.append(line)
 
     # Note: the MCP_*_AGENT_URL / bridge vars stay commented in .env.example, so

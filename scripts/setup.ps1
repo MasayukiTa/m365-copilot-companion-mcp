@@ -177,8 +177,7 @@ if (Test-Path ".env") {
         $lines = @(
             "MCP_API_KEY_PROTECTED=dpapi:generated-by-setup",
             "MCP_UNLOCK_PASSWORD_PROTECTED=dpapi:generated-by-setup",
-            "MCP_UNLOCK_TTL_DAYS=30",
-            "MCP_ALLOWED_BASE=~"
+            "MCP_UNLOCK_TTL_DAYS=30"
         )
     }
     $out = foreach ($line in $lines) {

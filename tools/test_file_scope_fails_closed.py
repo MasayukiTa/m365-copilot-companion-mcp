@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
-"""An ABSENT MCP_ALLOWED_BASE scopes the file tools to the home directory (D6, 2026-09-24).
+"""An ABSENT MCP_ALLOWED_BASE leaves the file tools on every drive (owner decision 2026-10-20).
 
-It used to mean "every drive". An absent key is not a decision -- it is what a .env looks like
-when configure_env.ps1 created it before bootstrap ran -- and it silently handed every drive to
-anyone holding the Bearer token on an install whose template says `MCP_ALLOWED_BASE=~`. Only
-the explicit `*` opts into every drive now.
+From 2026-09-24 (D6) it meant the home directory only; the owner reversed that: the default is
+the whole PC and narrowing is the opt-out (name a folder). A value naming no usable root still
+stays narrow (home), because that is a mistake in a restriction the person asked for.
 
 ALLOWED_BASES is computed at import, so each case runs in a fresh interpreter with the
 environment under test, and resolves a path OUTSIDE the home directory through the real
@@ -53,21 +52,27 @@ def _run(tmp_path, value):
     return json.loads(r.stdout.strip().splitlines()[-1]), home
 
 
-def test_absent_means_the_home_directory(tmp_path):
+def test_absent_means_every_drive(tmp_path):
     out, home = _run(tmp_path, None)
-    assert out["bases"] == [str(home.resolve())]
-    assert out["outside"] == "refused", "an absent key still opens every drive"
-    assert out["inside"] == "allowed"
+    assert out["bases"] is None
+    assert out["outside"] == "allowed" and out["inside"] == "allowed"
+    assert out["base"] == str(home.resolve()), "state dirs must still live under home"
 
 
-def test_empty_means_the_home_directory(tmp_path):
-    out, home = _run(tmp_path, "")
-    assert out["bases"] == [str(home.resolve())] and out["outside"] == "refused"
+def test_empty_means_every_drive(tmp_path):
+    out, _ = _run(tmp_path, "")
+    assert out["bases"] is None and out["outside"] == "allowed"
 
 
-def test_star_is_the_explicit_opt_in_to_every_drive(tmp_path):
+def test_star_still_means_every_drive(tmp_path):
     out, _ = _run(tmp_path, "*")
     assert out["bases"] is None and out["outside"] == "allowed"
+
+
+def test_naming_the_home_directory_is_the_opt_out(tmp_path):
+    out, home = _run(tmp_path, str(tmp_path / "home"))
+    assert out["bases"] == [str(home.resolve())]
+    assert out["outside"] == "refused" and out["inside"] == "allowed"
 
 
 def test_a_value_naming_no_usable_root_fails_closed(tmp_path):
