@@ -170,6 +170,11 @@ def _reader_consent_auto_approve():
     return mode()
 
 
+def _reader_resident_tools():
+    from relay.resident_guard import mode
+    return mode()
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -201,6 +206,7 @@ _LIVE_READERS = {
     "tool_transport": (_reader_tool_transport, "connector-less", "connector"),
     "socket_continue_recovery": (_reader_continue_recovery, "on", "off"),
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
+    "resident_tools": (_reader_resident_tools, "on", "off"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),
