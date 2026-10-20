@@ -142,6 +142,11 @@ def _reader_org_proposals():
     return mode()
 
 
+def _reader_org_ab():
+    from relay.org.ab import mode
+    return mode()
+
+
 def _reader_auto_resume():
     from relay.fleet_resume import auto_resume_setting
     return auto_resume_setting()
@@ -210,6 +215,7 @@ _LIVE_READERS = {
     "result_cache": (_reader_result_cache, "shadow", "off"),
     "team_mode": (_reader_team_mode, "shadow", "off"),
     "org_proposals": (_reader_org_proposals, "off", "on"),
+    "org_ab": (_reader_org_ab, "shadow", "off"),
     "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
     "supervisor_self_restart": (_reader_supervisor_self_restart, "off", "on"),
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),

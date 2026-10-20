@@ -275,6 +275,7 @@ partial class CockpitWindow
             case "relay_findings":
             case "team_mode":
             case "org_proposals":
+            case "org_ab":
             case "fanout_max_depth":
             case "fanout_max_total":
             case "fanout_max_active":
@@ -775,6 +776,7 @@ partial class CockpitWindow
         col.Children.Add(OrgVersionControl());
         col.Children.Add(OrgProposalControl());
         col.Children.Add(OrgShadowControl());
+        col.Children.Add(OrgAbControl());
         col.Children.Add(FanoutBudgetControl());
         col.Children.Add(MergeConversationControl());
         // the controls' Paint* run on every build, but fill the "in effect" lines from the

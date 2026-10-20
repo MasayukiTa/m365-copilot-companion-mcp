@@ -11,7 +11,7 @@ slice never swaps a prompt, never changes a role, never changes an admission dec
 touches the proposed definition. It only records an arm label. No value of this setting makes a
 run take the proposed arm; the proposed arm is run only by a later slice.
 
-SETTING `org_ab`: off | shadow, default off, read once when a run starts (sweep_start), next to
+SETTING `org_ab`: off | shadow, default off, re-read at the start of every run (each_gate), next to
 the version record and the shadow evaluation. Off reads one settings line and writes nothing.
 
 DETERMINISTIC ASSIGNMENT. The arm is a function of run_id alone: the low bit of a sha256 of the

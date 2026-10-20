@@ -282,9 +282,10 @@ KEYS = OrderedDict([
        "touched; it cannot show a proposal is better. off writes nothing. `on` is not "
        "implemented. No prompt or admission changes either way."),
 
-    # Record-only A/B arm assignment (relay/org/ab.py). Read once when a run starts.
-    _k("org_ab", SWEEP_START, "off",
-       "relay/org/ab.py:record_run (once, at run start)",
+    # Record-only A/B arm assignment (relay/org/ab.py). Read fresh on each run-start call, so a
+    # change is seen by the next run with no restart.
+    _k("org_ab", EACH_GATE, "off",
+       "relay/org/ab.py:record_run (each run start, re-reads the file)",
        "off|shadow. Takes effect on the NEXT run. shadow appends one small line per run to "
        ".fleet/org_ab_assign.jsonl: the run id and which arm (baseline|proposed) the run would "
        "land on if an A/B were running, chosen deterministically from a hash of the run id. "

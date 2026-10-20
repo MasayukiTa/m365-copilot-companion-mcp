@@ -240,8 +240,11 @@ partial class CockpitWindow : Window
     TextBlock _opLbl, _opNow, _opPending;
     // org proposal shadow evaluation off|shadow -> settings.txt org_shadow_eval ; absent key = off (OrgShadowView.Default)
     string _osVal = OrgShadowView.Default;
+    string _abVal = OrgAbView.Default;
     ComboBox _osBox;
+    ComboBox _abBox;
     TextBlock _osLbl, _osNow, _osPending;
+    TextBlock _abLbl, _abNow, _abPending;
     // hierarchical merge off|on -> settings.txt fanout_hierarchical_merge ; absent key = off
     string _hmVal = HierarchicalMergeView.Default;
     ComboBox _hmBox;
