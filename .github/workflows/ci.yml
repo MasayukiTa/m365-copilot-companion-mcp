@@ -652,6 +652,7 @@ jobs:
             tests/test_org_proposals_agrees.py \
             tests/test_org_shadow_eval_agrees.py \
             tests/test_org_ab_agrees.py \
+            tests/test_org_promotion.py \
             tests/test_fanout_budget.py \
             tests/test_fanout_budget_large_ledger.py \
             tests/test_campaigns_ledger_retention.py \
