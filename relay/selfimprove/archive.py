@@ -51,7 +51,10 @@ def _canonical(genome: dict) -> str:
     # Added only when present, so a knobs/cards genome hashes exactly as it always did and
     # rows already on disk keep their ids. Rewriting every historical id to fix a new bug
     # would break the joins the archive exists to support.
-    for key in ("components", "parameters"):
+    # "org" is the typed organisation genes (relay/org/genotype.py, slice E1-b). Without it two
+    # organisations that differ only in a tree or budget gene would hash to one id, the same
+    # failure the paragraph above records for components and parameters.
+    for key in ("components", "parameters", "org"):
         if genome.get(key):
             content[key] = dict(genome[key])
     return json.dumps(content, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
