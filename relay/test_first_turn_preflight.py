@@ -64,9 +64,9 @@ def test_block_is_empty_when_nothing_succeeded():
     assert ST.preflight_block([]) == ""
 
 
-def test_block_truncates_a_huge_result():
-    out = ST.preflight_block([("a", True, "z" * 9000)])
-    assert "切り詰め" in out and len(out) < 9000
+def test_block_passes_a_huge_result_whole():
+    out = ST.preflight_block([("a", True, "z" * 9000 + "END")])
+    assert "切り詰め" not in out and "z" * 9000 + "END" in out
 
 
 # ---- the lookups -----------------------------------------------------------------------

@@ -240,7 +240,19 @@ def test_a_socket_that_goes_silent_is_not_a_finished_turn():
     assert "silent" in str(exc.value)
 
 
-def test_the_frame_budget_is_bounded():
+# フレーム数の境界は「既定は無制限 / 明示指定でのみ打ち切る」をテストに置く。
+def test_by_default_no_frame_count_cuts_the_turn():
+    """既定ではフレーム数の上限が無い。何件来ても「frame budget」で打ち切らず、
+    ターンは type-3 の完了まで走る。"""
+    flood = ["{}" + CH.RS] + [_update("x")] * 500 + [_done()]
+    connect = _connect_returning(flood)
+    conv = CH.Conversation(lambda: _token())
+    out = conv.ask("x", connect=connect)
+    assert "x" * 500 in out
+
+
+def test_an_explicit_frame_cap_still_bounds_the_turn():
+    """呼び出し側が max_frames を明示したときだけ、その数で打ち切る。"""
     flood = ["{}" + CH.RS] + [_update("x")] * 50
     connect = _connect_returning(flood)
     conv = CH.Conversation(lambda: _token(), max_frames=10)

@@ -42,6 +42,7 @@ def _fake_query_connection():
     cur = MagicMock()
     cur.description = [("id",), ("name",)]
     cur.fetchmany.return_value = [(1, "row one")]
+    cur.fetchall.return_value = [(1, "row one")]
     con.cursor.return_value = cur
     return con
 

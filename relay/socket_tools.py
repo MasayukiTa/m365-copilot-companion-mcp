@@ -126,14 +126,15 @@ def preflight_block(items) -> str:
     turn asking for the index (and then skill_match), and a turn costs about 10 s. Only
     successful lookups are included; a failed one is left for the model to ask for itself.
     Returns "" when nothing succeeded, so a down server changes nothing.
+
+    The looked-up result is passed through in full: a very large index or skill body is sent
+    whole, which can make the first prompt large enough to reach the model's own context limit.
     """
     parts = []
     for label, ok, text in items:
         if not ok:
             continue
         body = str(text or "")
-        if len(body) > 8000:
-            body = body[:8000] + "\n…(切り詰め: %d 文字)" % len(str(text))
         parts.append("## %s\n%s" % (label, body))
     if not parts:
         return ""

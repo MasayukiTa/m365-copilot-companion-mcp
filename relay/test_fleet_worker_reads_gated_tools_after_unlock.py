@@ -132,6 +132,7 @@ def test_stubbed_odbc_query_actually_reads_once_the_worker_would_be_unlocked():
     cur = MagicMock()
     cur.description = [("id",), ("qty",)]
     cur.fetchmany.return_value = [(1, 42)]
+    cur.fetchall.return_value = [(1, 42)]
     con.cursor.return_value = cur
 
     with patch.object(D, "_connect", lambda *a, **kw: con):
