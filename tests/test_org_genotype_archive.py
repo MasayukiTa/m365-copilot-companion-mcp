@@ -141,6 +141,11 @@ def test_cli_prints_front_as_text_and_json_and_writes_nothing(tmp_path):
     assert js.returncode == 0
     assert {e["id"] for e in json.loads(js.stdout)["entries"]} == {"p", "c1"}
     assert sorted(os.listdir(tmp_path)) == before
+    arc = tmp_path / "a.json"
+    arc.write_text(js.stdout, encoding="utf-8")
+    again = subprocess.run([sys.executable, SCRIPT, str(arc), "--format", "json"],
+                           capture_output=True, text=True, encoding="utf-8", timeout=60)
+    assert again.returncode == 0 and json.loads(again.stdout) == json.loads(js.stdout)
     bad = subprocess.run([sys.executable, SCRIPT, str(tmp_path / "missing.json")],
                          capture_output=True, text=True, encoding="utf-8", timeout=60)
     assert bad.returncode == 2

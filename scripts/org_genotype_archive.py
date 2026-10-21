@@ -3,8 +3,8 @@
 
 WHAT DECISION THIS SERVES. Which measured genotypes are not beaten on every axis by another one
 (success, wall time, turns, tool calls, retries, infra failures, regressions, human
-interventions). It reads one JSON file (the report relay/org/genotype_bench.run() returns) and
-prints; it writes nothing (no file under .fleet), submits no job and no runtime module imports it.
+interventions). It reads one JSON file (the report relay/org/genotype_bench.run() returns, or an
+archive printed earlier with --format json) and prints; it writes nothing (no file under .fleet), submits no job and no runtime module imports it.
 
 Usage:  python scripts/org_genotype_archive.py RESULTS.json [--format text|json]
 """
@@ -29,8 +29,12 @@ def main(argv=None):
     args = ap.parse_args(argv)
     try:
         with open(args.results, encoding="utf-8-sig") as fh:
-            report = json.load(fh)
-        archive = A.build(A.entries_from_report(report))
+            text_in = fh.read()
+        data = json.loads(text_in)
+        if isinstance(data, dict) and "runs" not in data and "entries" in data:
+            archive = A.from_json(text_in)  # an archive written earlier: re-print its front
+        else:
+            archive = A.build(A.entries_from_report(data))
     except (OSError, ValueError) as exc:  # ArchiveError is a ValueError
         sys.stderr.write("refused: %s\n" % exc)
         return 2
