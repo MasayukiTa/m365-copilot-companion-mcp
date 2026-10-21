@@ -125,3 +125,14 @@ def test_cli_exit_codes(tmp_path):
     junk = tmp_path / "junk.json"
     junk.write_text("{not json", encoding="utf-8")
     assert _run("--holdout", str(junk)).returncode == 2
+
+
+def test_cli_add_exposure_what_if(tmp_path):
+    hold = _write(tmp_path / "hold.json", HOLD)
+    made = _run("--holdout", hold, "--make-seal")
+    seal = _write(tmp_path / "seal.json", json.loads(made.stdout))
+    ok = _run("--holdout", hold, "--seal", seal, "--add-exposure", "item-h1:g1:evaluation:t1")
+    assert ok.returncode == 0
+    bad = _run("--holdout", hold, "--seal", seal, "--add-exposure", "item-h1:g1:tuning:t1")
+    assert bad.returncode == 1
+    assert _run("--holdout", hold, "--seal", seal, "--add-exposure", "oops").returncode == 2

@@ -8,7 +8,8 @@ no file, submits no job and no runtime module imports it.
 Usage:
   python scripts/org_genotype_holdout.py --holdout HOLDOUT.json --make-seal
   python scripts/org_genotype_holdout.py --holdout HOLDOUT.json --seal SEAL.json
-         [--dev DEV.json] [--exposures EXPOSURES.json] [--budget N] [--format text|json]
+         [--dev DEV.json] [--exposures EXPOSURES.json] [--add-exposure ITEM:GENOTYPE:PURPOSE:AT]
+         [--budget N] [--format text|json]
 
 HOLDOUT.json and DEV.json are lists of item ids; EXPOSURES.json is a list of
 {"item", "genotype", "purpose", "at"}; SEAL.json is the output of --make-seal.
@@ -40,6 +41,8 @@ def main(argv=None):
     ap.add_argument("--seal")
     ap.add_argument("--dev")
     ap.add_argument("--exposures")
+    ap.add_argument("--add-exposure", action="append", default=[],
+                    metavar="ITEM:GENOTYPE:PURPOSE:AT")
     ap.add_argument("--budget", type=int, default=H.DEFAULT_BUDGET)
     ap.add_argument("--make-seal", action="store_true")
     ap.add_argument("--format", choices=("text", "json"), default="text")
@@ -55,6 +58,11 @@ def main(argv=None):
         exposures = _load(args.exposures) if args.exposures else []
         if not isinstance(exposures, list):
             raise H.HoldoutError("exposures must be a list")
+        for spec in args.add_exposure:  # what-if: judge the planned use before running it
+            parts = spec.split(":", 3)
+            if len(parts) != 4:
+                raise H.HoldoutError("--add-exposure needs ITEM:GENOTYPE:PURPOSE:AT")
+            exposures = H.record_exposure(exposures, *parts)
         v = H.verdict(sealed, dev, holdout, exposures, budget=args.budget)
     except (OSError, ValueError) as exc:  # HoldoutError and JSON errors are ValueErrors
         sys.stderr.write("refused: %s\n" % exc)
