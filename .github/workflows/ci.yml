@@ -650,6 +650,7 @@ jobs:
             tests/test_agent_board_agrees.py \
             tests/test_org_version_record_agrees.py \
             tests/test_org_genotype_record_agrees.py \
+            tests/test_org_genotype_lineage.py \
             tests/test_org_proposals_agrees.py \
             tests/test_org_shadow_eval_agrees.py \
             tests/test_org_ab_agrees.py \
