@@ -244,6 +244,7 @@ jobs:
             relay/test_roster.py \
             relay/test_org_versions.py \
             relay/test_org_genotype.py \
+            relay/test_org_genotype_ledger.py \
             relay/test_org_proposals.py \
             relay/test_org_shadow_eval.py \
             relay/test_verification_survives_the_archive.py \
