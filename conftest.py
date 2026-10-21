@@ -349,6 +349,13 @@ DELIBERATELY_NOT_REDIRECTED = {
     # rejected both: they are UNTRACKED, present only in one checkout. The walker now reads
     # `git ls-files`, so neither is visible to it on any machine, and an entry for either is a
     # stale claim about a file the pushed tree does not contain.
+    # A DIRECTORY NAME, joined onto a lab path only to build a string for the layout check. The
+    # module never opens, creates or writes anything (the CLI is --check only), so there is
+    # nothing for a redirect to protect, and pointing it elsewhere would change what the check
+    # reports as the lab's default state directory.
+    ("relay.org.lab_isolation", "DEFAULT_STATE_NAME"):
+        "a directory name used to compute a path string for a read-only check; nothing is "
+        "written through it",
     ("scripts.verify_secret_redaction", "LED"):
         "importing it executes it (sys.argv at module scope, then SystemExit), so no test "
         "can import it and none can write through it",
