@@ -162,6 +162,9 @@ LIVE_RECORD_REDIRECTS = {
     # RECORD-ONLY A/B ARM ASSIGNMENT. A test run through run_relay_fleet with org_ab=shadow would
     # append an arm-assignment line to the file a later report reads.
     "relay.org.ab": {"LOG_PATH": "org_ab_assign.jsonl"},
+    # STORED TEXT OF PROMOTED DEFINITIONS AND THE OVERRIDE STORE (D6-b). A test that writes an
+    # override here would change the planner prompt of the next process the operator starts.
+    "relay.org.def_store": {"STORE_DIR": "org_defs"},
     # THE ONLY RECORD OF WHETHER THE NIGHTLY LOOP ACTUALLY RUNS. A test firing written here
     # would answer "has it run?" with yes on a machine where it never has -- which is precisely
     # the question the file was added to make answerable. NOT in ONLY_IF_ALREADY_IMPORTED with

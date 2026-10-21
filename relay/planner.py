@@ -26,6 +26,10 @@ PLAN_PROMPT = (
     "各ステップは具体的に（どのファイルに何をするか）。\n"
     "最後の行に必ず " + PLAN_READY + " と書いて、承認待ちで停止してください。\nGoal: "
 )
+# D6-b: a rolled-back text, if the operator stored one (relay/org/def_store.py). Read ONCE, here,
+# at import; never again, so a running process keeps the text it started with.
+from .org import def_store as _def_store  # noqa: E402
+PLAN_PROMPT = _def_store.override("relay.planner.PLAN_PROMPT", PLAN_PROMPT)
 
 APPROVE_JOB = (
     "計画を承認します。上記の計画に沿って、最初のステップから実際に実装を進めてください。"
