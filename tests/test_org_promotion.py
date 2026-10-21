@@ -83,7 +83,8 @@ def test_the_real_definitions_can_be_promoted_and_the_script_runs(tmp_path):
     pytest.importorskip("fastmcp")      # the workflow prompts live in modules that import it
     script = os.path.join(REPO, "scripts", "org_promotion.py")
     run = lambda *a: subprocess.run([sys.executable, "-I", script, "--fleet-dir", str(tmp_path), *a],  # noqa: E731
-                                    capture_output=True, text=True, cwd=REPO)
+                                    capture_output=True, text=True, encoding="utf-8", errors="replace",
+                                    cwd=REPO)
     assert run("promote", "--evidence", "none").returncode == 0
     assert run("promote").returncode == 1                                  # already current
     out = json.loads(run("status").stdout)
