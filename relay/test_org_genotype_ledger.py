@@ -101,7 +101,9 @@ def test_the_tracked_archive_is_not_written_and_no_runtime_module_imports_the_le
 
 def test_script_adds_lists_and_exits_nonzero_on_refusal(tmp_path, monkeypatch):
     cand = tmp_path / "c.json"
-    cand.write_text(json.dumps([{"genes": {"fanout_max_depth": 1}}, {"genes": {"bogus": 1}}]),
+    # the script reads the configured baseline of this machine, so pick a depth that differs from it
+    depth = 1 if G.current()["fanout_max_depth"] != 1 else 3
+    cand.write_text(json.dumps([{"genes": {"fanout_max_depth": depth}}, {"genes": {"bogus": 1}}]),
                     encoding="utf-8")
     script = os.path.join(REPO, "scripts", "org_genotype_record.py")
     run = lambda *a: subprocess.run([sys.executable, "-I", script, "--fleet-dir", str(tmp_path / "s"), *a],  # noqa: E731
