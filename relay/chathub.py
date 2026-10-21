@@ -582,7 +582,7 @@ class Conversation:
 
     def __init__(self, token_supplier, *, send_origin=False, user_agent=None,
                  connect_timeout_s=15.0, frame_timeout_s=30.0, turn_timeout_s=300.0,
-                 max_frames=2000, gpt_id="", template=None,
+                 max_frames=None, gpt_id="", template=None,
                  turn_ceiling_s=None, clock=None):
         if not callable(token_supplier):
             raise ChatHubError(
@@ -607,7 +607,11 @@ class Conversation:
                                   else 3.0 * self.turn_timeout_s)
         #: Injectable so the deadline can be tested without sleeping.
         self._clock = clock if callable(clock) else time.time
-        self.max_frames = int(max_frames)
+        #: No frame-count cap by default: a turn runs until the socket completes, goes
+        #: silent, or hits the turn deadline. A caller may pass max_frames to bound it; when
+        #: unbounded, a backend that never stops streaming is caught by the idle and ceiling
+        #: clocks, not by a frame count.
+        self.max_frames = None if max_frames is None else int(max_frames)
         #: The agent to talk to. Empty reaches the default Copilot -- no connector, no tenant
         #: grounding, none of our tools.
         self.gpt_id = str(gpt_id or "") or (template.gpt_id if template is not None else "")
@@ -873,7 +877,7 @@ class Conversation:
                     raise ChatHubError("the socket went silent before the turn completed")
                 for frame in parse_frames(blob):
                     seen += 1
-                    if seen > self.max_frames:
+                    if self.max_frames is not None and seen > self.max_frames:
                         raise ChatHubError("frame budget exhausted before completion")
                     if is_ping(frame):
                         sock.send(json.dumps({"type": 6}) + RS)
