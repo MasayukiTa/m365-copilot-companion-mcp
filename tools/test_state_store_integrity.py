@@ -220,6 +220,7 @@ AUDITED = {
     "relay/fleet_reaper.py": "status/history snapshots finalised atomically after an interrupted run",
     "relay/fleet_runner.py": "per-run status/goal snapshots",
     "relay/local_loop_controller.py": "controller marker, atomic tmp+replace, one file per job",
+    "relay/org/def_store.py": "override map and per-version text, each file replaced whole by an operator command through temp file + os.replace; nothing accumulates",
     "relay/profile_token.py": "captured token template, re-captured on demand",
     "relay/resident_guard.py": "single-use lock file holding the owner pid, created with O_EXCL and removed on release",
     "relay/selfimprove/apply.py": "genome file written from a ledger row",
