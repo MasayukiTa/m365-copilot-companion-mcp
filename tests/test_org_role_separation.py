@@ -194,17 +194,17 @@ def run_cli(tmp_path, payload, *extra):
     path = tmp_path / "in.json"
     path.write_text(json.dumps(payload), encoding="utf-8")
     return subprocess.run([sys.executable, "-I", SCRIPT, "--records", str(path), *extra],
-                          capture_output=True, text=True, encoding="utf-8")
+                          capture_output=True, timeout=60)
 
 
 def test_cli_pass_exit_zero(tmp_path):
     res = run_cli(tmp_path, [cand(verdict="ok", by="j")])
-    assert res.returncode == 0 and "PASS" in res.stdout
+    assert res.returncode == 0 and b"PASS" in res.stdout
 
 
 def test_cli_fail_exit_one_with_reason(tmp_path):
     res = run_cli(tmp_path, {"records": [cand(judge="p")], "edges": []})
-    assert res.returncode == 1 and "FAIL" in res.stdout and R.JUDGE_IS_PROPOSER in res.stdout
+    assert res.returncode == 1 and b"FAIL" in res.stdout and R.JUDGE_IS_PROPOSER.encode() in res.stdout
 
 
 def test_cli_edges_and_json_format(tmp_path):
@@ -217,11 +217,11 @@ def test_cli_refuses_bad_input(tmp_path):
     bad = tmp_path / "bad.json"
     bad.write_text("not json", encoding="utf-8")
     res = subprocess.run([sys.executable, "-I", SCRIPT, "--records", str(bad)],
-                         capture_output=True, text=True)
+                         capture_output=True, timeout=60)
     assert res.returncode == 2
     assert run_cli(tmp_path, {"records": "x"}).returncode == 2
     missing = subprocess.run([sys.executable, "-I", SCRIPT, "--records", str(tmp_path / "none.json")],
-                             capture_output=True, text=True)
+                             capture_output=True, timeout=60)
     assert missing.returncode == 2
 
 
