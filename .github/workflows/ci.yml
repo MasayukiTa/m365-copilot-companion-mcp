@@ -669,6 +669,7 @@ jobs:
             tests/test_org_role_separation.py \
             tests/test_org_novelty.py \
             tests/test_org_reputation.py \
+            tests/test_org_credit_sim.py \
             tests/test_org_genotype_explore.py \
             tests/test_org_genotype_transfer.py \
             tests/test_org_proposals_agrees.py \
