@@ -266,7 +266,7 @@ def test_cli_refuses_bad_input(tmp_path):
     assert run_cli(tmp_path, None, raw="not json").returncode == 2
     assert run_cli(tmp_path, {"x": 1}).returncode == 2
     missing = subprocess.run([sys.executable, SCRIPT, "--records", str(tmp_path / "nope.json")],
-                             capture_output=True, text=True)
+                             capture_output=True, text=True, encoding="utf-8")
     assert missing.returncode == 2
 
 
