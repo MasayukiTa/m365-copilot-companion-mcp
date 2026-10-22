@@ -661,6 +661,7 @@ jobs:
             tests/test_org_lab_bench_bundle.py \
             tests/test_org_lab_security_regression.py \
             tests/test_org_lab_canary.py \
+            tests/test_org_lab_promotion_gate.py \
             tests/test_org_genotype_explore.py \
             tests/test_org_genotype_transfer.py \
             tests/test_org_proposals_agrees.py \
