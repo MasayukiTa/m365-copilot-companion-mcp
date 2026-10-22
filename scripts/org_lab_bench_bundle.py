@@ -10,6 +10,7 @@ Usage:
   python scripts/org_lab_bench_bundle.py --check --bundle FILE.json [--compare OTHER.json]
                                          [--format text|json]
   python scripts/org_lab_bench_bundle.py --hash --bundle FILE.json
+  python scripts/org_lab_bench_bundle.py --build --bundle SPEC.json
 --check validates one bundle (and, with --compare, whether the two are comparable). --hash prints
 the bundle_hash the content should carry, so a hand-written spec can be given its name.
 
@@ -38,12 +39,16 @@ def main(argv=None):
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--check", action="store_true")
     mode.add_argument("--hash", action="store_true")
+    mode.add_argument("--build", action="store_true", help="print the spec with its bundle_hash filled in")
     ap.add_argument("--bundle", required=True)
     ap.add_argument("--compare", default=None, help="a second bundle to compare with (--check)")
     ap.add_argument("--format", choices=("text", "json"), default="text")
     args = ap.parse_args(argv)
     try:
         bundle = _load(args.bundle)
+        if args.build:
+            sys.stdout.buffer.write((B.to_json(B.build_bundle(bundle)) + "\n").encode("utf-8"))
+            return 0
         if args.hash:
             sys.stdout.buffer.write((B.compute_hash(bundle) + "\n").encode("utf-8"))
             return 0
