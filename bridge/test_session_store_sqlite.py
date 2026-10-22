@@ -117,11 +117,14 @@ def test_the_table_is_the_source_of_truth_not_the_file(box):
     assert [t["text"] for t in ss.all_turns(sess["sid"])] == ["kept"]
 
 
-def test_it_uses_wal_so_a_reader_never_blocks_a_turn(box):
+def test_it_does_not_use_wal_because_its_mapped_shm_kills_the_process_on_a_full_disk(box):
+    """Was test_it_uses_wal_so_a_reader_never_blocks_a_turn. WAL's memory-mapped -shm raised
+    0xc0000006 inside sqlite3.dll and killed the coordinator when C: filled (2026-10-22);
+    see relay/sqlite_journal.py and relay/test_sqlite_no_shm_mapping.py."""
     ss.new_session(title="x")
     conn = sqlite3.connect(ss._db_path())
     try:
-        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "wal"
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
     finally:
         conn.close()
 

@@ -49,6 +49,8 @@ import sqlite3
 import time
 from pathlib import Path
 
+from relay.sqlite_journal import use_rollback_journal
+
 _log = logging.getLogger(__name__)
 
 REPO = Path(__file__).resolve().parent.parent
@@ -141,8 +143,12 @@ def _connect():
         # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
         # first was enough to lock it at NONE, so pruning freed rows and returned no disk.
         conn.execute("PRAGMA auto_vacuum=INCREMENTAL")
-        # WAL so a reader (the cockpit, a CLI) never blocks the bridge mid-turn.
-        conn.execute("PRAGMA journal_mode=WAL")
+        # NOT WAL (was WAL until 2026-10-22). WAL maps <db>-shm into the process, and on a full C:
+        # touching that mapping raises 0xc0000006 inside sqlite3.dll, killing the whole process
+        # with no traceback (measured: the coordinator died 3 times that day). A rollback journal
+        # maps nothing, so a full disk is a catchable sqlite3.OperationalError. Evidence and the
+        # cost measurements are in relay/sqlite_journal.py.
+        use_rollback_journal(conn)
         conn.execute("PRAGMA foreign_keys=ON")
     except (sqlite3.Error, OSError) as exc:
         # sqlite3.connect() itself is lazy about opening the file on some platforms -- the
