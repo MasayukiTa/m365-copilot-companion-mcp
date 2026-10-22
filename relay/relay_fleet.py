@@ -4485,7 +4485,13 @@ class RelayWorker:
                         continue
                     if rec.get("role") == "assistant":
                         text = str(rec.get("text") or "").strip()
-                        if text:
+                        # A question-back / greeting / canned reply is not something the old
+                        # conversation DID. Handed over under "what it said it did" it tells the
+                        # new conversation that asking for the task is the state of play
+                        # (w1-recycle0, 2026-10-22). Only replies the check proves goal-less
+                        # are dropped; anything it cannot judge stays.
+                        if text and first_reply_check.first_reply_absorbed(
+                                text, self.goal)[0] is not False:
                             said.append(text)
             if not said:
                 return ""
@@ -4612,6 +4618,35 @@ class RelayWorker:
         except Exception:
             return nudge
 
+    def _direct_execution_job(self, lead):
+        """The turn that tells a worker to do the goal HERE after the split question is closed.
+
+        WHY IT CARRIES THE FULL GOAL. For a fan-out worker the conversation's first message is
+        the "split this goal, do NOT execute yet" prompt. The compact ledger that `_task_anchor`
+        prepends points at "the first message of this conversation", so after NO_SPLIT it pointed
+        at a message that forbids executing. Transcripts 2026-10-22 (.fleet/transcripts/
+        r6ad93fba_a0_w1 / _w18 / _w31): right after NO_SPLIT (w1, w18) or the first generic nudge
+        (w31) Copilot answered "どのファイルに対してどのような編集を適用したいか..." 2-4 times.
+        This message is self-contained instead (goal in full + the usual closing instruction).
+
+        It also becomes the message `_first_message_redelivery` would send again: the split
+        prompt is no longer a runnable first message once the split question has been answered,
+        and answering it is proof that the split prompt landed. Never raises."""
+        try:
+            goal = effective_goal(self.goal).strip()
+            if not goal:
+                return self._task_anchor(lead + CLOSING_INSTRUCTION)
+            job = (lead + "\n\n--- 実行する目標（全文） ---\n" + goal + CLOSING_INSTRUCTION)
+            # Only a first message that IS the split prompt is replaced; after a mid-run split
+            # offer the first message is still the real, runnable one (contract and all).
+            if (getattr(self, "_first_message", None)
+                    and fanout_mod.SPLIT_JOB in self._first_message):
+                self._first_message = job
+            self._first_absorbed = True
+            return job
+        except Exception:
+            return self._task_anchor(lead + CLOSING_INSTRUCTION)
+
     #: How many times the first message may be delivered again, in total, per worker.
     FIRST_MESSAGE_MAX_REDELIVERIES = 2
     FIRST_MESSAGE_LEAD_IN = "先ほどのメッセージが届いていなかったようです。もう一度送ります。\n\n"
@@ -4633,6 +4668,9 @@ class RelayWorker:
             if getattr(self, "_first_redeliveries", 0) >= self.FIRST_MESSAGE_MAX_REDELIVERIES:
                 return ""
             self._first_redeliveries = getattr(self, "_first_redeliveries", 0) + 1
+            if not reason:
+                reason = getattr(self, "_rearm_reason", "") or ""
+            self._rearm_reason = ""
             try:
                 _mt.record("first_message_not_absorbed", run_id=getattr(self, "run_id", ""),
                            instance=getattr(self, "name", ""), turn=getattr(self, "turn", None),
@@ -4664,6 +4702,44 @@ class RelayWorker:
             self._first_verdict = (ok, why)
             if ok and why in first_reply_check.STRONG_ABSORBED_REASONS:
                 self._first_absorbed = True
+        except Exception:
+            pass
+
+    def _note_question_back(self, resp):
+        """After the goal was once absorbed, notice an agent that keeps ASKING FOR THE TASK.
+
+        Observed 2026-10-22 (.fleet/transcripts/r6ad93fba_a0_w1 / _w18 / _w31): after the goal
+        had been acted on or pointed at, Copilot answered "どのファイルに対してどのような編集を
+        適用したいか、具体的な編集内容を教えてください。" 2-4 times in a row while the harness kept
+        sending ledger nudges that only POINT at the first message. Two such replies in a row
+        (the known question-back shape, or the identical short reply twice that shows no work)
+        mean the pointer is not working, so the first message is treated as not having landed:
+        `_first_absorbed` is cleared and the next nudge (`_task_anchor`) delivers it again
+        through `_first_message_redelivery` -- the same bounded, counted and recorded mechanism
+        (FIRST_MESSAGE_MAX_REDELIVERIES, mechanism `first_message_not_absorbed`). No new limit.
+        Never raises."""
+        try:
+            if not getattr(self, "_first_message", None) or not getattr(self, "_first_absorbed", True):
+                self._qb_streak, self._qb_last_short = 0, None
+                return
+            text = str(resp or "").strip()
+            if not text:
+                return
+            ok, why = first_reply_check.first_reply_absorbed(text, self.goal)
+            short = len(text) < first_reply_check.SHORT_REPLY_MAX_CHARS
+            shape = (not ok) and why in first_reply_check.QUESTION_BACK_REASONS
+            same = (short and text == getattr(self, "_qb_last_short", None)
+                    and why not in first_reply_check.STRONG_ABSORBED_REASONS)
+            self._qb_last_short = text if short else None
+            if shape:
+                self._qb_streak = getattr(self, "_qb_streak", 0) + 1
+            elif not same:
+                self._qb_streak = 0
+            if (shape and self._qb_streak >= 2) or same:
+                self._qb_streak = 0
+                if getattr(self, "_first_redeliveries", 0) < self.FIRST_MESSAGE_MAX_REDELIVERIES:
+                    self._first_absorbed = False
+                    self._rearm_reason = "question_back_repeat:" + (why if shape else "same_reply")
         except Exception:
             pass
 
@@ -6737,6 +6813,8 @@ class RelayWorker:
         # that never acted on its first message means that message did not land.
         if not _resume and self._first_reply_gate(resp):
             return
+        if not _resume:
+            self._note_question_back(resp)
         norm = _norm_for_progress(resp)
         self.no_progress = self.no_progress + 1 if norm and norm == self.last_norm else 0
         self.last_norm = norm
@@ -6956,9 +7034,8 @@ class RelayWorker:
                 # deliberate refusal counted as a parse failure in the telemetry.
                 self._fanout_done = True
                 self.fanout = False
-                self.job = self._task_anchor(
-                    "分割しない判断を受け取りました。上記の目標をこの会話で直接実行してください。"
-                    + CLOSING_INSTRUCTION)
+                self.job = self._direct_execution_job(
+                    "分割しない判断を受け取りました。下記の目標をこの会話で直接実行してください。")
                 self.status = "ready"
                 self.reason = "エージェントが分割不要と判断（単独実行）"
                 try:
@@ -7033,9 +7110,8 @@ class RelayWorker:
                 # here instead of splitting: refusing to proceed would strand a goal on the
                 # grounds that the agent divided it badly, which is not the goal's fault.
                 self.fanout = False
-                self.job = self._task_anchor(
-                    "分割は行いません。上記の目標をこの会話で直接実行してください。"
-                    + CLOSING_INSTRUCTION)
+                self.job = self._direct_execution_job(
+                    "分割は行いません。下記の目標をこの会話で直接実行してください。")
                 self.status = "ready"
                 self.reason = ("分割予算の上限のため単独実行に切り替え (%s)" % self._budget_refusal
                                if getattr(self, "_budget_refusal", "") and not steps

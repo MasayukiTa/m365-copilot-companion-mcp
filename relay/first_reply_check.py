@@ -42,6 +42,11 @@ _PLATFORM_ERROR = re.compile(r"エラー コード|Error code", re.I)
 #: that wants to stop watching for the failure does so on these.
 STRONG_ABSORBED_REASONS = ("work_evidence", "long_reply", "echoes_goal")
 
+#: The "not absorbed" reasons that are a QUESTION BACK (the agent asks for the task), as opposed to
+#: the canned refusal, which other handlers own. Used to spot an agent that keeps asking after
+#: the goal was once delivered (transcripts r6ad93fba_a0_w1/_w18/_w31, 2026-10-22).
+QUESTION_BACK_REASONS = ("asks_for_goal", "empty_message", "greeting", "offers_help")
+
 #: Real replies of an agent that received nothing, collected from the transcripts. Each group
 #: names what the reply is, which is what the recorded reason carries.
 _PATTERNS = (
