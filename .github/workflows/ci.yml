@@ -657,6 +657,7 @@ jobs:
             tests/test_org_genotype_holdout.py \
             tests/test_org_lab_isolation.py \
             tests/test_org_lab_candidates.py \
+            tests/test_org_lab_lineage.py \
             tests/test_org_genotype_explore.py \
             tests/test_org_genotype_transfer.py \
             tests/test_org_proposals_agrees.py \
