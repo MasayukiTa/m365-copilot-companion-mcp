@@ -667,6 +667,7 @@ jobs:
             tests/test_org_failure_taxonomy.py \
             tests/test_org_provenance.py \
             tests/test_org_role_separation.py \
+            tests/test_org_novelty.py \
             tests/test_org_genotype_explore.py \
             tests/test_org_genotype_transfer.py \
             tests/test_org_proposals_agrees.py \
