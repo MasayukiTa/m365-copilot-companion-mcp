@@ -166,6 +166,15 @@ def test_cli_ok_and_violation_exit_codes(tmp_path):
     assert out["violations"][0]["code"] == "missing_parent" and out["summary"]["roots"] == 1
 
 
+def test_cli_prints_ancestor_chain(tmp_path):
+    p = run_cli(tmp_path, tree(), "--lineage-of", "c4")
+    assert p.returncode == 0 and b"lineage of c4:" in p.stdout
+    j = run_cli(tmp_path, tree(), "--lineage-of", "c4", "--format", "json")
+    out = json.loads(j.stdout.decode("utf-8"))
+    assert out["lineage_of"]["c4"] == L.lineage_of(tree(), "c4")
+    assert run_cli(tmp_path, tree(), "--lineage-of", "nope").returncode == 2
+
+
 def test_cli_refuses_bad_input(tmp_path):
     p = run_cli(tmp_path, [rec(1, created_at="x")])
     assert p.returncode == 2 and b"refused" in p.stderr

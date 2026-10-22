@@ -31,6 +31,8 @@ def main(argv=None):
     ap.add_argument("--check", action="store_true", required=True)
     ap.add_argument("--records", required=True)
     ap.add_argument("--format", choices=("text", "json"), default="text")
+    ap.add_argument("--lineage-of", metavar="CANDIDATE_ID", default=None,
+                    help="also print the ancestor chain of this candidate (root first)")
     args = ap.parse_args(argv)
     try:
         with open(args.records, encoding="utf-8-sig") as fh:
@@ -39,6 +41,8 @@ def main(argv=None):
             data = data.get("experiments")
         report = L.check_lineage(data)
         report["summary"] = L.summarize(data)
+        if args.lineage_of is not None:
+            report["lineage_of"] = {args.lineage_of: L.lineage_of(data, args.lineage_of)}
     except (OSError, ValueError) as exc:
         sys.stderr.write("refused: %s\n" % exc)
         return 2
@@ -51,6 +55,8 @@ def main(argv=None):
                  % (s["count"], s["depth"], s["roots"], s["max_branching"], s["mean_branching"])]
         for x in report["violations"]:
             lines.append("  violation %s [%s]: %s" % (x["code"], x["id"], x["detail"]))
+        for cid, chain in report.get("lineage_of", {}).items():
+            lines.append("  lineage of %s: %s" % (cid, " -> ".join(chain)))
         text = "\n".join(lines)
     sys.stdout.buffer.write((text + "\n").encode("utf-8"))
     return 0 if report["ok"] else 1
