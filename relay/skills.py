@@ -37,6 +37,7 @@ from typing import Any, Iterable
 
 import yaml
 
+from relay.sqlite_journal import use_rollback_journal
 
 NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]{0,63}$")
 MAX_FILES = 256
@@ -640,6 +641,9 @@ class SkillStore:
                 self._conn = sqlite3.connect(
                     str(self.db_path), timeout=10, check_same_thread=False)
                 self._conn.row_factory = sqlite3.Row
+                # Rollback journal, not WAL: WAL's memory-mapped -shm kills the process
+                # (0xc0000006) when C: is full. See relay/sqlite_journal.py.
+                use_rollback_journal(self._conn)
                 self._conn_pid = pid
         return _ConnCtx(self)
 
@@ -647,7 +651,6 @@ class SkillStore:
         with self._connect() as db:
             db.executescript(
                 """
-                PRAGMA journal_mode=WAL;
                 CREATE TABLE IF NOT EXISTS skill_sources (
                     source_path TEXT PRIMARY KEY,
                     provenance TEXT NOT NULL,

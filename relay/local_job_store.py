@@ -35,6 +35,7 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 
+from relay.sqlite_journal import use_rollback_journal
 from relay.execution_profiles import ExecutionProfile, resolve_profile
 
 
@@ -109,6 +110,9 @@ class LocalJobStore:
         conn.execute("PRAGMA foreign_keys=ON")
         conn.execute("PRAGMA busy_timeout=5000")
         conn.execute("PRAGMA synchronous=FULL")
+        # Rollback journal, not WAL: WAL's memory-mapped -shm kills the process (0xc0000006) when
+        # C: is full. See relay/sqlite_journal.py. A no-op once the file has been converted.
+        use_rollback_journal(conn)
         return conn
 
     @contextmanager
@@ -130,7 +134,6 @@ class LocalJobStore:
     def _initialize(self) -> None:
         conn = self._connect()
         try:
-            conn.execute("PRAGMA journal_mode=WAL")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS jobs (
