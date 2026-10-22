@@ -665,6 +665,7 @@ jobs:
             tests/test_org_lab_promotion_gate.py \
             tests/test_org_lab_rollback.py \
             tests/test_org_failure_taxonomy.py \
+            tests/test_org_provenance.py \
             tests/test_org_genotype_explore.py \
             tests/test_org_genotype_transfer.py \
             tests/test_org_proposals_agrees.py \
