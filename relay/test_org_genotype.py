@@ -158,7 +158,8 @@ def test_a_non_test_caller_exists_and_runtime_does_not_import_it():
             for fn in files:
                 if not fn.endswith(".py") or fn.startswith("test_") or fn in ("genotype.py", "genotype_ledger.py",
                                                                     "genotype_candidates.py", "genotype_bench.py",
-                                                                    "genotype_explore.py", "genotype_transfer.py"):
+                                                                    "genotype_explore.py", "genotype_transfer.py",
+                                                                    "lab_bench_bundle.py"):
                     # the ledger is itself unimported by runtime (test_org_genotype_ledger.py)
                     continue
                 with open(os.path.join(root, fn), encoding="utf-8", errors="replace") as fh:
