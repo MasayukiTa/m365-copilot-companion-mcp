@@ -88,7 +88,7 @@ def test_ordinary_replies_are_not_call_attempts(reply):
 
 
 def test_the_fabricated_result_reply_is_caught_by_its_unexecuted_call():
-    assert BC.is_call_attempt(FABRICATED_GO, 0)
+    assert BC.call_attempt_shapes(FABRICATED_GO, 0)
     f = BC.diagnose(FABRICATED_GO, 0)
     assert f.kind == BC.KIND_UNLANDED and BC.SHAPE_MARKUP in f.detail
 

@@ -109,10 +109,6 @@ def call_attempt_shapes(reply, executed=None):
     return shapes
 
 
-def is_call_attempt(reply, executed=None) -> bool:
-    return bool(call_attempt_shapes(reply, executed))
-
-
 # --------------------------------------------------------------------------------- absence claims
 
 #: Phrases a model uses to say something is absent. A sentence needs one of these AND a
