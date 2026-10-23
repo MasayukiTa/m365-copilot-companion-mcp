@@ -113,6 +113,90 @@ static class FleetConvIdentity
         if (!string.IsNullOrEmpty(liveGoal)) return liveGoal;
         return transcriptMetaGoal ?? "";
     }
+
+    // ---- WHICH CONVERSATION A TRANSCRIPT BELONGS TO (2026-10-23) -------------------------------
+    //
+    // MEASURED: opening the ADAMS conversation (sess:65c85c0a-..., worker w1) showed, after its own
+    // turns, two 10-14 phone-ledger transcripts (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the
+    // current run's computer-use transcript (r6adac45a_a0_w1). None of them is that conversation.
+    // They were joined by the WORKER NAME alone. A worker name (w0, w1, ...) is reused by every
+    // run, so it says nothing about which conversation a transcript is. The conversation's
+    // identity is its Copilot id (sess:<guid>, the transcript's own "guid" line, the registry's
+    // "url"). A conversation with no id is identified by its transcript file's STEM
+    // ("r6acf1938_a0_w1": run x attempt x worker, unique per file). The worker name alone is never
+    // identity. These functions are the only place that decides a match, so the chat window
+    // cannot grow another name-only comparison.
+
+    /// The identity of a transcript file with no Copilot id: its file name without ".gz" /
+    /// ".jsonl", case-folded ("r6acf1938_a0_w1"). A "__sub_" sibling is its own stem.
+    public static string StemOf(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return "";
+        string name = Path.GetFileName(path.Trim());
+        if (name.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 3);
+        if (name.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 6);
+        return name.ToLowerInvariant();
+    }
+
+    /// The key a conversation is known by: its Copilot id when it has one, else "stem:<stem>" of
+    /// its latest transcript. "" when it has neither. NEVER derived from a worker name.
+    public static string IdentityKey(string url, string transcript)
+    {
+        if (!string.IsNullOrEmpty(url)) return url;
+        string stem = StemOf(transcript);
+        return stem.Length > 0 ? "stem:" + stem : "";
+    }
+
+    /// True when a transcript of side A and one of side B are the same file (same stem).
+    public static bool SharesTranscript(IEnumerable<string> aLineage, string aLatest,
+                                        IEnumerable<string> bLineage, string bLatest)
+    {
+        var stems = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string p in MergeTranscriptLineage(aLineage, null, aLatest))
+        { string s = StemOf(p); if (s.Length > 0) stems.Add(s); }
+        foreach (string p in MergeTranscriptLineage(bLineage, null, bLatest))
+        { string s = StemOf(p); if (s.Length > 0 && stems.Contains(s)) return true; }
+        return false;
+    }
+
+    /// A transcript resolved from outside the conversation may join its lineage only when it is
+    /// not known to belong to another Copilot conversation. `hintGuid` is that transcript's own
+    /// guid ("" when it has none yet, e.g. a run whose first turn has not been answered).
+    public static bool HintMayJoin(string url, string hintGuid)
+    {
+        if (string.IsNullOrEmpty(url) || !url.StartsWith("sess:", StringComparison.Ordinal)) return true;
+        if (string.IsNullOrEmpty(hintGuid)) return true;
+        return string.Equals(url.Substring(5), hintGuid, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// Does this registry row describe the conversation being opened? (RegistryTranscriptLineageFor)
+    /// `anchor` is a transcript the caller already knows is this conversation's (the live
+    /// worker's, or the exact file a history click named); "" when there is none.
+    ///   * with an id: the row's id must be the same. A row with another id is another
+    ///     conversation, whatever its transcript or worker name. A row with no id matches when it
+    ///     holds the anchor's file.
+    ///   * without an id: the row must hold the anchor's file (same stem). No anchor, no match:
+    ///     the worker name is not identity and is not a parameter here.
+    public static bool RegistryRowMatches(string url, string anchor,
+                                          string rowUrl, string rowTranscript,
+                                          IEnumerable<string> rowLineage)
+    {
+        rowUrl = rowUrl ?? "";
+        if (!string.IsNullOrEmpty(url) && rowUrl == url) return true;
+        if (!string.IsNullOrEmpty(url) && rowUrl.Length > 0) return false;
+        return !string.IsNullOrEmpty(anchor)
+            && SharesTranscript(rowLineage, rowTranscript, null, anchor);
+    }
+
+    /// Is this registry row the sidebar conversation `c`? (SyncRegistry's existing-row lookup)
+    /// A row with an id matches the conversation with that id. A row without one matches the
+    /// conversation that holds the same transcript file -- never by worker name.
+    public static bool SyncRowMatches(string rowUrl, string rowTranscript, IEnumerable<string> rowLineage,
+                                      string cUrl, string cTranscript, IEnumerable<string> cLineage)
+    {
+        if (!string.IsNullOrEmpty(rowUrl)) return cUrl == rowUrl;
+        return SharesTranscript(rowLineage, rowTranscript, cLineage, cTranscript);
+    }
 }
 
 /// The conversation LIST, as plain functions: which transcripts exist, how they are paged, and
@@ -144,6 +228,38 @@ static class ConvListing
     {
         return (path != null && path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
             ? path.Substring(0, path.Length - 3) : path;
+    }
+
+    /// The Copilot conversation id written into a transcript ({"guid": ...}, within its first
+    /// 40 lines), or "" when there is none yet or the file cannot be read. Reads "x.jsonl" or
+    /// "x.jsonl.gz", whichever exists.
+    public static string TranscriptGuid(string path)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            string actual = path;
+            if (!File.Exists(actual)) actual = actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase) ? StripGz(actual) : actual + ".gz";
+            if (!File.Exists(actual)) return "";
+            var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            using (var fs = new FileStream(actual, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+                       ? new StreamReader(new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionMode.Decompress), System.Text.Encoding.UTF8)
+                       : new StreamReader(fs, System.Text.Encoding.UTF8))
+            {
+                for (int i = 0; i < 40; i++)
+                {
+                    string ln = sr.ReadLine();
+                    if (ln == null) break;
+                    if (ln.IndexOf("\"guid\"", StringComparison.Ordinal) < 0 || ln.IndexOf("\"role\"", StringComparison.Ordinal) >= 0) continue;
+                    var d = js.DeserializeObject(ln) as Dictionary<string, object>;
+                    object g;
+                    if (d != null && d.TryGetValue("guid", out g) && g != null) return g.ToString();
+                }
+            }
+        }
+        catch (Exception) { }
+        return "";
     }
 
     public static bool IsSubTranscript(string path)

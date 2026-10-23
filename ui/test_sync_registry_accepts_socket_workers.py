@@ -54,7 +54,7 @@ def test_dedup_falls_back_to_transcript_when_url_is_absent():
     all of them) and get re-inserted at position 0 every single poll -- the list would grow
     without bound and the same conversation would appear over and over, newest-first, forever."""
     body = _sync_registry_body()
-    assert 'c.Transcript == transcript' in body
+    assert 'FleetConvIdentity.SyncRowMatches(url, transcript, regLineage' in body   # transcript-file identity when url is absent
 
 
 def test_the_latest_transcript_pointer_is_derived_from_the_new_conversations_lineage():
@@ -68,4 +68,4 @@ def test_url_only_dedup_is_unaffected_when_url_is_present():
     """The pre-existing behaviour for a genuine conv_url row (the ordinary, non-socket path)
     must be untouched: dedup by ConvUrl still applies whenever url is non-empty."""
     body = _sync_registry_body()
-    assert "!string.IsNullOrEmpty(url) && c.ConvUrl == url" in body
+    assert 'FleetConvIdentity.SyncRowMatches(url, transcript, regLineage' in body   # the id decides when url is present (see FleetConvIdentity.SyncRowMatches)

@@ -139,8 +139,9 @@ partial class ChatWindow
         // NOT ONE past chat was retrievable. conv_url scrape is now only a last resort.
         if (c.Messages.Count == 0)
         {
-            string tp = !string.IsNullOrEmpty(c.Transcript) ? c.Transcript
-                        : (!string.IsNullOrEmpty(c.Name) ? NewestTranscriptForWorker(c.Name) : "");
+            // The transcript this row points at. NOT "the newest transcript of worker <name>":
+            // a worker name is reused by every run and is not a conversation's identity.
+            string tp = c.Transcript ?? "";
             if (!string.IsNullOrEmpty(tp))
             {
                 c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, tp);
