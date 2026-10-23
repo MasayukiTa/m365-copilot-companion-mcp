@@ -1015,12 +1015,24 @@ public static class SupervisorCodeView
 // relay/tool_bridge.py reads `tool_transport` whenever a fleet conversation is created. `connector`
 // is the existing path (the agent holds a custom connector and needs a Dev Tunnel); `connector-less`
 // registers nothing on the agent: the model writes the call in its reply and this machine runs it.
-// `bridge` is the first spelling of the second value and is read as connector-less. Default connector.
+// `bridge` is the first spelling of the second value and is read as connector-less. Default
+// connector-less (a new PC cannot create the custom connector the other route needs), except on a PC whose
+// .env already holds MCP_TUNNEL_URL or MCP_TUNNEL_NAME: it was set up for the connector route and stays on it.
 public static class ToolRouteView
 {
     //: must equal tools/settings_keys.py and relay/tool_bridge.py (TRANSPORTS / DEFAULT_TRANSPORT).
     public const string Key = "tool_transport";
-    public const string Default = "connector";
+    public const string Default = "connector-less";
+
+    /// <summary>What a PC runs when settings.txt has no usable tool_transport= line: connector when .env
+    /// has a non-empty MCP_TUNNEL_URL or MCP_TUNNEL_NAME (relay/tool_bridge.py CONNECTOR_FOOTPRINT_KEYS),
+    /// otherwise Default. A line with an unknown value is treated as no line, as in Python.</summary>
+    public static string UnsetValue(string tunnelUrl, string tunnelName)
+    {
+        bool footprint = !string.IsNullOrWhiteSpace((tunnelUrl ?? "").Trim('"', '\'', ' '))
+                      || !string.IsNullOrWhiteSpace((tunnelName ?? "").Trim('"', '\'', ' '));
+        return footprint ? "connector" : Default;
+    }
 
     public static readonly string[] Modes = { "connector", "connector-less" };
 

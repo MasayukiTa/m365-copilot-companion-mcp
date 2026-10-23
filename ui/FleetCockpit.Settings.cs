@@ -83,6 +83,10 @@ partial class CockpitWindow
     {
         try
         {
+            // The route when settings.txt says nothing usable: the same answer relay/tool_bridge.py gives
+            // (connector for a PC set up for it, else connector-less). Set BEFORE the file check below so a
+            // PC with no settings file shows it too; a tool_transport= line then overrides it.
+            _trVal = ToolRouteView.UnsetValue(EnvValue("MCP_TUNNEL_URL"), EnvValue("MCP_TUNNEL_NAME"));
             if (!File.Exists(SettingsFile)) return;
             foreach (string ln in File.ReadAllLines(SettingsFile))
             {

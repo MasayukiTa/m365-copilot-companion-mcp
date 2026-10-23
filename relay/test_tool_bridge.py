@@ -23,13 +23,82 @@ def _settings(tmp_path, text):
     return str(p)
 
 
-def test_the_default_is_connector_when_there_is_no_file(tmp_path):
-    assert TB.transport(str(tmp_path / "missing.txt")) == TB.CONNECTOR == "connector"
-    assert TB.is_bridge(str(tmp_path / "missing.txt")) is False
+def _env(tmp_path, text):
+    p = tmp_path / ".env"
+    p.write_text(text, encoding="utf-8")
+    return str(p)
 
 
-def test_the_default_is_connector_when_the_key_is_absent(tmp_path):
-    assert TB.transport(_settings(tmp_path, "maxtabs=3\n")) == "connector"
+def test_a_new_pc_with_no_settings_file_is_connector_less(tmp_path):
+    """New PC = no settings.txt and no connector footprint in .env: the route that works there."""
+    missing = str(tmp_path / "missing.txt")
+    assert TB.DEFAULT_TRANSPORT == TB.CONNECTOR_LESS == "connector-less"
+    assert TB.transport(missing) == "connector-less"
+    assert TB.transport(missing, env_path=str(tmp_path / "no.env")) == "connector-less"
+    assert TB.is_bridge(missing) is True
+
+
+def test_a_new_pc_with_no_tool_transport_line_is_connector_less(tmp_path):
+    s = _settings(tmp_path, "maxtabs=3\n")
+    assert TB.transport(s) == "connector-less"
+    assert TB.transport(s, env_path=_env(tmp_path, "MCP_TUNNEL_URL=\nMCP_TUNNEL_NAME=\nFOO=bar\n")) == "connector-less"
+
+
+@pytest.mark.parametrize("line", ["MCP_TUNNEL_URL=https://x.invalid/mcp", "MCP_TUNNEL_NAME=mytunnel",
+                                  "MCP_TUNNEL_NAME='mytunnel'", "  MCP_TUNNEL_URL = https://x.invalid/mcp  "])
+def test_a_pc_already_set_up_for_the_connector_keeps_it_when_no_line_exists(tmp_path, line):
+    """An update must not switch a PC whose agent holds a connector (tunnel recorded in .env)."""
+    env = _env(tmp_path, "# c\nOTHER=1\n%s\n" % line)
+    assert TB.has_connector_footprint(env_path=env) is True
+    assert TB.transport(str(tmp_path / "missing.txt"), env_path=env) == "connector"
+    assert TB.transport(_settings(tmp_path, "maxtabs=3\n"), env_path=env) == "connector"
+
+
+def test_a_commented_or_empty_tunnel_key_is_not_a_footprint(tmp_path):
+    env = _env(tmp_path, "#MCP_TUNNEL_URL=https://x.invalid\nMCP_TUNNEL_URL=\nMCP_TUNNEL_NAME=''\n")
+    assert TB.has_connector_footprint(env_path=env) is False
+
+
+def test_a_line_in_the_file_beats_the_footprint(tmp_path):
+    env = _env(tmp_path, "MCP_TUNNEL_URL=https://x.invalid/mcp\n")
+    assert TB.transport(_settings(tmp_path, "tool_transport=connector-less\n"), env_path=env) == "connector-less"
+    env2 = _env(tmp_path, "OTHER=1\n")
+    assert TB.transport(_settings(tmp_path, "tool_transport=connector\n"), env_path=env2) == "connector"
+
+
+def test_a_test_naming_only_a_settings_file_never_reads_the_developers_env(tmp_path):
+    assert TB._env_file_for(str(tmp_path / "s.txt"), None) is None
+    assert TB._env_file_for(None, None).endswith(".env")
+
+
+def test_the_default_is_the_same_in_python_settings_keys_and_the_cockpit():
+    import io
+    import os
+    import re
+    from tools import settings_keys as SK
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cs = io.open(os.path.join(repo, "ui", "EffortPolicy.cs"), encoding="utf-8-sig").read()
+    cs_default = re.search(r'class ToolRouteView.*?const string Default = "([a-z-]+)"', cs, re.S).group(1)
+    assert TB.DEFAULT_TRANSPORT == SK.default("tool_transport") == cs_default == "connector-less"
+    # the footprint keys are the same two words in the cockpit's UnsetValue(...) call
+    cs_settings = io.open(os.path.join(repo, "ui", "FleetCockpit.Settings.cs"), encoding="utf-8-sig").read()
+    for key in TB.CONNECTOR_FOOTPRINT_KEYS:
+        assert 'EnvValue("%s")' % key in cs_settings
+
+
+def test_pin_legacy_writes_connector_only_for_a_connector_pc_without_a_line(tmp_path):
+    env = _env(tmp_path, "MCP_TUNNEL_URL=https://x.invalid/mcp\n")
+    s = _settings(tmp_path, "maxtabs=3\n")
+    assert TB.pin_legacy(s, env_path=env) is True
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8").splitlines() == ["maxtabs=3", "tool_transport=connector"]
+    assert TB.pin_legacy(s, env_path=env) is False            # already has the line: untouched
+    # a new PC (no footprint) and a PC that chose connector-less are left alone
+    s2 = _settings(tmp_path, "maxtabs=3\n")
+    assert TB.pin_legacy(s2, env_path=_env(tmp_path, "FOO=1\n")) is False
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8") == "maxtabs=3\n"
+    s3 = _settings(tmp_path, "tool_transport=connector-less\n")
+    assert TB.pin_legacy(s3, env_path=env) is False
+    assert (tmp_path / "settings.txt").read_text(encoding="utf-8") == "tool_transport=connector-less\n"
 
 
 @pytest.mark.parametrize("raw", ["connector-less", "Connector-Less", " connector-less ", "bridge", "BRIDGE"])
@@ -38,8 +107,15 @@ def test_connector_less_is_read_from_the_file_and_bridge_is_its_legacy_spelling(
 
 
 @pytest.mark.parametrize("raw", ["", "brigde", "text_bridge", "1", "on", "connector "])
-def test_an_unknown_value_falls_back_to_connector(tmp_path, raw):
-    assert TB.transport(_settings(tmp_path, "tool_transport=%s\n" % raw)) == "connector"
+def test_an_unknown_value_reads_as_if_the_line_were_absent(tmp_path, raw):
+    """A typo keeps the route the machine was on and never moves it to another one."""
+    s = _settings(tmp_path, "tool_transport=%s\n" % raw)
+    if raw == "connector ":          # trailing space is stripped: a real spelling
+        assert TB.transport(s) == "connector"
+        return
+    assert TB.transport(s) == "connector-less"                                     # a new PC
+    env = _env(tmp_path, "MCP_TUNNEL_NAME=t\n")
+    assert TB.transport(s, env_path=env) == "connector"                            # a connector PC
 
 
 def test_a_byte_order_mark_is_tolerated(tmp_path):

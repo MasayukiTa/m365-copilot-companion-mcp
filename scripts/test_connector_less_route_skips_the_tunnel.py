@@ -5,8 +5,8 @@ THE RULE. `tool_transport=connector-less` (GUI: Settings > Tools > Tool route) m
 no connector and nothing reaches this PC through a tunnel. quickstart.bat, start_all.ps1, doctor.ps1,
 supervisor.ps1 and bootstrap.py each used to treat the tunnel as part of "started" and "healthy";
 each now asks relay/tool_bridge.py -- the ONE reader of the setting -- and skips the tunnel work
-for connector-less. The connector route (the default, and what any unreadable answer means) is left
-exactly as it was.
+for connector-less. The connector route (kept by a PC set up for it, see relay/tool_bridge.py
+unset_value) is left exactly as it was.
 
 What is pinned here: that every one of those scripts asks, that the answer cannot silently become
 connector-less, and that bootstrap's connector-only steps are skipped WITHOUT being marked done (so
@@ -60,10 +60,18 @@ def test_quickstart_skips_step_4_and_the_connector_values_when_connector_less():
     assert 'if "!TOOL_ROUTE!"=="connector-less" goto :route_connectorless' in qs
     # the skip comes BEFORE the access question and before the call that creates a tunnel
     skip = qs.index("goto :route_connectorless")
-    assert skip < qs.index("How should Copilot Studio be allowed to reach this machine?")
+    assert skip < qs.index("How should Copilot Studio reach the tools on this machine?")
     assert skip < qs.index('-File "%~dp0scripts\\setup_devtunnel.ps1"')
     # the choice is offered where the access question is asked, and recorded through the product
-    assert "choice /C ATNL" in qs and 'if "!QS_CHOICE!"=="4" goto :route_choose_connectorless' in qs
+    # L is first and recommended; A / T / N (the connector route) are the "only if you can create a connector" keys
+    assert "choice /C LATN" in qs and 'if "!QS_CHOICE!"=="1" goto :route_choose_connectorless' in qs
+    assert 'if "!QS_CHOICE!"=="2" set "TUNNEL_ACCESS=anonymous"' in qs
+    assert 'if "!QS_CHOICE!"=="3" set "TUNNEL_ACCESS=tenant"' in qs
+    assert 'if "!QS_CHOICE!"=="4" set "TUNNEL_ACCESS=none"' in qs
+    assert qs.index("[L] Connector-less - RECOMMENDED") < qs.index("[A] Anonymous")
+    # a PC set up for the connector route is pinned BEFORE the reader runs, so an update never moves it
+    assert qs.index("-m relay.tool_bridge pin-legacy") < qs.index("do set \"TOOL_ROUTE=%%R\"")
+    assert qs.isascii()
     assert "-m relay.tool_bridge set connector-less" in qs
     # ...and THIS run follows the choice at once (the reader above ran before it was made)
     choose = qs[qs.index(":route_choose_connectorless\n"):qs.index(":route_connectorless\n", qs.index(":route_choose_connectorless\n"))]
@@ -81,6 +89,7 @@ def test_start_all_gates_each_tunnel_step_on_the_route():
     sa = _read("scripts/start_all.ps1")
     assert '$script:ToolRoute = "connector"' in sa          # the default until the reader has answered
     assert "$script:ToolRoute = Get-ToolTransport" in sa
+    assert sa.index("relay.tool_bridge pin-legacy") < sa.index("$script:ToolRoute = Get-ToolTransport")
     heal = sa.index("Invoke-TunnelHealPreflight\n") if "Invoke-TunnelHealPreflight\n" in sa else \
         sa.index("Invoke-TunnelHealPreflight\r\n")
     assert 'connector-less' in sa[heal - 400:heal]            # the heal is inside the else of the route test
