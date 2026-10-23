@@ -82,6 +82,8 @@ def test_default_tunnel_without_tunnel_configured_is_ok(monkeypatch):
 
 
 def test_default_tunnel_checks_pid(monkeypatch):
+    from relay import tool_bridge
+    monkeypatch.setattr(tool_bridge, "is_bridge", lambda path=None: False)   # the connector route (a new PC defaults to connector-less)
     import relay.relay_fleet as rf
     monkeypatch.setattr(rf, "_mcp_tunnel_url", lambda: "https://t.example/")
     monkeypatch.setattr(mr, "fetch_json", lambda url, timeout_s=3.0: {"status": "ok", "server_pid": 9})
