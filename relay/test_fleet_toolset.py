@@ -62,6 +62,14 @@ def _catalogue():
     env["MCP_TOOL_MAP"] = "1"
     env["MCP_EXECUTION_PROFILES"] = "1"
     env["MCP_EXT_HELPER"] = "1"
+    # The validity_* tools register only when the helper's entry file exists (tools/auto/
+    # ext_helper.py), and they are listed in the gateway since 2026-10-23, so a worker can reach
+    # them. A stub entry in a throwaway folder opens that gate without any real program.
+    import tempfile
+    helper_dir = tempfile.mkdtemp(prefix="fleet_toolset_helper_")
+    with open(os.path.join(helper_dir, "helper_entry.py"), "w", encoding="utf-8") as fh:
+        fh.write("print('{}')\n")
+    env["MCP_EXT_HELPER_DIR"] = helper_dir
     out = _child_run(
         [sys.executable, "-c",
          "import json,sys;sys.path.insert(0,'.');import main;"
@@ -160,6 +168,7 @@ def test_the_audited_registry_is_the_widest_one():
     profile_only = {"claim_turn", "heartbeat", "commit_turn", "abort_turn",
                     "read_job_context", "get_job_status"}
     profile_only |= {"validity_audit_ledger"}      # present only under MCP_EXT_HELPER=1
+    profile_only |= {"validity_judge", "validity_list_claims"}   # ... and MCP_EXT_HELPER_DIR
     missing = sorted(profile_only - got)
     assert not missing, (
         "the audited registry is missing the execution-profile tools %s, so this file is "
