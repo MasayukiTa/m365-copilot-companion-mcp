@@ -744,9 +744,10 @@ class ResearchSession:
                 #
                 # A FAILED UPLOAD ENDS THE SESSION WITH ITS REASON, not a page and not an
                 # annotation-less question: "an instruction about a file that is not there
-                # comes back as a confident answer about nothing". The upload is derived from
-                # a page (relay/socket_attachment.py), which the no-tab rule refuses, so
-                # waiting cannot repair it -- holding here would hold for ever.
+                # comes back as a confident answer about nothing". The upload is the cached
+                # request shape with the file swapped in (relay/upload_template.py); only
+                # the first use per agent opens a no-turn capture page. A failure there is
+                # reported with its reason in the log, and holding would not repair it.
                 from relay.socket_attachment import annotation_for
 
                 _annotations = annotation_for(self.context, url, self.upload_path,
@@ -758,8 +759,9 @@ class ResearchSession:
                     except Exception:
                         pass
                     drv = None
-                    self._fail("the attachment upload did not return an annotation (no tab is "
-                               "ever opened to derive one): an instruction about a file that "
+                    self._fail("the attachment upload did not return an annotation (see the "
+                               "[socket_attachment]/[upload_template] log lines for the "
+                               "reason): an instruction about a file that "
                                "is not there comes back as a confident answer about nothing")
                     return False
             self.page, self.drv, self.socket = None, drv, True

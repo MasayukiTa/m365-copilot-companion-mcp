@@ -19,40 +19,67 @@ WHAT MADE IT POSSIBLE, all measured rather than reasoned:
                                       phrase was uploaded, its docId sent as an annotation on
                                       a socket turn, and the reply read the phrase back
 
-THE REQUEST IS CAPTURED, NEVER REBUILT. The page sends six multipart fields -- scenario,
+THE REQUEST SHAPE IS CAPTURED, NEVER COMPOSED. The page sends six multipart fields -- scenario,
 conversationId, FileBase64 as a data URI, and optionsSets THREE TIMES -- and eighteen headers,
 among them x-anchormailbox, which routes it. A probe that reconstructed that request failed
 three times in one afternoon and returned three 403s that were each reported as an answer about
 the credential. relay/chathub.py reached the same conclusion independently on 2026-08-20 for the
-socket frame: composed is REJECTED, captured is accepted. So this opens the page, lets it make
-its own request, captures the bytes and headers, and re-issues them with our token.
+socket frame: composed is REJECTED, captured is accepted.
+
+UPDATE 2026-10-23, MEASURED: THE PAGE IS NOT NEEDED AT ALL. Dropping the page's headers one at a
+time showed that only content-type (the multipart boundary) and x-scenario are required besides
+the bearer token; a body composed with our own boundary and a random conversationId got HTTP 200.
+The 403s recorded above came from requests that lacked x-scenario, not from "composition". So the
+first attempt is that minimal request (relay/upload_template.build_composed): no page, no cache,
+a few MB of Python memory. The captured-shape machinery below is the FALLBACK if the endpoint
+starts refusing the minimal request.
+
+HOW THE FALLBACK WORKS. The page that makes the request is a browser tab on the Copilot
+surface, which the owner's rule (relay/no_tab.py) refuses on a goal's path; for a month that made
+every attachment fail ("CopilotTabForbidden ... attachment upload page"). The shape does not
+depend on the file, so relay/upload_template.py captures it ONCE per agent surface (a page that
+loads, sets a test image, reads the request and closes -- no turn, like the token light page),
+caches it, and each upload is that cached request with only the FileBase64 value replaced. A
+refusal that says the shape is stale (400/403/404/415/422) discards the cache and captures once
+more; a 401 is about the credential and is not.
 
 FAILURE IS A REFUSAL, NOT A SILENT FALLBACK TO NO FILE. Every path returns None, and the caller
-must treat None as "use a tab". An instruction about a file that was never delivered comes back
-as a confident answer about nothing -- which is the failure agent_profiles already names in its
-tab path and the one this module must not reintroduce.
+ends the goal with the reason (relay/agent_profiles._try_socket). An instruction about a file
+that was never delivered comes back as a confident answer about nothing.
 """
 from __future__ import annotations
 
 import os
 
-#: Headers a replay must not forward: HTTP/2 framing, a length requests recomputes, the
-#: credential we are replacing, and an encoding we do not want applied twice.
-_DROP = {":authority", ":method", ":path", ":scheme", "content-length", "authorization",
-         "accept-encoding", "host"}
+from relay import upload_template as UT
 
-UPLOAD_URL = "https://substrate.office.com/m365Copilot/UploadFile"
+#: Headers a replay must not forward (kept under this name for the tests that pin it).
+_DROP = UT.DROP
 
-#: How long to wait for the page to make its own upload request after the file is set.
-CAPTURE_WAIT_S = 25.0
+UPLOAD_URL = UT.UPLOAD_URL
+
+#: Statuses that say the cached REQUEST SHAPE is no longer accepted (as opposed to the credential
+#: -- 401 -- or a fault on their side, 429/5xx).
+STALE_SHAPE_STATUSES = (400, 403, 404, 415, 422)
+
+
+def _post(captured_headers, body, token):
+    # IMPORTED HERE, NOT AT THE TOP OF THE MODULE. On a machine without it every failure in this
+    # function used to come back as ModuleNotFoundError -- including failures that had nothing
+    # to do with HTTP. An import belongs where the work it does begins.
+    import requests
+
+    headers = dict(captured_headers)
+    headers["Authorization"] = "Bearer " + token
+    return requests.post(UPLOAD_URL, headers=headers, data=body, timeout=45)
 
 
 def annotation_for(context, agent_url, upload_path, token, *, log=None):
     """Upload `upload_path` and return the messageAnnotations list, or None.
 
-    `context` is a live Playwright browser context; `token` is the bearer the socket route
-    already holds. Returns None for every failure, including an unreadable file -- the caller
-    opens a tab instead, which is what happened before this existed.
+    `context` is a live Playwright browser context, used ONLY to capture the request shape when
+    none is cached; `token` is the bearer the socket route already holds. Returns None for every
+    failure, including an unreadable file, and the caller ends the goal with the reason.
     """
     say = log or (lambda _m: None)
     try:
@@ -63,58 +90,39 @@ def annotation_for(context, agent_url, upload_path, token, *, log=None):
             say("[socket_attachment] no token; cannot upload")
             return None
 
-        captured = {}
-        # The upload was derived by driving the Copilot page's own file input in a tab. Copilot
-        # never runs in a browser tab (owner rule, relay/no_tab.py), so this refuses and the
-        # attachment goal is reported as unable to attach rather than opening one.
-        from relay.no_tab import forbid_copilot_tab
-        forbid_copilot_tab("attachment upload page")
-        page = None
-        try:
-            def _on_request(req):
-                if "uploadfile" not in (req.url or "").lower() or captured:
-                    return
-                try:
-                    captured["body"] = req.post_data_buffer
-                    captured["headers"] = {k: v for k, v in req.all_headers().items()
-                                           if k.lower() not in _DROP}
-                except Exception:
-                    pass
-
-            page.on("request", _on_request)
-            page.goto(agent_url, wait_until="domcontentloaded", timeout=60000)
-            page.wait_for_timeout(3000)
-
-            from relay.agent_profiles import upload_file
-
-            if not upload_file(page, upload_path):
-                say("[socket_attachment] the page did not accept the file")
+        # 1. THE MINIMAL REQUEST, no page and no cache (relay/upload_template.COMPOSED_*).
+        headers, body = UT.build_composed(upload_path)
+        r = _post(headers, body, token)
+        if r.status_code in STALE_SHAPE_STATUSES:
+            say("[socket_attachment] the minimal upload request was refused (HTTP %s); "
+                "falling back to the captured page shape" % r.status_code)
+            r = None
+        # 2./3. the page's captured shape, cached; captured once when absent.
+        tpl = UT.load(agent_url) if r is None else None
+        fresh = False
+        if r is None and tpl is None:
+            say("[socket_attachment] no cached upload shape for this agent; capturing one")
+            tpl = UT.capture(context, agent_url, log=say)
+            fresh = True
+            if tpl is None:
                 return None
-            waited = 0.0
-            while waited < CAPTURE_WAIT_S and not captured:
-                page.wait_for_timeout(500)
-                waited += 0.5
-        finally:
-            try:
-                page.close()
-            except Exception:
-                pass
 
-        if not captured:
-            say("[socket_attachment] the page's own upload request was never seen")
-            return None
-
-        # IMPORTED HERE, NOT AT THE TOP OF THE FUNCTION. It was above the page block, so on a
-        # machine without it every failure in this function came back as ModuleNotFoundError
-        # -- including failures that had nothing to do with HTTP. An import belongs where the
-        # work it does begins.
-        import requests
-
-        headers = dict(captured["headers"])
-        headers["Authorization"] = "Bearer " + token
-        r = requests.post(UPLOAD_URL, headers=headers, data=captured["body"], timeout=45)
+        if r is None:
+            headers, body = UT.build(tpl, upload_path)
+            r = _post(headers, body, token)
+        if r.status_code in STALE_SHAPE_STATUSES and not fresh and tpl is not None:
+            say("[socket_attachment] the cached upload shape was refused (HTTP %s); "
+                "capturing a fresh one" % r.status_code)
+            UT.discard(agent_url)
+            tpl = UT.capture(context, agent_url, log=say)
+            if tpl is None:
+                return None
+            headers, body = UT.build(tpl, upload_path)
+            r = _post(headers, body, token)
         if r.status_code not in (200, 201):
             say("[socket_attachment] upload refused: HTTP %s" % r.status_code)
+            if r.status_code in STALE_SHAPE_STATUSES:
+                UT.discard(agent_url)       # even a fresh capture was refused: do not keep it
             return None
         body = r.json()
         doc_id = body.get("docId")
@@ -135,3 +143,4 @@ def annotation_for(context, agent_url, upload_path, token, *, log=None):
     except Exception as exc:
         say("[socket_attachment] %s: %s" % (type(exc).__name__, str(exc)[:160]))
         return None
+

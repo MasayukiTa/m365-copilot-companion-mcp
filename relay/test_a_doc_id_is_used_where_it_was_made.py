@@ -175,23 +175,36 @@ def _sample_file(tmp_path, name="pic.png"):
     return str(f)
 
 
-# ── the page-driven upload is refused: Copilot never runs in a browser tab ──────────────────
+# ── behaviour: one upload per attachment, each frame carries the docId THAT upload returned ──
+#
+# Since 2026-10-23 the page is opened once per agent to learn the request shape
+# (relay/upload_template.py); an attachment after that opens no page at all.
 
-def test_an_attachment_upload_is_refused_and_opens_no_page_and_posts_nothing(
+_BODY = (b'--B\r\nContent-Disposition: form-data; name="scenario"\r\n\r\nx\r\n'
+         b'--B\r\nContent-Disposition: form-data; name="FileBase64"\r\n\r\n'
+         b'data:image/png;base64,AAAA\r\n--B--\r\n')
+_HDRS = {"x-anchormailbox": "test@example.com",
+         "content-type": "multipart/form-data; boundary=B"}
+
+
+def test_two_attachments_upload_twice_with_no_page_and_each_frame_carries_its_own_docid(
         tmp_path, monkeypatch):
+    from relay import upload_template as UT
+    monkeypatch.setattr(UT, "CACHE_DIR", str(tmp_path / "cache"))
     path = _sample_file(tmp_path)
-    fake_post = _fake_post(["DOC-FIRST"])
+    fake_post = _fake_post(["DOC-FIRST", "DOC-SECOND"])
     monkeypatch.setattr("requests.post", fake_post)
 
     class _NoPage:
         def new_page(self):
             raise AssertionError("opened a page for an attachment")
 
-    said = []
-    assert SA.annotation_for(_NoPage(), "https://example.test/agent", path, "tok-1",
-                             log=said.append) is None
-    assert fake_post.calls == []
-    assert any("CopilotTabForbidden" in m for m in said)
+    first = SA.annotation_for(_NoPage(), "https://example.test/agent", path, "tok-1")
+    second = SA.annotation_for(_NoPage(), "https://example.test/agent", path, "tok-1")
+    assert [len(fake_post.calls)] == [2]
+    assert first[0]["id"] == "DOC-FIRST" and second[0]["id"] == "DOC-SECOND"
+    assert fake_post.calls[0]["headers"]["Authorization"] == "Bearer tok-1"
+    assert fake_post.calls[0]["headers"]["x-scenario"]
 
 
 # ── module-level guard: no docId cache anywhere under relay/ ───────────────────────────────

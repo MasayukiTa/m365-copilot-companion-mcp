@@ -239,6 +239,9 @@ LIVE_RECORD_REDIRECTS = {
     # A DIRECTORY OF CAPTURED TOKENS AND REQUEST TEMPLATES. Not a log -- the one place in this
     # list where a stray test write would touch live credentials material.
     "relay.profile_token": {"TEMPLATE_DIR": "templates"},
+    # Cached account-routing headers of the upload request; a stray test write would land in the
+    # live .fleet\upload_templates.
+    "relay.upload_template": {"CACHE_DIR": "upload_templates"},
     "bridge.copilot_bridge": {"DELETE_LOG": "delete_log.jsonl",
                               # The page-count instrument, appended from the CDP watchdog every
                               # 60s. It exists to answer "was the browser accumulating tabs?"

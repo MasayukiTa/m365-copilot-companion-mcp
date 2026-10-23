@@ -17,11 +17,15 @@ GOAL_PATH_FILES = (
     "relay/relay_fleet.py", "relay/refuter.py", "relay/agent_profiles.py",
     "relay/socket_attachment.py", "relay/socket_route.py", "relay/fleet_runner.py",
     "relay/profile_token.py", "relay/lean_capture.py", "relay/local_loop_controller.py",
+    "relay/upload_template.py",
 )
 
 #: (file, text on the line) pairs that are allowed. Each is a page that carries NO Copilot turn.
 ALLOWED = (
     ("relay/profile_token.py", "page = context.new_page()"),                  # token light page
+    # upload-shape capture: loads the agent surface, sets a test image, reads the page's own
+    # UploadFile request, closes. Sends no Copilot turn; runs once per agent, not per goal.
+    ("relay/upload_template.py", "page = context.new_page()"),
     ("relay/relay_fleet.py", 'context.new_page().goto("about:blank"'),       # blank keeper
     ("relay/fleet_runner.py", 'context.new_page().goto("about:blank"'),      # blank keeper
     # These two call _open_fresh, which raises CopilotTabForbidden (asserted below): they
