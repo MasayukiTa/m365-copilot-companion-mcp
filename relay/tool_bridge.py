@@ -9,8 +9,9 @@ uses the other name. See docs/connector_less_route.md.
 TWO TRANSPORTS, ONE SETTING
 
   connector  The agent holds the tools itself (an MCP connector registered on the agent) and
-             calls them while it answers. This is the default and the behaviour that existed
-             before this module: nothing here changes it.
+             calls them while it answers. The behaviour that existed before this module: nothing
+             here changes it. It is what a machine already set up for it keeps (see below); it
+             needs a custom connector, which a new PC may not be allowed to create.
 
   connector-less  The agent has NO tools registered. The model asks for a call in a fenced block in
              its reply (relay/socket_tools.py), this process runs the call against its own
@@ -21,7 +22,16 @@ The choice is read from `tool_transport=` in settings.txt (the cockpit's file, r
 tools/settings_path.py) and nowhere else. There is deliberately NO environment variable for it:
 an environment value that beats the screen is how a hand-passed flag silently overrides what the
 operator sees (effort_policy carries that scar). Anything missing, unreadable or not one of the
-two accepted spellings reads as `connector`, so a typo can never switch a machine onto the unproven path.
+two accepted spellings reads as the UNSET value, `unset_value()`:
+
+  - a machine whose .env has MCP_TUNNEL_URL or MCP_TUNNEL_NAME (it was set up for the connector
+    route) reads `connector`, so updating the code never switches it;
+  - any other machine (a new PC) reads `connector-less`, the DEFAULT_TRANSPORT.
+
+A typo is therefore "as if unset": it keeps the route the machine was on and never moves it onto
+another one. `python -m relay.tool_bridge pin-legacy` writes the connector value into settings.txt for
+a machine of the first kind (quickstart.bat and start_all.ps1 run it), so the cockpit and the file
+say the same thing the reader does.
 
 WHAT THE BRIDGE MODE HAS TO TURN OFF. The fleet has several checks that assume the agent holds a
 connector: "the MCP connector never initialised", "the model says it has no call_tool", "a call
@@ -48,7 +58,20 @@ TRANSPORTS = (CONNECTOR, CONNECTOR_LESS)
 #: was called; a settings.txt written with it keeps working.
 _ALIASES = {"bridge": CONNECTOR_LESS, "connector-less": CONNECTOR_LESS, "connector_less": CONNECTOR_LESS,
             "connectorless": CONNECTOR_LESS, "connector": CONNECTOR}
-DEFAULT_TRANSPORT = CONNECTOR
+#: What a machine gets when settings.txt says nothing AND it has never been set up for the connector
+#: route. connector-less, because a new PC (a locked-down tenant) cannot create the custom connector the
+#: other route needs: with `connector` as the default, an operator who chose nothing was walked into
+#: a step that cannot succeed. Must equal ui/EffortPolicy.cs ToolRouteView.Default and the
+#: tool_transport default in tools/settings_keys.py (a test pins the three together).
+DEFAULT_TRANSPORT = CONNECTOR_LESS
+
+#: .env keys that exist only on a machine already set up for the connector route: bootstrap.py /
+#: setup_devtunnel.ps1 write them when they create the Dev Tunnel the connector points at. A machine
+#: that has either one, and no `tool_transport=` line, was running the connector route before the
+#: default changed, and it keeps running it: an update must not switch it (its agent holds a
+#: connector, so a switch changes what the agent does). ui/EffortPolicy.cs ToolRouteView.UnsetValue
+#: reads the same two keys.
+CONNECTOR_FOOTPRINT_KEYS = ("MCP_TUNNEL_URL", "MCP_TUNNEL_NAME")
 
 #: The local MCP server the bridge calls. The gateway tool lives behind this one URL.
 LOCAL_MCP_URL = "http://127.0.0.1:8000/mcp"
@@ -76,30 +99,101 @@ def _settings_path(path=None):
     return settings_file()
 
 
-def transport(path=None) -> str:
-    """`connector` or `connector-less`, from settings.txt. Never raises; anything unclear is connector.
+def _env_file_for(path=None, env_path=None):
+    """The .env that says whether this machine was set up for the connector route.
 
-    `path` exists for tests (they must never be steered by the developer's own settings file).
+    A test that names its own settings file gets NO .env unless it names that too, so the developer's
+    own .env can never steer it (same reason `path` exists).
+    """
+    if env_path is not None:
+        return str(env_path)
+    if path:
+        return None
+    from tools.settings_path import REPO
+    return os.path.join(REPO, ".env")
+
+
+_env_cache = {}
+
+
+def has_connector_footprint(path=None, env_path=None) -> bool:
+    """True when .env holds a non-empty MCP_TUNNEL_URL or MCP_TUNNEL_NAME: this machine was set up for the connector route.
+
+    Never raises. A missing or unreadable .env is "no footprint" (a new PC has no .env, or one
+    without those keys). `path` / `env_path` exist for tests.
     """
     try:
-        p = _settings_path(path)
+        ep = _env_file_for(path, env_path)
+        if not ep:
+            return False
+        st = os.stat(ep)
+        key = (ep, st.st_mtime_ns, st.st_size)
+        hit = _env_cache.get(ep)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        found = False
+        with open(ep, encoding="utf-8-sig") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if not ln or ln.startswith("#") or "=" not in ln:
+                    continue
+                k, v = ln.split("=", 1)
+                if k.strip() in CONNECTOR_FOOTPRINT_KEYS and v.strip().strip("\"'").strip():
+                    found = True
+                    break
+        _env_cache[ep] = (key, found)
+        return found
+    except Exception:
+        return False
+
+
+def unset_value(path=None, env_path=None) -> str:
+    """What this machine runs when settings.txt has no usable `tool_transport=` line.
+
+    connector for a machine already set up for the connector route (so an update never switches it),
+    connector-less (DEFAULT_TRANSPORT) for every other machine.
+    """
+    return CONNECTOR if has_connector_footprint(path, env_path) else DEFAULT_TRANSPORT
+
+
+def _line_value(p):
+    """The transport named by the file's first `tool_transport=` line; None when there is no such
+    line, the value is not an accepted spelling, or the file cannot be read."""
+    try:
         st = os.stat(p)
         key = (p, st.st_mtime_ns, st.st_size)
         hit = _cache.get(p)
         if hit is not None and hit[0] == key:
             return hit[1]
-        val = DEFAULT_TRANSPORT
+        val = None
         with open(p, encoding="utf-8-sig") as fh:
             for ln in fh:
                 ln = ln.strip()
                 if ln.startswith("tool_transport="):
-                    v = ln.split("=", 1)[1].strip().lower()
-                    val = _ALIASES.get(v, DEFAULT_TRANSPORT)
+                    val = _ALIASES.get(ln.split("=", 1)[1].strip().lower())
                     break
         _cache[p] = (key, val)
         return val
     except Exception:
-        return DEFAULT_TRANSPORT
+        return None
+
+
+def transport(path=None, env_path=None) -> str:
+    """`connector` or `connector-less`, from settings.txt. Never raises.
+
+    A `tool_transport=` line with an accepted spelling wins. Anything else -- no file, no line, an
+    unreadable file, a value that is not an accepted spelling -- reads as unset_value(): the route
+    this machine was already on if it was set up for the connector, otherwise the default. So a typo
+    can never move a machine onto a route it was not using.
+
+    `path` / `env_path` exist for tests (they must never be steered by the developer's own files).
+    """
+    try:
+        p = _settings_path(path)
+    except Exception:
+        return unset_value(path, env_path)
+    v = _line_value(p)
+    return v if v is not None else unset_value(path, env_path)
 
 
 def is_bridge(path=None) -> bool:
@@ -473,6 +567,8 @@ def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):
 #
 #   python -m relay.tool_bridge            prints `connector` or `connector-less`
 #   python -m relay.tool_bridge set X      writes tool_transport=X into the settings file
+#   python -m relay.tool_bridge pin-legacy writes tool_transport=connector for a machine set up for
+#                                          the connector route that has no such line, then prints
 #
 # quickstart.bat, start_all.ps1, doctor.ps1, supervisor.ps1 and bootstrap.py decide whether a Dev
 # Tunnel is needed by asking THIS function, so the answer cannot differ between them and the GUI
@@ -516,10 +612,31 @@ def set_transport(value, path=None) -> bool:
         return False
 
 
+def pin_legacy(path=None, env_path=None) -> bool:
+    """Write `tool_transport=connector` when this machine was set up for the connector route and the
+    settings file has no accepted `tool_transport=` line. True when it wrote.
+
+    The reader already gives such a machine `connector` (unset_value); this makes the file say so,
+    which is what the cockpit shows and what survives .env being edited later. A machine that
+    already has a line, or has no connector footprint, is left alone.
+    """
+    try:
+        p = _settings_path(path)
+        if _line_value(p) is not None or not has_connector_footprint(path, env_path):
+            return False
+        return set_transport(CONNECTOR, path)
+    except Exception:
+        return False
+
+
 def main(argv=None) -> int:
     import sys
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
+        print(transport())
+        return 0
+    if args == ["pin-legacy"]:
+        pin_legacy()
         print(transport())
         return 0
     if args[0] == "set" and len(args) == 2:

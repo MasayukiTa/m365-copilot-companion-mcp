@@ -4,7 +4,7 @@
 
 ## これは何か
 
-通常、Copilot Studio のエージェントはカスタムコネクタ(MCP コネクタ)を持ち、Dev Tunnel を通してこの PC のツールに届きます。これが**コネクタ経路**です。
+従来の経路では、Copilot Studio のエージェントがカスタムコネクタ(MCP コネクタ)を持ち、Dev Tunnel を通してこの PC のツールに届きます。これが**コネクタ経路**です。新しい PC ではカスタムコネクタを作れないことがあります(DLP で拒否されます)。
 
 **コネクタなし経路**はコネクタもトンネルも使いません。エージェントはコネクタも自前のツールも持たない普通の Standard エージェントです。ツールを使いたいときはチャットの返信に次のようなコードブロックで呼び出しを書きます。
 
@@ -14,7 +14,14 @@
 
 この PC がそのブロックを読み取り、手元のサーバー(`http://127.0.0.1:8000`)に呼び出しを実行して、結果を次のチャットのメッセージで返します。外からこの PC に接続するものはないのでトンネルも公開 URL も登録するコネクタも要りません。
 
-どちらの経路も使えます。既定はコネクタ経路のままなのでもう一方を選ばないマシンは何も変わりません。
+どちらの経路も使えます。**新しい PC の既定はコネクタなし経路です。** 何も選ばなければ、作れないコネクタを求める手順には進みません。
+
+すでにコネクタ経路で動いている PC は、更新(`git pull` や `start_all.bat`)してもコネクタ経路のままです。見分け方は次のとおりです。
+
+- 設定ファイルに `tool_transport=` の行があれば、その値に従います。
+- 行が無く、`.env` に `MCP_TUNNEL_URL` か `MCP_TUNNEL_NAME` の値がある PC は、コネクタ経路で動いていたと見なします。`quickstart.bat` と `start_all.bat` が `tool_transport=connector` を設定ファイルに書き込みます。書き込む前でも、読み取りの結果は同じコネクタ経路です。
+- 行が無く、`.env` にもその値が無い PC は、コネクタなし経路です。
+- 行の値が不明(書き間違い)のときは、行が無いものとして上の規則に従います。書き間違いで経路が変わることはありません。
 
 ## 必要なもの
 
@@ -25,7 +32,7 @@ Dev Tunnel CLI、トンネル、コネクタ、アクセス許可は要りませ
 
 ## 新しく使い始める人の手順
 
-1. `quickstart.bat` を実行します。「How should Copilot Studio be allowed to reach this machine?」と聞かれたら **L**(connector-less)を押します。アクセスの質問と Dev Tunnel の手順は省かれます。
+1. `quickstart.bat` を実行します。新しい PC では何も聞かれず、コネクタなし経路で進みます。アクセスの質問と Dev Tunnel の手順は省かれます。コネクタ経路に設定されている PC では「How should Copilot Studio reach the tools on this machine?」と聞かれます。**L**(connector-less)を押してください。A、T、N はカスタムコネクタを作れる人向けです。
 2. Copilot Studio で **Standard** エージェントを作ります。**Tools** の一覧は空のままにして、コネクタは追加しません。公開します。
 3. 公開したエージェントを Microsoft 365 Copilot に追加します(Channels から Microsoft 365 Copilot)。そこでエージェントを開き、チャット画面のアドレスをアドレスバーからコピーします。
 4. `quickstart.bat` が開くダイアログにそのアドレスを貼ります(あとから貼るなら `configure_env.bat`)。エージェントの URL として保存されます。
@@ -65,7 +72,7 @@ Dev Tunnel CLI、トンネル、コネクタ、アクセス許可は要りませ
 
 ## 元に戻す
 
-**設定**の**ツール**を開き、**ツールの接続方式**(英語表示では「Tool route」)を**コネクタ(従来)**(英語表示では「Connector」)にします。そして `configure_env.bat` で控えておいた古いエージェントの URL を戻します。次の会話からまたコネクタ経路を使います。そのマシンでトンネルを一度も作ったことがなければもう一度 `quickstart.bat` を実行し、アクセスの質問に **A** か **T** と答えてください。省かれていた Dev Tunnel の手順が実行されます。
+**設定**の**ツール**を開き、**ツールの接続方式**(英語表示では「Tool route」)を**コネクタ(従来)**(英語表示では「Connector」)にします。そして `configure_env.bat` で控えておいた古いエージェントの URL を戻します。次の会話からまたコネクタ経路を使います。そのマシンでトンネルを一度も作ったことがなければもう一度 `quickstart.bat` を実行し、アクセスの質問に **A** か **T** と答えてください。省かれていた Dev Tunnel の手順が実行されます。この質問が出るのはコネクタ経路のときだけです。コネクタなし経路の PC では出ないので、先にコックピットで**コネクタ(従来)**に切り替えてから実行してください。カスタムコネクタを作れない PC では、この手順は行えません。
 
 設定ファイルには、`tool_transport=connector` または `tool_transport=connector-less` として保存されます。以前の書き方 `tool_transport=bridge` もコネクタなしとして読み取ります。
 
@@ -77,8 +84,9 @@ Dev Tunnel CLI、トンネル、コネクタ、アクセス許可は要りませ
 
 ## What it is
 
-By default the agent in Copilot Studio holds a custom connector (an MCP connector) and reaches this
-PC's tools through a Dev Tunnel. That is the **connector** route.
+On the earlier route the agent in Copilot Studio holds a custom connector (an MCP connector) and reaches this
+PC's tools through a Dev Tunnel. That is the **connector** route. A new PC may not be allowed to create
+the custom connector (DLP denies it).
 
 The **connector-less** route needs neither. The agent is a plain Standard agent with no connector and
 no tools of its own. When it wants a tool it writes the call in its chat reply, as a fenced block:
@@ -91,8 +99,19 @@ This PC reads the block, runs the call against its own local server (`http://127
 and sends the result back in the next chat message. Nothing connects to this PC from outside, so there
 is no tunnel, no public URL and no connector to register.
 
-Both routes are supported. The connector route stays the default; nothing changes for a machine that
-does not choose the other one.
+Both routes are supported. **A new PC defaults to the connector-less route**, so choosing nothing never
+leads into steps that ask for a connector it cannot create.
+
+A PC that already runs the connector route stays on it when you update (`git pull`, `start_all.bat`).
+How the product tells them apart:
+
+- If the settings file has a `tool_transport=` line, that value is used.
+- With no line, a PC whose `.env` has a value for `MCP_TUNNEL_URL` or `MCP_TUNNEL_NAME` is taken to have
+  been running the connector route. `quickstart.bat` and `start_all.bat` write `tool_transport=connector`
+  into the settings file for it. Even before that write, the reader gives the same answer: connector.
+- With no line and no such `.env` value, the route is connector-less.
+- An unknown value (a typo) is treated as if there were no line and follows the rules above. A typo never
+  changes the route.
 
 ## What you need
 
@@ -103,8 +122,10 @@ You do not need the Dev Tunnel CLI, a tunnel, a connector, or an access grant.
 
 ## Setup for a new user
 
-1. Run `quickstart.bat`. At the question "How should Copilot Studio be allowed to reach this
-   machine?" press **L** (connector-less). The access question and the Dev Tunnel step are skipped.
+1. Run `quickstart.bat`. On a new PC it asks nothing and goes on with the connector-less route; the
+   access question and the Dev Tunnel step are skipped. On a PC set to the connector route it asks "How
+   should Copilot Studio reach the tools on this machine?": press **L** (connector-less). A, T and N are
+   for people who can create a custom connector.
 2. In Copilot Studio create a **Standard** agent. Leave its **Tools** list empty: do not add a
    connector. Publish it.
 3. Add the published agent to Microsoft 365 Copilot (Channels, then Microsoft 365 Copilot), and open it
@@ -180,7 +201,9 @@ never started by this product.
 
 Open **Settings**, **Tools**, set **Tool route** to **Connector**, and put the old agent URL back with `configure_env.bat`. The next conversation uses the
 connector route again. If the machine has never had a tunnel, run `quickstart.bat` again and answer
-the access question with **A** or **T**; it sets up the Dev Tunnel step that was skipped.
+the access question with **A** or **T**; it sets up the Dev Tunnel step that was skipped. That question
+is asked only on the connector route, so switch the route to Connector in the cockpit first. A PC that
+cannot create a custom connector cannot do this.
 
 The setting is stored as `tool_transport=connector` or `tool_transport=connector-less` in the settings
 file. The earlier spelling `tool_transport=bridge` is still read as connector-less.

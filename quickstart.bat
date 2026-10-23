@@ -212,22 +212,36 @@ if defined DO_PULL (
 )
 
 REM THE TOOL ROUTE (setting tool_transport, GUI: Settings > Tools), asked of the product's own
-REM reader so this file, the other scripts and the GUI cannot disagree. "connector" (the default
-REM and what an unreadable answer means) needs a custom connector and a Dev Tunnel. "connector-less"
-REM needs neither: the access question and STEP 4 below are skipped and STEP 5 does not ask for a
-REM connector. See docs/connector_less_route.md.
+REM reader so this file, the other scripts and the GUI cannot disagree. "connector-less" (the
+REM default of a new PC) needs neither a custom connector nor a Dev Tunnel: the access question and
+REM STEP 4 below are skipped and STEP 5 does not ask for a connector. "connector" needs both; a PC
+REM gets it only if it was set up for it (its .env has the tunnel) or the operator chose it. A new PC
+REM cannot create the custom connector (DLP), so it must never be walked into that route by default.
+REM See docs/connector_less_route.md.
+REM FIRST: a PC set up for the connector route before the default changed, with no tool_transport
+REM line, gets the line written, so an update never moves it. Does nothing for any other PC.
+"!QS_PY!" -m relay.tool_bridge pin-legacy >nul 2>nul
+REM Only if the reader cannot run at all: the route that existed before, as everywhere else.
 set "TOOL_ROUTE=connector"
 for /f "usebackq delims=" %%R in (`"!QS_PY!" -m relay.tool_bridge 2^>nul`) do set "TOOL_ROUTE=%%R"
 if "!TOOL_ROUTE!"=="connector-less" goto :route_connectorless
 
 echo.
 echo ===========================================================================
-echo  How should Copilot Studio be allowed to reach this machine?
+echo  How should Copilot Studio reach the tools on this machine?
 echo ===========================================================================
-echo   The tunnel needs an access grant or NOTHING can connect to it -- the
-echo   connection test in STEP 5 will fail. Asked before the tunnel is created,
-echo   because the grant is part of creating it.
+echo   This PC is set to the connector route ^(a custom connector and a Dev Tunnel^).
+echo   Press L unless you are SURE you can create a custom connector in Copilot
+echo   Studio: a new PC usually cannot ^(DLP denies it^), and A, T and N then stop
+echo   at a step that cannot succeed.
 echo.
+echo   [L] Connector-less - RECOMMENDED. No custom connector and NO Dev Tunnel. The
+echo                    agent writes its tool calls in the chat and this PC runs
+echo                    them. STEP 4 is skipped. See docs\connector_less_route.md.
+echo                    Change it later in Settings ^> Tools ^> Tool route.
+echo.
+echo   Only if you can create a custom connector ^(the tunnel needs an access grant
+echo   or NOTHING can connect to it; asked before the tunnel is created^):
 echo   [A] Anonymous  - anyone who knows the URL can reach the server. The file
 echo                    and shell tools are then on the public internet, gated
 echo                    ONLY by your Bearer token. Simplest, and least private.
@@ -235,21 +249,17 @@ echo   [T] Tenant     - only accounts in the Entra tenant of the Microsoft accou
 echo                    you sign devtunnel in with in STEP 4. More restrictive.
 echo   [N] Neither    - decide later. Copilot Studio will NOT connect, and quickstart
 echo                    STOPS after STEP 4 until you choose A or T.
-echo   [L] Connector-less - no custom connector and NO Dev Tunnel. The agent writes
-echo                    its tool calls in the chat and this PC runs them. STEP 4 is
-echo                    skipped. See docs\connector_less_route.md. Change it later in
-echo                    Settings ^> Tools ^> Tool route.
 echo.
 set "TUNNEL_ACCESS="
 set "TENANT_ID="
-choice /C ATNL /N /M "   Press A, T, N or L: "
-REM Read errorlevel IMMEDIATELY -- choice sets it (A=1, T=2, N=3) and any command
+choice /C LATN /N /M "   Press L (recommended), A, T or N: "
+REM Read errorlevel IMMEDIATELY -- choice sets it (L=1, A=2, T=3, N=4) and any command
 REM in between resets it. Delayed expansion is on, so !ERRORLEVEL! is the runtime value.
 set "QS_CHOICE=!ERRORLEVEL!"
-if "!QS_CHOICE!"=="1" set "TUNNEL_ACCESS=anonymous"
-if "!QS_CHOICE!"=="2" set "TUNNEL_ACCESS=tenant"
-if "!QS_CHOICE!"=="3" set "TUNNEL_ACCESS=none"
-if "!QS_CHOICE!"=="4" goto :route_choose_connectorless
+if "!QS_CHOICE!"=="1" goto :route_choose_connectorless
+if "!QS_CHOICE!"=="2" set "TUNNEL_ACCESS=anonymous"
+if "!QS_CHOICE!"=="3" set "TUNNEL_ACCESS=tenant"
+if "!QS_CHOICE!"=="4" set "TUNNEL_ACCESS=none"
 REM NO ANSWER IS NOT N (2026-09-24). MEASURED: with stdin closed, `choice` prints "ERROR: The file
 REM is either empty or does not contain the valid choices" and sets none of the above. That used
 REM to be recorded as N, the run went on, and it ended with a tunnel nothing could connect to
@@ -696,9 +706,9 @@ echo.
 echo ===========================================================================
 echo  Tool route: connector-less  ^(no custom connector, no Dev Tunnel^)
 echo ===========================================================================
-echo   The access question and STEP 4 ^(Dev Tunnel^) are skipped. To use the connector
-echo   route instead, set Settings ^> Tools ^> Tool route to Connector and run
-echo   quickstart.bat again.
+echo   This is the default of a new PC. The access question and STEP 4 ^(Dev Tunnel^)
+echo   are skipped. Only if you can create a custom connector in Copilot Studio: set
+echo   Settings ^> Tools ^> Tool route to Connector and run quickstart.bat again.
 goto :after_step4
 
 :access_unanswered
