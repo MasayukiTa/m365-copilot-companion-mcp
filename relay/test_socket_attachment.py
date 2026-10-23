@@ -52,9 +52,17 @@ def test_no_token_is_a_refusal_before_any_page_is_opened(tmp_path):
 
 
 def test_an_exception_anywhere_is_still_a_refusal_not_a_raise(tmp_path, monkeypatch):
-    """呼び出し側は「注釈か、タブか」しか扱わない。例外が出るとそのどちらでもなくなる。"""
+    """呼び出し側は「注釈か、理由つきの終了か」しか扱わない。例外が出るとそのどちらでもなくなる。"""
+    from relay import upload_template as UT
+    monkeypatch.setattr(UT, "CACHE_DIR", str(tmp_path / "cache"))
     png = tmp_path / "a.png"
     png.write_bytes(b"\x89PNG\r\n")
+
+    class _Refused:
+        status_code = 403
+
+    # the minimal request is tried first; refused here, so the page capture (which blows up) runs
+    monkeypatch.setattr("requests.post", lambda *a, **k: _Refused())
 
     class _Boom:
         def new_page(self):
@@ -62,7 +70,8 @@ def test_an_exception_anywhere_is_still_a_refusal_not_a_raise(tmp_path, monkeypa
 
     said = []
     assert SA.annotation_for(_Boom(), "https://x/", str(png), "tok", log=said.append) is None
-    assert any("CopilotTabForbidden" in m for m in said), "何が起きたか言わずに黙って諦めた"
+    assert any("capture failed" in m and "RuntimeError" in m for m in said), \
+        "何が起きたか言わずに黙って諦めた"
 
 
 def test_the_headers_a_replay_must_not_forward():
@@ -95,17 +104,17 @@ def _src():
     return code_only(_MODULE)
 
 
-def test_the_request_is_replayed_and_never_rebuilt():
-    """三度やって三度違う形で間違えた。ページ自身のバイト列を送る以外に通る道は無い。
+def test_the_request_shape_is_captured_and_only_the_file_value_is_replaced():
+    """三度やって三度違う形で間違えた。ヘッダーと他のフィールドは、ページ自身のバイト列のまま。
 
-    この不変条件は scripts/probes/replay_upload_with_our_token.py で固定されているが、
-    **フリートの実経路に居るのはこちら**。プローブだけを守っても、本番の経路が組み立て
-    始めたら誰も気づかない。"""
+    2026-10-23 以降、ファイルごとに変わる FileBase64 の値だけを差し替える(ページはもう
+    毎回開かない)。差し替えてよい箇所は relay/upload_template.build の一か所で、その不変条件は
+    test_upload_template.py が固定している。ここでは、実経路がその一か所を通ることを守る。"""
     code = _src()
-    assert "post_data_buffer" in code, "ページ自身のボディを取っていない"
-    assert 'data=captured["body"]' in code, "捕獲したボディを送っていない"
-    assert "FileBase64" not in code, "multipart のフィールドを組み立て直している"
+    assert "UT.build(tpl, upload_path)" in code, "キャッシュした形にファイルを差し込んでいない"
+    assert "FileBase64" not in code, "multipart のフィールドをここで組み立てている"
     assert 'files={"file"' not in code, "バイナリパートを再構成している"
+    assert "forbid_copilot_tab" not in code, "タブ拒否に戻っている(キャッシュ経路が無効)"
 
 
 def test_only_the_authorization_is_replaced():
