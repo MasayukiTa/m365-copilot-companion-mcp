@@ -127,6 +127,17 @@ jobs:
           [IO.File]::WriteAllLines((Join-Path $d 'devtunnel.cmd'), $lines)
           Add-Content -Path $env:GITHUB_PATH -Value $d
 
+      - name: Choose the connector route for this run
+        shell: powershell
+        run: |
+          # A new PC now defaults to the connector-less route (relay/tool_bridge.py), which skips the
+          # Dev Tunnel and connector steps this job exists to exercise with its devtunnel stub. Pick the
+          # connector route the way an operator would: a tool_transport line in the settings file.
+          $cfg = Join-Path (Join-Path $env:RUNNER_TEMP $env:TARGET_DIR) '.config'
+          New-Item -ItemType Directory -Force -Path $cfg | Out-Null
+          [IO.File]::WriteAllText((Join-Path $cfg 'settings.txt'), "tool_transport=connector`n", (New-Object Text.UTF8Encoding $false))
+          exit 0
+
       - name: Run setup.bat (first run)
         shell: cmd
         env:

@@ -102,15 +102,22 @@ def test_a_deep_research_conversation_never_gets_tools(monkeypatch):
     assert drv._catalogue is None and drv._run_tool is None
 
 
-def test_an_unset_transport_in_a_real_settings_file_means_connector(tmp_path, monkeypatch):
-    """The unpatched path: driver_for really reads the settings file through the resolver."""
+def test_an_unset_transport_in_a_real_settings_file_follows_the_pc_s_footprint(tmp_path, monkeypatch):
+    """The unpatched path: driver_for really reads the settings file (and the .env beside it)
+    through the resolver. Unset = connector-less on a new PC, connector on a PC set up for it."""
     from tools import settings_path as SP
     p = tmp_path / "settings.txt"
     p.write_text("maxtabs=3\n", encoding="utf-8")
     monkeypatch.setattr(SP, "NEW_PATH", str(p))
-    assert _route().driver_for("w0")._run_tool is None
+    monkeypatch.setattr(SP, "REPO", str(tmp_path))          # the .env the resolver looks at
+    assert _route().driver_for("w0")._run_tool is not None       # new PC: no .env at all
+    (tmp_path / ".env").write_text("MCP_TUNNEL_URL=https://x.invalid/mcp\n", encoding="utf-8")
+    assert _route().driver_for("w0")._run_tool is None           # set up for the connector: unchanged
     p.write_text("maxtabs=3\ntool_transport=bridge\n", encoding="utf-8")
     assert _route().driver_for("w0")._run_tool is not None
+    p.write_text("maxtabs=3\ntool_transport=connector\n", encoding="utf-8")
+    (tmp_path / ".env").write_text("OTHER=1\n", encoding="utf-8")
+    assert _route().driver_for("w0")._run_tool is None           # an explicit choice always wins
 
 
 def test_the_fleet_s_own_route_is_equipped(monkeypatch):
