@@ -68,7 +68,7 @@ def test_the_token_is_never_on_disk_in_clear(tmp_path):
     metadata (agent hash, audience, expiry, an account fingerprint)."""
     tok = _jwt()
     assert _save(tok, d=tmp_path)
-    path = TC.cache_path(AGENT, str(tmp_path))
+    path = TC.file_for(AGENT, str(tmp_path))
     raw = open(path, "rb").read().decode("utf-8")
     for part in tok.split("."):
         assert part not in raw
@@ -85,14 +85,14 @@ def test_nothing_is_written_where_the_token_cannot_be_encrypted(tmp_path):
     def no_dpapi(_v):
         raise RuntimeError("DPAPI protection is only available on Windows")
     assert not TC.save(_jwt(), AGENT, directory=str(tmp_path), protect=no_dpapi)
-    assert not os.path.exists(TC.cache_path(AGENT, str(tmp_path)))
+    assert not os.path.exists(TC.file_for(AGENT, str(tmp_path)))
 
 
 def test_a_protector_that_hands_the_token_back_is_refused(tmp_path):
     tok = _jwt()
     assert not TC.save(tok, AGENT, directory=str(tmp_path), protect=lambda v: v)
     assert not TC.save(tok, AGENT, directory=str(tmp_path), protect=lambda v: "x" + v)
-    assert not os.path.exists(TC.cache_path(AGENT, str(tmp_path)))
+    assert not os.path.exists(TC.file_for(AGENT, str(tmp_path)))
 
 
 def test_only_the_default_protector_is_dpapi():
@@ -108,7 +108,7 @@ def test_an_expired_token_is_not_reused_and_the_file_goes(tmp_path):
     tok = _jwt(exp_in=3600)
     assert _save(tok, d=tmp_path)
     assert _load(d=tmp_path, now=time.time() + 7200) == ""
-    assert not os.path.exists(TC.cache_path(AGENT, str(tmp_path)))
+    assert not os.path.exists(TC.file_for(AGENT, str(tmp_path)))
 
 
 def test_a_token_with_too_little_life_is_neither_saved_nor_reused(tmp_path):
@@ -125,9 +125,9 @@ def test_another_agent_surface_never_gets_the_token(tmp_path):
     assert _load(agent="https://m365.cloud.microsoft/chat/agent/T_other", d=tmp_path) == ""
     # and a file copied under another agent's name is caught by the hash stored inside it
     other = "https://m365.cloud.microsoft/chat/agent/T_other"
-    os.replace(TC.cache_path(AGENT, str(tmp_path)), TC.cache_path(other, str(tmp_path)))
+    os.replace(TC.file_for(AGENT, str(tmp_path)), TC.file_for(other, str(tmp_path)))
     assert _load(agent=other, d=tmp_path) == ""
-    assert not os.path.exists(TC.cache_path(other, str(tmp_path)))
+    assert not os.path.exists(TC.file_for(other, str(tmp_path)))
 
 
 def test_a_token_for_another_resource_is_not_saved(tmp_path):
@@ -144,7 +144,7 @@ def test_a_fingerprint_that_does_not_match_the_token_is_discarded(tmp_path):
     """The file says one account, the token inside is another: whatever made that, it is not
     something to hand to a worker."""
     assert _save(_jwt(oid="user-a"), d=tmp_path)
-    path = TC.cache_path(AGENT, str(tmp_path))
+    path = TC.file_for(AGENT, str(tmp_path))
     meta = json.load(open(path, encoding="utf-8"))
     meta["who"] = TC.who_of(_jwt(oid="user-b"))
     json.dump(meta, open(path, "w", encoding="utf-8"))
@@ -159,11 +159,11 @@ def test_a_file_this_user_cannot_decrypt_is_discarded(tmp_path):
     def refuse(_v):
         raise OSError("The data is invalid")
     assert TC.load(AGENT, directory=str(tmp_path), unprotect=refuse) == ""
-    assert not os.path.exists(TC.cache_path(AGENT, str(tmp_path)))
+    assert not os.path.exists(TC.file_for(AGENT, str(tmp_path)))
 
 
 def test_corrupt_or_foreign_files_are_not_an_error(tmp_path):
-    path = TC.cache_path(AGENT, str(tmp_path))
+    path = TC.file_for(AGENT, str(tmp_path))
     os.makedirs(os.path.dirname(path), exist_ok=True)
     open(path, "w", encoding="utf-8").write("{not json")
     assert _load(d=tmp_path) == ""
@@ -303,9 +303,9 @@ def test_a_capture_that_succeeds_leaves_its_token_for_the_next_process(dirs):
 def test_a_browser_reset_forgets_the_cached_token(dirs):
     from relay import relay_fleet
     assert TC.save(_jwt(), AGENT)
-    assert os.path.exists(TC.cache_path(AGENT))
+    assert os.path.exists(TC.file_for(AGENT))
     relay_fleet.reset_socket_route()
-    assert not os.path.exists(TC.cache_path(AGENT))
+    assert not os.path.exists(TC.file_for(AGENT))
 
 
 def test_a_refused_token_forgets_the_cached_token_but_a_mere_mention_does_not(dirs):
@@ -313,9 +313,9 @@ def test_a_refused_token_forgets_the_cached_token_but_a_mere_mention_does_not(di
     assert TC.save(_jwt(), AGENT)
     assert not relay_fleet._forget_cached_tokens("w1: connection reset while reading a frame")
     assert not relay_fleet._forget_cached_tokens("w1: no token available for the tool call")
-    assert os.path.exists(TC.cache_path(AGENT))
+    assert os.path.exists(TC.file_for(AGENT))
     assert relay_fleet._forget_cached_tokens("w1: HTTP 401 from the socket")
-    assert not os.path.exists(TC.cache_path(AGENT))
+    assert not os.path.exists(TC.file_for(AGENT))
 
 
 # ---- the page that holds a token with a few minutes left --------------------------------------

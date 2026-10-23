@@ -337,6 +337,10 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    ("relay.token_cache", "file_for"):
+        "a function that joins its `directory` argument, or CACHE_DIR, with a file name; "
+        "CACHE_DIR itself is redirected in LIVE_RECORD_REDIRECTS, so it resolves to the per-run "
+        "temp directory in tests",
     # NOT A PATH -- A SET OF DIRECTORY NAMES the updater must keep when it replaces a tree:
     # {".env", ".venv", ".setup", ".fleet", ...}. Nothing is written THROUGH it, and pointing it
     # at a temp directory would make the updater stop preserving the operator's .fleet, which is

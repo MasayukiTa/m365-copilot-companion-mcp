@@ -77,7 +77,7 @@ def _agent_hash(agent_url: str) -> str:
     return hashlib.sha256((agent_url or "").encode("utf-8")).hexdigest()[:16]
 
 
-def cache_path(agent_url: str, directory=None) -> str:
+def file_for(agent_url: str, directory=None) -> str:
     return os.path.join(directory or CACHE_DIR, "token_%s.json" % _agent_hash(agent_url))
 
 
@@ -102,7 +102,7 @@ def _read(path):
 
 def discard(agent_url: str, directory=None) -> None:
     try:
-        os.remove(cache_path(agent_url, directory))
+        os.remove(file_for(agent_url, directory))
     except OSError:
         pass
 
@@ -147,7 +147,7 @@ def save(token: str, agent_url: str, *, directory=None, protect=None, now=None,
             return False
         claims = _claims(token)
         exp = float(claims.get("exp") or 0)
-        path = cache_path(agent_url, directory)
+        path = file_for(agent_url, directory)
         old = _read(path)
         if old and old.get("who") == who and float(old.get("exp") or 0) >= exp:
             return True
@@ -183,7 +183,7 @@ def load(agent_url: str, *, directory=None, unprotect=None, now=None, audience=N
     now = time.time() if now is None else float(now)
     audience = PT.AUDIENCE if audience is None else audience
     min_life = PT.MIN_LIFE_S if min_life_s is None else float(min_life_s)
-    path = cache_path(agent_url, directory)
+    path = file_for(agent_url, directory)
     rec = _read(path)
     if rec is None:
         return ""

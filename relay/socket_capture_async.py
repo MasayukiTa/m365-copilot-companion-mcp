@@ -153,7 +153,7 @@ class AsyncCaptureManager:
                 return False
             from relay import token_cache
             from relay.profile_token import load_template
-            if not os.path.exists(token_cache.cache_path(key)):
+            if not os.path.exists(token_cache.file_for(key)):
                 return False          # the common case on a lap: nothing cached, nothing to read
             template = load_template(key)
             if template is None:
