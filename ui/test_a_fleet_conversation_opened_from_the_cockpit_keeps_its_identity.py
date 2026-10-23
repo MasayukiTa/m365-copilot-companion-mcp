@@ -177,8 +177,9 @@ def test_sync_registry_reads_and_merges_transcript_lineage():
     assert 'var regLineage = RegistryTranscriptLineage(d)' in body
     assert 'existingC.Transcripts = FleetConvIdentity.MergeTranscriptLineage' in body
     assert 'FleetConvIdentity.LatestTranscript' in body
-    assert 'regSource == c.Source && regName == c.Name' in body, (
-        "URL-less socket rows must use the same (source,name) identity as the Python registry merge")
+    assert 'FleetConvIdentity.SyncRowMatches(url, regSource, regName' in body, (
+        "URL-less socket rows match a sidebar row by (source,name) AND a shared run, never the "
+        "name alone (see ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py)")
 
 
 def test_sidebar_open_reads_all_segments_but_live_follow_keeps_latest_pointer():

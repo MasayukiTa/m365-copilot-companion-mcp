@@ -123,13 +123,15 @@ partial class ChatWindow
                 // (DiscoverTranscripts only scans once, at startup).
                 string regGoal = SS(d, "goal");
                 Conversation existingC = null;
+                // WHICH SIDEBAR ROW IS THIS REGISTRY ROW. By id when the row has one. A row with
+                // no id matches by its transcript file, or by (source, name) only together with
+                // a shared run: a worker name is reused by every run, and matching on it alone
+                // merged other runs' transcripts into whichever row happened to be named w1
+                // (FleetConvIdentity.SyncRowMatches).
                 foreach (var c in _all)
                 {
-                    if (!string.IsNullOrEmpty(url) && c.ConvUrl == url) { existingC = c; break; }
-                    if (string.IsNullOrEmpty(url) && regSource == c.Source && regName == c.Name
-                        && !string.IsNullOrEmpty(regName)) { existingC = c; break; }
-                    if (string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(transcript)
-                        && c.Transcript == transcript) { existingC = c; break; }
+                    if (FleetConvIdentity.SyncRowMatches(url, regSource, regName, transcript, regLineage,
+                            c.ConvUrl, c.Source, c.Name, c.Transcript, c.Transcripts)) { existingC = c; break; }
                 }
                 if (existingC != null)
                 {
@@ -295,8 +297,17 @@ partial class ChatWindow
         var wkr = ReadFleetWorker(key);
         bool running = FleetRunningFresh();
         string liveTranscriptPath = wkr != null ? SS(wkr, "transcript") : "";
-        if (string.IsNullOrEmpty(liveTranscriptPath) && !string.IsNullOrEmpty(worker))
+        // A WORKER NAME IS NOT A CONVERSATION. w0, w1, ... are reused by every run, so "the newest
+        // transcript of w1" is some other conversation whenever this one has an id of its own
+        // (that is how the ADAMS conversation grew a computer-use transcript at its end).
+        // The name is a fallback only for a key with no id ("fleet:<name>"), and a transcript
+        // that is known to carry another Copilot id is never taken (FleetConvIdentity.HintMayJoin).
+        if (string.IsNullOrEmpty(liveTranscriptPath) && !string.IsNullOrEmpty(worker)
+            && FleetConvIdentity.MayResolveByWorkerName(url))
             liveTranscriptPath = NewestTranscriptForWorker(worker);
+        if (!string.IsNullOrEmpty(liveTranscriptPath)
+            && !FleetConvIdentity.HintMayJoin(url, ConvListing.TranscriptGuid(liveTranscriptPath)))
+            liveTranscriptPath = "";
 
         // Registry lineage is the conversation identity (old -> new). A cockpit history click's
         // transcriptHint is DISPLAY LOCATION only: it must never rewind the Conversation.Transcript

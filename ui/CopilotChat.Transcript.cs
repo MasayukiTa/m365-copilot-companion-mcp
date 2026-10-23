@@ -215,7 +215,8 @@ partial class ChatWindow
             if (wkr == null) { StopFollowingTranscript(); return; }
             string tp = SS(wkr, "transcript");
             if (string.IsNullOrEmpty(tp)) tp = transcriptHint;
-            if (string.IsNullOrEmpty(tp) && c != null && !string.IsNullOrEmpty(c.Name))
+            if (string.IsNullOrEmpty(tp) && c != null && !string.IsNullOrEmpty(c.Name)
+                && FleetConvIdentity.MayResolveByWorkerName(key))
                 tp = NewestTranscriptForWorker(c.Name);
             if (string.IsNullOrEmpty(tp) || tp.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
             { StopFollowingTranscript(); return; }
@@ -267,11 +268,10 @@ partial class ChatWindow
                 string dn = SS(d, "name");
                 string ds = SS(d, "source");
                 string dt = SS(d, "transcript");
-                bool hit = false;
-                if (!string.IsNullOrEmpty(url)) hit = (du == url);
-                else if (!string.IsNullOrEmpty(worker)) hit = (du.Length == 0 && ds == "fleet" && dn == worker);
-                if (!hit && !string.IsNullOrEmpty(latestHint)) hit = (dt == latestHint);
-                if (!hit) continue;
+                // The decision (id first; a worker name only together with the same run) is
+                // FleetConvIdentity.RegistryRowMatches -- a worker name is reused by every run.
+                if (!FleetConvIdentity.RegistryRowMatches(url, worker, latestHint, du, ds, dn, dt,
+                        RegistryTranscriptLineage(d))) continue;
                 return FleetConvIdentity.MergeTranscriptLineage(
                     RegistryTranscriptLineage(d), null, latestHint);
             }

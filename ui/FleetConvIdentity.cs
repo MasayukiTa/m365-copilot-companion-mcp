@@ -113,6 +113,104 @@ static class FleetConvIdentity
         if (!string.IsNullOrEmpty(liveGoal)) return liveGoal;
         return transcriptMetaGoal ?? "";
     }
+
+    // ---- WHICH CONVERSATION A TRANSCRIPT BELONGS TO (2026-10-23) -------------------------------
+    //
+    // MEASURED: opening the ADAMS conversation (sess:65c85c0a-..., worker w1) showed, after its own
+    // turns, two 10-14 phone-ledger transcripts (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the
+    // current run's computer-use transcript (r6adac45a_a0_w1). None of them is that conversation.
+    // They were joined by the WORKER NAME alone. A worker name (w0, w1, ...) is reused by every
+    // run, so it says nothing about which conversation a transcript is. The conversation's
+    // identity is its Copilot id (sess:<guid>, the transcript's own "guid" line); a run is the
+    // file-name prefix before the worker ("r6acf1938_a0"). These functions are the only place
+    // that decides a match, so the chat window cannot grow another name-only comparison.
+
+    /// The run a transcript file belongs to: "r6acf1938_a0" for ".../r6acf1938_a0_w1.jsonl.gz"
+    /// (and for its "__sub_" siblings). "" when the name has no worker part.
+    public static string RunOf(string path)
+    {
+        if (string.IsNullOrEmpty(path)) return "";
+        string name = Path.GetFileName(path.Trim());
+        if (name.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 3);
+        if (name.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 6);
+        int sub = name.IndexOf("__sub_", StringComparison.Ordinal);
+        if (sub >= 0) name = name.Substring(0, sub);
+        int w = name.LastIndexOf("_w", StringComparison.Ordinal);
+        return w > 0 ? name.Substring(0, w) : "";
+    }
+
+    /// True when any transcript of side A and any of side B come from the same run.
+    public static bool SharesRun(IEnumerable<string> aLineage, string aLatest,
+                                 IEnumerable<string> bLineage, string bLatest)
+    {
+        var runs = new HashSet<string>(StringComparer.Ordinal);
+        foreach (string p in MergeTranscriptLineage(aLineage, null, aLatest))
+        { string r = RunOf(p); if (r.Length > 0) runs.Add(r); }
+        foreach (string p in MergeTranscriptLineage(bLineage, null, bLatest))
+        { string r = RunOf(p); if (r.Length > 0 && runs.Contains(r)) return true; }
+        return false;
+    }
+
+    static bool SameTranscript(string a, string b)
+    {
+        return !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b)
+            && string.Equals(ConvListing.StripGz(a.Trim()), ConvListing.StripGz(b.Trim()),
+                             StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// OpenFromFleet may fall back to "the newest transcript of worker <name>" only when the
+    /// conversation has no id of its own (a "fleet:<name>" key). With an id, the worker name is
+    /// reused by other runs and would pick some other conversation's transcript.
+    public static bool MayResolveByWorkerName(string url)
+    {
+        return string.IsNullOrEmpty(url);
+    }
+
+    /// A transcript resolved from outside the conversation may join its lineage only when it is
+    /// not known to belong to another Copilot conversation. `hintGuid` is that transcript's own
+    /// guid ("" when it has none yet, e.g. a run whose first turn has not been answered).
+    public static bool HintMayJoin(string url, string hintGuid)
+    {
+        if (string.IsNullOrEmpty(url) || !url.StartsWith("sess:", StringComparison.Ordinal)) return true;
+        if (string.IsNullOrEmpty(hintGuid)) return true;
+        return string.Equals(url.Substring(5), hintGuid, StringComparison.OrdinalIgnoreCase);
+    }
+
+    /// Does this registry row describe the conversation being opened? (RegistryTranscriptLineageFor)
+    ///   * with an id: the row's id must be the same. A latest-hint match is accepted only for a
+    ///     row that has no id of its own (the same transcript file, not another conversation).
+    ///   * without an id: the exact transcript file, or the same worker name AND the same run.
+    ///     A name alone never matches -- the name is reused by every run. With no hint there is
+    ///     nothing to anchor the run to, so nothing matches.
+    public static bool RegistryRowMatches(string url, string worker, string latestHint,
+                                          string rowUrl, string rowSource, string rowName,
+                                          string rowTranscript, IEnumerable<string> rowLineage)
+    {
+        rowUrl = rowUrl ?? "";
+        if (!string.IsNullOrEmpty(url))
+        {
+            if (rowUrl == url) return true;
+            return rowUrl.Length == 0 && SameTranscript(rowTranscript, latestHint);
+        }
+        if (SameTranscript(rowTranscript, latestHint)) return true;
+        return !string.IsNullOrEmpty(worker) && !string.IsNullOrEmpty(latestHint)
+            && rowUrl.Length == 0 && rowSource == "fleet" && rowName == worker
+            && SharesRun(rowLineage, rowTranscript, null, latestHint);
+    }
+
+    /// Is this registry row the sidebar conversation `c`? (SyncRegistry's existing-row lookup)
+    /// A row with an id matches the conversation with that id. A row without one matches by
+    /// transcript file, or by (source, name) AND a shared run -- never by the name alone.
+    public static bool SyncRowMatches(string rowUrl, string rowSource, string rowName,
+                                      string rowTranscript, IEnumerable<string> rowLineage,
+                                      string cUrl, string cSource, string cName,
+                                      string cTranscript, IEnumerable<string> cLineage)
+    {
+        if (!string.IsNullOrEmpty(rowUrl)) return cUrl == rowUrl;
+        if (SameTranscript(rowTranscript, cTranscript)) return true;
+        return !string.IsNullOrEmpty(rowName) && rowSource == cSource && rowName == cName
+            && SharesRun(rowLineage, rowTranscript, cLineage, cTranscript);
+    }
 }
 
 /// The conversation LIST, as plain functions: which transcripts exist, how they are paged, and
@@ -144,6 +242,38 @@ static class ConvListing
     {
         return (path != null && path.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
             ? path.Substring(0, path.Length - 3) : path;
+    }
+
+    /// The Copilot conversation id written into a transcript ({"guid": ...}, within its first
+    /// 40 lines), or "" when there is none yet or the file cannot be read. Reads "x.jsonl" or
+    /// "x.jsonl.gz", whichever exists.
+    public static string TranscriptGuid(string path)
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(path)) return "";
+            string actual = path;
+            if (!File.Exists(actual)) actual = actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase) ? StripGz(actual) : actual + ".gz";
+            if (!File.Exists(actual)) return "";
+            var js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
+            using (var fs = new FileStream(actual, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+            using (var sr = actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)
+                       ? new StreamReader(new System.IO.Compression.GZipStream(fs, System.IO.Compression.CompressionMode.Decompress), System.Text.Encoding.UTF8)
+                       : new StreamReader(fs, System.Text.Encoding.UTF8))
+            {
+                for (int i = 0; i < 40; i++)
+                {
+                    string ln = sr.ReadLine();
+                    if (ln == null) break;
+                    if (ln.IndexOf("\"guid\"", StringComparison.Ordinal) < 0 || ln.IndexOf("\"role\"", StringComparison.Ordinal) >= 0) continue;
+                    var d = js.DeserializeObject(ln) as Dictionary<string, object>;
+                    object g;
+                    if (d != null && d.TryGetValue("guid", out g) && g != null) return g.ToString();
+                }
+            }
+        }
+        catch (Exception) { }
+        return "";
     }
 
     public static bool IsSubTranscript(string path)

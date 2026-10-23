@@ -140,7 +140,8 @@ partial class ChatWindow
         if (c.Messages.Count == 0)
         {
             string tp = !string.IsNullOrEmpty(c.Transcript) ? c.Transcript
-                        : (!string.IsNullOrEmpty(c.Name) ? NewestTranscriptForWorker(c.Name) : "");
+                        : (!string.IsNullOrEmpty(c.Name) && FleetConvIdentity.MayResolveByWorkerName(c.ConvUrl)
+                            ? NewestTranscriptForWorker(c.Name) : "");
             if (!string.IsNullOrEmpty(tp))
             {
                 c.Transcripts = FleetConvIdentity.MergeTranscriptLineage(c.Transcripts, null, tp);
