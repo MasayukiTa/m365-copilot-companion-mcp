@@ -630,6 +630,7 @@ jobs:
             tests/test_capture_floor.py \
             tests/test_capture_budget.py \
             tests/test_capture_status.py \
+            tests/test_token_cache.py \
             relay/test_route_reopen.py \
             relay/test_dotenv_before_imports.py \
             tests/test_route_dot_follows_reopen.py \
