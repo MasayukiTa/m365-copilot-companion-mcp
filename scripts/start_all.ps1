@@ -2794,6 +2794,15 @@ function Invoke-Startup {
     # Dev Tunnel self-heal (best-effort, non-blocking, runs even under -NoUi):
     # repoints MCP_TUNNEL_NAME/MCP_TUNNEL_URL to a tunnel this account actually
     # owns, BEFORE the supervisor (below) hosts it.
+    # A PC set up for the connector route before the default became connector-less (its .env has
+    # MCP_TUNNEL_URL/NAME) and with no tool_transport line gets the line written, so the file and the
+    # GUI say what the reader already answers. Does nothing for any other PC. See relay/tool_bridge.py.
+    try {
+        if (Test-Path -LiteralPath $script:venvPy) {
+            Push-Location $root
+            try { & $script:venvPy -m relay.tool_bridge pin-legacy 2>$null | Out-Null } finally { Pop-Location }
+        }
+    } catch { }
     $script:ToolRoute = Get-ToolTransport -Python $script:venvPy -RepoRoot $root
     $t0_tunnelHeal = Get-Date
     if ($script:ToolRoute -eq "connector-less") {

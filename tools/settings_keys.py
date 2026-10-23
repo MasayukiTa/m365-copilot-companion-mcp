@@ -159,15 +159,18 @@ KEYS = OrderedDict([
        "evaluation) with no restart; decisions already made stand. An MCP_EFFORT_POLICY "
        "environment variable beats this setting and is reported as a conflict."),
 
-    _k("tool_transport", EACH_GATE, "connector",
+    _k("tool_transport", EACH_GATE, "connector-less",
        "relay/tool_bridge.py:transport (every driver_for, mtime-cached)",
        "connector|connector-less. connector: the agent holds the tools itself through a custom "
        "connector (the existing path, needs a Dev Tunnel). connector-less: the agent has no "
        "connector and no tunnel is needed; the model asks for a call in its reply and this "
        "process runs it against the local server (docs/connector_less_route.md). Read when a "
        "conversation is created, so a change reaches the NEXT conversation with no restart and "
-       "conversations already running keep the transport they started with. Anything else "
-       "reads as connector. No environment variable overrides it."),
+       "conversations already running keep the transport they started with. With no usable "
+       "line the value is connector-less, except on a machine whose .env already has "
+       "MCP_TUNNEL_URL or MCP_TUNNEL_NAME (set up for the connector route before the default "
+       "changed): that one stays on connector. An unknown value reads as if the line were "
+       "absent. No environment variable overrides it."),
 
     # Work IQ consent cards on the connector-less route (relay/consent_approve.py). ON by default
     # because the owner's standing requirement is that nobody clicks these cards by hand.
