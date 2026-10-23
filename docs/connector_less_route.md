@@ -217,3 +217,14 @@ cannot create a custom connector cannot do this.
 
 The setting is stored as `tool_transport=connector` or `tool_transport=connector-less` in the settings
 file. The earlier spelling `tool_transport=bridge` is still read as connector-less.
+
+## The request template on a new PC
+
+The socket route needs a request template for the agent (`.fleet/templates/template_<hash>.json`, not in git).
+A capture never sends a Copilot turn, so a new PC has nothing to copy from. `start_all` therefore runs
+`python -m relay.template_seed ensure` once the agent URL is known: it derives the template from the generic
+donor in `relay/seed_donor/` (the agent id from the address, this PC's locale and time zone), with no network,
+no browser and no turn. An existing template is never overwritten. If an agent URL is not a `T_` agent address
+(for example a first-party `P_` agent) nothing is derived. `doctor` shows a `request_template` check, and the
+reason on a held goal names the fix. `relay/test_template_seed_bundled.py` fails if the donor ever carries a
+user, tenant or machine value.

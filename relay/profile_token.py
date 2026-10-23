@@ -398,9 +398,23 @@ def _capture_no_turn(context, agent_url, say, directory):
 
     template = load_template(agent_url, directory)
     if template is None:
+        # A NEW PC HAS NO CAPTURED TEMPLATE AND NO DONOR TO COPY FROM. The product ships a generic donor
+        # (relay/seed_donor), so the template is derived from it here -- no turn, no page, just the agent
+        # id from the address. It is written once and never overwritten (a real capture would win).
+        why = ""
+        try:
+            from relay import template_seed
+            template_seed.seed_from_bundled(agent_url, directory)
+            say("[profile_token] no template for this agent: created one from the bundled donor "
+                "(no Copilot turn)")
+            template = load_template(agent_url, directory)
+        except Exception as exc:               # SeedError, or a donor file that cannot be read
+            why = "%s: %s" % (type(exc).__name__, exc)
+    if template is None:
         raise NoTemplateWithoutTurn(
-            "no cached request template for this agent and a capture never sends a Copilot "
-            "turn; the goal keeps waiting and the capture is retried")
+            "no request template for this agent (%s). A capture never sends a Copilot turn, so "
+            "goals keep waiting for a token. Fix: run start_all.bat, or `python -m relay.template_seed "
+            "ensure` in the repository" % (why or "it could not be written"))
     # Raises NoLightToken when the page shows no usable token in time; the caller backs off.
     token = token_via_light_page(context, agent_url, log=say)
     say("[profile_token] cached template + a page with no turn")
