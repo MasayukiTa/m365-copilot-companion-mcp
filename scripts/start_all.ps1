@@ -2683,6 +2683,22 @@ function Invoke-Startup {
         Record-PhaseTiming "setup_gate" $t0_setupGate
     }
 
+    # A NEW PC HAS NO REQUEST TEMPLATE, and without one every goal waits for a token for ever (a capture
+    # never sends a Copilot turn). Derive it from the donor that ships in relay\seed_donor now that the
+    # agent URL is known: no network, no browser, no turn. Existing templates are never overwritten.
+    # Runs under -NoUi and -CoreOnly too; it reads .env and writes only .fleet\templates.
+    try {
+        $tplPy = Join-Path $root ".venv\Scripts\python.exe"
+        if (Test-Path $tplPy) {
+            Push-Location $root
+            try {
+                & $tplPy -m relay.template_seed ensure 2>&1 | ForEach-Object { Write-Host "[template] $_" }
+            } finally { Pop-Location }
+        }
+    } catch {
+        Write-Host "[template] could not check the request template: $_"
+    }
+
     # A .ENV CARRIED FROM ANOTHER PC IS PRESENT AND UNUSABLE, WHICH NOTHING WAS LOOKING FOR.
     #
     # MCP_UNLOCK_PASSWORD_PROTECTED is a DPAPI value bound to one Windows account on one machine.

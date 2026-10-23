@@ -167,6 +167,19 @@ Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
     { ($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']) } `
     "double-click configure_env.bat and paste the Copilot Studio agent URL (README STEP 4)"
 
+# NO REQUEST TEMPLATE = EVERY GOAL WAITS FOR A TOKEN FOR EVER. A capture never sends a Copilot turn, so
+# the request template for the agent comes from the donor shipped in relay\seed_donor, written by
+# start_all.bat. Without it the cockpit only says "waiting for token", which looks like a slow login.
+Check "request_template" "Request template exists for the configured agent (goals wait for a token without it)" `
+    {
+        $tplPy = Join-Path $repo ".venv\Scripts\python.exe"
+        if (-not (($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']))) { return $true }
+        if (-not (Test-Path $tplPy)) { return $true }     # python_runnable reports that
+        Push-Location $repo
+        try { & $tplPy -m relay.template_seed check *> $null; return ($LASTEXITCODE -eq 0) } finally { Pop-Location }
+    } `
+    "double-click start_all.bat (it creates the template from the bundled donor), or run: .venv\Scripts\python.exe -m relay.template_seed ensure"
+
 # WHETHER A SUPERVISOR IS RUNNING WAS NEVER CHECKED. The only supervisor-related check was
 # "hosts the tunnel named in .env", which returns true when there is no supervisor at all --
 # nothing to mismatch, so nothing to report. The server_up advice below then asked the reader
