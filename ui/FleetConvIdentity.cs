@@ -121,49 +121,42 @@ static class FleetConvIdentity
     // current run's computer-use transcript (r6adac45a_a0_w1). None of them is that conversation.
     // They were joined by the WORKER NAME alone. A worker name (w0, w1, ...) is reused by every
     // run, so it says nothing about which conversation a transcript is. The conversation's
-    // identity is its Copilot id (sess:<guid>, the transcript's own "guid" line); a run is the
-    // file-name prefix before the worker ("r6acf1938_a0"). These functions are the only place
-    // that decides a match, so the chat window cannot grow another name-only comparison.
+    // identity is its Copilot id (sess:<guid>, the transcript's own "guid" line, the registry's
+    // "url"). A conversation with no id is identified by its transcript file's STEM
+    // ("r6acf1938_a0_w1": run x attempt x worker, unique per file). The worker name alone is never
+    // identity. These functions are the only place that decides a match, so the chat window
+    // cannot grow another name-only comparison.
 
-    /// The run a transcript file belongs to: "r6acf1938_a0" for ".../r6acf1938_a0_w1.jsonl.gz"
-    /// (and for its "__sub_" siblings). "" when the name has no worker part.
-    public static string RunOf(string path)
+    /// The identity of a transcript file with no Copilot id: its file name without ".gz" /
+    /// ".jsonl", case-folded ("r6acf1938_a0_w1"). A "__sub_" sibling is its own stem.
+    public static string StemOf(string path)
     {
         if (string.IsNullOrEmpty(path)) return "";
         string name = Path.GetFileName(path.Trim());
         if (name.EndsWith(".gz", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 3);
         if (name.EndsWith(".jsonl", StringComparison.OrdinalIgnoreCase)) name = name.Substring(0, name.Length - 6);
-        int sub = name.IndexOf("__sub_", StringComparison.Ordinal);
-        if (sub >= 0) name = name.Substring(0, sub);
-        int w = name.LastIndexOf("_w", StringComparison.Ordinal);
-        return w > 0 ? name.Substring(0, w) : "";
+        return name.ToLowerInvariant();
     }
 
-    /// True when any transcript of side A and any of side B come from the same run.
-    public static bool SharesRun(IEnumerable<string> aLineage, string aLatest,
-                                 IEnumerable<string> bLineage, string bLatest)
+    /// The key a conversation is known by: its Copilot id when it has one, else "stem:<stem>" of
+    /// its latest transcript. "" when it has neither. NEVER derived from a worker name.
+    public static string IdentityKey(string url, string transcript)
     {
-        var runs = new HashSet<string>(StringComparer.Ordinal);
+        if (!string.IsNullOrEmpty(url)) return url;
+        string stem = StemOf(transcript);
+        return stem.Length > 0 ? "stem:" + stem : "";
+    }
+
+    /// True when a transcript of side A and one of side B are the same file (same stem).
+    public static bool SharesTranscript(IEnumerable<string> aLineage, string aLatest,
+                                        IEnumerable<string> bLineage, string bLatest)
+    {
+        var stems = new HashSet<string>(StringComparer.Ordinal);
         foreach (string p in MergeTranscriptLineage(aLineage, null, aLatest))
-        { string r = RunOf(p); if (r.Length > 0) runs.Add(r); }
+        { string s = StemOf(p); if (s.Length > 0) stems.Add(s); }
         foreach (string p in MergeTranscriptLineage(bLineage, null, bLatest))
-        { string r = RunOf(p); if (r.Length > 0 && runs.Contains(r)) return true; }
+        { string s = StemOf(p); if (s.Length > 0 && stems.Contains(s)) return true; }
         return false;
-    }
-
-    static bool SameTranscript(string a, string b)
-    {
-        return !string.IsNullOrEmpty(a) && !string.IsNullOrEmpty(b)
-            && string.Equals(ConvListing.StripGz(a.Trim()), ConvListing.StripGz(b.Trim()),
-                             StringComparison.OrdinalIgnoreCase);
-    }
-
-    /// OpenFromFleet may fall back to "the newest transcript of worker <name>" only when the
-    /// conversation has no id of its own (a "fleet:<name>" key). With an id, the worker name is
-    /// reused by other runs and would pick some other conversation's transcript.
-    public static bool MayResolveByWorkerName(string url)
-    {
-        return string.IsNullOrEmpty(url);
     }
 
     /// A transcript resolved from outside the conversation may join its lineage only when it is
@@ -177,39 +170,32 @@ static class FleetConvIdentity
     }
 
     /// Does this registry row describe the conversation being opened? (RegistryTranscriptLineageFor)
-    ///   * with an id: the row's id must be the same. A latest-hint match is accepted only for a
-    ///     row that has no id of its own (the same transcript file, not another conversation).
-    ///   * without an id: the exact transcript file, or the same worker name AND the same run.
-    ///     A name alone never matches -- the name is reused by every run. With no hint there is
-    ///     nothing to anchor the run to, so nothing matches.
-    public static bool RegistryRowMatches(string url, string worker, string latestHint,
-                                          string rowUrl, string rowSource, string rowName,
-                                          string rowTranscript, IEnumerable<string> rowLineage)
+    /// `anchor` is a transcript the caller already knows is this conversation's (the live
+    /// worker's, or the exact file a history click named); "" when there is none.
+    ///   * with an id: the row's id must be the same. A row with another id is another
+    ///     conversation, whatever its transcript or worker name. A row with no id matches when it
+    ///     holds the anchor's file.
+    ///   * without an id: the row must hold the anchor's file (same stem). No anchor, no match:
+    ///     the worker name is not identity and is not a parameter here.
+    public static bool RegistryRowMatches(string url, string anchor,
+                                          string rowUrl, string rowTranscript,
+                                          IEnumerable<string> rowLineage)
     {
         rowUrl = rowUrl ?? "";
-        if (!string.IsNullOrEmpty(url))
-        {
-            if (rowUrl == url) return true;
-            return rowUrl.Length == 0 && SameTranscript(rowTranscript, latestHint);
-        }
-        if (SameTranscript(rowTranscript, latestHint)) return true;
-        return !string.IsNullOrEmpty(worker) && !string.IsNullOrEmpty(latestHint)
-            && rowUrl.Length == 0 && rowSource == "fleet" && rowName == worker
-            && SharesRun(rowLineage, rowTranscript, null, latestHint);
+        if (!string.IsNullOrEmpty(url) && rowUrl == url) return true;
+        if (!string.IsNullOrEmpty(url) && rowUrl.Length > 0) return false;
+        return !string.IsNullOrEmpty(anchor)
+            && SharesTranscript(rowLineage, rowTranscript, null, anchor);
     }
 
     /// Is this registry row the sidebar conversation `c`? (SyncRegistry's existing-row lookup)
-    /// A row with an id matches the conversation with that id. A row without one matches by
-    /// transcript file, or by (source, name) AND a shared run -- never by the name alone.
-    public static bool SyncRowMatches(string rowUrl, string rowSource, string rowName,
-                                      string rowTranscript, IEnumerable<string> rowLineage,
-                                      string cUrl, string cSource, string cName,
-                                      string cTranscript, IEnumerable<string> cLineage)
+    /// A row with an id matches the conversation with that id. A row without one matches the
+    /// conversation that holds the same transcript file -- never by worker name.
+    public static bool SyncRowMatches(string rowUrl, string rowTranscript, IEnumerable<string> rowLineage,
+                                      string cUrl, string cTranscript, IEnumerable<string> cLineage)
     {
         if (!string.IsNullOrEmpty(rowUrl)) return cUrl == rowUrl;
-        if (SameTranscript(rowTranscript, cTranscript)) return true;
-        return !string.IsNullOrEmpty(rowName) && rowSource == cSource && rowName == cName
-            && SharesRun(rowLineage, rowTranscript, cLineage, cTranscript);
+        return SharesTranscript(rowLineage, rowTranscript, cLineage, cTranscript);
     }
 }
 

@@ -299,6 +299,7 @@ jobs:
             ui/test_a_chat_that_was_not_saved_says_so.py \
             ui/test_a_fleet_conversation_opened_from_the_cockpit_keeps_its_identity.py \
             ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py \
+            tools/test_backfill_conversation_ids.py \
             ui/test_a_ledger_the_ui_writes_has_no_byte_order_mark.py \
             ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py \
             ui/test_the_chat_window_sends_what_was_typed.py \

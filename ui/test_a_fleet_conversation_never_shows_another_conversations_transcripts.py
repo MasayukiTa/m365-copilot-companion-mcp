@@ -15,8 +15,8 @@ reuses. Three places compared that name:
 
 The decisions now live in ui/FleetConvIdentity.cs (WPF-free) and this test compiles and runs
 them with ui/harness/ConvMixHarness.cs. A conversation's identity is its Copilot id
-(sess:<guid>, the transcript's own guid line); a worker name counts only together with the same
-RUN (file-name prefix before _w<N>). The source-text tests at the end pin that the chat window
+(sess:<guid>, the transcript's own guid line); with no id it is the transcript file's stem
+(r<run>_a<attempt>_w<N>). A worker name is never identity. The source-text tests at the end pin that the chat window
 calls these functions and no longer compares a bare name.
 """
 from __future__ import annotations
@@ -107,46 +107,45 @@ def run_cases(tmp_path_factory):
 
 
 def _reg(**kw):
-    base = dict(op="registry_match", url="", worker="", hint="", row_url="", row_source="fleet",
-                row_name="", row_transcript="", row_transcripts=[])
+    base = dict(op="registry_match", url="", anchor="", row_url="", row_transcript="", row_transcripts=[])
     base.update(kw)
     return base
 
 
 def _sync(**kw):
-    base = dict(op="sync_match", row_url="", row_source="fleet", row_name="", row_transcript="",
-                row_transcripts=[], c_url="", c_source="fleet", c_name="", c_transcript="",
-                c_transcripts=[])
+    base = dict(op="sync_match", row_url="", row_transcript="", row_transcripts=[],
+                c_url="", c_transcript="", c_transcripts=[])
     base.update(kw)
     return base
 
 
 @needs_csc
-def test_run_of_names_the_run_not_the_worker(run_cases):
+def test_a_stem_is_the_identity_of_a_conversation_with_no_id(run_cases):
     got = run_cases([
-        {"id": "a", "op": "run_of", "path": PHONE_A0},
-        {"id": "b", "op": "run_of", "path": PHONE_A1},
-        {"id": "c", "op": "run_of", "path": TD + r"\r6adac45a_a0_w1__sub_research_t1_1.jsonl"},
-        {"id": "d", "op": "run_of", "path": TD + r"\old_name.jsonl"},
+        {"id": "a", "op": "stem_of", "path": PHONE_A0},
+        {"id": "b", "op": "stem_of", "path": PHONE_A1},
+        {"id": "c", "op": "stem_of", "path": TD + r"\R6ADAC45A_a0_w1.JSONL"},
+        {"id": "k_id", "op": "identity_key", "url": ADAMS_URL, "path": PHONE_A0},
+        {"id": "k_stem", "op": "identity_key", "url": "", "path": PHONE_A1},
+        {"id": "k_none", "op": "identity_key", "url": "", "path": ""},
     ])
-    assert got["a"] == "r6acf1938_a0"
-    assert got["b"] == "r6acf1938_a1"
-    assert got["c"] == "r6adac45a_a0"
-    assert got["d"] == ""
+    assert got["a"] == "r6acf1938_a0_w1"
+    assert got["b"] == "r6acf1938_a1_w1"
+    assert got["c"] == "r6adac45a_a0_w1"
+    assert got["k_id"] == ADAMS_URL
+    assert got["k_stem"] == "stem:r6acf1938_a1_w1"
+    assert got["k_none"] == ""
 
 
 @needs_csc
-def test_opening_adams_does_not_take_the_newest_w1_of_another_run(run_cases):
-    """OpenFromFleet(url=sess:ADAMS, worker=w1): the worker-name fallback must be off whenever
-    the conversation has an id, and a hint carrying another Copilot id must not join."""
+def test_opening_adams_does_not_take_a_transcript_that_carries_another_id(run_cases):
+    """OpenFromFleet(url=sess:ADAMS, worker=w1): a transcript with another Copilot id never joins."""
     d = run_cases.dir
     mine = _write_transcript(d / "r6adab543_a0_w1.jsonl", ADAMS_URL[5:])
     other = _write_transcript(d / "r6adac45a_a0_w1.jsonl", "00000002-aaaa-bbbb-cccc-000000000002")
     other_gz = _write_transcript(d / "r6adac45a_a1_w1.jsonl.gz", "00000002-aaaa-bbbb-cccc-000000000002", gz=True)
-    pending = _write_transcript(d / "r6adae000_a0_w1.jsonl", "")   # no guid line value yet
+    pending = _write_transcript(d / "r6adae000_a0_w1.jsonl", "")   # no guid value yet
     got = run_cases([
-        {"id": "name_with_id", "op": "may_resolve_by_name", "url": ADAMS_URL},
-        {"id": "name_without_id", "op": "may_resolve_by_name", "url": ""},
         {"id": "own_hint", "op": "hint_may_join", "url": ADAMS_URL, "hint_path": mine},
         {"id": "foreign_hint", "op": "hint_may_join", "url": ADAMS_URL, "hint_path": other},
         {"id": "foreign_hint_gz", "op": "hint_may_join", "url": ADAMS_URL, "hint_path": other_gz},
@@ -156,8 +155,6 @@ def test_opening_adams_does_not_take_the_newest_w1_of_another_run(run_cases):
         {"id": "guid_gz", "op": "transcript_guid", "path": other_gz},
         {"id": "guid_gz_by_plain_name", "op": "transcript_guid", "path": str(d / "r6adac45a_a1_w1.jsonl")},
     ])
-    assert got["name_with_id"] is False
-    assert got["name_without_id"] is True
     assert got["own_hint"] is True
     assert got["foreign_hint"] is False, "another conversation's transcript joined ADAMS' lineage"
     assert got["foreign_hint_gz"] is False
@@ -169,69 +166,96 @@ def test_opening_adams_does_not_take_the_newest_w1_of_another_run(run_cases):
 
 
 @needs_csc
-def test_registry_lineage_lookup_matches_by_id_then_by_run_never_by_name(run_cases):
-    adams_row = dict(row_url=ADAMS_URL, row_name="w1", row_transcript=ADAMS_T[-1], row_transcripts=ADAMS_T)
-    phone_row = dict(row_url="", row_name="w1", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0])
-    cur_row = dict(row_url="", row_name="w1", row_transcript=NOW_W1, row_transcripts=[NOW_W1])
+def test_the_adams_shape_from_2026_10_23(run_cases):
+    """The real case: ADAMS (id, w1) against the url-less 10-14 w1 rows and today's w1 row."""
+    adams = dict(row_url=ADAMS_URL, row_transcript=ADAMS_T[-1], row_transcripts=ADAMS_T)
+    phone = dict(row_url="", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0])
+    cur = dict(row_url="", row_transcript=NOW_W1, row_transcripts=[NOW_W1])
+    adams_c = dict(c_url=ADAMS_URL, c_transcript=ADAMS_T[-1], c_transcripts=ADAMS_T)
     got = run_cases([
-        # by id
-        _reg(id="id_hit", url=ADAMS_URL, worker="w1", hint=NOW_W1, **adams_row),
-        # id given: a url-less row of another run is not this conversation, even with name w1
-        _reg(id="id_vs_phone_row", url=ADAMS_URL, worker="w1", hint=NOW_W1, **phone_row),
-        # id given: another conversation's row is not matched through the hint
-        _reg(id="id_vs_hint_row", url=ADAMS_URL, worker="w1", hint=NOW_W1,
-             row_url="sess:00000002-aaaa-bbbb-cccc-000000000002", row_name="w1",
-             row_transcript=NOW_W1, row_transcripts=[NOW_W1]),
-        # no id (live, url never captured): the same run matches...
-        _reg(id="live_same_run", url="", worker="w1", hint=NOW_W1, **cur_row),
-        # ...an earlier run with the same worker name does not
-        _reg(id="live_other_run", url="", worker="w1", hint=NOW_W1, **phone_row),
-        # ...and with nothing to anchor the run, a name alone matches nothing
-        _reg(id="name_only", url="", worker="w1", hint="", **phone_row),
-        # the exact transcript file still matches (compressed spelling too)
-        _reg(id="same_file_gz", url="", worker="w1", hint=NOW_W1 + ".gz", **cur_row),
+        _reg(id="open_adams_finds_its_row", url=ADAMS_URL, anchor="", **adams),
+        _reg(id="open_adams_not_phone_row", url=ADAMS_URL, anchor="", **phone),
+        _reg(id="open_adams_not_todays_row", url=ADAMS_URL, anchor="", **cur),
+        _reg(id="live_no_id_finds_own_row", url="", anchor=NOW_W1, **cur),
+        _reg(id="live_no_id_not_old_row", url="", anchor=NOW_W1, **phone),
+        _reg(id="no_id_no_anchor_matches_nothing", url="", anchor="", **cur),
+        _reg(id="same_file_gz", url="", anchor=NOW_W1 + ".gz", **cur),
+        _sync(id="sync_phone_vs_adams", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0], **adams_c),
+        _sync(id="sync_phone_gz_vs_adams", row_transcript=PHONE_A1, row_transcripts=[PHONE_A1], **adams_c),
+        _sync(id="sync_own_file_row", row_transcript=TD + r"\r6adab543_a0_w1.jsonl.gz", **adams_c),
+        _sync(id="sync_id_row_by_id", row_url=ADAMS_URL, row_transcript="", **adams_c),
+        _sync(id="sync_other_id_row", row_url="sess:00000002-aaaa-bbbb-cccc-000000000002",
+              row_transcript=ADAMS_T[-1], **adams_c),
     ])
-    assert got["id_hit"] is True
-    assert got["id_vs_phone_row"] is False
-    assert got["id_vs_hint_row"] is False
-    assert got["live_same_run"] is True
-    assert got["live_other_run"] is False, "a url-less row of another run matched by worker name"
-    assert got["name_only"] is False
+    assert got["open_adams_finds_its_row"] is True
+    assert got["open_adams_not_phone_row"] is False
+    assert got["open_adams_not_todays_row"] is False, "a url-less row matched an id'd conversation"
+    assert got["live_no_id_finds_own_row"] is True, "a live conversation with no id must stay openable"
+    assert got["live_no_id_not_old_row"] is False
+    assert got["no_id_no_anchor_matches_nothing"] is False
     assert got["same_file_gz"] is True
+    assert got["sync_phone_vs_adams"] is False, "the 10-14 phone-ledger row was merged into ADAMS"
+    assert got["sync_phone_gz_vs_adams"] is False
+    assert got["sync_own_file_row"] is True
+    assert got["sync_id_row_by_id"] is True
+    assert got["sync_other_id_row"] is False
+
+
+def _population(n_ids=8, n_noid=4):
+    """Many conversations, ALL on worker w0, different ids; some have no id at all. Each has one
+    to three transcript files (follow-ups), all named ..._w0."""
+    convs = []
+    for i in range(n_ids + n_noid):
+        files = [TD + r"\r6b%05x_a%d_w0.jsonl" % (i, k) for k in range(1 + i % 3)]
+        convs.append({
+            "i": i,
+            "url": ("sess:%08x-0000-4000-8000-%012x" % (i + 1, i + 1)) if i < n_ids else "",
+            "files": files,
+        })
+    return convs
 
 
 @needs_csc
-def test_the_registry_poll_does_not_merge_another_runs_row_into_a_sidebar_row(run_cases):
-    """SyncRegistry: the url-less phone-ledger rows (name w1) must not land on the ADAMS row
-    (name w1); the url-less row of ADAMS' own run still does, and a live url-less row keeps
-    updating its own sidebar row."""
-    adams_c = dict(c_url=ADAMS_URL, c_name="w1", c_transcript=ADAMS_T[-1], c_transcripts=ADAMS_T)
-    live_c = dict(c_url="fleet:w1", c_name="w1", c_transcript=NOW_W1, c_transcripts=[NOW_W1])
+def test_many_conversations_on_the_same_worker_name_never_see_each_other(run_cases):
+    """12 conversations, every one on w0, 8 with a Copilot id and 4 with none. Opening any of them
+    selects its own registry row and no other; the registry poll maps every row onto its own
+    sidebar row and no other. A no-id conversation is found by its transcript file only."""
+    convs = _population()
+    cases = []
+    for o in convs:                      # o = the conversation being opened
+        for r in convs:                  # r = a registry row
+            cases.append(_reg(id="reg-%d-%d" % (o["i"], r["i"]), url=o["url"], anchor=o["files"][-1],
+                              row_url=r["url"], row_transcript=r["files"][-1], row_transcripts=r["files"]))
+            cases.append(_sync(id="sync-%d-%d" % (o["i"], r["i"]), row_url=r["url"],
+                               row_transcript=r["files"][-1], row_transcripts=r["files"],
+                               c_url=o["url"], c_transcript=o["files"][-1], c_transcripts=o["files"]))
+    got = run_cases(cases)
+    for o in convs:
+        for r in convs:
+            want = o["i"] == r["i"]
+            assert got["reg-%d-%d" % (o["i"], r["i"])] is want, ("registry lookup", o["i"], r["i"])
+            assert got["sync-%d-%d" % (o["i"], r["i"])] is want, ("registry poll", o["i"], r["i"])
+    assert sum(1 for c in convs if not c["url"]) >= 4
+
+
+@needs_csc
+def test_a_conversation_with_no_id_is_found_by_its_stem_whichever_spelling_the_file_has(run_cases):
+    f = TD + r"\r6b00009_a0_w0.jsonl"
     got = run_cases([
-        _sync(id="phone_vs_adams", row_name="w1", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0], **adams_c),
-        _sync(id="phone_gz_vs_adams", row_name="w1", row_transcript=PHONE_A1, row_transcripts=[PHONE_A1], **adams_c),
-        _sync(id="own_run_vs_adams", row_name="w1", row_transcript=ADAMS_T[-1], row_transcripts=[ADAMS_T[-1]], **adams_c),
-        _sync(id="same_run_other_file", row_name="w1", row_transcript=TD + r"\r6adab543_a0_w1.jsonl.gz",
-              row_transcripts=[], **adams_c),
-        _sync(id="live_row_updates", row_name="w1", row_transcript=NOW_W1, row_transcripts=[NOW_W1], **live_c),
-        _sync(id="live_row_vs_old_run", row_name="w1", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0], **live_c),
-        _sync(id="id_row_by_id", row_url=ADAMS_URL, row_name="w9", row_transcript="", **adams_c),
-        _sync(id="id_row_other_id", row_url="sess:00000002-aaaa-bbbb-cccc-000000000002", row_name="w1",
-              row_transcript=ADAMS_T[-1], **adams_c),
-        _sync(id="empty_name", row_name="", row_transcript="", row_transcripts=[], **adams_c),
+        _reg(id="gz_anchor", url="", anchor=f + ".gz", row_transcript=f, row_transcripts=[f]),
+        _reg(id="gz_row", url="", anchor=f, row_transcript=f + ".gz", row_transcripts=[f + ".gz"]),
+        _reg(id="other_worker_same_run", url="", anchor=TD + r"\r6b00009_a0_w1.jsonl",
+             row_transcript=f, row_transcripts=[f]),
+        _reg(id="other_attempt_same_worker", url="", anchor=TD + r"\r6b00009_a1_w0.jsonl",
+             row_transcript=f, row_transcripts=[f]),
     ])
-    assert got["phone_vs_adams"] is False, "the 10-14 phone-ledger row was merged into the ADAMS conversation"
-    assert got["phone_gz_vs_adams"] is False
-    assert got["own_run_vs_adams"] is True
-    assert got["same_run_other_file"] is True
-    assert got["live_row_updates"] is True, "a live conversation must keep receiving its own registry row"
-    assert got["live_row_vs_old_run"] is False
-    assert got["id_row_by_id"] is True
-    assert got["id_row_other_id"] is False
-    assert got["empty_name"] is False
+    assert got["gz_anchor"] is True
+    assert got["gz_row"] is True
+    assert got["other_worker_same_run"] is False
+    assert got["other_attempt_same_worker"] is False
 
 
-# ── the chat window calls those functions and compares no bare name ────────────────────────
+# -- the chat window calls those functions and compares no bare name --------------------------
 
 def _code() -> str:
     text = ui_source.chat_window_source(encoding="utf-8-sig")
@@ -243,28 +267,32 @@ def _block(code: str, start: str, length: int) -> str:
     return code[i:i + length]
 
 
-def test_open_from_fleet_uses_the_worker_name_only_for_a_key_without_an_id():
-    body = _block(_code(), "void OpenFromFleet(string url, string worker, string transcriptHint)", 2600)
-    assert "FleetConvIdentity.MayResolveByWorkerName(url)" in body
+def test_no_lookup_by_worker_name_is_left_in_the_chat_window():
+    code = _code()
+    assert "NewestTranscriptForWorker" not in code, (
+        "'the newest transcript of worker w1' is some other run's conversation")
+    assert "MayResolveByWorkerName" not in code
+
+
+def test_open_from_fleet_anchors_on_a_transcript_and_keys_a_url_less_row_by_its_stem():
+    body = _block(_code(), "void OpenFromFleet(string url, string worker, string transcriptHint)", 4200)
     assert "FleetConvIdentity.HintMayJoin(url, ConvListing.TranscriptGuid(liveTranscriptPath))" in body
-    # the fallback call must sit behind the id check, not stand alone
-    i = body.index("NewestTranscriptForWorker(worker)")
-    assert "MayResolveByWorkerName(url)" in body[max(0, i - 200):i]
+    assert "RegistryTranscriptLineageFor(url, lineageAnchor, liveTranscriptPath)" in body
+    assert '"fleet:" + FleetConvIdentity.StemOf(lineageAnchor)' in body, (
+        "a url-less row was keyed 'fleet:<worker name>', shared by every run's worker of that name")
+    assert "StemOf(transcriptHint)" in body
 
 
-def test_the_registry_lookups_go_through_the_run_aware_matchers():
+def test_the_registry_lookups_go_through_the_identity_matchers():
     code = _code()
     lin = _block(code, "List<string> RegistryTranscriptLineageFor(", 1700)
     assert "FleetConvIdentity.RegistryRowMatches(" in lin
-    assert 'dn == worker' not in lin and "du.Length == 0 && ds ==" not in lin
+    assert 'dn == worker' not in lin and 'SS(d, "name")' not in lin
     sync = _block(code, "void SyncRegistry()", 5200)
     assert "FleetConvIdentity.SyncRowMatches(" in sync
     assert "regName == c.Name" not in sync
 
 
-def test_the_sidebar_open_and_the_follow_do_not_resolve_an_id_by_worker_name():
-    code = _code()
-    op = _block(code, "void OpenConversation(Conversation c)", 2200)
-    assert "MayResolveByWorkerName(c.ConvUrl)" in op
-    fol = _block(code, "void MaybeFollowConversation(", 1200)
-    assert "MayResolveByWorkerName(key)" in fol
+def test_a_status_worker_is_found_by_stem_as_well_as_by_current_name():
+    body = _block(_code(), "Dictionary<string, object> ReadFleetWorker(string key)", 1800)
+    assert "FleetConvIdentity.StemOf(SS(w, \"transcript\")) == wantStem" in body

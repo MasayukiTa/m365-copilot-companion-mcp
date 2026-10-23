@@ -215,9 +215,6 @@ partial class ChatWindow
             if (wkr == null) { StopFollowingTranscript(); return; }
             string tp = SS(wkr, "transcript");
             if (string.IsNullOrEmpty(tp)) tp = transcriptHint;
-            if (string.IsNullOrEmpty(tp) && c != null && !string.IsNullOrEmpty(c.Name)
-                && FleetConvIdentity.MayResolveByWorkerName(key))
-                tp = NewestTranscriptForWorker(c.Name);
             if (string.IsNullOrEmpty(tp) || tp.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
             { StopFollowingTranscript(); return; }
             long startOff = 0;
@@ -256,7 +253,9 @@ partial class ChatWindow
     // Resolve one shared-conversation lineage from the registry. Real/sess URLs are the primary
     // identity. For legacy rows without a URL, mirror the registry writer's (source,name) key.
     // A latest hint is appended only when the registry has not seen it yet.
-    List<string> RegistryTranscriptLineageFor(string url, string worker, string latestHint)
+    // `anchor` is a transcript already known to be this conversation's (the live worker's, or the
+    // exact file a history click named); it finds the row of a conversation that has no id.
+    List<string> RegistryTranscriptLineageFor(string url, string anchor, string latestHint)
     {
         try
         {
@@ -265,12 +264,11 @@ partial class ChatWindow
                 var d = o as Dictionary<string, object>;
                 if (d == null) continue;
                 string du = SS(d, "url");
-                string dn = SS(d, "name");
-                string ds = SS(d, "source");
                 string dt = SS(d, "transcript");
-                // The decision (id first; a worker name only together with the same run) is
-                // FleetConvIdentity.RegistryRowMatches -- a worker name is reused by every run.
-                if (!FleetConvIdentity.RegistryRowMatches(url, worker, latestHint, du, ds, dn, dt,
+                // The decision (Copilot id first; else the same transcript file) is
+                // FleetConvIdentity.RegistryRowMatches. The worker name is not identity: every
+                // run reuses w0, w1, ...
+                if (!FleetConvIdentity.RegistryRowMatches(url, anchor, du, dt,
                         RegistryTranscriptLineage(d))) continue;
                 return FleetConvIdentity.MergeTranscriptLineage(
                     RegistryTranscriptLineage(d), null, latestHint);
@@ -289,7 +287,10 @@ partial class ChatWindow
         // key is either a real Copilot conv_url, or a synthetic "fleet:<worker-name>" used when the
         // conv_url was never captured -- in that case resolve the worker by NAME so click-to-open
         // always finds its live status.json snapshot regardless of URL scraping.
+        // "fleet:<x>": x is a transcript STEM ("r6adac45a_a0_w1", the conversation's identity when
+        // it has no Copilot id) or a bare worker name (the CURRENT run's worker of that name).
         string wantName = key.StartsWith("fleet:") ? key.Substring(6) : null;
+        string wantStem = wantName != null ? FleetConvIdentity.StemOf(wantName) : null;
         try
         {
             string statusPath = Path.Combine(Path.GetDirectoryName(_convsPath), "status.json");
@@ -303,7 +304,11 @@ partial class ChatWindow
             {
                 var w = o as Dictionary<string, object>;
                 if (w == null) continue;
-                if (wantName != null) { if (SS(w, "name") == wantName) return w; }
+                if (wantName != null)
+                {
+                    if (SS(w, "name") == wantName) return w;
+                    if (wantStem.Length > 0 && FleetConvIdentity.StemOf(SS(w, "transcript")) == wantStem) return w;
+                }
                 else if (SS(w, "conv_url") == key) return w;
             }
         }
@@ -353,36 +358,6 @@ partial class ChatWindow
         if (actual.EndsWith(".gz", StringComparison.OrdinalIgnoreCase))
             return new StreamReader(new GZipStream(fsr, CompressionMode.Decompress), Encoding.UTF8);
         return new StreamReader(fsr, Encoding.UTF8);
-    }
-
-    // Locate a worker's on-disk transcript by NAME, independent of the live status.json worker
-    // entry. Transcripts are named "<runid>_a<agent>_w<N>.jsonl" (or "...jsonl.gz" once
-    // fleet_retention compresses it) and OUTLIVE the live worker dict, so this lets click-to-open
-    // load the full conversation for a finished/restarted/history worker (when ReadFleetWorker
-    // returns null) instead of falling back to the "not available" placeholder.
-    // Returns the NEWEST matching file (the latest run for that worker), or "" if none.
-    string NewestTranscriptForWorker(string worker)
-    {
-        try
-        {
-            if (string.IsNullOrEmpty(worker)) return "";
-            string tdir = Path.Combine(Path.GetDirectoryName(_convsPath), "transcripts");
-            if (!Directory.Exists(tdir)) return "";
-            string suffix = "_" + worker + ".jsonl";   // exact suffix: "w1" must not match "w10"
-            string gzSuffix = suffix + ".gz";
-            string newest = null; DateTime best = DateTime.MinValue;
-            var candidates = new List<string>(Directory.GetFiles(tdir, "*" + suffix));
-            candidates.AddRange(Directory.GetFiles(tdir, "*" + gzSuffix));
-            foreach (string f in candidates)
-            {
-                string name = Path.GetFileName(f);
-                if (!(name.EndsWith(suffix, StringComparison.Ordinal) || name.EndsWith(gzSuffix, StringComparison.Ordinal))) continue;
-                DateTime t = File.GetLastWriteTimeUtc(f);
-                if (t > best) { best = t; newest = f; }
-            }
-            return newest ?? "";
-        }
-        catch { return ""; }
     }
 
     // Read a worker's persisted full-text transcript (.fleet/transcripts/<key>.jsonl, one

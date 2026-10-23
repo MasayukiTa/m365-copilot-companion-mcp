@@ -130,8 +130,8 @@ partial class ChatWindow
                 // (FleetConvIdentity.SyncRowMatches).
                 foreach (var c in _all)
                 {
-                    if (FleetConvIdentity.SyncRowMatches(url, regSource, regName, transcript, regLineage,
-                            c.ConvUrl, c.Source, c.Name, c.Transcript, c.Transcripts)) { existingC = c; break; }
+                    if (FleetConvIdentity.SyncRowMatches(url, transcript, regLineage,
+                            c.ConvUrl, c.Transcript, c.Transcripts)) { existingC = c; break; }
                 }
                 if (existingC != null)
                 {
@@ -289,30 +289,38 @@ partial class ChatWindow
         // Normalize a "fleet:<name>" url back into a worker key (no real Copilot URL was captured).
         if (!string.IsNullOrEmpty(url) && url.StartsWith("fleet:"))
         { if (string.IsNullOrEmpty(worker)) worker = url.Substring(6); url = ""; }
-        // Robust key: prefer the real conv_url (for /history); else a synthetic worker key that
-        // ReadFleetWorker resolves by NAME so the click always lands on the live snapshot.
-        string key = !string.IsNullOrEmpty(url) ? url : ("fleet:" + (worker ?? ""));
-
-        // Resolve the live worker dict (by conv_url when we have a real URL, else by name).
-        var wkr = ReadFleetWorker(key);
+        // Resolve the live worker dict: by conv_url when we have a real URL; else the CURRENT
+        // run's worker of that name -- but only if it is the very transcript the click named
+        // (a history click names the exact file; w1 of today's run is not w1 of an older run).
+        var wkr = ReadFleetWorker(!string.IsNullOrEmpty(url) ? url : ("fleet:" + (worker ?? "")));
+        if (wkr != null && string.IsNullOrEmpty(url) && !string.IsNullOrEmpty(transcriptHint)
+            && FleetConvIdentity.StemOf(SS(wkr, "transcript")) != FleetConvIdentity.StemOf(transcriptHint))
+            wkr = null;
         bool running = FleetRunningFresh();
         string liveTranscriptPath = wkr != null ? SS(wkr, "transcript") : "";
         // A WORKER NAME IS NOT A CONVERSATION. w0, w1, ... are reused by every run, so "the newest
-        // transcript of w1" is some other conversation whenever this one has an id of its own
-        // (that is how the ADAMS conversation grew a computer-use transcript at its end).
-        // The name is a fallback only for a key with no id ("fleet:<name>"), and a transcript
-        // that is known to carry another Copilot id is never taken (FleetConvIdentity.HintMayJoin).
-        if (string.IsNullOrEmpty(liveTranscriptPath) && !string.IsNullOrEmpty(worker)
-            && FleetConvIdentity.MayResolveByWorkerName(url))
-            liveTranscriptPath = NewestTranscriptForWorker(worker);
+        // transcript of w1" is some other conversation (that is how the ADAMS conversation grew a
+        // computer-use transcript at its end). A conversation is its Copilot id, or -- with no id
+        // -- its transcript file. The live transcript is the one in this conversation's own
+        // status.json worker (found by conv_url, or by the "fleet:<name>" key of the CURRENT
+        // run); a transcript known to carry another Copilot id is never taken.
         if (!string.IsNullOrEmpty(liveTranscriptPath)
             && !FleetConvIdentity.HintMayJoin(url, ConvListing.TranscriptGuid(liveTranscriptPath)))
             liveTranscriptPath = "";
+        // What finds the registry row of a conversation that has no id: the live transcript, or
+        // the exact file a history click named.
+        string lineageAnchor = !string.IsNullOrEmpty(liveTranscriptPath) ? liveTranscriptPath : (transcriptHint ?? "");
+        // The sidebar key. A Copilot id when there is one; otherwise the transcript FILE's stem
+        // ("fleet:r6adac45a_a0_w1"), never the bare worker name -- "fleet:w1" was one key shared
+        // by every run's w1, so opening today's w1 reused (and added to) an older run's row.
+        string key = !string.IsNullOrEmpty(url) ? url
+            : (FleetConvIdentity.IdentityKey("", lineageAnchor).Length > 0
+                ? "fleet:" + FleetConvIdentity.StemOf(lineageAnchor) : "fleet:" + (worker ?? ""));
 
         // Registry lineage is the conversation identity (old -> new). A cockpit history click's
         // transcriptHint is DISPLAY LOCATION only: it must never rewind the Conversation.Transcript
         // pointer that ChatSend later uses for live-worker/follow-up routing.
-        var transcriptLineage = RegistryTranscriptLineageFor(url, worker, liveTranscriptPath);
+        var transcriptLineage = RegistryTranscriptLineageFor(url, lineageAnchor, liveTranscriptPath);
         string identityTranscriptPath = FleetConvIdentity.LatestTranscript(transcriptLineage, liveTranscriptPath);
         bool exactTranscriptView = !string.IsNullOrEmpty(transcriptHint);
         string displayTranscriptPath = exactTranscriptView ? transcriptHint : identityTranscriptPath;

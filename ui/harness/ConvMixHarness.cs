@@ -5,7 +5,7 @@
 //
 //   ConvMixHarness.exe run <cases.json> <results.json>
 //
-// ops: registry_match, sync_match, may_resolve_by_name, hint_may_join, transcript_guid, run_of.
+// ops: registry_match, sync_match, hint_may_join, transcript_guid, stem_of, identity_key.
 // Legacy csc, C# 5.
 using System;
 using System.Collections.Generic;
@@ -66,22 +66,20 @@ static class ConvMixHarness
             {
                 string op = Str(c, "op");
                 if (op == "registry_match")
-                    value = FleetConvIdentity.RegistryRowMatches(Str(c, "url"), Str(c, "worker"), Str(c, "hint"),
-                        Str(c, "row_url"), Str(c, "row_source"), Str(c, "row_name"), Str(c, "row_transcript"),
-                        StrList(c, "row_transcripts"));
+                    value = FleetConvIdentity.RegistryRowMatches(Str(c, "url"), Str(c, "anchor"),
+                        Str(c, "row_url"), Str(c, "row_transcript"), StrList(c, "row_transcripts"));
                 else if (op == "sync_match")
-                    value = FleetConvIdentity.SyncRowMatches(Str(c, "row_url"), Str(c, "row_source"), Str(c, "row_name"),
-                        Str(c, "row_transcript"), StrList(c, "row_transcripts"),
-                        Str(c, "c_url"), Str(c, "c_source"), Str(c, "c_name"), Str(c, "c_transcript"),
+                    value = FleetConvIdentity.SyncRowMatches(Str(c, "row_url"), Str(c, "row_transcript"),
+                        StrList(c, "row_transcripts"), Str(c, "c_url"), Str(c, "c_transcript"),
                         StrList(c, "c_transcripts"));
-                else if (op == "may_resolve_by_name")
-                    value = FleetConvIdentity.MayResolveByWorkerName(Str(c, "url"));
                 else if (op == "hint_may_join")
                     value = FleetConvIdentity.HintMayJoin(Str(c, "url"), ConvListing.TranscriptGuid(Str(c, "hint_path")));
                 else if (op == "transcript_guid")
                     value = ConvListing.TranscriptGuid(Str(c, "path"));
-                else if (op == "run_of")
-                    value = FleetConvIdentity.RunOf(Str(c, "path"));
+                else if (op == "stem_of")
+                    value = FleetConvIdentity.StemOf(Str(c, "path"));
+                else if (op == "identity_key")
+                    value = FleetConvIdentity.IdentityKey(Str(c, "url"), Str(c, "path"));
                 else
                     throw new InvalidOperationException("unknown op " + op);
             }
