@@ -966,6 +966,16 @@ AUTOSTART_GRACE_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_GRACE_S", "240"
 #: spawn a browser every drain pass -- every fifteen seconds -- for as long as the goal waits.
 AUTOSTART_BACKOFF_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_BACKOFF_S", "900") or 900)
 
+#: How long an autostarted runner waits for the previous coordinator to release the state dir's
+#: run lock before it gives up (fleet_runner --wait-for-state-dir-seconds). Without it a launch
+#: made while the previous run is still in its final persistence exits at once, because the lock
+#: is fail-fast by default: status.json reaches running:false before the old process lets go
+#: (see fleet_runner._acquire_run_slot). Measured 2026-10-23: a launch at 17:46:08 vanished in
+#: seconds with no log while the previous run's cleanup kept writing history.json until
+#: 17:47:29 (81s), and its goal was redelivered 7 minutes later. 120s covers the 81s measured;
+#: the cockpit uses 60 for the same handoff.
+AUTOSTART_WAIT_PRIOR_S = float(os.environ.get("FLEET_INTAKE_AUTOSTART_WAIT_PRIOR_S", "120") or 120)
+
 #: The free-space floor an autostarted (non-bench) run admits against. Small on purpose -- it is
 #: not protecting a Docker build, it is protecting the machine's ability to keep working at all.
 #: Sized from what stops being possible below it: git cannot write a loose object, the fleet
@@ -1186,6 +1196,36 @@ def _pid_alive(pid) -> bool:
         return True
 
 
+def _launch_run_finished(state_dir, started) -> bool:
+    """True when the run an autostart launched (at `started`) came up and has already ended.
+
+    WHY THIS EXISTS: AUTOSTART_GRACE_S (240s) was the earliest moment anything could judge a
+    launch, even when the answer was already on disk. A run that finished in 95-154s then left
+    autostart_status saying "the fleet launched Ns ago is not running and its process is gone;
+    waiting out the backoff" (or "still coming up") until the grace expired and
+    recover_failed_autostart marked the record became_live. Measured 2026-10-23, soak2, 100 min:
+    of 33 goals, 32 parked behind an earlier launch; 16 of those went out 241-265s after that
+    launch (the grace plus up to one 15s pass) and 15 more 287-372s after it. Goals that joined
+    a live run (add_goal) were delivered in 1-2s and fresh autostarts in 5-6s. Median
+    submit-to-dispatch was 24s, p90 109s, max 255s.
+
+    The evidence is the same that recover_failed_autostart already trusts after the grace:
+    status.json carries this run's own `started` stamp (so it came up) and fleet_is_live is
+    False (so it is not running now). Neither depends on the pid, so a coordinator still in its
+    final persistence does not hold the queue; the new launch waits for the run lock instead
+    (AUTOSTART_WAIT_PRIOR_S). A launch that never came up has no such stamp and keeps the full
+    grace and backoff. Never raises.
+    """
+    try:
+        if not started:
+            return False
+        if fleet_is_live(state_dir):
+            return False
+        return _run_started_since(state_dir or FLEET_STATE_DIR, started)
+    except Exception:
+        return False
+
+
 def autostart_status(state_dir=None, now=None) -> tuple:
     """(may_start, reason). Reads only; the reason is what the record will say.
 
@@ -1215,6 +1255,10 @@ def autostart_status(state_dir=None, now=None) -> tuple:
     if started:
         age = now - started
         outcome = rec.get("outcome")
+        if outcome == "launched" and _launch_run_finished(state_dir, started):
+            # THE LAUNCHED RUN CAME UP AND HAS ENDED: nothing is in flight. See
+            # _launch_run_finished for what this replaced and the measurement behind it.
+            return True, "the run this launch started has finished"
         if outcome == "launched":
             if age < AUTOSTART_GRACE_S and _pid_alive(rec.get("pid")):
                 return False, ("a fleet launched %.0fs ago is still coming up (pid %s)"
@@ -1354,7 +1398,8 @@ def autostart_fleet(goals, state_dir=None, now=None, launcher=None) -> dict:
     # had chosen anything. When the operator has chosen, their choice is left to the chain, and
     # the cockpit's live `set_disk_floor_gb` keeps working because nothing is pinned at launch.
     cmd = [sys.executable, "-m", "relay.fleet_runner",
-           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd]
+           "--goals-file", goals_file, "--agent-url", url, "--state-dir", sd,
+           "--wait-for-state-dir-seconds", "%g" % AUTOSTART_WAIT_PRIOR_S]
     if not _operator_set_a_disk_floor():
         cmd += ["--disk-floor-gb", str(AUTOSTART_DISK_FLOOR_GB)]
     # FAN-OUT WAS WIRED EVERYWHERE BUT HERE. fleet_runner parses --fanout and passes it to
@@ -1549,7 +1594,9 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
     if not rec or rec.get("outcome") not in ("launched",):
         return []
     started = float(rec.get("started_at") or 0)
-    if now - started < AUTOSTART_GRACE_S:
+    if now - started < AUTOSTART_GRACE_S and not _launch_run_finished(sd, started):
+        # Inside the grace a launch may still be coming up, so it is left alone -- unless the
+        # run is already known to have come up and ended, which is a verdict and not a guess.
         return []
     if fleet_is_live(sd):
         _write_autostart(sd, dict(rec, outcome="became_live"))
