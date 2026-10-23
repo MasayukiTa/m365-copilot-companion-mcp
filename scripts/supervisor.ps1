@@ -450,6 +450,20 @@ function Get-SupervisorBridgeState {
     }
 }
 
+function Read-JsonFileUtf8 {
+    # READ A JSON FILE THE PRODUCT WROTE, AS UTF-8. THROWS when the file cannot be read or parsed.
+    # Every JSON file under .fleet is written by Python as UTF-8 with ensure_ascii=False, so a goal
+    # in Japanese is stored as raw UTF-8 bytes. Windows PowerShell 5.1's `Get-Content -Raw` with no
+    # -Encoding decodes a BOM-less file with the ANSI code page (cp932 here): the bytes become
+    # mojibake, a lead byte swallows the byte after it (often a closing quote), and
+    # ConvertFrom-Json fails (invalid object passed in). Measured 2026-10-23: all four of the
+    # newest .fleet\interrupted snapshots that carry a Japanese goal failed to parse that way, the
+    # per-cycle auto-resume saw "no snapshot" and returned without a word (G10).
+    param([Parameter(Mandatory=$true)][string]$Path)
+    $raw = [System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false)))
+    return ($raw.TrimStart([char]0xFEFF) | ConvertFrom-Json -ErrorAction Stop)
+}
+
 function Test-SupervisorResumeInProgress {
     # A resume this supervisor launched that has not exited, or a launch guard that is still fresh
     # (.fleet\resume_launch.json, written BEFORE Start-Process by Invoke-FleetAutoResume).
@@ -457,7 +471,7 @@ function Test-SupervisorResumeInProgress {
         if ($script:AutoResumeRunners -and $script:AutoResumeRunners.Count -gt 0) { return $true }
         $gp = Join-Path $SupFleetDir "resume_launch.json"
         if (Test-Path -LiteralPath $gp) {
-            $g = (Get-Content -LiteralPath $gp -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+            $g = Read-JsonFileUtf8 -Path $gp
             $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double]$g.ts
             if ($age -ge 0 -and $age -lt 600) {
                 $gpid = 0
@@ -476,7 +490,7 @@ function Test-SupervisorOtherRunActive {
         if ($null -ne $rm -and (Test-ReviewMarkerProcessAlive $rm)) { return $true }
         if (Test-Path -LiteralPath $LocalLoopMarkerDir) {
             foreach ($f in @(Get-ChildItem -Path $LocalLoopMarkerDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
-                try { $m = (Get-Content -Path $f.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+                try { $m = Read-JsonFileUtf8 -Path $f.FullName } catch { continue }
                 if ($null -ne $m -and (Test-LocalLoopMarkerProcessAlive $m)) { return $true }
             }
         }
@@ -488,7 +502,7 @@ function Get-SupervisorLastRestartAge {
     # Seconds since the previous self-restart, -1 when there was none / the mark is unreadable.
     try {
         if (-not (Test-Path -LiteralPath $SupervisorRestartMarkPath)) { return -1 }
-        $m = (Get-Content -LiteralPath $SupervisorRestartMarkPath -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop
+        $m = Read-JsonFileUtf8 -Path $SupervisorRestartMarkPath
         $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [double]$m.ts
         if ($age -lt 0) { return 0 }
         return [double]$age
@@ -2201,9 +2215,9 @@ function Get-FleetActiveMarker {
     # corrupt JSON -> $null, never throws.
     if (-not (Test-Path $FleetMarkerPath)) { return $null }
     try {
-        $raw = Get-Content -Path $FleetMarkerPath -Raw -ErrorAction Stop
-        return $raw | ConvertFrom-Json -ErrorAction Stop
+        return (Read-JsonFileUtf8 -Path $FleetMarkerPath)
     } catch {
+        Write-FleetResumeLog -Once -Key "unreadable:fleet_run_active" -Msg ("fleet auto-resume: the live run marker cannot be read (" + $_.Exception.Message + ")")
         return $null
     }
 }
@@ -2291,7 +2305,14 @@ function Get-FleetPendingSnapshot {
         if (-not (Test-Path $dir)) { return $null }
         $best = $null
         foreach ($f in (Get-ChildItem -Path $dir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
-            try { $d = (Get-Content -Path $f.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop } catch { continue }
+            $d = $null
+            try { $d = Read-JsonFileUtf8 -Path $f.FullName } catch {
+                # A SNAPSHOT THAT CANNOT BE READ MUST NOT VANISH. Skipping it quietly is what hid
+                # the 2026-10-23 failure (see Read-JsonFileUtf8): the run was interrupted, resumable,
+                # and the supervisor never said it had looked. Once per file per supervisor life.
+                Write-FleetResumeLog -Once -Key ("unreadable:" + $f.Name) -Msg ("fleet auto-resume: interrupted-run snapshot " + $f.Name + " cannot be read (" + $_.Exception.Message + ") -- skipped")
+                continue
+            }
             if (-not $d -or $d.state -ne "pending") { continue }
             $ts = 0.0
             try { $ts = [double]$d.written_ts } catch { $ts = 0.0 }
@@ -2346,8 +2367,20 @@ function Invoke-FleetAutoResume {
     if ($null -eq $marker) {
         $snap = Get-FleetPendingSnapshot
         if ($snap -and $snap.Data.marker) { $marker = $snap.Data.marker }
+        elseif ($snap) {
+            Write-FleetResumeLog -Once:$FromCycle -Key "$($snap.Path):nomarker" -Msg "fleet auto-resume: pending snapshot $([System.IO.Path]::GetFileName($snap.Path)) carries no run marker -- nothing to resume from"
+        }
     }
-    if (-not (Test-FleetShouldAutoResume $marker)) { return $false }
+    if (-not (Test-FleetShouldAutoResume $marker)) {
+        # NEVER A SILENT NO for a snapshot: the live-marker case (pid still alive) is the normal
+        # running state and stays quiet, but a pending snapshot is an interrupted run waiting for
+        # a decision, and "pid still alive" there means a reused pid or a coordinator that is not
+        # dead -- worth one line.
+        if ($snap -and $marker) {
+            Write-FleetResumeLog -Once:$FromCycle -Key "$($snap.Path):alive" -Msg "fleet auto-resume: pending snapshot $([System.IO.Path]::GetFileName($snap.Path)) names pid $($marker.pid), which is alive (or the pid is unusable) -- not resuming"
+        }
+        return $false
+    }
     # THE SWITCH IS ASKED ONLY NOW, with a candidate in hand (see Test-FleetAutoResumeEnabled).
     if (-not (Test-FleetAutoResumeEnabled -Force:$ForceEnabled)) {
         Write-FleetResumeLog -Once:$FromCycle -Key "$($marker.pid):disabled" -Msg "fleet auto-resume is OFF (fleet_auto_resume setting / MCP_FLEET_AUTORESUME) -- interrupted run (marker pid $($marker.pid)) left for a manual resume"
@@ -2402,7 +2435,15 @@ function Invoke-FleetAutoResume {
     if ($marker.resume_argv) { $resumeArgs = @($marker.resume_argv) }
     $resumeArgs = @($resumeArgs) + "--resume"
     $shown = ($resumeArgs -join " ")
-    Write-FleetResumeLog -Once:($FromCycle -and $DryRun) -Key "$($marker.pid):dry" -Msg "fleet run INTERRUPTED (marker pid $($marker.pid) is dead) -> auto-resuming: python -m relay.fleet_runner $shown"
+    # WHAT THE GATE SAID, in the same line: the source, the loop-guard result and the count so far
+    # (relay.fleet_resume.MAX_AUTO_RESUMES = 3; the number is the gate's, not chosen here).
+    $gateNote = "source=live-marker (loop guard not applied)"
+    if ($snap) {
+        $cnt = 0
+        try { if ($snap.Data.resume -and $null -ne $snap.Data.resume.count) { $cnt = [int]$snap.Data.resume.count } } catch { $cnt = 0 }
+        $gateNote = "source=snapshot $([System.IO.Path]::GetFileName($snap.Path)) loop-guard=ok resumes-so-far=$cnt of 3"
+    }
+    Write-FleetResumeLog -Once:($FromCycle -and $DryRun) -Key "$($marker.pid):dry" -Msg "fleet run INTERRUPTED (marker pid $($marker.pid) is dead) -> auto-resuming ($gateNote): python -m relay.fleet_runner $shown"
     if ($DryRun) {
         Write-FleetResumeLog -Once:($FromCycle -and $DryRun) -Key "$($marker.pid):dry2" -Msg "fleet auto-resume DRY RUN -- not relaunching (verification mode)"
         return $true
@@ -2474,8 +2515,7 @@ function Test-ReviewAutoResumeEnabled {
 function Get-ReviewActiveMarker {
     if (-not (Test-Path $ReviewMarkerPath)) { return $null }
     try {
-        return (Get-Content -Path $ReviewMarkerPath -Raw -ErrorAction Stop) |
-            ConvertFrom-Json -ErrorAction Stop
+        return (Read-JsonFileUtf8 -Path $ReviewMarkerPath)
     } catch { return $null }
 }
 
@@ -2612,7 +2652,7 @@ function Invoke-LocalLoopAutoResume {
     $did = $false
     foreach ($file in @(Get-ChildItem -Path $LocalLoopMarkerDir -Filter "*.json" -File -ErrorAction SilentlyContinue)) {
         $marker = $null
-        try { $marker = (Get-Content -Path $file.FullName -Raw -ErrorAction Stop) | ConvertFrom-Json -ErrorAction Stop }
+        try { $marker = Read-JsonFileUtf8 -Path $file.FullName }
         catch { continue }
         if ($null -eq $marker) { continue }
         if (Test-LocalLoopMarkerProcessAlive $marker) { continue }

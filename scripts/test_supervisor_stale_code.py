@@ -94,7 +94,7 @@ _FUNCTIONS = (
     "function Get-SupervisorFileStat", "function Get-SupervisorFileHash", "function Get-SupervisorGitHead",
     "function Initialize-SupervisorCodeWatch", "function Update-SupervisorCodeState",
     "function Write-SupervisorState", "function Test-SupervisorScriptsParse",
-    "function Get-SupervisorRestartVerdict", "function Get-SupervisorLastRestartAge",
+    "function Get-SupervisorRestartVerdict", "function Get-SupervisorLastRestartAge", "function Read-JsonFileUtf8",
     "function Invoke-SupervisorCodeCycle",
 )
 
