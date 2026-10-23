@@ -57,6 +57,7 @@ Dev Tunnel CLI、トンネル、コネクタ、アクセス許可は要りませ
 ## リスクと制限
 
 - **呼び出しはモデルが書きます。** できることはコネクタ経路と同じですが、ブロックの書き間違い(項目の抜け、余計な文字)があるとそのターンは無駄になります。エラーはモデルに返され、たいていは自分で直します。
+- **読み取れない書式の呼び出しは、検出して直させます。** `json` と書く、ツール名そのものを書く、バッククォートが4個、返信が途中で切れる、`<invoke>` と書く、といった呼び出しは実行されず、エラーも出ません。フリートはこれを見つけると、正しい書式を示して1回やり直させ、2ターン続けば新しい会話で最初からやり直し、それでも直らなければ基盤側の停滞として止めます。「call_tool がない」「ツール○○が索引にない」という返答も、サーバーに実際に問い合わせて誤りと分かったときだけ、同じ形で直させます(relay/bridged_reply_checks.py)。ツールの結果として書かれた値がツールの返したものか、までは確かめません。ツール呼び出しの形が書かれていない返信は、この検出では見つかりません。
 - **1ターンが遅くなります。** ツールを呼ぶたびにチャットが1往復します。このため、この経路ではフリートの無応答の上限とターンの上限を長くしています(既定は、無応答 600 秒、1ターン 1200 秒)。
 - **チャットの長さの制限を受けます。** ツールの結果は切らずにそのままモデルへ返します。結果が非常に大きいと、モデル側の上限にあたってそのターンが失敗することがあります。
 - **権限はコネクタ経路と同じです。** サーバー自身の確認(アンロック、ツールごとの権限、フォルダーの規則)が、すべての呼び出しにかかります。この経路で使える範囲が増えることはなく、確認が減ることもありません。
@@ -163,6 +164,15 @@ never started by this product.
 - **The model writes the call.** Everything it can do here it can also do on the connector route, but
   a mistake in the block (a missing field, a stray character) costs a turn. The loop reports the error
   back to the model, which usually corrects it.
+- **Calls in a form the loop cannot read are detected and sent back.** A call written with the info
+  string `json`, with the tool's own name, with four backticks, cut off inside the block, or as
+  `<invoke>` markup is not executed and raises no error. The fleet recognises it, shows the model the
+  exact block format and asks once more; two turns in a row open a fresh conversation, and if that
+  does not help the worker stops as an infrastructure stall. A reply saying "there is no call_tool" or
+  "tool X is not in the index" is corrected the same way, but only after asking the server and finding
+  that the name does exist (relay/bridged_reply_checks.py). It does not verify that values the model
+  states as a tool's result were returned by a tool, and a reply that contains no call-shaped text
+  is not caught by this check.
 - **Slower turns.** Each tool call is a chat round trip. The fleet's silence and turn limits are longer
   on this route (600 s idle, 1200 s per turn by default) for that reason.
 - **Chat-length limits apply.** Very large results are truncated before they go back to the model, and
