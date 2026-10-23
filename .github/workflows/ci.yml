@@ -424,6 +424,7 @@ jobs:
             tools/test_evidence_trace.py \
             tools/test_auto_loader.py \
             tools/test_ext_helper.py \
+            tools/test_a_registered_tool_is_not_missing_from_the_index.py \
             tools/test_procedural_memory.py \
             tools/test_procedural_memory_concurrency.py \
             tools/test_state_store.py \

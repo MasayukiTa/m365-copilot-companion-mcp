@@ -765,6 +765,37 @@ TOOLS = (
 import inspect as _inspect
 
 _ALL_TOOLS = {getattr(t, "__name__", repr(t)): t for t in TOOLS}
+# The static tuple above, before anything is added: tool annotations are derived from it only.
+_STATIC_TOOLS = dict(_ALL_TOOLS)
+
+# AUTO-REGISTERED TOOLS BELONG IN THE GATEWAY'S TABLE TOO.
+#
+# tools/auto/ modules (the forged tools, and the optional validity helper) used to be registered
+# with the MCP server further down and NEVER added to _ALL_TOOLS, which is what call_tool lists
+# and dispatches from. So the server held validity_judge, validity_list_claims and
+# validity_explain_reason, and call_tool(name='') did not list them, and
+# call_tool(name='validity_judge') answered "no tool or category named" -- from a gateway whose
+# own instructions say anything not found there does not exist. Measured 2026-10-23: a fleet
+# worker asked to run validity_judge read that answer, concluded the tool was not there, and
+# stopped (STUCK); .fleet/tool_events.jsonl holds 10 such lookups for the three names (the log's
+# ok=True is the outcome of the lookup, not of a tool run -- nothing was executed).
+#
+# The fix is at the mechanism, not at the three names: whatever the loader finds is listed,
+# unless tools.tool_catalogue.GATEWAY_UNLISTED says otherwise, with a reason. A static-tuple
+# tool of the same name wins. The loader is called once and its result reused at registration.
+try:
+    from tools.auto_loader import load_auto_tools as _load_auto_tools
+    _AUTO_TOOLS = list(_load_auto_tools())
+except Exception:
+    _AUTO_TOOLS = []
+try:
+    from tools.tool_catalogue import GATEWAY_UNLISTED as _GATEWAY_UNLISTED
+except Exception:
+    _GATEWAY_UNLISTED = {}
+for _mod_name, _forged in _AUTO_TOOLS:
+    _forged_name = getattr(_forged, "__name__", "")
+    if _forged_name and _forged_name not in _ALL_TOOLS and _forged_name not in _GATEWAY_UNLISTED:
+        _ALL_TOOLS[_forged_name] = _forged
 
 if os.environ.get("MCP_TOOL_MAP") == "1":
     def call_tool(name: str = "", arguments: dict = None, unlock_token: str = ""):
@@ -1273,7 +1304,7 @@ try:
     # override-table consistency check (every destructiveHint tool must be gated) would
     # otherwise see mutating tools as "absent" and fail -> crash the server on startup.
     # Annotations are keyed by name and applied to whichever subset registers below.
-    _TOOL_ANNOTATIONS = build_annotations(list(_ALL_TOOLS.values()))
+    _TOOL_ANNOTATIONS = build_annotations(list(_STATIC_TOOLS.values()))
 except Exception:
     _TOOL_ANNOTATIONS = {}
 
@@ -1305,9 +1336,12 @@ for tool in TOOLS:
 # Auto-register forged tools (operator A). Safe when tools/auto is empty:
 # load_auto_tools() returns [] and any failing forged module is skipped.
 try:
-    from tools.auto_loader import load_auto_tools
-
-    for _mod_name, _forged in load_auto_tools():
+    # The list was loaded once, above, so that the gateway's table and this registration cannot
+    # disagree about what was found. A tool the cap already registered directly (pinned by
+    # MCP_TOOL_MAP_INCLUDE) is not registered a second time.
+    for _mod_name, _forged in _AUTO_TOOLS:
+        if _forged in TOOLS:
+            continue
         try:
             mcp.tool()(register(_forged))
         except Exception:

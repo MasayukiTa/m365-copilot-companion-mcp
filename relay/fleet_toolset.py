@@ -151,6 +151,17 @@ DELIBERATELY_EXCLUDED = {
     "fleet_submit":      "queues work for this machine's fleet: a worker that can enqueue runs is not bounded by the run it is in -- same family as stop_request and schedule_create",
     "fleet_queue":       "reads what else the operator has running, which is not part of fixing the instance",
     "validity_audit_ledger": "reads the audit ledger of the validity tools, which is the operator's record of other conversations and not part of fixing the instance",
+    # LISTED IN THE GATEWAY FROM 2026-10-23 (tools/auto/ tools used to bypass its table, so they
+    # were reachable only by a client that saw the server's own tool list). Unlisted already meant
+    # refused, so recording them changes nothing the gate does; it records that somebody looked.
+    "validity_list_claims": "the operator's pre-registered validity claims are not part of fixing the instance -- same reason as validity_audit_ledger",
+    "validity_judge":    "runs the operator's pre-registered validity judgement, a process outside any benchmark instance -- same reason as validity_audit_ledger",
+    "validity_negative_control": "repeats the operator's validity judgement on controls, which is not part of fixing the instance -- same reason as validity_audit_ledger",
+    "validity_verify_lock": "checks the operator's validity pre-registration lock, which is not part of fixing the instance -- same reason as validity_audit_ledger",
+    "validity_explain_reason": "explains the operator's validity reason codes, which are not part of fixing the instance -- same reason as validity_audit_ledger",
+    "count_failures":    "helper of the edit/verify loop (edit_and_verify's family), not weighed on its own -- recorded as excluded because unlisted already meant refused",
+    "failure_signal":    "helper of the edit/verify loop (edit_and_verify's family), not weighed on its own -- recorded as excluded because unlisted already meant refused",
+    "trajectory":        "reads the run log of an edit/verify loop, which a worker has no loop of its own to report on -- same reason as loop_trajectory",
     "trace_session":     "reads a history of what other callers did on this server, which is not part of fixing the instance -- same reason as validity_audit_ledger",
     "loop_until_verified": "drives an edit/verify loop of its own inside one turn; a worker that can start an unbounded agent loop is not bounded by a list of tools -- same reason as forge_tool",
     "recurrent_begin":   "opens a self-generating loop, for the same reason",

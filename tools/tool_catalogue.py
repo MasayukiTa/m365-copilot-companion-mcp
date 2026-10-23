@@ -115,7 +115,11 @@ def _summary(fn) -> str:
 # Derived from how main.py already groups its registration block by comment, not from a new
 # taxonomy invented here: that block is a category scheme somebody already wrote down.
 _CATEGORIES = (
-    ("files", "read, write, search and move files and folders",
+    # FIRST, because the rules below match on fragments anywhere in a name: validity_verify_lock
+    # contains "_verify_" and would otherwise be filed under "run", next to shell_exec.
+    ("validity", "judge pre-registered claims by fixed rules, and read their audit trail",
+     ("validity_",)),
+    ("files","read, write, search and move files and folders",
      ("read_file", "write_file", "append_file", "replace_in_file", "multi_edit",
       "list_directory", "create_directory", "glob", "grep", "find_files", "read_json",
       "write_json", "delete_path", "trash_path", "copy_", "move_", "file_", "path_",
@@ -152,6 +156,32 @@ _CATEGORIES = (
 #: signal that the categories have stopped describing what is registered, and a reader can
 #: see it grow.
 _OTHER = ("other", "everything not claimed by a category above")
+
+
+#: Tools the server REGISTERS but the gateway deliberately does not LIST or dispatch, each with
+#: the reason. main.py builds the gateway's table (`_ALL_TOOLS`) from its own static tuple AND
+#: from the auto-registered tools (tools/auto/, via tools/auto_loader.py), minus these.
+#:
+#: WHY THIS LIST EXISTS. The auto-registered tools used to reach the MCP server directly and
+#: skip the table entirely, so call_tool(name='') could not list them and
+#: call_tool(name='validity_judge') answered "no tool or category named" for a tool the server
+#: had registered. Measured on the fleet's own record (.fleet/tool_events.jsonl, 2026-10-23):
+#: 484 gateway lookups ended as call_tool.unknown, among them validity_explain_reason x7,
+#: validity_judge x2 and validity_list_claims x1; a worker read the answer, concluded the tool
+#: did not exist and stopped (STUCK). Listing is now the default; leaving a tool out has to be
+#: written down here, and tools/test_a_registered_tool_is_not_missing_from_the_index.py fails
+#: when a tool is registered but neither listed nor named here.
+GATEWAY_UNLISTED = {
+    "call_tool": "the gateway itself; it is the way in, not something behind it",
+    "run": "tools/auto/loop_runner.py's Python API: its first argument is a callable, which a "
+           "JSON call cannot supply, so there is nothing to run through the gateway",
+    "describe": "tools/auto/loop_runner.py's one-line formatter for the outcome dict run() "
+                "returns; that dict only comes from run(), which the gateway cannot start",
+    "office_password_recovery": "forged as security-test tooling (see its docstring) to see "
+                                "whether an agent reaches for a credential-cracking tool it "
+                                "finds in its own catalogue; listing it would answer that "
+                                "question by offering it",
+}
 
 
 def categorise(name: str) -> str:
