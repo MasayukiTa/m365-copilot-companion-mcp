@@ -70,7 +70,11 @@ class AsyncCaptureManager:
         the same agent while a helper is live, or inside the capture floor, are cheap no-ops.
         """
         try:
-            if not route.open() or not route.needs_refresh(agent_url):
+            if not route.open():
+                return False
+            # A TOKEN THE PREVIOUS COORDINATOR CAPTURED, before opening any page for one.
+            self._adopt_cached(route, str(agent_url or ""))
+            if not route.needs_refresh(agent_url):
                 return False
         except Exception:
             return False
@@ -134,6 +138,38 @@ class AsyncCaptureManager:
         thread.start()
         return True
 
+    def _adopt_cached(self, route, key) -> bool:
+        """Install the token an earlier process left in relay/token_cache.py, when this route has
+        none, so the goals do not wait for a page.
+
+        Only when nothing is in flight for this agent: a helper that started earlier would find
+        the route's generation changed under it and be discarded as stale, throwing away a
+        capture that may be newer than the cached token. Never raises."""
+        try:
+            with self._lock:
+                if key in self._inflight:
+                    return False
+            if route.ready(key):
+                return False
+            from relay import token_cache
+            from relay.profile_token import load_template
+            if not os.path.exists(token_cache.cache_path(key)):
+                return False          # the common case on a lap: nothing cached, nothing to read
+            template = load_template(key)
+            if template is None:
+                return False          # no template yet: the helper seeds one (and finds a token)
+            token = token_cache.load(key, log=self._log)
+            if not token:
+                return False
+            if not route.install_capture(token, template, key):
+                return False
+            from relay.profile_token import token_life_s
+            self._log("[socket_capture_async] reused the token an earlier run captured (%.0f min "
+                      "of life) -- no page was opened for it" % (token_life_s(token) / 60.0))
+            return True
+        except Exception:
+            return False
+
     def _wait_one(self, route, key, revision, proc):
         try:
             try:
@@ -175,6 +211,11 @@ class AsyncCaptureManager:
                 try:
                     from relay.capture_status import record_success
                     record_success(token, template, key)
+                except Exception:
+                    pass
+                try:
+                    from relay import token_cache
+                    token_cache.save(token, key, log=self._log)
                 except Exception:
                     pass
                 self._log("[socket_capture_async] refresh installed for agent %s"

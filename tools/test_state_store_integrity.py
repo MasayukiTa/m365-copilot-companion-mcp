@@ -223,6 +223,7 @@ AUDITED = {
     "relay/local_loop_controller.py": "controller marker, atomic tmp+replace, one file per job",
     "relay/org/def_store.py": "override map and per-version text, each file replaced whole by an operator command through temp file + os.replace; nothing accumulates",
     "relay/profile_token.py": "captured token template, re-captured on demand",
+    "relay/token_cache.py": "encrypted copy of the current access token for the next process, tmp+replace, one file per agent; re-captured when absent, expired or refused",
     "relay/upload_template.py": "cached shape of the page's UploadFile request, re-captured on demand (fallback path only)",
     "relay/resident_guard.py": "single-use lock file holding the owner pid, created with O_EXCL and removed on release",
     "relay/selfimprove/apply.py": "genome file written from a ledger row",

@@ -2616,6 +2616,13 @@ def reset_socket_route():
         _pt.forget_memo()
     except Exception:
         pass
+    # AND THE TOKEN THE NEXT PROCESS WOULD INHERIT (relay/token_cache.py): it was minted against
+    # the browser that is gone, so it is forgotten like the in-memory one.
+    try:
+        from relay import token_cache as _tc
+        _tc.discard_all()
+    except Exception:
+        pass
     # AND THE POST-CONDITION, CHECKED RATHER THAN ASSERTED IN PROSE. The sentence above this
     # function's body -- "Nothing is preserved: not the token" -- was false for long enough to
     # be quoted, and nothing would have said so. RECORD, not RAISE: this runs after a browser
@@ -2695,6 +2702,28 @@ def _forget_cached_templates(reason):
         return False
 
 
+#: A fault that says the backend refused the TOKEN itself. Narrow on purpose: this throws away a
+#: token another process may be about to reuse, so a transport fault that merely mentions
+#: "token" somewhere must not. (`\b401\b`, an "unauthorized" reply, or the module's own
+#: "supplied token has expired" message.)
+_TOKEN_REFUSED = re.compile(r"\b401\b|unauthori[sz]ed|token has expired", re.IGNORECASE)
+
+
+def _forget_cached_tokens(reason):
+    """Drop the tokens relay/token_cache keeps for the next process when the backend refuses one."""
+    if not _TOKEN_REFUSED.search(reason or ""):
+        return False
+    try:
+        from relay import token_cache
+        gone = token_cache.discard_all()
+        if gone:
+            print("[socket_route] the backend refused a token; discarded %d cached token "
+                  "file(s) so the next process captures a fresh one" % gone, flush=True)
+        return bool(gone)
+    except Exception:
+        return False
+
+
 def report_route_fault(reason, now=None):
     """Report a fault to the route, coalescing TRANSPORT faults within one incident window.
 
@@ -2711,6 +2740,7 @@ def report_route_fault(reason, now=None):
     """
     t = (now or time.time)()
     _forget_cached_templates(reason)
+    _forget_cached_tokens(reason)
     try:
         from relay.transport_policy import classify_fallback
         transport = classify_fallback(reason) == "route"

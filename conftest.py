@@ -239,6 +239,9 @@ LIVE_RECORD_REDIRECTS = {
     # A DIRECTORY OF CAPTURED TOKENS AND REQUEST TEMPLATES. Not a log -- the one place in this
     # list where a stray test write would touch live credentials material.
     "relay.profile_token": {"TEMPLATE_DIR": "templates"},
+    # THE ENCRYPTED TOKEN THE NEXT COORDINATOR REUSES (relay/token_cache.py). A stray test write
+    # would put a made-up token where a real run adopts it as the live credential.
+    "relay.token_cache": {"CACHE_DIR": "token_cache"},
     # Cached account-routing headers of the upload request; a stray test write would land in the
     # live .fleet\upload_templates.
     "relay.upload_template": {"CACHE_DIR": "upload_templates"},
