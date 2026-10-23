@@ -260,6 +260,60 @@ try {
     $c2 = [bool](Invoke-FleetAutoResume -DryRun -FromCycle)
     $r.cycle = [ordered]@{ first = $c1; second = $c2; log = @($script:CapturedLog)
                            snapshotStillPending = ((Get-Content (Join-Path $snapDir "rTEST_a1.json") -Raw | ConvertFrom-Json).state) }
+
+    # 6. G10 (2026-10-23): a coordinator killed outright (a stand-in that only waits), a goal in
+    # Japanese in the status the reaper snapshots, and the PER-CYCLE path deciding to resume.
+    # The Japanese text is built from code points because this driver is read as ANSI by
+    # Windows PowerShell 5.1 -- the same trap the production fix removes.
+    Remove-Item (Join-Path $FleetDir "GO"), (Join-Path $FleetDir "STOP") -Force -ErrorAction SilentlyContinue
+    Remove-Item $FleetMarkerPath -Force -ErrorAction SilentlyContinue
+    Get-ChildItem $snapDir -ErrorAction SilentlyContinue | Remove-Item -Force
+    $ja = -join ([char[]]@(0x30C6, 0x30B9, 0x30C8, 0x7528, 0x306E, 0x30D5, 0x30A1, 0x30A4, 0x30EB, 0x3092, 0x4F5C, 0x3063, 0x3066))
+    $utf8 = New-Object System.Text.UTF8Encoding($false)
+    $victim = Start-Process -FilePath $BasePy -WindowStyle Hidden -PassThru -ArgumentList @('-c', '"import time; time.sleep(300)"')
+    $mk = @{ pid = $victim.Id; start_ts = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds(); argv = @("--goal", $ja); resume_argv = @("--x") }
+    [System.IO.File]::WriteAllText($FleetMarkerPath, ($mk | ConvertTo-Json -Compress), $utf8)
+    $st = @{ running = $true; workers = @(@{ name = "w0"; status = "working"; run_id = "rJA1_a0"; jid = "j1"; goal = $ja }) }
+    [System.IO.File]::WriteAllText((Join-Path $FleetDir "status.json"), ($st | ConvertTo-Json -Depth 5 -Compress), $utf8)
+    Stop-Process -Id $victim.Id -Force
+    $victim.WaitForExit(10000) | Out-Null
+    $script:CapturedLog.Clear()
+    Invoke-FleetReap
+    $snapFiles = @(Get-ChildItem $snapDir -Filter "*.json" -ErrorAction SilentlyContinue)
+    $r.kill = [ordered]@{ victimPid = $victim.Id; snapshots = $snapFiles.Count; reapLog = @($script:CapturedLog) }
+    if ($snapFiles.Count -gt 0) {
+        $r.kill.snapshotHasJapanese = ([System.IO.File]::ReadAllText($snapFiles[0].FullName, $utf8)).Contains($ja)
+        $r.kill.snapshotState = (Read-JsonFileUtf8 -Path $snapFiles[0].FullName).state
+    }
+    $script:CapturedLog.Clear()
+    $r.kill.resumed = [bool](Invoke-FleetAutoResume -FromCycle)
+    $r.kill.tracked = [bool]$script:ResumedFleet
+    $r.kill.log = @($script:CapturedLog)
+    if ($snapFiles.Count -gt 0) { $r.kill.snapshotStateAfter = (Read-JsonFileUtf8 -Path $snapFiles[0].FullName).state }
+    New-Item -ItemType File -Path (Join-Path $FleetDir "GO") -Force | Out-Null
+    New-Item -ItemType File -Path (Join-Path $FleetDir "STOP") -Force | Out-Null
+    foreach ($e in $script:AutoResumeRunners) { try { $e.Proc.WaitForExit(10000) | Out-Null } catch { } }
+    Remove-Item (Join-Path $FleetDir "GO"), (Join-Path $FleetDir "STOP") -Force -ErrorAction SilentlyContinue
+    Remove-Item $FleetMarkerPath -Force -ErrorAction SilentlyContinue
+    $script:ResumedFleet = $null
+
+    # 7. a refusal is never silent: three resumes already used -> REFUSED, with the reason
+    Get-ChildItem $snapDir -ErrorAction SilentlyContinue | Remove-Item -Force
+    $capBody = @{ schema = 1; run_id = "rCAP_a1"; state = "pending"; written_ts = 6.0
+                  marker = @{ pid = $DeadPid; start_ts = 1.0; argv = @("--x"); resume_argv = @("--x") }
+                  interrupted = @{ free_bytes_at_detection = 1000 }
+                  resume = @{ count = 3; last_ts = 7.0; history = @() } }
+    [System.IO.File]::WriteAllText((Join-Path $snapDir "rCAP_a1.json"), ($capBody | ConvertTo-Json -Depth 6), $utf8)
+    $script:CapturedLog.Clear()
+    $r.capped = [ordered]@{ resumed = [bool](Invoke-FleetAutoResume -FromCycle); log = @($script:CapturedLog) }
+
+    # 8. nor is a snapshot that cannot be read: it is named once, and the cycle goes on
+    Get-ChildItem $snapDir -ErrorAction SilentlyContinue | Remove-Item -Force
+    [System.IO.File]::WriteAllText((Join-Path $snapDir "rBAD_a1.json"), '{"state": "pending", "marker": {', $utf8)
+    $script:CapturedLog.Clear()
+    $b1 = [bool](Invoke-FleetAutoResume -FromCycle)
+    $b2 = [bool](Invoke-FleetAutoResume -FromCycle)
+    $r.unreadable = [ordered]@{ first = $b1; second = $b2; log = @($script:CapturedLog) }
 } finally {
     if ($fake) { Stop-Process -Id $fake.Id -Force }
     New-Item -ItemType File -Path (Join-Path $FleetDir "GO") -Force | Out-Null
@@ -270,7 +324,7 @@ try {
 '''
 
 _FUNCTIONS = (
-    "function Test-PythonRuns", "function Update-PythonInterpreter",
+    "function Test-PythonRuns", "function Update-PythonInterpreter", "function Read-JsonFileUtf8",
     "function Register-AutoResumeRunner", "function Test-FleetAutoResumeEnabled",
     "function Get-FleetActiveMarker", "function Test-PidAlive", "function Test-FleetShouldAutoResume",
     "function Get-ThisCheckoutFleetCoordinatorPids", "function Invoke-FleetAutoResume",
@@ -754,3 +808,47 @@ def test_no_second_coordinator_even_with_the_setting_on(setting_result):
     r = setting_result["coordinator_already_live"]
     assert r["resumed"] is False and r["launched"] == 0
     assert r["snapState"] == "pending"
+
+
+# -- G10 (2026-10-23): the per-cycle path did not resume a killed coordinator ----------------------
+
+@windows_only
+def test_a_killed_coordinator_with_a_japanese_goal_is_resumed_by_the_cycle_path(driver_result):
+    """The root cause: Get-Content -Raw (no -Encoding) read the reaper's UTF-8 snapshot as cp932,
+    ConvertFrom-Json failed, the snapshot was skipped and the cycle returned without a word. The
+    status the reaper snapshots here carries a goal in Japanese, as the real runs do."""
+    k = driver_result["kill"]
+    assert k["snapshots"] == 1, "the reaper wrote no snapshot for the killed stand-in: %s" % _lines(k["reapLog"])
+    assert k["snapshotHasJapanese"] is True, "the snapshot does not carry the Japanese goal"
+    assert k["snapshotState"] == "pending"
+    assert k["resumed"] is True, _lines(k["log"])
+    assert k["tracked"] is True
+    line = [l for l in _lines(k["log"]) if "auto-resuming" in l]
+    assert len(line) == 1 and "loop-guard=ok" in line[0] and "resumes-so-far=0 of 3" in line[0], line
+
+
+@windows_only
+def test_a_refused_cycle_resume_says_why(driver_result):
+    c = driver_result["capped"]
+    assert c["resumed"] is False
+    assert any("REFUSED" in l and "max_resumes" in l for l in _lines(c["log"])), _lines(c["log"])
+
+
+@windows_only
+def test_an_unreadable_snapshot_is_named_once_not_skipped_in_silence(driver_result):
+    u = driver_result["unreadable"]
+    assert u["first"] is False and u["second"] is False
+    named = [l for l in _lines(u["log"]) if "rBAD_a1.json" in l and "cannot be read" in l]
+    assert len(named) == 1, _lines(u["log"])
+
+
+def test_no_json_under_fleet_is_read_with_the_ansi_default(src):
+    """Every JSON file the supervisor reads is written by Python as UTF-8 (ensure_ascii=False).
+    `Get-Content -Raw | ConvertFrom-Json` without -Encoding reads it as ANSI in Windows PowerShell
+    5.1; the product's reader is Read-JsonFileUtf8."""
+    code = _code_only(src)
+    bad = [l.strip() for l in code.splitlines()
+           if "Get-Content" in l and "-Raw" in l and "ConvertFrom-Json" in l
+           and "-Encoding" not in l and "SupervisorHeartbeatPath" not in l]
+    assert not bad, "ANSI read of a JSON file: %s" % bad
+    assert "[System.IO.File]::ReadAllText($Path, (New-Object System.Text.UTF8Encoding($false)))" in code
