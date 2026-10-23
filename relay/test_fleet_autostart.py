@@ -427,6 +427,101 @@ def test_no_status_file_at_all_still_restores(state, monkeypatch):
     assert len(TR.recover_failed_autostart(str(state), now=1000.0 + TR.AUTOSTART_GRACE_S + 1)) == 1
 
 
+# ---------------------------------------------------------------------------------------
+# A GOAL SUBMITTED RIGHT AFTER A RUN ENDS MUST NOT WAIT OUT THE GRACE.
+#
+# Measured 2026-10-23 (soak2, 100 min, 33 goals): 32 parked as "launched Ns ago is not running
+# and its process is gone; waiting out the backoff" or "still coming up", and went out 241-265s
+# after the launch they queued behind (AUTOSTART_GRACE_S 240 + one 15s pass), while runs took
+# 95-154s. The fake coordinator below is a status.json and a pid answer -- nothing else a
+# finished run leaves behind that the router reads.
+# ---------------------------------------------------------------------------------------
+
+def test_a_goal_after_a_finished_run_starts_a_fleet_without_waiting_for_the_grace(state, monkeypatch):
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)     # the coordinator has exited
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": "first"}], str(state), now=1000.0, launcher=launcher)
+    _write_status(state, started=1003.0, running=False)          # it ran and ended at ~1100
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+
+    may, why = TR.autostart_status(str(state), now=1100.0)        # 100s in: inside the grace
+    assert 1100.0 - 1000.0 < TR.AUTOSTART_GRACE_S
+    assert may is True, why
+
+
+def test_a_finished_run_whose_process_is_still_closing_does_not_hold_the_queue(state, monkeypatch):
+    """The 'still coming up' arm: pid alive, status.json says the run ended. The new launch
+    waits for the run lock (--wait-for-state-dir-seconds), so single-flight is the lock's job."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: True)
+    TR.autostart_fleet([{"text": "first"}], str(state), now=1000.0, launcher=_Launcher())
+    _write_status(state, started=1003.0, running=False)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+
+    may, why = TR.autostart_status(str(state), now=1100.0)
+    assert may is True, why
+
+
+def test_a_run_that_is_still_running_inside_the_grace_is_never_restarted(state, monkeypatch):
+    """Single-flight: a live run (status.json running and fresh) blocks the launch."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: True)
+    TR.autostart_fleet([{"text": "first"}], str(state), now=1000.0, launcher=_Launcher())
+    _write_status(state, started=1003.0, running=True)
+    may, why = TR.autostart_status(str(state), now=1100.0)
+    assert may is False and "already running" in why
+
+
+def test_a_launch_that_never_wrote_status_still_waits_out_the_grace_and_backoff(state, monkeypatch):
+    """No run of ours was ever recorded -> the early verdict must not apply."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    _write_status(state, started=900.0, running=False)           # an EARLIER run
+    TR.autostart_fleet([{"text": "doomed"}], str(state), now=1000.0, launcher=_Launcher())
+    may, why = TR.autostart_status(str(state), now=1100.0)
+    assert may is False and "backoff" in why
+
+
+def test_recover_marks_a_finished_run_inside_the_grace_and_restores_nothing(state, monkeypatch):
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    TR.autostart_fleet([{"text": "small goal"}], str(state), now=1000.0, launcher=_Launcher())
+    _write_status(state, started=1003.0, running=False)
+    assert TR.recover_failed_autostart(str(state), now=1100.0) == []
+    assert TR._read_autostart(str(state))["outcome"] == "became_live"
+
+
+def test_goal_parked_during_the_tail_is_delivered_on_the_first_pass_after(state, monkeypatch):
+    """End to end through the router's own delivery pass, with the launcher faked: a goal
+    parked while the run was live is handed to a NEW fleet as soon as the run has ended,
+    on the very next pass, not 240s after the previous launch."""
+    monkeypatch.setattr(TR, "_pid_alive", lambda pid: False)
+    first = _Launcher(pid=111)
+    TR.autostart_fleet([{"text": "first"}], str(state), now=time.time() - 100, launcher=first)
+    _write_status(state, started=time.time() - 97, running=False)
+    old = time.time() - TR.FLEET_LIVE_MAX_AGE_S - 5
+    os.utime(os.path.join(str(state), "status.json"), (old, old))
+    TR._write_for_fleet("waiter1", "goal that arrived during the tail")
+
+    second = _Launcher(pid=222)
+    real = TR.autostart_fleet
+    monkeypatch.setattr(TR, "autostart_fleet",
+                        lambda goals, sd=None, now=None, launcher=None: real(goals, sd, now, second))
+    out = TR._deliver_waiting_goals(now_ts=time.time(), state_dir=str(state))
+
+    assert len(out) == 1 and out[0]["result"]["delivered"] == "autostart"
+    assert len(second.calls) == 1
+    assert os.listdir(os.path.join(TR.TASKS, "for_fleet")) == []
+
+
+def test_the_autostart_command_waits_for_the_previous_run_lock(state):
+    """The new run starts while the old one may still be in final persistence; without this the
+    launch dies at once on the fail-fast lock (2026-10-23 17:46:08, pid gone in seconds)."""
+    launcher = _Launcher()
+    TR.autostart_fleet([{"text": "g"}], str(state), now=1000.0, launcher=launcher)
+    cmd = launcher.calls[0]
+    i = cmd.index("--wait-for-state-dir-seconds")
+    assert float(cmd[i + 1]) == TR.AUTOSTART_WAIT_PRIOR_S > 0
+
+
 def test_run_started_since_reads_the_start_stamp_not_the_running_flag(state):
     """The distinction the fix rests on, asserted directly: a stopped run still answers yes."""
     _write_status(state, started=1003.0, running=False)
