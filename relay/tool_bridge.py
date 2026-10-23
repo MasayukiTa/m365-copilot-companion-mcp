@@ -37,7 +37,11 @@ WHAT THE BRIDGE MODE HAS TO TURN OFF. The fleet has several checks that assume t
 connector: "the MCP connector never initialised", "the model says it has no call_tool", "a call
 was printed as text instead of made", "no progress for 60 s", "no reply within 240 s". Under the
 bridge none of those premises hold, so relay_fleet.py consults `worker_is_bridged()` at each of
-them and relaxes or skips the check for a bridged worker only.
+them and relaxes or skips the check for a bridged worker only. TWO OF THE FIVE ARE REPLACED, NOT
+JUST SKIPPED: a call printed as text, and the model saying it has no call_tool, are judged for a
+bridged worker by relay/bridged_reply_checks.py (a call in a form the coordinator does not
+execute, a wrong "no call_tool" or "tool X is not in the index"), through
+`RelayWorker._bridged_reply_fault`.
 
 NOTHING IN THIS MODULE OPENS A NETWORK CONNECTION AT IMPORT. `make_run_tool` takes a
 `client_factory`, the seam through which a test supplies a fake client; the real one is built

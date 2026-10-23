@@ -78,6 +78,7 @@ from relay import effort_policy as effort_policy_mod
 from relay import stuck_cause as stuck_cause_mod
 from relay import conversation_saving as conv_saving_mod
 from relay import tool_bridge
+from relay import bridged_reply_checks as bridged_checks
 from relay import load_routing
 from relay import team_formation
 from relay import agent_board
@@ -7132,6 +7133,13 @@ class RelayWorker:
                         "書いてください（まだ実装はしないこと）。")
             self.status = "ready"
             return
+        # CONNECTOR-LESS ROUTE ONLY, AND BEFORE DONE IS BELIEVED. A reply whose tool call was never
+        # executed (or whose claim that a tool is missing is wrong) must not be accepted as a
+        # finished task: any result it states was not produced by a tool. Measured 2026-10-23: a
+        # worker whose lookup of an unlisted tool failed reported a GO verdict made of the SHA-256
+        # of "", "test" and "foo". relay/bridged_reply_checks.py says what counts and why.
+        if not _resume and self._bridged_reply_fault(resp):
+            return
         if "DONE" in up and "FAIL" not in last_line:
             self._on_done_claimed(resp)
             return
@@ -8733,6 +8741,71 @@ class RelayWorker:
         self.reason = (reason or {"malformed": "ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)",
                                   "stalled": "会話が進まず停滞→この会話だけ作り直し(%d/%d)"}.get(
                                       kind, "定型の無回答→会話を作り直し(%d/%d)")) % (n, limit)
+        return True
+
+    def _bridged_reply_fault(self, resp):
+        """The connector-less route's replacement for two checks it skips (see
+        relay/bridged_reply_checks.py). True when this method settled the turn.
+
+        A call the model wrote in a form the coordinator does not execute, or a claim that
+        call_tool / a tool that exists is missing, gets ONE correction that shows the exact
+        format; the second consecutive one is the same escalation the connector route has for
+        an unlanded call: a fresh conversation (bounded by FRESH_RETRY_MAX), then INFRA_STUCK.
+
+        THE NUMBER 2 IS NOT NEW. It is `_unlanded_calls >= 2` below in _decide_impl (one steer,
+        then the conversation is the problem), which the connector route has used since
+        2026-09-16; the streak counter is the same attribute so the two routes cannot drift.
+        Bounded, because there is no cap on tool rounds on this route (chathub.ask) and a model
+        that cannot form a block would otherwise be corrected for ever.
+
+        Never raises: a check that fails leaves the turn to the ordinary decision.
+        """
+        if not tool_bridge.worker_is_bridged(self):
+            return False
+        try:
+            executed = getattr(getattr(self.drv, "conv", None), "_tool_calls", None)
+            executed = executed if isinstance(executed, int) and not isinstance(executed, bool) else None
+            fault = bridged_checks.diagnose(resp, executed, getattr(self.drv, "_run_tool", None))
+        except Exception:
+            return False
+        if fault is None:
+            self._unlanded_calls = 0           # a clean reply ends the streak
+            return False
+        self._unlanded_calls = getattr(self, "_unlanded_calls", 0) + 1
+        n = self._unlanded_calls
+        if n >= 2 and self._recycle_fresh_conversation("malformed"):
+            return True
+        if n >= 2:
+            self._gateway_unlanded = n
+            self.status, self.outcome = "stuck", "INFRA_STUCK"
+            self.reason = (
+                "⚠ コネクタなし経路: %d ターン連続で、ツール経路の誤りが返信に残った(%s: %s)。"
+                "**タスクの失敗ではなく、モデルがツール呼び出しの書式を守れていない、"
+                "またはツールの有無を誤って述べている問題**。"
+                "正しい書式を示して訂正しても直らなかった。" % (n, fault.kind, fault.detail))
+            try:
+                _mt.record("unlanded_calls", run_id=getattr(self, "run_id", ""),
+                           instance=self.name, turn=getattr(self, "turn", None),
+                           configured=True, config_source="always on",
+                           eligible=True, triggered=True, executed=True,
+                           extra={"consecutive": n, "route": "connector-less",
+                                  "kind": fault.kind, "detail": fault.detail[:80]})
+            except Exception:
+                pass
+            return True
+        try:
+            _mt.record("unlanded_calls", run_id=getattr(self, "run_id", ""),
+                       instance=self.name, turn=getattr(self, "turn", None),
+                       configured=True, config_source="always on",
+                       eligible=True, triggered=True, executed=True,
+                       extra={"consecutive": n, "route": "connector-less",
+                              "kind": fault.kind, "detail": fault.detail[:80]})
+        except Exception:
+            pass
+        self.job = self._task_anchor(fault.steer + CLOSING_INSTRUCTION)
+        self.status = "ready"
+        self.reason = ("コネクタなし経路: ツール呼び出しの誤り(%s)→正しい書式を示して再送(1回目)"
+                       % fault.kind)
         return True
 
     def _handle_platform_error(self, resp):
