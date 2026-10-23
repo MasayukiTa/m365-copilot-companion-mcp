@@ -177,8 +177,9 @@ def test_sync_registry_reads_and_merges_transcript_lineage():
     assert 'var regLineage = RegistryTranscriptLineage(d)' in body
     assert 'existingC.Transcripts = FleetConvIdentity.MergeTranscriptLineage' in body
     assert 'FleetConvIdentity.LatestTranscript' in body
-    assert 'regSource == c.Source && regName == c.Name' in body, (
-        "URL-less socket rows must use the same (source,name) identity as the Python registry merge")
+    assert 'FleetConvIdentity.SyncRowMatches(url, transcript, regLineage' in body, (
+        "URL-less socket rows match a sidebar row by the same transcript file (stem), never by the "
+        "name alone (see ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py)")
 
 
 def test_sidebar_open_reads_all_segments_but_live_follow_keeps_latest_pointer():
@@ -192,7 +193,7 @@ def test_sidebar_open_reads_all_segments_but_live_follow_keeps_latest_pointer():
 def test_open_from_fleet_preserves_exact_history_click_index_but_normal_open_uses_lineage():
     code = _code()
     body = _block(code, "void OpenFromFleet(string url, string worker, string transcriptHint)", 9000)
-    assert 'var transcriptLineage = RegistryTranscriptLineageFor(url, worker, liveTranscriptPath)' in body
+    assert 'var transcriptLineage = RegistryTranscriptLineageFor(url, lineageAnchor, liveTranscriptPath)' in body
     assert 'bool exactTranscriptView = !string.IsNullOrEmpty(transcriptHint)' in body
     assert 'string displayTranscriptPath = exactTranscriptView ? transcriptHint : identityTranscriptPath' in body
     assert 'ReadTranscriptLineage(transcriptLineage)' in body
