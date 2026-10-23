@@ -239,6 +239,9 @@ LIVE_RECORD_REDIRECTS = {
     # A DIRECTORY OF CAPTURED TOKENS AND REQUEST TEMPLATES. Not a log -- the one place in this
     # list where a stray test write would touch live credentials material.
     "relay.profile_token": {"TEMPLATE_DIR": "templates"},
+    # THE ENCRYPTED TOKEN THE NEXT COORDINATOR REUSES (relay/token_cache.py). A stray test write
+    # would put a made-up token where a real run adopts it as the live credential.
+    "relay.token_cache": {"CACHE_DIR": "token_cache"},
     # Cached account-routing headers of the upload request; a stray test write would land in the
     # live .fleet\upload_templates.
     "relay.upload_template": {"CACHE_DIR": "upload_templates"},
@@ -334,6 +337,10 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    ("relay.token_cache", "file_for"):
+        "a function that joins its `directory` argument, or CACHE_DIR, with a file name; "
+        "CACHE_DIR itself is redirected in LIVE_RECORD_REDIRECTS, so it resolves to the per-run "
+        "temp directory in tests",
     # NOT A PATH -- A SET OF DIRECTORY NAMES the updater must keep when it replaces a tree:
     # {".env", ".venv", ".setup", ".fleet", ...}. Nothing is written THROUGH it, and pointing it
     # at a temp directory would make the updater stop preserving the operator's .fleet, which is

@@ -60,6 +60,16 @@ LIGHT_TIMEOUT_S = float(os.environ.get("MCP_LIGHT_CAPTURE_TIMEOUT_S", "30"))
 MIN_LIFE_S = float(os.environ.get("MCP_PROFILE_TOKEN_MIN_LIFE_S", "660"))
 
 
+#: How long to wait for a longer-lived token once the page has shown one that is too short (it
+#: has the right audience and at least SERVE_FLOOR_S left, but less than MIN_LIFE_S). 13 s is the
+#: 90th percentile of the pages that DID deliver a token: 12.7 s over 2,568 pages recorded in
+#: .fleet/ownership.jsonl (median 7.1 s, 99th percentile 22.1 s; the other 245 pages ran into the
+#: 30 s limit). A renewal that has not arrived by the time nine pages in ten are done is not
+#: coming soon, and waiting out the full limit only to fail cost the goals 30 s per attempt plus
+#: the 30-120 s retry delay.
+SHORT_TOKEN_GRACE_S = float(os.environ.get("MCP_SHORT_TOKEN_GRACE_S", "13"))
+
+
 class NoLightToken(RuntimeError):
     """The light path produced no usable token. The caller runs a full capture, as it always did."""
 
@@ -110,6 +120,12 @@ def token_via_light_page(context, url, *, audience=AUDIENCE, timeout_s=None,
     say = log or _say
     budget = LIGHT_TIMEOUT_S if timeout_s is None else float(timeout_s)
     found = {"token": ""}
+    #: The longest-lived token for the right audience that fell short of `min_life_s`, and when
+    #: it was first seen. See SHORT_TOKEN_GRACE_S for why it can be used at all.
+    short = {"token": "", "life": 0.0, "at": 0.0}
+    #: What the page showed, for the error message when nothing usable comes: how many Bearer
+    #: requests, for which audiences. Counts and audience names only -- never a token.
+    seen = {"bearer": 0, "audiences": {}}
 
     def on_request(req):
         if found["token"]:
@@ -121,12 +137,23 @@ def token_via_light_page(context, url, *, audience=AUDIENCE, timeout_s=None,
         if not auth.lower().startswith("bearer "):
             return
         candidate = auth.split(None, 1)[1]
+        seen["bearer"] += 1
+        aud = str(_claims(candidate).get("aud") or "?")[:60]
+        seen["audiences"][aud] = seen["audiences"].get(aud, 0) + 1
         if token_is_usable(candidate, audience=audience, min_life_s=min_life_s):
             found["token"] = candidate
+            return
+        life = token_life_s(candidate)
+        if (audience.lower() in aud.lower() and life >= SERVE_FLOOR_S
+                and life > short["life"]):
+            if not short["token"]:
+                short["at"] = time.time()
+            short["token"], short["life"] = candidate, life
 
     page = context.new_page()
     _claim(page, "light token")
     started = time.time()
+    final_url = ""
     try:
         page.on("request", on_request)
         try:
@@ -136,13 +163,38 @@ def token_via_light_page(context, url, *, audience=AUDIENCE, timeout_s=None,
             # makes, and those begin well before the load event settles.
             pass
         while not found["token"] and time.time() - started < budget:
+            if short["token"] and time.time() - short["at"] >= SHORT_TOKEN_GRACE_S:
+                break
             page.wait_for_timeout(250)
+        try:
+            final_url = str(page.url or "")
+        except Exception:
+            final_url = ""
     finally:
         _release(page)
+    if not found["token"] and short["token"]:
+        # THE LAST MINUTES OF A TOKEN'S LIFE. The page keeps presenting the token it holds until
+        # it renews it, and the bar above (MIN_LIFE_S) rejects exactly that one. Measured
+        # 2026-10-23: 28 of the 48 page timeouts on record happened while the newest token
+        # known was in its last 10 minutes -- and the next page, a minute or two later, got a
+        # new token at once. The old one is perfectly good for the turns that start now; the
+        # route refreshes it in the background because it is inside its refresh margin.
+        say("[profile_token] no token with %.0fs of life within %.0fs; using the one the page "
+            "holds (%.0fs left) -- the page has not renewed it yet"
+            % (min_life_s, SHORT_TOKEN_GRACE_S, short["life"]))
+        return short["token"]
     if not found["token"]:
+        try:
+            from urllib.parse import urlsplit
+            u = urlsplit(final_url)
+            where = (u.netloc + u.path)[:80]
+        except Exception:
+            where = ""
         raise NoLightToken(
-            "no %s token with %.0fs of life seen in %.0fs of page traffic"
-            % (audience, min_life_s, time.time() - started))
+            "no %s token with %.0fs of life seen in %.0fs of page traffic (%d Bearer request(s), "
+            "audiences %s, page ended at %s)"
+            % (audience, min_life_s, time.time() - started, seen["bearer"],
+               json.dumps(seen["audiences"], sort_keys=True)[:200] or "{}", where or "?"))
     say("[profile_token] token in %.1fs with no turn sent (%.0f min of life)"
         % (time.time() - started, token_life_s(found["token"]) / 60.0))
     return found["token"]

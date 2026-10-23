@@ -96,6 +96,12 @@ class CaptureFloor:
             self._last[key] = {"at": self._now(), "token": token, "template": template}
             self._captured += 1
         self._record_success(token, template, agent_url)
+        try:
+            # For the NEXT process (relay/token_cache.py): encrypted, never written in clear.
+            from relay import token_cache
+            token_cache.save(token, agent_url or "")
+        except Exception:
+            pass
         return token, template
 
     @staticmethod
