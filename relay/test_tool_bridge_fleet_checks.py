@@ -9,6 +9,7 @@ that was simply deleted.
   A  no MCP `initialize` within the window  -> recycle the conversation
   B  the model says it has no call_tool     -> recycle the conversation
   D  a call written out as text             -> steer, then recycle, then INFRA_STUCK
+     (a bridged worker is not skipped any more: it is judged by relay/bridged_reply_checks.py)
   F  no meaningful progress for 60 s        -> fail the turn, recycle
   G  no reply within the outer 240 s clock  -> retry / STUCK
 """
@@ -134,16 +135,28 @@ def test_D_connector_worker_is_steered_then_recycled(worker, monkeypatch):
     assert worker._malformed_recycles == 1
 
 
-def test_D_bridged_worker_is_neither_steered_nor_recycled_nor_stuck(worker, monkeypatch):
+def test_D_bridged_worker_never_gets_the_connector_steer(worker, monkeypatch):
+    """The connector's steer tells the model to use "the tool-calling mechanism", which on the
+    connector-less route IS the code block. A bridged worker is judged by
+    relay/bridged_reply_checks.py instead (tests in relay/test_bridged_reply_checks.py), and its
+    correction shows the block format."""
     monkeypatch.setattr(F.time, "time", lambda: 1000.0)
     _bridge(worker)
+    _decide(worker, MALFORMED + "\nstep 1", 1)
+    assert "ツール呼び出しの仕組み" not in worker.job
+    assert "```call_tool" in worker.job
+
+
+def test_D_bridged_prose_about_a_call_that_was_made_is_not_a_fault(worker, monkeypatch):
+    """A call spelled `call_tool(` in the summary of a turn that DID execute calls is normal."""
+    monkeypatch.setattr(F.time, "time", lambda: 1000.0)
+    _bridge(worker)
+    worker.drv.conv = types.SimpleNamespace(_tool_calls=2)
     for turn in (1, 2, 3):
-        # Distinct replies: an identical reply repeated is judged by an unrelated check.
-        _decide(worker, MALFORMED + "\nstep %d" % turn, turn)
+        _decide(worker, "call_tool(name='x') で確認しました。続けます。step %d" % turn, turn)
     assert getattr(worker, "_unlanded_calls", 0) == 0
     assert worker._malformed_recycles == 0
     assert worker.outcome != "INFRA_STUCK" and worker.status != "stuck"
-    assert "ツール呼び出しの仕組み" not in worker.job
 
 
 # ------------------------------------------------------------------------------------------ F
