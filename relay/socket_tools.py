@@ -64,6 +64,44 @@ _FENCE = re.compile(
     re.DOTALL | re.MULTILINE)
 
 
+# A call whose opening fence is missing. Measured 2026-10-23: the model's reply reached the
+# coordinator as `call_tool\n{"name": ...}\n```` -- the label line, the JSON, a lone closing
+# fence -- so _FENCE (which needs an opening ```label) read nothing, the worker was nudged
+# six times and ended STUCK (transcript r6adb57ae_a0_w0, turns 2-7; 17 such final replies in
+# 2 of 5,403 transcripts, none followed by a result). Accepted ONLY with the literal label
+# `call_tool` alone on a line, then a balanced JSON object with a string "name", then
+# end-of-line or one lone ``` -- so prose that merely contains JSON is never a call.
+_UNFENCED_HEAD = re.compile(r"^[ \t]*call_tool[ \t]*\r?\n\s*(?=\{)", re.MULTILINE)
+_LONE_FENCE_TAIL = re.compile(r"[ \t]*(?:\r?\n[ \t]*```[ \t]*(?=\r?\n|$)|(?=\r?\n|$))")
+_JSON = json.JSONDecoder()
+
+
+def _unfenced_calls(text, allowed, fenced_spans):
+    """[(start, end, "call_tool", args)] for label+JSON calls written without an opening fence.
+
+    Text inside a fenced block is never read here (an example in a ```python block is not a
+    request), and `end` includes the lone closing fence so strip_calls leaves no stray ```.
+    """
+    if "call_tool" not in allowed:
+        return []
+    found = []
+    for head in _UNFENCED_HEAD.finditer(text):
+        start = head.start()
+        if any(s <= start < e for s, e in fenced_spans):
+            continue
+        try:
+            obj, stop = _JSON.raw_decode(text, head.end())
+        except ValueError:
+            continue
+        if not isinstance(obj, dict) or not isinstance(obj.get("name"), str):
+            continue
+        tail = _LONE_FENCE_TAIL.match(text, stop)
+        if tail is None:
+            continue                        # prose follows the object on its line
+        found.append((start, tail.end(), "call_tool", obj))
+    return found
+
+
 class ToolProtocolError(RuntimeError):
     """The reply could not be read as a tool call. Callers fall back rather than guess."""
 
@@ -163,11 +201,21 @@ def read_reply(reply: str, *, allowed=DEFAULT_ALLOWED):
     """
     calls, unreadable = [], []
     pos = 0
-    for match in _FENCE.finditer(reply or ""):
-        name, body = match.group(1), match.group(2)
-        if name not in allowed:
-            continue
+    text = reply or ""
+    items = []                              # (start, name, body | None, args | None)
+    spans = []
+    for match in _FENCE.finditer(text):
+        spans.append((match.start(), match.end()))
+        if match.group(1) in allowed:
+            items.append((match.start(), match.group(1), match.group(2), None))
+    for start, _end, name, args in _unfenced_calls(text, allowed, spans):
+        items.append((start, name, None, args))
+    items.sort(key=lambda it: it[0])
+    for _start, name, body, parsed in items:
         pos += 1
+        if body is None:
+            calls.append((pos, name, parsed))
+            continue
         try:
             args = json.loads(body)
         except Exception as exc:
@@ -197,7 +245,14 @@ def strip_calls(reply: str, *, allowed=DEFAULT_ALLOWED) -> str:
             return match.group(0)
         return "" if isinstance(args, dict) else match.group(0)
 
-    return _FENCE.sub(_drop, reply or "").strip()
+    text = reply or ""
+    spans = [(m.start(), m.end()) for m in _FENCE.finditer(text)]
+    cuts = [(s, e) for s, e, _n, _a in _unfenced_calls(text, allowed, spans)]
+    if cuts:
+        # Remove from the back so earlier offsets stay valid; the fenced pass then runs on the rest.
+        for s, e in sorted(cuts, reverse=True):
+            text = text[:s] + text[e:]
+    return _FENCE.sub(_drop, text).strip()
 
 
 def result_turn(results, notices=None) -> str:
