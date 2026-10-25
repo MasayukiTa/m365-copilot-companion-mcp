@@ -972,6 +972,7 @@ jobs:
             scripts/test_capability_profile.py \
             scripts/test_task_kind.py \
             scripts/test_load_routing_report.py \
+            scripts/test_result_cache_report.py \
             scripts/test_team_formation_report.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
