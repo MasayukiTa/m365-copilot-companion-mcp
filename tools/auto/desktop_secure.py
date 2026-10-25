@@ -43,20 +43,35 @@ def _service_folder() -> str:
 
 
 def _call_pipe(payload: dict, timeout_ms: int = 30000) -> dict:
+    import time
+
     import pywintypes
     import win32file
     import win32pipe
 
-    try:
-        win32pipe.WaitNamedPipe(_PIPE_NAME, timeout_ms)
-    except pywintypes.error as exc:
-        if exc.winerror in (2, 121):  # not found / timeout
-            raise FileNotFoundError("pipe absent") from exc
-        raise
-    handle = win32file.CreateFile(
-        _PIPE_NAME,
-        win32file.GENERIC_READ | win32file.GENERIC_WRITE,
-        0, None, win32file.OPEN_EXISTING, 0, None)
+    # WaitNamedPipe fails INSTANTLY with ERROR_FILE_NOT_FOUND when no
+    # pipe instance exists at that moment -- and the server closes its
+    # instance between requests, so there is a brief gap after every
+    # reply where the name does not exist at all. The first live test
+    # rode over the gap for 'status' and fell into it for 'capture'.
+    # Retry for a few seconds before concluding the service is absent.
+    handle = None
+    deadline = time.time() + 5.0
+    while True:
+        try:
+            win32pipe.WaitNamedPipe(_PIPE_NAME, 500)
+            handle = win32file.CreateFile(
+                _PIPE_NAME,
+                win32file.GENERIC_READ | win32file.GENERIC_WRITE,
+                0, None, win32file.OPEN_EXISTING, 0, None)
+            break
+        except pywintypes.error as exc:
+            if exc.winerror in (2, 121, 231) and time.time() < deadline:
+                time.sleep(0.25)
+                continue
+            if exc.winerror in (2, 121, 231):
+                raise FileNotFoundError("pipe absent") from exc
+            raise
     try:
         win32pipe.SetNamedPipeHandleState(
             handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
