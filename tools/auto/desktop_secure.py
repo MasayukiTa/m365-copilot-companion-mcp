@@ -131,7 +131,13 @@ def _call_pipe(payload: dict, timeout_ms: int = 30000) -> dict:
             handle, win32pipe.PIPE_READMODE_MESSAGE, None, None)
         win32file.WriteFile(handle, json.dumps(payload).encode("utf-8"))
         _hr, data = win32file.ReadFile(handle, 65536)
-        return json.loads(data.decode("utf-8", errors="replace"))
+        chunks = [data]
+        while _hr == 234:
+            # ERROR_MORE_DATA: the reply (a capture carries an inlined
+            # base64 PNG) exceeds one read; keep pulling message chunks.
+            _hr, data = win32file.ReadFile(handle, 65536)
+            chunks.append(data)
+        return json.loads(b"".join(chunks).decode("utf-8", errors="replace"))
     finally:
         # finding 8 partial: guard the close and swallow a close error
         # so it cannot mask an in-flight exception.
