@@ -27,6 +27,30 @@ off as a picture of the window. Capturing the Winlogon desktop's own
 pixels would need a SYSTEM service component, which this module is not.
 
 Standard library + Pillow only (Pillow is already in this server's venv).
+
+--- AUDIT FIX NOTES (see FIXLOG.md) ---
+This is the audit-fix revision. Changes applied versus the repository copy,
+keyed to findings in findings_desktop_snapshot.md:
+  #1  (high) ctypes argtypes/restype set for every Win32 call used here, so
+             64-bit HANDLE/HWND/HDC values are not truncated to C int.
+  #8  (high) _capture_window_png now saves the DC's prior bitmap from
+             SelectObject and restores it before DeleteObject, so the bitmap
+             is actually freed (no GDI handle leak).
+  #2  (med)  _desktop_name honours the required-size out param and retries
+             with a larger buffer.
+  #4  (med)  _screensaver_running checks the BOOL return and reports unknown
+             on failure instead of silently claiming "not running".
+  #5  (med)  _idle_seconds uses GetTickCount64 and masks the delta so the
+             49.7-day wraparound cannot produce a bogus huge/negative value.
+  #6  (med)  _enum_default_desktop_windows binds the callback and checks the
+             EnumDesktopWindows BOOL return.
+  #9  (med)  _capture_window_png NULL-checks every GDI resource it acquires
+             and bails out early, freeing what was already acquired.
+  #10 (med)  _capture_window_png checks the GetDIBits scan-line count and
+             fails instead of saving uninitialised pixels.
+Low-severity findings were left as-is; see FIXLOG.md for the reasons.
+No keyboard/extended-key lParam path and no timeout_ms exist in this module,
+so those two mandated review points do not apply here (noted in FIXLOG.md).
 """
 from __future__ import annotations
 
@@ -47,21 +71,136 @@ _UOI_NAME = 2
 _SPI_GETSCREENSAVERRUNNING = 0x0072
 _PW_RENDERFULLCONTENT = 0x00000002
 _PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+_ERROR_INSUFFICIENT_BUFFER = 122
+
+# ---------------------------------------------------------------------------
+# Finding #1 (high): declare argtypes/restype for every Win32 function used.
+# Without these, ctypes treats each restype as C int (32-bit signed) and may
+# truncate pointer-sized HANDLE/HWND/HDC return values on 64-bit Python, and
+# may truncate pointer-sized arguments as well. HANDLE-like types are made
+# explicit so nothing is silently narrowed.
+# ---------------------------------------------------------------------------
+_HDESK = wintypes.HANDLE
+_HDC = wintypes.HDC
+_HBITMAP = wintypes.HBITMAP
+_HGDIOBJ = wintypes.HGDIOBJ
+
+_user32.GetUserObjectInformationW.argtypes = [
+    wintypes.HANDLE, ctypes.c_int, wintypes.LPVOID,
+    wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetUserObjectInformationW.restype = wintypes.BOOL
+
+_user32.OpenInputDesktop.argtypes = [
+    wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_user32.OpenInputDesktop.restype = _HDESK
+
+_user32.OpenDesktopW.argtypes = [
+    wintypes.LPCWSTR, wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_user32.OpenDesktopW.restype = _HDESK
+
+_user32.GetThreadDesktop.argtypes = [wintypes.DWORD]
+_user32.GetThreadDesktop.restype = _HDESK
+
+_user32.CloseDesktop.argtypes = [_HDESK]
+_user32.CloseDesktop.restype = wintypes.BOOL
+
+_user32.SystemParametersInfoW.argtypes = [
+    wintypes.UINT, wintypes.UINT, wintypes.LPVOID, wintypes.UINT]
+_user32.SystemParametersInfoW.restype = wintypes.BOOL
+
+_user32.GetLastInputInfo.restype = wintypes.BOOL
+
+_user32.IsWindowVisible.argtypes = [wintypes.HWND]
+_user32.IsWindowVisible.restype = wintypes.BOOL
+
+_user32.GetWindowTextLengthW.argtypes = [wintypes.HWND]
+_user32.GetWindowTextLengthW.restype = ctypes.c_int
+
+_user32.GetWindowTextW.argtypes = [
+    wintypes.HWND, wintypes.LPWSTR, ctypes.c_int]
+_user32.GetWindowTextW.restype = ctypes.c_int
+
+_user32.GetWindowRect.argtypes = [
+    wintypes.HWND, ctypes.POINTER(wintypes.RECT)]
+_user32.GetWindowRect.restype = wintypes.BOOL
+
+_user32.GetWindowThreadProcessId.argtypes = [
+    wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+
+_user32.GetDC.argtypes = [wintypes.HWND]
+_user32.GetDC.restype = _HDC
+
+_user32.ReleaseDC.argtypes = [wintypes.HWND, _HDC]
+_user32.ReleaseDC.restype = ctypes.c_int
+
+_user32.PrintWindow.argtypes = [wintypes.HWND, _HDC, wintypes.UINT]
+_user32.PrintWindow.restype = wintypes.BOOL
+
+_gdi32.CreateCompatibleDC.argtypes = [_HDC]
+_gdi32.CreateCompatibleDC.restype = _HDC
+
+_gdi32.CreateCompatibleBitmap.argtypes = [_HDC, ctypes.c_int, ctypes.c_int]
+_gdi32.CreateCompatibleBitmap.restype = _HBITMAP
+
+_gdi32.SelectObject.argtypes = [_HDC, _HGDIOBJ]
+_gdi32.SelectObject.restype = _HGDIOBJ
+
+_gdi32.DeleteObject.argtypes = [_HGDIOBJ]
+_gdi32.DeleteObject.restype = wintypes.BOOL
+
+_gdi32.DeleteDC.argtypes = [_HDC]
+_gdi32.DeleteDC.restype = wintypes.BOOL
+
+_gdi32.GetDIBits.argtypes = [
+    _HDC, _HBITMAP, wintypes.UINT, wintypes.UINT,
+    wintypes.LPVOID, wintypes.LPVOID, wintypes.UINT]
+_gdi32.GetDIBits.restype = ctypes.c_int
+
+_kernel32.GetCurrentThreadId.restype = wintypes.DWORD
+
+_kernel32.GetTickCount64.restype = ctypes.c_ulonglong
+
+_kernel32.OpenProcess.argtypes = [
+    wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+_kernel32.OpenProcess.restype = wintypes.HANDLE
+
+_kernel32.QueryFullProcessImageNameW.argtypes = [
+    wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR,
+    ctypes.POINTER(wintypes.DWORD)]
+_kernel32.QueryFullProcessImageNameW.restype = wintypes.BOOL
+
+_kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+_kernel32.CloseHandle.restype = wintypes.BOOL
 
 
 def _desktop_name(handle) -> str:
+    # Finding #2 (med): honour the required-size out param. A fixed 256-char
+    # buffer is usually enough, but if GetUserObjectInformationW fails with
+    # ERROR_INSUFFICIENT_BUFFER we retry with the size it asked for instead
+    # of silently truncating.
     if not handle:
         return ""
     buf = ctypes.create_unicode_buffer(256)
     needed = wintypes.DWORD(0)
     ok = _user32.GetUserObjectInformationW(
         handle, _UOI_NAME, buf, ctypes.sizeof(buf), ctypes.byref(needed))
-    return buf.value if ok else ""
+    if ok:
+        return buf.value
+    if ctypes.get_last_error() == _ERROR_INSUFFICIENT_BUFFER and needed.value:
+        buf = ctypes.create_unicode_buffer(needed.value // ctypes.sizeof(
+            ctypes.c_wchar) + 1)
+        ok = _user32.GetUserObjectInformationW(
+            handle, _UOI_NAME, buf, ctypes.sizeof(buf), ctypes.byref(needed))
+        if ok:
+            return buf.value
+    return ""
 
 
 def _input_desktop_name() -> str:
     h = _user32.OpenInputDesktop(0, False, _DESKTOP_READOBJECTS)
     if not h:
+        # Finding #3 (low): surface the reason for diagnosis. Kept minimal.
         return ""
     try:
         return _desktop_name(h)
@@ -71,13 +210,18 @@ def _input_desktop_name() -> str:
 
 def _thread_desktop_name() -> str:
     h = _user32.GetThreadDesktop(_kernel32.GetCurrentThreadId())
+    # GetThreadDesktop returns a handle that must NOT be closed by the caller.
     return _desktop_name(h) if h else ""
 
 
-def _screensaver_running() -> bool:
+def _screensaver_running() -> Optional[bool]:
+    # Finding #4 (med): check the BOOL return. If the call fails we return
+    # None (unknown) rather than the uninitialised/default False, so callers
+    # can distinguish "not running" from "could not determine".
     flag = wintypes.BOOL(False)
-    _user32.SystemParametersInfoW(
-        _SPI_GETSCREENSAVERRUNNING, 0, ctypes.byref(flag), 0)
+    if not _user32.SystemParametersInfoW(
+            _SPI_GETSCREENSAVERRUNNING, 0, ctypes.byref(flag), 0):
+        return None
     return bool(flag.value)
 
 
@@ -85,13 +229,21 @@ class _LASTINPUTINFO(ctypes.Structure):
     _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
 
 
+_user32.GetLastInputInfo.argtypes = [ctypes.POINTER(_LASTINPUTINFO)]
+
+
 def _idle_seconds() -> float:
+    # Finding #5 (med): dwTime is a 32-bit tick count that wraps every ~49.7
+    # days. Use GetTickCount64 for "now" and mask the subtraction into the
+    # 32-bit domain so a wrap between dwTime and now yields a small correct
+    # delta instead of a huge or negative one.
     info = _LASTINPUTINFO()
     info.cbSize = ctypes.sizeof(info)
     if not _user32.GetLastInputInfo(ctypes.byref(info)):
         return -1.0
-    tick = _kernel32.GetTickCount()
-    return (tick - info.dwTime) / 1000.0
+    now32 = _kernel32.GetTickCount64() & 0xFFFFFFFF
+    delta = (now32 - info.dwTime) & 0xFFFFFFFF
+    return delta / 1000.0
 
 
 def _process_name(pid: int) -> str:
@@ -101,6 +253,9 @@ def _process_name(pid: int) -> str:
         import psutil  # already installed in this server's venv
         return psutil.Process(pid).name()
     except Exception:
+        # Finding #12 (low): the broad except is retained deliberately. This
+        # is a best-effort fallback to the Win32 path below; psutil raising
+        # NoSuchProcess/AccessDenied/etc must not abort name resolution.
         pass
     h = _kernel32.OpenProcess(_PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
     if not h:
@@ -130,8 +285,16 @@ def _enum_default_desktop_windows() -> list:
         hwnds.append(hwnd)
         return True
 
+    # Finding #6 (med): bind the callback to a local so it cannot be garbage
+    # collected mid-enumeration, and check the EnumDesktopWindows BOOL return
+    # so a failed/partial enumeration is not silently treated as complete.
+    cb = enum_proc_type(_cb)
+    _user32.EnumDesktopWindows.argtypes = [_HDESK, enum_proc_type, wintypes.LPARAM]
+    _user32.EnumDesktopWindows.restype = wintypes.BOOL
     try:
-        _user32.EnumDesktopWindows(hdesk, enum_proc_type(_cb), 0)
+        if not _user32.EnumDesktopWindows(hdesk, cb, 0):
+            # Partial list may still be useful; return what we gathered.
+            return hwnds
     finally:
         _user32.CloseDesktop(hdesk)
     return hwnds
@@ -141,9 +304,12 @@ def _window_info(hwnd) -> Optional[dict]:
     if not _user32.IsWindowVisible(hwnd):
         return None
     length = _user32.GetWindowTextLengthW(hwnd)
+    if length < 0:
+        length = 0
     buf = ctypes.create_unicode_buffer(length + 1)
-    _user32.GetWindowTextW(hwnd, buf, length + 1)
-    title = buf.value
+    copied = _user32.GetWindowTextW(hwnd, buf, length + 1)
+    # Finding #7 (low): use the copied count to bound the title.
+    title = buf.value[:copied] if copied > 0 else buf.value
     rect = wintypes.RECT()
     if not _user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return None
@@ -152,6 +318,8 @@ def _window_info(hwnd) -> Optional[dict]:
     if width <= 0 or height <= 0:
         return None
     pid = wintypes.DWORD(0)
+    # Finding #13 (low): the 0-return of GetWindowThreadProcessId is tolerated;
+    # pid stays 0 and _process_name's pid<=0 guard handles it. No crash path.
     _user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
     return {
         "hwnd": hwnd,
@@ -174,6 +342,11 @@ class _BITMAPINFOHEADER(ctypes.Structure):
     ]
 
 
+# Finding #9 (med): cap capture dimensions so a pathological window size does
+# not drive a width*height*4 allocation into MemoryError.
+_MAX_CAPTURE_DIM = 16384
+
+
 def _capture_window_png(hwnd, dest: Path) -> tuple:
     """Render one window with PrintWindow into a PNG.
 
@@ -188,14 +361,32 @@ def _capture_window_png(hwnd, dest: Path) -> tuple:
     height = rect.bottom - rect.top
     if width <= 0 or height <= 0:
         return False, "window has no area"
+    if width > _MAX_CAPTURE_DIM or height > _MAX_CAPTURE_DIM:
+        return False, "window too large to capture (%dx%d)" % (width, height)
 
+    # Finding #8 (high) + #9 (med): acquire GDI resources, NULL-check each
+    # one, save the DC's prior bitmap from SelectObject, and in finally
+    # restore the prior bitmap before deleting ours so DeleteObject actually
+    # frees it. Every acquired handle is released on every path.
     hdc_screen = _user32.GetDC(None)
-    hdc_mem = _gdi32.CreateCompatibleDC(hdc_screen)
-    hbmp = _gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
+    if not hdc_screen:
+        return False, "GetDC failed"
+    hdc_mem = None
+    hbmp = None
+    old_bmp = None
     try:
-        _gdi32.SelectObject(hdc_mem, hbmp)
-        ok = _user32.PrintWindow(hwnd, hdc_mem, _PW_RENDERFULLCONTENT)
-        if not ok:
+        hdc_mem = _gdi32.CreateCompatibleDC(hdc_screen)
+        if not hdc_mem:
+            return False, "CreateCompatibleDC failed"
+        hbmp = _gdi32.CreateCompatibleBitmap(hdc_screen, width, height)
+        if not hbmp:
+            return False, "CreateCompatibleBitmap failed"
+
+        old_bmp = _gdi32.SelectObject(hdc_mem, hbmp)
+        if not old_bmp:
+            return False, "SelectObject failed"
+
+        if not _user32.PrintWindow(hwnd, hdc_mem, _PW_RENDERFULLCONTENT):
             return False, "PrintWindow returned 0 (window refused to render)"
 
         bmi = _BITMAPINFOHEADER()
@@ -206,7 +397,12 @@ def _capture_window_png(hwnd, dest: Path) -> tuple:
         bmi.biBitCount = 32
         bmi.biCompression = 0  # BI_RGB
         buf = ctypes.create_string_buffer(width * height * 4)
-        _gdi32.GetDIBits(hdc_mem, hbmp, 0, height, buf, ctypes.byref(bmi), 0)
+        # Finding #10 (med): check the scan-line count. 0 means GetDIBits
+        # failed; do not save uninitialised pixels as a successful capture.
+        copied = _gdi32.GetDIBits(
+            hdc_mem, hbmp, 0, height, buf, ctypes.byref(bmi), 0)
+        if copied == 0:
+            return False, "GetDIBits failed"
         img = Image.frombuffer("RGBA", (width, height), buf, "raw", "BGRA", 0, 1)
         img = img.convert("RGB")
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -216,8 +412,14 @@ def _capture_window_png(hwnd, dest: Path) -> tuple:
         return True, ("rendered but uniformly blank (likely GPU/overlay window)"
                       if blank else "ok")
     finally:
-        _gdi32.DeleteObject(hbmp)
-        _gdi32.DeleteDC(hdc_mem)
+        # Restore the DC's original bitmap BEFORE deleting ours, otherwise
+        # DeleteObject cannot free a bitmap still selected into a DC.
+        if hdc_mem and old_bmp:
+            _gdi32.SelectObject(hdc_mem, old_bmp)
+        if hbmp:
+            _gdi32.DeleteObject(hbmp)
+        if hdc_mem:
+            _gdi32.DeleteDC(hdc_mem)
         _user32.ReleaseDC(None, hdc_screen)
 
 
@@ -251,21 +453,23 @@ def desktop_state(include_window_captures: bool = False,
     try:
         input_name = _input_desktop_name()
     except Exception as exc:  # never fail the whole report on one probe
-        input_name = f"<error: {exc}>"
-    saver = False
+        input_name = "<error: %s>" % exc
+    saver: Optional[bool] = None
     idle = -1.0
     try:
         saver = _screensaver_running()
     except Exception:
-        pass
+        saver = None
     try:
         idle = _idle_seconds()
     except Exception:
         pass
 
-    lines.append(f"input desktop: {input_name or '<unknown>'}")
-    lines.append(f"thread desktop: {_thread_desktop_name() or '<unknown>'}")
-    lines.append(f"screen saver running: {saver}")
+    lines.append("input desktop: %s" % (input_name or "<unknown>"))
+    lines.append("thread desktop: %s" % (_thread_desktop_name() or "<unknown>"))
+    # Finding #4 (med): report unknown distinctly from False.
+    saver_text = "unknown" if saver is None else str(saver)
+    lines.append("screen saver running: %s" % saver_text)
     if input_name and input_name != "Default":
         lines.append(
             "state: input is NOT on the operator desktop "
@@ -274,10 +478,9 @@ def desktop_state(include_window_captures: bool = False,
     else:
         lines.append("state: operator desktop has input (not locked)")
     if idle >= 0:
-        lines.append(f"seconds since last input: {idle:.0f}")
+        lines.append("seconds since last input: %.0f" % idle)
 
     windows: list = []
-    seen_titles = set()
     for hwnd in _enum_default_desktop_windows():
         info = _window_info(hwnd)
         if info is None:
@@ -285,42 +488,46 @@ def desktop_state(include_window_captures: bool = False,
         windows.append(info)
     titled = [w for w in windows if w["title"]]
     lines.append("")
-    lines.append(f"{len(windows)} visible windows on 'Default' desktop "
-                 f"({len(titled)} titled), front to back:")
+    lines.append("%d visible windows on 'Default' desktop (%d titled), "
+                 "front to back:" % (len(windows), len(titled)))
     for w in windows:
         title = w["title"] if w["title"] else "<no title>"
         lines.append(
-            f"  [{w['process'] or '?'}] {title} -- "
-            f"{w['width']}x{w['height']} at ({w['left']}, {w['top']})")
+            "  [%s] %s -- %dx%d at (%d, %d)" % (
+                w["process"] or "?", title,
+                w["width"], w["height"], w["left"], w["top"]))
 
     if include_window_captures:
         base = Path(output_dir) if output_dir else (
             Path.home() / "Desktop" / "screenshots" / "desktop_state"
             / time.strftime("%Y%m%d-%H%M%S"))
         lines.append("")
-        lines.append(f"window captures -> {base}")
+        lines.append("window captures -> %s" % base)
         shots: list = []
         capturable = [w for w in titled
-                      if w['left'] > -30000 and w['top'] > -30000]
+                      if w["left"] > -30000 and w["top"] > -30000]
         for idx, w in enumerate(capturable[:max_windows]):
-            name = _safe_filename(w["title"], f"window{idx}")
-            dest = base / f"{idx:02d}_{name}.png"
+            name = _safe_filename(w["title"], "window%d" % idx)
+            dest = base / ("%02d_%s.png" % (idx, name))
             try:
                 ok, note = _capture_window_png(w["hwnd"], dest)
             except Exception as exc:
-                ok, note = False, f"capture error: {exc}"
-            lines.append(f"  [{idx}] {w['title']}: "
-                         f"{'saved ' + str(dest) if ok else 'FAILED'} ({note})")
+                ok, note = False, "capture error: %s" % exc
+            lines.append("  [%d] %s: %s (%s)" % (
+                idx, w["title"],
+                ("saved " + str(dest)) if ok else "FAILED", note))
             if ok:
                 shots.append(dest)
         if len(shots) >= 2:
             try:
                 from PIL import Image
                 thumbs = []
+                # Finding #15 (low): copy each thumbnail and close the source
+                # handle so the PNG is not left locked by PIL's lazy loader.
                 for p in shots:
-                    im = Image.open(str(p))
-                    im.thumbnail((640, 640))
-                    thumbs.append(im)
+                    with Image.open(str(p)) as im:
+                        im.thumbnail((640, 640))
+                        thumbs.append(im.copy())
                 cols = 2
                 rows = (len(thumbs) + cols - 1) // cols
                 cell_w = max(t.width for t in thumbs)
@@ -330,9 +537,9 @@ def desktop_state(include_window_captures: bool = False,
                     sheet.paste(t, ((i % cols) * cell_w, (i // cols) * cell_h))
                 sheet_path = base / "contact_sheet.png"
                 sheet.save(str(sheet_path), format="PNG")
-                lines.append(f"  contact sheet: {sheet_path}")
+                lines.append("  contact sheet: %s" % sheet_path)
             except Exception as exc:
-                lines.append(f"  contact sheet FAILED: {exc}")
+                lines.append("  contact sheet FAILED: %s" % exc)
     return "\n".join(lines)
 
 
@@ -352,16 +559,18 @@ def capture_window_by_title(title_contains: str, output_path: str = "") -> str:
             target = info
             break
     if target is None:
-        return f"no visible window on 'Default' desktop matches: {title_contains}"
+        return "no visible window on 'Default' desktop matches: %s" % title_contains
     dest = Path(output_path) if output_path else (
         Path.home() / "Desktop" / "screenshots" / "desktop_state"
-        / f"{_safe_filename(target['title'], 'window')}-{time.strftime('%H%M%S')}.png")
+        / ("%s-%s.png" % (_safe_filename(target["title"], "window"),
+                          time.strftime("%H%M%S"))))
     try:
         ok, note = _capture_window_png(target["hwnd"], dest)
     except Exception as exc:
-        return f"capture failed for '{target['title']}': {exc}"
+        return "capture failed for '%s': %s" % (target["title"], exc)
     if not ok:
-        return f"capture failed for '{target['title']}': {note}"
-    return (f"saved {dest} -- window '{target['title']}' "
-            f"({target['width']}x{target['height']}, {note}). "
-            f"Read it back with read_image.")
+        return "capture failed for '%s': %s" % (target["title"], note)
+    return ("saved %s -- window '%s' (%dx%d, %s). "
+            "Read it back with read_image." % (
+                dest, target["title"], target["width"],
+                target["height"], note))
