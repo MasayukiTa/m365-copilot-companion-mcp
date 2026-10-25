@@ -18,6 +18,10 @@ Uninstall:
 A successful capture lands as a PNG under
 C:\\ProgramData\\CompanionSecureDesktop\\captures\\ -- display it with
 the usual read_image tool.
+
+AUDIT-FIX NOTES (see FIXLOG.md): this revision makes timeout_ms real
+(findings 1 and 9) and separates a WaitNamedPipe timeout (winerror 121)
+from genuine pipe-absence (finding 5).
 """
 from __future__ import annotations
 
@@ -31,6 +35,21 @@ _INSTALL_HINT = (
     "run secure_desktop\\install.ps1 from an elevated PowerShell "
     "(it registers the service and starts it). Service folder: "
 )
+
+# Separate the 'service may be busy or starting' story from 'service is
+# not installed' (finding 5). This is returned instead of the install
+# hint when the only failures we saw were WaitNamedPipe timeouts (121),
+# which mean a pipe exists but no instance was free in time.
+_BUSY_HINT = (
+    "The Secure Desktop Helper service did not answer within the allotted "
+    "time. It may be busy or still starting (not necessarily uninstalled). "
+    "Retry shortly; if it never answers, check the service in: "
+)
+
+
+class _PipeTimeout(Exception):
+    """Raised when the pipe never became available before the deadline,
+    but the failures were WaitNamedPipe timeouts (busy), not absence."""
 
 
 def _service_folder() -> str:
@@ -54,22 +73,57 @@ def _call_pipe(payload: dict, timeout_ms: int = 30000) -> dict:
     # instance between requests, so there is a brief gap after every
     # reply where the name does not exist at all. The first live test
     # rode over the gap for 'status' and fell into it for 'capture'.
-    # Retry for a few seconds before concluding the service is absent.
+    # Retry until the caller's deadline before concluding anything.
+    #
+    # findings 1/9: honour timeout_ms instead of a hardcoded 5.0 s so
+    # that 'status' (short) and 'capture' (long) behave as declared.
+    if timeout_ms is None or timeout_ms <= 0:
+        timeout_ms = 30000
+    deadline = time.time() + (timeout_ms / 1000.0)
+
+    # finding 5: track whether every failure was a WaitNamedPipe timeout
+    # (121). If so, the pipe is busy/starting, not absent, and we raise
+    # _PipeTimeout so the caller can give a neutral message.
+    saw_only_timeouts = True
+    saw_any_failure = False
+
     handle = None
-    deadline = time.time() + 5.0
     while True:
+        # finding 6 partial: evaluate the deadline at the top and size
+        # the WaitNamedPipe wait from the remaining time so the overall
+        # wait tracks timeout_ms instead of overshooting by a fixed 500.
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            if saw_any_failure and saw_only_timeouts:
+                raise _PipeTimeout("pipe busy (WaitNamedPipe timed out)")
+            raise FileNotFoundError("pipe absent")
+        wait_ms = int(min(500, remaining * 1000.0))
+        if wait_ms < 1:
+            wait_ms = 1
         try:
-            win32pipe.WaitNamedPipe(_PIPE_NAME, 500)
+            win32pipe.WaitNamedPipe(_PIPE_NAME, wait_ms)
             handle = win32file.CreateFile(
                 _PIPE_NAME,
                 win32file.GENERIC_READ | win32file.GENERIC_WRITE,
                 0, None, win32file.OPEN_EXISTING, 0, None)
             break
         except pywintypes.error as exc:
-            if exc.winerror in (2, 121, 231) and time.time() < deadline:
-                time.sleep(0.25)
-                continue
+            # 2   = ERROR_FILE_NOT_FOUND  -> no pipe instance right now
+            # 231 = ERROR_PIPE_BUSY       -> all instances busy
+            # 121 = ERROR_SEM_TIMEOUT     -> WaitNamedPipe timed out (busy)
             if exc.winerror in (2, 121, 231):
+                saw_any_failure = True
+                if exc.winerror != 121:
+                    saw_only_timeouts = False
+                if time.time() < deadline:
+                    # short sleep, but never past the deadline
+                    nap = min(0.25, max(0.0, deadline - time.time()))
+                    if nap > 0:
+                        time.sleep(nap)
+                    continue
+                if saw_only_timeouts:
+                    raise _PipeTimeout(
+                        "pipe busy (WaitNamedPipe timed out)") from exc
                 raise FileNotFoundError("pipe absent") from exc
             raise
     try:
@@ -79,7 +133,13 @@ def _call_pipe(payload: dict, timeout_ms: int = 30000) -> dict:
         _hr, data = win32file.ReadFile(handle, 65536)
         return json.loads(data.decode("utf-8", errors="replace"))
     finally:
-        handle.Close()
+        # finding 8 partial: guard the close and swallow a close error
+        # so it cannot mask an in-flight exception.
+        if handle is not None:
+            try:
+                handle.Close()
+            except Exception:
+                pass
 
 
 def screen_secure_status() -> str:
@@ -87,10 +147,13 @@ def screen_secure_status() -> str:
 
     Returns the service version, the active console session and the
     session list when installed; a plain 'not installed' report with
-    the install path when it is not.
+    the install path when it is not; a neutral 'busy or starting' note
+    when the pipe exists but never freed up in time.
     """
     try:
         resp = _call_pipe({"cmd": "status"}, timeout_ms=3000)
+    except _PipeTimeout:
+        return _BUSY_HINT + _service_folder()
     except FileNotFoundError:
         return _INSTALL_HINT + _service_folder()
     except Exception as exc:
@@ -114,13 +177,27 @@ def screen_secure_capture() -> str:
     """
     try:
         resp = _call_pipe({"cmd": "capture"}, timeout_ms=35000)
+    except _PipeTimeout:
+        return _BUSY_HINT + _service_folder()
     except FileNotFoundError:
         return _INSTALL_HINT + _service_folder()
     except Exception as exc:
         return f"Secure Desktop Helper did not answer cleanly: {exc}"
     if not resp.get("ok"):
         return f"secure capture failed: {resp.get('error')}"
+    png_ref = resp.get("png")
+    if resp.get("png_base64"):
+        # Hardened service (finding 10): the PNG is inlined as base64
+        # and the service-side file is deleted. Materialise it locally
+        # so callers still get a viewable path.
+        import base64 as _b64
+        import time as _time
+        from pathlib import Path as _Path
+        _dir = _Path.home() / "Desktop" / "screenshots"
+        _dir.mkdir(parents=True, exist_ok=True)
+        png_ref = str(_dir / ("secure-" + _time.strftime("%Y%m%d-%H%M%S") + ".png"))
+        _Path(png_ref).write_bytes(_b64.b64decode(resp["png_base64"]))
     return (f"captured desktop '{resp.get('desktop')}' of session "
-            f"{resp.get('session')} -> {resp.get('png')} "
+            f"{resp.get('session')} -> {png_ref} "
             f"({resp.get('width')}x{resp.get('height')}). "
             "View it with read_image.")
