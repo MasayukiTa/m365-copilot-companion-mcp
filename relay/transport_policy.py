@@ -505,6 +505,23 @@ def duplicate_risk(reason: str) -> bool:
     return delivery_status(reason) in ("delivered", "unknown")
 
 
+def delivery_proves_not_sent(reason: str) -> bool:
+    """True only when the reason PROVES the turn never reached the server.
+
+    A token that expired or a capture/handshake that failed happens BEFORE the frame could be
+    put on the wire (see NOT_DELIVERED), so the turn demonstrably did not land. In that one
+    case a verbatim re-send cannot repeat a model-side act, and sticky 'this turn may already
+    have landed' state from an EARLIER turn (relay_fleet `_landed_pending`) must not keep the
+    worker from recovering with a fresh token.
+
+    This is deliberately the strict complement of `duplicate_risk`: 'delivered' and the honest
+    'unknown' majority both return False and keep the careful refuse-on-landed default. It says
+    nothing about a call that ALREADY RAN on this side (continue-turn `executed`): that side
+    effect is local and real whether or not the frame was sent, so the caller still honours it.
+    """
+    return delivery_status(reason) == "not_delivered"
+
+
 # ------------------------------------------------------------------------------------------
 # Is the act's EFFECT one that can be checked before deciding to re-send?
 # ------------------------------------------------------------------------------------------

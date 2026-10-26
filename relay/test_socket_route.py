@@ -1644,6 +1644,127 @@ def test_a_later_turn_is_judged_on_its_own_evidence(monkeypatch):
     assert w._retry_socket(DROPPED) is True
 
 
+# ---- トークン失効は『未配送が確定』なので、前ターンの着地状態で再送を止めない ----------------
+#
+# 2026-10-26 10:34、艦隊全員が同じ exp のトークンで一斉に失効し、w18/w23/w25/w28 が
+# 「the supplied token has expired」で STUCK になった。いずれも acting goal で、前のターンに
+# 出力があったため `_landed_pending=True` が焼き付いており、*今回の失効ターンは一度もサーバに
+# 届いていない*のに「着地済みかもしれない」として再送を拒否されていた。失効は配送の手前で
+# 起きる（transport_policy の NOT_DELIVERED）ので、新トークンでの再送は重複ではなく復旧である。
+
+EXPIRED = "ChatHubError: the supplied token has expired. Ask the browser for a fresh one."
+
+
+def test_expired_token_is_not_blocked_by_a_prior_turns_landing(monkeypatch):
+    """失効（未配送が確定）なら、前ターン由来の `_landed_pending` で再送を止めない。"""
+    from relay.transport_policy import delivery_status
+    assert delivery_status(EXPIRED) == "not_delivered"
+
+    _retry_route(monkeypatch, drv=_FakeDrv())
+    monkeypatch.setattr(rf, "_open_fresh",
+                        lambda *a: pytest.fail("失効で復旧するのにタブを開いてはいけない"))
+    w = rf.RelayWorker("send an email to the team", "w0")   # 書き込む acting goal
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w._landed_pending = True                                # 前のターンで出力があった
+    assert w._retry_socket(EXPIRED) is True, \
+        "失効ターンは未配送なのに、前ターンの着地状態で再送を拒否している"
+    assert w.status == "ready" and w.outcome != "STUCK"
+
+
+def test_an_acting_goal_with_output_this_turn_still_refuses_on_an_unknown_drop(monkeypatch):
+    """対照群。理由が『未配送確定』でない（unknown）なら、従来どおり慎重に拒否する。
+    失効の緩和が、本当に重複を生みうるケースまで広がっていないことの保証。"""
+    from relay.transport_policy import delivery_status
+    assert delivery_status(DROPPED) == "unknown"
+
+    records = []
+    _retry_route(monkeypatch, drv=_FakeDrv(), records=records)
+    w = rf.RelayWorker("send an email to the team", "w0")
+    w.socket, w.drv, w.status = True, _FakeDrv(), "waiting"
+    w.drv.partial_text = lambda: "このターンの途中出力"      # 今回のターンで出力＝着地の疑い
+    assert w._retry_socket(DROPPED) is False, \
+        "未配送が確定していない acting goal の着地ターンを再送してしまっている"
+    assert w.outcome == "STUCK"
+    assert any(r["event"] == "resend_refused" for r in records)
+
+
+# ---- タブ退避の経路でも、失効は復旧であって STUCK ではない（やること3-b・2経路目）----------
+#
+# 失効の緩和は `_retry_socket`（再接続）だけでなく `_fall_back_to_tab`（タブ退避＝no_tab 下では
+# 「経路待ち」）の経路にも要る。両経路とも前ターンの `_landed_pending` を焼き付けたまま失効を
+# 迎えると、未配送のターンを「着地したかも」と誤判定して STUCK にしてしまう。さらにこの経路は、
+# 失効を掴んだ最初のワーカーが次の sweep を待たずに更新を蹴る（_consider_socket_refresh）こと
+# で、同じ exp で一斉に落ちた残りのワーカーが入る新トークンの到着を早める。
+
+
+class _RefreshingRoute:
+    """タブ退避経路用の経路代役。更新の起動を1回だけ記録する。"""
+
+    def __init__(self, *, needs=True):
+        self.default_agent_url = "A"
+        self.records = []
+        self.kicked = 0
+        self._needs = needs
+
+    def open(self):
+        return True
+
+    def needs_refresh(self, agent_url=None):
+        return self._needs
+
+    def record(self, event, **f):
+        self.records.append(dict(f, event=event))
+
+    def token_life(self, agent_url=None):
+        return 0.0            # 失効直後なので残り0。記録用にだけ読まれる。
+
+
+def _fallback_worker(monkeypatch, route, reason):
+    monkeypatch.setattr(rf, "_socket_route", lambda: route)
+    monkeypatch.setattr(rf, "report_route_fault", lambda *_a, **_k: None)
+    kicks = []
+
+    def _kick(r, a):
+        kicks.append((r, a))
+        route.kicked += 1
+        return True
+
+    monkeypatch.setattr(rf, "_consider_socket_refresh", _kick)
+    monkeypatch.setattr(rf, "_open_fresh",
+                        lambda *a: pytest.fail("no_tab 下では失効でタブを開かない"))
+    w = rf.RelayWorker("send an email to the team", "w0")    # 書き込む acting goal
+    w.socket, w.drv, w.status = True, _IdDrv(), "waiting"
+    w.drv.failed = reason
+    w._landed_pending = True                                 # 前のターンで出力があった
+    return w, kicks
+
+
+def test_fallback_path_recovers_from_expiry_and_kicks_a_refresh(monkeypatch):
+    """失効（未配送確定）なら、前ターンの着地状態で止めず、待機して新トークンを蹴る。"""
+    route = _RefreshingRoute(needs=True)
+    w, kicks = _fallback_worker(monkeypatch, route, EXPIRED)
+
+    assert w._fall_back_to_tab() is True
+    # STUCK ではなく『経路待ちで同じ仕事を再送する』状態になる。
+    assert w.status == "ready"
+    assert w.outcome != "STUCK"
+    assert w._needs_socket_rebind is True
+    # 失効を掴んだワーカーが、次の sweep を待たずに更新を1回起動した。
+    assert route.kicked == 1 and len(kicks) == 1
+
+
+def test_fallback_path_still_refuses_an_unknown_landed_act(monkeypatch):
+    """対照群。未配送が確定しない（unknown）着地ターンは従来どおり拒否し、更新も蹴らない。"""
+    route = _RefreshingRoute(needs=True)
+    w, kicks = _fallback_worker(monkeypatch, route, DROPPED)
+    w.drv.partial_text = lambda: "このターンの途中出力"       # 今回のターンで出力＝着地の疑い
+
+    assert w._fall_back_to_tab() is False
+    assert w.outcome == "STUCK"
+    assert any(r["event"] == "resend_refused" for r in route.records)
+    assert route.kicked == 0, "未配送確定でない故障で更新を蹴ってはいけない"
+
+
 # ---- 再接続は無料でも即時でもない --------------------------------------------------------------
 #
 # 自分の会話だけをバックエンドに拒まれたワーカーは、兄弟が成功し続ける限り経路が閉じないので、
