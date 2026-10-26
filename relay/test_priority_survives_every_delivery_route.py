@@ -87,7 +87,7 @@ def test_a_goal_that_has_to_wait_keeps_its_priority(router, tmp_path, monkeypatc
     assert status == "awaiting_fleet"
 
     parked = open(os.path.join(router.TASKS, "for_fleet", "j4.txt"), encoding="utf-8").read()
-    assert router.read_for_fleet(parked) == ("tidy the docs", True)
+    assert router.read_for_fleet(parked) == ("tidy the docs", True, "")
 
     # ...and it is still priority when a fleet finally appears.
     monkeypatch.setattr(router, "fleet_is_live", lambda *a, **k: True)
@@ -110,8 +110,8 @@ def test_a_plain_parked_file_still_reads(router, tmp_path, monkeypatch):
 
 def test_a_goal_whose_text_starts_with_a_brace_is_not_misread(router):
     """JSON かどうかを**形で**判定しているので、境界を押さえる。"""
-    assert router.read_for_fleet("{not json at all") == ("{not json at all", False)
-    assert router.read_for_fleet('{"priority": true}') == ('{"priority": true}', False)
+    assert router.read_for_fleet("{not json at all") == ("{not json at all", False, "")
+    assert router.read_for_fleet('{"priority": true}') == ('{"priority": true}', False, "")
 
 
 # ── the door ──────────────────────────────────────────────────────────────────

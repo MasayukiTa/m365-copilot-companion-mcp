@@ -85,10 +85,16 @@ def test_canned_is_bounded_then_falls_to_the_existing_diagnostics(worker, monkey
     assert worker._tools_recycles == 0 and worker._recycles == 0   # separate budgets
 
 
-def test_canned_late_in_a_conversation_is_not_recycled(worker):
+def test_canned_late_in_a_conversation_is_still_recycled(worker, monkeypatch):
+    # NEW BEHAVIOUR (brief fix 1): a canned non-answer is re-queued in a fresh conversation on
+    # ANY turn, not only the first two. The old gate `(turn - base) <= CANNED_RETRY_MAX_TURN`
+    # filed a turn-3 non-answer straight to stuck; a read-only goal carries no duplicate-act
+    # hazard, so turn position must not decide whether it recovers. (explain.md: 直した理由)
+    monkeypatch.setattr(F.time, "time", lambda: 1000.0)
     _decide(worker, CANNED, 3)
-    assert worker._canned_recycles == 0
-    assert worker.status == "stuck"
+    assert worker._canned_recycles == 1
+    assert worker.status == "ready" and worker.outcome in ("", None)
+    assert worker.recovery_state == "recovering"
 
 
 # --- (b) tool call printed as text ---------------------------------------------------------
@@ -128,3 +134,49 @@ def test_a_clean_reply_after_the_steer_means_no_recycle(worker):
     _decide(worker, MALFORMED, 1)
     _decide(worker, PLAIN, 2)
     assert worker._malformed_recycles == 0 and worker._unlanded_calls == 0
+
+
+# --- brief fix 1/2/3: canned recovery reads as 自動回復中, not 要対応 ----------------------
+# A goal that ACTS on the world, used to prove an acting goal is NOT replayed in a fresh
+# conversation (brief fix 3: no duplicate side effect). "送信してください" matches ACTING.
+ACT_GOAL = "会議の議事録をメールで送信してください"
+
+
+def test_a_canned_then_a_real_reply_completes_without_needs_attention(worker, monkeypatch):
+    # (a) first turn canned -> fresh replay (recovering), second turn a real answer -> the
+    # worker is NOT filed as 要対応; the recovering pill drops back to recovered.
+    monkeypatch.setattr(F.time, "time", lambda: 1000.0)
+    _decide(worker, CANNED, 1)
+    assert worker.status == "ready" and worker.recovery_state == "recovering"
+    assert worker.outcome in ("", None)          # not stuck, no terminal outcome yet
+    _decide(worker, PLAIN, 2)
+    assert worker.recovery_state == "recovered"  # cleared the moment a real reply arrives
+    assert worker.outcome in ("", None) and worker.status != "stuck"
+
+
+def test_canned_repeats_until_bound_then_needs_attention(worker, monkeypatch):
+    # (b) the SAME canned non-answer coming back again and again spends the bound and only
+    # THEN becomes 要対応 (stuck), with the retry count recorded in the reason.
+    monkeypatch.setattr(F.time, "time", lambda: 1000.0)
+    for n in (1, 2, 3):
+        _decide(worker, CANNED, worker._fresh_turn_base + 1)
+        assert worker.status == "ready" and worker.recovery_state == "recovering"
+    _decide(worker, CANNED, worker._fresh_turn_base + 1)
+    assert worker.status == "stuck" and worker.outcome == "REFUSED"
+    assert worker._canned_recycles == 3
+    assert "3回再投入" in worker.reason          # the reason states how many replays were tried
+
+
+def test_a_canned_after_an_acting_goal_is_not_replayed(monkeypatch):
+    # (c) a canned non-answer on a goal that ACTS on the world is NOT re-sent in a fresh
+    # conversation (would risk doing the act twice); it falls straight to the diagnostics.
+    monkeypatch.setattr(F, "_unlock_password", lambda: "pw-placeholder-not-a-credential")
+    monkeypatch.setattr(F, "connector_proof_source", lambda: "run")
+    monkeypatch.setattr(F.time, "time", lambda: 1000.0)
+    w = F.RelayWorker(ACT_GOAL, "wact")
+    w._last_sent_job = "FIRST MESSAGE"
+    _decide(w, CANNED, 1)
+    assert w._canned_recycles == 0               # never replayed
+    assert w.recovery_state != "recovering"
+    assert w.status == "stuck" and w.outcome == "REFUSED"
+    assert "再送はしていない" in w.reason

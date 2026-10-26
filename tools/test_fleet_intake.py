@@ -256,3 +256,54 @@ def test_redaction_happens_before_the_cap_not_after():
     """Capping first would let a long prefix push the address past the cut and 'pass'."""
     FI.fleet_submit("do a thing", source="x" * 55 + " someone@example.com")
     assert "@" not in _jobs()[0]["origin"]["source"]
+
+
+# -- resume_conv: a continuation, not a new task ----------------------------------------------
+#
+# The chat window reads a durable conversation id off the transcript and hands it to this door
+# so the fleet CONTINUES that conversation instead of guessing one by goal text. Two things
+# have to hold for that to work from a phone: the id has to reach the queued job's payload (so
+# the router can thread it to the fleet), and a follow-up -- which is deliberately short and
+# reads like the terse resubmission the duplicate check refuses -- must not be refused for
+# carrying resume_conv.
+
+_GOAL_A = "summarise the Q3 revenue deck and list every open action item by owner and date"
+
+
+def test_resume_conv_rides_on_the_queued_payload():
+    """The id has to survive onto the payload, beside goal/priority, or the router has nothing
+    to thread through its three delivery routes."""
+    out = FI.fleet_submit("continue where we left off", resume_conv="sess:abc123")
+    assert "queued" in out
+    assert _jobs()[0]["payload"]["resume_conv"] == "sess:abc123"
+
+
+def test_an_ordinary_goal_writes_no_resume_conv_key():
+    """'resume_conv not in payload' has to keep meaning 'start fresh', so an ordinary goal's
+    record is unchanged and nothing downstream reads a stray empty id."""
+    FI.fleet_submit("do a thing")
+    assert "resume_conv" not in _jobs()[0]["payload"]
+
+
+def test_a_follow_up_is_not_refused_as_a_near_duplicate():
+    """THE WHOLE POINT. The first turn sits in pending/; a continuation of the SAME work reads
+    as a near-duplicate of it. Without the exemption the follow-up is refused and the
+    conversation it meant to resume is never answered -- the exact bug this closes. With a
+    resume_conv it goes through, and its own id travels with it."""
+    first = FI.fleet_submit(_GOAL_A)
+    assert "queued" in first
+    # A re-worded continuation of the same work, with no resume_conv, is caught as a duplicate.
+    refused = FI.fleet_submit(_GOAL_A + " please")
+    assert "refused" in refused and "overlap" in refused
+    # The SAME near-duplicate, carrying a conversation id, is admitted as a continuation.
+    ok = FI.fleet_submit(_GOAL_A + " please", resume_conv="sess:xyz789")
+    assert "queued" in ok
+    payloads = [j["payload"] for j in _jobs()]
+    assert any(p.get("resume_conv") == "sess:xyz789" for p in payloads)
+
+
+def test_resume_conv_whitespace_is_normalised():
+    """The id is composed elsewhere and relayed here; it is trimmed like the other relayed
+    fields so a stray newline never becomes part of the id the fleet matches on."""
+    FI.fleet_submit("continue", resume_conv="  sess:trim  ")
+    assert _jobs()[0]["payload"]["resume_conv"] == "sess:trim"
