@@ -121,20 +121,24 @@ def test_the_two_goals_really_do_share_a_long_common_rules_tail():
         % specific)
 
 
-def test_two_unrelated_goals_sharing_only_the_common_rules_are_both_accepted(isolated_state):
+def test_two_unrelated_goals_sharing_only_the_common_rules_are_both_accepted(
+        isolated_state, monkeypatch):
     """(a) The incident itself. First goal is in flight on a worker; the second, a different
-    request carrying the same appended rules, must be accepted rather than refused as a
-    near-duplicate."""
+    request carrying the same appended rules, must be accepted. With the guard off by default this
+    is now true for ANY second goal, related or not; the guard is pinned off explicitly so the
+    test does not depend on the machine's settings file."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
     _write_status(isolated_state, [_running_worker("run1", _CHAT_SWITCH)])
     out = FI.fleet_submit(_PQC_MIGRATE)
     assert "queued" in out, out
     assert len(_jobs()) == 1
 
 
-def test_the_same_holds_when_the_first_goal_is_only_pending(isolated_state):
+def test_the_same_holds_when_the_first_goal_is_only_pending(isolated_state, monkeypatch):
     """(a), via the door's own pending/ queue rather than a live worker -- a goal sitting in
     pending is exactly as 'in flight' as one on a worker, so the shared tail must not make it
     swallow an unrelated second goal either."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
     FI.fleet_submit(_CHAT_SWITCH)
     assert len(_jobs()) == 1
     out = FI.fleet_submit(_PQC_MIGRATE)
@@ -142,22 +146,29 @@ def test_the_same_holds_when_the_first_goal_is_only_pending(isolated_state):
     assert len(_jobs()) == 2
 
 
-def test_an_exact_resend_is_still_refused(isolated_state):
-    """(b) The property the guard exists for must survive the fix: resubmitting a goal already
-    in flight, byte for byte, is still refused and the refusal names the running job. (An
-    exact resend shares its whole text as the tail, so goal-specific words fall below the
-    floor and the comparison falls back to the whole-goal measure -- which is 1.0.)"""
+def test_an_exact_resend_is_still_refused_when_the_guard_is_on(isolated_state, monkeypatch):
+    """(b) The improved similarity still does its job WHEN THE GUARD IS TURNED ON. By owner order
+    2026-10-26 the guard is off by default, so an exact resend is now ACCEPTED and recorded in the
+    background, not refused (see the accept-by-default suites). This test pins the other half: with
+    fleet_submit_dup_guard on, resubmitting a goal already in flight byte-for-byte is still refused
+    and the refusal still names the running job. (An exact resend shares its whole text as the
+    tail, so goal-specific words fall below the floor and the comparison falls back to the
+    whole-goal measure -- which is 1.0.) The guard is forced on by patching _dup_guard_on so this
+    proves the similarity logic, not settings-file parsing."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", _CHAT_SWITCH)])
     out = FI.fleet_submit(_CHAT_SWITCH)
     assert "refused" in out and "run1" in out, out
     assert _jobs() == [], "a refused resend must not be queued"
 
 
-def test_a_resend_with_a_few_words_reworded_is_still_refused(isolated_state):
-    """(c) A near-exact resend -- the SAME job with a handful of words changed -- must still be
-    caught, because that is the worker-paraphrase shape the guard was built to stop. The
-    reworded goal keeps almost all of its OWN words, so its goal-specific overlap with the
-    original stays well above the bar."""
+def test_a_resend_with_a_few_words_reworded_is_still_refused_when_the_guard_is_on(
+        isolated_state, monkeypatch):
+    """(c) A near-exact resend -- the SAME job with a handful of words changed -- is still caught
+    WHEN THE GUARD IS ON, because that is the worker-paraphrase shape the guard was built to stop.
+    The reworded goal keeps almost all of its OWN words, so its goal-specific overlap with the
+    original stays well above the bar. Off by default now, so the guard is forced on here."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     reworded = (_CHAT_SWITCH
                 .replace("調べて直す", "調査して修正する")
                 .replace("特定し", "特定して")

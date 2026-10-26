@@ -212,7 +212,9 @@ def _cut_after_one_call(tools, *, second="silent"):
 # ---- 1. 設定が off なら今までと同じ ------------------------------------------------------------
 
 def test_mode_off_changes_nothing_on_the_wire_or_in_the_refusal(tmp_path, monkeypatch):
-    _mode(tmp_path, monkeypatch, None)                       # キー無し = off
+    # この PR で既定が on になったので、キー無し(None)はもう off ではない。off の挙動
+    # (記録を持たず、送信文に参照番号を足さない)を検証するには、明示的に off を書く。
+    _mode(tmp_path, monkeypatch, "off")                      # 明示 off
     tools = _Tools()
     A, connect, drv = _cut_after_one_call(tools)
     _run(drv, "THE-JOB")

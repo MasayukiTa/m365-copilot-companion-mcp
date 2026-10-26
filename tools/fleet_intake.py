@@ -207,6 +207,18 @@ _DUP_STOPWORDS = frozenset(
 #: really is new -- cheap next to the failure mode this exists to close.
 DUP_SIMILARITY = 0.5
 
+#: OWNER ORDER 2026-10-26: refusing a goal at the door on word overlap is OFF by default.
+#: 177 measured refusals (144 of them goals under 200 characters) stopped DIFFERENT work -- two
+#: short goals sharing a verb, or two unrelated coding goals sharing one appended block of common
+#: rules -- and that was the single biggest source of a person being turned away at the door. The
+#: owner's decision is that near-duplicates are NORMALISED IN THE BACKGROUND (a note on the job and
+#: one line in .fleet/dup_notes.jsonl), not refused in front of the person. The whole similarity
+#: machinery below is kept, because it is still exactly what the background note needs; it simply no
+#: longer gates admission. The old refusing behaviour can be restored per-machine with the
+#: `fleet_submit_dup_guard=on` setting (see tools/settings_keys.py), for an operator who wants it
+#: back; absent or anything but `on` is off.
+DUP_GUARD_ENABLED = False
+
 #: Same floor and same reason as skill_lessons.MIN_WORDS: below this many content words, overlap
 #: is not evidence either way, and a short goal ("do a thing", used throughout this file's own
 #: tests) must never be compared at all rather than compared unreliably.
@@ -479,6 +491,70 @@ def _duplicate_of(text: str):
     return best
 
 
+#: off|on. When on, a near-duplicate is REFUSED at the door exactly as before (the old behaviour,
+#: kept for an operator who wants it). When off (the default, DUP_GUARD_ENABLED is False), a
+#: near-duplicate is ACCEPTED and recorded in the background. Read fresh on every submission, like
+#: tools/approval_policy.current_approval_mode, so turning it on takes effect on the next call with
+#: no restart. Tests set it directly by patching this function so the admission decision is tested
+#: in isolation from settings-file parsing.
+_DUP_GUARD_SETTING = "fleet_submit_dup_guard"
+
+
+def _dup_guard_on() -> bool:
+    """Whether the word-overlap guard REFUSES a near-duplicate right now.
+
+    DUP_GUARD_ENABLED is the compiled default (False -- the owner's 2026-10-26 order). The
+    `fleet_submit_dup_guard` setting can turn it back on per-machine: an explicit `on` in the one
+    settings file restores the old refusal; absent, unreadable, or anything but `on` leaves it off.
+    Read at each call so a change lands on the next submission with no restart, and swallow any
+    read error to off -- the door must never fail because a settings file could not be read.
+    """
+    try:
+        from tools import settings_path as SP
+        raw = SP.read_key(SP.settings_file(), _DUP_GUARD_SETTING)
+        if raw is not None:
+            return raw.strip().lower() == "on"
+    except Exception:
+        pass
+    return bool(DUP_GUARD_ENABLED)
+
+
+def _note_possible_duplicate(new_jid: str, dup_jid: str, similarity: float, text: str) -> None:
+    """Record, in the background, that `new_jid` resembles the in-flight `dup_jid` -- the
+    replacement for refusing the person at the door.
+
+    Appends one line to .fleet/dup_notes.jsonl: the time, the new job id, the one it resembles,
+    the similarity, and the first 80 characters of the goal (same head rule and same address
+    redaction as the refusal log, so a note never carries an address or a goal body). The job's
+    own payload is tagged separately by fleet_submit (possible_duplicate_of / similarity) so a
+    reader of the queue sees it without opening this log.
+
+    NEVER RAISES, and never fails the submission: a dup note is an after-the-fact record, and the
+    owner's order is that a near-duplicate is ACCEPTED. A write failure here is written to
+    .fleet/dup_notes_errors.log and swallowed -- the exception is recorded, not re-raised and not
+    silently dropped, so a broken note leaves a trail without ever turning into a second gate.
+    """
+    try:
+        from tools import obs_log
+        obs_log.append("dup_notes.jsonl", {
+            "new": str(new_jid),
+            "possible_duplicate_of": str(dup_jid),
+            "similarity": round(float(similarity), 4),
+            "goal_head": obs_log.head(text, 80),
+        })
+    except Exception as exc:
+        try:
+            from tools import obs_log
+            import time as _time
+            path = os.path.join(obs_log._state_dir(), "dup_notes_errors.log")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%s %s: %s\n" % (_time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                          type(exc).__name__, exc))
+        except Exception:
+            pass
+
+
 def _log_refusal(reason: str, text: str, source: str, similar_to: str = "") -> None:
     """Record a refusal in .fleet/fleet_submit_refusals.jsonl. Never raises, never alters the
     reply the caller gets."""
@@ -518,8 +594,11 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
             "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
             "messages back into Fleet.]"
         )
+    # NEAR-DUPLICATE: refuse ONLY when the guard is explicitly on; otherwise accept and record in
+    # the background (owner order 2026-10-26). _duplicate_of still runs when the guard is off,
+    # because its answer is what the background note needs -- it just no longer gates admission.
     dup = _duplicate_of(text)
-    if dup is not None:
+    if dup is not None and _dup_guard_on():
         dup_jid, sim = dup
         _log_refusal("similar", text, source, similar_to=dup_jid)
         return ("[fleet_submit: refused -- this reads as the goal already queued or running "
@@ -550,6 +629,14 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         # into the queue instead of being lost at the door.
         "origin": {"via": "mcp", "source": _clean(source or "agent", MAX_SOURCE_CHARS)},
     }
+    # ACCEPTED-BUT-SIMILAR: tag the job itself so a reader of the queue sees the resemblance
+    # without opening the dup-notes log. Only set when a near-duplicate was found AND it was not
+    # refused (guard off); a refused one never reaches here. The dup-notes line is written AFTER
+    # the job is safely on disk, so a failed note never leaves a tagged job the log does not
+    # mention, and a failed write never produces an orphan note.
+    if dup is not None:
+        job["payload"]["possible_duplicate_of"] = dup[0]
+        job["payload"]["similarity"] = round(float(dup[1]), 4)
     try:
         TR.ensure_dirs()
         path = os.path.join(TR.TASKS, "pending", "%s.json" % jid)
@@ -560,6 +647,9 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     except Exception as exc:
         _log_refusal("other", text, source)
         return "[fleet_submit: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
+
+    if dup is not None:
+        _note_possible_duplicate(jid, dup[0], dup[1], text)
 
     # COUNTED AFTER THE WRITE, NOT BEFORE. Four devices submitting at the same instant each
     # read the queue before any of them had written, so all four were told "1 job waiting"

@@ -134,6 +134,22 @@ KEYS = OrderedDict([
        "tools/approval_policy.py:current_approval_mode (every gate check)",
        "Read fresh at every approval gate, so the panel governs jobs already queued."),
 
+    # fleet_submit's word-overlap duplicate guard (tools/fleet_intake.py). OFF by default by
+    # owner order 2026-10-26: refusing a goal at the door on word overlap turned away DIFFERENT
+    # work (two short goals sharing a verb, two coding goals sharing one appended block of common
+    # rules), so near-duplicates are now NORMALISED IN THE BACKGROUND -- a possible_duplicate_of
+    # tag on the job and one line in .fleet/dup_notes.jsonl -- instead of being refused. This
+    # switch only restores the OLD refusal for an operator who wants it.
+    _k("fleet_submit_dup_guard", EACH_GATE, "off",
+       "tools/fleet_intake.py:_dup_guard_on (every fleet_submit call)",
+       "off|on. off (default, owner order 2026-10-26): a goal that resembles one already queued or "
+       "running is ACCEPTED and recorded (possible_duplicate_of on the job, one line in "
+       ".fleet/dup_notes.jsonl), never refused. on: restores the old behaviour -- such a goal is "
+       "refused at the door using PR #293's improved similarity (the appended common-rules tail is "
+       "ignored, short goals weigh their own identifiers). Read fresh on every submission, so a "
+       "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
+       "anything but on reads as off."),
+
     # ---------------------------------------------------------------- sweep_start
     _k("autoscale", SWEEP_START, 0,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",

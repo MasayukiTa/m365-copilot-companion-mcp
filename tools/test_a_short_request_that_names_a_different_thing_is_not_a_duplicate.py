@@ -95,25 +95,30 @@ def test_a_shared_tail_does_not_leak_its_identifiers_into_the_specific_set():
 
 # -- (a)(b)(c) different specific thing -> accepted ---------------------------------------------
 
-def test_a_single_letter_name_makes_a_second_short_goal_its_own_job(isolated_state):
+def test_a_single_letter_name_makes_a_second_short_goal_its_own_job(isolated_state, monkeypatch):
     """(a) 'ファイルAを解析してレポートを作成' is in flight; 'ファイルBを解析してレポートを作成'
-    is a DIFFERENT file and must be accepted, not refused as a near-duplicate."""
+    is a DIFFERENT file and must be accepted. With the guard off by default this holds for any
+    second goal; the guard is pinned off explicitly so the test does not depend on the machine's
+    settings file."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
     _write_status(isolated_state, [_running_worker("run1", "ファイルAを解析してレポートを作成")])
     out = FI.fleet_submit("ファイルBを解析してレポートを作成")
     assert "queued" in out, out
     assert len(_jobs()) == 1
 
 
-def test_a_different_filename_makes_its_own_job(isolated_state):
+def test_a_different_filename_makes_its_own_job(isolated_state, monkeypatch):
     """(b) Distinguished by a filename rather than a bare letter."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
     _write_status(isolated_state, [_running_worker("run1", "sales.csv を解析して集計を出す")])
     out = FI.fleet_submit("orders.csv を解析して集計を出す")
     assert "queued" in out, out
     assert len(_jobs()) == 1
 
 
-def test_a_different_version_string_makes_its_own_job(isolated_state):
+def test_a_different_version_string_makes_its_own_job(isolated_state, monkeypatch):
     """(c) Distinguished by a version identifier."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
     _write_status(isolated_state, [_running_worker("run1", "v2 の設定ファイルを直して確認する")])
     out = FI.fleet_submit("v3 の設定ファイルを直して確認する")
     assert "queued" in out, out
@@ -122,19 +127,28 @@ def test_a_different_version_string_makes_its_own_job(isolated_state):
 
 # -- (d)(e) the property the guard exists for must survive --------------------------------------
 
-def test_an_exact_resend_of_a_short_goal_is_still_refused(isolated_state):
+def test_an_exact_resend_of_a_short_goal_is_still_refused_when_the_guard_is_on(
+        isolated_state, monkeypatch):
     """(d) The two goals name the SAME thing (or none), so the identifier check does not fire and
-    the word measure refuses the resend as before."""
+    the word measure would refuse the resend as before -- but only WHEN THE GUARD IS ON. By owner
+    order 2026-10-26 it is off by default, so this resend is now accepted and recorded in the
+    background; this test forces the guard on to pin that the short-goal word measure still
+    refuses when an operator asks for it."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", "ファイルAを解析してレポートを作成")])
     out = FI.fleet_submit("ファイルAを解析してレポートを作成")
     assert "refused" in out and "run1" in out, out
     assert _jobs() == []
 
 
-def test_a_reworded_resend_naming_the_same_thing_is_still_refused(isolated_state):
-    """(e) Same identifier (v2), a few words changed: still the same job, still refused. The
-    identifier sets are NOT disjoint (both name v2), so the guard falls through to the word
-    measure, which still clears the bar."""
+def test_a_reworded_resend_naming_the_same_thing_is_still_refused_when_the_guard_is_on(
+        isolated_state, monkeypatch):
+    """(e) Same identifier (v2), a few words changed: still the same job, still refused WHEN THE
+    GUARD IS ON. The identifier sets are NOT disjoint (both name v2), so the guard falls through
+    to the word measure, which still clears the bar. Off by default now, so the guard is forced
+    on here -- this is exactly the brief's test (e): turning the setting back on restores PR
+    #293's refusal."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", "v2 の設定ファイルを直して確認する")])
     out = FI.fleet_submit("v2 の設定ファイルを修正して確認する")
     assert "refused" in out and "run1" in out, out
