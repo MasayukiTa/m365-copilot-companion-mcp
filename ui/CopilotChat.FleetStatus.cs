@@ -402,15 +402,24 @@ partial class ChatWindow
             if (!string.IsNullOrEmpty(runLabel) && runLabel.Length > 50)
                 runLabel = runLabel.Substring(0, 50) + "…";
 
-            // Worker counts
-            int doneCount2 = 0, attentionCount2 = 0, runningCount2 = 0, pendingCount2 = 0;
+            // Worker counts. "Needs attention" is decided by the ONE shared definition
+            // (Theme.CountsAsNeedsAttention), the same the cockpit header uses, so this band and
+            // the header can no longer report two different attention numbers. The old inline test
+            // here counted {stuck, maxturns, error, awaiting} with no exclusions: it lumped
+            // "awaiting approval" into "needs attention" and counted an INFRA_STUCK worker (being
+            // retried automatically) and would have counted `recovering` -- none of which is a lane
+            // a person has to touch. `awaiting`/`awaiting_gate` are now their own tally; recovering
+            // and interrupted fall to runningCount2 (the harness is still driving them).
+            int doneCount2 = 0, attentionCount2 = 0, runningCount2 = 0, pendingCount2 = 0, gateCount2 = 0, errorCount2 = 0;
             foreach (object o in workers)
             {
                 var w = o as Dictionary<string, object>;
                 if (w == null) continue;
                 string st = SS(w, "status").ToLowerInvariant();
                 if (st == "done" || st == "resolved" || st == "cancelled" || st == "freed") doneCount2++;
-                else if (st == "stuck" || st == "maxturns" || st == "error" || st == "awaiting") attentionCount2++;
+                else if (st == "awaiting" || st == "awaiting_gate") gateCount2++;
+                else if (Theme.CountsAsError(st)) errorCount2++;   // brief rule 5: error is a separate danger count
+                else if (Theme.CountsAsNeedsAttention(st, SS(w, "outcome"))) attentionCount2++;
                 else if (st == "pending") pendingCount2++;
                 else runningCount2++;
             }
@@ -434,10 +443,15 @@ partial class ChatWindow
             // Determine status dot color. pending (queued / not yet started) must NOT read as
             // Success green — that hides the most anxious state of a long delegation ("not started
             // yet"). When nothing is running but work is queued, use Info (blue/neutral).
+            // attention OR a waiting approval gate both want a person -- keep the amber dot the old
+            // code showed for `awaiting` (it used to be folded into attention), but they stay
+            // SEPARATE tallies in the summary text below.
             string dotColor;
             if (runningCount2 > 0)
                 dotColor = Theme.Info(_dark);
-            else if (attentionCount2 > 0)
+            else if (errorCount2 > 0)
+                dotColor = Theme.Danger(_dark);   // error is its own red state, not folded into attention
+            else if (attentionCount2 > 0 || gateCount2 > 0)
                 dotColor = Theme.Warning(_dark);
             else if (pendingCount2 > 0)
                 dotColor = Theme.Info(_dark);
@@ -449,6 +463,12 @@ partial class ChatWindow
             string summaryText;
             if (runningCount2 > 0)
                 summaryText = ja ? ("実行中 " + runningCount2) : (runningCount2 + " running");
+            else if (attentionCount2 > 0)
+                summaryText = ja ? ("要対応 " + attentionCount2) : (attentionCount2 + " need attention");
+            else if (errorCount2 > 0)
+                summaryText = ja ? ("停止(エラー) " + errorCount2) : (errorCount2 + " error");
+            else if (gateCount2 > 0)
+                summaryText = ja ? ("承認待ち " + gateCount2) : (gateCount2 + " awaiting approval");
             else if (pendingCount2 > 0)
                 summaryText = ja ? ("待機中 " + pendingCount2) : ("Queued " + pendingCount2);
             else
@@ -579,6 +599,30 @@ partial class ChatWindow
                     Foreground = new SolidColorBrush(Theme.Col(Theme.Warning(_dark)))
                 };
                 leftStack.Children.Add(attTb);
+            }
+
+            // Error segment (Danger color when >0). Brief rule 5: error is shown apart from
+            // "needs attention", in its own red, matching the "停止(エラー)" chip.
+            if (errorCount2 > 0)
+            {
+                var sepE = new TextBlock
+                {
+                    Text = " · ",
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center
+                };
+                SetRef(sepE, TextBlock.ForegroundProperty, "Faint");
+                leftStack.Children.Add(sepE);
+
+                string errText = ja ? ("停止(エラー) " + errorCount2) : (errorCount2 + " error");
+                var errTb = new TextBlock
+                {
+                    Text = errText,
+                    FontSize = 11,
+                    VerticalAlignment = VerticalAlignment.Center,
+                    Foreground = new SolidColorBrush(Theme.Col(Theme.Danger(_dark)))
+                };
+                leftStack.Children.Add(errTb);
             }
 
             // Freshness

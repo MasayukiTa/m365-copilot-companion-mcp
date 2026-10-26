@@ -280,6 +280,8 @@ def world(exe, tmp_path_factory):
         _w("wNoEvents", "a pending worker with no phase events", "pending", born=None),
         _w("wActive2", "a second active worker", "verifying", born=T - 400),
         _w("wFreed", "a freed worker", "freed", born=T - 800),
+        _w("wTieA", "first of a completion tie", "done", born=T - 1000),
+        _w("wTieB", "second of a completion tie", "freed", born=T - 1000),
     ])
 
     # --- retry: the old worker already carries the goal text ---
@@ -489,12 +491,16 @@ def test_three_sources_of_one_goal_are_one_row_at_the_furthest_stage(results):
 
 def test_the_order_is_submitted_then_fresh_pending_then_active_then_older_pending_then_done(results):
     step, = _views(results, "ordering")
+    # Terminal bucket is ordered by COMPLETION TIME, newest first (the ts of the last
+    # phase_event). wFreed finished at T-799 (born T-800 +1), wDone at T-899 (born T-900 +1),
+    # so the more recently finished wFreed sorts above wDone -- regardless of status.json order.
     assert step["order"] == [
         "S:newest submission", "S:older submission",        # submitted, newest first
         "W:wFresh2", "W:wFresh",                            # fresh pending, newest first
         "W:wActive", "W:wActive2",                          # active, status.json order
         "W:wOldPending", "W:wEdge", "W:wNoEvents",          # older pending (180 s is not fresh)
-        "W:wDone", "W:wFreed",                              # terminal
+        "W:wFreed", "W:wDone",                              # terminal, newest completion first
+        "W:wTieA", "W:wTieB",                               # oldest completion; equal ts -> status.json order
     ], step["order"]
 
 

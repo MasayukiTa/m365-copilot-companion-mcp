@@ -169,6 +169,7 @@ partial class CockpitWindow
         // TASK 5: run-ended state — when running==false AND every worker is terminal, show ended summary.
         bool allTerminal = false;
         int cntAttn = 0;
+        int cntErr = 0;   // brief rule 5: error is its own danger count, not folded into needs-attention
         object wo3;
         if (root.TryGetValue("workers", out wo3) && wo3 is object[])
         {
@@ -181,7 +182,13 @@ partial class CockpitWindow
                     var ww2 = ow2 as Dictionary<string, object>;
                     if (ww2 == null) continue;
                     if (!IsTerminalWorker(ww2) && !IsInterruptedWorker(ww2)) { allTerminal = false; }
-                    if (IsOperatorAttention(ww2)) cntAttn++;
+                    // ONE DEFINITION OF "needs attention" (Theme.CountsAsNeedsAttention), shared
+                    // with the chat window's fleet band, plus the goal-based local_loop guard that
+                    // needs the goal text. This is exactly IsOperatorAttention, spelled through the
+                    // shared core so the two screens cannot drift apart again.
+                    if (Theme.CountsAsNeedsAttention(S(ww2, "status"), S(ww2, "outcome"))
+                        && !IsLocalLoopControlGoal(S(ww2, "goal"))) cntAttn++;
+                    if (Theme.CountsAsError(S(ww2, "status"))) cntErr++;   // separate red tally
                 }
             }
         }
@@ -192,11 +199,11 @@ partial class CockpitWindow
             // Run-ended header: "{done} done · {attn} needs attention · run ended"
             if (ja2)
             {
-                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · " + (cntIntr > 0 ? cntIntr + " 中断 · " : "") + "終了";
+                triple = cntDoneW + " 完了 · " + cntAttn + " 要対応 · " + (cntErr > 0 ? cntErr + " 停止(エラー) · " : "") + (cntIntr > 0 ? cntIntr + " 中断 · " : "") + "終了";
             }
             else
             {
-                triple = cntDoneW + " done · " + cntAttn + " needs attention · " + (cntIntr > 0 ? cntIntr + " interrupted · " : "") + "run ended";
+                triple = cntDoneW + " done · " + cntAttn + " needs attention · " + (cntErr > 0 ? cntErr + " error · " : "") + (cntIntr > 0 ? cntIntr + " interrupted · " : "") + "run ended";
             }
         }
         else
@@ -282,6 +289,8 @@ partial class CockpitWindow
                 _subChips.Children.Add(ChipMargin(Pill(cntDoneW + " " + (ja2 ? "完了" : "done"), "success")));
                 _subChips.Children.Add(ChipMargin(Pill(cntAttn + " " + (ja2 ? "要対応" : "needs attention"),
                     cntAttn > 0 ? "warning" : "neutral")));
+                if (cntErr > 0)
+                    _subChips.Children.Add(ChipMargin(Pill(cntErr + " " + (ja2 ? "停止(エラー)" : "error"), "danger")));
                 if (cntIntr > 0)
                     _subChips.Children.Add(ChipMargin(Pill(cntIntr + " " + (ja2 ? "中断" : "interrupted"), "warning")));
                 _subChips.Children.Add(ChipMargin(Pill(ja2 ? "終了" : "run ended", "neutral")));
