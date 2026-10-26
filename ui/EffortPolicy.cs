@@ -1818,3 +1818,56 @@ public static class OrgAbView
                   : "Applies from the next run; a run in progress keeps its mode.";
     }
 }
+
+// The continue-turn recovery selector's words and parsing, WPF-free. The Python side decides:
+// relay/continue_recovery.py reads `socket_continue_recovery` at every send on the socket route and
+// every retry decision (each_gate). The DEFAULT is ON when no line is present
+// (relay/continue_recovery.DEFAULT). An explicit on/off line always wins. on:
+// for connector-less repository work, a turn cut after unknown delivery is continued in the SAME
+// conversation instead of ending STUCK -- it checks the conversation still holds its history,
+// re-quotes the results of calls this process already ran, and never runs the same call twice.
+public static class ContinueRecoveryView
+{
+    //: must equal tools/settings_keys.py and relay/continue_recovery.py KEY / DEFAULT.
+    public const string Key = "socket_continue_recovery";
+    //: The default when no line is present, matching relay/continue_recovery.py DEFAULT and
+    //: SK.default("socket_continue_recovery"). A test pins this to both.
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one socket_continue_recovery= line; null when the line is not that
+    /// key or the value is not off|on (the caller keeps its value). A byte order mark is tolerated
+    /// and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "続きのターンによる回復" : "Continue-turn recovery"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン" : "On";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "オン(既定)=コネクタなし経路で、接続が切れて届いたか分からないまま止まったリポジトリ作業を、同じ会話の続きのターンで回復します。会話が履歴を保っているか確認し、このPCで実行済みの呼び出しの結果を再掲し、同じ呼び出しを二度実行しません。オフ=従来どおりその作業はSTUCKで終わります。"
+                  : "On (default) recovers, on the connector-less route, repository work cut after unknown delivery by sending a continue turn in the SAME conversation. It checks the conversation still holds its history, re-quotes the results of calls this PC already ran, and never runs the same call twice. Off: such work ends STUCK, as before.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次に送るターン/再試行の判断から有効。再起動不要。実行中の会話は始めた状態のまま続きます。"
+                  : "Applies to the next send or retry decision, no restart. Conversations already running keep what they started with.";
+    }
+}

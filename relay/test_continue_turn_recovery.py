@@ -232,10 +232,10 @@ def test_mode_off_changes_nothing_on_the_wire_or_in_the_refusal(tmp_path, monkey
     assert tools.count("a.py") == 1
 
 
-def test_the_setting_defaults_to_off_and_is_declared():
+def test_the_setting_defaults_to_on_and_is_declared():
     from tools import settings_keys as SK
     from relay import continue_recovery as CR
-    assert SK.default("socket_continue_recovery") == "off" == CR.DEFAULT
+    assert SK.default("socket_continue_recovery") == "on" == CR.DEFAULT
     assert SK.effect("socket_continue_recovery") == SK.EACH_GATE
 
 

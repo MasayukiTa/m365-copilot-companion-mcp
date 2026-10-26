@@ -791,6 +791,69 @@ def fleet_is_live(state_dir=None) -> bool:
     return _active_marker_process_alive(sd)
 
 
+def fleet_accepting_goals(state_dir=None) -> bool:
+    """Whether a live fleet is still READING its command channel, as opposed to merely having a
+    process alive.
+
+    fleet_is_live() answers "is a run in flight" -- true for the whole post-run cleanup window,
+    because the process is alive and status.json's mtime is still fresh (see its docstring and
+    _active_marker_process_alive). But once run_relay_fleet has returned, fleet_runner's
+    on_tick/_drain_commands no longer run, so a goal add_goal'd now is written into a channel
+    that will never be drained and sits "dispatched" until the 90s landing-ack grace expires.
+    fleet_runner._mark_not_accepting_goals stamps `accepting_goals: False` the instant that
+    window opens; this reads it so fleet_handoff can route such a goal to autostart instead.
+
+    OLD STATUS FILES ARE TREATED AS BEFORE. A run started before this field existed writes no
+    `accepting_goals` key, and a missing/stale/unreadable status.json carries no stamp either --
+    in every one of those cases this returns True, so the behaviour for a goal arriving at a
+    genuinely live, draining fleet is exactly what it was. Only an EXPLICIT False -- written by a
+    run that has reached the stop-accepting point -- diverts the goal. That keeps a mixed
+    old/new deployment safe: the feature can only ADD the autostart route, never remove the
+    add_goal one from a fleet that is still reading.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if os.path.isfile(sp) and (time.time() - os.path.getmtime(sp)) <= FLEET_LIVE_MAX_AGE_S:
+            with open(sp, encoding="utf-8-sig") as fh:
+                snap = json.load(fh)
+            if isinstance(snap, dict) and snap.get("accepting_goals") is False:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _fleet_stopped_reading(state_dir=None) -> bool:
+    """Whether the current status.json shows a run that has STOPPED reading its command channel.
+
+    Used by _reconcile_landings to cut the landing-ack grace short. Returns True only on a
+    readable status.json that EXPLICITLY says the run is done reading -- `accepting_goals` is
+    False (the stamp fleet_runner writes the instant its sweep loop exits) OR `running` is False
+    (the final snapshot). Either way on_tick/_drain_commands will not run again, so a goal still
+    unacked will never be read by this run and there is nothing to wait for.
+
+    CONSERVATIVE BY DESIGN. A missing, stale, or unreadable status.json, or one that still looks
+    live (no accepting_goals stamp and running:True), returns False -- the full grace is kept,
+    exactly as before this check existed. An old run that predates the accepting_goals stamp
+    still flips running:False in its final snapshot, so even a mixed deployment gets the early
+    cut once the run has truly finished, while never cutting it on a fleet that might still take
+    the goal.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if not os.path.isfile(sp):
+            return False
+        with open(sp, encoding="utf-8-sig") as fh:
+            snap = json.load(fh)
+    except Exception:
+        return False
+    if not isinstance(snap, dict):
+        return False
+    return snap.get("accepting_goals") is False or snap.get("running") is False
+
+
 def _active_marker_process_alive(state_dir) -> bool:
     """Fallback liveness read for a stale/unreadable status.json: is the pid recorded in
     fleet_runner's `fleet_run_active.json` still running? Never raises; a missing/corrupt
@@ -1722,7 +1785,15 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
     if is_local_loop_control_submission(goal):
         return "refused", {"handoff": "for_fleet/%s.txt" % jid, "refused": True,
                            "detail": "LOCAL_LOOP control envelope is not Fleet work"}
-    if fleet_is_live(state_dir):
+    # LIVE AND STILL READING ITS CHANNEL. fleet_is_live() alone is True for the whole post-run
+    # cleanup window -- the process is alive and status.json's mtime is fresh -- but during that
+    # window on_tick/_drain_commands no longer run, so an add_goal here lands in a channel that
+    # will never be drained and sits "dispatched" until the 90s ack grace expires (~2 min).
+    # fleet_accepting_goals() reads the `accepting_goals: False` stamp fleet_runner writes the
+    # instant that window opens, so a goal arriving then falls through to the autostart block
+    # below instead. An old status.json without the stamp reads as accepting, so a genuinely
+    # live, draining fleet still takes the add_goal path exactly as before.
+    if fleet_is_live(state_dir) and fleet_accepting_goals(state_dir):
         # Clear any stale receipt for this id before queueing, so a confirmation seen later
         # belongs to THIS handoff and not a previous run's leftover file.
         try:
@@ -1882,9 +1953,19 @@ def _reconcile_landings(now_ts=None, state_dir=None):
             out.append(rec)
             continue
         age = now - float(marker.get("ts", now))
-        if age <= RECONCILE_ACK_GRACE_S:
+        # CUT THE GRACE SHORT WHEN THE RUN HAS PLAINLY STOPPED READING. The 90s grace exists for
+        # a fleet that is alive but slow to drain its command channel. But a run that has reached
+        # its post-sweep cleanup (status.json stamped accepting_goals=False, or already
+        # running=False) will NEVER read this goal -- on_tick/_drain_commands have stopped. In
+        # that case waiting out the remaining grace just adds dead time before the re-queue, so
+        # re-queue now. A status that still looks live (no stamp, running:True), or one we cannot
+        # read, keeps the full grace -- the old behaviour -- so this only ever shortens the wait
+        # for a run that has demonstrably finished reading, never re-queues out from under a
+        # fleet that might still take the goal.
+        if age <= RECONCILE_ACK_GRACE_S and not _fleet_stopped_reading(state_dir):
             continue  # live-but-slow fleet may still read it; do not re-queue yet
-        # Past the grace with no ack: the goal was lost into the stale-status window. Put it
+        # Past the grace (or the run has stopped reading) with no ack: the goal was lost into
+        # the stale-status window. Put it
         # back on the waiter channel so a live fleet picks it up again, this time with an ack
         # we can confirm. Written before the marker is removed, so a crash between the two
         # leaves a waiter (re-tried) rather than nothing (lost).
