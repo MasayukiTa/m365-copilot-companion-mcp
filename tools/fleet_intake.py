@@ -566,7 +566,7 @@ def _log_refusal(reason: str, text: str, source: str, similar_to: str = "") -> N
 
 
 def fleet_submit(goal: str, note: str = "", source: str = "",
-                 priority: bool = False) -> str:
+                 priority: bool = False, resume_conv: str = "") -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
 
     goal: the whole instruction, standalone -- whatever runs it will not see this
@@ -576,9 +576,17 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     than the machine can -- the fleet still waits for a free worker slot, and a priority goal
     simply goes to the front of the line rather than the back. Default false, because a door
     where everything is urgent has no priority at all.
+    resume_conv: the id (or URL) of an EXISTING Copilot conversation this goal should CONTINUE
+    rather than start fresh -- the value the chat window's continuation puts on the goal item
+    (e.g. "sess:..."). Carried on the job payload and threaded through every delivery route as
+    the goal-item field `resume_conv`, so the worker resumes that conversation instead of
+    guessing one by goal text. A goal that carries it is EXEMPT from the duplicate check: a
+    follow-up is deliberately short and reads as the terse resubmission that check refuses, and
+    refusing it is how a continuation silently became a new, context-free task. Default empty.
 
     QUEUED, NOT STARTED. Nothing runs because this was called.
     """
+    resume_conv = " ".join(str(resume_conv or "").split())
     text = " ".join(str(goal or "").split())
     if not text:
         _log_refusal("missing_goal", text, source)
@@ -594,17 +602,33 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
             "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
             "messages back into Fleet.]"
         )
-    # NEAR-DUPLICATE: refuse ONLY when the guard is explicitly on; otherwise accept and record in
-    # the background (owner order 2026-10-26). _duplicate_of still runs when the guard is off,
-    # because its answer is what the background note needs -- it just no longer gates admission.
-    dup = _duplicate_of(text)
-    if dup is not None and _dup_guard_on():
-        dup_jid, sim = dup
-        _log_refusal("similar", text, source, similar_to=dup_jid)
-        return ("[fleet_submit: refused -- this reads as the goal already queued or running "
-                "as %s (%d%% word overlap). If it is genuinely different work, say specifically "
-                "how; if you meant to check on that job, use fleet_queue() instead of "
-                "resubmitting it.]" % (dup_jid, round(sim * 100)))
+    # NEAR-DUPLICATE, with two gates layered (both #293 and #294 survive here):
+    #
+    #   * A CONTINUATION IS EXEMPT ENTIRELY (#294). resume_conv names an existing conversation
+    #     this goal is meant to CONTINUE, and a follow-up is deliberately short and terse
+    #     ("write the changelog", "now do the other half") -- exactly the shape _duplicate_of
+    #     reads as a resubmission of something already in flight. Refusing it is the specific
+    #     way a continuation stopped being a continuation: the terse second turn was rejected
+    #     as a near-duplicate of the first, and the conversation it meant to resume was never
+    #     answered. So a goal carrying resume_conv skips the duplicate machinery altogether --
+    #     no match is computed, no tag is written -- and dup stays None so the tag/dup-note
+    #     block below is a no-op for it. The worker keeps the conversation apart by its id,
+    #     which is what the overlap heuristic was standing in for.
+    #
+    #   * OTHERWISE, refuse ONLY when the guard is explicitly on; else accept and record in the
+    #     background (owner order 2026-10-26, #293). _duplicate_of still runs when the guard is
+    #     off, because its answer is what the background note needs -- it just no longer gates
+    #     admission.
+    dup = None
+    if not resume_conv:
+        dup = _duplicate_of(text)
+        if dup is not None and _dup_guard_on():
+            dup_jid, sim = dup
+            _log_refusal("similar", text, source, similar_to=dup_jid)
+            return ("[fleet_submit: refused -- this reads as the goal already queued or running "
+                    "as %s (%d%% word overlap). If it is genuinely different work, say specifically "
+                    "how; if you meant to check on that job, use fleet_queue() instead of "
+                    "resubmitting it.]" % (dup_jid, round(sim * 100)))
     n = _pending_count()
     if n >= MAX_PENDING:
         _log_refusal("pending_full", text, source)
@@ -621,7 +645,13 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         # which is the part that had to be built rather than declared: the waiting path stored
         # the goal as a bare .txt, so a field added here without touching it would have been
         # dropped exactly the way resume_conv was.
-        "payload": {"goal": text, "note": _clean(note, 500), "priority": bool(priority)},
+        # resume_conv RIDES ON THE PAYLOAD, BESIDE goal/priority, for the same reason priority
+        # does: that is where the router reads a job's own fields before handing them to the
+        # fleet, and from here it has to survive all three delivery routes as the goal-item
+        # field `resume_conv`. Only set when non-empty, so an ordinary (non-continuation) job's
+        # record is unchanged and `resume_conv not in payload` keeps meaning "start fresh".
+        "payload": dict({"goal": text, "note": _clean(note, 500), "priority": bool(priority)},
+                        **({"resume_conv": resume_conv} if resume_conv else {})),
         "created": time.time(),
         # PROVENANCE TRAVELS WITH THE JOB. This arrived over a tunnel from an agent, which is
         # not the same authority as a person typing into the cockpit, and the consumer is
