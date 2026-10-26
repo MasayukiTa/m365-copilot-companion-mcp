@@ -8445,6 +8445,22 @@ class RelayWorker:
                     self._refuse_resend(reason, delivery)
                     return False
 
+        # KICK A REFRESH NOW, exactly as _fall_back_to_tab does -- the two paths are the two
+        # ways a worker reacts to a dropped socket, and a proven token expiry is a shared-`exp`
+        # event that hits the whole fleet within seconds (every worker captured off the same
+        # page). Starting the off-thread capture the moment the first worker on THIS path hits
+        # it, rather than waiting for the next sweep lap, shortens the window before a fresh
+        # token is installed and the reconnect below (driver_for, which needs a live token)
+        # succeeds. Guarded by needs_refresh() and a no-op while a capture is already in flight
+        # or inside the policy backoff (_consider_socket_refresh -> AsyncCaptureManager.consider),
+        # so adding it to both paths cannot double-launch.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None)
+        except Exception:
+            pass
+
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
         if recovery is not None:

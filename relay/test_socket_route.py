@@ -1765,6 +1765,137 @@ def test_fallback_path_still_refuses_an_unknown_landed_act(monkeypatch):
     assert route.kicked == 0, "未配送確定でない故障で更新を蹴ってはいけない"
 
 
+# ---- 再接続経路（_retry_socket）でも、失効は更新を蹴る（やるこ3-b・1経路目）----
+#
+# brief の「更新の起動を両方の経路に足す」のうち、タブ退避側（_fall_back_to_tab）は
+# 上で見た。こちらは再接続側。_retry_socket も delivery_proves_not_sent な理由（失効・
+# ソケットが開けない）のときだけ、次の sweep を待たずに _consider_socket_refresh を
+# 1回蹴る。route.open() と route.needs_refresh() で守られているので、unknown な故障や
+# 更新不要のときは蹴らない。
+#
+# 既存の _retry_route の代役 _R には needs_refresh / default_agent_url が無く、本体側の
+# kick ブロックは try/except で包まれているので、その代役だと AttributeError が黙って
+# 握りつぶされ kick が一度も呼ばれない。kick を実際に見るための拡張代役を使う。
+
+
+class _RetryRefreshRoute:
+    """再接続経路用の経路代役。driver_for で再接続を成功させつつ、
+    kick 判定に要る needs_refresh / default_agent_url を持つ。"""
+
+    def __init__(self, *, drv, needs=True):
+        self.default_agent_url = "A"
+        self._drv = drv
+        self._needs = needs
+        self.records = []
+        self.asked = {}
+
+    def open(self):
+        return True
+
+    def needs_refresh(self, agent_url=None):
+        return self._needs
+
+    def driver_for(self, n, **kw):
+        self.asked.update(kw)
+        self.asked["_called"] = True
+        return self._drv
+
+    def note_failure(self, why):
+        pass
+
+    def note_success(self):
+        pass
+
+    def record(self, event, **f):
+        self.records.append(dict(f, event=event))
+
+    def token_life(self, agent_url=None):
+        return 0.0
+
+
+def _retry_refresh_worker(monkeypatch, route, reason, goal):
+    kicks = []
+
+    def _kick(r, a):
+        kicks.append((r, a))
+        route.kicked = getattr(route, "kicked", 0) + 1
+        return True
+
+    monkeypatch.setattr(rf, "_socket_route", lambda: route)
+    monkeypatch.setattr(rf, "_consider_socket_refresh", _kick)
+    monkeypatch.setattr(rf, "_open_fresh",
+                        lambda *a: pytest.fail("再接続で復旧するのにタブを開いてはいけない"))
+    w = rf.RelayWorker(goal, "w0")
+    w.socket, w.drv, w.status = True, _IdDrv(), "waiting"
+    w._landed_pending = True                                 # 前のターンで出力があった
+    return w, kicks
+
+
+def test_retry_socket_recovers_from_expiry_and_kicks_a_refresh(monkeypatch):
+    """再接続経路。失効（未配送確定）なら、前ターンの着地状態で止めずに
+    再送し、次の sweep を待たずに更新を 1 回蹴る。"""
+    route = _RetryRefreshRoute(drv=_FakeDrv(), needs=True)
+    route.kicked = 0
+    w, kicks = _retry_refresh_worker(monkeypatch, route, EXPIRED,
+                                     "send an email to the team")  # 書き込む acting goal
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+
+    assert w._retry_socket(EXPIRED) is True, \
+        "失効ターンは未配送なのに、前ターンの着地状態で再接続を拒んでいる"
+    assert route.kicked == 1 and len(kicks) == 1
+
+
+def test_retry_socket_does_not_kick_on_an_unknown_drop(monkeypatch):
+    """対照群。unknown（未配送が確定しない）なら更新を蹴らない。
+    再接続自体は起きても、kick だけが 0 であることを見る（read goal で配送判定を外す）。"""
+    from relay.transport_policy import delivery_proves_not_sent
+    assert delivery_proves_not_sent(DROPPED) is False
+
+    route = _RetryRefreshRoute(drv=_FakeDrv(), needs=True)
+    route.kicked = 0
+    w, kicks = _retry_refresh_worker(monkeypatch, route, DROPPED,
+                                     "read the status file")       # 読むだけの goal
+    now = [1000.0]
+    monkeypatch.setattr(rf.time, "time", lambda: now[0])
+
+    assert w._retry_socket(DROPPED) is True
+    assert route.kicked == 0 and kicks == [], "未配送確定でない故障で更新を蹴ってはいけない"
+
+
+# ---- 実ログの reason が「未配送が確定」判定を通ることを表で固定する（A）----------------
+#
+# delivery_proves_not_sent は今や kick と _landed_pending のクリアを駆動する。幅広い語リスト
+# （NOT_DELIVERED）ではなく、実ログに出た 2 形状の厳密部分文字列（SENT_NEVER）だけが True
+# になること、かつ配送後の故障や deadline は False のままであることを固定する。
+
+EXPIRED_FULL = (
+    "ChatHubError: the supplied token has expired. Ask the browser for a fresh one -- this "
+    "turn was abandoned before a frame was signed."
+)
+SOCKET_NEVER_OPENED = (
+    "could not open the socket: [Errno 11001] getaddrinfo failed"
+)
+
+
+def test_real_log_reasons_that_prove_not_sent(monkeypatch):
+    """実ログ全文の reason でも、失効と「ソケットが開けなかった」は未配送確定。"""
+    from relay.transport_policy import delivery_proves_not_sent
+    assert delivery_proves_not_sent(EXPIRED) is True
+    assert delivery_proves_not_sent(EXPIRED_FULL) is True
+    assert delivery_proves_not_sent(SOCKET_NEVER_OPENED) is True
+
+
+def test_real_log_reasons_that_do_not_prove_not_sent():
+    """配送後の切断・期限・unknown は、語が似ていても未配送確定にしない。"""
+    from relay.transport_policy import delivery_proves_not_sent
+    assert delivery_proves_not_sent(DROPPED) is False
+    assert delivery_proves_not_sent(DELIVERED_REASON) is False
+    # 配送後に「token」を含むが未配送ではない文字列は True にしない。
+    assert delivery_proves_not_sent(
+        "the turn completed but the token refresh afterwards failed") is False
+
+
 # ---- 再接続は無料でも即時でもない --------------------------------------------------------------
 #
 # 自分の会話だけをバックエンドに拒まれたワーカーは、兄弟が成功し続ける限り経路が閉じないので、

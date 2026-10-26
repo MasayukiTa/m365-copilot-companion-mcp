@@ -505,21 +505,52 @@ def duplicate_risk(reason: str) -> bool:
     return delivery_status(reason) in ("delivered", "unknown")
 
 
+#: Reasons that PROVE the frame never reached the server, as STRICT substrings of the real log
+#: text (not the broad word list `NOT_DELIVERED` uses). Two shapes, both occurring BEFORE a
+#: frame can be put on the wire:
+#:
+#:   * the access token expired, so the send was abandoned before signing a frame
+#:     ("ChatHubError: the supplied token has expired ...")
+#:   * the socket could not be OPENED at all -- name resolution, proxy reject, a rejected
+#:     WebSocket upgrade (HTTP 4xx/5xx), a reset/refused connection or a handshake timeout.
+#:     Every one of these is raised by `could not open the socket:` before the turn is sent.
+#:
+#: Why strict, not the `NOT_DELIVERED` word list: `delivery_proves_not_sent` now drives ACTIVE
+#: behaviour (it clears sticky `_landed_pending`, so an acting goal's turn is re-sent). A broad
+#: substring like `token`/`refresh`/`capture` could match a POST-delivery failure string that
+#: happens to carry the word in another sense and wrongly license a duplicate send. These two
+#: patterns are taken from the actual `resend_refused`/`fallback`/`socket_retry` reasons on
+#: record (.fleet/socket_route.jsonl) and match only the before-the-wire failures there.
+SENT_NEVER = (
+    r"the supplied token has expired",
+    r"could not open the socket",
+)
+
+
 def delivery_proves_not_sent(reason: str) -> bool:
     """True only when the reason PROVES the turn never reached the server.
 
-    A token that expired or a capture/handshake that failed happens BEFORE the frame could be
-    put on the wire (see NOT_DELIVERED), so the turn demonstrably did not land. In that one
-    case a verbatim re-send cannot repeat a model-side act, and sticky 'this turn may already
-    have landed' state from an EARLIER turn (relay_fleet `_landed_pending`) must not keep the
-    worker from recovering with a fresh token.
+    A token that expired, or a socket that could not be OPENED (name resolution, proxy reject,
+    a rejected WebSocket upgrade, a reset connection or a handshake timeout), happens BEFORE the
+    frame could be put on the wire, so the turn demonstrably did not land. In that one case a
+    verbatim re-send cannot repeat a model-side act, and sticky 'this turn may already have
+    landed' state from an EARLIER turn (relay_fleet `_landed_pending`) must not keep the worker
+    from recovering with a fresh token.
 
-    This is deliberately the strict complement of `duplicate_risk`: 'delivered' and the honest
-    'unknown' majority both return False and keep the careful refuse-on-landed default. It says
-    nothing about a call that ALREADY RAN on this side (continue-turn `executed`): that side
-    effect is local and real whether or not the frame was sent, so the caller still honours it.
+    DELIBERATELY STRICTER THAN `delivery_status() == "not_delivered"`. That classifier uses the
+    broad `NOT_DELIVERED` word list (`token`/`refresh`/`capture`/`handshake`/`401`/...), which
+    is fine for a RECORD label but too loose to license an active re-send: a post-delivery
+    failure whose text merely contains one of those words would wrongly read as 'never sent'.
+    This predicate matches only the two before-the-wire shapes seen in the real logs, so a
+    connection that dropped AFTER sending, a keepalive timeout, a turn deadline and the honest
+    'unknown' majority all return False and keep the careful refuse-on-landed default.
+
+    It says nothing about a call that ALREADY RAN on this side (continue-turn `executed`): that
+    side effect is local and real whether or not the frame was sent, so the caller still honours
+    it.
     """
-    return delivery_status(reason) == "not_delivered"
+    text = (reason or "").lower()
+    return any(re.search(p, text, re.IGNORECASE) for p in SENT_NEVER)
 
 
 # ------------------------------------------------------------------------------------------
