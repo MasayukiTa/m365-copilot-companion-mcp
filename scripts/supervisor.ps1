@@ -365,18 +365,43 @@ function Get-SupervisorSelfRestartSetting {
     return "on"
 }
 
+function Get-HostTunnelForExternalClientsSetting {
+    # The `host_tunnel_for_external_clients` setting, "on" or "off", through the product's own
+    # reader. A reader that cannot run reads as the registry default, ON. Independent of the agent's
+    # tool_transport: it says whether an OUTSIDE client needs the local server published, which the
+    # route the agent itself uses does not answer.
+    $setting = ""
+    try {
+        $setting = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay import code_staleness; print(code_staleness.host_tunnel_for_external_clients_setting())" 2>$null)).Trim()
+    } catch { $setting = "" }
+    if ($setting -eq "off") { return "off" }
+    return "on"
+}
+
 function Test-TunnelRouteWanted {
-    # $false when the setting tool_transport is connector-less: the agent holds no connector, so
-    # no Dev Tunnel is needed and none is hosted, logged into or reported on. Asked of the
-    # product's own reader (Get-ToolTransport), at most once a minute, so a change in the
-    # GUI is followed without a restart and a tick pays nothing. A host that is ALREADY running is
-    # left alone (this supervisor never kills a live tunnel): it just stops being managed.
+    # $false when NO Dev Tunnel is wanted: the agent's route is connector-less AND no external
+    # client needs the local server published. The agent's tool_transport says how the AGENT
+    # reaches its tools; it does NOT say whether an outside client (a separate session on another
+    # machine) reaches the local server through the tunnel. host_tunnel_for_external_clients (ON
+    # by default) keeps the tunnel hosted and watched for that client whatever the route is; when
+    # it is off the old rule stands and a connector-less route hosts no tunnel. Both are asked of
+    # the product's own readers, at most once a minute, so a change in the GUI is followed without
+    # a restart and a tick pays nothing. A host that is ALREADY running is left alone (this
+    # supervisor never kills a live tunnel): it just stops being managed.
     $now = [DateTime]::UtcNow
     if ($script:TunnelRouteAt -and (($now - $script:TunnelRouteAt).TotalSeconds -lt 60)) { return $script:TunnelRouteWanted }
     $t = Get-ToolTransport -Python $Py -RepoRoot $Root
-    $wanted = ($t -ne "connector-less")
+    $hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"
+    $wanted = ($t -ne "connector-less") -or $hostForExternal
     if ($null -ne $script:TunnelRouteWanted -and $script:TunnelRouteWanted -ne $wanted) {
         Write-Log ("tool route changed: " + $t + " -> Dev Tunnel management " + $(if ($wanted) { "resumes" } else { "stops (no tunnel is needed)" }))
+    }
+    $reason = if ($wanted -and ($t -eq "connector-less") -and $hostForExternal) { "external-client" } elseif ($wanted) { "connector" } else { "none" }
+    if ($script:TunnelRouteReason -ne $reason) {
+        if ($reason -eq "external-client") {
+            Write-Log "tool route is connector-less, but host_tunnel_for_external_clients=on -> Dev Tunnel is hosted and watched for an external client"
+        }
+        $script:TunnelRouteReason = $reason
     }
     $script:TunnelRouteWanted = $wanted
     $script:TunnelRouteAt = $now
