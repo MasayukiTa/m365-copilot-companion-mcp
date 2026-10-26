@@ -44,7 +44,7 @@
   intake+priority suites; 16 passed for the new route suite).
 
 - Running note (not a code issue). The module import cost is ~24 s, and a second checkout at
-  `C:\Users\<user>\resonac-mcp` shares the top-level `tools`/`relay` package names, so a naive
+  `C:\Users\<user>\the live checkout` shares the top-level `tools`/`relay` package names, so a naive
   `pytest` run either times out on repeated collection imports or picks up the other clone's
   same-named test modules. Pin both packages' `__path__` to this worktree and warm the imports once
   in-process before calling `pytest.main`; use `--import-mode=importlib`. The test LOGIC was never
