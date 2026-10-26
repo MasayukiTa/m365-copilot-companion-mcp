@@ -92,6 +92,24 @@ def _jobs():
     return out
 
 
+@pytest.fixture()
+def dup_state(tmp_path, monkeypatch):
+    """Point the background dup-note's log at a throwaway directory. obs_log writes
+    dup_notes.jsonl in the directory of tool_ledger's ledger path, so moving the ledger moves
+    the note -- the same redirection tools/test_fleet_intake.py's dup_state fixture uses."""
+    from tools import obs_log, tool_ledger
+    monkeypatch.setattr(tool_ledger, "LEDGER_PATH", str(tmp_path / ".fleet" / "tool_events.jsonl"))
+    monkeypatch.setattr(obs_log, "_WARNED", False)
+    return tmp_path
+
+
+def _dup_notes(state):
+    p = state / ".fleet" / "dup_notes.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x]
+
+
 # The goal the measured incident was about, paraphrased -- not the real product/file names,
 # which do not belong in a tracked file (see MEMORY.md on this repo's history rewrite).
 _ORIGINAL = (
@@ -120,21 +138,58 @@ _DIFFERENT = (
 )
 
 
-def test_a_paraphrase_of_a_running_workers_goal_is_refused_and_names_it(isolated_state):
+def test_a_paraphrase_of_a_running_workers_goal_is_accepted_and_notes_the_running_job(
+        isolated_state, monkeypatch, dup_state):
+    """OWNER ORDER 2026-10-26: a worker's own paraphrase of a goal already running is no longer
+    refused -- it is ACCEPTED and its resemblance to the running job is recorded in the
+    background (possible_duplicate_of on the queued job, one line in .fleet/dup_notes.jsonl).
+    The guard is pinned off so the test does not depend on the machine's settings file.
+
+    This replaces the old refusal assertion: the paraphrase is the exact shape the guard used
+    to stop, so it still RESEMBLES the running job (that is what the note records) -- it is
+    simply no longer turned away at the door."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
+    _write_status(isolated_state, [_running_worker("run1", _ORIGINAL)])
+    out = FI.fleet_submit(_PARAPHRASE)
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1, "the paraphrase must be queued, not refused"
+    assert jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs
+    assert 0.0 < jobs[0]["payload"]["similarity"] <= 1.0
+    notes = _dup_notes(dup_state)
+    assert len(notes) == 1 and notes[0]["possible_duplicate_of"] == "run1", notes
+    assert notes[0]["new"] == jobs[0]["id"]
+
+
+def test_a_paraphrase_of_a_pending_goal_is_also_accepted_and_notes_it(
+        isolated_state, monkeypatch, dup_state):
+    """Not only status.json: a goal still sitting in this door's own pending/ queue, never
+    having reached a worker yet, is exactly as much "already in flight" as one being worked --
+    so the paraphrase's possible_duplicate_of points at the PENDING job. Accepted now, not
+    refused (owner order 2026-10-26); the resemblance is recorded, not turned away."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
+    FI.fleet_submit(_ORIGINAL)
+    first_id = _jobs()[0]["id"]
+    out = FI.fleet_submit(_PARAPHRASE)
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 2
+    tagged = [j for j in jobs if "possible_duplicate_of" in j["payload"]]
+    assert len(tagged) == 1 and tagged[0]["payload"]["possible_duplicate_of"] == first_id, jobs
+    notes = _dup_notes(dup_state)
+    assert len(notes) == 1 and notes[0]["possible_duplicate_of"] == first_id, notes
+
+
+def test_a_paraphrase_of_a_running_goal_is_still_refused_when_the_guard_is_on(
+        isolated_state, monkeypatch):
+    """The old judgement is kept behind fleet_submit_dup_guard: turned on, a paraphrase of the
+    running goal is refused exactly as before and the refusal names the running job. Pinned on
+    by patching _dup_guard_on so this proves the similarity logic, not settings-file parsing."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", _ORIGINAL)])
     out = FI.fleet_submit(_PARAPHRASE)
     assert "refused" in out and "run1" in out, out
     assert _jobs() == [], "a refused goal must not be queued"
-
-
-def test_a_paraphrase_of_a_pending_goal_is_also_refused(isolated_state):
-    """Not only status.json: a goal still sitting in this door's own pending/ queue, never
-    having reached a worker yet, is exactly as much "already in flight" as one being worked."""
-    FI.fleet_submit(_ORIGINAL)
-    first_id = _jobs()[0]["id"]
-    out = FI.fleet_submit(_PARAPHRASE)
-    assert "refused" in out and first_id in out, out
-    assert len(_jobs()) == 1
 
 
 def test_a_genuinely_different_goal_is_accepted_even_with_something_in_flight(isolated_state):
