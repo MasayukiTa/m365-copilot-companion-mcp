@@ -477,6 +477,14 @@ partial class CockpitWindow
             }
         }
         catch (Exception) { }
+        // KEEP THE LIST SCROLLABLE AFTER A CLEAR. Clearing history removes a large block of rows
+        // while running/completed cards remain; the list must still reach its own last row. The
+        // list's ScrollViewer is set to Auto at build time, and this path must never turn it off --
+        // re-affirm Auto here so a clear can only ever restore scrolling, never disable it. (The
+        // bottom-anchor layout -- a fixed '*' row with the list bottom-aligned, see BuildChrome --
+        // is what makes the end reachable; this line guarantees the scroller itself stays enabled.)
+        if (_list != null)
+            ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ForceRender();
     }
     // The finished run's last archive pass. See the call site for why it exists and why it

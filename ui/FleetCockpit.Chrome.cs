@@ -154,7 +154,7 @@ partial class CockpitWindow
         _list = new ListBox();
         _list.BorderThickness = new Thickness(0);
         _list.Background = Brushes.Transparent;
-        _list.Padding = new Thickness(16, 6, 16, 20);  // bottom clears the composer DropShadow (BlurRadius 14 + ShadowDepth 2 ≈ 12px) so the last row is not overlapped by the shadow. 20, not 18: the spacing scale steps in fours above the optical range, and 18 was the only value off it.
+        _list.Padding = new Thickness(16, 6, 16, 24);  // bottom clears the composer (floating box + DropShadow BlurRadius 14 + ShadowDepth 2) so the LAST row always has breathing room above the input area and is never tucked under the composer. 24, not 20: 20 left the last row flush against the composer's shadow; the spacing scale steps in fours above the optical range so the next step up is 24.
         ScrollViewer.SetVerticalScrollBarVisibility(_list, ScrollBarVisibility.Auto);
         ScrollViewer.SetHorizontalScrollBarVisibility(_list, ScrollBarVisibility.Disabled);
         // Pixel scroll (not item scroll) so the list can SIZE TO CONTENT inside an Auto row and
@@ -197,18 +197,25 @@ partial class CockpitWindow
         Grid.SetColumn(_spinePanel, 0);
         lanesGrid.Children.Add(_spinePanel);
 
-        // Bottom-anchor wrapper (chat-style): a '*' spacer row absorbs the slack ABOVE the rows,
-        // so when the content is shorter than the viewport the rows sit just above the composer
-        // instead of leaving a dead void between the last row and the input. The list row is Auto
-        // (sizes to content) but the list's MaxHeight is bound to the wrapper height, so a long
-        // list is capped to the viewport and scrolls normally.
+        // Bottom-anchor wrapper (chat-style): ONE '*' row that fills the available space, with the
+        // list bottom-aligned inside it. When the content is shorter than the row the list sizes to
+        // its content and hugs the bottom (the slack stays ABOVE it, just over the composer, no dead
+        // void); when the content is taller than the row the list is clipped to the row height and
+        // its own ScrollViewer scrolls to the very end.
+        //
+        // This REPLACES the earlier '*' spacer + Auto list-row + self-referential MaxHeight binding
+        // (_list.MaxHeight <- listWrap.ActualHeight). That binding was circular: _list lived inside
+        // listWrap AND was capped by listWrap's height, so an Auto row measured the list under an
+        // infinite height, realized the whole (non-virtualizing) content, and the cap resolved a
+        // layout pass late. After a big content change -- clearing all history while running/done
+        // cards remained -- the list could settle with viewport == content and its ScrollViewer
+        // went inert (the "after clearing history it will not scroll" report), and even when it did
+        // scroll the stale extent stopped short of the last row. A fixed '*' row gives the list a
+        // height that does not depend on its own content, so the end is always reachable.
         var listWrap = new Grid();
         listWrap.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        listWrap.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        var maxBind = new System.Windows.Data.Binding("ActualHeight");
-        maxBind.Source = listWrap;
-        _list.SetBinding(FrameworkElement.MaxHeightProperty, maxBind);
-        Grid.SetRow(_list, 1);
+        _list.VerticalAlignment = VerticalAlignment.Bottom;   // hug the composer when short; clip-and-scroll when tall
+        Grid.SetRow(_list, 0);
         listWrap.Children.Add(_list);
 
         // Col1 is now a DockPanel: the pinned filter bar sits at the TOP (fixed), the bottom-anchored
