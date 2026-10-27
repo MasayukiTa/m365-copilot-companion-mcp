@@ -988,7 +988,7 @@ def read_ack_receipt(jid: str, state_dir=None):
 
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
                            entry: dict = None, jid: str = None,
-                           resume_conv: str = "") -> None:
+                           resume_conv: str = "", origin: dict = None) -> None:
     """Append a goal to the running fleet's command channel.
 
     utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
@@ -1016,6 +1016,12 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
     resume_conv = (resume_conv or "").strip()
     if resume_conv and not item.get("resume_conv"):
         item["resume_conv"] = resume_conv
+    # PROVENANCE ON THE ITEM, so goal_items_from_command (relay.fleet_runner) copies it onto the
+    # goal dict and it reaches the worker row and history.json. Only set when a caller passed one
+    # AND the entry did not already carry it (code_task builds its own dict); mirrors how
+    # resume_conv is attached above without clobbering an entry that already has the field.
+    if origin and not item.get("origin"):
+        item["origin"] = origin
     patch = {"add_goal": [item]}
     if jid:
         patch["ack"] = _ack_path(jid, sd)
@@ -1796,7 +1802,7 @@ def _park_in_for_fleet(goal, jid, priority=False, resume_conv: str = ""):
 
 
 def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False,
-                  resume_conv: str = ""):
+                  resume_conv: str = "", origin: dict = None):
     """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry.
 
     `priority` HAS TO SURVIVE ALL THREE ROUTES OR IT IS A LIE ON ONE OF THEM. A goal leaves
@@ -1835,7 +1841,7 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False,
         except OSError:
             pass
         add_goal_to_live_fleet(goal, state_dir, priority=priority, jid=jid,
-                               resume_conv=resume_conv)
+                               resume_conv=resume_conv, origin=origin)
         # RECORD THE OPEN CLAIM so a later pass can check it. "dispatched" is written to done/
         # now, but done/ is terminal -- nothing re-reads it -- so on its own it can never be
         # corrected when the fleet turns out to have died inside the stale-status window. This
@@ -1877,7 +1883,8 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False,
             out = autostart_fleet([dict({"text": goal, "jid": jid,
                                          "priority": bool(priority)},
                                         **({"resume_conv": resume_conv}
-                                           if resume_conv else {}))], state_dir)
+                                           if resume_conv else {}),
+                                        **({"origin": origin} if origin else {}))], state_dir)
             if out.get("ok"):
                 return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
                                       "delivered": "autostart",
@@ -2457,8 +2464,14 @@ def run_job(job, now_ts=None):
             # resume_conv read off the payload the door wrote and threaded through handoff, so a
             # continuation submitted through fleet_submit reaches the fleet as a continuation.
             resume_conv = str(payload.get("resume_conv") or "")
+            # origin threaded through so a goal joining a live run (add_goal) or cold-starting
+            # one (autostart) carries WHO submitted it into the worker row and history.json, the
+            # same provenance a pending job already has on disk. job.get("origin") is the block
+            # fleet_submit/CLI wrote at the door.
+            _origin = job.get("origin") if isinstance(job.get("origin"), dict) else None
             rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio,
-                                                          resume_conv=resume_conv)
+                                                          resume_conv=resume_conv,
+                                                          origin=_origin)
             if rec["status"] != "dispatched":
                 # fleet_handoff already parked it on every non-dispatched path, carrying the
                 # priority AND resume_conv with it; this second write is the belt to that braces

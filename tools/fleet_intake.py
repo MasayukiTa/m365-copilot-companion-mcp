@@ -678,6 +678,18 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         _log_refusal("other", text, source)
         return "[fleet_submit: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
 
+    # ONE ADMISSION ENTRY, SHARED WITH EVERY ROUTE. The job is safely on disk; record that an
+    # mcp submission arrived, by whom, so this door leaves the SAME receipt the cockpit and CLI
+    # routes leave (relay/intake_journal). Never raises -- a journal line is an after-the-fact
+    # witness, exactly like the dup note below, and must not fail a submission already queued.
+    try:
+        from relay import intake_journal as _ij
+        _ij.record(jid=jid, route="mcp",
+                   submitter=job["origin"].get("source", ""),
+                   goal=text)
+    except Exception:
+        pass
+
     if dup is not None:
         _note_possible_duplicate(jid, dup[0], dup[1], text)
 
