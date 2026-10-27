@@ -1128,32 +1128,32 @@ partial class CockpitWindow
 
     UIElement OrgAbControl()
     {
-        _abLbl = new TextBlock(); _abLbl.VerticalAlignment = VerticalAlignment.Center;
-        _abLbl.FontSize = 12;
+        _oabLbl = new TextBlock(); _oabLbl.VerticalAlignment = VerticalAlignment.Center;
+        _oabLbl.FontSize = 12;
 
-        _abBox = new ComboBox();
-        System.Windows.Automation.AutomationProperties.SetAutomationId(_abBox, "orgAbBox");
-        _abBox.ToolTip = OrgAbView.Help(_lang == 0) + "\n" + OrgAbView.TakeEffectTip(_lang == 0);
-        _abBox.Cursor = Cursors.Hand; _abBox.FontSize = 12;
-        _abBox.FontWeight = FontWeights.SemiBold; _abBox.MinWidth = 78;
-        _abBox.Padding = new Thickness(8, 2, 4, 2);
-        _abBox.VerticalAlignment = VerticalAlignment.Center;
+        _oabBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_oabBox, "orgAbBox");
+        _oabBox.ToolTip = OrgAbView.Help(_lang == 0) + "\n" + OrgAbView.TakeEffectTip(_lang == 0);
+        _oabBox.Cursor = Cursors.Hand; _oabBox.FontSize = 12;
+        _oabBox.FontWeight = FontWeights.SemiBold; _oabBox.MinWidth = 78;
+        _oabBox.Padding = new Thickness(8, 2, 4, 2);
+        _oabBox.VerticalAlignment = VerticalAlignment.Center;
         var abHelp = new Dictionary<string, string>();
         foreach (string m in OrgAbView.Modes) abHelp[m] = OrgAbView.ModeLabel(m, _lang == 0);
-        FillComboWithHelp(_abBox, OrgAbView.Modes, abHelp, _abVal);
-        _abBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
-        _abBox.SelectionChanged += delegate
+        FillComboWithHelp(_oabBox, OrgAbView.Modes, abHelp, _oabVal);
+        _oabBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _oabBox.SelectionChanged += delegate
         {
-            string sel = ComboVal(_abBox);
-            if (!OrgAbView.IsMode(sel) || sel == _abVal) return;   // unchanged -> no write, no re-fire
-            _abVal = sel;
-            SaveKey(OrgAbView.Key, _abVal);
+            string sel = ComboVal(_oabBox);
+            if (!OrgAbView.IsMode(sel) || sel == _oabVal) return;   // unchanged -> no write, no re-fire
+            _oabVal = sel;
+            SaveKey(OrgAbView.Key, _oabVal);
         };
 
-        _abNow = new TextBlock(); _abNow.Visibility = Visibility.Collapsed;
-        _abPending = new TextBlock(); _abPending.Visibility = Visibility.Collapsed;
+        _oabNow = new TextBlock(); _oabNow.Visibility = Visibility.Collapsed;
+        _oabPending = new TextBlock(); _oabPending.Visibility = Visibility.Collapsed;
 
-        var wrap = SettingsComboBlock(_abLbl, _abBox, _abNow, _abPending);
+        var wrap = SettingsComboBlock(_oabLbl, _oabBox, _oabNow, _oabPending);
         PaintOrgAb();
         return wrap;
     }
@@ -1170,13 +1170,13 @@ partial class CockpitWindow
 
     void PaintOrgAb()
     {
-        if (_abLbl != null) { _abLbl.Text = OrgAbView.Label(_lang == 0); _abLbl.Foreground = Muted; }
-        if (_abBox == null) return;
+        if (_oabLbl != null) { _oabLbl.Text = OrgAbView.Label(_lang == 0); _oabLbl.Foreground = Muted; }
+        if (_oabBox == null) return;
         // assign only when different so SelectionChanged (which persists) does not re-fire
-        if (!Equals(ComboVal(_abBox), _abVal)) ComboSelectVal(_abBox, _abVal);
-        _abBox.ToolTip = OrgAbView.Help(_lang == 0) + "\n" + OrgAbView.TakeEffectTip(_lang == 0);
-        _abBox.Background = BtnBg; _abBox.Foreground = Fg; _abBox.BorderBrush = Border;
-        StyleFlatCombo(_abBox);
+        if (!Equals(ComboVal(_oabBox), _oabVal)) ComboSelectVal(_oabBox, _oabVal);
+        _oabBox.ToolTip = OrgAbView.Help(_lang == 0) + "\n" + OrgAbView.TakeEffectTip(_lang == 0);
+        _oabBox.Background = BtnBg; _oabBox.Foreground = Fg; _oabBox.BorderBrush = Border;
+        StyleFlatCombo(_oabBox);
     }
     // Campaign board (off|p0), beside load-aware routing. Persists through SaveKey only; the
     // coordinator reads the key once when a run starts (sweep_start), so a run in progress keeps
