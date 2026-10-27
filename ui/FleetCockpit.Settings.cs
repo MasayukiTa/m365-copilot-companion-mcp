@@ -211,8 +211,8 @@ partial class CockpitWindow
                 }
                 else if (ln.StartsWith("org_ab="))
                 {
-                    string abv = OrgAbView.ParseLine(ln);   // off|shadow only; junk (and on) keeps the value
-                    if (abv != null) _abVal = abv;
+                    string oabv = OrgAbView.ParseLine(ln);   // off|shadow only; junk (and on) keeps the value
+                    if (oabv != null) _oabVal = oabv;
                 }
                 else if (ln.StartsWith("org_proposals="))
                 {
