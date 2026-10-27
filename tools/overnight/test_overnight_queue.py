@@ -25,11 +25,12 @@ def test_queue_submitter_reads_the_job_id_from_the_door_reply():
     assert r.ok and r.job_id == "abc123def456" and not r.duplicate
 
 
-def test_queue_submitter_maps_the_similar_goal_refusal_to_duplicate():
-    msg = ("[fleet_submit: refused -- this reads as the goal already queued or running "
-           "as abc123 (70% word overlap). If it is genuinely different work, say specifically]")
+def test_queue_submitter_never_marks_a_goal_duplicate():
+    # The door no longer refuses on content resemblance (2026-10-26/27 owner instruction), so no
+    # reply maps to a duplicate. A queued-ok reply is ok; anything else is a plain failure.
+    msg = "[fleet_submit: could not queue the goal: OSError: disk full]"
     r = QueueSubmitter(fn=lambda *a, **k: msg).submit("[A1] x。")
-    assert r.duplicate and not r.ok
+    assert not r.duplicate and not r.ok
 
 
 @pytest.mark.parametrize("msg", [
@@ -65,7 +66,11 @@ def test_queue_submitter_against_the_real_door_in_a_temp_queue(tmp_path, monkeyp
     assert files == [r.job_id + ".json"]
     job = json.loads((tmp_path / "tasks" / "pending" / files[0]).read_text(encoding="utf-8"))
     assert job["payload"]["goal"] == goal and job["origin"]["source"] == "overnight batch"
-    assert q.submit(goal).duplicate                         # the door's own duplicate rule
+    # The same goal submitted again is queued as its OWN job, not refused: the door no longer
+    # rejects on content resemblance (2026-10-26/27 owner instruction).
+    r2 = q.submit(goal)
+    assert r2.ok and not r2.duplicate and r2.job_id != r.job_id
+    assert len(os.listdir(tmp_path / "tasks" / "pending")) == 2
 
 
 def test_job_waiting_sees_the_queue_directories(tmp_path):
@@ -150,12 +155,14 @@ def test_without_the_queue_marker_an_unseen_goal_still_fails(tmp_path):
     assert st.get("A1")["status"] == S.FAILED and st.get("A1")["category"] == classify.NOT_SUBMITTABLE
 
 
-def test_duplicate_rejection_is_reworded_once_on_the_queue_route(tmp_path):
+def test_a_goal_is_submitted_as_written_without_rewording(tmp_path):
+    # There is no longer any reword-on-duplicate step: the door does not refuse on content
+    # resemblance (2026-10-26/27 owner instruction), so the goal goes out once, as written.
     st = _mk(tmp_path, 1)
-    seq = [SubmitResult(duplicate=True), SubmitResult(ok=True, attempts=1, job_id="j1j1j1j1j1j1")]
+    seq = [SubmitResult(ok=True, attempts=1, job_id="j1j1j1j1j1j1")]
     done = Observation(state=DONE, outcome="DONE", answer="要点\n1\n2\n3")
     Runner(st, clock=_Clock(), reader=_Reader({"A1": [done]}), submitter=_Sub(seq)).run()
-    assert st.get("A1")["variant"] == 1 and st.get("A1")["status"] == S.DONE
+    assert st.get("A1")["variant"] == 0 and st.get("A1")["status"] == S.DONE
 
 
 # ------------------------------------------------------------------ report banner / reconcile
@@ -301,11 +308,11 @@ def test_cli_defaults_to_the_queue_route_and_gui_can_be_chosen(tmp_path, monkeyp
     assert S.State.load(tmp_path / "g" / "state.json").config["submit_route"] == "gui"
 
 
-# ------------------------------------------------------------------ similar goals are held back
-def test_similar_requests_are_serialised_instead_of_refused(tmp_path):
-    from tools.overnight.submit import fleet_similarity
-    sim = fleet_similarity()
-    assert sim is not None
+# ------------------------------------------------------ similar goals are never held back
+def test_similar_requests_are_all_submitted_not_held_back(tmp_path):
+    # Resemblance between goals no longer holds any request back (2026-10-26/27 owner
+    # instruction): every pending item is submitted, up to max_inflight, regardless of how
+    # closely it reads like one already in flight. All three go out and all three finish.
     st = _mk(tmp_path, 3)
     calls = []
 
@@ -318,14 +325,13 @@ def test_similar_requests_are_serialised_instead_of_refused(tmp_path):
             return "ro"
 
     done = lambda: Observation(state=DONE, outcome="DONE", answer="要点\n1\n2\n3")
-    # nothing finishes until a few polls have passed: the second goal must not be sent early
     r = _Reader({"A1": [Observation(state=RUNNING), done()], "A2": [done()], "A3": [done()]})
-    Runner(st, clock=_Clock(), reader=r, submitter=Sub(), similar=sim).run()
+    Runner(st, clock=_Clock(), reader=r, submitter=Sub()).run()
     assert len(calls) == 3
     assert [st.get(i)["status"] for i in st.ids()] == [S.DONE] * 3
 
 
-def test_a_request_is_not_held_back_when_nothing_is_similar(tmp_path):
+def test_all_pending_go_out_in_the_first_sweep(tmp_path):
     st = _mk(tmp_path, 2)
     sent = []
 
@@ -343,5 +349,5 @@ def test_a_request_is_not_held_back_when_nothing_is_similar(tmp_path):
 
     clock = _Clock()
     st.config["deadline"] = (clock.now() + timedelta(minutes=3)).isoformat()
-    Runner(st, clock=clock, reader=R(), submitter=Sub(), similar=lambda a, b: False).run()
+    Runner(st, clock=clock, reader=R(), submitter=Sub()).run()
     assert len(sent) == 2                                   # both went out in the first sweep

@@ -39,13 +39,16 @@ def test_json_plain_list(tmp_path):
     assert len(r.items) == 2
 
 
-def test_duplicates_are_detected_and_reported(tmp_path):
+def test_same_wording_is_kept_but_a_duplicate_id_is_skipped(tmp_path):
+    # Two requests with nearly identical wording are BOTH kept (content resemblance never drops
+    # a job; 2026-10-26/27 owner instruction). Only a duplicate ID is skipped, because that is an
+    # identity collision, not a resemblance.
     p = _w(tmp_path, "items.txt", "件数を集計して\n 件数を 集計して。\nA1: 別の依頼\nA1: 同じID\n")
     r = parse_items(p)
-    assert [i.id for i in r.items] == ["I001", "A1"]
+    assert [i.id for i in r.items] == ["I001", "I002", "A1"]
     reasons = [s[1] for s in r.skipped]
-    assert any(x.startswith("duplicate of") for x in reasons) and "duplicate id" in reasons
-    assert len(r.warnings) >= 2
+    assert "duplicate id" in reasons
+    assert not any(str(x).startswith("duplicate of") for x in reasons)
 
 
 def test_item_limit_warns_and_keeps_the_rest_as_skipped(tmp_path):
