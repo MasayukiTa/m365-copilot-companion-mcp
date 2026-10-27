@@ -45,7 +45,6 @@ from __future__ import annotations
 import io
 import json
 import os
-import subprocess
 import threading
 import time
 from pathlib import Path
@@ -149,9 +148,10 @@ def _tracked_tops() -> frozenset:
         if _TRACKED_CACHE is not None and (now - _TRACKED_AT) < _TRACKED_TTL_S:
             return _TRACKED_CACHE
     try:
-        r = subprocess.run(
+        from tools import childproc
+        r = childproc.run(
             ["git", "-C", str(CHECKOUT_ROOT), "ls-tree", "--name-only", "HEAD"],
-            capture_output=True, text=True, timeout=10,
+            timeout=10,
         )
         tops = frozenset(n.strip().rstrip("/").lower()
                          for n in r.stdout.splitlines() if n.strip()) if r.returncode == 0 else frozenset()
