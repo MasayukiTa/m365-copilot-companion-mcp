@@ -99,6 +99,7 @@ partial class CockpitWindow
                 else if (ln.StartsWith("autoretry_max=") && int.TryParse(ln.Substring(14).Trim(), out v)) _autoRetryMax = Math.Max(1, Math.Min(3, v));
                 else if (ln.StartsWith("autoretry=")) _autoRetry = ln.Substring(10).Trim() == "1";
                 else if (ln.StartsWith("autoarchive=")) _autoArchive = ln.Substring(12).Trim() == "1";
+                else if (ln.StartsWith("priority_boost_ui=")) _priorityBoostEnabled = ln.Substring(18).Trim() != "0";
                 else if (ln.StartsWith("session_retention_days=") && int.TryParse(ln.Substring(23).Trim(), out v))
                     _retDays = Math.Max(0, Math.Min(3650, v));
                 else if (ln.StartsWith("session_max_mb=") && int.TryParse(ln.Substring(15).Trim(), out v))

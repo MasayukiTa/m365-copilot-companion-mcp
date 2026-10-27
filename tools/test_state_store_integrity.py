@@ -210,6 +210,7 @@ def test_approved_jobs_keep_every_approval_and_never_overwrite_an_unreadable_sto
 # Files that hold accumulated data and now use tools/state_store (locked, atomic, generation
 # backups, never empty on a failed read). They must reference state_store.
 PROTECTED = {
+    "relay/priority_boost.py": "persistent per-job boost markers updated under the state_store lock",
     "relay/task_router.py": "approved_jobs.json via state_store.update_json; the other json.dump "
                             "sites in this file are per-job records (see AUDITED)",
 }

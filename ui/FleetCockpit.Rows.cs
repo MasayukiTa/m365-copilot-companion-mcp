@@ -420,7 +420,8 @@ partial class CockpitWindow
                 return "T|" + g + "|" + _toolbarShown.Count + "/" + _toolbarAll.Count
                        + "|all" + tc0[0] + ":act" + tc0[1] + ":need" + tc0[2] + ":done" + tc0[3]
                        + ":max" + tc0[5] + ":bad" + tc0[6] + ":hid" + tc0[7] + ":int" + tc0[8]
-                       + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter;
+                       + "|ar" + (_autoRetry ? 1 : 0) + ":" + _autoRetryMax + "|f" + _cardFilter
+                       + "|pb" + PriorityBoostCount(_toolbarAll) + (_priorityBoostEnabled ? "e" : "-");
             case 2: return "HH|" + g;                          // history header (static chrome; search box preserved across renders)
             case 7:                                            // date-group subheader: keyed on its label
                 return "HG|" + g + "|" + (hist != null ? S(hist, "label") : "");
@@ -446,7 +447,8 @@ partial class CockpitWindow
             case 5: return "ES|" + g + "|" + ReadQueuedJobs().Count;   // empty state: its headline counts the submitted group
             case 6:                                            // directive band: keyed on first-worker goal + started
                 return "DB|" + g + "|" + (w != null ? S(w, "goal") + "|" + S(w, "name") : "")
-                       + "|tc" + (_toolbarAll.Count) + "|" + _directiveBandMeta;
+                       + "|tc" + (_toolbarAll.Count) + "|" + _directiveBandMeta
+                       + "|pb" + PriorityBoostCount(_toolbarAll) + (_priorityBoostEnabled ? "e" : "-");
             case 3:                                            // history row: stable per entry, but expand state changes the render
             {
                 string hk3 = hist != null ? S(hist, "key") : "";
@@ -493,6 +495,15 @@ partial class CockpitWindow
                 // FIX B: _stopping dims non-terminal cards -- track it so a Stop click (or its
                 // resolution) re-templates this card instead of reusing the old realized element.
                 sb.Append('|').Append(_stopping ? "1" : "0");
+                // Priority boost: the card shows a marker + a boost/clear menu item, both of which
+                // depend on the fleet's priority_boost flag AND on whether the feature is enabled in
+                // settings -- fold both in so toggling either re-templates this card.
+                sb.Append("|pb:").Append(IsBoosted(w) ? "1" : "0").Append(_priorityBoostEnabled ? "e" : "-");
+                // Requirement (6) "why waiting" line fields: re-render when queue rank / lanes ahead /
+                // resource wait / the fleet's waiting_reason change, so the explanation stays live.
+                sb.Append("|wy:").Append(S(w, "queue_rank")).Append(':').Append(S(w, "queue_ahead"))
+                  .Append(':').Append(StableShortHash(S(w, "resource_wait")))
+                  .Append(':').Append(StableShortHash(S(Obj(w, "execution") ?? new Dictionary<string, object>(), "waiting_reason")));
                 // Feature 1: fold whether THIS card's collapsed steer box currently has a non-empty
                 // draft and/or keyboard focus into the signature. This does not, by itself, protect
                 // the draft/focus (that's _steerDraft + _steerBoxRef + the RenderCards restore pass,

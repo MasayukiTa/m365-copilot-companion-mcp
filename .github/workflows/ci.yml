@@ -151,6 +151,8 @@ jobs:
             tools/test_refused_record_and_force.py \
             ui/test_a_refused_request_is_shown_and_can_be_forced.py \
             tools/test_dismiss_refused_card.py \
+            ui/test_priority_boost_persists_and_audits.py \
+            ui/test_a_boosted_parent_lifts_its_children.py \
             tools/overnight/test_overnight_input.py \
             tools/overnight/test_overnight_runner.py \
             tools/overnight/test_overnight_detect.py \
@@ -321,6 +323,7 @@ jobs:
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
+            ui/test_boosted_goal_takes_the_next_slot.py \
             ui/test_a_submitted_card_waits_for_the_run_to_be_accepted.py \
             ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py \
             ui/test_clear_history_never_drops_unfinished_work.py \
@@ -369,7 +372,9 @@ jobs:
             ui/test_fleet_cockpit_disk_strip.py \
             ui/test_fleet_cockpit_card_menu.py \
             ui/test_running_card_kebab_menu.py \
+            ui/test_fleet_cockpit_card_boost.py \
             ui/test_fleet_cockpit_advanced_settings.py \
+            ui/test_fleet_cockpit_priority_boost.py \
             tools/test_gate_stop.py \
             tools/test_one_override_isolates_every_gate_writer.py \
             tools/test_auto_is_a_mode_not_a_label.py \

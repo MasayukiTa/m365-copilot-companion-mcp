@@ -119,18 +119,14 @@ def test_active_card_items_are_real_actions_only():
     assert "ArchiveAndHide(wt);" in active
 
 
-def test_priority_toggle_is_a_call_site_only_no_fake_reorder():
+def test_priority_toggle_sends_the_fleet_command():
     src = _read("FleetCockpit.Card.cs")
     active = _active_branch(src)
-    # the label flips on the persisted flag; the click calls the placeholder, which reports pending
-    assert 'PriorityBoostActive(wt) ? T("clear_priority") : T("make_priority")' in active
-    assert "TogglePriorityBoost(wt)" in active
-    # the placeholder does NOT reorder anything; it only reports pending (priority_boost owns it)
-    toggle = src[src.index("void TogglePriorityBoost"):]
-    toggle = toggle[: toggle.index("\n    }")]
-    assert 'ShowScaleToast(T("priority_pending"))' in toggle
-    # the active state's flag reader keys off a persisted field, defaulting to not-boosted
-    assert 'S(w, "priority_boost")' in src
+    assert "_priorityBoostEnabled" in active
+    assert 'on ? T("boost_clear") : T("boost_set")' in active
+    assert "IsBoosted(wt)" in active
+    assert "RequestSetPriorityBoost(nmb, !on)" in active
+    assert 'ShowScaleToast(on ? T("boost_clear_done") : T("boost_set_done"))' in active
 
 
 def test_why_waiting_formats_status_reason_next_step():

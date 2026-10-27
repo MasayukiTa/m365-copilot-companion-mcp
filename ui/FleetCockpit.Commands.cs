@@ -76,6 +76,24 @@ partial class CockpitWindow
         SendCommand(Cmd1("set_autoscale", sa));
     }
 
+    // Manual priority boost: {"set_priority_boost":{"name":N,"on":0|1,"by":"cockpit","at":<unix>}}.
+    // The UI shares only the FLAG NAME (priority_boost) with the fleet; the fleet owns applying it
+    // (queue head, next-turn precedence, deferring non-boosted turns) AND writing the audit record
+    // into .fleet (who/when/what), so the cockpit does not open a second writer onto that ledger --
+    // the same one-writer discipline the close/steer/autoscale commands keep. `at` lets the fleet
+    // record the request time even if it applies it a sweep later. A boost on a fan-out PARENT is
+    // understood by the fleet to cover its children; the UI sends the parent name only.
+    void RequestSetPriorityBoost(string name, bool on)
+    {
+        if (string.IsNullOrEmpty(name)) return;
+        var pb = new Dictionary<string, object>();
+        pb["name"] = name;
+        pb["on"] = on ? 1 : 0;
+        pb["by"] = "cockpit";
+        pb["at"] = NowUnix();
+        SendCommand(Cmd1("set_priority_boost", pb));
+    }
+
     Dictionary<string, object> WorkerByName(string name)
     {
         if (string.IsNullOrEmpty(name)) return null;
