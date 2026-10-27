@@ -1337,6 +1337,52 @@ def _read_goals_file(path):
 #: are known, and removed when the run actually starts and the goals ledger takes over. A run
 #: that never starts leaves them behind, which is the point: an unclaimed entry on the screen
 #: is the difference between "refused" and "never happened".
+def _record_launch_admission(args):
+    """Write ONE admission-journal line for a launch that names its intake door, before the run
+    lock can refuse it. Never raises -- a receipt is a witness, not a gate.
+
+    This exists for the GUI start/resume routes (SpawnFleet / SpawnFleetResume), which reach the
+    fleet through --goals-file / --resume rather than commands.d. Their only prior receipt was
+    _record_cli_submission's route="cli" line, written AFTER the exclusion lock -- so a start
+    refused for a held lock (return 3) left no trace, and a start that did run lost which screen
+    and session asked. Called right after argparse, before _acquire_run_slot, so the receipt
+    survives the lock refusal the owner flagged.
+
+    Gated on args.submit_route: unset means an ordinary CLI / supervisor launch, whose behaviour
+    must not change (it still journals as "cli" from _record_cli_submission). Set means a caller
+    that named its door, and this is that door's ONLY admission writer, so nothing is journalled
+    twice. The jid is derived from the goals so a reader can join this line to the run; it does
+    not have to match a task-file id, because this door writes no task file -- the goals-file or
+    the resume ledger is the queue, and this line is only the receipt that it arrived.
+    """
+    try:
+        route = " ".join(str(getattr(args, "submit_route", "") or "").split())
+        if not route:
+            return
+        goals = _read_goals(args)
+        text = ""
+        for g in goals or []:
+            text = g.get("text", "") if isinstance(g, dict) else str(g or "")
+            if text:
+                break
+        if not text and getattr(args, "resume", False):
+            # A bare --resume carries no goals on the command line; the ledger holds them. Record
+            # the arrival anyway -- the whole point is that a resume is an ingress too -- with a
+            # preview the journal reader can recognise.
+            text = "(resume: unfinished goals from the durable ledger)"
+        submitter = " ".join(str(getattr(args, "submit_origin", "") or "").split())
+        import hashlib as _hl
+        import time as _t
+        seed = "%s|%s|%s" % (route, submitter, text[:200])
+        jid = "launch_%s_%s" % (route, _hl.sha1(seed.encode("utf-8")).hexdigest()[:10])
+        from relay import intake_journal as _ij
+        _ij.record(jid=jid, route=route, submitter=submitter, goal=text,
+                   state_dir=args.state_dir, ts=_t.time())
+    except Exception:
+        # A receipt that could not be written must never fail the launch it was only witnessing.
+        pass
+
+
 def _record_cli_submission(state_dir, goals, argv):
     """Write one visible queue entry per CLI goal. Returns their paths. Never raises."""
     import json as _j
@@ -1380,6 +1426,15 @@ def _record_cli_submission(state_dir, goals, argv):
                 _j.dump(rec, fh, ensure_ascii=False, indent=1)
             os.replace(tmp, p)
             out.append(p)
+            # ONE ADMISSION ENTRY, the same receipt the mcp and ui routes leave. The CLI goal is
+            # on disk; record that a cli submission arrived, by whom. Never raises onto the run.
+            try:
+                from relay import intake_journal as _ij
+                _ij.record(jid=jid, route="cli",
+                           submitter=rec["origin"].get("source", ""),
+                           goal=text, state_dir=state_dir)
+            except Exception:
+                pass
     except Exception:
         pass
     return out
@@ -3821,6 +3876,15 @@ def goals_from_command(cmd, submission_id=None) -> list:
                 elif _sid:
                     import hashlib
                     g["jid"] = hashlib.sha1(((_sid + "\0" + str(_idx))).encode("utf-8")).hexdigest()[:12]
+                # WHO SUBMITTED IT, carried through same as jid above. The cockpit's "追加"
+                # writes an add_goal straight into commands.d/, and until now the item carried
+                # no provenance, so a goal that joined a live run read origin=null while the
+                # same goal submitted through fleet_submit carried its origin into history.json.
+                # add_goal readers ignore keys they do not recognise, so threading it is safe
+                # for every existing command that predates it. Dropped here it would dead-end
+                # exactly the way resume_conv did (see the module docstring's writer/reader warning).
+                if it.get("origin"):
+                    g["origin"] = it["origin"]
                 # WHICH CONVERSATION TO CONTINUE, carried through for the same reason as the
                 # three above it. _follow_up builds this field and RelayWorker.__init__ reads
                 # it, but until now the only path between them ran inside one live run: a
@@ -4081,8 +4145,31 @@ def main():
                          "coordinator to release the same state dir (default 0 = fail fast)")
     ap.add_argument("--state-dir", default=os.path.join(_repo_root(), ".fleet"),
                     help="where to write the live status.json the cockpit reads")
+    # WHO LAUNCHED THIS, AND BY WHICH DOOR. The GUI "開始"/"続き" buttons (SpawnFleet /
+    # SpawnFleetResume) reach the fleet through --goals-file / --resume, NOT through commands.d,
+    # so before these flags their admission was recorded -- if at all -- only by
+    # _record_cli_submission below as route "cli", losing which screen and session asked, and
+    # NOTHING was recorded when the lock check below exits 3 (a run refused for a held lock left
+    # no receipt at all -- the owner's "開始が取りこぼされる" incident). When set, these carry the
+    # route and submitter into the one admission journal every other door already writes, BEFORE
+    # the exclusion lock can refuse the run. Unset keeps the prior CLI behaviour exactly.
+    ap.add_argument("--submit-route", default="",
+                    help="the intake door this launch came through (e.g. ui_start, ui_resume); "
+                         "when set, one admission-journal line is written before the run lock")
+    ap.add_argument("--submit-origin", default="",
+                    help="who submitted, as short text (screen/user/session); recorded as the "
+                         "admission journal's submitter when --submit-route is set")
     args = ap.parse_args()
     _record_run_fanout(args.fanout)
+
+    # ADMISSION RECEIPT FOR A GUI START/RESUME, WRITTEN BEFORE THE RUN LOCK CAN REFUSE IT. Placed
+    # here (right after argparse, before _acquire_run_slot) on purpose: a start refused for a
+    # held lock returns 3 below without ever reaching _record_cli_submission, so this is the ONLY
+    # point at which that refused submission can still leave a receipt. Gated on --submit-route
+    # so ordinary CLI / supervisor launches are byte-for-byte unchanged (they journal as "cli"
+    # from _record_cli_submission as before); only a caller that names its door writes here, and
+    # it is the only writer for that door, so no line is written twice. Never raises onto the run.
+    _record_launch_admission(args)
 
     # FINAL EXCLUSION LAYER: one state dir may have exactly one coordinator. Do this before
     # coordinator logs, queue receipts, retention, resume expansion, or any durable run-state
@@ -4682,6 +4769,25 @@ def main():
             if _cmd_goals:
                 _new_cmd_goals = _append_goals_ledger(
                     args.state_dir, _cmd_goals, started, raise_on_error=True, return_new=True)
+                # ADMISSION ENTRY FOR A GOAL THAT CAME STRAIGHT THROUGH commands.d. The mcp and
+                # cli routes already wrote their journal line at the door (fleet_submit /
+                # _record_cli_submission); a goal added by the cockpit's "追加" button reaches
+                # the fleet ONLY here, so this is the one place its admission can be recorded.
+                # Gated on origin.via starting "ui" so a live-add of an mcp/cli goal (whose
+                # origin rode in on fleet_handoff) is not journalled twice -- the via tells the
+                # two apart. Never raises into the drain; a lost journal line must not cost the
+                # goal that was being admitted.
+                try:
+                    from relay import intake_journal as _ij
+                    for _g in (_new_cmd_goals or []):
+                        _o = _g.get("origin") if isinstance(_g.get("origin"), dict) else None
+                        _via = (_o or {}).get("via", "")
+                        if _o and str(_via).startswith("ui"):
+                            _ij.record(jid=_g.get("jid", ""), route=str(_via),
+                                       submitter=_o.get("source", ""),
+                                       goal=_g.get("text", ""), state_dir=args.state_dir)
+                except Exception:
+                    pass
             by_name = {w.name: w for w in workers}
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
