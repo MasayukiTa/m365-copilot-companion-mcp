@@ -226,7 +226,8 @@ partial class CockpitWindow
         bool terminal = status == "done" || status == "stuck" || status == "maxturns"
                         || status == "error" || status == "cancelled";
         bool isOpen = _expanded.Contains(name);
-        bool internalControl = IsLocalLoopControlGoal(goal);
+        bool internalControl = true;
+        if (!IsLocalLoopControlGoal(goal)) internalControl = false;
         // P0: INFRA_STUCK is an infra pause (Edge/sign-in/connector broke), NOT a task failure. It
         // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
         // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
