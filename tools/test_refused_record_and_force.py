@@ -85,7 +85,14 @@ def test_a_too_long_goal_leaves_a_refused_record_with_the_whole_goal():
 
 def test_a_duplicate_refusal_records_the_lookalike_and_the_overlap(monkeypatch):
     """A near-duplicate names the job it looked like and the measured word overlap, so the card
-    can say 'NN% 一致' without recomputing."""
+    can say 'NN% 一致' without recomputing.
+
+    The duplicate guard is OFF by compiled default (the owner's 2026-10-26 order, #293): a
+    look-alike is then ACCEPTED and only noted in the background, so NO refusal -- and hence no
+    refused record -- is produced. A refused record for a duplicate only exists on a machine that
+    turned the guard back on (fleet_submit_dup_guard=on), so this test turns it on to exercise
+    the path it is about."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     monkeypatch.setattr(FI, "_duplicate_of", lambda text: ("job123abc", 0.875))
     out = FI.fleet_submit("do the same big thing again please now", source="x")
     assert "job123abc" in out
