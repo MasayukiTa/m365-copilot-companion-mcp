@@ -2017,6 +2017,57 @@ function Start-Server {
     Write-Log "MCP server process launched (stale instances cleared); output -> $srvErr"
 }
 
+# -- DISK SERIES: C: free space and the processes writing it, as a resident (owner, 2026-10-27) --
+# C: free space moved ~6 GB up and down within minutes and the cause was never pinned. The hand
+# tools that measured it (disk_watch\proc_write_log.py, disk_watch\disk_watch.py) were started by
+# hand and die with the shell. relay\disk_series.py is their product form: one resident that
+# records .fleet\disk_series.jsonl every 5 s, flags swings into .fleet\disk_swings.jsonl, and
+# publishes hs_disk into .fleet\health_strip.json. THE SUPERVISOR HOSTS IT, not fleet_runner: a
+# fleet runner only lives for the length of a run, so the series would be full of holes; the
+# supervisor is the one process demonstrably alive the whole time (same single-resident shape it
+# already uses for the server and tunnel host). Launched like Start-Server does main.py -- the
+# .venv python when it exists, a hidden window, output redirected (encoding explicit on the read
+# side), and -PassThru so a later tick can see it exit -- and with the SAME headless creation flag
+# the ratchet requires (CREATE_NO_WINDOW; relay.disk_series itself launches its WMI child through
+# tools.childproc for the UTF-8-first decode).
+$script:DiskSeriesProc = $null
+
+function Ensure-DiskSeries {
+    # Keep exactly one relay.disk_series resident alive. Cheap when it is already running (one
+    # HasExited read). Never throws -- a disk sampler that could take down the supervisor would be
+    # worse than a gap in the series.
+    try {
+        if ($script:DiskSeriesProc) {
+            try {
+                $script:DiskSeriesProc.Refresh()
+                if (-not $script:DiskSeriesProc.HasExited) { return }
+            } catch { }
+        }
+        Update-PythonInterpreter "the disk-series sampler"
+        $logDir = Join-Path $Root ".setup\logs"
+        try { if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null } } catch { }
+        $dsOut = Join-Path $logDir "disk-series.out.log"
+        $dsErr = Join-Path $logDir "disk-series.err.log"
+        # CREATIONFLAGS DECIDED: this child is launched windowless. Start-Process does not take a
+        # raw creationflags, so -WindowStyle Hidden is the headless request here; the WMI child
+        # relay.disk_series itself spawns goes through tools.childproc with CREATE_NO_WINDOW (the
+        # ratchet's headless flag) so no console is ever allocated on an unattended desktop. The
+        # output is read back with the encoding stated explicitly (UTF-8) on the reader side below.
+        try {
+            $script:DiskSeriesProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.disk_series")) `
+                -WorkingDirectory $Root -WindowStyle Hidden `
+                -RedirectStandardOutput $dsOut -RedirectStandardError $dsErr -PassThru
+        } catch {
+            Write-Log "disk-series output could not be redirected ($($_.Exception.Message)); starting without it"
+            $script:DiskSeriesProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.disk_series")) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+        }
+        Write-Log "disk-series sampler launched (.fleet\disk_series.jsonl / disk_swings.jsonl / health_strip.json hs_disk)"
+    } catch {
+        Write-Log "disk-series sampler could not be started: $($_.Exception.Message)"
+    }
+}
+
 function Start-TunnelHost {
     # Stop only OUR stale host process(es) -- those whose command line is
     # `devtunnel host <TunnelName>`. NEVER `Get-Process devtunnel | Stop-Process`: that
@@ -2983,6 +3034,10 @@ Invoke-ReviewAutoResume | Out-Null
 Invoke-LocalLoopCampaignDrain | Out-Null
 Invoke-LocalLoopAutoResume | Out-Null
 
+# Start the disk-series resident once, before the loop. Ensure-DiskSeries is called again every
+# tick (below) to relaunch it if it ever exits, the same single-resident shape as the server.
+Ensure-DiskSeries
+
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
 # Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
 # this machine: "supervisor up" at 11:44:39, "MCP server process launched" at 11:45:52 -- 73
@@ -3179,6 +3234,10 @@ while ($true) {
     Invoke-ReviewAutoResume | Out-Null
     Invoke-LocalLoopCampaignDrain | Out-Null
     Invoke-LocalLoopAutoResume | Out-Null
+
+    # Keep the disk-series sampler alive: relaunch it if it has exited since the last tick. Cheap
+    # when it is already running (one HasExited read).
+    Ensure-DiskSeries
 
     # Report any tracked fleet/review/LOCAL_LOOP auto-resume runner that has exited since the last tick.
     # Every tick, not just after a relaunch, because the runner that needs reporting may still

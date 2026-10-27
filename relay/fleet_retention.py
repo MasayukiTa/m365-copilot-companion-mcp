@@ -1481,7 +1481,9 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("cap_jsonl", cap_jsonl),
                      ("temp_home", sweep_temp_home)):
         try:
-            if fn in (coordinator_logs, scratch, stores, compress, conversations,
+            if fn is cap_jsonl:
+                freed, items = cap_jsonl(fleet_dir, dry_run=dry_run)
+            elif fn in (coordinator_logs, scratch, stores, compress, conversations,
                      workspace_clones, sweep_temp_home):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:

@@ -362,6 +362,7 @@ jobs:
             relay/selfimprove/test_the_slice_refusal_fires_through_the_real_entry.py \
             ui/test_a_setting_that_is_off_is_said_out_loud.py \
             ui/test_fleet_cockpit_health.py \
+            ui/test_fleet_cockpit_disk_strip.py \
             ui/test_fleet_cockpit_card_menu.py \
             ui/test_running_card_kebab_menu.py \
             ui/test_fleet_cockpit_advanced_settings.py \
@@ -881,6 +882,7 @@ jobs:
             relay/test_effort_expressible.py \
             relay/test_evidence_manifest.py \
             relay/test_fleet_retention.py \
+            relay/test_disk_series.py \
             relay/test_conversation_registry_keeps_listable_rows.py \
             relay/test_temp_home.py \
             relay/test_fleet_toolset.py \

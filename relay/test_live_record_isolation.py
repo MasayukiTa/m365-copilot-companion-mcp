@@ -542,7 +542,8 @@ def test_the_redirect_actually_lands(module, const):
         return
 
     mod = importlib.import_module(module)
-    value = str(getattr(mod, const, "") or "")
+    value = getattr(mod, const, "")
+    value = str((value() if callable(value) else value) or "")
     assert value, "%s.%s is gone; the redirect names a constant that no longer exists" % (
         module, const)
     assert os.path.join(REPO, ".fleet") not in value, (
@@ -653,3 +654,17 @@ def test_the_three_unlock_helpers_follow_state_files_redirect():
                     % (fn.__name__, resolved))
     finally:
         sec.STATE_FILE = orig
+
+
+def test_disk_series_default_state_dir_is_redirected():
+    """The sampler's default directory remains callable and writes inside the test home."""
+    from pathlib import Path
+    from relay import disk_series
+
+    state = Path(disk_series._state_dir())
+    assert os.path.join(REPO, ".fleet") not in str(state)
+    times = iter((100.0, 105.0))
+    disk_series.run(sample_fn=lambda: {1: ("p", 0, "p")},
+                    free_fn=lambda: 10 * 1024 ** 3, now_fn=lambda: next(times),
+                    stop_after=2, interval_s=0.0001)
+    assert (state / "disk_series.jsonl").is_file()
