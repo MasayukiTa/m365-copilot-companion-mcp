@@ -349,6 +349,8 @@ jobs:
             ui/test_live_composer_adds_tasks.py \
             ui/test_one_list_says_what_the_ui_compiles.py \
             ui/test_card_duration.py \
+            ui/test_rebuild_ui_uncommitted_guard.py \
+            ui/test_cockpit_tick_is_crash_safe.py \
             scripts/test_each_edge_profile_is_its_own_sign_in.py \
             scripts/test_nothing_new_is_invisible.py \
             scripts/test_a_leftover_tab_is_not_a_locked_door.py \
@@ -478,6 +480,9 @@ jobs:
             tools/test_a_record_that_was_cut_must_say_it_was_cut.py \
             tools/test_provenance_survives_both_writers.py \
             tools/test_a_cap_below_the_guard_silences_the_guard.py \
+            tools/test_live_checkout_write_guard.py \
+            tools/test_file_ops_live_checkout_wiring.py \
+            tools/test_child_process_priority.py \
             tools/test_a_dot_on_in_the_normal_state_is_not_a_signal.py \
             tools/test_tool_probe.py \
             tools/test_tool_probe_skips_when_the_fleet_proves_it.py \

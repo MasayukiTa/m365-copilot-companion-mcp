@@ -8,7 +8,16 @@
 #
 #   .\rebuild_ui.ps1            # stop, rebuild both, relaunch both
 #   .\rebuild_ui.ps1 -NoLaunch  # stop + rebuild only (don't relaunch)
-param([switch]$NoLaunch)
+#
+# SAFETY VALVE (2026-10-27). This script builds FleetCockpit FROM THE PRODUCTION CHECKOUT, so an
+# unfinished tracked edit sitting in ui/ -- e.g. a worker that wrote into the live checkout
+# instead of a clone -- is compiled into the live binary and can crash it on launch (that is how
+# the cockpit died three times). Before building, this now checks for UNCOMMITTED TRACKED
+# changes under ui/. Default: WARN and build anyway (the committed convention is preserved).
+#   -IgnoreUncommittedUi  build from the COMMITTED version of ui/ instead (git stash the tracked
+#                         ui/ changes into a temporary area, build, then restore them), so a
+#                         known-good binary is produced without discarding anyone's edit.
+param([switch]$NoLaunch, [switch]$IgnoreUncommittedUi)
 
 $ErrorActionPreference = "Stop"
 $ui  = $PSScriptRoot
@@ -16,6 +25,39 @@ $FW  = "C:\Windows\Microsoft.NET\Framework64\v4.0.30319"
 $CSC = "$FW\csc.exe"
 $WPF = "$FW\WPF"
 if (-not (Test-Path $CSC)) { Write-Host "ERROR: csc.exe not found ($CSC)"; exit 1 }
+
+# 0) Guard: uncommitted TRACKED changes under ui/. `git status --porcelain -- ui` lists only
+#    tracked, modified/added/deleted paths (untracked scratch files are not a build input and
+#    are ignored here). Fail-open on any git error -- a missing git must not stop a rebuild.
+$uiDirty = @()
+try {
+    $repoRoot = (& git -C $ui rev-parse --show-toplevel 2>$null)
+    if ($LASTEXITCODE -eq 0 -and $repoRoot) {
+        $porcelain = (& git -C $ui status --porcelain --untracked-files=no -- $ui 2>$null)
+        if ($LASTEXITCODE -eq 0 -and $porcelain) {
+            $uiDirty = @($porcelain | Where-Object { $_ -and $_.Trim() -ne "" })
+        }
+    }
+} catch { $uiDirty = @() }
+
+$stashRef = $null
+if ($uiDirty.Count -gt 0) {
+    Write-Host ("WARNING: " + $uiDirty.Count + " uncommitted tracked change(s) under ui/ -- these are compiled into the live binary:")
+    $uiDirty | Select-Object -First 20 | ForEach-Object { Write-Host ("  " + $_) }
+    if ($IgnoreUncommittedUi) {
+        Write-Host "-IgnoreUncommittedUi: building from the COMMITTED version of ui/ (tracked ui/ changes are stashed, then restored)."
+        $stashMsg = "rebuild_ui auto-stash " + (Get-Date -Format "yyyyMMdd_HHmmss")
+        & git -C $ui stash push --keep-index=$false -- $ui > $null 2>&1
+        if ($LASTEXITCODE -eq 0) {
+            $stashRef = "stash@{0}"
+            Write-Host "  (ui/ changes stashed; they will be restored after the build)"
+        } else {
+            Write-Host "  WARNING: could not stash ui/ changes; building with them in place."
+        }
+    } else {
+        Write-Host "  Building WITH these changes (default). Pass -IgnoreUncommittedUi to build from the committed version instead."
+    }
+}
 
 # 1) Stop BOTH first. FleetCockpit auto-relaunches CopilotChat (OpenMain), so killing only one lets
 #    the other respawn a stale copy and re-lock the exe -> the rebuild then fails silently.
@@ -65,5 +107,17 @@ if (-not $NoLaunch) {
     Start-Sleep -Milliseconds 1200
     Get-Process FleetCockpit,CopilotChat -ErrorAction SilentlyContinue |
         ForEach-Object { Write-Host ("running " + $_.ProcessName + " pid=" + $_.Id + " start=" + $_.StartTime.ToString("HH:mm:ss")) }
+}
+
+# Restore the ui/ changes that were stashed to build from the committed version. Done in a
+# finally-style unconditional block so an edit is never left stranded in the stash, even if the
+# build or launch above failed. Fail-open: a restore error is reported, not thrown.
+if ($stashRef) {
+    & git -C $ui stash pop > $null 2>&1
+    if ($LASTEXITCODE -eq 0) {
+        Write-Host "restored the stashed ui/ changes."
+    } else {
+        Write-Host "WARNING: could not auto-restore the stashed ui/ changes; recover them with: git -C `"$ui`" stash pop"
+    }
 }
 Write-Host "rebuild_ui: done."

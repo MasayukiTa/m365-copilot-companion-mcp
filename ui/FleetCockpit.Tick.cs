@@ -27,7 +27,19 @@ partial class CockpitWindow
 {
 
     // ── poll loop ─────────────────────────────────────────────────────────────────
+    // TOP-LEVEL GUARD. OnTick is a DispatcherTimer handler, so an exception that escapes it is
+    // unhandled on the UI thread and TERMINATES the process -- which is exactly how the cockpit
+    // died three times on 2026-10-27 (a NullReferenceException deep in the first RenderCards,
+    // S <- RowSig <- MkRow <- AppendHistoryRows). The real poll work now lives in OnTickCore;
+    // this wrapper is the one place that catches anything it throws so a bad tick SKIPS rather
+    // than kills, shows the cause on screen, and records it once. The next tick runs normally.
     void OnTick(object sender, EventArgs e)
+    {
+        try { OnTickCore(sender, e); }
+        catch (Exception ex) { OnTickFailed(ex); }
+    }
+
+    void OnTickCore(object sender, EventArgs e)
     {
         // follow external theme/lang/maxtabs edits (e.g. the chat toggled the theme)
         try
@@ -293,6 +305,40 @@ partial class CockpitWindow
                         + ",\"bytes\":" + size
                         + ",\"type\":\"" + ex.GetType().Name + "\""
                         + ",\"detail\":\"" + (ex.Message ?? "").Replace("\\", "/").Replace("\"", "'") + "\"}";
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "ui_errors.jsonl");
+            File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
+        }
+        catch (Exception) { }   // a trace that can break the cockpit is worse than no trace
+    }
+
+    bool _tickFailLogged;
+
+    // A TICK THAT THREW MUST NOT TAKE THE PROCESS WITH IT. Called from OnTick's top-level catch.
+    // Shows the cause in the header area (so an operator sees WHY the board stopped updating
+    // instead of a vanished window) and records the first failure per process to ui_errors.jsonl
+    // for a trace. The screen text is refreshed on every failing tick; the file line is written
+    // once (the failure is structural, and an unbounded log on a per-tick path is its own disk
+    // problem). Everything here is itself guarded: the recovery path must never be the new
+    // source of an unhandled exception.
+    void OnTickFailed(Exception ex)
+    {
+        try
+        {
+            if (_header != null) _header.Text = "Fleet";
+            if (_sub != null)
+                _sub.Text = (_lang == 0 ? "更新中にエラー: " : "tick error: ")
+                            + ex.GetType().Name + ": " + (ex.Message ?? "");
+        }
+        catch (Exception) { }
+        try
+        {
+            if (_tickFailLogged) return;
+            _tickFailLogged = true;
+            string line = "{\"ts\":" + DateTimeOffset.UtcNow.ToUnixTimeSeconds()
+                        + ",\"what\":\"tick_failed\""
+                        + ",\"type\":\"" + ex.GetType().Name + "\""
+                        + ",\"detail\":\"" + (ex.Message ?? "").Replace("\\", "/").Replace("\"", "'") + "\""
+                        + ",\"at\":\"" + (ex.StackTrace ?? "").Replace("\\", "/").Replace("\"", "'").Replace("\r", " ").Replace("\n", " ") + "\"}";
             string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "ui_errors.jsonl");
             File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
         }

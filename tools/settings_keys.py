@@ -295,6 +295,50 @@ KEYS = OrderedDict([
        "list plus the product dirs are the whole allow-set. Changing it reaches the next write "
        "with no restart."),
 
+    # Live-checkout write guard (tools/live_write_guard.py). Refuses (or in the default warn
+    # mode, only records) a FLEET WORKER's write into the TRACKED SOURCE of the production
+    # checkout (ui/, relay/, tools/, ...). A worker must edit a clone; the checkout is the
+    # binary the operator runs, and a half-written edit in it crashes the live UI (2026-10-27).
+    # Operations updates the checkout through git/PowerShell below the file tools, so a
+    # write-tool call landing on tracked source is a worker write. Ships as warn so
+    # .fleet/live_write_refused.jsonl measures real traffic before the switch is flipped to
+    # block -- the same measure-before-you-close posture as workarea_guard.
+    _k("live_checkout_write_guard", EACH_GATE, "warn",
+       "tools/live_write_guard.py:mode (every write through file_ops._validate_path, reads settings.txt mtime-cached)",
+       "off|warn|block. Re-read at every write with no restart. warn records each worker write "
+       "to tracked source under the production checkout in .fleet/live_write_refused.jsonl and "
+       "lets it through; block refuses it with a PermissionError telling the worker to work in a "
+       "clone; off disables the guard. An operator who deliberately drives a write tool at the "
+       "checkout opts out per-session with MCP_LIVE_CHECKOUT_WRITE_OK=1 or by naming their "
+       "authenticated scope in live_checkout_write_allow. Writes outside the checkout and writes "
+       "to untracked paths are never affected. MCP_LIVE_CHECKOUT_WRITE_GUARD overrides this and "
+       "is reported as a conflict. Flip to block on the strength of the warn-mode ledger."),
+
+    # Authenticated scopes (token client_ids) treated as operations by the live-checkout guard,
+    # so their writes to the checkout's tracked source are allowed. One comma- or
+    # space-separated list. Empty by default: the per-session MCP_LIVE_CHECKOUT_WRITE_OK marker
+    # is the ordinary opt-out; this is for a named scope that is always operations.
+    _k("live_checkout_write_allow", EACH_GATE, "",
+       "tools/live_write_guard.py:_allow_scopes (every write, reads settings.txt mtime-cached)",
+       "Authenticated scope names (token client_ids) whose writes to the production checkout's "
+       "tracked source are allowed by live_checkout_write_guard. Empty by default. Changing it "
+       "reaches the next write with no restart."),
+
+    # Child-process priority (tools/childproc.py). A fleet worker's child processes (tests,
+    # analysis, builds, background jobs) run BELOW_NORMAL by default so they cannot starve the
+    # two windows the operator watches -- Fleet Cockpit and CopilotChat -- which are launched
+    # through explorer by ui/rebuild_ui.ps1 and keep the desktop's ordinary priority. Read once
+    # per child as it is spawned, so a change reaches the next child with no restart.
+    _k("child_process_priority", EACH_GATE, "below_normal",
+       "tools/childproc.py:_priority_name (every child spawned through tree_popen_kwargs, reads settings.txt mtime-cached)",
+       "idle|below_normal|normal. The scheduling priority of child processes the fleet spawns "
+       "(run_python, shell, background jobs, builds). below_normal (default) keeps them from "
+       "starving the operator's windows while leaving them plenty of CPU when the machine is "
+       "idle; idle yields even harder; normal runs them at the parent's priority. Read as each "
+       "child is spawned, so a change takes effect on the next one with no restart. "
+       "MCP_CHILD_PROCESS_PRIORITY overrides this. The GUI windows are not affected -- they do "
+       "not pass through this helper."),
+
     # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
     # which queued goal a router using the remaining admission margins and the role profile
     # would have admitted, beside the one that was. There is deliberately no value that routes.
