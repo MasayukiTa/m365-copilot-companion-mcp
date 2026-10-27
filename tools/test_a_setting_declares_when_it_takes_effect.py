@@ -190,6 +190,20 @@ def _reader_relay_findings():
     return mode()
 
 
+def _reader_workarea_guard():
+    from tools import workarea_guard
+    workarea_guard._reset_for_test()
+    return workarea_guard.mode()
+
+
+def _reader_workarea_allow():
+    # The raw value an operator would see take effect: the one extra top-level name they added.
+    from tools import workarea_guard
+    workarea_guard._reset_for_test()
+    extra = workarea_guard._allow_extra()
+    return extra[0] if extra else ""
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -225,6 +239,8 @@ _LIVE_READERS = {
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
+    "workarea_guard": (_reader_workarea_guard, "warn", "enforce"),
+    "workarea_allow": (_reader_workarea_allow, "audit_alpha", "audit_beta"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),

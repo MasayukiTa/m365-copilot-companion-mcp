@@ -219,6 +219,29 @@ KEYS = OrderedDict([
        "row when two siblings write one path or one writes a path another's step names; "
        "nothing is blocked and no prompt or output changes."),
 
+    # Checkout-root placement guard (tools/workarea_guard.py). Refuses (or in the default
+    # warn mode, only records) a write that would create a NEW untracked top-level name
+    # directly under the production checkout. Ships as warn so the refusal ledger
+    # (.fleet/workarea_refusals.jsonl) measures the real traffic before the switch is flipped
+    # to enforce -- the same measure-before-you-close posture as the command judge.
+    _k("workarea_guard", EACH_GATE, "warn",
+       "tools/workarea_guard.py:mode (every write through file_ops._validate_path, reads settings.txt mtime-cached)",
+       "off|warn|enforce. Re-read at every write with no restart. warn records each violation "
+       "to .fleet/workarea_refusals.jsonl and lets the write through; enforce refuses it with a "
+       "message naming the allowed places; off disables the guard. Reads and writes outside the "
+       "checkout are never affected. MCP_WORKAREA_GUARD overrides this and is reported as a "
+       "conflict. Flip to enforce on the strength of the warn-mode ledger, not before."),
+
+    # Extra top-level names the guard treats as allowed, beyond git-tracked entries and the
+    # product's own runtime dirs. One comma- or path-separator-separated list. Read with the
+    # guard's config on the same mtime cache.
+    _k("workarea_allow", EACH_GATE, "",
+       "tools/workarea_guard.py:_allow_extra (every write, reads settings.txt mtime-cached)",
+       "Extra top-level names allowed at the checkout root, on top of the git-tracked entries "
+       "and the product-managed dirs the guard already permits. Empty by default: the tracked "
+       "list plus the product dirs are the whole allow-set. Changing it reaches the next write "
+       "with no restart."),
+
     # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
     # which queued goal a router using the remaining admission margins and the role profile
     # would have admitted, beside the one that was. There is deliberately no value that routes.

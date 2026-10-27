@@ -23,6 +23,19 @@ from .file_ops import _validate_path
 from .security import require_unlocked
 
 
+def _default_cwd() -> str:
+    """Per-run work area when no working_dir is given, not the checkout root (os.getcwd()).
+
+    Imported lazily: code_exec imports this module, so a top-level import back into it would
+    be circular. Falls back to os.getcwd() if code_exec cannot be reached.
+    """
+    try:
+        from .code_exec import default_work_dir
+        return default_work_dir()
+    except Exception:
+        return os.getcwd()
+
+
 def _gate_detail(script: str) -> str:
     """What the approval is ABOUT: the whole script, identified by a digest of all of it.
 
@@ -139,7 +152,7 @@ def pwsh_exec(
             return (
                 "[pwsh_exec error: neither powershell.exe nor pwsh.exe found on PATH]"
             )
-        cwd = os.getcwd()
+        cwd = _default_cwd()
         if working_dir:
             p = _validate_path(working_dir)
             if not p.is_dir():
