@@ -305,6 +305,8 @@ partial class CockpitWindow
             case "fleet_compress_hours":
             case "org_genotype_record":
                 return "sweep_start";
+            case "priority_boost_ui":
+                return "ui_only";
             default:
                 return "ui_only";
         }

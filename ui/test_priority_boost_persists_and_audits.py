@@ -138,3 +138,36 @@ def test_boost_is_idempotent_but_audit_records_each_press(tmp_path):
     assert PB.list_boosted(tasks_dir=td) == ["job-8"]  # still one marker
     actions = [r["action"] for r in PB.read_audit(tasks_dir=td)]
     assert actions == ["boost", "boost"]  # but two audit lines
+
+
+def test_cockpit_command_reaches_scheduler_and_clear(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from relay import fleet_runner as FR, relay_fleet as RF, task_router as TR
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    workers = [SimpleNamespace(name="w0", jid="first"),
+               SimpleNamespace(name="w1", jid="urgent")]
+    command = {"set_priority_boost": {"name": "w1", "on": 1, "by": "cockpit", "at": 1}}
+    assert FR.validate_command(command) == []
+    TR.write_command(str(tmp_path), command)
+    received = FR.read_commands(str(tmp_path))[0]["set_priority_boost"]
+    FR.apply_priority_boost(received, workers)
+    assert RF.reorder_pending_by_boost(workers, set(PB.list_boosted())) == workers[::-1]
+    received["on"] = 0
+    FR.apply_priority_boost(received, workers)
+    assert not PB.is_boosted("urgent")
+
+
+def test_boost_without_jid_propagates_to_children_and_clears(tmp_path, monkeypatch):
+    from types import SimpleNamespace as W
+    from relay import fleet_runner as FR, relay_fleet as RF, task_router as TR
+    monkeypatch.setattr(TR, "TASKS", str(tmp_path / "tasks"))
+    parent = W(name="parent", jid=None, run_id="run-1", task_envelope=W(task_id="root", parent_task_id=None, campaign_id="root", role="producer"))
+    child = W(name="child", jid=None, run_id="run-1", task_envelope=W(task_id="child", parent_task_id="root", campaign_id="root", role="subtask"))
+    other = W(name="other", jid=None, run_id="run-1", task_envelope=None)
+    workers = [other, parent, child]
+    FR.apply_priority_boost({"name": "parent", "on": 1}, workers)
+    effective = PB.effective_workers(workers)
+    assert RF.reorder_pending_by_boost([other, child], effective) == [child, other]
+    assert PB.worker_key(W(name="parent", jid=None, run_id="run-2")) not in effective
+    FR.apply_priority_boost({"name": "parent", "on": 0}, workers)
+    assert not PB.effective_workers(workers)

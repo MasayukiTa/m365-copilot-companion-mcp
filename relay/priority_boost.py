@@ -29,6 +29,7 @@ execution in fleet_intake.
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import re
@@ -199,6 +200,36 @@ def list_boosted(tasks_dir=None) -> list:
     out = [n[:-5] for n in names if n.endswith(".json")]
     out.sort()
     return out
+
+
+def worker_key(worker):
+    """Stable marker identity; names without admission IDs are scoped to their run."""
+    jid = getattr(worker, "jid", None)
+    if jid:
+        return str(jid)
+    run = getattr(worker, "run_id", "") or ""
+    name = getattr(worker, "name", "") or ""
+    if not run or not name:
+        return ""
+    return "worker-" + hashlib.sha256((run + "\0" + name).encode("utf-8")).hexdigest()
+
+
+def effective_workers(workers):
+    """Return marker keys for directly boosted workers and their fan-out descendants."""
+    from ui import priority_propagation as propagation
+    markers = set(list_boosted())
+    rows = []
+    for worker in workers:
+        env = getattr(worker, "task_envelope", None)
+        rows.append({"name": getattr(worker, "name", ""),
+                     "task_id": getattr(env, "task_id", ""),
+                     "parent_task_id": getattr(env, "parent_task_id", ""),
+                     "campaign_id": getattr(env, "campaign_id", ""),
+                     "role": getattr(env, "role", ""),
+                     "priority_boost": worker_key(worker) in markers})
+    effective = propagation.propagate_boost(rows)
+    return {worker_key(w) for w, row in zip(workers, rows)
+            if worker_key(w) and propagation.is_boosted(propagation._node_id(row), effective)}
 
 
 def boosted_count(tasks_dir=None) -> int:

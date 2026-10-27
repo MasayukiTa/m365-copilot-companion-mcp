@@ -3380,9 +3380,10 @@ def reorder_pending_by_boost(pending, boosted_jids):
     """
     if not pending or not boosted_jids:
         return list(pending)
+    from relay import priority_boost
     boosted, rest = [], []
     for w in pending:
-        if (getattr(w, "jid", None) or "") in boosted_jids:
+        if priority_boost.worker_key(w) in boosted_jids:
             boosted.append(w)
         else:
             rest.append(w)
@@ -10805,7 +10806,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             from relay import priority_boost as _pb
             if not _pb.is_enabled():
                 return
-            boosted_jids = set(_pb.list_boosted())
+            boosted_jids = _pb.effective_workers(workers)
         except Exception:
             return
         if not boosted_jids:
@@ -10813,13 +10814,13 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         reordered = reorder_pending_by_boost(pend, boosted_jids)
         if reordered == list(pend):
             return                         # already boosted-first -- no reorder, no log
-        _n_rest = sum(1 for _w in pend if (getattr(_w, "jid", None) or "") not in boosted_jids)
+        _n_rest = sum(1 for _w in pend if _pb.worker_key(_w) not in boosted_jids)
         # ANNOUNCE ONCE PER GOAL, WITH ITS REASON. The record shows why a goal that was next in
         # line is now behind another: a human boosted jid, and these non-boosted goals had their
         # next turn deferred for it. Not kill, not stop -- a deferral, said out loud so a stalled
         # goal's cause is on the record (the owner's point (6)).
         for _w in pend:
-            _jid = getattr(_w, "jid", None) or ""
+            _jid = _pb.worker_key(_w)
             if _jid and _jid in boosted_jids and _jid not in _boost_announced:
                 _boost_announced.add(_jid)
                 try:

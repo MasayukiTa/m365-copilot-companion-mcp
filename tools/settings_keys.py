@@ -518,6 +518,8 @@ KEYS = OrderedDict([
        "Applied once when the bridge starts. None/0 means no cap."),
 
     # ---------------------------------------------------------------- ui_only
+    _k("priority_boost_ui", UI_ONLY, 1, "ui/FleetCockpit.Settings.cs",
+       "Show priority boost controls in the cockpit immediately."),
     _k("approval", UI_ONLY, "run", "ui/FleetCockpit.cs",
        "Restores the plan/auto/run selector. The choice reaches a run as a command-line "
        "flag; no Python reads this key."),

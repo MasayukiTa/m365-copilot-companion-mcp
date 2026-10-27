@@ -1935,6 +1935,8 @@ def _submitter_of(jid):
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None):
+    from relay import priority_boost
+    boosted_workers = priority_boost.effective_workers(workers)
     from relay.relay_fleet import (free_disk_gb, floor_source as _floor_source,
                                    floor_source_text as _floor_source_text,
                                    floor_warning as _floor_warning)
@@ -2050,6 +2052,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             # is exactly the evidence bar the plan named: "同一run IDで受付・発火・実行・
             # 検証・終了を結ぶ". Empty for goals that never passed through admission.
             "jid": getattr(w, "jid", None) or "",
+            "priority_boost": priority_boost.worker_key(w) in boosted_workers,
             # WHO SUBMITTED IT (origin.via:source of the job), so a person looking for tonight's
             # run can tell their own from the fleet's other work. Empty when unknown.
             "submitter": _submitter_of(getattr(w, "jid", None) or ""),
@@ -2129,6 +2132,8 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     }
     # Derived fan-out family markers (parent / child / aggregator / stalled) so the
     # cockpit can render the split-and-merge structure the lineage already implies.
+    _snap["priority_boost_count"] = priority_boost.boosted_count()
+    _snap["priority_boost_audit"] = priority_boost.read_audit(limit=20)
     _fv = fanout_family_view(_snap["workers"])
     for _w in _snap["workers"]:
         _w["fanout"] = _fv.get(_w["name"], {"kind": "solo", "campaign_id": _w.get("campaign_id", ""), "label": ""})
@@ -3069,7 +3074,7 @@ MAX_CHECKS_JSON = 65_536
 
 _COMMAND_KEYS = frozenset({
     "close", "set_maxtabs", "set_disk_floor_gb", "set_ram_floor_mb", "set_autoscale",
-    "steer", "reunlock", "add_goal", "pause", "stop", "ack",
+    "steer", "reunlock", "add_goal", "pause", "stop", "ack", "set_priority_boost",
 })
 _AUTOSCALE_KEYS = frozenset({"on", "max", "default"})
 _STEER_KEYS = frozenset({"worker", "text"})
@@ -3232,6 +3237,14 @@ def _validate_command(cmd, state_dir):
             return []
         return items
 
+    if "set_priority_boost" in cmd:
+        v = cmd["set_priority_boost"]
+        if (not isinstance(v, dict) or set(v) - {"name", "on", "by", "at"}
+                or not _is_name(v.get("name"), allow_empty=False)
+                or not _is_flag(v.get("on"))
+                or ("by" in v and not _text_ok(v["by"], MAX_NAME))
+                or ("at" in v and not _is_number(v["at"]))):
+            errs.append("set_priority_boost: invalid name, flag or metadata")
     if "close" in cmd:
         v = cmd["close"]
         if not isinstance(v, list) or len(v) > MAX_ITEMS:
@@ -3758,6 +3771,21 @@ def claim_adopt_command(state_dir, path):
         restore_command_claim(claim)
         return None, [], errors
     return claim, goals, []
+
+
+def apply_priority_boost(command, workers):
+    """Apply a validated cockpit request to the named worker's admission ID."""
+    from relay import priority_boost
+    worker = next ( (w for w in workers if w.name == command["name"]), None)
+    jid = priority_boost.worker_key(worker) if worker is not None else None
+    if not jid or not _is_safe_id(jid):
+        raise ValueError("worker has no safe boost identity")
+    if command["on"]:
+        if not priority_boost.boost(jid, actor=command.get("by", "cockpit")):
+            raise RuntimeError("could not persist priority boost")
+    elif priority_boost.is_boosted(jid):
+        if not priority_boost.unboost(jid, actor=command.get("by", "cockpit")):
+            raise RuntimeError("could not clear priority boost")
 
 
 def read_commands(state_dir) -> list:
@@ -4683,6 +4711,11 @@ def main():
                 _new_cmd_goals = _append_goals_ledger(
                     args.state_dir, _cmd_goals, started, raise_on_error=True, return_new=True)
             by_name = {w.name: w for w in workers}
+            if "set_priority_boost" in cmd:
+                try:
+                    apply_priority_boost(cmd["set_priority_boost"], workers)
+                except (ValueError, RuntimeError) as exc:
+                    return False, [str(exc)]
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
                 if w is not None and w.status not in TERMINAL:
