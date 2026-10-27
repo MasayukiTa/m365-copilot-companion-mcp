@@ -3111,6 +3111,9 @@ SOCKET_MEANINGFUL_IDLE_S = float(os.environ.get(
 # none at all) is judged by the short limit. 2026-10-15: brand-new conversations received 68-95
 # update frames and were declared stalled at 60 s.
 SOCKET_LIVE_STREAM_IDLE_S = float(os.environ.get("MCP_FLEET_SOCKET_LIVE_IDLE_S", "300"))
+# Long acting turns may still be executing after the outer deadline. Give meaningful
+# output/tool activity 1200 seconds of silence before refusing, not another turn.
+LIVE_TURN_SILENCE_S = float(os.environ.get("MCP_FLEET_LIVE_TURN_SILENCE_S", "1200"))
 # A turn that has used attributed MCP tools is silent between a tool result and the next call
 # while the model writes its next action. Measured 2026-10-17 over socket_turn_tools rows: 881
 # gaps in 96 completed tool-using turns, median 6.8 s, p90 13.6, p99 23.8, max 176.3 s; none
@@ -8589,9 +8592,23 @@ class RelayWorker:
             except Exception:
                 decision = "refuse"
             if decision != "resend":
+                thread = getattr(self.drv, "_thread", None)
+                if thread is not None and thread.is_alive():
+                    # Never replace a driver whose acting turn can still complete.
+                    self._live_turn_wait = (reason, delivery, time.time())
+                    self.status = "waiting"
+                    self.reason = "waiting for the existing acting turn to finish"
+                    return True
                 recovery = self._plan_continue(
                     "turn deadline exceeded" if reason == "turn timeout without a reply" else reason,
                     delivery)
+                # The thread can start or remain alive while the planner inspects it.
+                thread = getattr(self.drv, "_thread", None)
+                if recovery is None and thread is not None and thread.is_alive():
+                    self._live_turn_wait = (reason, delivery, time.time())
+                    self.status = "waiting"
+                    self.reason = "waiting for the existing acting turn to finish"
+                    return True
                 # A call that RAN on this side is as good as a landed turn: with no continue turn
                 # to carry it, the verbatim resend below would run it again.
                 if recovery is None and (landed or executed):
@@ -9269,6 +9286,34 @@ class RelayWorker:
         """
         if self.status in TERMINAL:
             return True
+        live_wait = getattr(self, "_live_turn_wait", None)
+        if live_wait:
+            reason, delivery, started = live_wait
+            thread = getattr(self.drv, "_thread", None)
+            if thread is not None and thread.is_alive():
+                try:
+                    idle = float(self.drv.generation_idle_s())
+                except Exception:
+                    idle = time.time() - started
+                # Locally running tools are progress even when the socket is quiet.
+                tool_idle = RelayWorker._socket_tool_idle_s(self)
+                if (idle >= LIVE_TURN_SILENCE_S
+                        and (tool_idle is None or tool_idle >= LIVE_TURN_SILENCE_S)):
+                    self._live_turn_wait = None
+                    self._refuse_continue("existing turn thread still alive after %.0fs without meaningful progress; its outcome is unknown" % LIVE_TURN_SILENCE_S)
+                    return True
+                return False
+            self._live_turn_wait = None
+            try:
+                answered = self.drv._answers().count() > self._count_before
+            except Exception:
+                answered = False
+            if not answered:
+                if self._retry_socket(reason, assume_landed=True):
+                    return False
+                if self.status != "stuck":
+                    self._refuse_continue("existing turn ended without a reply; continuation unavailable")
+                return True
         # getattr, like the rest of this loop: the settle tests drive poll() on a stand-in
         # worker that never runs __init__, and a hard attribute read here would make a socket
         # feature break a test about text stability.
@@ -9435,6 +9480,12 @@ class RelayWorker:
                         if time.time() < _deadline:
                             self.reason = "turn delivered; waiting for reply before continuation"
                             return False
+                    # A closed route does not mean the existing turn thread is dead.
+                    _thread = getattr(self.drv, "_thread", None)
+                    if getattr(self, "socket", False) and _thread is not None and _thread.is_alive():
+                        self._live_turn_wait = ("turn timeout without a reply", "unknown", time.time())
+                        self.reason = "waiting for the existing acting turn to finish"
+                        return False
                     _tried_continue = False
                     try:
                         _tried_continue = bool(getattr(self, "socket", False)
