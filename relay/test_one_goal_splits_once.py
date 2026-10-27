@@ -59,12 +59,12 @@ def _spawn_body(body):
 
 # ── the two guards ────────────────────────────────────────────────────────────────────────
 
-def test_a_second_split_in_the_same_run_is_refused():
+def test_a_second_split_checks_live_children_before_requeueing():
+    # The behavioral no-duplicate case is exercised in test_fanout_lost_adoption.
     body = _spawn_body(_source())
-    assert "if cid in campaigns:" in body, (
-        "nothing stops a second worker in the same run re-queueing the same family")
-    i = body.index("if cid in campaigns:")
-    assert "return" in body[i:i + 400]
+    assert 'if existing or on_disk:' in body
+    assert 'missing = indices - done - alive' in body
+    assert 'assert indices <= done | alive' in body
 
 
 def test_a_split_recorded_by_an_earlier_run_is_adopted_not_repeated():
