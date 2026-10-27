@@ -37,7 +37,7 @@ def test_retry_socket_accepts_assume_landed():
 
 def test_timeout_path_continues_before_it_refuses():
     start = SRC.index('_timeout_policy = getattr(self, "_timeout_resend_decision", None)')
-    block = SRC[start:start + 3500]
+    block = SRC[start:start + 5500]
     call = block.index('self._retry_socket("turn timeout without a reply",')
     call_end = block.index("))", call)
     assert "assume_landed=True" in block[call:call_end]
@@ -52,6 +52,6 @@ def test_read_only_goals_keep_the_plain_retry():
     # the refusal (and so the continue attempt) sits under `_timeout_resend != "resend"`; a goal that
     # may resend still falls through to `_retry_transient`, unchanged.
     start = SRC.index('if _timeout_resend != "resend":')
-    after = SRC[start:start + 4000]
+    after = SRC[start:start + 5500]
     assert "if self._retry_transient():" in after
     assert after.index('if _timeout_resend != "resend":') < after.index("if self._retry_transient():")
