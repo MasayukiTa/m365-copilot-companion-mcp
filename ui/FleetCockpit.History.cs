@@ -449,31 +449,29 @@ partial class CockpitWindow
         catch (Exception) { }
         try
         {
-            // ONE RULE, whether or not a runner is alive: only TERMINAL cards are retired.
-            // status.json is NEVER rewritten here and non-terminal (ready/waiting/running/
-            // interrupted ...) workers are NEVER hidden. This method used to decide "the run is
-            // dead" from status.json's `updated` age (> 15 s) and then overwrite status.json with an
-            // empty snapshot -- a wedged-but-alive runner looks exactly like that, so its unfinished
-            // workers vanished and looked stopped (2026-10-14 13:54:44, 436 rows). Liveness is a
-            // property of the runner PROCESS (RunnerProcessAlive), not of a file's age, and the
-            // outcome here no longer depends on it at all: hiding terminal cards is correct for a
-            // live, a wedged and a dead run alike, and it cannot lose work.
+            // CLEARING HISTORY ERASES THE HISTORY LIST ONLY -- it never retires a completed card
+            // from the 完了 section. A finished worker shows as a 完了 card AND is recorded in
+            // history; removing the history record must leave the card where it is. Taking a card
+            // off the board is a SEPARATE action (_archiveOne / ArchiveAllTerminal, the 完了-divider
+            // button) that adds to _hiddenKeys; this path must NOT touch _hiddenKeys, or clearing
+            // history makes the completed cards vanish and the left-rail 完了 count disagrees with
+            // the board (owner report 2026-10-27: 2 cards shown, left-rail read 71).
+            //
+            // We still guard _archivedKeys so the per-tick archive pass cannot refill the history we
+            // just cleared from the frozen snapshot these cards still sit in. status.json is NEVER
+            // rewritten here and non-terminal workers are never affected.
             var st = ReadStatus();
             object wo; string started = S(st, "started");
             if (st != null && st.TryGetValue("workers", out wo) && wo is object[])
             {
-                bool any = false;
                 foreach (object o in (object[])wo)
                 {
                     var w = o as Dictionary<string, object>;
                     if (w == null || !IsTerminalWorker(w)) continue;
-                    string wk = WorkerKey(started, w);
-                    if (_hiddenKeys.Add(wk)) any = true;
                     // In-memory only: keep the per-tick archive pass from refilling the history
-                    // that was just cleared from the frozen snapshot these cards still sit in.
-                    _archivedKeys.Add(wk);
+                    // that was just cleared. Does NOT hide the card -- _hiddenKeys is untouched.
+                    _archivedKeys.Add(WorkerKey(started, w));
                 }
-                if (any) SaveHidden();
             }
         }
         catch (Exception) { }
