@@ -201,7 +201,11 @@ static class Theme
         { "maxturns",    "warning" },
         { "error",       "danger"  },
         { "cancelled",   "neutral" },
-        { "interrupted", "warning" },   // coordinator died; resumable. Not the muted "stopped".
+        { "interrupted", "warning" },   // coordinator died; resume EXHAUSTED. Not the muted "stopped".
+        // Auto-recovery in progress (canned-nonanswer requeue, reconnect, token renew, INFRA_STUCK
+        // retry, interrupted auto-resume). Info blue, NOT warning: the harness is still driving it,
+        // so it is not a lane a person has to touch -- and it is NOT counted in "needs attention".
+        { "recovering",  "info"    },
         { "freed",       "neutral" },
     };
 
@@ -262,12 +266,78 @@ static class Theme
         return KindColor(StatusKind(canonical), dark);
     }
 
+    // THE ONE DEFINITION OF "needs attention", shared by every surface that counts it. Before
+    // this, the cockpit header and the chat window's fleet band each had their own inline test
+    // and they disagreed: the header counted {stuck, maxturns, error} minus INFRA_STUCK, the band
+    // counted {stuck, maxturns, error, awaiting} with no exclusions, so the same fleet showed two
+    // different "needs attention" numbers. Both now call this.
+    //
+    // A lane needs a person when it is stuck or maxturns AND the harness is NOT already driving it
+    // back: an INFRA_STUCK worker is being retried automatically, and `recovering` is the explicit
+    // auto-recovery status -- neither is a lane a person has to touch, so neither counts.
+    // `error` is DELIBERATELY NOT here: the brief keeps error as its own danger-coloured count
+    // ("停止(エラー)"), not mixed into "needs attention" -- see CountsAsError below.
+    // `awaiting` / `awaiting_gate` are NOT counted here either: they are "awaiting approval", a
+    // separate tally. The goal-based local_loop exclusion is applied by the caller (goal text).
+    public static bool CountsAsNeedsAttention(string status, string outcome)
+    {
+        string s = StatusKey(status);
+        if (s != "stuck" && s != "maxturns") return false;
+        string o = outcome == null ? "" : outcome.Trim().ToUpperInvariant();
+        if (o == "INFRA_STUCK") return false;  // being retried automatically, not a person's lane
+        return true;
+    }
+
+    // error is its own count, coloured danger (not folded into "needs attention"). The brief (rule 5)
+    // wants the error heading to match the red error chip, shown apart from the orange attention tally.
+    public static bool CountsAsError(string status)
+    {
+        return StatusKey(status) == "error";
+    }
+
     // Display label. lang: 0 = Japanese, 1 = English. Called during render (not cached),
     // so a language toggle that re-renders picks up the new label automatically.
+    // lang: 0 = Japanese, 1 = English, 2 = Chinese (Simplified). Chinese is resolved first in its
+    // own switch so the ja/en returns below stay byte-for-byte what they were; an unlisted key in
+    // Chinese falls through to the English wording rather than to the raw canonical.
     public static string StatusLabel(string canonical, int lang)
     {
         bool jp = lang == 0;
         string key = StatusKey(canonical);
+        if (lang == 2)
+        {
+            switch (key)
+            {
+                case "pending":     return "等待中";
+                case "ready":       return "开始";
+                case "waiting":     return "运行中";
+                case "researching": return "调查中";
+                case "refuting":    return "复查中";
+                case "verifying":   return "验证中";
+                case "waiting_runtime": return "等待运行环境";
+                case "awaiting":    return "等待批准";
+                case "awaiting_gate": return "等待批准";
+                case "done":        return "完成";
+                case "stuck":       return "需要处理";
+                case "maxturns":    return "需要处理";
+                case "error":       return "已停止(错误)";
+                case "cancelled":   return "已停止";
+                case "interrupted": return "中断";
+                case "recovering":  return "自动恢复中";
+                case "freed":       return "已释放";
+                case "job_created": return "作业已创建";
+                case "job_cancelled": return "作业已停止";
+                case "ui_trigger_attempt": return "UI启动尝试";
+                case "ui_trigger_sent": return "UI启动已发送";
+                case "protocol_bootstrap_sent": return "协议启动指示已发送";
+                case "turn_finished_without_commit": return "回合结束但未提交";
+                case "turn_controller_retry": return "控制器重试";
+                case "conversation_rotated": return "已切换会话";
+                case "browser_metrics": return "浏览器计测";
+                default:            break;   // fall through to the English switch below
+            }
+            lang = 1; jp = false;
+        }
         switch (key)
         {
             case "pending":     return jp ? "待機"                   : "Queued";
@@ -285,6 +355,7 @@ static class Theme
             case "error":       return jp ? "停止(エラー)"           : "Stopped (error)";
             case "cancelled":   return jp ? "停止"                   : "Stopped";
             case "interrupted": return jp ? "中断"                   : "Interrupted";
+            case "recovering":  return jp ? "自動回復中"             : "Auto-recovering";
             case "freed":       return jp ? "解放済"                 : "Released";
             case "job_created": return jp ? "ジョブ作成"             : "Job created";
             case "job_cancelled": return jp ? "ジョブ停止"           : "Job cancelled";
@@ -308,6 +379,40 @@ static class Theme
     {
         bool jp = lang == 0;
         string key = StatusKey(canonical);
+        if (lang == 2)
+        {
+            switch (key)
+            {
+                case "pending":     return "已投入";
+                case "ready":       return "开始";
+                case "waiting":     return "运行中";
+                case "researching": return "调查中";
+                case "refuting":    return "复查中";
+                case "verifying":   return "验证中";
+                case "waiting_runtime": return "等待运行环境";
+                case "awaiting":    return "等待批准";
+                case "awaiting_gate": return "等待批准";
+                case "done":        return "完成";
+                case "stuck":       return "停滞";
+                case "maxturns":    return "达到回合上限";
+                case "error":       return "错误";
+                case "cancelled":   return "已停止";
+                case "interrupted": return "中断";
+                case "recovering":  return "自动恢复";
+                case "freed":       return "已释放";
+                case "job_created": return "作业已创建";
+                case "job_cancelled": return "作业已停止";
+                case "ui_trigger_attempt": return "UI启动尝试";
+                case "ui_trigger_sent": return "UI启动已发送";
+                case "protocol_bootstrap_sent": return "协议启动指示已发送";
+                case "turn_finished_without_commit": return "回合结束但未提交";
+                case "turn_controller_retry": return "控制器重试";
+                case "conversation_rotated": return "已切换会话";
+                case "browser_metrics": return "浏览器计测";
+                default:            break;
+            }
+            lang = 1; jp = false;
+        }
         switch (key)
         {
             case "pending":     return jp ? "投入"           : "Queued";
@@ -320,11 +425,12 @@ static class Theme
             case "awaiting":    return jp ? "承認待ち"       : "Needs input";
             case "awaiting_gate": return jp ? "承認待ち"     : "Needs approval";
             case "done":        return jp ? "完了"           : "Completed";
-            case "stuck":       return jp ? "停滞"           : "Stuck";
+            case "stuck":       return jp ? "要対応"         : "Needs attention";  // rule 6: same word as chip
             case "maxturns":    return jp ? "ターン上限"     : "Max turns reached";
             case "error":       return jp ? "エラー"         : "Error";
             case "cancelled":   return jp ? "停止"           : "Cancelled";
             case "interrupted": return jp ? "中断"           : "Interrupted";
+            case "recovering":  return jp ? "自動回復"       : "Auto-recovering";
             case "freed":       return jp ? "解放"           : "Released";
             case "job_created": return jp ? "ジョブ作成"     : "Job created";
             case "job_cancelled": return jp ? "ジョブ停止"   : "Job cancelled";

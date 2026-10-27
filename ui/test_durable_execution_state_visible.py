@@ -133,8 +133,14 @@ def test_internal_control_stuck_rows_are_not_operator_attention():
     assert '!IsLocalLoopControlGoal(S(w, "goal"))' in helper
     assert '!IsInfraStuck(w)' in helper
 
+    # The header counts needs-attention through the SAME shared definition the cards use:
+    # Theme.CountsAsNeedsAttention (which excludes INFRA_STUCK -- internal control retry) plus the
+    # goal-based local_loop guard the shared core cannot see. That is exactly IsOperatorAttention,
+    # so an infra-stuck or local_loop-control row is not folded into the red needs-attention tally.
     header = SOURCE[SOURCE.index('int cntAttn = 0;'):SOURCE.index('string triple;', SOURCE.index('int cntAttn = 0;'))]
-    assert 'IsOperatorAttention(ww2)' in header
+    assert 'Theme.CountsAsNeedsAttention(S(ww2, "status"), S(ww2, "outcome"))' in header
+    assert '!IsLocalLoopControlGoal(S(ww2, "goal"))' in header
+    assert 'cntAttn++' in header
 
     card = _method(SOURCE, "Border Card(Dictionary<string, object> w)", "UIElement BuildCardTabs(")
     assert 'bool isAttention = !closed && IsOperatorAttention(w);' in card

@@ -3443,6 +3443,11 @@ _PHASE_LABELS = {
     "error":       "Stopped (error)",
     "cancelled":   "Stopped",
     "interrupted": "Interrupted",   # written only by relay/fleet_reaper.py; never held live
+    # Auto-recovery in progress: canned-nonanswer requeue, reconnect, token renew, INFRA_STUCK
+    # retry, interrupted auto-resume. Non-terminal and NOT a "needs attention" lane -- the
+    # harness is still driving it. The side that transitions a worker INTO this status is a
+    # separate change; this entry is the phase-spine label and the UI classification only.
+    "recovering": "Auto-recovering",
     "fresh_replay": "Fresh replay",
     "content_refused": "Content refused",
 }

@@ -116,7 +116,8 @@ def test_real_mode_uses_event_history_vocabulary_not_status_chip_copy():
         'ready': ('開始', 'Started'),
         'waiting': ('実行中', 'Running'),
         'done': ('完了', 'Completed'),
-        'stuck': ('停滞', 'Stuck'),
+        # brief rule 6: stuck's timeline word now matches its chip word (要対応 / Needs attention)
+        'stuck': ('要対応', 'Needs attention'),
         'maxturns': ('ターン上限', 'Max turns reached'),
         'error': ('エラー', 'Error'),
         'cancelled': ('停止', 'Cancelled'),
