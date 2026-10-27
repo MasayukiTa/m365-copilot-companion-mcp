@@ -306,6 +306,8 @@ partial class CockpitWindow
             case "fleet_compress_hours":
             case "org_genotype_record":
                 return "sweep_start";
+            case "priority_boost_ui":
+                return "ui_only";
             default:
                 return "ui_only";
         }
@@ -688,6 +690,20 @@ partial class CockpitWindow
         _autoArchiveBtn.Click += delegate { _autoArchive = !_autoArchive; SaveKey("autoarchive", _autoArchive ? "1" : "0"); PaintAutoArchiveBtn(); };
         PaintAutoArchiveBtn();
         col.Children.Add(_autoArchiveBtn);
+
+        // Priority boost enable toggle (default ON). Same status-toggle shape as auto-archive.
+        _priorityBoostBtn = new Button();
+        _priorityBoostBtn.BorderThickness = new Thickness(1); _priorityBoostBtn.Cursor = Cursors.Hand;
+        _priorityBoostBtn.Padding = new Thickness(12, 4, 12, 4); _priorityBoostBtn.FontSize = 12;
+        _priorityBoostBtn.FontWeight = FontWeights.SemiBold; _priorityBoostBtn.HorizontalAlignment = HorizontalAlignment.Left;
+        _priorityBoostBtn.Margin = new Thickness(0, 2, 0, 4);
+        _priorityBoostBtn.Template = FlatButtonTemplate();
+        _priorityBoostBtn.ToolTip = _lang == 0
+            ? "カードの「最優先にする」操作と優先中カウントの表示（既定ON）。fleet 側へ既に送った優先指定は、ここをOFFにしても解除されません。"
+            : "Show the per-card 'Make top priority' action and boosted count (default ON). Turning this off does not clear boosts already sent to the fleet.";
+        _priorityBoostBtn.Click += delegate { _priorityBoostEnabled = !_priorityBoostEnabled; SaveKey("priority_boost_ui", _priorityBoostEnabled ? "1" : "0"); PaintPriorityBoostBtn(); };
+        PaintPriorityBoostBtn();
+        col.Children.Add(_priorityBoostBtn);
 
         // ── Capacity guard: NEW user-editable disk floor (GB) ──
         col.Children.Add(SectionHeader(T("set_capacity_section")));

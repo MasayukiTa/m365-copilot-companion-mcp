@@ -210,6 +210,16 @@ partial class CockpitWindow
         if (k == "hist_earlier") return ja ? "その他" : "Earlier";
         if (k == "hist_search") return ja ? "履歴を検索…" : "Search history…";
         if (k == "autoarchive") return ja ? "完了を自動で履歴へ" : "Auto-archive on finish";
+        // Priority boost ("make this top priority") feature strings.
+        if (k == "boost_setting") return ja ? "最優先の操作を表示" : "Show top-priority control";
+        if (k == "boost_set") return ja ? "最優先にする" : "Make top priority";
+        if (k == "boost_clear") return ja ? "最優先を解除" : "Clear top priority";
+        if (k == "boost_set_done") return ja ? "最優先に指定しました" : "Marked top priority";
+        if (k == "boost_clear_done") return ja ? "最優先を解除しました" : "Top priority cleared";
+        if (k == "boost_mark") return ja ? "最優先" : "Top priority";
+        if (k == "boost_count") return ja ? "優先中" : "Boosted";
+        if (k == "boost_too_many") return ja ? "同時実行枠を超えています（これ以上は優先が効きません）" : "exceeds concurrent slots (further boosts have no effect)";
+        if (k == "boost_disabled") return ja ? "最優先機能は設定でオフです" : "Priority boost is turned off in settings";
         if (k == "set_archive_section") return ja ? "自動アーカイブ" : "Auto-archive";
         // Capacity-wait banner (admission gate) + force-start
         // Settings panel (gear popup) -- consolidates the scattered toolbar controls

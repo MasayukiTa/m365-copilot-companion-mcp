@@ -141,13 +141,16 @@ partial class CockpitWindow
             });
         }
 
-        // Priority toggle: the boost mechanism itself is owned by the separate priority_boost work
-        // (feature/priority-boost). Until it lands we expose the item + call site only, and report
-        // that it is pending rather than faking a reorder. One call site keeps the two from being
-        // built twice. See explain.md.
-        if (!controlGoal)
-            m.Add(PriorityBoostActive(wt) ? T("clear_priority") : T("make_priority"),
-                  delegate { TogglePriorityBoost(wt); });
+        // The fleet applies and persists the priority toggle.
+        if (_priorityBoostEnabled && !string.IsNullOrEmpty(name) && !controlGoal)
+        {
+            bool on = IsBoosted(wt);
+            string nmb = name;
+            m.Add(on ? T("boost_clear") : T("boost_set"), delegate {
+                RequestSetPriorityBoost(nmb, !on);
+                ShowScaleToast(on ? T("boost_clear_done") : T("boost_set_done"));
+            });
+        }
 
         // Why it's waiting: real queue rank / workers-ahead / resource-wait are not emitted into
         // status.json yet, so this formats what IS known (status/reason/next_step), shown as-is.
@@ -166,23 +169,6 @@ partial class CockpitWindow
         m.Separator();
         m.Add("→ " + T("to_history"), delegate { ArchiveAndHide(wt); });
         return m;
-    }
-
-    // Call site for the priority-boost feature (feature/priority-boost / priority_boost clone).
-    // That work owns the real queue reorder and the persisted boost flag. Until it is present we
-    // do not fake a reorder: we tell the operator it is pending. When priority_boost lands it
-    // replaces this body (and PriorityBoostActive) -- the menu wiring here stays unchanged.
-    bool PriorityBoostActive(Dictionary<string, object> w)
-    {
-        // priority_boost persists the boost; with it absent, nothing is boosted.
-        return string.Equals(S(w, "priority_boost"), "True", StringComparison.OrdinalIgnoreCase);
-    }
-
-    void TogglePriorityBoost(Dictionary<string, object> w)
-    {
-        // No-op placeholder: the mechanism is owned by priority_boost. Report pending so the click
-        // is acknowledged without pretending the queue was reordered.
-        ShowScaleToast(T("priority_pending"));
     }
 
     // Format what is known about why an active card is not progressing. Queue rank, workers-ahead
@@ -343,6 +329,15 @@ partial class CockpitWindow
         chip.Margin = new Thickness(2, 0, 5, 0);
         if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
+        // Top-priority marker: a small blue pill right after the status chip when the fleet has
+        // applied priority_boost to this worker (read-only reflection of fleet state).
+        if (_priorityBoostEnabled && IsBoosted(w))
+        {
+            var boostPill = Pill(T("boost_mark"), "info");
+            boostPill.Margin = new Thickness(0, 0, 5, 0);
+            boostPill.ToolTip = _lang == 0 ? "このタスクは最優先に指定されています" : "This task is marked top priority";
+            DockPanel.SetDock(boostPill, Dock.Left); left.Children.Add(boostPill);
+        }
         // AGENT BADGE (P0 feature 4): which agent this conversation is bound to. Green subtle badge
         // for the configured agent, WARNING-colored 既定Copilot badge for a plain /chat/ (default) url.
         var agentBadge = BuildAgentBadge(conv, convTitle);
@@ -598,6 +593,28 @@ partial class CockpitWindow
                         Margin = new Thickness(24, 4, 0, 0)
                     };
                     col.Children.Add(rl);
+                }
+
+                // Requirement (6): one honest line on why this lane is not progressing — queue rank,
+                // how many are ahead, and/or a resource wait. Built ONLY from fields the fleet puts
+                // in the worker dict (no fabricated rank). Empty when the fleet supplies none, so
+                // nothing is invented. Shown for non-terminal lanes only.
+                if (!terminal && !closed)
+                {
+                    string whyLine = WhyNotProgressing(w);
+                    if (!string.IsNullOrEmpty(whyLine))
+                    {
+                        var wl = new TextBlock
+                        {
+                            Text = whyLine,
+                            Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
+                            TextTrimming = TextTrimming.CharacterEllipsis,
+                            TextWrapping = TextWrapping.NoWrap,
+                            Margin = new Thickness(24, 2, 0, 0)
+                        };
+                        wl.ToolTip = whyLine;
+                        col.Children.Add(wl);
+                    }
                 }
 
                 // Line 3: meta — [elapsed ·] {worker name | 完了時刻} · turn N · verified [COMPUTED].
@@ -1015,6 +1032,55 @@ partial class CockpitWindow
         b.Margin = new Thickness(0, 0, 5, 0);
         b.ToolTip = EffortPolicyView.BadgeTip(level, src, last, ja);
         return b;
+    }
+
+    // Requirement (6): build a single honest line explaining why a lane is not progressing. Uses
+    // ONLY fields the fleet writes into the worker dict — never fabricates a rank. Returns "" when
+    // the fleet supplies none of them, so an operator never sees an invented queue position.
+    //   - queue_rank / queue_ahead : the lane's position and how many lanes are ahead of it
+    //   - resource_wait           : a named resource the lane is blocked on (tab slot, token, lock)
+    //   - execution.waiting_reason : the fleet's own human sentence for why it is parked
+    // When the lane is boosted but still waiting, we prefix 最優先 so the operator sees the boost
+    // is applied yet something else (a resource, not rank) is holding it — that is the "why it's
+    // still slow despite boosting" answer the owner asked for.
+    string WhyNotProgressing(Dictionary<string, object> w)
+    {
+        if (w == null) return "";
+        bool ja = _lang == 0;
+        var bits = new List<string>();
+
+        // Queue position + lanes ahead (only if the fleet provided numbers).
+        string rankTxt = S(w, "queue_rank");
+        string aheadTxt = S(w, "queue_ahead");
+        int rank, ahead;
+        bool hasRank = int.TryParse(rankTxt, out rank) && rank > 0;
+        bool hasAhead = int.TryParse(aheadTxt, out ahead) && ahead >= 0;
+        if (hasRank && hasAhead)
+            bits.Add(ja ? ("待ち " + rank + " 番目・前に " + ahead + " 件")
+                        : ("queue #" + rank + ", " + ahead + " ahead"));
+        else if (hasRank)
+            bits.Add(ja ? ("待ち " + rank + " 番目") : ("queue #" + rank));
+        else if (hasAhead)
+            bits.Add(ja ? ("前に " + ahead + " 件") : (ahead + " ahead"));
+
+        // Resource wait (named blocker), if present.
+        string res = S(w, "resource_wait");
+        if (!string.IsNullOrEmpty(res))
+            bits.Add((ja ? "資源待ち: " : "waiting on: ") + OneLine(res));
+
+        // Fleet's own waiting sentence, if present and nothing more specific was added.
+        if (bits.Count == 0)
+        {
+            var ex = Obj(w, "execution");
+            string wr = ex != null ? S(ex, "waiting_reason") : "";
+            if (!string.IsNullOrEmpty(wr))
+                bits.Add(OneLine(wr));
+        }
+
+        if (bits.Count == 0) return "";
+        string line = (ja ? "進まない理由: " : "Why waiting: ") + string.Join(" · ", bits.ToArray());
+        if (IsBoosted(w)) line = T("boost_mark") + " · " + line;
+        return line;
     }
 
     Border Pill(string text, string kind)
