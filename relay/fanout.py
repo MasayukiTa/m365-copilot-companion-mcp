@@ -581,7 +581,8 @@ def _base_goal_of(text):
 
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
                 cwd=None, parent_level=None, run_id="",
-                parent_campaign_id="", parent_subtask_index=None, root_id=""):
+                parent_campaign_id="", parent_subtask_index=None, root_id="",
+                board_lines=""):
     """Turn the accepted steps into goal items the fleet can admit.
 
     TASK-TREE IDENTITY (additive, record-only). Each child also carries `parent_campaign_id`
@@ -635,6 +636,11 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
              % (goal_text, i, len(steps), step))
             + CLOSING_INSTRUCTION
         )
+        # BOARD USAGE (p1 only). `board_lines` is the campaign-board how-to (when to read, when
+        # to write); the caller passes it only under p1 and "" otherwise, so off and p0 leave
+        # this prompt unchanged to the character -- the same additive shape aggregation_goal uses.
+        if board_lines:
+            text = text + "\n\n" + board_lines
         out.append({
             "text": text,
             "cwd": cwd,

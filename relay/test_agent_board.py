@@ -90,12 +90,18 @@ def test_no_run_means_off_and_no_status_block():
     assert AB.run_mode() == "off" and not AB.active() and AB.status_block() == {}
 
 
-def test_p1_is_declared_and_behaves_as_p0(tmp_path, monkeypatch):
+def test_p1_enables_the_worker_write_path(tmp_path, monkeypatch):
+    # p1 keeps everything p0 does (the coordinator still points at a child's result) AND opens
+    # the narrow board_post path so a worker can share a finding mid-run.
     _settings(tmp_path, monkeypatch, "agent_board_mode=p1\n")
     assert AB.begin_run() == "p1" and AB.active()
-    assert AB.post_result("cA", 1, "cA-1") is True
+    assert AB.post_result("cA", 1, "cA-1") is True          # the p0 behaviour is still there
     assert AB.status_block()["agent_board"]["mode"] == "p1"
-    assert not hasattr(AB, "board_post")      # no worker write path exists
+    # the worker write path exists and works under p1
+    ok, reason = AB.board_post("cA", "fact", "w1", {"subject": "s", "text": "found X"})
+    assert ok and reason == ""
+    # a worker is refused the coordinator's result kind
+    assert AB.board_post("cA", "result", "w1", {"subject": "s", "ref": "r"}) == (False, "role")
 
 
 # ------------------------------------------------------------------ schema
@@ -279,7 +285,12 @@ def test_the_tool_reads_the_campaign_of_the_caller_and_hides_its_own(monkeypatch
 
 def test_the_caller_is_decided_from_the_ledger_identity_never_from_an_argument(monkeypatch):
     import inspect
-    assert list(inspect.signature(board_tool.board_digest).parameters) == []
+    # The only parameters are the optional read FILTERS (kind, subject); there is no parameter
+    # that names the campaign or the author -- those are decided from the calling session below,
+    # so a caller can never read or write another campaign's board by passing an argument.
+    params = list(inspect.signature(board_tool.board_digest).parameters)
+    assert params == ["kind", "subject"]
+    assert "campaign" not in params and "author" not in params and "viewer" not in params
     from tools import tool_ledger, turn_context
     monkeypatch.setattr(tool_ledger, "session_fingerprint", lambda: "sess")
     monkeypatch.setattr(tool_ledger, "_identity_for",
@@ -418,6 +429,135 @@ def test_junk_to_the_readers_never_raises():
     assert AB.post_result(object(), object(), object(), object()) is False
 
 
+# ------------------------------------------------------------------ the worker write path (p1)
+
+def _p1(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch, "agent_board_mode=p1\n")
+    AB.begin_run()
+
+
+def test_board_post_writes_a_worker_fact_only_under_p1(tmp_path, monkeypatch):
+    _p1(tmp_path, monkeypatch)
+    assert AB.board_post("cA", "fact", "w1", {"subject": "s", "text": "found"}) == (True, "")
+    (row,) = [r for r in _rows() if r.get("event") != "deny"]
+    assert (row["kind"], row["author"], row["author_role"]) == ("fact", "w1", "worker")
+    assert row["subject"] == "s" and row["text"] == "found"
+
+
+@pytest.mark.parametrize("mode", ["off", "p0"])
+def test_board_post_writes_nothing_when_not_p1(tmp_path, monkeypatch, mode):
+    _settings(tmp_path, monkeypatch, "agent_board_mode=%s\n" % mode)
+    AB.begin_run()
+    assert AB.board_post("cA", "fact", "w1", {"subject": "s", "text": "t"}) == (False, "mode")
+    assert _rows() == []
+
+
+def test_board_post_refuses_the_coordinators_result_kind_to_a_worker(tmp_path, monkeypatch):
+    _p1(tmp_path, monkeypatch)
+    assert AB.board_post("cA", "result", "w1", {"subject": "s", "ref": "r"}) == (False, "role")
+    assert [r for r in _rows() if r.get("event") != "deny"] == []
+
+
+@pytest.mark.parametrize("kind", ["note", "", "FACT", "request"])
+def test_board_post_refuses_an_unknown_kind(tmp_path, monkeypatch, kind):
+    _p1(tmp_path, monkeypatch)
+    assert AB.board_post("cA", kind, "w1", {"text": "t"}) == (False, "bad_kind")
+
+
+def test_board_post_refuses_an_unknown_key_and_records_it(tmp_path, monkeypatch):
+    _p1(tmp_path, monkeypatch)
+    assert AB.board_post("cA", "fact", "w1",
+                         {"subject": "s", "text": "t", "x": "1"}) == (False, "unknown_key")
+    denies = [r for r in _rows() if r.get("event") == "deny"]
+    assert len(denies) == 1 and denies[0]["reason"] == "unknown_key"
+
+
+def test_board_post_honours_the_worker_per_kind_ceiling(tmp_path, monkeypatch):
+    _p1(tmp_path, monkeypatch)
+    for i in range(5):                              # fact cap is 5
+        assert AB.board_post("cA", "fact", "w1", {"subject": "s%d" % i, "text": "t"})[0]
+    assert AB.board_post("cA", "fact", "w1", {"subject": "s6", "text": "t"}) == (False, "author_cap")
+    assert AB.board_post("cA", "fact", "w2", {"subject": "s", "text": "t"})[0] is True
+
+
+def test_board_post_write_failure_is_counted_and_never_raises(tmp_path, monkeypatch):
+    _p1(tmp_path, monkeypatch)
+    blocker = tmp_path / "afile"
+    blocker.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(AB, "BOARD_PATH", str(blocker / "sub" / "board.jsonl"))
+    assert AB.board_post("cA", "fact", "w1", {"subject": "s", "text": "t"}) == (False, "write_error")
+    assert AB._STATE["write_errors"] == 1
+
+
+def test_board_post_worker_lines_are_added_only_under_p1(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch, "agent_board_mode=p0\n")
+    AB.begin_run()
+    assert AB.worker_lines() == ""
+    _settings(tmp_path, monkeypatch, "agent_board_mode=p1\n")
+    AB.begin_run()
+    assert AB.worker_lines() == "\n".join(AB.WORKER_LINES)
+    assert len(AB.WORKER_LINES) == 2 and "board_post" in AB.worker_lines()
+    assert "board_digest" in AB.worker_lines()
+
+
+def test_the_tool_board_post_reports_a_short_status_and_hides_the_identity(tmp_path, monkeypatch):
+    _p1(tmp_path, monkeypatch)
+    monkeypatch.setattr(board_tool, "_caller", lambda ts=None: ("cA", "w1"))
+    assert board_tool.board_post("fact", subject="s", text="found X") == "board: posted a fact entry."
+    assert board_tool.board_post("result", subject="s", ref="r").startswith("board: refused (role)")
+    (row,) = [r for r in _rows() if r.get("event") != "deny"]
+    assert row["author"] == "w1" and row["author_role"] == "worker"    # identity from the session
+
+
+def test_the_tool_board_post_writes_nothing_off_or_without_a_campaign(tmp_path, monkeypatch):
+    _settings(tmp_path, monkeypatch, "agent_board_mode=p0\n")
+    AB.begin_run()
+    assert "not p1" in board_tool.board_post("fact", subject="s", text="t")
+    _p1(tmp_path, monkeypatch)
+    monkeypatch.setattr(board_tool, "_caller", lambda ts=None: ("", ""))
+    assert "not part of a campaign" in board_tool.board_post("fact", subject="s", text="t")
+    assert _rows() == []
+
+
+# ------------------------------------------------------------------ the digest filters (p1)
+
+def test_the_digest_filters_by_kind(tmp_path, monkeypatch):
+    _post("cA", "fact", who="w1", subject="f1", text="x")
+    _post("cA", "claim", who="w2", subject="c1")
+    _post("cA", "question", who="w3", text="why")
+    d = AB.digest("cA", now=NOW + 5, kind="fact")
+    assert "f1" in d and "c1" not in d and "why" not in d
+    assert "有効 1件" in d
+
+
+def test_the_digest_filters_by_subject(tmp_path, monkeypatch):
+    _post("cA", "fact", who="w1", subject="alpha", text="x")
+    _post("cA", "fact", who="w2", subject="beta", text="y")
+    d = AB.digest("cA", now=NOW + 5, subject="alpha")
+    assert "alpha" in d and "beta" not in d and "有効 1件" in d
+
+
+def test_an_unknown_kind_filter_yields_no_lines_not_an_error(tmp_path, monkeypatch):
+    _post("cA", "fact", who="w1", subject="f1", text="x")
+    d = AB.digest("cA", now=NOW + 5, kind="nope")
+    assert "有効 0件" in d and d.endswith(AB.DATA_LINE)
+
+
+def test_a_filter_does_not_change_the_expired_count_in_the_header(tmp_path, monkeypatch):
+    _post("cA", "claim", who="w1", subject="stale")                 # claim TTL is 30 min
+    _post("cA", "fact", who="w2", subject="fresh", text="x", now=NOW + 3000)
+    d = AB.digest("cA", now=NOW + 3600, kind="fact")
+    assert "古い 1件は省略" in d and "fresh" in d and "stale" not in d
+
+
+def test_the_tool_passes_its_filters_through_to_the_campaign_of_the_caller(tmp_path, monkeypatch):
+    _post("cA", "fact", who="w1", subject="keepme", text="x")
+    _post("cA", "claim", who="w2", subject="dropme")
+    monkeypatch.setattr(board_tool, "_caller", lambda ts=None: ("cA", "zz"))
+    out = board_tool.board_digest(kind="fact")
+    assert "keepme" in out and "dropme" not in out
+
+
 # ------------------------------------------------------------------ post_result
 
 def test_post_result_does_nothing_when_off(tmp_path, monkeypatch):
@@ -454,7 +594,8 @@ def test_the_status_block_reports_what_the_run_applies(tmp_path, monkeypatch):
     AB.begin_run()
     AB.post_result("cA", 1, "cA-1")
     assert AB.status_block() == {"agent_board": {"mode": "p0", "posted": 1, "refused": 0,
-                                                 "write_errors": 0}}
+                                                 "write_errors": 0,
+                                                 "kinds_version": AB.board_kinds.SCHEMA_VERSION}}
     from relay import fleet_runner as FR
     assert FR._agent_board_block() == AB.status_block()
 

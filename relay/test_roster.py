@@ -201,7 +201,7 @@ def test_board_digest_passes_the_roster_to_the_digest(monkeypatch):
     monkeypatch.setattr(board_tool, "_caller", lambda ts=None: ("cA", "w1"))
     monkeypatch.setattr(board_tool, "_roster_lines", lambda cid: [" r1"])
     monkeypatch.setattr(AB, "digest", lambda cid, viewer, **k: seen.update(k) or "D")
-    assert board_tool.board_digest() == "D" and seen == {"roster_lines": [" r1"]}
+    assert board_tool.board_digest() == "D" and seen == {"roster_lines": [" r1"], "kind": None, "subject": None}
 
 
 # ------------------------------------------------------------------ the cockpit
