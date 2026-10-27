@@ -590,14 +590,21 @@ partial class CockpitWindow
     // The bottom composer is the task intake surface in BOTH idle and live-run states.
     // During a live run, enqueue new work through the same lossless one-command-per-file channel
     // used by retry. Worker-specific steering remains available on each worker card.
-    // goal-set hash -> path of the add_goal command written for it (see TryAddGoalsToLiveFleet).
-    readonly Dictionary<string, string> _pendingAddCommands = new Dictionary<string, string>();
+    // Paths of add_goal commands this UI has written that have NOT been consumed yet (the file
+    // still exists in commands.d). IDENTITY, NOT CONTENT: the live-add guard keys on "did my own
+    // previous add_goal command drain yet", never on what the goals SAY, so two different goal
+    // sets -- or the same wording submitted twice on purpose -- are both queued. The owner's
+    // instruction (2026-10-26/27) is that content resemblance must never stop a submission; this
+    // list is how the double-write guard survives while dropping the goal-text hash it keyed on.
+    readonly List<string> _pendingAddCommandPaths = new List<string>();
 
-    static string AddGoalSetKey(List<string> goals)
+    // True if any add_goal command this UI wrote is still sitting unconsumed on disk. Prunes
+    // paths whose files the runner has already drained, so a genuinely new submission is never
+    // held back once the previous command has been taken.
+    bool HasUnconsumedAddCommand()
     {
-        var parts = new List<string>();
-        foreach (string g in goals) parts.Add(GoalKey(g));
-        return string.Join("|", parts.ToArray());
+        _pendingAddCommandPaths.RemoveAll(pp => string.IsNullOrEmpty(pp) || !File.Exists(pp));
+        return _pendingAddCommandPaths.Count > 0;
     }
 
     void TryAddGoalsToLiveFleet()
@@ -618,24 +625,25 @@ partial class CockpitWindow
                 : "LOCAL_LOOP control text cannot be added to ordinary Fleet. Resume the durable task card instead.";
             return;
         }
-        // ONE UNCONSUMED COMMAND PER GOAL SET. A retry of the same text while its first command is
-        // still sitting in commands.d (the runner's drain lagged 30-190 s on 2026-10-14) used to
-        // write a SECOND command, and the runner admits identical text under a new command as a
-        // new task: 3 goals became 5 workers. The key is the goal-set hash; the first command's
-        // file existing on disk is the proof it has not been consumed yet.
-        string addKey = AddGoalSetKey(goals);
-        string pendingPath;
-        if (_pendingAddCommands.TryGetValue(addKey, out pendingPath))
+        // DO NOT WRITE A SECOND COMMAND WHILE MY FIRST ONE IS STILL UNCONSUMED. A retry issued
+        // while the previous add_goal command still sits in commands.d (the runner's drain lagged
+        // 30-190 s on 2026-10-14) used to write a SECOND command, and the runner admits each
+        // command as a new task: 3 goals became 5 workers.
+        //
+        // IDENTITY, NOT CONTENT. This guard used to key on the goal-set hash (AddGoalSetKey ->
+        // GoalKey -> SHA1 of the goal TEXT): a content match, exactly what the owner forbade
+        // (2026-10-26/27) -- two different goal sets that happened to hash the same, or the same
+        // wording submitted twice on purpose, were refused with "重複追加しません". It now keys on
+        // whether ANY add_goal command THIS UI wrote is still unconsumed on disk, regardless of
+        // what the goals say. A different-worded submission is never blocked by resemblance; the
+        // only thing deferred is piling a second command on top of one the runner has not drained.
+        if (HasUnconsumedAddCommand())
         {
-            if (!string.IsNullOrEmpty(pendingPath) && File.Exists(pendingPath))
-            {
-                _goalInput.Text = "";
-                if (_startNote != null)
-                    _startNote.Text = _lang == 0 ? "同じタスクは既にキューに入っています(処理待ち)。重複追加しません。"
-                                                  : "That task is already queued (waiting to be picked up); not adding a duplicate.";
-                return;
-            }
-            _pendingAddCommands.Remove(addKey);
+            _goalInput.Text = "";
+            if (_startNote != null)
+                _startNote.Text = _lang == 0 ? "先ほどの追加がまだキューから取り込まれていません(処理待ち)。取り込み後に再度追加してください。"
+                                              : "Your last add is still waiting to be picked up; add again once it has been taken.";
+            return;
         }
         SubmissionBaseline submitBaseline = CaptureSubmissionBaseline();
 
@@ -666,7 +674,7 @@ partial class CockpitWindow
             return;
         }
 
-        _pendingAddCommands[addKey] = commandPath;
+        _pendingAddCommandPaths.Add(commandPath);
         // Optimistic row first; the runner will replace it with a real worker on the next sweep.
         NoteSubmitted(goals, submitBaseline);
         WatchLiveAddHandoff(commandPath, ackPath);

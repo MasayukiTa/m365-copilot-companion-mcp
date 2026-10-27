@@ -24,12 +24,14 @@ a real one had been added: normalising a path to `<path>` and then requiring equ
 exact-match refusal here would have: none of the three real submissions shared enough literal
 text to be caught by one, but they shared the vocabulary of the same job.
 
-WHAT THIS FILE PINS. A paraphrase of a goal already running is refused, and the refusal names
-the running job. A goal that only shares a topic, not the work, is accepted. A goal whose
-original has actually finished is accepted -- a deliberate resubmission of stopped work must
-never be mistaken for a duplicate. And relay/fanout.py's near-identical-by-construction sibling
-goals are shown never to reach this door at all, so the dedup rule cannot be the thing that
-strangles a legitimate split.
+WHAT THIS FILE PINS (UPDATED 2026-10-27). Content resemblance NEVER stops a submission any
+more: a paraphrase of a goal already running or pending is QUEUED, and the resemblance is only
+recorded in the background (fleet_submit_similarity.jsonl), never used to refuse or fold the
+work. The real guard against a locked-out worker cloning its own job is the JOB ID applied
+downstream, not a content comparison at this door. A goal that only shares a topic is of course
+accepted too, and a deliberate resubmission of finished work is accepted. relay/fanout.py's
+near-identical-by-construction sibling goals are still shown never to reach this door at all, so
+the (now observation-only) resemblance heuristic cannot be the thing that strangles a split.
 """
 from __future__ import annotations
 
@@ -182,14 +184,18 @@ def test_a_paraphrase_of_a_pending_goal_is_also_accepted_and_notes_it(
 
 def test_a_paraphrase_of_a_running_goal_is_still_refused_when_the_guard_is_on(
         isolated_state, monkeypatch):
-    """The old judgement is kept behind fleet_submit_dup_guard: turned on, a paraphrase of the
-    running goal is refused exactly as before and the refusal names the running job. Pinned on
-    by patching _dup_guard_on so this proves the similarity logic, not settings-file parsing."""
+    """Content resemblance never refuses a submission, even with fleet_submit_dup_guard on
+    (owner order 2026-10-26/27). A paraphrase of the running goal is QUEUED; the guard only
+    makes the resemblance observable (possible_duplicate_of names the running job), it does not
+    stop the job. Pinned on by patching _dup_guard_on so this proves the similarity logic, not
+    settings-file parsing."""
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", _ORIGINAL)])
     out = FI.fleet_submit(_PARAPHRASE)
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == [], "a refused goal must not be queued"
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1, "the paraphrase must be queued, not refused"
+    assert jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs
 
 
 def test_a_genuinely_different_goal_is_accepted_even_with_something_in_flight(isolated_state):

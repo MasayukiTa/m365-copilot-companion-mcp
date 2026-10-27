@@ -11,8 +11,7 @@ from tools.overnight.detect import FleetReader
 from tools.overnight.items import DEFAULT_MAX_ITEMS, parse_items
 from tools.overnight.runner import (DEFAULT_MAX_INFLIGHT, DEFAULT_MAX_MINUTES, DEFAULT_POLL_S,
                                     Runner)
-from tools.overnight.submit import (DEFAULT_SCRIPT, REPO, QueueSubmitter, Submitter,
-                                    fleet_similarity)
+from tools.overnight.submit import DEFAULT_SCRIPT, REPO, QueueSubmitter, Submitter
 
 
 def default_out_dir(clock) -> Path:
@@ -92,8 +91,7 @@ def _make_runner(st: S.State, args, clock, log) -> Runner:
 
     return Runner(st, clock=clock, reader=reader, submitter=submitter, log=log,
                   free_gb=lambda: env.free_disk_gb(out), floor_gb=env.disk_floor_gb,
-                  awake=env.keep_awake, finish=finish,
-                  similar=fleet_similarity())
+                  awake=env.keep_awake, finish=finish)
 
 
 def run_batch(args, clock=None) -> int:

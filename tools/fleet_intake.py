@@ -565,6 +565,19 @@ def _log_refusal(reason: str, text: str, source: str, similar_to: str = "") -> N
         pass
 
 
+def _log_similarity_observed(text: str, source: str, similar_to: str = "",
+                             similarity: float = 0.0) -> None:
+    """Note that an incoming goal RESEMBLED one already in flight, WITHOUT refusing it. The
+    goal is queued normally; this only records the resemblance so the pattern stays visible.
+    Never raises, never alters the reply the caller gets."""
+    try:
+        from tools import obs_log
+        obs_log.log_similarity_observed(text, source, similar_to=similar_to,
+                                        similarity=similarity)
+    except Exception:
+        pass
+
+
 #: Where a refused goal's FULL record is written, one file per refusal, beside the queue it did
 #: not enter. The existing .fleet/fleet_submit_refusals.jsonl (tools/obs_log) is a one-line
 #: digest with the goal HEAD only and no id to act on; it is left exactly as it was. This is the
@@ -682,12 +695,7 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         dup = _duplicate_of(text)
         if dup is not None and _dup_guard_on():
             dup_jid, sim = dup
-            _log_refusal("similar", text, source, similar_to=dup_jid)
-            _write_refused_record("similar", text, source, similar_to=dup_jid, similarity=sim)
-            return ("[fleet_submit: refused -- this reads as the goal already queued or running "
-                    "as %s (%d%% word overlap). If it is genuinely different work, say specifically "
-                    "how; if you meant to check on that job, use fleet_queue() instead of "
-                    "resubmitting it.]" % (dup_jid, round(sim * 100)))
+            _log_similarity_observed(text, source, similar_to=dup_jid, similarity=sim)
     n = _pending_count()
     if n >= MAX_PENDING:
         _log_refusal("pending_full", text, source)
