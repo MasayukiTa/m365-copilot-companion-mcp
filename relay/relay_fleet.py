@@ -2447,8 +2447,11 @@ def priority_extra_slots():
     return max(0, min(100, _settings_int("priority_extra_slots", 10)))
 
 
-def concurrency_admits(workers, cap, priority=False, extra=10):
-    return active_worker_count(workers) < max(1, cap) + (extra if priority else 0)
+def concurrency_admits(workers, cap, priority=False, extra=10, ram_cap=None):
+    limit = max(1, cap) + (extra if priority else 0)
+    if ram_cap is not None:
+        limit = min(limit, ram_cap)
+    return socket_capacity.admits_another_goal(active_worker_count(workers), limit)
 
 
 def _holds_slot(w):
@@ -2891,7 +2894,7 @@ def _commit_subject_from_goal(goal):
 
 def auto_concurrency(n_goals, per_tab_mb=None, headroom_mb=None, hard_cap=None):
     """The start-up lane count for `--max-concurrent 0` (auto): the goals present, capped by the
-    lane ceiling (derived from the cloud rate, tools/settings_keys.derive_lane_ceiling).
+    configured lane ceiling (default 50).
 
     FREE RAM IS NOT IN THIS NUMBER. It used to be (free RAM // per-TAB cost), a budget for browser
     tabs that a socket goal does not hold, and it was bypassed wholesale on 2026-10-14. The RAM
@@ -11088,7 +11091,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
 
         # CAPACITY OF THE SOCKET ROUTE -- the cap on concurrent goals. It is the lane ceiling
         # (the operator's live `maxtabs` stepper, or the autoscale ceiling when autoscale is on;
-        # default derived from the cloud rate, see tools/settings_keys.derive_lane_ceiling),
+        # default 50, bounded by the historical rate estimate),
         # reduced by a RAM safeguard priced from what a held socket conversation really costs
         # (relay/socket_capacity.py). The safeguard only gates NEW admissions: it never drains a
         # running goal and never stops the last one. Throughput is bounded where the rate is
@@ -11103,6 +11106,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _socket_cap = min(_lane_ceiling, socket_capacity.ram_safeguard_cap(
             _active_open(), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
             _lane_ceiling))
+        _priority_ram_cap = socket_capacity.ram_safeguard_cap(
+            _active_open(), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
+            _lane_ceiling + 100)
         if asc_on:
             mc_box[0] = _socket_cap          # shown as the live cap; the ceiling is separate
 
@@ -11157,7 +11163,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # 120-200 concurrent produced 5 DONE / 178 STUCK on 2026-10-27.
             # Keep normal work at 50 by default, with 10 additional priority slots.
             if not concurrency_admits(workers, _socket_cap, pending[0].priority,
-                                      priority_extra_slots()):
+                                      priority_extra_slots(), _priority_ram_cap):
                 break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
@@ -11177,7 +11183,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 base = sum(repo_eval_gb(x.cwd) for x in open_ws)
                 pick = -1
                 for i, p in enumerate(pending):
-                    if not concurrency_admits(workers, _socket_cap, p.priority, priority_extra_slots()):
+                    if not concurrency_admits(workers, _socket_cap, p.priority, priority_extra_slots(),
+                                              _priority_ram_cap):
                         continue
                     if disk_admission_ok(floor_gb=PERREPO_HARD_MIN_GB,
                                          reserve_gb=base + repo_eval_gb(p.cwd)):

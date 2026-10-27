@@ -20,10 +20,13 @@ def test_count_and_settings(monkeypatch):
 
 
 @pytest.mark.parametrize('socket', [False, True])
-def test_live_admission_priority_and_resume(monkeypatch, socket):
+@pytest.mark.parametrize('extra', [4, 10])
+def test_live_admission_priority_and_resume(monkeypatch, tmp_path, socket, extra):
     monkeypatch.setattr(rf, 'avail_phys_mb', lambda: 1000000.0)
     monkeypatch.setattr(rf, 'free_disk_gb', lambda path=None: 1000000.0)
-    monkeypatch.setattr(rf, 'priority_extra_slots', lambda: 10)
+    settings = tmp_path / 'settings.txt'
+    settings.write_text('priority_extra_slots=%d\n' % extra, encoding='utf-8')
+    monkeypatch.setattr(fr, '_settings_path', lambda: str(settings))
     state = {'control': {}}
     orig = (fixtures._install_fake_socket_worker(state) if socket else fixtures._install_fake_worker(state))
     added = []
@@ -42,8 +45,8 @@ def test_live_admission_priority_and_resume(monkeypatch, socket):
                     if w.status == 'waiting':
                         state['control'][w.name] = 'done'
                         break
-            elif (len(observations) == 2 and active == 60 and
-                  sum(w.priority and w.status == 'pending' for w in workers) == 1):
+            elif (len(observations) == 2 and active == 50 + extra and
+                  sum(w.priority and w.status == 'pending' for w in workers) == 11 - extra):
                 observations.append((active, sum(w.priority and w.status == 'pending' for w in workers),
                                      sum(not w.priority and w.status == 'pending' for w in workers)))
                 for w in workers:
@@ -60,7 +63,8 @@ def test_live_admission_priority_and_resume(monkeypatch, socket):
         result = rf.run_relay_fleet(fixtures.FakeContext(), ['normal%d' % i for i in range(52)],
                                     'http://agent', max_concurrent=50, add_box=added, stop_box=stop,
                                     poll_s=0, on_tick=tick, notify=lambda *a, **k: None)
-        assert observations == [(50, 2), (60, 2, 2), (60, 1, 2)]
+        assert observations == [(50, 2), (50 + extra, 12 - extra, 2),
+                                (50 + extra, 11 - extra, 2)]
         assert len(result) == 64 and all(r['outcome'] == 'DONE' for r in result)
     finally:
         fixtures._restore_worker(orig)

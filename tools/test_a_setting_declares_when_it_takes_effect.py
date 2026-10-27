@@ -92,6 +92,11 @@ def _reader_maxtabs():
     return settings_maxtabs()
 
 
+def _reader_priority_extra_slots():
+    from relay.relay_fleet import priority_extra_slots
+    return priority_extra_slots()
+
+
 def _reader_rate():
     from relay.relay_fleet import rate_ceiling
     return rate_ceiling()
@@ -236,6 +241,7 @@ _LIVE_READERS = {
     "disk_floor_gb": (_reader_disk, "1", "9"),
     "ram_floor_mb": (_reader_ram, "512", "3072"),
     "maxtabs": (_reader_maxtabs, "2", "7"),
+    "priority_extra_slots": (_reader_priority_extra_slots, "4", "10"),
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
     "socket_goal_mb": (_reader_socket_goal_mb, "10", "60"),
     "effort_policy": (_reader_effort_policy, "shadow", "on"),

@@ -62,7 +62,7 @@ def derive_lane_ceiling(rpm=CLOUD_RPM, turn_s=TYPICAL_TURN_S, headroom=LANE_HEAD
 
 
 # 2026-10-27: 120-200 concurrent yielded 5 DONE and 178 STUCK; reserve 10 priority slots.
-LANE_CEILING_DEFAULT = 50
+LANE_CEILING_DEFAULT = min(50, derive_lane_ceiling())
 
 #: THE BOUNDARY A CHANGE CROSSES, not a rough class of it. The first version of this table
 #: used "live" for both the follower and the per-decision reads, which are different promises:
