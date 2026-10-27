@@ -8589,7 +8589,9 @@ class RelayWorker:
             except Exception:
                 decision = "refuse"
             if decision != "resend":
-                recovery = self._plan_continue(reason, delivery)
+                recovery = self._plan_continue(
+                    "turn deadline exceeded" if reason == "turn timeout without a reply" else reason,
+                    delivery)
                 # A call that RAN on this side is as good as a landed turn: with no continue turn
                 # to carry it, the verbatim resend below would run it again.
                 if recovery is None and (landed or executed):
@@ -9327,6 +9329,7 @@ class RelayWorker:
         if self.status == "ready":
             if time.time() < self._cooldown_until:
                 return False             # waiting out a transient-retry backoff
+            self._delivered_wait_deadline = None
             self._begin_send()
             self._capture_url()
             return self.status in TERMINAL
@@ -9416,6 +9419,22 @@ class RelayWorker:
                     # refused outright, so 260 timed-out acting goals ended STUCK without one try.
                     # `_retry_socket(assume_landed=True)` continues the interrupted turn, or ends
                     # the worker with the same named refusal as before when no continue is safe.
+                    # A delivered turn may still be generating. Give its driver a bounded
+                    # grace period before attempting recovery; do not mark it terminal first.
+                    try:
+                        from relay import delivery_verify as _DV
+                        _seen = _DV.verify_on() and self._saw_output_for_turn()
+                    except Exception:
+                        _seen = False
+                    if _seen:
+                        _deadline = getattr(self, "_delivered_wait_deadline", None)
+                        if _deadline is None:
+                            _deadline = time.time() + 30.0
+                            self._delivered_wait_deadline = _deadline
+                            self._note_timeout(_origin, _elapsed, "delivered-wait", budget_s=_bound)
+                        if time.time() < _deadline:
+                            self.reason = "turn delivered; waiting for reply before continuation"
+                            return False
                     _tried_continue = False
                     try:
                         _tried_continue = bool(getattr(self, "socket", False)
@@ -9429,15 +9448,7 @@ class RelayWorker:
                         self._note_timeout(_origin, _elapsed, "continue", budget_s=_bound)
                         self.reason = "turn timeout -> continue the same conversation"
                         return False
-                    # BEFORE GIVING UP, ASK WHETHER THE TURN WAS DELIVERED. The refusal used to
-                    # hard-code delivery="unknown" and never read the driver's own evidence --
-                    # `partial_text()`/`_turn_answered`, the same `saw_output` the reconnect path
-                    # reads. Under load (2026-10-27 15:53: 90 workers) a turn whose answer was
-                    # merely slow carried real output and was still ended STUCK. When the setting
-                    # is on and output arrived, the turn DID reach the model: keep waiting for the
-                    # reply instead of refusing -- a verbatim resend would ask for the act again.
-                    # Output absent stays "unknown" and keeps the careful refuse below. With the
-                    # setting off, the old hard-coded "unknown" refusal is unchanged.
+                    # Preserve the evidence in the terminal refusal if recovery is unavailable.
                     _delivery = "unknown"
                     try:
                         from relay import delivery_verify as _DV
@@ -9446,11 +9457,9 @@ class RelayWorker:
                             _delivery = delivery_seen_from_output(True)
                     except Exception:
                         _delivery = "unknown"
-                    if _delivery == "delivered":
-                        self._note_timeout(_origin, _elapsed, "delivered-wait", budget_s=_bound)
-                        self.reason = ("turn timeout but output arrived -> delivered; "
-                                       "waiting for the reply, not re-sending")
-                        return False
+                    if _delivery == "delivered" and self.status != "stuck":
+                        self._refuse_resend("bounded wait expired; continuation unavailable", _delivery)
+                        return True
                     self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
                     if self.status != "stuck":
                         self._refuse_resend("turn timeout without a reply", _delivery)
