@@ -65,4 +65,9 @@ def test_the_admission_loop_asks_with_the_box_and_not_a_copy():
     assert "mc_box[0]" in block, "the live box is no longer the lane ceiling"
     assert "socket_capacity.ram_safeguard_cap(" in block
     j = src.index("while pending:")
-    assert "socket_capacity.admits_another_goal(" in src[j:j + 3000]
+    assert "_socket_cap = min(_lane_ceiling, socket_capacity.ram_safeguard_cap(" in block
+    assert "concurrency_admits(workers, _socket_cap," in src[j:j + 3000]
+    helper = src[src.index("def concurrency_admits("):src.index("def _holds_slot(")]
+    assert "limit = max(1, cap) + (extra if priority else 0)" in helper
+    assert "limit = min(limit, ram_cap)" in helper
+    assert "socket_capacity.admits_another_goal(active_worker_count(workers), limit)" in helper
