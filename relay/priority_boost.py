@@ -37,6 +37,7 @@ import time
 import uuid
 
 from relay import task_router as TR
+from tools import state_store
 
 #: Sub-directory under TR.TASKS holding one file per boosted job.
 BOOSTS_DIR = "boosts"
@@ -139,10 +140,14 @@ def boost(jid: str, actor: str = "agent", reason: str = "", tasks_dir=None) -> b
     try:
         path = _boost_path(jid, tasks_dir)
         os.makedirs(os.path.dirname(path), exist_ok=True)
-        tmp = path + ".tmp"
-        with io.open(tmp, "w", encoding="utf-8", newline="\n") as fh:
-            json.dump(rec, fh, ensure_ascii=False, indent=1)
-        os.replace(tmp, path)
+        def replace_marker(state):
+            state.clear()
+            state.update(rec)
+
+        state_store.update_json(
+            path, replace_marker, validate=lambda state: isinstance(state, dict),
+            count=len, default=dict, allow_shrink=True,
+        )
     except Exception:
         return False
     _append_audit("boost", jid, actor, reason, tasks_dir)
