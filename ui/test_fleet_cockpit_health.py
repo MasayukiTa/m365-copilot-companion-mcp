@@ -48,6 +48,17 @@ def _executable(cs):
 SOURCE = _executable(RAW)
 
 
+def test_stale_status_reports_age_and_live_runner_without_guessing_cause():
+    header = (Path(__file__).parent / "FleetCockpit.Header.cs").read_text(encoding="utf-8")
+    body = header[header.index("void StaleVerdict("):header.index("// Process state unknown")]
+    assert 'if (st == 1)' in body
+    assert 'status.json の更新が ' in body
+    assert ' 秒止まっています（ランナーは稼働中）' in body
+    assert 'status.json has not updated for ' in body
+    assert 's (runner alive)' in body
+    assert 'sweep busy' not in body
+
+
 def _dots_body():
     body = SOURCE[SOURCE.index("void UpdateCaptureDots("):]
     return body[:body.index('SetDot(4, HealthState.Red, T("hs_agent_bad"), now);')]

@@ -115,8 +115,8 @@ partial class CockpitWindow
             if (top.Length > 70) top = top.Substring(0, 70) + "…";
             string tail = top != "" ? ": " + top : "";
             kind = (age > STALE_HARD && act > STALE_HARD) ? "warning" : "info";
-            text = ja ? "ランナー稼働中・スイープ処理中 " + (int)age + "秒" + tail
-                      : "runner alive, sweep busy " + (int)age + "s" + tail;
+            text = ja ? "status.json の更新が " + (int)age + " 秒止まっています（ランナーは稼働中）" + tail
+                      : "status.json has not updated for " + (int)age + "s (runner alive)" + tail;
             return;
         }
         // Process state unknown: old wording, but recent file activity vetoes the hard claim.
