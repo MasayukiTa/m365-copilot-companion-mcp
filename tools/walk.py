@@ -17,6 +17,7 @@ only when something was ACTUALLY skipped, and one environment variable turns it 
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 
 #: Directories no search descends into. Not a performance list -- a correctness one: a hit
@@ -39,7 +40,22 @@ def pruning_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-def iter_files(base: Path, skipped=None):
+SEARCH_TIMEOUT_SECONDS = 20
+
+
+class WalkDeadline:
+    def __init__(self):
+        self.seconds = SEARCH_TIMEOUT_SECONDS
+        self.end = time.monotonic() + self.seconds
+        self.cut = False
+
+    def expired(self):
+        if time.monotonic() >= self.end:
+            self.cut = True
+        return self.cut
+
+
+def iter_files(base: Path, skipped=None, deadline=None):
     """Yield every file under `base`, skipping PRUNED_DIRS. A generator, never a list.
 
     os.walk rather than rglob because rglob cannot be told not to descend -- the pruning has
@@ -49,8 +65,14 @@ def iter_files(base: Path, skipped=None):
     rather than on the setting: a note saying "vendored directories were not searched" is a
     lie about a tree that contains none, and about a search of a single file.
     """
+    own_deadline = deadline is None
+    deadline = deadline or WalkDeadline()
     prune = pruning_enabled()
     for root, dirs, files in os.walk(str(base)):
+        if deadline.expired():
+            if own_deadline:
+                raise TimeoutError("search deadline exceeded; results may be incomplete")
+            return
         if prune:
             keep = []
             for d in dirs:
@@ -75,6 +97,10 @@ def iter_files(base: Path, skipped=None):
         # each directory costs one sort per directory against a stat() per candidate.
         dirs.sort()
         for name in sorted(files):
+            if deadline.expired():
+                if own_deadline:
+                    raise TimeoutError("search deadline exceeded; results may be incomplete")
+                return
             yield Path(root) / name
 
 

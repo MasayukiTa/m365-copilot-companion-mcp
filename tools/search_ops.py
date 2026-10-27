@@ -1,13 +1,36 @@
 import fnmatch
 import heapq
 import stat
+import threading
+from functools import wraps
 from pathlib import Path
 from typing import Optional
 
 from .file_ops import _validate_path
-from .walk import PRUNED_DIRS, is_pruned, iter_files, pruned_note
+from .walk import PRUNED_DIRS, WalkDeadline, is_pruned, iter_files, pruned_note
+
+SEARCH_CONCURRENCY = 4
+_SEARCH_SLOTS = threading.BoundedSemaphore(SEARCH_CONCURRENCY)
 
 
+def _bounded_search(func):
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        if not _SEARCH_SLOTS.acquire(blocking=False):
+            return f"busy: {SEARCH_CONCURRENCY} searches already running, retry later"
+        try:
+            return func(*args, **kwargs)
+        finally:
+            _SEARCH_SLOTS.release()
+    return wrapped
+
+
+def _cut_note(deadline):
+    return f"[search cut after {deadline.seconds} seconds; results may be incomplete]"
+
+
+
+@_bounded_search
 def glob(
     pattern: str,
     path: str = ".",
@@ -53,10 +76,13 @@ def glob(
         # non-recursive pattern matching exactly as pathlib matched it before.
         seen: set[Path] = set()
         gskipped: set = set()
+        deadline = WalkDeadline()
         for pat in patterns:
+            if deadline.expired():
+                break
             if "**" in pat:
                 tail = pat.replace("\\", "/").split("**/", 1)[-1]
-                for match in iter_files(base, gskipped):
+                for match in iter_files(base, gskipped, deadline):
                     try:
                         rel = match.relative_to(base).as_posix()
                     except ValueError:
@@ -68,6 +94,8 @@ def glob(
                     seen.add(match)
                 continue
             for match in base.glob(pat):
+                if deadline.expired():
+                    break
                 if not match.is_file():
                     continue
                 if not include_hidden and _is_hidden(match, base):
@@ -83,7 +111,7 @@ def glob(
         truncated = len(results) > max_results
         results = results[:max_results]
         if not results:
-            return f"0 matches under {base}"
+            return f"0 matches under {base}" + ("\n" + _cut_note(deadline) if deadline.cut else "")
         # 件数を先頭で返す。返していなかった頃は、呼び出し側が一覧を目で数えて
         # 同じ問いに 14/15/16/17 と答えていた(正解は16、実測10回)。数えるのは
         # こちらの仕事で、読み取り専用なので unlock も要らない。
@@ -97,6 +125,8 @@ def glob(
         # tests pin that exact string. A disclosure that has to be appended somewhere does not
         # get to be appended to a line that already means something else.
         tail = ["[" + pruned_note(gskipped) + "]"] if pruned_note(gskipped) else []
+        if deadline.cut:
+            tail.append(_cut_note(deadline))
         return "\n".join([head] + [str(p) for p in results] + tail)
     except Exception as e:
         return f"[glob error: {type(e).__name__}: {e}]"
@@ -162,6 +192,7 @@ def _expand_braces(pattern: str) -> list[str]:
     return expanded
 
 
+@_bounded_search
 def find_files(
     name_contains: str,
     path: str = ".",
@@ -195,7 +226,8 @@ def find_files(
         seen = 0
         truncated = False
         skipped: set = set()
-        for p in iter_files(base, skipped):
+        deadline = WalkDeadline()
+        for p in iter_files(base, skipped, deadline):
             if needle not in p.name.lower():
                 continue
             try:
@@ -218,12 +250,14 @@ def find_files(
                 heapq.heappushpop(best, item)
                 truncated = True
         if not best:
-            return "(no matches)"
+            return "(no matches)" + ("\n" + _cut_note(deadline) if deadline.cut else "")
         out = [t[2] for t in sorted(best, reverse=True)]
         if truncated:
             out.append(f"... truncated at {max_results} entries")
         if pruned_note(skipped):
             out.append("[" + pruned_note(skipped) + "]")
+        if deadline.cut:
+            out.append(_cut_note(deadline))
         return "\n".join(out)
     except Exception as e:
         return f"[find_files error: {type(e).__name__}: {e}]"
