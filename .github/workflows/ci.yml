@@ -320,6 +320,7 @@ jobs:
             ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py \
             ui/test_clear_history_never_drops_unfinished_work.py \
             ui/test_left_rail_done_matches_the_completed_cards.py \
+            ui/test_clear_history_keeps_the_completed_cards.py \
             ui/test_the_effort_policy_says_what_is_in_effect.py \
             ui/test_content_details_spine.py \
             ui/test_submitted_history_reconciliation.py \
