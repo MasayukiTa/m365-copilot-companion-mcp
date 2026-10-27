@@ -7210,7 +7210,8 @@ class RelayWorker:
                     cwd=getattr(self, "cwd", None), **_tree,
                     parent_level=(effort_policy_mod.worker_level(self)
                                   if effort_policy_mod.mode() != "off" else None),
-                    run_id=getattr(self, "run_id", "") or "") if steps else [])
+                    run_id=getattr(self, "run_id", "") or "",
+                    board_lines=agent_board.worker_lines()) if steps else [])
                 if kids and self._spawn_fn:
                     # THE PARENT'S CHECK GOES TO THE MERGE, NOT ONTO EVERY CHILD. It used to
                     # ride in child_goals(checks=...) and land identically on all of them, so
