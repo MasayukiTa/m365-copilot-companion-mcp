@@ -38,10 +38,12 @@ def test_retry_socket_accepts_assume_landed():
 def test_timeout_path_continues_before_it_refuses():
     start = SRC.index('_timeout_policy = getattr(self, "_timeout_resend_decision", None)')
     block = SRC[start:start + 3500]
-    call = block.index("self._retry_socket(")
-    assert "assume_landed=True" in block[call:call + 200]
-    refuse = block.index('self._refuse_resend("turn timeout without a reply", "unknown")')
-    assert call < refuse, "the continue attempt must come before the refusal"
+    call = block.index('self._retry_socket("turn timeout without a reply",')
+    call_end = block.index("))", call)
+    assert "assume_landed=True" in block[call:call_end]
+    delivery = block.index("if _DV.verify_on() and self._saw_output_for_turn():")
+    refuse = block.index('self._refuse_resend("turn timeout without a reply", _delivery)')
+    assert call < delivery < refuse, "continue and delivery verification must precede refusal"
     # a worker the continue already ended STUCK is not refused a second time
     assert 'if self.status != "stuck":' in block[call:refuse]
 

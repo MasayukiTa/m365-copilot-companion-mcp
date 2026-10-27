@@ -232,6 +232,20 @@ KEYS = OrderedDict([
        "created while it is on carry the refs the check needs. A present line reads as on only when it "
        "says on; anything else on a present line is off, while an absent line is on (the default)."),
 
+    # Verify delivery before giving up a timed-out acting turn (relay/delivery_verify.py). ON by
+    # default. Read in the timeout refusal path of relay/relay_fleet.py.
+    _k("verify_delivery_before_giving_up", EACH_GATE, "on",
+       "relay/delivery_verify.py:mode (every timeout refusal decision, mtime-cached)",
+       "on|off. on (default): when a turn's reply times out and the goal acts, the harness reads the "
+       "driver's own delivery evidence (partial_text()/_turn_answered, the same saw_output the "
+       "reconnect path reads) before giving up. If output arrived, the turn reached the model, so the "
+       "worker keeps WAITING for the reply instead of ending STUCK (a verbatim resend would ask for "
+       "the act again); the recorded delivery status becomes 'delivered' rather than a hard-coded "
+       "'unknown'. If no output arrived, the honest 'unknown' is kept and the careful refuse-on-landed "
+       "default is unchanged. off: the timeout refusal keeps its old hard-coded delivery='unknown' and "
+       "ends the worker exactly as before. Read at each timeout refusal with no restart. A present "
+       "line reads as off only when it says off; anything else is on (the default)."),
+
     # Rephrase+continue replay of an ACTING goal that drew a canned non-answer
     # (relay/auto_rephrase_continue.py). ON by default.
     _k("auto_rephrase_continue", EACH_GATE, "on",

@@ -505,6 +505,23 @@ def duplicate_risk(reason: str) -> bool:
     return delivery_status(reason) in ("delivered", "unknown")
 
 
+def delivery_seen_from_output(saw_output: bool) -> str:
+    """The turn's delivery status from whether ANY output arrived for it. 'delivered' or 'unknown'.
+
+    The reconnect path reads the driver's own evidence -- `partial_text()` (tokens that arrived for
+    THIS turn) or `_turn_answered` -- as `saw_output`, and a turn that produced output demonstrably
+    reached the model. The timeout refusal, by contrast, hard-coded `delivery="unknown"` and never
+    consulted that evidence, so a turn whose answer was merely slow was recorded as never-known and
+    the worker ended STUCK (the 2026-10-27 15:53 bundle: 90 workers).
+
+    NO OUTPUT IS NOT 'not_delivered'. A dropped socket mid-flight, or a frame still in transit when
+    the clock fired, produces no observable tokens either way, so the honest answer is 'unknown' --
+    which keeps the careful refuse-on-landed default. Only the 'delivered' reading licenses a
+    behaviour change (keep waiting instead of ending STUCK), and it is licensed by real tokens.
+    """
+    return "delivered" if saw_output else "unknown"
+
+
 #: Reasons that PROVE the frame never reached the server, as STRICT substrings of the real log
 #: text (not the broad word list `NOT_DELIVERED` uses). Two shapes, both occurring BEFORE a
 #: frame can be put on the wire:
