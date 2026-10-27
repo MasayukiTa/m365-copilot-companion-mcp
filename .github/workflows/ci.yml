@@ -572,6 +572,7 @@ jobs:
             bench/test_swe_check_feedback.py \
             bench/test_swe_grade_launch_verification.py \
             relay/test_admission.py \
+            relay/test_concurrency_cap.py \
             relay/test_a_worker_that_dies_after_a_fresh_replay_says_why.py \
             relay/test_bestofn.py \
             relay/test_bestofn_run.py \

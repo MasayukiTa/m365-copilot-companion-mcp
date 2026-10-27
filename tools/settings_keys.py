@@ -44,7 +44,7 @@ from __future__ import annotations
 import math
 from collections import OrderedDict
 
-# ---- THE LANE CEILING IS DERIVED, NOT A MAGIC NUMBER ------------------------------------
+# ---- HISTORICAL RATE-BASED ESTIMATE (the operational default is measured below) -----------
 # How many goals may run at once is bounded by the cloud rate, not by RAM or tabs: a goal sends
 # about one request per turn, so by Little's law the goals the rate can feed at once are
 #     concurrent goals ~= rate (requests/min) x seconds per turn / 60.
@@ -61,7 +61,8 @@ def derive_lane_ceiling(rpm=CLOUD_RPM, turn_s=TYPICAL_TURN_S, headroom=LANE_HEAD
     return int(math.ceil(float(rpm) * float(turn_s) / 60.0 * float(headroom)))
 
 
-LANE_CEILING_DEFAULT = derive_lane_ceiling()
+# 2026-10-27: 120-200 concurrent yielded 5 DONE and 178 STUCK; reserve 10 priority slots.
+LANE_CEILING_DEFAULT = 50
 
 #: THE BOUNDARY A CHANGE CROSSES, not a rough class of it. The first version of this table
 #: used "live" for both the follower and the per-decision reads, which are different promises:
@@ -118,6 +119,11 @@ KEYS = OrderedDict([
        "relay/fleet_runner.py:settings_maxtabs + Follower.watch",
        "Live, but it means different things: with autoscale ON this moves the CEILING, "
        "with autoscale off it is the fixed cap."),
+
+    _k("priority_extra_slots", EACH_GATE, 10,
+       "relay/relay_fleet.py:priority_extra_slots (each admission sweep)",
+       "Extra priority slots above the normal cap. On 2026-10-27, 120-200 concurrent "
+       "yielded 5 DONE and 178 STUCK; the defaults are 50 plus 10 priority slots."),
 
     # ---------------------------------------------------------------- each_gate
     _k("rate_ceiling_rpm", EACH_GATE, 100.0,

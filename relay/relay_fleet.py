@@ -2437,6 +2437,20 @@ def _jid_is_live(workers, jid, exclude=None):
     return False
 
 
+def active_worker_count(workers):
+    """Count running workers identically for socket and tab routes."""
+    return sum(1 for w in workers if w.status not in TERMINAL and w.status != PENDING)
+
+
+def priority_extra_slots():
+    from relay.fleet_runner import _settings_int
+    return max(0, min(100, _settings_int("priority_extra_slots", 10)))
+
+
+def concurrency_admits(workers, cap, priority=False, extra=10):
+    return active_worker_count(workers) < max(1, cap) + (extra if priority else 0)
+
+
 def _holds_slot(w):
     """Whether this worker is admitted and consuming the fleet's budget right now.
 
@@ -10650,11 +10664,12 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                            max_fresh_replays=max_fresh_replays,
                            fanout=fanout, spawn_fn=_spawn_children)
         # Durable at the moment of settling: see RelayWorker._settle_done.
+        _nw.priority = bool(goal_item.get("priority")) if isinstance(goal_item, dict) else False
         _nw.on_settled_done = _note_one_finished
         return _nw
 
     workers = [_worker_for(i, g) for i, g in enumerate(goals)]
-    pending = list(workers)            # FIFO queue of not-yet-attached workers
+    pending = sorted(workers, key=lambda w: not w.priority)  # priority first, FIFO within class
 
     def _active_open():
         # Worker (MAIN-tab) count -- the DISK accounting unit: only main agent tabs run the
@@ -11085,9 +11100,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             asc_on = bool(asc_box[0])
             ceiling = asc_box[1] or autoscale_max
         _lane_ceiling = max(1, int(ceiling)) if asc_on else max(1, int(mc_box[0]))
-        _socket_cap = socket_capacity.ram_safeguard_cap(
+        _socket_cap = min(_lane_ceiling, socket_capacity.ram_safeguard_cap(
             _active_open(), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
-            _lane_ceiling)
+            _lane_ceiling))
         if asc_on:
             mc_box[0] = _socket_cap          # shown as the live cap; the ceiling is separate
 
@@ -11139,7 +11154,10 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                         pending[0].reason = ""
                 except Exception:
                     pass
-            if not socket_capacity.admits_another_goal(_active_open(), _socket_cap):
+            # 120-200 concurrent produced 5 DONE / 178 STUCK on 2026-10-27.
+            # Keep normal work at 50 by default, with 10 additional priority slots.
+            if not concurrency_admits(workers, _socket_cap, pending[0].priority,
+                                      priority_extra_slots()):
                 break
             # reserve disk for THIS eval plus every already-open eval still in flight, so we never
             # admit N tabs that look fine individually but crash C: once their builds run at once.
@@ -11159,6 +11177,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 base = sum(repo_eval_gb(x.cwd) for x in open_ws)
                 pick = -1
                 for i, p in enumerate(pending):
+                    if not concurrency_admits(workers, _socket_cap, p.priority, priority_extra_slots()):
+                        continue
                     if disk_admission_ok(floor_gb=PERREPO_HARD_MIN_GB,
                                          reserve_gb=base + repo_eval_gb(p.cwd)):
                         pick = i
