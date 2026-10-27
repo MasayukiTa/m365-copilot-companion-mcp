@@ -459,3 +459,117 @@ def test_the_refusal_reaches_the_caller_rather_than_the_tool():
     assert "if not _allowed" in arm, "the answer is computed and not acted on"
     assert "return" in arm.split("if not _allowed", 1)[1][:400], (
         "a refusal does not return -- the tool runs anyway and the gate only writes a log line")
+
+
+# ---- run kind: a bench run should not reach the desktop, an office-work run should ---------
+#
+# The FLEET_TOOLS comment on the six screen_* tools said the distinction actually wanted is by
+# RUN KIND, which the file could not express: a bench worker fixing a bug in a checkout has no
+# business driving the operator's desktop, while an office-work run is the caller that should.
+# These pin that the distinction now exists AND that it did not disturb the old answer.
+
+
+def test_the_six_screen_tools_are_the_office_only_set():
+    """The run-kind-sensitive tools are exactly the six computer-use tools, no more."""
+    from relay.fleet_toolset import OFFICE_ONLY_TOOLS
+    assert OFFICE_ONLY_TOOLS == frozenset((
+        "screen_look", "screen_click", "screen_scroll",
+        "screen_type", "screen_press", "screen_windows"))
+    # and every one of them is in the allowed set to begin with -- run kind narrows, it does
+    # not invent a tool that was never allowed.
+    for name in OFFICE_ONLY_TOOLS:
+        assert name in FLEET_TOOLS
+
+
+def test_an_office_work_run_reaches_the_desktop():
+    """The capability this whole thing exists to measure must survive the restriction."""
+    for name in ("screen_look", "screen_click", "screen_type", "screen_windows"):
+        assert is_allowed(name, "office"), "%s must stay reachable for office work" % name
+
+
+def test_a_bench_run_does_not_reach_the_desktop():
+    """A bench worker driving the operator's desktop is exactly what RUN KIND refuses."""
+    from relay.fleet_toolset import OFFICE_ONLY_TOOLS
+    for name in OFFICE_ONLY_TOOLS:
+        assert not is_allowed(name, "bench"), "%s must be refused to a bench run" % name
+
+
+def test_run_kind_only_moves_the_six_not_the_rest():
+    """Narrowing the desktop tools must not change the answer for anything else."""
+    for name in ("read_file", "write_file", "shell_exec", "run_python", "grep", "git_diff"):
+        assert is_allowed(name, "bench") == is_allowed(name, "office") == is_allowed(name), (
+            "%s changed answer with run kind and should not have" % name)
+    # a refused tool stays refused regardless of run kind
+    for name in ("process_kill", "unlock", "git_commit"):
+        assert not is_allowed(name, "bench") and not is_allowed(name, "office")
+
+
+def test_an_undeclared_run_keeps_the_old_behaviour():
+    """The old one-argument call is unchanged: with no run kind declared, the desktop tools are
+    allowed, which is the behaviour main.py's existing call site gets."""
+    import relay.fleet_toolset as FT
+    for name in FT.OFFICE_ONLY_TOOLS:
+        assert FT.is_allowed(name), "%s must stay allowed when no run kind is declared" % name
+        ok, _ = FT.check(name)          # one-argument call, as main.py makes it
+        assert ok, "%s refused with no run kind and no env -- old behaviour broke" % name
+
+
+def test_the_run_kind_comes_from_the_environment_when_not_passed(monkeypatch):
+    """A caller that cannot pass an argument (the gateway) still gets the distinction through
+    FLEET_RUN_KIND, which the bench harness exports to its worker child."""
+    import relay.fleet_toolset as FT
+    monkeypatch.setenv(FT.RUN_KIND_ENV, "bench")
+    assert FT.run_kind() == "bench"
+    assert not FT.is_allowed("screen_click")
+    monkeypatch.setenv(FT.RUN_KIND_ENV, "office")
+    assert FT.run_kind() == "office"
+    assert FT.is_allowed("screen_click")
+    monkeypatch.delenv(FT.RUN_KIND_ENV, raising=False)
+    assert FT.run_kind() == ""
+    assert FT.is_allowed("screen_click")
+
+
+def test_an_unrecognised_run_kind_does_not_restrict(monkeypatch):
+    """Anything that is neither bench nor office is unknown, and unknown does not restrict --
+    failing open here is correct because the operator's own calls set nothing."""
+    import relay.fleet_toolset as FT
+    for junk in ("", "BENCHMARK", "prod", "  ", "benchy"):
+        monkeypatch.setenv(FT.RUN_KIND_ENV, junk)
+        assert FT.is_allowed("screen_click"), "run kind %r should not restrict" % junk
+    monkeypatch.delenv(FT.RUN_KIND_ENV, raising=False)
+
+
+def test_an_explicit_argument_wins_over_the_environment(monkeypatch):
+    """A caller that knows its run kind can say so without a process-global var."""
+    import relay.fleet_toolset as FT
+    monkeypatch.setenv(FT.RUN_KIND_ENV, "office")
+    assert not FT.is_allowed("screen_click", "bench"), "explicit bench must override env office"
+    monkeypatch.setenv(FT.RUN_KIND_ENV, "bench")
+    assert FT.is_allowed("screen_click", "office"), "explicit office must override env bench"
+    monkeypatch.delenv(FT.RUN_KIND_ENV, raising=False)
+
+
+def test_a_refused_bench_desktop_call_says_why(monkeypatch):
+    """The note on a refusal names the run-kind reason, not the generic deny reason."""
+    import relay.fleet_toolset as FT
+    monkeypatch.setattr(FT, "mode", lambda: "enforce")
+    monkeypatch.setattr(FT, "_fleet_run_active", lambda: True)
+    ok, note = FT.check("screen_click", "bench")
+    assert not ok
+    assert "desktop" in note, "the refusal should explain the run-kind reason: %r" % note
+
+
+def test_the_bench_harness_declares_the_run_kind_to_its_child():
+    """The one caller that KNOWS it is a bench run must export FLEET_RUN_KIND to the worker it
+    spawns -- otherwise the gateway inside that child has no way to tell, and the distinction
+    is unreachable in the one place it matters."""
+    import ast as _ast, io as _io, os as _os
+    root = _os.path.dirname(_os.path.dirname(_os.path.abspath(__file__)))
+    src = _io.open(_os.path.join(root, "bench", "companionbench", "fleet_agent.py"),
+                   encoding="utf-8").read()
+    code = chr(10).join(l for l in src.splitlines() if not l.strip().startswith("#"))
+    assert 'FLEET_RUN_KIND' in code and '"bench"' in code, (
+        "fleet_agent.py does not export FLEET_RUN_KIND=bench to its worker child")
+    # anchored: the export sits in the child's env dict, next to the other env it sets
+    assert 'env["FLEET_RUN_KIND"]' in code, (
+        "FLEET_RUN_KIND is not written into the child env dict")
