@@ -1169,6 +1169,56 @@ public static class ResidentToolsView
     }
 }
 
+// The host-tunnel-for-external-clients selector's words and parsing, WPF-free. The Python side
+// decides: scripts/supervisor.ps1 asks relay/code_staleness.py host_tunnel_for_external_clients_setting
+// (on|off, default on) every supervisor cycle. on: a Dev Tunnel is hosted and watched even on the
+// connector-less route, because an external client (not a fleet agent) reaches the local server
+// through it. off: the old behaviour, a connector-less route hosts no tunnel. A tunnel already
+// running is never killed either way.
+public static class HostTunnelExternalView
+{
+    //: must equal tools/settings_keys.py and relay/code_staleness.py KEY / DEFAULT / MODES.
+    public const string Key = "host_tunnel_for_external_clients";
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one host_tunnel_for_external_clients= line; null when the line is
+    /// not that key or the value is not off|on (the caller keeps its value, on). A byte order mark
+    /// is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "外部クライアント用トンネルの常時ホスト" : "Host a tunnel for external clients"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ(コネクタ経路のときだけ)" : "Off (only on the connector route)";
+        if (mode == "on") return ja ? "オン(経路に関わらず)" : "On (whatever the route)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "エージェント自身のツール経路(コネクタ有/無)とは別に、外部のクライアント(別のセッションなど)がこのPCのローカルサーバーへ Dev Tunnel 経由で接続するためのホストを、常に維持するかどうかです。オンだと、コネクタなし経路でもスーパーバイザーがトンネルをホストし監視します。オフだと旧来の挙動(コネクタなし経路ではトンネルを立てない)に戻ります。既にあるトンネルはどちらでも止めません。"
+                  : "Whether to keep hosting a Dev Tunnel so an external client (a separate session, say) can reach this PC's local server, independently of the route the agent itself uses for tools. On: the supervisor hosts and watches the tunnel even on the connector-less route. Off: the old behaviour, a connector-less route hosts no tunnel. A tunnel already running is left alone either way.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次のスーパーバイザー周期で反映。再起動不要。"
+                  : "Applies on the next supervisor cycle, no restart.";
+    }
+}
+
 // The read-only result-cache selector's words and parsing, WPF-free. The Python side decides:
 // relay/result_cache.py reads `result_cache` at every read-only tool call and, for `shadow`,
 // records beside the real call whether a cache would have served the same answer and the time it
