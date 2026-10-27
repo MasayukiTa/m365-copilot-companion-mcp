@@ -177,19 +177,6 @@ SETTING_DEFAULT = DEFAULT
 _mode_cache = {}
 
 
-def continue_enabled(value):
-    """設定値(文字列)から、作用目標の言い換え再投入が有効かを返す。既定(None/空)はオン。
-
-    "off" / "0" / "false" / "no" を無効とみなし、それ以外(既定 "on" を含む)は有効。
-    """
-    if value is None:
-        return True
-    s = str(value).strip().lower()
-    if s == "":
-        return True
-    return s not in ("off", "0", "false", "no")
-
-
 def _settings_path(path=None):
     if path:
         return str(path)
