@@ -184,14 +184,18 @@ def test_a_paraphrase_of_a_pending_goal_is_also_accepted_and_notes_it(
 
 def test_a_paraphrase_of_a_running_goal_is_still_refused_when_the_guard_is_on(
         isolated_state, monkeypatch):
-    """The old judgement is kept behind fleet_submit_dup_guard: turned on, a paraphrase of the
-    running goal is refused exactly as before and the refusal names the running job. Pinned on
-    by patching _dup_guard_on so this proves the similarity logic, not settings-file parsing."""
+    """Content resemblance never refuses a submission, even with fleet_submit_dup_guard on
+    (owner order 2026-10-26/27). A paraphrase of the running goal is QUEUED; the guard only
+    makes the resemblance observable (possible_duplicate_of names the running job), it does not
+    stop the job. Pinned on by patching _dup_guard_on so this proves the similarity logic, not
+    settings-file parsing."""
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", _ORIGINAL)])
     out = FI.fleet_submit(_PARAPHRASE)
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == [], "a refused goal must not be queued"
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1, "the paraphrase must be queued, not refused"
+    assert jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs
 
 
 def test_a_genuinely_different_goal_is_accepted_even_with_something_in_flight(isolated_state):
