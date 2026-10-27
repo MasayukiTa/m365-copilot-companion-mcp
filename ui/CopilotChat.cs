@@ -550,7 +550,24 @@ partial class ChatWindow : Window, IChatSendEffects
 
         // ① watch for the cockpit asking to open a parallel-task conversation here, and
         // sync the session-shared conversation registry (fleet + chat conversations).
-        try { _openMtime = File.Exists(_openPath) ? File.GetLastWriteTimeUtc(_openPath).Ticks : 0; }
+        // Normally seed _openMtime to the current open.json so only CHANGES after launch are
+        // acted on -- otherwise every start would replay whatever conversation was last opened.
+        // EXCEPTION: when the cockpit starts this chat for a card Open (EnsureMainChatRunning in
+        // ui/FleetCockpit.Commands.cs), it writes open.json an instant before/after we launch, so
+        // that request is only seconds old. Treat a FRESH open.json (<= 10s) as unseen by leaving
+        // _openMtime at 0, so the first CheckOpenRequest tick opens the surface the user clicked.
+        // A STALE open.json (older than that, i.e. a previous session's leftover) is seeded as
+        // already-seen and ignored -- so a plain launch does not reopen an old conversation.
+        try
+        {
+            if (File.Exists(_openPath))
+            {
+                long t = File.GetLastWriteTimeUtc(_openPath).Ticks;
+                bool fresh = (DateTime.UtcNow.Ticks - t) <= TimeSpan.FromSeconds(10).Ticks;
+                _openMtime = fresh ? 0 : t;
+            }
+            else _openMtime = 0;
+        }
         catch { _openMtime = 0; }
         try { _settingsMtime = File.Exists(SettingsFile) ? File.GetLastWriteTimeUtc(SettingsFile).Ticks : 0; }
         catch { _settingsMtime = 0; }
