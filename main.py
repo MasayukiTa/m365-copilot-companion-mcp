@@ -1,3 +1,4 @@
+import asyncio
 import hmac
 import os
 import time
@@ -579,11 +580,11 @@ async def health(request: Request) -> JSONResponse:
     #
     # The decision itself is scripts/stale_server_check.classify_staleness -- pure and
     # pytest-covered -- so this cannot drift from what those tests assert.
-    payload.update(_server_identity())
-    payload.update(_auth_stats_summary())
+    payload.update(await asyncio.to_thread(_server_identity))
+    payload.update(await asyncio.to_thread(_auth_stats_summary))
     # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
-    payload.update(_self_test_summary())
-    payload.update(_tool_probe_summary())
+    payload.update(await asyncio.to_thread(_self_test_summary))
+    payload.update(await asyncio.to_thread(_tool_probe_summary))
     # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
     # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
     # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
@@ -592,7 +593,7 @@ async def health(request: Request) -> JSONResponse:
     # None means "no calls lately", which is not a failure.
     try:
         from tools.fleet_tool_health import get_summary as _fleet_tool_summary
-        payload.update(_fleet_tool_summary())
+        payload.update(await asyncio.to_thread(_fleet_tool_summary))
     except Exception:
         pass
     return JSONResponse(payload)
@@ -1514,7 +1515,7 @@ def _is_local_self_test(scope) -> bool:
     return bool(is_local)
 
 
-def _observe_inbound(scope, receive):
+async def _observe_inbound(scope, receive):
     """Return a `receive` that passes every message through untouched while noting the JSON-RPC
     method of the request (tools.obs_log -> .fleet/mcp_inbound.jsonl). Only method names and the
     tools/call tool name are kept; no body, argument or header value other than a hashed
@@ -1552,7 +1553,7 @@ def _observe_inbound(scope, receive):
     try:
         http_method = str(scope.get("method") or "")
         if http_method != "POST":
-            _finish([("HTTP " + http_method, "")])
+            await asyncio.to_thread(_finish, [("HTTP " + http_method, "")])
             return receive
     except Exception:
         return receive
@@ -1572,22 +1573,22 @@ def _observe_inbound(scope, receive):
                 if not message.get("more_body"):
                     from tools import obs_log
                     if state["over"]:
-                        _finish([("(oversize)", "")])
+                        await asyncio.to_thread(_finish, [("(oversize)", "")])
                     else:
                         _body = bytes(state["buf"])
-                        _finish(obs_log.methods_from_body(_body),
-                                obs_log.extras_from_body(_body))
+                        await asyncio.to_thread(_finish, obs_log.methods_from_body(_body),
+                                                obs_log.extras_from_body(_body))
             elif not state["done"] and message.get("type") == "http.disconnect":
-                _finish([("(disconnect-before-body)", "")])
+                await asyncio.to_thread(_finish, [("(disconnect-before-body)", "")])
         except Exception:
             pass
         return message
 
-    def _flush_unread(status):
+    async def _flush_unread(status):
         # A response started although the body was never read (auth rejected it first): still
         # worth one line, so "client reached us and was refused" is distinguishable from silence.
         try:
-            _finish([("(body-unread status=%s)" % status, "")])
+            await asyncio.to_thread(_finish, [("(body-unread status=%s)" % status, "")])
         except Exception:
             pass
 
@@ -1661,7 +1662,7 @@ class _BearerPrefix:
             await self.app(scope, receive, send)
             return
 
-        receive = _observe_inbound(scope, receive)
+        receive = await _observe_inbound(scope, receive)
 
         async def _send_and_observe(message):
             # Observe the response status BEFORE forwarding it -- never delay or
@@ -1671,7 +1672,7 @@ class _BearerPrefix:
                 if message.get("type") == "http.response.start":
                     _fl = getattr(receive, "flush_unread", None)
                     if _fl is not None:
-                        _fl(message.get("status"))
+                        await _fl(message.get("status"))
             except Exception:
                 pass
             try:
