@@ -194,3 +194,44 @@ def test_revision_is_snapshotted_before_process_launch():
     assert r.token_for("A") == newer_token
     assert r.template_for("A").gpt_id == "T_agent.new"
     assert mgr.stats()["discarded"] == 1
+
+
+# ---- 期限の前に更新する（やること3-a）------------------------------------------------------
+#
+# 2026-10-26 10:34 の一斉失効は、艦隊全員が同じ page の 1 本のトークンを共有し exp がほぼ同一
+# だったために起きた。だから「失効してから捕まえ直す」では全員が同時に落ちる。refresh margin
+# （既定 600s）を切った時点で、まだ余命があるうちに更新を始めていなければならない。consider は
+# no-turn の light capture を独立プロセスで起動するだけで、艦隊 sweep を一切ブロックしない。
+
+
+def _install(route, agent, seconds):
+    """余命 seconds のトークンと本物の形のテンプレートを route に入れる。"""
+    tpl = RequestTemplate({"gptId": "x"}, {"threadLevelGptId": {"id": "T_agent.x"}})
+    assert route.install_capture(_token(seconds), tpl, agent)
+
+
+def test_a_token_inside_the_refresh_margin_is_renewed_before_it_expires():
+    """余命はまだあるが margin を切ったトークンでは、失効を待たず更新を起動する。"""
+    from relay.socket_capture_async import AsyncCaptureManager
+    fac = _Factory(delay=0.02)
+    mgr = AsyncCaptureManager(popen=fac, interval_s=120, timeout_s=2, log=lambda _m: None)
+    r = _route()                                   # refresh_margin_s は既定 600
+    _install(r, "A", 500)                           # margin 未満。ただし未失効（余命 500s）
+    assert r.needs_refresh("A") is True
+    assert r.token_life("A") > 0, "まだ失効していない＝『期限の前』であることの保証"
+    assert mgr.consider(r, "A", "http://localhost:9222") is True
+    assert len(fac.calls) == 1, "margin を切ったのに更新を起動していない"
+    _wait_done(mgr)
+
+
+def test_a_token_with_ample_life_is_not_renewed():
+    """対照群。margin より十分に余命があるトークンは更新しない（無駄打ちしない）。
+    『期限の前に更新』が『常に更新』に広がっていないことの保証。"""
+    from relay.socket_capture_async import AsyncCaptureManager
+    fac = _Factory(delay=0.02)
+    mgr = AsyncCaptureManager(popen=fac, interval_s=120, timeout_s=2, log=lambda _m: None)
+    r = _route()
+    _install(r, "A", 1800)                          # margin(600) より十分長い
+    assert r.needs_refresh("A") is False
+    assert mgr.consider(r, "A", "http://localhost:9222") is False
+    assert fac.calls == [], "余命が十分あるのに更新を起動している"

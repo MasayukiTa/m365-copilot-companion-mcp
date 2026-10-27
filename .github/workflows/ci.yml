@@ -127,6 +127,7 @@ jobs:
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
+            relay/test_goal_during_cleanup_window.py \
             scripts/test_status_tool_does_not_mislead.py \
             tools/test_one_settings_file_for_every_context.py \
             tools/test_a_setting_declares_when_it_takes_effect.py \
@@ -152,6 +153,8 @@ jobs:
             tools/overnight/test_overnight_report.py \
             tools/overnight/test_overnight_queue.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
+            tools/test_a_shared_tail_of_common_rules_is_not_a_duplicate.py \
+            tools/test_a_short_request_that_names_a_different_thing_is_not_a_duplicate.py \
             tests/test_security_state_is_not_readable.py \
             tests/test_git_shared_guard.py \
             tests/test_dedicated_root_guard.py \
@@ -232,6 +235,7 @@ jobs:
             tools/test_a_rule_stated_twice_must_be_pinned_once.py \
             relay/test_fleet_handoff.py \
             relay/test_priority_survives_every_delivery_route.py \
+            relay/test_resume_conv_survives_every_delivery_route.py \
             relay/test_fanout_family_view.py \
             relay/test_family_view.py \
             relay/test_family_view_nesting.py \
@@ -308,11 +312,13 @@ jobs:
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
+            ui/test_a_submitted_card_waits_for_the_run_to_be_accepted.py \
             ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py \
             ui/test_clear_history_never_drops_unfinished_work.py \
             ui/test_the_effort_policy_says_what_is_in_effect.py \
             ui/test_content_details_spine.py \
             ui/test_submitted_history_reconciliation.py \
+            ui/test_the_submit_box_clears_the_moment_a_run_is_spawned.py \
             ui/test_stale_submitted_tasks_are_observable.py \
             ui/test_goal_summary_display.py \
             ui/test_fleet_status_colors_preserved.py \
@@ -395,8 +401,11 @@ jobs:
             relay/test_no_test_writes_into_the_operators_approval_queue.py \
             relay/test_the_panel_shows_the_floor_the_run_uses.py \
             relay/test_a_floor_says_where_it_came_from.py \
+            relay/test_floor_warning_tracks_the_disagreement.py \
+            relay/test_status_json_powershell_safe.py \
             ui/test_a_warning_that_is_always_on_is_not_a_warning.py \
             ui/test_the_last_setting_is_reachable.py \
+            ui/test_the_list_scrolls_to_the_end_after_a_clear.py \
             ui/test_an_answer_does_not_rewrap_when_it_settles.py \
             ui/test_the_same_decision_does_not_flood_the_approval_history.py \
             relay/test_a_kept_for_claim_names_a_real_consumer.py \
@@ -1028,7 +1037,8 @@ jobs:
             relay/test_workspace_clone_retention.py \
             scripts/test_bootstrap_pip_tls.py \
             tests/test_reload_main_leaves_a_restore_behind.py \
-            tools/test_reldisc.py
+            tools/test_reldisc.py \
+            tests/test_owner_verbatim_realuse.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py

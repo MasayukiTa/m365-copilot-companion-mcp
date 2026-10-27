@@ -4445,7 +4445,18 @@ class Handler(BaseHTTPRequestHandler):
                 finally:
                     PAGE_LOCK.release()
 
-            threading.Thread(target=_promote, name="send-promote", daemon=True).start()
+            # ONLY PROMOTE WHEN THERE IS A PAGE TO PROMOTE ONTO. The promotion runs on its
+            # own thread and reaches the page via run_on_page_thread; with no page-owner thread
+            # (PAGE is None or PAGE_EXECUTOR not alive) that call raises at once -- the same
+            # condition release_resident_page() already guards against at line ~1777. Starting
+            # the thread anyway was a race against this very response: on a slow host the
+            # daemon's startup overlapped self.wfile.write() in _json below, and the aborted
+            # write surfaced to the client as a timeout (WinError 10053) -- the flaky failure
+            # of ui/test_the_bridge_client_sends_the_token.py's real_bridge cases, where the
+            # page layer is stubbed out entirely. When no page can run it, the message simply
+            # stays queued, which is exactly what the reply below already says can happen.
+            if PAGE is not None and PAGE_EXECUTOR.alive():
+                threading.Thread(target=_promote, name="send-promote", daemon=True).start()
 
             self._json({
                 "ok": True, "queued": True, "sid": sid,

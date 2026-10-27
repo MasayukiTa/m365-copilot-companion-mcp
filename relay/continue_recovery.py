@@ -24,8 +24,8 @@ never executed anything. What can go wrong is therefore a short list, and each i
     -- invisible to the ledger                              NATIVE= line. Not fully closable; see
                                                             the design note, section 4.
 
-DEFAULT OFF (`socket_continue_recovery`). With it off nothing in this module runs on the wire:
-`Conversation.ask` keeps no journal, adds no ref, wraps no tool.
+DEFAULT ON (`socket_continue_recovery`). With it off (set `socket_continue_recovery=off`) nothing
+in this module runs on the wire: `Conversation.ask` keeps no journal, adds no ref, wraps no tool.
 """
 from __future__ import annotations
 
@@ -37,7 +37,7 @@ import time
 import uuid
 
 KEY = "socket_continue_recovery"
-DEFAULT = "off"
+DEFAULT = "on"
 
 #: A refusal by the continue turn itself starts with this. The fleet reads it to stop: no resend,
 #: no new conversation.
@@ -88,7 +88,7 @@ def _settings_path(path=None):
 
 
 def mode(path=None) -> str:
-    """`on` or `off`, from settings.txt. Anything but `on` is `off`. Never raises.
+    """`on` or `off`, from settings.txt. Default on; anything but an explicit `off` is `on`. Never raises.
 
     One os.stat per read and a re-read only when the file changed, so a change made in the cockpit
     reaches the next decision with no restart (declared each_gate in tools/settings_keys.py).

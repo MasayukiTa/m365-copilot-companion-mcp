@@ -65,9 +65,62 @@ partial class SelfImproveDashboardWindow : Window
     // FIX 1: regeneration throttle
     DateTime _lastRegen = DateTime.MinValue;
 
-    static readonly string SettingsFile = Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
-        "copilot-bridge", "settings.txt");
+    // The same two-location rule as FleetCockpit / CopilotChat / ApprovalPrompt and
+    // tools/settings_path.py: read the repo's .config/settings.txt when it exists (every
+    // context -- inside or outside the MSIX package -- resolves the repo identically), fall
+    // back to the retired %APPDATA% copy while a machine is mid-migration, and ALWAYS WRITE
+    // the new location. This window used to hard-code the %APPDATA% path alone, so the theme/
+    // language it saved landed in a package-private copy no coordinator reads -- the same
+    // panel-writes-one-file, run-reads-another split the shared resolver exists to close.
+    static string SettingsFileNew
+    { get { return Path.Combine(RepoRootForSettings(), ".config", "settings.txt"); } }
+
+    static string SettingsFileOld
+    {
+        get
+        {
+            string app = Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData);
+            if (string.IsNullOrEmpty(app))
+                return Path.Combine(
+                    Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
+                    ".copilot-bridge", "settings.txt");
+            return Path.Combine(app, "copilot-bridge", "settings.txt");
+        }
+    }
+
+    static string SettingsFile
+    {
+        get
+        {
+            try { if (File.Exists(SettingsFileNew)) return SettingsFileNew; } catch (Exception) { }
+            try { if (File.Exists(SettingsFileOld)) return SettingsFileOld; } catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string SettingsFileForWrite
+    {
+        get
+        {
+            try { Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileNew)); }
+            catch (Exception) { }
+            return SettingsFileNew;
+        }
+    }
+
+    static string RepoRootForSettings()
+    {
+        try
+        {
+            string exe = System.Reflection.Assembly.GetExecutingAssembly().Location;
+            DirectoryInfo d = new DirectoryInfo(Path.GetDirectoryName(exe));
+            while (d != null && !Directory.Exists(Path.Combine(d.FullName, ".fleet")))
+                d = d.Parent;
+            if (d != null) return d.FullName;
+        }
+        catch (Exception) { }
+        return Directory.GetCurrentDirectory();
+    }
 
     readonly string _jsonPath;
     DispatcherTimer _timer;

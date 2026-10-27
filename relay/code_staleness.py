@@ -27,6 +27,10 @@ SELF_RESTART_KEY = "supervisor_self_restart"
 SELF_RESTART_DEFAULT = "on"
 SELF_RESTART_MODES = ("off", "on")
 
+HOST_TUNNEL_KEY = "host_tunnel_for_external_clients"
+HOST_TUNNEL_DEFAULT = "on"
+HOST_TUNNEL_MODES = ("off", "on")
+
 #: Files whose change makes a running supervisor stale. supervisor.ps1 dot-sources the second.
 SUPERVISOR_CODE_FILES = ("scripts/supervisor.ps1", "scripts/tunnel_name_util.ps1")
 
@@ -58,6 +62,29 @@ def self_restart_setting():
         return v if v in SELF_RESTART_MODES else SELF_RESTART_DEFAULT
     except Exception:
         return SELF_RESTART_DEFAULT
+
+
+def host_tunnel_for_external_clients_setting():
+    """The `host_tunnel_for_external_clients` setting, "on" or "off". Read from settings.txt on
+    every call; absent, empty or unrecognised means the default, on. Never raises.
+
+    on: the supervisor hosts and watches a Dev Tunnel even on the connector-less route, because an
+    EXTERNAL client (not a fleet agent) reaches the local server through that tunnel; whether a
+    tunnel is wanted is therefore independent of the agent's own tool_transport. off: the old
+    behaviour -- a connector-less route hosts no tunnel."""
+    try:
+        from tools.settings_path import settings_file
+        path = settings_file()
+        raw = None
+        if os.path.isfile(path):
+            with open(path, encoding="utf-8-sig") as fh:
+                for ln in fh.read().splitlines():
+                    if ln.startswith(HOST_TUNNEL_KEY + "="):
+                        raw = ln.split("=", 1)[1]
+        v = (raw or "").strip().lower()
+        return v if v in HOST_TUNNEL_MODES else HOST_TUNNEL_DEFAULT
+    except Exception:
+        return HOST_TUNNEL_DEFAULT
 
 
 def file_sha256(path):

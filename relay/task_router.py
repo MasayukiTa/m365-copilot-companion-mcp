@@ -791,6 +791,69 @@ def fleet_is_live(state_dir=None) -> bool:
     return _active_marker_process_alive(sd)
 
 
+def fleet_accepting_goals(state_dir=None) -> bool:
+    """Whether a live fleet is still READING its command channel, as opposed to merely having a
+    process alive.
+
+    fleet_is_live() answers "is a run in flight" -- true for the whole post-run cleanup window,
+    because the process is alive and status.json's mtime is still fresh (see its docstring and
+    _active_marker_process_alive). But once run_relay_fleet has returned, fleet_runner's
+    on_tick/_drain_commands no longer run, so a goal add_goal'd now is written into a channel
+    that will never be drained and sits "dispatched" until the 90s landing-ack grace expires.
+    fleet_runner._mark_not_accepting_goals stamps `accepting_goals: False` the instant that
+    window opens; this reads it so fleet_handoff can route such a goal to autostart instead.
+
+    OLD STATUS FILES ARE TREATED AS BEFORE. A run started before this field existed writes no
+    `accepting_goals` key, and a missing/stale/unreadable status.json carries no stamp either --
+    in every one of those cases this returns True, so the behaviour for a goal arriving at a
+    genuinely live, draining fleet is exactly what it was. Only an EXPLICIT False -- written by a
+    run that has reached the stop-accepting point -- diverts the goal. That keeps a mixed
+    old/new deployment safe: the feature can only ADD the autostart route, never remove the
+    add_goal one from a fleet that is still reading.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if os.path.isfile(sp) and (time.time() - os.path.getmtime(sp)) <= FLEET_LIVE_MAX_AGE_S:
+            with open(sp, encoding="utf-8-sig") as fh:
+                snap = json.load(fh)
+            if isinstance(snap, dict) and snap.get("accepting_goals") is False:
+                return False
+    except Exception:
+        pass
+    return True
+
+
+def _fleet_stopped_reading(state_dir=None) -> bool:
+    """Whether the current status.json shows a run that has STOPPED reading its command channel.
+
+    Used by _reconcile_landings to cut the landing-ack grace short. Returns True only on a
+    readable status.json that EXPLICITLY says the run is done reading -- `accepting_goals` is
+    False (the stamp fleet_runner writes the instant its sweep loop exits) OR `running` is False
+    (the final snapshot). Either way on_tick/_drain_commands will not run again, so a goal still
+    unacked will never be read by this run and there is nothing to wait for.
+
+    CONSERVATIVE BY DESIGN. A missing, stale, or unreadable status.json, or one that still looks
+    live (no accepting_goals stamp and running:True), returns False -- the full grace is kept,
+    exactly as before this check existed. An old run that predates the accepting_goals stamp
+    still flips running:False in its final snapshot, so even a mixed deployment gets the early
+    cut once the run has truly finished, while never cutting it on a fleet that might still take
+    the goal.
+    """
+    sd = state_dir or FLEET_STATE_DIR
+    try:
+        sp = os.path.join(sd, "status.json")
+        if not os.path.isfile(sp):
+            return False
+        with open(sp, encoding="utf-8-sig") as fh:
+            snap = json.load(fh)
+    except Exception:
+        return False
+    if not isinstance(snap, dict):
+        return False
+    return snap.get("accepting_goals") is False or snap.get("running") is False
+
+
 def _active_marker_process_alive(state_dir) -> bool:
     """Fallback liveness read for a stale/unreadable status.json: is the pid recorded in
     fleet_runner's `fleet_run_active.json` still running? Never raises; a missing/corrupt
@@ -924,7 +987,8 @@ def read_ack_receipt(jid: str, state_dir=None):
 
 
 def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
-                           entry: dict = None, jid: str = None) -> None:
+                           entry: dict = None, jid: str = None,
+                           resume_conv: str = "") -> None:
     """Append a goal to the running fleet's command channel.
 
     utf-8 with no BOM on the way out and utf-8-sig on the way in, matching code_task.py: the
@@ -945,6 +1009,13 @@ def add_goal_to_live_fleet(goal: str, state_dir=None, priority: bool = False,
     """
     sd = state_dir or FLEET_STATE_DIR
     item = dict(entry) if entry else {"text": goal, "priority": bool(priority)}
+    # resume_conv ON THE ITEM, so goals_from_command (relay.fleet_runner) copies it onto the
+    # goal dict it builds and RelayWorker resumes that conversation instead of guessing one by
+    # goal text. Only set when a caller passed one AND did not supply its own `entry` (code_task
+    # builds the whole dict itself); added without clobbering an entry that already carries it.
+    resume_conv = (resume_conv or "").strip()
+    if resume_conv and not item.get("resume_conv"):
+        item["resume_conv"] = resume_conv
     patch = {"add_goal": [item]}
     if jid:
         patch["ack"] = _ack_path(jid, sd)
@@ -1629,7 +1700,7 @@ def recover_failed_autostart(state_dir=None, now=None) -> list:
 
 
 def read_for_fleet(text: str) -> tuple:
-    """A parked file's contents as (goal, priority). The inverse of `_write_for_fleet`.
+    """A parked file's contents as (goal, priority, resume_conv). Inverse of `_write_for_fleet`.
 
     OLD FILES ARE PLAIN TEXT AND MUST KEEP WORKING. Anything already sitting in for_fleet/
     when this shipped is a bare goal, and so is every goal parked without a field worth
@@ -1640,6 +1711,9 @@ def read_for_fleet(text: str) -> tuple:
     A goal whose own text begins with a brace is not mistaken for one: the parse has to
     succeed AND produce a mapping with a `text` in it, and anything else falls back to
     treating the whole contents as the goal, which is what it is.
+
+    `resume_conv` joined `priority` as a carried field: the JSON shape is written whenever
+    EITHER is present, and a plain-text file (no field to carry) reads back as resume_conv "".
     """
     body = text or ""
     if body.lstrip().startswith("{"):
@@ -1648,11 +1722,12 @@ def read_for_fleet(text: str) -> tuple:
         except ValueError:
             obj = None
         if isinstance(obj, dict) and isinstance(obj.get("text"), str):
-            return obj["text"], bool(obj.get("priority"))
-    return body, False
+            return (obj["text"], bool(obj.get("priority")),
+                    str(obj.get("resume_conv") or ""))
+    return body, False, ""
 
 
-def _write_for_fleet(jid, goal, priority: bool = False) -> bool:
+def _write_for_fleet(jid, goal, priority: bool = False, resume_conv: str = "") -> bool:
     """Put a waiting goal on disk so a reader never sees half of one. Returns whether it landed.
 
     THE EMPTY CHECK WAS NOT A TORN-WRITE CHECK. `_deliver_waiting_goals` skips a file whose
@@ -1673,8 +1748,18 @@ def _write_for_fleet(jid, goal, priority: bool = False) -> bool:
     # JSON ONLY WHEN THERE IS SOMETHING TO CARRY. A parked goal used to be its text and
     # nothing else, so any field the door accepts was lost the moment no fleet was running --
     # the same goal delivered a second later kept it. `read_for_fleet` reads both shapes.
-    body = json.dumps({"text": goal, "priority": True}, ensure_ascii=False) if priority \
-        else goal
+    # resume_conv is a second carried field: the JSON shape is written whenever EITHER priority
+    # or resume_conv is present, so a parked continuation keeps its conversation id the same way
+    # a parked priority goal keeps its place in line. Plain text stays the default for the
+    # common case that carries neither.
+    resume_conv = (resume_conv or "").strip()
+    if priority or resume_conv:
+        obj = {"text": goal, "priority": bool(priority)}
+        if resume_conv:
+            obj["resume_conv"] = resume_conv
+        body = json.dumps(obj, ensure_ascii=False)
+    else:
+        body = goal
     try:
         with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
             fh.write(body)
@@ -1698,16 +1783,20 @@ def _write_for_fleet(jid, goal, priority: bool = False) -> bool:
     return False
 
 
-def _park_in_for_fleet(goal, jid, priority=False):
+def _park_in_for_fleet(goal, jid, priority=False, resume_conv: str = ""):
     """Write the goal into for_fleet/<jid>.txt so a waiting goal is visible on disk, not just
     named in a status string. Returns the handoff path label either way. Best-effort: a goal
     the queue cannot see is the very failure this module exists to prevent, but if the write
-    itself fails the caller still reports "waiting" rather than a false "delivered"."""
-    _write_for_fleet(jid, goal, priority=priority)
+    itself fails the caller still reports "waiting" rather than a false "delivered".
+
+    resume_conv is carried through to the parked file so a continuation that waits for a fleet
+    keeps its conversation id, the same way priority is carried."""
+    _write_for_fleet(jid, goal, priority=priority, resume_conv=resume_conv)
     return "for_fleet/%s.txt" % jid
 
 
-def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
+def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False,
+                  resume_conv: str = ""):
     """Deliver a fleet-bound goal. Returns the (status, result) the job record should carry.
 
     `priority` HAS TO SURVIVE ALL THREE ROUTES OR IT IS A LIE ON ONE OF THEM. A goal leaves
@@ -1716,20 +1805,37 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
     silently dropped by whichever route the machine happened to take. That is the shape
     resume_conv had: set at one end, read at the other, lost in between, and working on one
     path while guessing on another.
+
+    `resume_conv` NOW TRAVELS THE SAME THREE ROUTES, by the same discipline. It names an
+    existing conversation the worker should continue, and it has to reach the goal item as
+    `resume_conv` whether the goal joins a live fleet (add_goal item), starts one (autostart
+    goal dict) or waits in for_fleet/ (parked JSON) -- otherwise a continuation delivered by
+    one route works and by another silently starts a fresh conversation, which is exactly the
+    bug this is closing. Empty means "start fresh", and nothing is added on any route then.
     """
+    resume_conv = (resume_conv or "").strip()
     if not (goal or "").strip():
         return "error", {"handoff": "for_fleet/%s.txt" % jid, "detail": "empty goal"}
     if is_local_loop_control_submission(goal):
         return "refused", {"handoff": "for_fleet/%s.txt" % jid, "refused": True,
                            "detail": "LOCAL_LOOP control envelope is not Fleet work"}
-    if fleet_is_live(state_dir):
+    # LIVE AND STILL READING ITS CHANNEL. fleet_is_live() alone is True for the whole post-run
+    # cleanup window -- the process is alive and status.json's mtime is fresh -- but during that
+    # window on_tick/_drain_commands no longer run, so an add_goal here lands in a channel that
+    # will never be drained and sits "dispatched" until the 90s ack grace expires (~2 min).
+    # fleet_accepting_goals() reads the `accepting_goals: False` stamp fleet_runner writes the
+    # instant that window opens, so a goal arriving then falls through to the autostart block
+    # below instead. An old status.json without the stamp reads as accepting, so a genuinely
+    # live, draining fleet still takes the add_goal path exactly as before.
+    if fleet_is_live(state_dir) and fleet_accepting_goals(state_dir):
         # Clear any stale receipt for this id before queueing, so a confirmation seen later
         # belongs to THIS handoff and not a previous run's leftover file.
         try:
             os.remove(_ack_path(jid, state_dir))
         except OSError:
             pass
-        add_goal_to_live_fleet(goal, state_dir, priority=priority, jid=jid)
+        add_goal_to_live_fleet(goal, state_dir, priority=priority, jid=jid,
+                               resume_conv=resume_conv)
         # RECORD THE OPEN CLAIM so a later pass can check it. "dispatched" is written to done/
         # now, but done/ is terminal -- nothing re-reads it -- so on its own it can never be
         # corrected when the fleet turns out to have died inside the stale-status window. This
@@ -1763,21 +1869,30 @@ def fleet_handoff(goal: str, jid: str, state_dir=None, priority: bool = False):
             # above -- _read_goals_file() keeps a JSON-object goal line verbatim, so this
             # survives into the cold-started fleet's Worker unchanged. Without it, a goal
             # delivered via autostart could never be joined back to its admission record.
-            out = autostart_fleet([{"text": goal, "jid": jid,
-                                    "priority": bool(priority)}], state_dir)
+            # resume_conv carried into the goal dict exactly as jid/priority are: autostart
+            # writes these dicts verbatim into the run's goals-file (one JSON object per line)
+            # and _read_goals keeps every recognised key, so a continuation cold-starts a fleet
+            # that resumes the right conversation instead of opening a new one. Omitted when
+            # empty so an ordinary goal's dict is unchanged.
+            out = autostart_fleet([dict({"text": goal, "jid": jid,
+                                         "priority": bool(priority)},
+                                        **({"resume_conv": resume_conv}
+                                           if resume_conv else {}))], state_dir)
             if out.get("ok"):
                 return "dispatched", {"handoff": "for_fleet/%s.txt" % jid,
                                       "delivered": "autostart",
                                       "note": "started a fleet for this goal (pid %s)"
                                               % out.get("pid")}
-            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority),
+            return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority,
+                                                                     resume_conv),
                                       "note": "autostart could not start a fleet: %s"
                                               % out.get("detail")}
-        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority), "note": why}
+        return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority,
+                                                                resume_conv), "note": why}
     # SAYS IT IS WAITING, rather than "dispatched". The old wording claimed delivery for a
     # file nobody read, and a status that overstates what happened is how a queue goes
     # unnoticed for months.
-    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority),
+    return "awaiting_fleet", {"handoff": _park_in_for_fleet(goal, jid, priority, resume_conv),
                               "note": "no fleet run is in flight; the goal waits for one"}
 
 
@@ -1882,9 +1997,19 @@ def _reconcile_landings(now_ts=None, state_dir=None):
             out.append(rec)
             continue
         age = now - float(marker.get("ts", now))
-        if age <= RECONCILE_ACK_GRACE_S:
+        # CUT THE GRACE SHORT WHEN THE RUN HAS PLAINLY STOPPED READING. The 90s grace exists for
+        # a fleet that is alive but slow to drain its command channel. But a run that has reached
+        # its post-sweep cleanup (status.json stamped accepting_goals=False, or already
+        # running=False) will NEVER read this goal -- on_tick/_drain_commands have stopped. In
+        # that case waiting out the remaining grace just adds dead time before the re-queue, so
+        # re-queue now. A status that still looks live (no stamp, running:True), or one we cannot
+        # read, keeps the full grace -- the old behaviour -- so this only ever shortens the wait
+        # for a run that has demonstrably finished reading, never re-queues out from under a
+        # fleet that might still take the goal.
+        if age <= RECONCILE_ACK_GRACE_S and not _fleet_stopped_reading(state_dir):
             continue  # live-but-slow fleet may still read it; do not re-queue yet
-        # Past the grace with no ack: the goal was lost into the stale-status window. Put it
+        # Past the grace (or the run has stopped reading) with no ack: the goal was lost into
+        # the stale-status window. Put it
         # back on the waiter channel so a live fleet picks it up again, this time with an ack
         # we can confirm. Written before the marker is removed, so a crash between the two
         # leaves a waiter (re-tried) rather than nothing (lost).
@@ -2329,12 +2454,17 @@ def run_job(job, now_ts=None):
             # "dispatched" and names how; a goal that was not leaves one, and every drain pass
             # tries the waiting ones again while a fleet is live.
             prio = bool(payload.get("priority"))
-            rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio)
+            # resume_conv read off the payload the door wrote and threaded through handoff, so a
+            # continuation submitted through fleet_submit reaches the fleet as a continuation.
+            resume_conv = str(payload.get("resume_conv") or "")
+            rec["status"], rec["result"] = fleet_handoff(goal, jid, priority=prio,
+                                                          resume_conv=resume_conv)
             if rec["status"] != "dispatched":
                 # fleet_handoff already parked it on every non-dispatched path, carrying the
-                # priority with it; this second write is the belt to that braces and must
-                # carry the same field or it would overwrite the parked copy with a poorer one.
-                _write_for_fleet(jid, goal, priority=prio)
+                # priority AND resume_conv with it; this second write is the belt to that braces
+                # and must carry the same fields or it would overwrite the parked copy with a
+                # poorer one that has lost the conversation id.
+                _write_for_fleet(jid, goal, priority=prio, resume_conv=resume_conv)
         else:  # claude
             with open(_p("for_claude", "%s.json" % jid), "w", encoding="utf-8") as f:
                 json.dump(job, f, ensure_ascii=False, indent=2)
@@ -2476,7 +2606,7 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
         path = _p("for_fleet", name)
         try:
             with open(path, encoding="utf-8") as fh:
-                goal, parked_priority = read_for_fleet(fh.read())
+                goal, parked_priority, parked_resume_conv = read_for_fleet(fh.read())
         except OSError:
             continue
         jid = name[:-4]
@@ -2509,7 +2639,8 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
             if offered_cold:
                 continue                   # one cold start per pass -- see the docstring
             offered_cold = True
-        status, result = fleet_handoff(goal, jid, state_dir, priority=parked_priority)
+        status, result = fleet_handoff(goal, jid, state_dir, priority=parked_priority,
+                                       resume_conv=parked_resume_conv)
         if status != "dispatched":
             continue                       # still no run; leave it waiting
         # DELETED ONLY AFTER DELIVERY SUCCEEDS. Removing it first would lose the goal if the

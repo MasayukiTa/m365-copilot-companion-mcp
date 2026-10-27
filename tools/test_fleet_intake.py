@@ -256,3 +256,177 @@ def test_redaction_happens_before_the_cap_not_after():
     """Capping first would let a long prefix push the address past the cut and 'pass'."""
     FI.fleet_submit("do a thing", source="x" * 55 + " someone@example.com")
     assert "@" not in _jobs()[0]["origin"]["source"]
+
+
+# -- duplicates are normalised in the background, not refused at the door ------------------------
+#
+# OWNER ORDER 2026-10-26: refusing a goal because it resembles one already in flight turned away
+# DIFFERENT work and was the single biggest source of a person being stopped at the door. The
+# word-overlap guard is now OFF by default (FI.DUP_GUARD_ENABLED is False): a near-duplicate is
+# ACCEPTED and recorded in the background -- a possible_duplicate_of tag on the job and one line in
+# .fleet/dup_notes.jsonl -- and the old refusal is kept only behind the fleet_submit_dup_guard
+# setting. These tests pin that behaviour against the measured incident.
+
+
+@pytest.fixture()
+def dup_state(tmp_path, monkeypatch):
+    """Point the background note's log at a throwaway directory. obs_log writes dup_notes.jsonl in
+    the directory of tool_ledger's ledger path, so moving the ledger moves the note."""
+    from tools import obs_log, tool_ledger
+    monkeypatch.setattr(tool_ledger, "LEDGER_PATH", str(tmp_path / ".fleet" / "tool_events.jsonl"))
+    monkeypatch.setattr(obs_log, "_WARNED", False)
+    return tmp_path
+
+
+def _dup_notes(state):
+    p = state / ".fleet" / "dup_notes.jsonl"
+    if not p.exists():
+        return []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x]
+
+
+def test_two_near_identical_goals_are_both_accepted(monkeypatch, dup_state):
+    """(a) With the guard off (the default), two goals that measure as near-duplicates are BOTH
+    queued. The first has nothing in flight to resemble; the second resembles the first and is
+    still accepted."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
+    goal = "sales.csv を解析して売上の月次推移をまとめ、グラフを作って報告する"
+    out1 = FI.fleet_submit(goal)
+    out2 = FI.fleet_submit(goal)
+    assert "queued" in out1 and "queued" in out2
+    assert "refused" not in out1 and "refused" not in out2
+    assert len(_jobs()) == 2
+
+
+def test_the_second_job_is_tagged_and_a_dup_note_is_written(monkeypatch, dup_state):
+    """(b) The second job carries possible_duplicate_of pointing at the first, with a similarity,
+    and exactly one line lands in .fleet/dup_notes.jsonl naming both."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
+    goal = "sales.csv を解析して売上の月次推移をまとめ、グラフを作って報告する"
+    FI.fleet_submit(goal)
+    first = _jobs()[0]
+    FI.fleet_submit(goal)
+    jobs = _jobs()
+    assert len(jobs) == 2
+    # The first job has no resemblance recorded; the second points back at the first.
+    tagged = [j for j in jobs if "possible_duplicate_of" in j["payload"]]
+    assert len(tagged) == 1, jobs
+    assert tagged[0]["payload"]["possible_duplicate_of"] == first["id"]
+    assert 0.0 < tagged[0]["payload"]["similarity"] <= 1.0
+    notes = _dup_notes(dup_state)
+    assert len(notes) == 1, notes
+    assert notes[0]["possible_duplicate_of"] == first["id"]
+    assert notes[0]["new"] == tagged[0]["id"]
+
+
+def test_a_failing_dup_note_does_not_fail_the_submission(monkeypatch, dup_state):
+    """(c) The background record is after-the-fact and must never fail the submission. We break
+    the ACTUAL write (obs_log.append raises), the way a full disk or a missing directory would,
+    and assert that _note_possible_duplicate swallows it: the goal is still queued, the caller
+    still gets 'queued', and the swallowed error is written to dup_notes_errors.log rather than
+    surfaced or silently dropped."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
+    goal = "sales.csv を解析して売上の月次推移をまとめ、グラフを作って報告する"
+    FI.fleet_submit(goal)
+
+    from tools import obs_log
+
+    def boom(name, row):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(obs_log, "append", boom)
+    # The raise happens inside _note_possible_duplicate, which must catch it.
+    out = FI.fleet_submit(goal)
+    assert "queued" in out
+    assert len(_jobs()) == 2
+    # No dup-notes line was written (the writer failed) ...
+    assert _dup_notes(dup_state) == []
+    # ... but the failure left a trail rather than vanishing.
+    errlog = dup_state / ".fleet" / "dup_notes_errors.log"
+    assert errlog.exists() and "OSError" in errlog.read_text(encoding="utf-8")
+
+
+def test_the_guard_still_refuses_a_near_match_when_turned_on(monkeypatch, dup_state):
+    """(e) Turning fleet_submit_dup_guard on restores the old refusal: the near-duplicate second
+    goal is refused and nothing is queued for it."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
+    goal = "sales.csv を解析して売上の月次推移をまとめ、グラフを作って報告する"
+    FI.fleet_submit(goal)
+    out = FI.fleet_submit(goal)
+    assert "refused" in out and "overlap" in out
+    assert len(_jobs()) == 1
+
+
+def test_the_guard_setting_is_read_from_the_one_settings_file(monkeypatch, tmp_path):
+    """_dup_guard_on reads fleet_submit_dup_guard from the shared settings file; on restores the
+    guard, absent or anything but on leaves it off (DUP_GUARD_ENABLED's compiled default)."""
+    from tools import settings_path as SP
+    sfile = tmp_path / "settings.txt"
+    monkeypatch.setattr(SP, "settings_file", lambda: str(sfile))
+    # absent -> off
+    assert FI._dup_guard_on() is False
+    sfile.write_text("fleet_submit_dup_guard=on\n", encoding="utf-8")
+    assert FI._dup_guard_on() is True
+    sfile.write_text("fleet_submit_dup_guard=off\n", encoding="utf-8")
+    assert FI._dup_guard_on() is False
+    sfile.write_text("fleet_submit_dup_guard=maybe\n", encoding="utf-8")
+    assert FI._dup_guard_on() is False
+
+
+# -- resume_conv: a continuation, not a new task ----------------------------------------------
+#
+# The chat window reads a durable conversation id off the transcript and hands it to this door
+# so the fleet CONTINUES that conversation instead of guessing one by goal text. Two things
+# have to hold for that to work from a phone: the id has to reach the queued job's payload (so
+# the router can thread it to the fleet), and a follow-up -- which is deliberately short and
+# reads like the terse resubmission the duplicate check refuses -- must not be refused for
+# carrying resume_conv.
+
+_GOAL_A = "summarise the Q3 revenue deck and list every open action item by owner and date"
+
+
+def test_resume_conv_rides_on_the_queued_payload():
+    """The id has to survive onto the payload, beside goal/priority, or the router has nothing
+    to thread through its three delivery routes."""
+    out = FI.fleet_submit("continue where we left off", resume_conv="sess:abc123")
+    assert "queued" in out
+    assert _jobs()[0]["payload"]["resume_conv"] == "sess:abc123"
+
+
+def test_an_ordinary_goal_writes_no_resume_conv_key():
+    """'resume_conv not in payload' has to keep meaning 'start fresh', so an ordinary goal's
+    record is unchanged and nothing downstream reads a stray empty id."""
+    FI.fleet_submit("do a thing")
+    assert "resume_conv" not in _jobs()[0]["payload"]
+
+
+def test_a_follow_up_is_not_refused_as_a_near_duplicate(monkeypatch):
+    """THE WHOLE POINT. The first turn sits in pending/; a continuation of the SAME work reads
+    as a near-duplicate of it. Without the exemption the follow-up is refused and the
+    conversation it meant to resume is never answered -- the exact bug this closes. With a
+    resume_conv it goes through, and its own id travels with it.
+
+    The duplicate guard is turned ON for this test so the refusal path actually fires: with the
+    guard off (the 2026-10-26 default) a near-duplicate is accepted in the background rather than
+    refused, which would make the exemption invisible -- there would be nothing for resume_conv
+    to be exempt FROM. resume_conv must skip the duplicate machinery whether the guard is on or
+    off, so pinning it against the guard ON is the stronger check: it proves the id, not the
+    guard's default, is what lets the continuation through."""
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
+    first = FI.fleet_submit(_GOAL_A)
+    assert "queued" in first
+    # A re-worded continuation of the same work, with no resume_conv, is caught as a duplicate.
+    refused = FI.fleet_submit(_GOAL_A + " please")
+    assert "refused" in refused and "overlap" in refused
+    # The SAME near-duplicate, carrying a conversation id, is admitted as a continuation.
+    ok = FI.fleet_submit(_GOAL_A + " please", resume_conv="sess:xyz789")
+    assert "queued" in ok
+    payloads = [j["payload"] for j in _jobs()]
+    assert any(p.get("resume_conv") == "sess:xyz789" for p in payloads)
+
+
+def test_resume_conv_whitespace_is_normalised():
+    """The id is composed elsewhere and relayed here; it is trimmed like the other relayed
+    fields so a stray newline never becomes part of the id the fleet matches on."""
+    FI.fleet_submit("continue", resume_conv="  sess:trim  ")
+    assert _jobs()[0]["payload"]["resume_conv"] == "sess:trim"

@@ -6632,13 +6632,27 @@ class RelayWorker:
                         self.reason = ("サインイン待ち(定型無回答)、専用Edgeの自動表示は失敗 -> 手動でEdgeを"
                                        "前面に出してサインイン後に自動再試行 (%d回)" % self._canned_streak)
                     return
-                # (a2) A CANNED REPLY ON THE FIRST TURNS IS THE CONVERSATION'S FAULT, NOT THE
-                # GOAL'S. Measured 2026-10-15: the same short goal drew it on turn 1 in several
-                # runs and was answered normally in others, connector alive. So: a NEW
-                # conversation and the SAME goal text (never reworded), bounded, with backoff;
-                # only when the bound is spent does it fall to the diagnostics below.
-                if (self.turn - getattr(self, "_fresh_turn_base", 0)) <= CANNED_RETRY_MAX_TURN \
-                        and self._recycle_fresh_conversation("canned"):
+                # (a2) A CANNED REPLY IS THE CONVERSATION'S FAULT, NOT THE GOAL'S. Measured
+                # 2026-10-15: the same short goal drew it on turn 1 in several runs and was
+                # answered normally in others, connector alive. So: a NEW conversation and the
+                # SAME goal text (never reworded), bounded, with backoff; only when the bound is
+                # spent -- the same canned non-answer coming back again and again -- does it fall
+                # to the diagnostics below and become "needs attention".
+                #
+                # ON ANY TURN, NOT JUST THE FIRST TWO. A non-answer on turn 3 is no more the
+                # goal's fault than one on turn 1, so it is re-queued in a fresh conversation just
+                # the same. The OLD gate `(turn - base) <= CANNED_RETRY_MAX_TURN` filed every
+                # later non-answer straight to stuck without trying a replay.
+                #
+                # THE ONE HAZARD A REPLAY MUST AVOID IS A DUPLICATE SIDE EFFECT. If the goal ACTS
+                # on the world (`_goal_may_act`) the model may already have performed that act in
+                # the conversation we are about to abandon, and the SAME goal text in a new chat
+                # would do it a second time (transport_policy's landed-act concern). So an acting
+                # goal is NOT replayed in a fresh conversation here -- it falls to the existing
+                # per-conversation recovery/diagnostics below, which keep the careful refuse-on-
+                # landed default. A read-only goal carries no such hazard and is replayed whatever
+                # the turn.
+                if not self._goal_may_act() and self._recycle_fresh_conversation("canned"):
                     return
                 # (b) NOT a login wall = the headless->default-Copilot fallback. PREFER the cheap,
                 # per-tab redirect recovery: re-navigate the tab back to the agent URL. If it
@@ -6702,11 +6716,18 @@ class RelayWorker:
                 # canned reply is about this prompt, so telling the operator to relaunch Edge
                 # sends them after a fault that is not there.
                 self.status = "stuck"
+                # The replay bound is spent (or the goal acts and was never replayed): record how
+                # many fresh conversations were tried and that each drew the SAME canned non-answer,
+                # so the operator reads "retried N times, still nothing" rather than a bare stuck.
+                _rc = getattr(self, "_canned_recycles", 0)
+                _retry_note = ("新しい会話で%d回再投入しても同じ定型の無回答が返った。" % _rc) if _rc \
+                    else "(作用を伴う目標のため新しい会話での再送はしていない。)"
+                self._canned_recovery_exhausted = bool(_rc)
                 _proof = connector_proof_source()
                 if _proof == "run":
                     self.retryable_override = False
                     self.outcome = "REFUSED"
-                    self.reason = ("⚠ 定型の無回答が継続。ただし本走行の別ワーカーにはカスタム"
+                    self.reason = ("⚠ 定型の無回答が継続。" + _retry_note + "ただし本走行の別ワーカーにはカスタム"
                                    "エージェントが応答しており、MCPコネクタは生きている。"
                                    "→ 接続の問題ではなく**この指示に対する拒否**。"
                                    "再ナビもヘッドフル復旧も効かない。指示の言い換えが要る。")
@@ -6715,7 +6736,7 @@ class RelayWorker:
                     # SAME VERDICT, DIFFERENT EVIDENCE. Saying "a sibling answered" here would
                     # be false -- this run may have had no sibling at all.
                     self.outcome = "REFUSED"
-                    self.reason = ("⚠ 定型の無回答が継続。ただし直近%.0f分以内に本機のMCP"
+                    self.reason = ("⚠ 定型の無回答が継続。" + _retry_note + "ただし直近%.0f分以内に本機のMCP"
                                    "サーバへ実際のツール呼び出しが着弾しており(%s)、"
                                    "コネクタ自体は生きている。→ 接続の問題ではなく"
                                    "**この指示に対する拒否**の可能性が高い。指示の言い換えから試せ。"
@@ -6727,7 +6748,7 @@ class RelayWorker:
                     # asserted the headless/?titleId= fallback as the cause. Nothing here
                     # measures that -- this branch only knows no tool call has arrived. A reader
                     # took the old sentence for a finding and reported it as the root cause.
-                    self.reason = ("⚠ 定型の無回答が継続し、再ナビ/ヘッドフル復旧でも解消せず。"
+                    self.reason = ("⚠ 定型の無回答が継続し、再ナビ/ヘッドフル復旧でも解消せず。" + _retry_note +
                                    "**測定されたのは「直近%.0f分、本機のMCPサーバにツール呼び出しが1件も"
                                    "着弾していない」ことだけ**。原因は未特定。headless の ?titleId= 解決失敗で"
                                    "既定Copilot(コネクタ無し)に落ちているのが有力な**仮説**だが、確認済みの"
@@ -6739,6 +6760,19 @@ class RelayWorker:
                 # handling below (the reply may still hit AGENT_DEAD / no-progress paths) rather
                 # than breaking the live sweep.
                 pass
+        else:
+            # THE REPLY IS NOT A CANNED NON-ANSWER. If this worker was showing the "再試行中 /
+            # Fresh replay" pill because a previous canned reply pushed it into a fresh
+            # conversation (recovery_state set by _recycle_fresh_conversation, with no
+            # fresh_replay_count to clear it on the policy-refusal path), the replay has produced
+            # a real reply and the pill must drop back. Cleared here, the moment a non-canned
+            # reply arrives, not only on DONE -- a worker that replays and then keeps working for
+            # several turns should read as running, not as still-recovering. Scoped to the canned
+            # origin so a concurrent policy-refusal replay's own state is left untouched; the
+            # streak counter is reset for the same reason.
+            if getattr(self, "recovery_state", "") == "recovering":
+                self.recovery_state = "recovered"
+            self._canned_streak = 0
         if any(m in _low for m in AGENT_DEAD_MARKERS):
             now = time.time()
             if self._agent_err_ts <= 0.0:
@@ -8386,6 +8420,20 @@ class RelayWorker:
         if saw_output:
             self._landed_pending = True
         landed = (delivery == "delivered") or getattr(self, "_landed_pending", False)
+        # A REASON THAT PROVES THE FRAME NEVER LEFT (an expired token, a failed capture or
+        # handshake) means THIS turn did not land, whatever an earlier turn did. Without this,
+        # a worker that produced output on a previous turn carries `_landed_pending=True` into
+        # a later token-expiry fault and is refused a re-send -- the 2026-10-26 10:34 bundle,
+        # where w18/w23/w25/w28 went STUCK on "the supplied token has expired" although the
+        # turn was never delivered. The fresh token (captured here or by the sweep) then lets
+        # the same goal be re-sent safely. `executed` is still honoured below: a call that RAN
+        # on this side is a local effect regardless of whether the frame was sent.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason):
+                landed = False
+        except Exception:
+            pass
 
         # WHAT THE GOAL ASKS FOR, which nothing here was reading. A count bounds how many
         # times a turn is repeated; it says nothing about whether repeating it is safe. For a
@@ -8430,6 +8478,22 @@ class RelayWorker:
                 if recovery is None and (landed or executed):
                     self._refuse_resend(reason, delivery)
                     return False
+
+        # KICK A REFRESH NOW, exactly as _fall_back_to_tab does -- the two paths are the two
+        # ways a worker reacts to a dropped socket, and a proven token expiry is a shared-`exp`
+        # event that hits the whole fleet within seconds (every worker captured off the same
+        # page). Starting the off-thread capture the moment the first worker on THIS path hits
+        # it, rather than waiting for the next sweep lap, shortens the window before a fresh
+        # token is installed and the reconnect below (driver_for, which needs a live token)
+        # succeeds. Guarded by needs_refresh() and a no-op while a capture is already in flight
+        # or inside the policy backoff (_consider_socket_refresh -> AsyncCaptureManager.consider),
+        # so adding it to both paths cannot double-launch.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None)
+        except Exception:
+            pass
 
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
@@ -8535,8 +8599,20 @@ class RelayWorker:
             _delivery = "unknown"
         # A call that already ran on this side counts too (continue-turn setting on): the tab
         # re-sends the goal verbatim.
-        if (_delivery == "delivered" or getattr(self, "_landed_pending", False)
-                or self._journal_shows_executed_calls()) and self._goal_may_act():
+        # A PROVEN-NOT-SENT reason (expired token / failed capture or handshake) clears the
+        # sticky `_landed_pending` left by an earlier turn: this turn never reached the server,
+        # so re-sending it with a fresh token is the recovery, not a duplicate. A call that RAN
+        # on this side (`_journal_shows_executed_calls`) is still honoured -- it is a local
+        # effect whether or not the frame was sent.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            _not_sent = delivery_proves_not_sent(reason)
+        except Exception:
+            _not_sent = False
+        _may_have_landed = (_delivery == "delivered"
+                            or (getattr(self, "_landed_pending", False) and not _not_sent)
+                            or self._journal_shows_executed_calls())
+        if _may_have_landed and self._goal_may_act():
             decision = "refuse"
             try:
                 from relay.transport_policy import resend_decision_for_landed_act
@@ -8587,6 +8663,18 @@ class RelayWorker:
             pass
         self.socket, self.drv = False, None
         self._needs_socket_rebind = True
+        # KICK A REFRESH NOW, don't only wait for the next sweep lap. When the fault is a proven
+        # token expiry the whole fleet shares one `exp` (every worker captured off the same page),
+        # so they fail within seconds of each other -- the 2026-10-26 10:34 bundle. Starting the
+        # off-thread capture here, the moment the first worker hits it, shortens the window before
+        # a fresh token is installed and the rebind below succeeds. It is a cheap no-op while a
+        # capture is already in flight or inside the policy's backoff (relay/socket_capture_async).
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None)
+        except Exception:
+            pass
         # BACKOFF, because nothing ends this wait but the route recovering: 4, 8 ... 60 s.
         self._socket_rebinds = getattr(self, "_socket_rebinds", 0) + 1
         self._cooldown_until = time.time() + min(60.0, 2.0 * (2 ** min(self._socket_rebinds, 5)))
@@ -8768,6 +8856,19 @@ class RelayWorker:
         print("[relay_fleet] %s: %s fault; new conversation %d/%d (backoff %.0fs)"
               % (self.name, kind, n, limit, delay), flush=True)
         self._start_fresh_conversation(job, time.time() + delay)
+        # WHILE THE REPLAY IS IN FLIGHT THE WORKER IS RECOVERING, NOT STUCK. status stays
+        # "ready" (set by _start_fresh_conversation) so the next sweep actually sends the goal;
+        # recovery_state is the separate field status.json carries (fleet_runner writes it; the
+        # cockpit renders it). The value is "recovering" -- the key labels_impl adds to
+        # _PHASE_LABELS / outcomes.STATUS_OF with the 文言「自動回復中」; this branch is the relay
+        # side that WRITES it (the two briefs split the work exactly there). Set only for the
+        # canned no-answer replay, which is this change's subject; a malformed/stalled/platform
+        # recycle keeps its prior reporting untouched so this edit cannot shift their pills.
+        # It is cleared the moment the fresh conversation produces a real (non-canned) answer
+        # (see the _decide else-branch), so a worker only reads "needs attention" once the
+        # replay bound is spent and _decide settles it STUCK.
+        if kind == "canned":
+            self.recovery_state = "recovering"
         self.reason = (reason or {"malformed": "ツール呼び出しがテキストで出力された→会話を作り直し(%d/%d)",
                                   "stalled": "会話が進まず停滞→この会話だけ作り直し(%d/%d)"}.get(
                                       kind, "定型の無回答→会話を作り直し(%d/%d)")) % (n, limit)

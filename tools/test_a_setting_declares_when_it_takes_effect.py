@@ -155,6 +155,13 @@ def _reader_auto_resume():
 def _reader_supervisor_self_restart():
     from relay.code_staleness import self_restart_setting
     return self_restart_setting()
+
+
+def _reader_host_tunnel_for_external_clients():
+    from relay.code_staleness import host_tunnel_for_external_clients_setting
+    return host_tunnel_for_external_clients_setting()
+
+
 def _reader_tool_probe_idle_min():
     from tools.tool_probe import idle_min_setting
     return idle_min_setting()
@@ -204,6 +211,16 @@ def _reader_workarea_allow():
     return extra[0] if extra else ""
 
 
+def _reader_dup_guard():
+    # fleet_submit_dup_guard follows the file at every submission (owner order 2026-10-26: off by
+    # default). _dup_guard_on reads SP.read_key(SP.settings_file(), ...) fresh each call, so with
+    # SP.NEW_PATH pointed at the test's file an operator's change is seen on the next read with no
+    # restart. Returned as off|on, the setting's own vocabulary, so the behavioural check compares
+    # words rather than a bool's str().
+    from tools import fleet_intake as FI
+    return "on" if FI._dup_guard_on() else "off"
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -232,6 +249,7 @@ _LIVE_READERS = {
     "org_ab": (_reader_org_ab, "shadow", "off"),
     "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
     "supervisor_self_restart": (_reader_supervisor_self_restart, "off", "on"),
+    "host_tunnel_for_external_clients": (_reader_host_tunnel_for_external_clients, "off", "on"),
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),
     "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
     "tool_transport": (_reader_tool_transport, "connector-less", "connector"),
@@ -241,6 +259,7 @@ _LIVE_READERS = {
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
     "workarea_guard": (_reader_workarea_guard, "warn", "enforce"),
     "workarea_allow": (_reader_workarea_allow, "audit_alpha", "audit_beta"),
+    "fleet_submit_dup_guard": (_reader_dup_guard, "off", "on"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),
