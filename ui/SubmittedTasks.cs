@@ -390,6 +390,39 @@ sealed class SubmittedTasks
         }
     }
 
+    /// Read the dismiss list the person built in the cockpit: the ids of refused cards they
+    /// chose to hide. Written by tools.fleet_intake --dismiss-refused / --dismiss-all-refused
+    /// (and left whole by force and by clearing a refusal), it is a small JSON object {"ids":[...]}
+    /// -- a bare array is read too, so an older or hand-written file still works. The record each
+    /// id points at is NOT deleted; this set only tells ReadRefusedCards which cards to drop. Never
+    /// throws: a torn or missing file is an empty set, so a dismiss list that cannot be read hides
+    /// nothing and never resurfaces a card the person had already hidden by mistake.
+    public static HashSet<string> ReadDismissedRefused(string dismissedPath)
+    {
+        var outSet = new HashSet<string>(StringComparer.Ordinal);
+        try
+        {
+            string body = ReadSmall(dismissedPath);
+            if (string.IsNullOrEmpty(body)) return outSet;
+            object parsed = _js.DeserializeObject(body);
+            object[] ids = parsed as object[];
+            if (ids == null)
+            {
+                var o = parsed as Dictionary<string, object>;
+                object idsObj;
+                if (o != null && o.TryGetValue("ids", out idsObj)) ids = idsObj as object[];
+            }
+            if (ids == null) return outSet;
+            foreach (object x in ids)
+            {
+                string id = x == null ? null : x.ToString();
+                if (!string.IsNullOrEmpty(id)) outSet.Add(id);
+            }
+        }
+        catch (Exception) { }
+        return outSet;
+    }
+
     /// Read .fleet/tasks/refused/<id>.json, newest refusal first. One file per refused goal,
     /// written by tools/fleet_intake._write_refused_record; a record stamped forced (already
     /// pushed through) is still returned so the card can show "forced in as <jid>" instead of a
