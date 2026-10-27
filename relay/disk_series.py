@@ -404,7 +404,7 @@ def run(state_dir=None, sample_fn=None, free_fn=None, now_fn=None, stop_after=No
     """
     state_dir = state_dir or _state_dir()
     sample_fn = sample_fn or sample_processes
-    free_fn = free_fn or free_bytes
+    free_fn = free_fn or (lambda: free_bytes())
     now_fn = now_fn or time.time
     series_path = os.path.join(state_dir, "disk_series.jsonl")
     swings_path = os.path.join(state_dir, "disk_swings.jsonl")
