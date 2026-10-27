@@ -698,9 +698,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     if cfg.out_dir:
         paths = write_reports(cfg.out_dir, rec["plan"], metrics, verdict)
         # Also drop the raw run record next to the report.
-        with open(os.path.join(cfg.out_dir, "run_record.json"), "w",
-                  encoding="utf-8", newline="\n") as fh:
-            json.dump(rec, fh, ensure_ascii=False, indent=2)
+        from tools import state_store
+
+        def replace_record(previous: dict) -> None:
+            previous.clear()
+            previous.update(rec)
+
+        state_store.update_json(
+            os.path.join(cfg.out_dir, "run_record.json"), replace_record,
+            validate=lambda value: isinstance(value, dict), count=len, default=dict,
+            allow_shrink=True)
         print("wrote %s and %s" % (paths["md"], paths["csv"]))
     else:
         print(json.dumps({"plan": rec["plan"], "verdict": verdict}, ensure_ascii=False,
