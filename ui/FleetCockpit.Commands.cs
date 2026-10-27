@@ -277,6 +277,10 @@ partial class CockpitWindow
             _openSeq++;
             var o = new Dictionary<string, object>();
             o["url"] = url; o["ts"] = _openSeq;
+            // The main chat is what READS open.json; if it is not running the signal lands
+            // nowhere and the click does nothing. Start it (or focus it) for THIS open only --
+            // before the write, so a freshly launched chat sees a recent open.json and acts on it.
+            EnsureMainChatRunning();
             File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
@@ -305,6 +309,7 @@ partial class CockpitWindow
             // Written only when there is one, so a reader of open.json can tell "no position
             // was asked for" from "position 0" -- which are different requests.
             if (turnIndex >= 0) o["turn_index"] = turnIndex;
+            EnsureMainChatRunning();
             File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
@@ -322,8 +327,31 @@ partial class CockpitWindow
             var o = new Dictionary<string, object>();
             o["worker"] = name ?? ""; o["url"] = url ?? "";
             o["transcript"] = transcript ?? ""; o["ts"] = _openSeq;
+            EnsureMainChatRunning();
             File.WriteAllText(_openPath, _js.Serialize(o), new UTF8Encoding(false));
         }
         catch (Exception) { }
+    }
+
+    // Launch the main chat (CopilotChat.exe) if it is not already running; otherwise bring it
+    // to the front. Shared by OpenMain() and by the card Open handlers above, so pressing Open
+    // on a card STARTS the main window when it is absent instead of writing a signal nobody
+    // reads. This opens ONLY the main chat (the surface a card Open targets) -- it does not
+    // touch the cockpit or any other window, so the earlier "every button opened everything"
+    // behaviour does not return.
+    void EnsureMainChatRunning()
+    {
+        try
+        {
+            var existing = System.Diagnostics.Process.GetProcessesByName("CopilotChat");
+            if (existing.Length > 0)
+            {
+                try { if (existing[0].MainWindowHandle != IntPtr.Zero) SetForegroundWindow(existing[0].MainWindowHandle); } catch { }
+                return;
+            }
+            string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CopilotChat.exe");
+            if (File.Exists(exe)) System.Diagnostics.Process.Start(exe);
+        }
+        catch { }
     }
 }

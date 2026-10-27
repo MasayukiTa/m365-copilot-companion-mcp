@@ -35,18 +35,9 @@ partial class CockpitWindow
     // (previously only main -> fleet existed).
     void OpenMain()
     {
-        try
-        {
-            var existing = System.Diagnostics.Process.GetProcessesByName("CopilotChat");
-            if (existing.Length > 0)
-            {
-                try { if (existing[0].MainWindowHandle != IntPtr.Zero) SetForegroundWindow(existing[0].MainWindowHandle); } catch { }
-                return;
-            }
-            string exe = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "CopilotChat.exe");
-            if (File.Exists(exe)) System.Diagnostics.Process.Start(exe);
-        }
-        catch { }
+        // Same "start it if absent, else foreground it" behaviour the card Open handlers now use;
+        // the shared helper lives in ui/FleetCockpit.Commands.cs (EnsureMainChatRunning).
+        EnsureMainChatRunning();
     }
 
     // A small centered self-fading overlay showing the current zoom % (e.g. "125%"). Built once per
