@@ -412,6 +412,7 @@ jobs:
             tools/test_a_deck_the_agent_wrote_says_so.py \
             tools/test_an_archive_does_not_contain_itself.py \
             tests/test_flow_map_docs_name_files_that_exist.py \
+            tests/test_fleet_operation_routes_gui_and_invariant3.py \
             relay/test_whose_refusal_it_was_is_recorded_so_stop_guessing_from_length.py \
             relay/test_running_out_of_review_budget_is_not_passing_review.py \
             tools/test_a_pixel_means_the_same_place_at_both_ends.py \
