@@ -24,12 +24,14 @@ a real one had been added: normalising a path to `<path>` and then requiring equ
 exact-match refusal here would have: none of the three real submissions shared enough literal
 text to be caught by one, but they shared the vocabulary of the same job.
 
-WHAT THIS FILE PINS. A paraphrase of a goal already running is refused, and the refusal names
-the running job. A goal that only shares a topic, not the work, is accepted. A goal whose
-original has actually finished is accepted -- a deliberate resubmission of stopped work must
-never be mistaken for a duplicate. And relay/fanout.py's near-identical-by-construction sibling
-goals are shown never to reach this door at all, so the dedup rule cannot be the thing that
-strangles a legitimate split.
+WHAT THIS FILE PINS (UPDATED 2026-10-27). Content resemblance NEVER stops a submission any
+more: a paraphrase of a goal already running or pending is QUEUED, and the resemblance is only
+recorded in the background (fleet_submit_similarity.jsonl), never used to refuse or fold the
+work. The real guard against a locked-out worker cloning its own job is the JOB ID applied
+downstream, not a content comparison at this door. A goal that only shares a topic is of course
+accepted too, and a deliberate resubmission of finished work is accepted. relay/fanout.py's
+near-identical-by-construction sibling goals are still shown never to reach this door at all, so
+the (now observation-only) resemblance heuristic cannot be the thing that strangles a split.
 """
 from __future__ import annotations
 
@@ -120,21 +122,27 @@ _DIFFERENT = (
 )
 
 
-def test_a_paraphrase_of_a_running_workers_goal_is_refused_and_names_it(isolated_state):
+def test_a_paraphrase_of_a_running_workers_goal_is_queued_not_refused(isolated_state):
+    """Content resemblance NEVER refuses a submission (owner instruction 2026-10-26/27). A
+    worker's paraphrase of a goal already running is QUEUED like any other -- the resemblance
+    to run1 is only noted in the background, never used to stop or fold the work. The guard
+    against a locked-out worker cloning its own job is JOB ID, applied downstream, not a
+    content comparison at this door."""
     _write_status(isolated_state, [_running_worker("run1", _ORIGINAL)])
     out = FI.fleet_submit(_PARAPHRASE)
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == [], "a refused goal must not be queued"
+    assert "queued" in out and "refused" not in out, out
+    assert len(_jobs()) == 1, "the paraphrase must be queued, not dropped as a resemblance"
 
 
-def test_a_paraphrase_of_a_pending_goal_is_also_refused(isolated_state):
-    """Not only status.json: a goal still sitting in this door's own pending/ queue, never
-    having reached a worker yet, is exactly as much "already in flight" as one being worked."""
+def test_a_paraphrase_of_a_pending_goal_is_also_queued(isolated_state):
+    """Not only status.json: a goal still sitting in this door's own pending/ queue is just as
+    much "in flight" as one being worked -- and, under the new rule, a paraphrase of it is
+    still queued rather than refused. Both the original and its reword end up in pending/."""
     FI.fleet_submit(_ORIGINAL)
-    first_id = _jobs()[0]["id"]
-    out = FI.fleet_submit(_PARAPHRASE)
-    assert "refused" in out and first_id in out, out
     assert len(_jobs()) == 1
+    out = FI.fleet_submit(_PARAPHRASE)
+    assert "queued" in out and "refused" not in out, out
+    assert len(_jobs()) == 2, "both the original and its paraphrase must be queued"
 
 
 def test_a_genuinely_different_goal_is_accepted_even_with_something_in_flight(isolated_state):

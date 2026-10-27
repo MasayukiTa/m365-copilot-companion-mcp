@@ -285,21 +285,27 @@ def test_an_ordinary_goal_writes_no_resume_conv_key():
     assert "resume_conv" not in _jobs()[0]["payload"]
 
 
-def test_a_follow_up_is_not_refused_as_a_near_duplicate():
+def test_a_near_duplicate_follow_up_is_queued_not_refused():
     """THE WHOLE POINT. The first turn sits in pending/; a continuation of the SAME work reads
-    as a near-duplicate of it. Without the exemption the follow-up is refused and the
-    conversation it meant to resume is never answered -- the exact bug this closes. With a
-    resume_conv it goes through, and its own id travels with it."""
+    as a near-duplicate of it. Content resemblance NEVER refuses a submission any more (owner
+    instruction 2026-10-26/27): the re-worded follow-up is queued even WITHOUT a resume_conv --
+    the resemblance is only noted in the background, never used to block. A resume_conv still
+    goes through too, and its own id travels with it."""
     first = FI.fleet_submit(_GOAL_A)
     assert "queued" in first
-    # A re-worded continuation of the same work, with no resume_conv, is caught as a duplicate.
-    refused = FI.fleet_submit(_GOAL_A + " please")
-    assert "refused" in refused and "overlap" in refused
-    # The SAME near-duplicate, carrying a conversation id, is admitted as a continuation.
+    # A re-worded continuation of the same work, with NO resume_conv, is queued as its own job.
+    # It is not refused and nothing about "overlap" or "duplicate" comes back.
+    second = FI.fleet_submit(_GOAL_A + " please")
+    assert "queued" in second
+    assert "refused" not in second
+    # The SAME near-duplicate, carrying a conversation id, is admitted as a continuation and
+    # keeps its id on the payload.
     ok = FI.fleet_submit(_GOAL_A + " please", resume_conv="sess:xyz789")
     assert "queued" in ok
     payloads = [j["payload"] for j in _jobs()]
     assert any(p.get("resume_conv") == "sess:xyz789" for p in payloads)
+    # All three went through: none was dropped as a resemblance of another.
+    assert len(payloads) == 3
 
 
 def test_resume_conv_whitespace_is_normalised():

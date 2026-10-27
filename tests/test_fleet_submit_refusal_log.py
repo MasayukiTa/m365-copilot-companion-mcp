@@ -55,12 +55,24 @@ def test_local_loop(state, monkeypatch):
     assert r["reason"] == "local_loop"
 
 
-def test_similar_carries_the_matching_id(state, monkeypatch):
+def _observed(state):
+    p = state / obs_log.SIMILAR_OBSERVED_NAME
+    if not p.exists():
+        return []
+    return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines() if x]
+
+
+def test_a_resemblance_is_observed_not_refused(state, monkeypatch):
+    # Content resemblance NEVER refuses (owner instruction 2026-10-26/27). Even when the
+    # heuristic finds a 90%-overlap in-flight goal, the submission is QUEUED; the match is only
+    # recorded in fleet_submit_similarity.jsonl, and nothing lands in the refusals log.
     monkeypatch.setattr(FI, "_duplicate_of", lambda text: ("job123abc", 0.9))
     out = FI.fleet_submit("do the same thing again please", source="x")
-    assert "job123abc" in out and "90%" in out
-    (r,) = _rows(state)
-    assert r["reason"] == "similar" and r["similar_to"] == "job123abc"
+    assert "queued" in out and "refused" not in out
+    assert _rows(state) == []                       # no refusal was recorded
+    (o,) = _observed(state)                          # the resemblance was noted instead
+    assert o["similar_to"] == "job123abc" and o["queued"] is True
+    assert o["similarity"] == 0.9
 
 
 def test_pending_full(state, monkeypatch):

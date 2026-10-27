@@ -17,7 +17,30 @@ fixture's stub is just a (harmless) no-op capture, not the real emitter.
 import hashlib
 import io
 import os
+import sys
+
 import pytest
+
+
+#: THIS WORKTREE MUST WIN OVER THE INSTALLED REPO. The environment's sitecustomize
+#: (resonac-mcp/tools/_pptx_autostamp/sitecustomize.py) inserts MCP_COMPANION_REPO
+#: (= C:\Users\...\resonac-mcp) at sys.path[0] in every interpreter, so `import tools.*`
+#: would resolve to that OTHER checkout and silently test its (older) code instead of the
+#: files under this worktree. conftest.py is imported by pytest before collection, which is
+#: early enough to correct it: put this worktree at the front of sys.path and drop any
+#: tools/relay/scripts modules a sitecustomize already pulled from the other tree, so the
+#: next import re-reads them from here.
+_WORKTREE = os.path.dirname(os.path.abspath(__file__))
+if _WORKTREE in sys.path:
+    sys.path.remove(_WORKTREE)
+sys.path.insert(0, _WORKTREE)
+for _m in [m for m in list(sys.modules)
+           if m in ("tools", "relay", "scripts", "bench")
+           or m.startswith(("tools.", "relay.", "scripts.", "bench."))]:
+    _mod = sys.modules.get(_m)
+    _f = getattr(_mod, "__file__", "") or ""
+    if _f and not os.path.abspath(_f).startswith(_WORKTREE + os.sep):
+        del sys.modules[_m]
 
 
 #: Variables git exports to a hook (pre-push runs this suite) that pin every git command to the
