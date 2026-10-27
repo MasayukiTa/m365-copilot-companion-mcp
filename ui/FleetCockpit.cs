@@ -281,6 +281,10 @@ partial class CockpitWindow : Window
     string _rtVal = ResidentToolsView.Default;
     ComboBox _rtBox;
     TextBlock _rtLbl;
+    // continue-turn recovery off|on -> settings.txt socket_continue_recovery ; absent key = on
+    string _crVal = ContinueRecoveryView.Default;
+    ComboBox _crBox;
+    TextBlock _crLbl;
     // read-only tool result cache off|shadow -> settings.txt result_cache ; absent key = off
     string _rcVal = ResultCacheView.Default;
     ComboBox _rcBox;

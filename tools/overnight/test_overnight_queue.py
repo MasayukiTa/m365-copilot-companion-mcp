@@ -65,7 +65,12 @@ def test_queue_submitter_against_the_real_door_in_a_temp_queue(tmp_path, monkeyp
     assert files == [r.job_id + ".json"]
     job = json.loads((tmp_path / "tasks" / "pending" / files[0]).read_text(encoding="utf-8"))
     assert job["payload"]["goal"] == goal and job["origin"]["source"] == "overnight batch"
-    assert q.submit(goal).duplicate                         # the door's own duplicate rule
+    # OWNER ORDER 2026-10-26: the door no longer refuses a goal because it resembles one already
+    # queued -- a resubmission is ACCEPTED (and the resemblance recorded in the background), so the
+    # second submit comes back queued with its own job id, not as a duplicate.
+    r2 = q.submit(goal)
+    assert r2.ok and r2.job_id and not r2.duplicate, r2
+    assert r2.job_id != r.job_id
 
 
 def test_job_waiting_sees_the_queue_directories(tmp_path):
