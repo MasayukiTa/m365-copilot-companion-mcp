@@ -263,7 +263,12 @@ def test_the_socket_payload_with_preamble_and_tools_is_what_is_stored(store):
     row = wire_rows[0]
     assert row["text"] == sent_on_wire[0]                  # byte for byte what went out
     assert row["text"].startswith("PROTOCOL-PREAMBLE") and "<tools>" in row["text"]
-    assert row["text"].endswith("the job text")
+    # socket_continue_recovery is ON by default, so the wire payload carries a trailing
+    # "\n\n[ref:<12 hex>]" (relay/continue_recovery.ref_suffix). The stored row is byte-for-byte
+    # what went out (asserted above), so the job text is the body BEFORE that ref trailer.
+    import re as _re
+    _body = _re.sub(r"\n\n\[ref:[0-9a-f]{12}\]\Z", "", row["text"])
+    assert _body.endswith("the job text")
     assert row["turn"] == 1
     assert row["extra"]["route"] == "socket" and row["extra"]["truncated"] is False
     assert row["extra"]["sha256"] == hashlib.sha256(row["text"].encode()).hexdigest()

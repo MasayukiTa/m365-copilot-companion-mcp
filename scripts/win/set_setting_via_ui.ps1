@@ -40,6 +40,7 @@ $Boxes = @{
     'consent_auto_approve'      = 'consentApproveBox'
     'result_cache'              = 'resultCacheBox'
     'resident_tools'            = 'residentToolsBox'
+    'socket_continue_recovery'  = 'continueRecoveryBox'
     'merge_conversation'        = 'mergeConversationBox'
     'fleet_auto_resume'         = 'autoResumeBox'
     'supervisor_self_restart'   = 'supervisorCodeBox'

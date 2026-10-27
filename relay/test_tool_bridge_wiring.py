@@ -16,12 +16,25 @@ import base64
 import json
 import time
 
+import re
+
 import pytest
 
 from relay import chathub
 from relay import socket_driver as SD
 from relay import tool_bridge as TB
 from relay.socket_route import SocketRoute
+
+# socket_continue_recovery is ON by default (tools/settings_keys.py), so Conversation.ask
+# appends a per-round ref -- "\n\n[ref:<12 hex>]" (relay/continue_recovery.ref_suffix) -- to
+# every payload it puts on the wire. These tests assert on the REQUEST the model received, so
+# they must look past that trailer. _wire_body strips exactly one trailing ref, leaving the
+# payload a pre-recovery wire carried.
+_REF_TRAILER = re.compile(r"\n\n\[ref:[0-9a-f]{12}\]\Z")
+
+
+def _wire_body(payload):
+    return _REF_TRAILER.sub("", payload)
 
 
 @pytest.fixture(autouse=True)
@@ -207,7 +220,7 @@ def test_the_driver_forwards_run_tool_and_the_second_round_carries_its_result():
     assert drv.failed == ""
     assert ran == [("call_tool", {"name": "count", "arguments": {"t": "a"}})]
     assert len(sent) == 2
-    assert "<tools>" in sent[0] and sent[0].endswith("the job text")      # round 0
+    assert "<tools>" in sent[0] and _wire_body(sent[0]).endswith("the job text")  # round 0
     assert "RESULT-MARKER-17" in sent[1] and "call_tool → ok" in sent[1]  # round 1
     assert [r for r, _ in rounds] == [0, 1]
     assert drv.read_last_response() == "3件でした。"                        # no raw block upstream
@@ -230,7 +243,7 @@ def test_without_a_run_tool_the_driver_asks_once_and_nothing_is_executed():
     drv = SD.CopilotSocketDriver(conv, connect=None)
     drv.send("the job text")
     _wait(drv)
-    assert sent == ["the job text"]
+    assert len(sent) == 1 and _wire_body(sent[0]) == "the job text"
 
 
 # ---------------------------------------------------------------- (e) no tunnel in the path
@@ -274,8 +287,8 @@ def test_the_instructions_ride_on_the_first_turn_only():
     _wait(drv)
     drv.send("second job")
     _wait(drv)
-    assert sent[0].startswith("SERVER-RULES") and sent[0].endswith("first job")
-    assert "SERVER-RULES" not in sent[1] and sent[1].endswith("second job")
+    assert sent[0].startswith("SERVER-RULES") and _wire_body(sent[0]).endswith("first job")
+    assert "SERVER-RULES" not in sent[1] and _wire_body(sent[1]).endswith("second job")
 
 
 def test_equip_hands_the_fetched_instructions_to_a_connector_less_driver(monkeypatch):

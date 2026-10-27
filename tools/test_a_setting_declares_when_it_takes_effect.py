@@ -197,6 +197,16 @@ def _reader_relay_findings():
     return mode()
 
 
+def _reader_dup_guard():
+    # fleet_submit_dup_guard follows the file at every submission (owner order 2026-10-26: off by
+    # default). _dup_guard_on reads SP.read_key(SP.settings_file(), ...) fresh each call, so with
+    # SP.NEW_PATH pointed at the test's file an operator's change is seen on the next read with no
+    # restart. Returned as off|on, the setting's own vocabulary, so the behavioural check compares
+    # words rather than a bool's str().
+    from tools import fleet_intake as FI
+    return "on" if FI._dup_guard_on() else "off"
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -233,6 +243,7 @@ _LIVE_READERS = {
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
+    "fleet_submit_dup_guard": (_reader_dup_guard, "off", "on"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),

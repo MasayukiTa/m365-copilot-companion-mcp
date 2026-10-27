@@ -134,6 +134,22 @@ KEYS = OrderedDict([
        "tools/approval_policy.py:current_approval_mode (every gate check)",
        "Read fresh at every approval gate, so the panel governs jobs already queued."),
 
+    # fleet_submit's word-overlap duplicate guard (tools/fleet_intake.py). OFF by default by
+    # owner order 2026-10-26: refusing a goal at the door on word overlap turned away DIFFERENT
+    # work (two short goals sharing a verb, two coding goals sharing one appended block of common
+    # rules), so near-duplicates are now NORMALISED IN THE BACKGROUND -- a possible_duplicate_of
+    # tag on the job and one line in .fleet/dup_notes.jsonl -- instead of being refused. This
+    # switch only restores the OLD refusal for an operator who wants it.
+    _k("fleet_submit_dup_guard", EACH_GATE, "off",
+       "tools/fleet_intake.py:_dup_guard_on (every fleet_submit call)",
+       "off|on. off (default, owner order 2026-10-26): a goal that resembles one already queued or "
+       "running is ACCEPTED and recorded (possible_duplicate_of on the job, one line in "
+       ".fleet/dup_notes.jsonl), never refused. on: restores the old behaviour -- such a goal is "
+       "refused at the door using PR #293's improved similarity (the appended common-rules tail is "
+       "ignored, short goals weigh their own identifiers). Read fresh on every submission, so a "
+       "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
+       "anything but on reads as off."),
+
     # ---------------------------------------------------------------- sweep_start
     _k("autoscale", SWEEP_START, 0,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",
@@ -198,16 +214,17 @@ KEYS = OrderedDict([
        "but on reads as off."),
 
     # Continue turn after an unknown delivery (relay/continue_recovery.py). OFF by default.
-    _k("socket_continue_recovery", EACH_GATE, "off",
+    _k("socket_continue_recovery", EACH_GATE, "on",
        "relay/continue_recovery.py:mode (every send on the socket route and every retry "
        "decision, mtime-cached)",
-       "off|on. off: a socket goal whose turn was cut after unknown delivery and that performs "
-       "an action ends STUCK, exactly as before. on: for connector-less (bridged) repository "
-       "work, the worker opens a continue turn in the SAME conversation instead -- it first "
-       "checks that the conversation still holds its history, re-quotes the results of calls "
-       "this process already ran, and never runs the same call twice. Read at each send and "
+       "on|off. on (default): for connector-less (bridged) repository work, a socket goal whose "
+       "turn was cut after unknown delivery opens a continue turn in the SAME conversation "
+       "instead of ending STUCK -- it first checks that the conversation still holds its "
+       "history, re-quotes the results of calls this process already ran, and never runs the "
+       "same call twice. off: such a goal ends STUCK, exactly as before. Read at each send and "
        "retry decision, so a change reaches the next turn with no restart; only conversations "
-       "created while it is on carry the refs the check needs. Anything but on reads as off."),
+       "created while it is on carry the refs the check needs. A present line reads as on only when it "
+       "says on; anything else on a present line is off, while an absent line is on (the default)."),
 
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;

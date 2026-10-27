@@ -109,29 +109,42 @@ def test_submission_baseline_is_captured_before_handoff_can_create_a_worker():
     assert 'NoteSubmitted(new List<string> { S(w, "goal") }, submitBaseline)' in live_branch
 
 
-def test_fresh_start_waits_for_closing_coordinator_before_clearing_input():
+def test_fresh_start_clears_the_box_at_spawn_not_at_accept():
+    # Integrated behaviour of the two fixes: the composer box is emptied the moment a fresh
+    # run is SPAWNED (ui_submit), while the "submitted" card is raised only once the run is
+    # confirmed ACCEPTED (gui_start). Between the two the work stays visible via the start-note.
     src = cockpit_source.read(encoding="utf-8-sig")
     start = _method_block(src, "void StartFleet()", "bool ActiveRunIsLocalLoop()")
-    assert '_fleetLaunchPending' in start
-    assert 'waitForClosingRun: true' in start
-    assert '_goalInput.Text = "";' not in start[start.index('bool planMode ='):], (
-        'fresh Start must keep the operator text until a new run is actually accepted')
+    assert "_fleetLaunchPending" in start
+    assert "waitForClosingRun: true" in start
 
     spawn = _method_block(src, "bool SpawnFleet(List<string> goals", "string GoalsToJsonl(")
-    assert 'bool waitForClosingRun = false' in spawn
-    assert '--wait-for-state-dir-seconds 60' in spawn
-    assert 'WatchFreshFleetLaunch(' in spawn
-    assert 'System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);' in spawn
+    assert "bool waitForClosingRun = false" in spawn
+    assert "--wait-for-state-dir-seconds 60" in spawn
+    assert "WatchFreshFleetLaunch(" in spawn
+    assert "System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);" in spawn
+    # The box is cleared at spawn success, inside the waitForClosingRun branch.
+    assert '_goalInput.Text = "";' in spawn
+    assert "box_cleared_at_spawn" in spawn
+    # The card is NOT raised at spawn in the waiting branch -- only non-waiting spawns note here.
+    wait_branch = spawn[spawn.index("if (waitForClosingRun)"):]
+    assert "NoteSubmitted(" not in wait_branch[:wait_branch.index("else")], (
+        "the fresh-Start (waiting) path must not raise the card at spawn")
 
-    watch = _method_block(src, "void WatchFreshFleetLaunch(", "string GoalsToJsonl(")
-    assert 'StartedOf(root)' in watch
-    assert 'baseline.Started' in watch
-    assert 'FreshRunContainsGoals(root, goals)' in watch
-    assert 'FreshRunContainsGoals(root, goals)' in watch
-    assert 'if (_goalInput.Text == submittedText) _goalInput.Text = "";' in watch
-    assert 'proc.HasExited' in watch
-    assert '_fleetLaunchPending = false;' in watch
-
+    watch = _method_block(src, "void WatchFreshFleetLaunch(", "bool SpawnFleetRetry(")
+    assert "StartedOf(root)" in watch
+    assert "baseline.Started" in watch
+    assert "FreshRunContainsGoals(root, goals)" in watch
+    assert "proc.HasExited" in watch
+    assert "_fleetLaunchPending = false;" in watch
+    # Card raised at acceptance, in the watcher, against the original baseline.
+    assert "NoteSubmitted(goals, baseline)" in watch
+    # The old accept-time clear line is gone: the box was already emptied at spawn.
+    assert 'if (_goalInput.Text == submittedText) _goalInput.Text = "";' not in watch
+    # A launch that never confirms is bounded and restores the operator text.
+    assert "_freshLaunchConfirmWindow" in watch
+    assert "SubmitRestoreBox(submittedText)" in watch
+    assert "timeout_unconfirmed" in watch
 
 def test_fresh_start_uses_unique_goal_file_while_other_spawn_paths_keep_defaults():
     src = cockpit_source.read(encoding="utf-8-sig")
