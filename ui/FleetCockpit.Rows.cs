@@ -214,11 +214,15 @@ partial class CockpitWindow
         if (workers.Count == 0 && _history.Count == 0)
         {
             AppendSubmittedRows(rows, order);
+            AppendRefusedRows(rows);
             rows.Add(MkRow(5, null, null));
             return rows;
         }
         // The submitted group: the first rows of the list, above the directive band.
         AppendSubmittedRows(rows, order);
+        // Refused goals: turned away by fleet_submit, drawn just under the submitted group so a
+        // request the system silently dropped is seen at the machine and can be forced in.
+        AppendRefusedRows(rows);
         // NOTE: the toolbar (すべて/実行中/承認待ち/完了 filter) is NO LONGER a scrolling row. It is
         // pinned in _pinnedToolbarHost above the list (see RefreshPinnedToolbar, called from
         // RenderCards). Row kind 0 is retained in the converter for safety but never emitted here.
@@ -430,6 +434,14 @@ partial class CockpitWindow
                 return "SB|" + g + "|" + StableShortHash(sv.Key) + "|" + SubmittedTasks.Label(sv, _lang == 0)
                        + "|" + (sv.Dismissable ? "x" : "-");
             }
+            case 10:                                           // refused-not-submitted: id + reason + forced + similarity
+            {
+                var rv = hist != null && hist.ContainsKey("refused") ? hist["refused"] as RefusedView : null;
+                if (rv == null) return "RF|" + g;
+                return "RF|" + g + "|" + StableShortHash(rv.Id) + "|" + (rv.Reason ?? "")
+                       + "|" + StableShortHash(rv.SimilarTo) + "|" + ((int)System.Math.Round((rv.Similarity >= 0 ? rv.Similarity : 0) * 100))
+                       + "|" + (rv.Forced ? "f" : "-") + "|" + StableShortHash(rv.Goal);
+            }
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
             case 5: return "ES|" + g + "|" + ReadQueuedJobs().Count;   // empty state: its headline counts the submitted group
             case 6:                                            // directive band: keyed on first-worker goal + started
@@ -545,7 +557,9 @@ partial class CockpitWindow
 
     // Tiny per-row model. Kind: 0=toolbar, 1=card, 2=history-header, 3=history-row, 4=completed-divider,
     // 5=empty state, 6=directive band, 7=date-group header, 8=resume affordance,
-    // 9=submitted-not-picked-up-yet (Hist["view"] is its SubmittedView).
+    // 9=submitted-not-picked-up-yet (Hist["view"] is its SubmittedView),
+    // 10=refused-not-submitted (Hist["refused"] is its RefusedView): a goal fleet_submit turned
+    //    away, drawn in the submitted area with its reason and a person-only "force" button.
     class Row
     {
         public int Kind;
@@ -580,6 +594,8 @@ partial class CockpitWindow
             if (r.Kind == 7) return _w.HistoryGroupHeader(r.Hist != null ? S(r.Hist, "label") : "");
             if (r.Kind == 9) return _w.SubmittedRow(
                 r.Hist != null && r.Hist.ContainsKey("view") ? r.Hist["view"] as SubmittedView : null);
+            if (r.Kind == 10) return _w.RefusedCard(
+                r.Hist != null && r.Hist.ContainsKey("refused") ? r.Hist["refused"] as RefusedView : null);
             if (r.Kind == 8) return _w.ResumeAffordance(
                 r.Hist != null ? I(r.Hist, "n") : 0,
                 r.Hist != null ? S(r.Hist, "signature") : "");
@@ -631,6 +647,23 @@ partial class CockpitWindow
             var d = new Dictionary<string, object>();
             d["view"] = it.Submitted;
             rows.Add(MkRow(9, null, d));
+        }
+    }
+
+    // One row per refused goal (newest first), each a RefusedCard. Drawn directly beneath the
+    // submitted group: a goal fleet_submit turned away never entered the queue, but it belongs in
+    // the same top area so a turned-away request is visible and the person can force it in. A
+    // record already forced in is dropped by ReadRefusedCards, so a spent card does not linger.
+    void AppendRefusedRows(List<object> rows)
+    {
+        List<RefusedView> refused = ReadRefusedCards();
+        if (refused == null) return;
+        foreach (RefusedView rv in refused)
+        {
+            if (rv == null) continue;
+            var d = new Dictionary<string, object>();
+            d["refused"] = rv;
+            rows.Add(MkRow(10, null, d));
         }
     }
 

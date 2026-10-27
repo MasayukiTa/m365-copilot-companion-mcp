@@ -86,6 +86,26 @@ sealed class SubmittedDisplayItem
     public int Rank;                                // -1 submitted; else SubmittedTasks.WorkerRank
 }
 
+/// One goal that fleet_submit TURNED AWAY, read back from .fleet/tasks/refused/<id>.json
+/// (tools/fleet_intake._write_refused_record). This is the half the cockpit never had: a
+/// refusal used to be a string handed back to the agent over the tunnel and seen by no one at
+/// the machine. The record carries the WHOLE goal (not the 80-char head the jsonl digest keeps),
+/// the reason KIND, the job it looked like with the measured overlap, and -- once the person
+/// presses the button -- the id of the job it was forced in as. Plain data; RefusedReasonText
+/// turns it into the Japanese line the card shows.
+sealed class RefusedView
+{
+    public string Id;              // the refused-record id; what the force button sends back
+    public string Reason;          // "similar" | "too_long" | "pending_full" | "local_loop" | "missing_goal"
+    public string Goal;            // the goal IN FULL, as the person wrote it
+    public string SimilarTo;       // for "similar": the job id it reads as a repeat of
+    public double Similarity;      // for "similar": 0..1 word overlap, -1 when not recorded
+    public double RefusedAtUnix;
+    public bool Forced;            // already forced in: the button is spent, show the job id instead
+    public string ForcedJid;       // the job id a forced resubmission became
+}
+
+
 sealed class SubmittedTasks
 {
     /// A local entry nothing has confirmed for this long is marked unconfirmed (and may be
@@ -368,6 +388,91 @@ sealed class SubmittedTasks
             }
             catch (Exception) { }
         }
+    }
+
+    /// Read .fleet/tasks/refused/<id>.json, newest refusal first. One file per refused goal,
+    /// written by tools/fleet_intake._write_refused_record; a record stamped forced (already
+    /// pushed through) is still returned so the card can show "forced in as <jid>" instead of a
+    /// button. Never throws: a torn or oversize file is skipped, the rest still read.
+    public static List<RefusedView> ReadRefused(string refusedDir)
+    {
+        var outList = new List<RefusedView>();
+        try
+        {
+            foreach (string f in Files(refusedDir, ".json"))
+            {
+                try
+                {
+                    string body = ReadSmall(f);
+                    if (string.IsNullOrEmpty(body)) continue;
+                    var o = _js.DeserializeObject(body) as Dictionary<string, object>;
+                    if (o == null) continue;
+                    string goal = Str(o, "goal");
+                    if (Normalize(goal).Length == 0) continue;
+                    string id = Str(o, "id");
+                    if (string.IsNullOrEmpty(id))
+                        id = Path.GetFileNameWithoutExtension(f);
+                    object simObj;
+                    double sim = -1.0;
+                    if (o.TryGetValue("similarity", out simObj)) sim = Num(simObj);
+                    object forcedObj;
+                    bool forced = o.TryGetValue("forced", out forcedObj) && forcedObj is bool
+                                  && (bool)forcedObj;
+                    outList.Add(new RefusedView {
+                        Id = id,
+                        Reason = Str(o, "reason"),
+                        Goal = goal,
+                        SimilarTo = Str(o, "similar_to"),
+                        Similarity = sim,
+                        RefusedAtUnix = Num(o.ContainsKey("refused_at") ? o["refused_at"] : null),
+                        Forced = forced,
+                        ForcedJid = Str(o, "forced_jid") });
+                }
+                catch (Exception) { }
+            }
+        }
+        catch (Exception) { }
+        // Newest refusal first, matching how the submitted group reads (most recent on top).
+        outList.Sort(delegate (RefusedView a, RefusedView b)
+        {
+            return b.RefusedAtUnix.CompareTo(a.RefusedAtUnix);
+        });
+        return outList;
+    }
+
+    /// The Japanese (or English) one-line reason a refused card shows. For a near-duplicate it
+    /// NAMES the job it looked like and the measured overlap as a percent, which is the whole
+    /// point of the line -- "why was this turned away, and against what" answered without the
+    /// operator opening a log. Kept here, next to the record it reads, so a test runs it.
+    public static string RefusedReasonText(RefusedView v, bool ja)
+    {
+        if (v == null) return "";
+        string reason = v.Reason ?? "";
+        if (reason == "similar")
+        {
+            string pct = "";
+            if (v.Similarity >= 0)
+                pct = " （" + ((int)Math.Round(v.Similarity * 100)).ToString(CultureInfo.InvariantCulture)
+                      + (ja ? "% 一致）" : "% match)");
+            string who = string.IsNullOrEmpty(v.SimilarTo) ? (ja ? "既存のジョブ" : "an existing job")
+                                                           : v.SimilarTo;
+            return ja
+                ? ("重複のため却下：" + who + " に似ています" + pct)
+                : ("Refused as a near-duplicate of " + who + pct);
+        }
+        if (reason == "too_long")
+            return ja ? "長すぎるため却下：指示ではなく文書が送られました。"
+                      : "Refused as too long: a document, not an instruction.";
+        if (reason == "pending_full")
+            return ja ? "待機列が一杯のため却下：誰も消化していません。"
+                      : "Refused: the queue is full and nothing is draining it.";
+        if (reason == "local_loop")
+            return ja ? "LOCAL_LOOP 制御メッセージのため却下：Fleet の目標ではありません。"
+                      : "Refused: a LOCAL_LOOP control message, not a Fleet goal.";
+        if (reason == "missing_goal")
+            return ja ? "空の目標のため却下：指示になっていません。"
+                      : "Refused: an empty goal is not an instruction.";
+        return ja ? ("却下：" + reason) : ("Refused: " + reason);
     }
 
     // ── the merge ──────────────────────────────────────────────────────────────────────────
