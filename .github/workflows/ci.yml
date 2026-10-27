@@ -532,6 +532,7 @@ jobs:
             relay/test_no_turn_capture_live.py \
             relay/test_lanes_default_and_send_bucket.py \
             relay/test_no_goal_path_opens_a_tab.py \
+            relay/test_aboutblank_is_reused_not_reopened.py \
             relay/test_socket_capacity.py \
             relay/test_sweep_hot_path.py \
             relay/test_the_cockpit_retry_is_accepted.py \
