@@ -400,6 +400,8 @@ jobs:
             relay/test_no_test_writes_into_the_operators_approval_queue.py \
             relay/test_the_panel_shows_the_floor_the_run_uses.py \
             relay/test_a_floor_says_where_it_came_from.py \
+            relay/test_floor_warning_tracks_the_disagreement.py \
+            relay/test_status_json_powershell_safe.py \
             ui/test_a_warning_that_is_always_on_is_not_a_warning.py \
             ui/test_the_last_setting_is_reachable.py \
             ui/test_the_list_scrolls_to_the_end_after_a_clear.py \

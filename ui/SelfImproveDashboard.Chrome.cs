@@ -71,9 +71,12 @@ partial class SelfImproveDashboardWindow
                     else lines.Add(ln);
                 }
             if (!found) lines.Add(key + "=" + val);
-            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFile));
-            File.WriteAllText(SettingsFile, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
-            _settingsMtime = File.GetLastWriteTimeUtc(SettingsFile).Ticks;
+            // WRITE the new shared location (repo .config), never the retired %APPDATA% copy,
+            // so a theme/language change here is read by every coordinator and by the other
+            // panels. Reading above still honours the old file while a machine migrates.
+            Directory.CreateDirectory(Path.GetDirectoryName(SettingsFileForWrite));
+            File.WriteAllText(SettingsFileForWrite, string.Join("\n", lines.ToArray()) + "\n", new UTF8Encoding(false));
+            _settingsMtime = File.GetLastWriteTimeUtc(SettingsFileForWrite).Ticks;
         }
         catch (Exception) { }
     }
