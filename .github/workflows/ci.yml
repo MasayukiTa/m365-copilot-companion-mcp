@@ -128,6 +128,7 @@ jobs:
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
+            relay/test_auto_rephrase_continue.py \
             scripts/test_status_tool_does_not_mislead.py \
             tools/test_one_settings_file_for_every_context.py \
             tools/test_a_setting_declares_when_it_takes_effect.py \

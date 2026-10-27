@@ -137,8 +137,7 @@ def test_a_clean_reply_after_the_steer_means_no_recycle(worker):
 
 
 # --- brief fix 1/2/3: canned recovery reads as 自動回復中, not 要対応 ----------------------
-# A goal that ACTS on the world, used to prove an acting goal is NOT replayed in a fresh
-# conversation (brief fix 3: no duplicate side effect). "送信してください" matches ACTING.
+# A goal that ACTS on the world, used to check the bounded replay policy. "送信してください" matches ACTING.
 ACT_GOAL = "会議の議事録をメールで送信してください"
 
 
@@ -167,16 +166,50 @@ def test_canned_repeats_until_bound_then_needs_attention(worker, monkeypatch):
     assert "3回再投入" in worker.reason          # the reason states how many replays were tried
 
 
-def test_a_canned_after_an_acting_goal_is_not_replayed(monkeypatch):
-    # (c) a canned non-answer on a goal that ACTS on the world is NOT re-sent in a fresh
-    # conversation (would risk doing the act twice); it falls straight to the diagnostics.
+@pytest.fixture()
+def acting_worker(monkeypatch):
     monkeypatch.setattr(F, "_unlock_password", lambda: "pw-placeholder-not-a-credential")
     monkeypatch.setattr(F, "connector_proof_source", lambda: "run")
     monkeypatch.setattr(F.time, "time", lambda: 1000.0)
+    monkeypatch.setattr(F._auto_rephrase, "enabled", lambda: True)
     w = F.RelayWorker(ACT_GOAL, "wact")
     w._last_sent_job = "FIRST MESSAGE"
+    monkeypatch.setattr(w, "_collect_progress_fields", lambda: ("prior progress", "", ""))
+    return w
+
+
+def test_canned_acting_goal_replays_with_progress_in_fresh_conversation(acting_worker):
+    w = acting_worker
     _decide(w, CANNED, 1)
-    assert w._canned_recycles == 0               # never replayed
-    assert w.recovery_state != "recovering"
+    assert w.status == "ready" and w.outcome in ("", None)
+    assert w._acting_rephrase_done is True
+    assert w._canned_recycles == 0
+    assert w._needs_socket_rebind and w._socket_conv_id == "" and w._mcp_conv_fresh
+    assert "prior progress" in w.job and ACT_GOAL in w.job
+    assert w.job.index("prior progress") < w.job.index(ACT_GOAL)
+
+
+def test_second_canned_acting_goal_stops_without_another_replay(acting_worker, monkeypatch):
+    w = acting_worker
+    calls = []
+    start = w._start_fresh_conversation
+    def record_start(*args, **kwargs):
+        calls.append(args)
+        return start(*args, **kwargs)
+    monkeypatch.setattr(w, "_start_fresh_conversation", record_start)
+    _decide(w, CANNED, 1)
+    assert len(calls) == 1 and w._acting_rephrase_done is True
+    _decide(w, CANNED, w._fresh_turn_base + 1)
+    assert w.status == "stuck" and w.outcome == "REFUSED"
+    assert "言い換えを1回試した" in w.reason
+    assert len(calls) == 1 and w._canned_recycles == 0
+
+
+def test_canned_acting_goal_stops_immediately_when_rephrase_disabled(acting_worker, monkeypatch):
+    w = acting_worker
+    monkeypatch.setattr(F._auto_rephrase, "enabled", lambda: False)
+    _decide(w, CANNED, 1)
     assert w.status == "stuck" and w.outcome == "REFUSED"
     assert "再送はしていない" in w.reason
+    assert w._acting_rephrase_done is False and w._canned_recycles == 0
+    assert not w._needs_socket_rebind

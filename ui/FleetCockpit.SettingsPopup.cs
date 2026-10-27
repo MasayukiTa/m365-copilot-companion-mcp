@@ -265,6 +265,7 @@ partial class CockpitWindow
             case "consent_auto_approve":
             case "resident_tools":
             case "socket_continue_recovery":
+            case "auto_rephrase_continue":
             case "result_cache":
             case "fanout_hierarchical_merge":
             case "fleet_auto_resume":
