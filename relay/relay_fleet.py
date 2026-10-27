@@ -55,6 +55,7 @@ from relay import fanout_budget as fanout_budget_mod
 from relay import fleet_resume as resume_mod
 from relay.control_markers import CLOSING_INSTRUCTION
 from relay import invariants as _invariants
+from relay import auto_rephrase_continue as _auto_rephrase
 
 #: RECORD, not RAISE -- see the check in reset_socket_route. A reset runs after a browser has
 #: already died and an exception there costs the run the reset was meant to save.
@@ -3575,6 +3576,11 @@ class RelayWorker:
         self._platform_recycles = 0      # platform error replies (relay/platform_errors.py)
         self._platform_code = ""         # code of the LAST reply if it was a platform error
         self._fresh_turn_base = 0
+        # An ACTING goal that drew a canned non-answer is replayed in a fresh conversation ONCE,
+        # with the prior worker's progress prepended (relay/auto_rephrase_continue.py). The guard
+        # is one shot per worker: the thing it prevents is a SECOND run repeating a side effect
+        # the first run may already have performed.
+        self._acting_rephrase_done = False
         self._first_turn_sent_at = 0.0
         self._gateway_unlanded = 0
         self.recovery_result = ""
@@ -6741,6 +6747,14 @@ class RelayWorker:
                                        "-ExecutionPolicy Bypass -File scripts\\start_companion_edge.ps1 "
                                        "-Foreground` を実行してから再投入してください。")
                     return
+                # (d) ACTING GOAL, CANNED, EVERY CHEAPER RECOVERY SPENT. A read-only goal was
+                # already replayed verbatim at (a2); an acting goal was held back there to avoid a
+                # duplicate side effect. Rather than go straight to stuck, replay it ONCE in a
+                # fresh conversation with the prior worker's progress prepended, so the new worker
+                # continues from what exists instead of redoing it. One shot per worker
+                # (_acting_rephrase_done); off when the cockpit setting auto_rephrase_continue=off.
+                if self._goal_may_act() and self._recycle_acting_goal_with_progress():
+                    return
                 # nothing left to try. WHICH KIND OF STUCK depends on whether the custom agent
                 # has been seen answering in this run: if it has, the browser is fine and the
                 # canned reply is about this prompt, so telling the operator to relaunch Edge
@@ -6750,9 +6764,20 @@ class RelayWorker:
                 # many fresh conversations were tried and that each drew the SAME canned non-answer,
                 # so the operator reads "retried N times, still nothing" rather than a bare stuck.
                 _rc = getattr(self, "_canned_recycles", 0)
-                _retry_note = ("新しい会話で%d回再投入しても同じ定型の無回答が返った。" % _rc) if _rc \
-                    else "(作用を伴う目標のため新しい会話での再送はしていない。)"
-                self._canned_recovery_exhausted = bool(_rc)
+                if getattr(self, "_acting_rephrase_done", False):
+                    # The acting-goal path (d) replayed it once, with progress prepended, and the
+                    # SAME canned non-answer came back. Say so, and keep the gathered situation so
+                    # the operator sees what 'ここまでの状況' was handed to the retry.
+                    _snap = getattr(self, "_acting_progress_snapshot", "") or ""
+                    _retry_note = ("作用を伴う目標。進捗を前置きして言い換えを1回試したが、"
+                                   "同じ定型の無回答が返った。手渡した「ここまでの状況」:\n%s\n"
+                                   % _clip(_snap, 1200))
+                elif _rc:
+                    _retry_note = "新しい会話で%d回再投入しても同じ定型の無回答が返った。" % _rc
+                else:
+                    _retry_note = "(作用を伴う目標のため新しい会話での再送はしていない。)"
+                self._canned_recovery_exhausted = bool(_rc) or getattr(
+                    self, "_acting_rephrase_done", False)
                 _proof = connector_proof_source()
                 if _proof == "run":
                     self.retryable_override = False
@@ -8846,6 +8871,79 @@ class RelayWorker:
         self._start_fresh_conversation(job, now + 1.0)
         self.reason = "ツール未接続 → 新会話で作り直し (%d/%d): %s" % (
             self._tools_recycles, mcp_ready.MAX_TOOLS_RECYCLES, why[:80])
+
+    def _collect_progress_fields(self):
+        """Read this worker's 'what is done so far' WITHOUT raising: last reply, the partial text
+        left by a cut turn, the continue-turn journal, and the working tree (self.cwd).
+
+        Each field is best-effort; a driver that is already gone just yields empty strings. The
+        git/folder I/O lives in relay/auto_rephrase_continue.py (so it is testable there); this
+        only gathers the in-memory worker fields."""
+        last = ""
+        try:
+            last = self._last_text or ""
+        except Exception:
+            last = ""
+        partial = ""
+        try:
+            if self.drv is not None and hasattr(self.drv, "partial_text"):
+                partial = self.drv.partial_text() or ""
+        except Exception:
+            partial = ""
+        journal = ""
+        try:
+            conv = getattr(self.drv, "conv", None)
+            jr = getattr(conv, "journal", None)
+            if jr:
+                journal = str(jr)
+        except Exception:
+            journal = ""
+        return last, partial, journal
+
+    def _recycle_acting_goal_with_progress(self):
+        """An ACTING goal drew a canned non-answer and every cheaper recovery is spent. Replay it
+        ONCE, in a fresh conversation, with the prior worker's progress prepended so the new
+        worker continues instead of starting over (and does not redo a side effect blindly).
+
+        Returns True when the one-shot replay was started (the caller returns). Returns False when
+        it is disabled, already spent, or the goal is empty -- the caller then falls to its
+        existing stuck diagnostics. The old conversation is closed first (inside
+        _start_fresh_conversation), so no two conversations act on the goal at once.
+        """
+        if self._acting_rephrase_done:
+            return False
+        try:
+            if not _auto_rephrase.enabled():
+                return False
+        except Exception:
+            return False
+        goal_body = effective_goal(self.goal)
+        if not goal_body.strip():
+            return False
+        last, partial, journal = self._collect_progress_fields()
+        try:
+            resend_goal = _auto_rephrase.build_resend_text(
+                goal_body, worker_last=last, partial_text=partial,
+                journal=journal, cwd=(self.cwd or ""))
+        except Exception:
+            return False
+        # Store the gathered situation so a second canned non-answer can report it verbatim.
+        self._acting_progress_snapshot = resend_goal
+        self._acting_rephrase_done = True
+        job = (conversation_start_label(self.name + "-rephrase")
+               + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + resend_goal
+               + self._compaction_note())
+        # New conversation = new repetition count; the same canned text in it is a fresh
+        # observation, not 'no progress' in the old one.
+        self.no_progress, self.last_norm = 0, None
+        self._fresh_turn_base = self.turn
+        delay = transient_backoff(2)
+        print("[relay_fleet] %s: acting goal canned; rephrase+continue replay (one shot, "
+              "backoff %.0fs)" % (self.name, delay), flush=True)
+        self._start_fresh_conversation(job, time.time() + delay)
+        self.reason = ("定型の無回答(作用を伴う目標)→ 進捗を前置きして言い換え、新しい会話で"
+                       "続きから1回だけ再投入(自動・1回のみ)")
+        return True
 
     def _start_fresh_conversation(self, job, cooldown_until):
         """Drop this worker's conversation and queue `job` for a NEW one (never a tab)."""

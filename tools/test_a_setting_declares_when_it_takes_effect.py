@@ -182,6 +182,11 @@ def _reader_continue_recovery():
     return mode()
 
 
+def _reader_auto_rephrase_continue():
+    from relay.auto_rephrase_continue import mode
+    return mode()
+
+
 def _reader_consent_auto_approve():
     from relay.consent_approve import mode
     return mode()
@@ -254,6 +259,7 @@ _LIVE_READERS = {
     "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
     "tool_transport": (_reader_tool_transport, "connector-less", "connector"),
     "socket_continue_recovery": (_reader_continue_recovery, "on", "off"),
+    "auto_rephrase_continue": (_reader_auto_rephrase_continue, "on", "off"),
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
