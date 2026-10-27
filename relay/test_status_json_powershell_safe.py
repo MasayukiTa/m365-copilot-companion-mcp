@@ -16,12 +16,12 @@ case is skipped off Windows / when powershell.exe is absent.
 import json
 import os
 import shutil
-import subprocess
 
 import pytest
 
 from relay.json_casefold import fold_case_collisions, has_case_collision
 from relay import fleet_runner as FR
+from tools import childproc
 
 
 # --------------------------------------------------------------------- the helper, in python
@@ -79,8 +79,8 @@ def test_written_status_is_read_by_powershell_5_1(tmp_path):
     cmd = ("$ErrorActionPreference='Stop'; try { Get-Content -Raw -Encoding UTF8 '%s' | "
            "ConvertFrom-Json | Out-Null; 'PS_OK' } catch { 'PS_FAIL: '+$_.Exception.Message }"
            % str(p))
-    r = subprocess.run([_PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd],
-                       capture_output=True, text=True, timeout=120)
+    r = childproc.run([_PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd],
+                      timeout=120)
     assert (r.stdout or "").strip() == "PS_OK", (r.stdout, r.stderr)
 
 
@@ -92,6 +92,6 @@ def test_unfolded_colliding_json_really_does_break_powershell(tmp_path):
                  encoding="utf-8")
     cmd = ("$ErrorActionPreference='Stop'; try { Get-Content -Raw -Encoding UTF8 '%s' | "
            "ConvertFrom-Json | Out-Null; 'PS_OK' } catch { 'PS_FAIL' }" % str(p))
-    r = subprocess.run([_PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd],
-                       capture_output=True, text=True, timeout=120)
+    r = childproc.run([_PWSH, "-NoProfile", "-NonInteractive", "-Command", cmd],
+                      timeout=120)
     assert (r.stdout or "").strip() == "PS_FAIL", (r.stdout, r.stderr)
