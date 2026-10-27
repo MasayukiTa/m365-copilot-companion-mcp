@@ -341,8 +341,114 @@ partial class CockpitWindow
             // slow and the stop had no explanation anyone could point at.
             var rate = BuildRateStrip(root, ja2);
             if (rate != null) _subChips.Children.Add(rate);
+            // C: FREE SPACE, beside the rate gauge. relay/disk_series.py publishes hs_disk into
+            // health_strip.json (free_gb, 10-minute slope, swing count, warn, warn_gb). The owner
+            // measured C: swinging ~6 GB within minutes; this is the always-visible reading of it.
+            var disk = BuildDiskStrip(ja2);
+            if (disk != null) _subChips.Children.Add(disk);
             _subChips.ToolTip = _sub.Text;   // same fallback sentence, shown on hover over the chip row
         }
+    }
+
+    // The hs_disk block relay/disk_series.py merges into .fleet/health_strip.json, or null when
+    // the file is absent/unreadable or carries no hs_disk. Read straight off disk so the reading
+    // does not depend on a fleet running -- the disk swings whether or not a run is in flight.
+    // Never throws: a gauge that can take down the header is worse than no gauge.
+    Dictionary<string, object> ReadHsDisk()
+    {
+        try
+        {
+            if (string.IsNullOrEmpty(_statusPath)) return null;
+            string path = Path.Combine(Path.GetDirectoryName(_statusPath), "health_strip.json");
+            if (!File.Exists(path)) return null;
+            var root = _js.DeserializeObject(File.ReadAllText(path, Encoding.UTF8)) as Dictionary<string, object>;
+            if (root == null) return null;
+            object hd;
+            if (!root.TryGetValue("hs_disk", out hd)) return null;
+            return hd as Dictionary<string, object>;
+        }
+        catch { return null; }
+    }
+
+    // "C: NN.N GB" with a warning colour when hs_disk.warn is set (free space at or below the
+    // owner's warn_gb line). WARNS ONLY -- the owner's rule is that the disk floor is the owner's
+    // setting and a low reading never stops intake, so this is colour and a tooltip, nothing more.
+    // The tooltip carries the 10-minute slope and the swing count so a reader sees the trend, not
+    // just the level. Returns null when nothing has been measured (checked_age_s < 0 or no free_gb).
+    UIElement BuildDiskStrip(bool ja)
+    {
+        var hd = ReadHsDisk();
+        if (hd == null) return null;
+        object freeRaw;
+        if (!hd.TryGetValue("free_gb", out freeRaw) || freeRaw == null) return null;
+        double freeGb;
+        try { freeGb = Convert.ToDouble(freeRaw); } catch { return null; }
+        bool warn = false;
+        object wRaw;
+        if (hd.TryGetValue("warn", out wRaw) && wRaw != null)
+        { try { warn = Convert.ToBoolean(wRaw); } catch { } }
+        double warnGb = 0.0;
+        object wgRaw;
+        if (hd.TryGetValue("warn_gb", out wgRaw) && wgRaw != null)
+        { try { warnGb = Convert.ToDouble(wgRaw); } catch { } }
+        double slope = double.NaN;
+        object slRaw;
+        if (hd.TryGetValue("slope_gb_per_10min", out slRaw) && slRaw != null)
+        { try { slope = Convert.ToDouble(slRaw); } catch { } }
+        int swings = 0;
+        object swRaw;
+        if (hd.TryGetValue("swings_10min", out swRaw) && swRaw != null)
+        { try { swings = Convert.ToInt32(swRaw); } catch { } }
+
+        var row = new StackPanel();
+        row.Orientation = Orientation.Horizontal;
+        row.VerticalAlignment = VerticalAlignment.Center;
+        row.Margin = new Thickness(20, 0, 0, 0);
+
+        var lbl = new TextBlock();
+        lbl.Text = "C:";
+        lbl.Foreground = Theme.Br(Theme.Faint(_dark));
+        lbl.FontSize = 11;
+        lbl.VerticalAlignment = VerticalAlignment.Center;
+        lbl.Margin = new Thickness(0, 0, 6, 0);
+        row.Children.Add(lbl);
+
+        var val = new TextBlock();
+        val.FontSize = 11.5;
+        val.FontWeight = FontWeights.SemiBold;
+        // Warning colour comes from the SAME severity ramp the rate strip uses (full red at the
+        // warn line), so the two gauges read with one visual language; a healthy reading is the
+        // ordinary text colour, not green, because green here would claim more than "not low".
+        val.Foreground = warn ? new SolidColorBrush(SeverityColor(1.0)) : Theme.Br(Theme.Text(_dark));
+        val.VerticalAlignment = VerticalAlignment.Center;
+        val.Text = freeGb.ToString("0.0") + " GB";
+        row.Children.Add(val);
+
+        if (swings > 0)
+        {
+            var sw = new TextBlock();
+            sw.Text = ja ? ("  揺れ " + swings) : ("  " + swings + " swings");
+            sw.Foreground = new SolidColorBrush(SeverityColor(0.6));
+            sw.FontSize = 10.5;
+            sw.VerticalAlignment = VerticalAlignment.Center;
+            sw.Margin = new Thickness(4, 0, 0, 0);
+            row.Children.Add(sw);
+        }
+
+        string slopeTxt;
+        if (double.IsNaN(slope)) slopeTxt = ja ? "傾き不明" : "slope n/a";
+        else slopeTxt = (slope >= 0 ? "+" : "") + slope.ToString("0.0")
+                        + (ja ? " GB/10分" : " GB/10min");
+        row.ToolTip = ja
+            ? ("C: 空き " + freeGb.ToString("0.0") + " GB(直近10分の傾き " + slopeTxt
+               + "、揺れ " + swings + " 回)。\n"
+               + "警告色は空きが " + warnGb.ToString("0.#") + " GB 以下のとき。これは表示のみで、投入は止めません"
+               + "(下限はオーナー設定)。")
+            : ("C: free " + freeGb.ToString("0.0") + " GB (10-min slope " + slopeTxt
+               + ", " + swings + " swings).\n"
+               + "The warning colour lights at or below " + warnGb.ToString("0.#") + " GB free; it WARNS "
+               + "ONLY and never stops intake (the floor is the owner's setting).");
+        return row;
     }
 
 
