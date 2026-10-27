@@ -342,6 +342,19 @@ def _log_refusal(reason: str, text: str, source: str, similar_to: str = "") -> N
         pass
 
 
+def _log_similarity_observed(text: str, source: str, similar_to: str = "",
+                             similarity: float = 0.0) -> None:
+    """Note that an incoming goal RESEMBLED one already in flight, WITHOUT refusing it. The
+    goal is queued normally; this only records the resemblance so the pattern stays visible.
+    Never raises, never alters the reply the caller gets."""
+    try:
+        from tools import obs_log
+        obs_log.log_similarity_observed(text, source, similar_to=similar_to,
+                                        similarity=similarity)
+    except Exception:
+        pass
+
+
 def fleet_submit(goal: str, note: str = "", source: str = "",
                  priority: bool = False, resume_conv: str = "") -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
@@ -379,24 +392,26 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
             "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
             "messages back into Fleet.]"
         )
-    # A CONTINUATION IS EXEMPT FROM THE DUPLICATE CHECK. resume_conv names an existing
-    # conversation this goal is meant to CONTINUE, and a follow-up is deliberately short and
-    # terse ("write the changelog", "now do the other half") -- exactly the shape _duplicate_of
-    # reads as the resubmission of something already in flight. Refusing it is the specific way
-    # a continuation stopped being a continuation: the terse second turn was rejected as a
-    # near-duplicate of the first, and the conversation it was meant to resume was never
-    # answered. So a goal that carries resume_conv skips the overlap test entirely; the worker
-    # keeps the conversation apart by its id, which is what the overlap heuristic was standing
-    # in for.
+    # CONTENT RESEMBLANCE NEVER STOPS A SUBMISSION. The owner's instruction (2026-10-26 "vari, 内容
+    # 一致で投入を止めるやつ今すぐ廃止しろ。正規化は裏でやれ"; reiterated 2026-10-27 when a 塗工布調査 goal
+    # would not start) is explicit: a goal must be queued even when its wording resembles one
+    # already in flight. The resemblance heuristic (_duplicate_of) is KEPT, but demoted from a
+    # refusal to an observation -- it runs in the background and records what it saw, and the
+    # goal is queued regardless. Two deliberately-identical instructions from two devices, a
+    # worker's paraphrase and an operator's terser resubmission, and the one job the owner just
+    # tried to start all now go through; the only thing that changes is a line in
+    # fleet_submit_similarity.jsonl noting the overlap. Genuine double-execution is prevented
+    # elsewhere by JOB ID, not by content: see relay/relay_fleet.py's add_box retry guard
+    # (jid-based) and relay/fleet_runner.py's _goal_resume_key (jid first, text only for legacy).
+    #
+    # resume_conv (a continuation) is likewise never compared -- a follow-up is deliberately
+    # terse, and the worker keeps the conversation apart by its id -- so the observation is
+    # skipped for it too, to avoid noise rather than to avoid a block (there is no block).
     if not resume_conv:
         dup = _duplicate_of(text)
         if dup is not None:
             dup_jid, sim = dup
-            _log_refusal("similar", text, source, similar_to=dup_jid)
-            return ("[fleet_submit: refused -- this reads as the goal already queued or running "
-                    "as %s (%d%% word overlap). If it is genuinely different work, say specifically "
-                    "how; if you meant to check on that job, use fleet_queue() instead of "
-                    "resubmitting it.]" % (dup_jid, round(sim * 100)))
+            _log_similarity_observed(text, source, similar_to=dup_jid, similarity=sim)
     n = _pending_count()
     if n >= MAX_PENDING:
         _log_refusal("pending_full", text, source)

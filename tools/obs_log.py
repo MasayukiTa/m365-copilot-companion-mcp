@@ -29,6 +29,12 @@ MAX_BYTES = 20 * 1024 * 1024
 
 INBOUND_NAME = "mcp_inbound.jsonl"
 REFUSALS_NAME = "fleet_submit_refusals.jsonl"
+#: Where content-similarity is NOTED without refusing anything. The owner's instruction
+#: (2026-10-26/27) is that a goal must never be stopped because its wording resembles another
+#: goal's -- normalisation/similarity may run, but only to RECORD, never to block. A separate
+#: file from REFUSALS_NAME on purpose: a row here is an observation, not a refusal, and must not
+#: be miscounted as one.
+SIMILAR_OBSERVED_NAME = "fleet_submit_similarity.jsonl"
 
 _LOCK = threading.Lock()
 _WARNED = False
@@ -290,5 +296,27 @@ def log_refusal(reason: str, goal_text: str, source: str, similar_to: str = "") 
         if similar_to:
             row["similar_to"] = str(similar_to)
         append(REFUSALS_NAME, row)
+    except Exception as exc:
+        _note_failure(exc)
+
+
+def log_similarity_observed(goal_text: str, source: str, similar_to: str = "",
+                            similarity: float = 0.0) -> None:
+    """Record that an incoming goal RESEMBLED one already in flight -- WITHOUT refusing it.
+
+    This is the 'normalise in the background' half of the owner's instruction: the goal is
+    queued normally, and the resemblance is noted here only so the pattern stays visible. It
+    is written to SIMILAR_OBSERVED_NAME, never REFUSALS_NAME, because nothing was refused.
+    Never raises.
+    """
+    try:
+        row = {"goal_len": len(str(goal_text or "")),
+               "goal_head": head(goal_text, 80), "source": head(source, 80),
+               "queued": True}
+        if similar_to:
+            row["similar_to"] = str(similar_to)
+        if similarity:
+            row["similarity"] = round(float(similarity), 4)
+        append(SIMILAR_OBSERVED_NAME, row)
     except Exception as exc:
         _note_failure(exc)
