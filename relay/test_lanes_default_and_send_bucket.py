@@ -24,29 +24,20 @@ def _clean():
 def test_the_default_lane_count_is_the_derived_ceiling_everywhere():
     from tools.settings_keys import LANE_CEILING_DEFAULT
     assert FR.LANES_DEFAULT == FR.DEFAULT_MAX_CONCURRENT == FR.AUTOSCALE_CEILING_DEFAULT
-    assert FR.LANES_DEFAULT == LANE_CEILING_DEFAULT == 200
-    assert FR.TABS_BOUNDS[1] >= 1000                       # the rail is still wide
+    assert FR.LANES_DEFAULT == LANE_CEILING_DEFAULT == 50
+    assert FR.TABS_BOUNDS[1] == 1000                       # the rail is still wide
 
 
 def test_the_automatic_lane_count_is_goals_present_capped_by_the_ceiling(monkeypatch):
     monkeypatch.setattr(RF, "avail_phys_mb", lambda: 10.0)           # RAM does not enter it
-    assert RF.auto_concurrency(1000) == 200
+    assert RF.auto_concurrency(1000) == 50
     assert RF.auto_concurrency(5) == 5
 
 
-def test_a_stale_settings_value_does_not_set_the_start_up_cap(monkeypatch, capsys):
+def test_settings_set_the_start_up_cap(monkeypatch):
     monkeypatch.setattr(FR, "_settings_int", lambda key, default: {"maxtabs": 3,
-                                                                    "autoscale_max": 30}.get(key, default))
-    monkeypatch.setattr(FR, "HONOR_SETTINGS_LANES", False)
-    assert FR.lane_setting("maxtabs") == FR.LANES_DEFAULT
-    assert FR.lane_setting("autoscale_max") == FR.LANES_DEFAULT
-    out = capsys.readouterr().out
-    assert "ignoring settings.txt maxtabs=3" in out and "autoscale_max=30" in out
-
-
-def test_settings_can_be_honoured_only_by_opting_in(monkeypatch):
-    monkeypatch.setattr(FR, "_settings_int", lambda key, default: 30)
-    monkeypatch.setattr(FR, "HONOR_SETTINGS_LANES", True)
+                                                                   "autoscale_max": 30}.get(key, default))
+    assert FR.lane_setting("maxtabs") == 3
     assert FR.lane_setting("autoscale_max") == 30
 
 
@@ -54,7 +45,7 @@ def test_the_admission_loop_uses_the_ram_safeguard_not_the_tab_budget():
     import inspect
     src = inspect.getsource(RF.run_relay_fleet)
     assert "socket_capacity.ram_safeguard_cap(" in src
-    assert "socket_capacity.admits_another_goal(" in src
+    assert "concurrency_admits(" in src
     assert "admits_another_tab(" not in src and "_candidate_socket" not in src
 
 

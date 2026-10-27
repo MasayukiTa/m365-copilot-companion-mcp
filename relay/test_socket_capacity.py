@@ -34,13 +34,14 @@ def test_goal_cost_is_declared_settable_and_positive(monkeypatch):
     assert SC.goal_cost_mb() == SC.GOAL_MB_DEFAULT
 
 
-def test_lane_ceiling_is_derived_not_a_literal():
-    assert SK.derive_lane_ceiling(100, 60, 2) == 200 == SK.LANE_CEILING_DEFAULT
+def test_lane_ceiling_uses_operational_limit_and_rate_estimate():
+    assert SK.derive_lane_ceiling(100, 60, 2) == 200
+    assert SK.LANE_CEILING_DEFAULT == 50
     assert SK.derive_lane_ceiling(50, 60, 2) == 100            # follows the rate
     from relay.quota_meter import LIMIT_RPM
     assert SK.CLOUD_RPM == LIMIT_RPM
     import relay.fleet_runner as FR
-    assert FR.LANES_DEFAULT == FR.DEFAULT_MAX_CONCURRENT == FR.AUTOSCALE_CEILING_DEFAULT == 200
+    assert FR.LANES_DEFAULT == FR.DEFAULT_MAX_CONCURRENT == FR.AUTOSCALE_CEILING_DEFAULT == 50
 
 
 def test_the_word_emergency_is_gone_from_code():

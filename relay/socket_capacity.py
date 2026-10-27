@@ -7,8 +7,8 @@ removing the gate. The resources a socket goal actually uses are two, and each h
   * THE CLOUD RATE -- the bound that decides throughput. It is enforced where it is spent, at
     the send: a token bucket (rate = min(100, rate_ceiling_rpm), burst 8, in relay_fleet:
     socket_send_due / note_socket_sent). Goals beyond what the rate can feed simply wait READY.
-    No lane count can raise throughput past it, so the lane ceiling is derived from it
-    (tools/settings_keys.derive_lane_ceiling), not guessed.
+    No lane count can raise throughput past it. The default ceiling is 50, bounded by the
+    historical rate estimate (tools/settings_keys.derive_lane_ceiling).
 
   * RAM IN THIS PROCESS -- what a held conversation costs. MEASURED, NOT ASSUMED (2026-08-25,
     nineteen cold runs): one worker at a time put the fleet process at 244.0 MB, three at a time
