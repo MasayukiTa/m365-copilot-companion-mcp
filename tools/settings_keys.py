@@ -226,6 +226,22 @@ KEYS = OrderedDict([
        "created while it is on carry the refs the check needs. A present line reads as on only when it "
        "says on; anything else on a present line is off, while an absent line is on (the default)."),
 
+    # Rephrase+continue replay of an ACTING goal that drew a canned non-answer
+    # (relay/auto_rephrase_continue.py). ON by default.
+    _k("auto_rephrase_continue", EACH_GATE, "on",
+       "relay/auto_rephrase_continue.py:mode (read when a canned non-answer has spent every "
+       "cheaper recovery, mtime-cached)",
+       "on|off. on (default): when an acting goal (writes to a clone, opens a PR) draws a canned "
+       "non-answer and re-nav and the headed-Edge relaunch are both spent, the harness replays it "
+       "ONCE in a fresh conversation, with the prior worker's progress (last reply, cut partial, "
+       "continue-turn journal, git state and the output folder listing) prepended and a rephrase "
+       "lead, so the new worker continues from what exists instead of starting over. One shot per "
+       "worker; if the rephrased replay draws the same canned non-answer it stops and the reason "
+       "carries 'tried a rephrase once' plus the gathered situation. off: such a goal ends STUCK "
+       "without a replay, exactly as before. Read at that decision, so a change reaches the next "
+       "one with no restart. A present line reads as on only when it says on; anything else on a "
+       "present line is off, while an absent line is on (the default)."),
+
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
     # enforcing a write scope would go through the folder policy (frozen) and needs a separate
