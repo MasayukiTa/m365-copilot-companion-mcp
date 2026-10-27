@@ -513,7 +513,12 @@ partial class CockpitWindow
                     col.Children.Add(rl);
                 }
 
-                // Line 3: meta — worker name · turn N · alive {freshness} ago · verified [COMPUTED].
+                // Line 3: meta — [elapsed ·] {worker name | 完了時刻} · turn N · verified [COMPUTED].
+                // On a COMPLETED (terminal) card the worker number (e.g. W67) is NOT shown: the
+                // operator asked for the task's identity (its title, already on line 1) and WHEN it
+                // finished, not which lane ran it. The completion time is the ts of the last
+                // phase_event; if none exists we show neither number nor time (the other meta parts
+                // still render). A live card keeps the worker name as before.
                 var meta = new StringBuilder();
                 string transcriptPath = S(w, "transcript");
                 double startTs = ReadTranscriptStartTs(transcriptPath);
@@ -523,7 +528,27 @@ partial class CockpitWindow
                     if (cardElapsed > 0)
                         meta.Append(Fmt(cardElapsed)).Append(" · ");
                 }
-                meta.Append(name.ToUpper());
+                if (terminal)
+                {
+                    double doneTs = SubmittedTasks.CompletedUnix(w);
+                    if (doneTs > 0)
+                    {
+                        string hhmm;
+                        try
+                        {
+                            var dt = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc)
+                                .AddSeconds(doneTs).ToLocalTime();
+                            hhmm = dt.ToString("HH:mm");
+                        }
+                        catch (Exception) { hhmm = ""; }
+                        if (hhmm.Length > 0)
+                            meta.Append(_lang == 0 ? ("完了 " + hhmm) : ("completed " + hhmm));
+                    }
+                }
+                else
+                {
+                    meta.Append(name.ToUpper());
+                }
                 if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
                 if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
                 if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
@@ -544,9 +569,14 @@ partial class CockpitWindow
                             .Append(Fmt(progressAge)).Append(_lang == 0 ? " 前" : " ago");
                     }
                 }
+                // A completed card with no completion ts (no phase_events) drops its leading cell,
+                // so the string can start with a stray " · ". Trim it so the line never leads with
+                // a separator.
+                string metaText = meta.ToString();
+                if (metaText.StartsWith(" · ")) metaText = metaText.Substring(3);
                 var ml = new TextBlock
                 {
-                    Text = meta.ToString(), Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
+                    Text = metaText, Foreground = Theme.Br(Theme.Faint(_dark)), FontSize = 12,
                     Margin = new Thickness(24, 3, 0, 0)
                 };
                 col.Children.Add(ml);

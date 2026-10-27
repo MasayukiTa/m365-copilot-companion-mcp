@@ -731,6 +731,32 @@ sealed class SubmittedTasks
         return d.TryGetValue("ts", out ts) ? Num(ts) : 0.0;
     }
 
+    /// The time a worker FINISHED, as the ts of the LAST phase_event (the terminal
+    /// transition). Falls back to 0 when a worker has no phase_events. This is the value the
+    /// completed group is ordered by -- newest completion on top. CreatedUnix uses the FIRST
+    /// event; this uses the LAST, so a long-running task that finished recently still sorts above
+    /// a short task that finished earlier.
+    public static double CompletedUnix(Dictionary<string, object> w)
+    {
+        object pe;
+        if (w == null || !w.TryGetValue("phase_events", out pe) || pe == null) return 0.0;
+        object last = null;
+        if (pe is object[])
+        {
+            object[] arr = (object[])pe;
+            if (arr.Length > 0) last = arr[arr.Length - 1];
+        }
+        else if (pe is System.Collections.ArrayList)
+        {
+            System.Collections.ArrayList al = (System.Collections.ArrayList)pe;
+            if (al.Count > 0) last = al[al.Count - 1];
+        }
+        var d = last as Dictionary<string, object>;
+        if (d == null) return 0.0;
+        object ts;
+        return d.TryGetValue("ts", out ts) ? Num(ts) : 0.0;
+    }
+
     /// 0 fresh pending (see FRESH_PENDING_S), 1 active, 2 older pending, 3 terminal.
     public static int WorkerRank(Dictionary<string, object> w, double nowUnix,
                                  Predicate<Dictionary<string, object>> isTerminal)
@@ -773,9 +799,27 @@ sealed class SubmittedTasks
             return c != 0 ? c : idx[a].CompareTo(idx[b]);
         });
         outList.AddRange(fresh);
-        for (int rank = 1; rank <= 3; rank++)
-            foreach (SubmittedDisplayItem x in ranked)
-                if (x.Rank == rank) outList.Add(x);
+        // Active (1) and older pending (2), NEWEST FIRST within each bucket: the most recently
+        // submitted worker (largest Wnn, appended last to status.json) sits on top, so the task a
+        // user just dispatched is what they see first; W0 falls to the bottom (owner request
+        // 2026-10-26). Walk `ranked` (status.json order) in reverse to achieve this. Terminal (3)
+        // is NOT walked here: it is ordered by completion time just below, which already places the
+        // newest-finished card on top.
+        for (int rank = 1; rank <= 2; rank++)
+            for (int i = ranked.Count - 1; i >= 0; i--)
+                if (ranked[i].Rank == rank) outList.Add(ranked[i]);
+        // Terminal (3): the completed group, ordered by completion time, NEWEST FIRST -- the most
+        // recently finished task on top. Stable: List.Sort is not, so the original index breaks
+        // ties (two workers with the same/zero completion ts keep status.json order).
+        var done = ranked.FindAll(delegate (SubmittedDisplayItem x) { return x.Rank == 3; });
+        var doneIdx = new Dictionary<SubmittedDisplayItem, int>();
+        for (int i = 0; i < done.Count; i++) doneIdx[done[i]] = i;
+        done.Sort(delegate (SubmittedDisplayItem a, SubmittedDisplayItem b)
+        {
+            int c = CompletedUnix(b.Worker).CompareTo(CompletedUnix(a.Worker));
+            return c != 0 ? c : doneIdx[a].CompareTo(doneIdx[b]);
+        });
+        outList.AddRange(done);
         return outList;
     }
 }

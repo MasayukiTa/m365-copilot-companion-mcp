@@ -73,6 +73,20 @@ STATUS_OF = {
 #: The closed set. Nothing outside it may be assigned to a worker's outcome.
 OUTCOMES = frozenset(STATUS_OF)
 
+#: A NON-TERMINAL STATUS WITH NO OUTCOME, so it is deliberately NOT a key of STATUS_OF.
+#:
+#: STATUS_OF maps an OUTCOME (a way a worker FINISHED) to the status a reader sees, and the
+#: module asserts `set(STATUS_OF) == OUTCOMES` at import. `recovering` is not a finish: it is
+#: the transient state while the harness is auto-recovering a worker -- canned-nonanswer
+#: requeue, reconnect, token renew, INFRA_STUCK retry, interrupted auto-resume -- the same
+#: shape as `ready`/`waiting`/`awaiting`, which are statuses with no STATUS_OF entry either.
+#: Putting it in STATUS_OF would require a RECOVERING *outcome* that nothing produces and would
+#: break the closed-set and SCORING invariants below. It is defined here so the status key has
+#: one documented home on the relay side; its phase-spine label lives in relay_fleet._PHASE_LABELS
+#: and its severity/colour (info, NOT needs-attention) in ui/Theme.cs. The side that transitions
+#: a worker INTO this status is a separate change.
+RECOVERING_STATUS = "recovering"
+
 #: Declared but never produced, with the reason, so the exhaustiveness test can tell "not
 #: emitted yet" from "the enum is stale".
 #:
