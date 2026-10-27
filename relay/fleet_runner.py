@@ -2265,6 +2265,20 @@ def _write_atomic(path, payload):
     cannot be written is a real failure -- a fleet with no status is a fleet the panel shows
     as dead -- so this turns a lost race into a delay, never into a silent skip.
     """
+    # CASE-FOLD FOR THE COCKPIT'S READER. Windows PowerShell 5.1's ConvertFrom-Json builds
+    # each JSON object into a CASE-INSENSITIVE dictionary, so two keys in one object that
+    # differ only in case (e.g. "turn"/"Turn") make it throw "duplicate keys" and read
+    # NOTHING -- while python's json keeps both and writes the file without complaint. The
+    # snapshot is assembled from many additive blocks; rather than audit every producer
+    # forever, fold once here on the way out (last writer wins, exactly as the reader would
+    # collapse them). Values are untouched; only a name clash is resolved. A plain same-name
+    # duplicate cannot occur from a python dict, but this also makes the written bytes provably
+    # safe for the panel. See relay/json_casefold.py.
+    try:
+        from relay.json_casefold import fold_case_collisions
+        payload = fold_case_collisions(payload)
+    except Exception:
+        pass   # a status file must still be written even if the fold helper is unavailable
     tmp = path + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)

@@ -51,11 +51,21 @@ partial class CockpitWindow
     // poll's background thread can read it (PublishHealthStrip) without a lock.
     volatile List<SubmittedView> _submittedNow = new List<SubmittedView>();
     string _submittedSig = "";
+    // The refused goals, read the same tick from .fleet/tasks/refused. Same publish discipline:
+    // replaced whole on the UI thread, read without a lock. A refused card is NOT merged into the
+    // submitted group -- it did not enter the queue -- but it is drawn in the same top area so a
+    // turned-away request is seen at the machine and can be forced in by the person.
+    volatile List<RefusedView> _refusedNow = new List<RefusedView>();
 
     static string TasksDir()
     {
         string exeDir = AppDomain.CurrentDomain.BaseDirectory;          // ...\ui\
         return Path.GetFullPath(Path.Combine(exeDir, "..", ".fleet", "tasks"));
+    }
+
+    static string RefusedDir()
+    {
+        return Path.Combine(TasksDir(), "refused");
     }
 
     // What the "submitted" group shows right now: the merged list, newest first, as of the
@@ -64,6 +74,90 @@ partial class CockpitWindow
     {
         List<SubmittedView> now = _submittedNow;
         return now ?? new List<SubmittedView>();
+    }
+
+    // The refused goals to draw this tick, newest first. A record already forced in is dropped
+    // from the cards here: its job is now in the submitted group like any other, and a spent
+    // button must not linger. Never throws.
+    List<RefusedView> ReadRefusedCards()
+    {
+        var outp = new List<RefusedView>();
+        List<RefusedView> now = _refusedNow;
+        if (now == null) return outp;
+        foreach (RefusedView v in now)
+            if (v != null && !v.Forced) outp.Add(v);
+        return outp;
+    }
+
+    // A "refused, not submitted" card: a goal fleet_submit turned away. The owner asked that the
+    // system never silently drop a request -- so the reason is shown IN JAPANESE (for a near-
+    // duplicate, naming the job it looked like and the measured overlap), the whole goal is on the
+    // card, and a "強制投入" (force) button lets the PERSON overrule the refusal. The button
+    // runs tools.fleet_intake --force-refused <id>, which is force_submit_refused -- an operator
+    // entry deliberately kept out of the MCP tool list, so only a person at this machine reaches it.
+    UIElement RefusedCard(RefusedView v)
+    {
+        bool ja = _lang == 0;
+        var card = new Border {
+            BorderThickness = new Thickness(1), BorderBrush = Border, Background = BtnBg,
+            CornerRadius = new CornerRadius(Theme.RadCard),
+            Padding = new Thickness(16, 8, 16, 8), Margin = new Thickness(8, 8, 8, 4) };
+        if (v == null) { card.Child = new TextBlock { Text = "" }; return card; }
+        var dp = new DockPanel { LastChildFill = true };
+        // The action sits on the right, mirroring SubmittedRow's dismiss. A spent record never
+        // reaches here (ReadRefusedCards drops Forced), so the button is always live.
+        var force = new Button {
+            Content = ja ? "強制投入" : "Force in", Cursor = Cursors.Hand, FontSize = 12,
+            Foreground = Fg, Background = Brushes.Transparent,
+            BorderBrush = Border, BorderThickness = new Thickness(1),
+            Padding = new Thickness(12, 4, 12, 4), Margin = new Thickness(8, 0, 0, 0) };
+        force.ToolTip = ja ? "判定を飛ばしてこの目標を投入します（利用者による強制）"
+                           : "Queue this goal, skipping the admission checks (operator override)";
+        string refusedId = v.Id;
+        force.Click += delegate (object sender, RoutedEventArgs e)
+        {
+            e.Handled = true;
+            ForceRefusedGoal(refusedId);
+        };
+        DockPanel.SetDock(force, Dock.Right); dp.Children.Add(force);
+        var stack = new StackPanel();
+        stack.Children.Add(new TextBlock {
+            Text = SubmittedTasks.RefusedReasonText(v, ja),
+            Foreground = Muted, FontSize = 11.5, FontWeight = FontWeights.SemiBold,
+            TextWrapping = TextWrapping.Wrap });
+        stack.Children.Add(new TextBlock {
+            Text = OneLine(v.Goal, 140),
+            Foreground = Fg, FontSize = 13, Margin = new Thickness(0, 2, 0, 0),
+            TextTrimming = TextTrimming.CharacterEllipsis, ToolTip = v.Goal });
+        dp.Children.Add(stack);
+        card.Child = dp;
+        return card;
+    }
+
+    // Run the operator-only force path for one refused record, off the MCP surface: launch
+    // tools.fleet_intake --force-refused <id> (force_submit_refused), then refresh so the card --
+    // whose record is now stamped forced -- drops on the next read. Never throws into the click.
+    void ForceRefusedGoal(string refusedId)
+    {
+        if (string.IsNullOrEmpty(refusedId)) return;
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m tools.fleet_intake --force-refused \"" + refusedId + "\" --source cockpit";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            System.Diagnostics.Process.Start(psi);
+        }
+        catch (Exception) { }
+        // The pending job and the stamped record land on disk; the next tick reads both. Nudge a
+        // render so the forced card leaves promptly rather than waiting for the status poll.
+        ForceRender();
     }
 
     // Once per tick: read the three on-disk sources and merge them with this window's own
@@ -88,6 +182,9 @@ partial class CockpitWindow
                                                            WorkersOf(root), HistoryWorkers(), NowUnix());
             _submittedNow = views;
             _submittedSig = SubmittedTasks.Signature(views, _lang == 0);
+            // Read the refusals the same tick, from the same tasks dir, so the submitted group
+            // and its refused cards cannot point at different places. ReadRefused never throws.
+            _refusedNow = SubmittedTasks.ReadRefused(RefusedDir());
         }
         catch (Exception) { }
     }
@@ -946,12 +1043,16 @@ partial class CockpitWindow
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
-        // CAPTURE THE COORDINATOR'S STDOUT/STDERR. Measured 2026-10-26: a GUI-launched
-        // coordinator that printed "TIMED OUT WAITING TO START" and exited 3 left no trace
-        // anywhere, because this process was started with no redirection -- so the operator
-        // saw a stuck "投入済み" card with no way to learn why. Redirect both streams and drain
-        // them asynchronously (sync ReadToEnd here would block the UI thread / risk a pipe
-        // deadlock) into .fleet/gui_start_<time>.log.
+        // CAPTURE THE COORDINATOR'S STDOUT/STDERR. Two defects are fixed here together:
+        //  - (gui_start) a GUI-launched coordinator that printed "TIMED OUT WAITING TO START"
+        //    and exited 3 left no trace anywhere, so the operator saw a stuck "投入済み" card
+        //    with no way to learn why. Redirect BOTH streams and drain them asynchronously (a
+        //    sync ReadToEnd here would block the UI thread / risk a pipe deadlock) into
+        //    .fleet/gui_start_<time>.log.
+        //  - (refused_ux) a run that fails to start said only its exit code (or nothing), so the
+        //    person at the machine was told "could not start" with no reason. In addition to the
+        //    log file, stderr is drained into a bounded in-memory buffer so WatchFreshFleetLaunch
+        //    can put the runner's OWN last words on screen when it dies.
         psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
@@ -959,6 +1060,9 @@ partial class CockpitWindow
                              + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + ".log");
         System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
         if (proc == null) return false;
+        // Drain both streams to the log file (gui_start) AND keep stderr's tail in a bounded
+        // in-memory buffer (refused_ux) so the failure reason can also reach the operator's card.
+        StringBuilder errBuf = new StringBuilder();
         try
         {
             var logLock = new object();
@@ -971,7 +1075,18 @@ partial class CockpitWindow
                 try { lock (logLock) { logw.WriteLine(e.Data); logw.Flush(); } } catch (Exception) { }
             };
             proc.OutputDataReceived += sink;
-            proc.ErrorDataReceived += sink;
+            proc.ErrorDataReceived += delegate (object s, System.Diagnostics.DataReceivedEventArgs e)
+            {
+                // Log file (via sink) AND the bounded tail buffer: keep only the TAIL, since a
+                // runaway traceback must not grow unbounded in the UI process and the last lines
+                // are the ones that name the failure.
+                sink(s, e);
+                if (e == null || e.Data == null) return;
+                lock (errBuf)
+                {
+                    if (errBuf.Length < 8000) errBuf.Append(e.Data).Append('\n');
+                }
+            };
             proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
             // Close the log writer when the coordinator exits so the handle is not leaked.
@@ -1006,7 +1121,7 @@ partial class CockpitWindow
                 SubmitDbg("box_cleared_at_spawn");
             }
             WatchFreshFleetLaunch(proc, submitBaseline, goalsFile, submittedText ?? "",
-                                  goals, planMode, 0);
+                                  goals, planMode, errBuf, 0);
         }
         else
         {
@@ -1016,6 +1131,24 @@ partial class CockpitWindow
             try { proc.Dispose(); } catch (Exception) { }
         }
         return true;
+    }
+
+    // The runner's last stderr lines, trimmed to a single short line for the start note. Empty
+    // when it said nothing. Static and side-effect free so a test can feed it a buffer.
+    static string StartFailureReason(StringBuilder errBuf)
+    {
+        if (errBuf == null) return "";
+        string all;
+        lock (errBuf) { all = errBuf.ToString(); }
+        if (string.IsNullOrEmpty(all)) return "";
+        string[] lines = all.Replace("\r", "").Split('\n');
+        string last = "";
+        for (int i = lines.Length - 1; i >= 0; i--)
+        {
+            if (lines[i] != null && lines[i].Trim().Length > 0) { last = lines[i].Trim(); break; }
+        }
+        if (last.Length > 300) last = last.Substring(0, 300) + "…";
+        return last;
     }
 
     static bool FreshRunContainsGoals(Dictionary<string, object> root, List<string> goals)
@@ -1052,7 +1185,7 @@ partial class CockpitWindow
 
     void WatchFreshFleetLaunch(System.Diagnostics.Process proc, SubmissionBaseline baseline,
                                string goalsFile, string submittedText, List<string> goals, bool planMode,
-                               int attempt)
+                               StringBuilder errBuf, int attempt)
     {
         var timer = new System.Windows.Threading.DispatcherTimer();
         timer.Interval = TimeSpan.FromMilliseconds(200);
@@ -1163,12 +1296,19 @@ partial class CockpitWindow
                 _fleetLaunchPending = false;
                 _fleetLaunchPendingSinceUtc = DateTime.MinValue;
                 try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                // The box was emptied at spawn (ui_submit fix), so restore the operator's text
+                // (gui_start fix), then show the exit code AND the reason: StartFailureReason
+                // returns the runner's last stderr line (empty if it was silent), appended so the
+                // person sees WHY, not just the number (refused_ux fix).
                 SubmitRestoreBox(submittedText);
+                string why = StartFailureReason(errBuf);
                 if (_startNote != null)
                     _startNote.Text = (_lang == 0
                         ? "新しい実行を開始できませんでした。入力は戻しました。終了コード "
                         : "Could not start the new run; your input was restored. Exit code ")
-                        + code;
+                        + code
+                        + (why.Length > 0 ? (_lang == 0 ? "。理由: " : ". Reason: ") + why : "");
+                try { proc.Dispose(); } catch (Exception) { }
             }
             catch (Exception ex)
             {
@@ -1221,6 +1361,10 @@ partial class CockpitWindow
                                  + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + ".log");
             System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
             if (proc == null) return false;
+            // Same dual drain as the primary spawn path: both streams to the log file (gui_start)
+            // and stderr's tail into a bounded buffer (refused_ux) so a retry that also fails can
+            // still name WHY on the operator's card.
+            StringBuilder errBuf = new StringBuilder();
             try
             {
                 var logLock = new object();
@@ -1233,7 +1377,15 @@ partial class CockpitWindow
                     try { lock (logLock) { logw.WriteLine(e.Data); logw.Flush(); } } catch (Exception) { }
                 };
                 proc.OutputDataReceived += sink;
-                proc.ErrorDataReceived += sink;
+                proc.ErrorDataReceived += delegate (object s, System.Diagnostics.DataReceivedEventArgs e)
+                {
+                    sink(s, e);
+                    if (e == null || e.Data == null) return;
+                    lock (errBuf)
+                    {
+                        if (errBuf.Length < 8000) errBuf.Append(e.Data).Append('\n');
+                    }
+                };
                 proc.BeginOutputReadLine();
                 proc.BeginErrorReadLine();
                 proc.EnableRaisingEvents = true;
@@ -1243,7 +1395,7 @@ partial class CockpitWindow
             _fleetLaunchPending = true;
             _fleetLaunchPendingSinceUtc = DateTime.UtcNow;
             _fleetLaunchSubmittedText = submittedText ?? "";
-            WatchFreshFleetLaunch(proc, baseline, goalsFile, submittedText ?? "", goals, planMode, attempt);
+            WatchFreshFleetLaunch(proc, baseline, goalsFile, submittedText ?? "", goals, planMode, errBuf, attempt);
             return true;
         }
         catch (Exception) { return false; }

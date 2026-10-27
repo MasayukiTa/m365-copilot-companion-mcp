@@ -381,3 +381,96 @@ def test_the_interrupted_run_snapshots_are_never_swept(tmp_path):
     for p in snaps:
         assert os.path.isfile(p), "retention deleted a resume snapshot: %s" % p
     assert os.path.isfile(str(tmp_path / "interrupted" / "r9_a1.json.tmp"))
+
+
+# --------------------------------------------------- vs_tests_* stray (disk_causal cause fix)
+
+
+def test_an_aged_vs_tests_dir_is_measured_and_listed_not_deleted(tmp_path):
+    # The brief forbids deleting files: aged vs_tests_* scratch is MEASURED and returned as a
+    # candidate, never removed. sweep_temp_home must not touch it at all.
+    now = time.time()
+    d = tmp_path / "vs_tests_abc123"
+    _touch(str(d / "inner" / "data.bin"), size=4096, age_days=3, now=now)
+    # sweep_temp_home no longer acts on vs_tests_* -- the dir survives the sweep.
+    _freed, items = R.sweep_temp_home(temp_root=str(tmp_path), now=now)
+    assert str(d) not in items, "sweep_temp_home must not delete/report vs_tests dirs"
+    assert os.path.isdir(str(d)), "sweep deleted a vs_tests dir (brief forbids deletion)"
+    # the instrument measures the bytes and lists the dir as a candidate, deleting nothing.
+    total, cands = R.vs_tests_warning(temp_root=str(tmp_path), now=now)
+    assert str(d) in cands, "the aged vs_tests dir was not listed as a candidate: %s" % cands
+    assert total >= 4096, "measured bytes did not include the contents: %d" % total
+    assert os.path.isdir(str(d)), "the instrument deleted a vs_tests dir"
+
+
+def test_a_fresh_vs_tests_dir_is_not_a_candidate(tmp_path):
+    # Only dirs older than max_age_h are reported; a run still in progress is not listed.
+    now = time.time()
+    d = tmp_path / "vs_tests_fresh"
+    _touch(str(d / "data.bin"), size=4096, age_days=0.1, now=now)
+    total, cands = R.vs_tests_warning(temp_root=str(tmp_path), now=now)
+    assert str(d) not in cands
+    assert total == 0, "a fresh vs_tests dir was measured: %d" % total
+    assert os.path.isdir(str(d)), "a fresh vs_tests dir was touched"
+
+
+def test_vs_tests_warning_dry_run_measures_but_records_nothing(tmp_path):
+    # dry_run still measures and lists candidates; it simply does not emit a mechanism row.
+    # Nothing is ever deleted in either mode.
+    now = time.time()
+    d = tmp_path / "vs_tests_dry"
+    _touch(str(d / "data.bin"), size=4096, age_days=3, now=now)
+    total, cands = R.vs_tests_warning(temp_root=str(tmp_path), now=now, dry_run=True)
+    assert str(d) in cands, "dry run should still list the candidate"
+    assert total >= 4096, "dry run should still measure the bytes"
+    assert os.path.isdir(str(d)), "dry run deleted a vs_tests dir"
+
+
+def test_a_stranger_in_temp_is_not_a_vs_tests_candidate(tmp_path):
+    # The match is anchored: only `vs_tests_<token>`. A directory that merely contains the
+    # substring, or is somebody else's, is never measured or listed.
+    now = time.time()
+    keep = tmp_path / "my_vs_tests_backup"
+    _touch(str(keep / "x"), size=100, age_days=99, now=now)
+    total, cands = R.vs_tests_warning(temp_root=str(tmp_path), now=now)
+    assert str(keep) not in cands
+    assert total == 0
+    assert os.path.isdir(str(keep)), "a non-matching neighbour was touched"
+
+
+# ------------------------------------------- non-empty playwright artifacts: instrument only
+
+
+def test_a_nonempty_playwright_dir_is_measured_not_deleted(tmp_path):
+    # The empty ones are swept; the non-empty ones stayed at correlation in the survey, so they
+    # are recorded and LEFT, never deleted.
+    now = time.time()
+    d = tmp_path / "playwright-artifacts-0001"
+    _touch(str(d / "trace.zip"), size=5000, age_days=1, now=now)
+    # sweep_temp_home must not delete a non-empty artifact dir
+    freed, items = R.sweep_temp_home(temp_root=str(tmp_path), now=now)
+    assert str(d) not in items
+    assert os.path.isdir(str(d)), "a non-empty playwright dir was deleted by the sweep"
+    # the instrument reports its bytes without removing it
+    total = R.playwright_nonempty_warning(temp_root=str(tmp_path), now=now, dry_run=True)
+    assert total >= 5000, "the non-empty bytes were not measured: %d" % total
+    assert os.path.isdir(str(d)), "the instrument deleted the dir"
+
+
+def test_an_empty_playwright_dir_is_not_counted_by_the_instrument(tmp_path):
+    # Empty dirs are sweep_temp_home's job; the instrument is only for the non-empty class.
+    now = time.time()
+    d = tmp_path / "playwright-artifacts-empty"
+    os.makedirs(str(d))
+    old = now - 99 * 86400.0
+    os.utime(str(d), (old, old))
+    total = R.playwright_nonempty_warning(temp_root=str(tmp_path), now=now, dry_run=True)
+    assert total == 0, "an empty dir was counted by the non-empty instrument: %d" % total
+
+
+def test_a_fresh_nonempty_playwright_dir_is_not_counted(tmp_path):
+    now = time.time()
+    d = tmp_path / "playwright-artifacts-live"
+    _touch(str(d / "trace.zip"), size=5000, age_days=0.01, now=now)
+    total = R.playwright_nonempty_warning(temp_root=str(tmp_path), now=now, dry_run=True)
+    assert total == 0, "a dir newer than the age gate was counted: %d" % total
