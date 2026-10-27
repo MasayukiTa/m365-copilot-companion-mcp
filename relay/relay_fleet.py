@@ -8512,7 +8512,21 @@ class RelayWorker:
                 # A call that RAN on this side is as good as a landed turn: with no continue turn
                 # to carry it, the verbatim resend below would run it again.
                 if recovery is None and (landed or executed):
-                    self._refuse_resend(reason, delivery)
+                    # A PROVEN-NOT-SENT reason (expired token / failed capture or
+                    # handshake) is NOT a refusal: the frame never reached the server, so
+                    # the turn is still owed and ending the worker would strand it. Mirrors
+                    # `_fall_back_to_tab`. When no call ran this side, `landed` was already
+                    # cleared above, so this block is not entered; when a call DID run
+                    # (`executed`), do not refuse and do not resend verbatim -- hold for a
+                    # fresh token (no tab; `_rebind_socket` waits as `token_wait`) and let
+                    # the next attempt continue with the ReplayCache once the token is back.
+                    try:
+                        from relay.transport_policy import delivery_proves_not_sent
+                        _not_sent = delivery_proves_not_sent(reason)
+                    except Exception:
+                        _not_sent = False
+                    if not _not_sent:
+                        self._refuse_resend(reason, delivery)
                     return False
 
         # KICK A REFRESH NOW, exactly as _fall_back_to_tab does -- the two paths are the two
