@@ -659,4 +659,35 @@ partial class CockpitWindow
         sb.Append(s).Append('s');
         return sb.ToString();
     }
+
+    // Human-readable RUN DURATION for a completed task card (start..done). Unlike Fmt (a
+    // compact ago-stamp), this reads as prose: "23分" / "1時間12分" in JA, "23m" / "1h12m" in EN.
+    // Rules (verified by test_card_duration.py): < 60s -> seconds; < 1h -> whole minutes
+    // (seconds dropped); >= 1h -> hours, plus minutes only when non-zero; a day part is
+    // prepended past 24h. sec < 0 (no start or no completion ts recorded) yields "": the
+    // caller then shows no duration at all rather than guessing one.
+    static string DurationHuman(double sec, bool ja)
+    {
+        if (sec < 0) return "";
+        long s = (long)sec;
+        long dd = s / 86400; s -= dd * 86400;
+        long hh = s / 3600;  s -= hh * 3600;
+        long mm = s / 60;    s -= mm * 60;
+        var sb = new StringBuilder();
+        if (dd > 0) sb.Append(dd).Append(ja ? "日" : "d");
+        if (dd > 0 || hh > 0) sb.Append(hh).Append(ja ? "時間" : "h");
+        if (dd > 0 || hh > 0)
+        {
+            if (mm > 0) sb.Append(mm).Append(ja ? "分" : "m");
+        }
+        else if (mm > 0)
+        {
+            sb.Append(mm).Append(ja ? "分" : "m");
+        }
+        else
+        {
+            sb.Append(s).Append(ja ? "秒" : "s");
+        }
+        return sb.ToString();
+    }
 }
