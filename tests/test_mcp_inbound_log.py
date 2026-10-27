@@ -157,3 +157,37 @@ def test_size_cap_keeps_the_tail_on_line_boundaries(state, monkeypatch):
     assert rows[-1]["n"] == 199, "the newest line must survive"
     assert rows[0]["n"] > 0, "the oldest lines were dropped"
     assert [r["n"] for r in rows] == list(range(rows[0]["n"], 200)), "no torn or missing lines"
+
+
+def test_slow_inbound_log_does_not_block_event_loop(monkeypatch):
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_log(*args, **kwargs):
+        entered.set()
+        release.wait(5)
+
+    monkeypatch.setattr(obs_log, "log_inbound", slow_log)
+    scope = {"type": "http", "method": "POST", "path": "/mcp", "headers": [],
+             "client": ("127.0.0.1", 1)}
+
+    async def run():
+        async def receive():
+            return {"type": "http.request", "body": b'{"method":"tools/call"}',
+                    "more_body": False}
+        wrapped = await main._observe_inbound(scope, receive)
+        task = asyncio.create_task(wrapped())
+        try:
+            for _ in range(100):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set()
+            # The log is still blocked, but the event loop can run this coroutine.
+            assert not task.done()
+        finally:
+            release.set()
+            await task
+
+    asyncio.run(run())
