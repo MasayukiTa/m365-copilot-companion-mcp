@@ -79,6 +79,9 @@ LIVE_RECORD_REDIRECTS = {
                          "_STATE_FILE": "lock_state.json",
                          "_TOKEN_GAP_FILE": "unlock_token_gap.json"},
     "relay.socket_route": {"DEFAULT_LOG": "socket_route.jsonl"},
+    # The work-area guard's refusal ledger. A test that drives the guard would otherwise append
+    # refusals to the operator's own .fleet\workarea_refusals.jsonl.
+    "tools.workarea_guard": {"LEDGER_PATH": "workarea_refusals.jsonl"},
     # Approved/unknown Work IQ cards (counts, tool names, conversation ids). A test that drives
     # the recorder would otherwise add rows to the operator's own approval record.
     "relay.consent_approve": {"LOG_PATH": "consent_approvals.jsonl"},
@@ -337,6 +340,12 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    # NOT A PATH -- A SET OF TOP-LEVEL NAMES the work-area guard allows at the checkout root
+    # (".fleet", ".jobs", "generated" ...). Nothing is written through it; redirecting it would
+    # make the guard refuse the product's own directories.
+    ("tools.workarea_guard", "PRODUCT_ROOT_ALLOW"):
+        "a set of top-level directory names the guard allows at the checkout root, not a "
+        "location anything writes to",
     ("relay.token_cache", "file_for"):
         "a function that joins its `directory` argument, or CACHE_DIR, with a file name; "
         "CACHE_DIR itself is redirected in LIVE_RECORD_REDIRECTS, so it resolves to the per-run "
