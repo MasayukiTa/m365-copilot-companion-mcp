@@ -196,6 +196,14 @@ partial class CockpitWindow
         if (k == "reveal_artifacts_fail") return ja ? "成果物を表示できませんでした" : "Could not open artifacts";
         if (k == "rerun_same") return ja ? "同じ条件でもう一度実行" : "Run again with the same goal";
         if (k == "rerun_started") return ja ? "同じ条件で再実行を開始しました" : "Started the same goal again";
+        // ── running/waiting/stopped card menu (same kebab as completed cards) ──────────
+        if (k == "stop_task") return ja ? "止める" : "Stop";
+        if (k == "why_waiting") return ja ? "進まない理由を表示" : "Why it's waiting";
+        if (k == "why_waiting_title") return ja ? "進まない理由" : "Why it's waiting";
+        if (k == "why_waiting_none") return ja ? "待ちの理由は報告されていません。" : "No waiting reason was reported.";
+        if (k == "make_priority") return ja ? "最優先にする" : "Make top priority";
+        if (k == "clear_priority") return ja ? "優先を解除" : "Clear priority";
+        if (k == "priority_pending") return ja ? "優先の仕組みは準備中です（priority_boost）" : "Priority boosting is not wired up yet (priority_boost)";
         if (k == "path_missing") return ja ? "見つかりません" : "Not found";
         if (k == "hist_today") return ja ? "今日" : "Today";
         if (k == "hist_yesterday") return ja ? "昨日" : "Yesterday";

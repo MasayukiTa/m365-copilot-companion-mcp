@@ -75,6 +75,139 @@ partial class CockpitWindow
         catch (Exception) { ShowScaleToast(T("copy_result_fail")); }
     }
 
+    // The parallel label/action lists a CardKebabBtn consumes. A null label is a separator; the
+    // matching action slot is null too (CardKebabBtn pairs them by index).
+    sealed class CardMenuModel
+    {
+        public readonly List<string> Labels = new List<string>();
+        public readonly List<Action> Actions = new List<Action>();
+        public void Add(string label, Action action) { Labels.Add(label); Actions.Add(action); }
+        public void Separator() { Labels.Add(null); Actions.Add(null); }
+    }
+
+    // STATE -> MENU ITEMS, in ONE place. Every card (running / waiting / stopped / runtime-wait /
+    // completed) gets its kebab items from here, so adding an action is one row in this method
+    // rather than a new branch in Card(). Each item calls an action that ALREADY EXISTS elsewhere
+    // in this class (OpenWorker, RevealPath, RetryGoal, RequestClose, ArchiveAndHide, ...), except
+    // the priority toggle whose body lives in the separate priority_boost work (wired here as a
+    // call site only -- see explain.md).
+    //
+    // Built lazily: this runs when the card is drawn, but the per-item delegates only fire on
+    // click, and CardKebabBtn itself defers the ContextMenu's visual materialization to first open.
+    CardMenuModel BuildCardMenu(Dictionary<string, object> w, string name, string goal, string conv,
+                                string status, string reason, bool closed, bool terminal)
+    {
+        var m = new CardMenuModel();
+        var wt = w;
+        bool finishedCard = closed || terminal;
+
+        string menuResult = WorkerResultText(wt, finishedCard);
+        var artifactPaths = DetectExistingPaths(menuResult);
+        bool controlGoal = IsLocalLoopControlGoal(goal);
+
+        if (finishedCard)
+        {
+            // Completed/released card: reuse actions first, cleanup after a separator. This order
+            // and these keys are pinned by test_fleet_cockpit_card_menu.py -- do not reshuffle.
+            string copyText = menuResult;
+            m.Add(T("copy_result"), delegate { CopyWorkerResult(copyText); });
+
+            if (artifactPaths.Count > 0)
+            {
+                string firstArtifact = artifactPaths[0];
+                m.Add(T("reveal_artifacts"), delegate {
+                    ShowScaleToast(RevealPath(firstArtifact) ? T("reveal_artifacts_done") : T("reveal_artifacts_fail"));
+                });
+            }
+
+            if (!controlGoal)
+                m.Add(T("rerun_same"), delegate { RetryGoal(wt); ShowScaleToast(T("rerun_started")); });
+
+            m.Separator();
+            m.Add("→ " + T("to_history"), delegate { ArchiveAndHide(wt); });
+            return m;
+        }
+
+        // Active card: running / waiting / stopped / runtime-wait (NOT closed, NOT terminal).
+        // NOTE: the always-visible 開く/Open link to the left of the kebab already opens the
+        // conversation, so the menu does NOT repeat it -- it carries the actions that link cannot.
+        string nm = name;
+
+        if (artifactPaths.Count > 0)
+        {
+            string firstArtifact = artifactPaths[0];
+            m.Add(T("reveal_artifacts"), delegate {
+                ShowScaleToast(RevealPath(firstArtifact) ? T("reveal_artifacts_done") : T("reveal_artifacts_fail"));
+            });
+        }
+
+        // Priority toggle: the boost mechanism itself is owned by the separate priority_boost work
+        // (feature/priority-boost). Until it lands we expose the item + call site only, and report
+        // that it is pending rather than faking a reorder. One call site keeps the two from being
+        // built twice. See explain.md.
+        if (!controlGoal)
+            m.Add(PriorityBoostActive(wt) ? T("clear_priority") : T("make_priority"),
+                  delegate { TogglePriorityBoost(wt); });
+
+        // Why it's waiting: real queue rank / workers-ahead / resource-wait are not emitted into
+        // status.json yet, so this formats what IS known (status/reason/next_step), shown as-is.
+        m.Add(T("why_waiting"), delegate { ShowWhyWaiting(wt); });
+
+        // Stop: same behaviour the old always-visible 解放 button had -- close, then clear the card
+        // only if the fleet is stopped (so a stopped-fleet card does not linger).
+        m.Add(T("stop_task"), delegate {
+            RequestClose(nm);
+            if (_lastRoot != null
+                && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
+                && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
+                ArchiveAndHide(wt);
+        });
+
+        m.Separator();
+        m.Add("→ " + T("to_history"), delegate { ArchiveAndHide(wt); });
+        return m;
+    }
+
+    // Call site for the priority-boost feature (feature/priority-boost / priority_boost clone).
+    // That work owns the real queue reorder and the persisted boost flag. Until it is present we
+    // do not fake a reorder: we tell the operator it is pending. When priority_boost lands it
+    // replaces this body (and PriorityBoostActive) -- the menu wiring here stays unchanged.
+    bool PriorityBoostActive(Dictionary<string, object> w)
+    {
+        // priority_boost persists the boost; with it absent, nothing is boosted.
+        return string.Equals(S(w, "priority_boost"), "True", StringComparison.OrdinalIgnoreCase);
+    }
+
+    void TogglePriorityBoost(Dictionary<string, object> w)
+    {
+        // No-op placeholder: the mechanism is owned by priority_boost. Report pending so the click
+        // is acknowledged without pretending the queue was reordered.
+        ShowScaleToast(T("priority_pending"));
+    }
+
+    // Format what is known about why an active card is not progressing. Queue rank, workers-ahead
+    // and resource-wait are not in status.json yet (no queue_position/work_dir keys exist), so we
+    // present the agent-emitted status / reason / next_step as-is in a dialog. When the queue
+    // fields arrive, prepend them here -- the menu wiring does not change.
+    void ShowWhyWaiting(Dictionary<string, object> w)
+    {
+        string status = S(w, "status");
+        string reason = S(w, "reason");
+        string nextStep = S(w, "next_step");
+        var sb = new StringBuilder();
+        if (!string.IsNullOrEmpty(status))
+            sb.Append(_lang == 0 ? "状態: " : "Status: ").Append(status).Append('\n');
+        if (!string.IsNullOrEmpty(reason))
+            sb.Append(_lang == 0 ? "理由: " : "Reason: ").Append(reason).Append('\n');
+        if (!string.IsNullOrEmpty(nextStep))
+            sb.Append(_lang == 0 ? "次の一手: " : "Next step: ").Append(nextStep).Append('\n');
+        string body = sb.ToString().TrimEnd('\n');
+        if (string.IsNullOrEmpty(body)) body = T("why_waiting_none");
+        try { MessageBox.Show(this, body, T("why_waiting_title"),
+                              MessageBoxButton.OK, MessageBoxImage.Information); }
+        catch (Exception) { ShowScaleToast(body); }
+    }
+
     Border Card(Dictionary<string, object> w)
     {
         string name = S(w, "name");
@@ -173,6 +306,11 @@ partial class CockpitWindow
             openLink.MouseLeftButtonUp += delegate (object s, MouseButtonEventArgs e) { e.Handled = true; FlashOpen(card); OpenWorker(onm, ourl); };
             right.Children.Add(openLink);
         }
+        // The kebab (More actions) now appears on EVERY card -- running, waiting, stopped,
+        // runtime-wait, and completed -- in the same right-edge slot with the same look. Its item
+        // list is built in ONE place (BuildCardMenu, the state->items table below) so a new action
+        // is one row there, not a new branch here. The runtime-wait card additionally keeps its
+        // explicit 再開/Resume button (a one-click recovery affordance), with the kebab beside it.
         if (isLocalRuntimeWait)
         {
             var runtimeResume = AttentionBtn(_lang == 0 ? "再開" : "Resume");
@@ -187,61 +325,9 @@ partial class CockpitWindow
             };
             right.Children.Add(runtimeResume);
         }
-        else if (closed || terminal)
         {
-            // Completed/released Fleet card menu: keep the kebab available after its agent tab is
-            // released. The result and artifacts remain useful, and the same goal can be run again.
-            // Reuse actions come first; the cleanup action sits after a separator.
-            var wt2 = w;
-            string menuResult = WorkerResultText(wt2, true);
-            var artifactPaths = DetectExistingPaths(menuResult);
-            var menuLabels = new List<string>();
-            var menuActions = new List<Action>();
-
-            string copyText = menuResult;
-            menuLabels.Add(T("copy_result"));
-            menuActions.Add(delegate { CopyWorkerResult(copyText); });
-
-            if (artifactPaths.Count > 0)
-            {
-                string firstArtifact = artifactPaths[0];
-                menuLabels.Add(T("reveal_artifacts"));
-                menuActions.Add(delegate {
-                    ShowScaleToast(RevealPath(firstArtifact) ? T("reveal_artifacts_done") : T("reveal_artifacts_fail"));
-                });
-            }
-
-            if (!IsLocalLoopControlGoal(goal))
-            {
-                menuLabels.Add(T("rerun_same"));
-                menuActions.Add(delegate { RetryGoal(wt2); ShowScaleToast(T("rerun_started")); });
-            }
-
-            menuLabels.Add(null);
-            menuActions.Add(null);
-            menuLabels.Add("→ " + T("to_history"));
-            menuActions.Add(delegate { ArchiveAndHide(wt2); });
-            right.Children.Add(CardKebabBtn(menuLabels.ToArray(), menuActions.ToArray(), w));
-        }
-        else
-        {
-            // running (non-terminal) card: release stays VISIBLE (single-click, never hidden)
-            var relBtn = new Button();
-            relBtn.Content = MakeReleaseContent();
-            relBtn.Cursor = Cursors.Hand; relBtn.BorderThickness = new Thickness(1);
-            relBtn.Background = BtnBg; relBtn.BorderBrush = Border; relBtn.Foreground = Fg;
-            relBtn.Padding = new Thickness(6, 2, 8, 2);
-            relBtn.ToolTip = _lang == 0 ? "このタスクを停止してタブを解放（fleet 停止中ならカードを片付け）"
-                                        : "Stop this task and release its tab (clears the card if the fleet is stopped)";
-            string nm = name; var wt2 = w;
-            relBtn.Click += delegate {
-                RequestClose(nm);
-                if (_lastRoot != null
-                    && (!_lastRoot.ContainsKey("running") || Convert.ToBoolean(_lastRoot["running"]))
-                    && (NowUnix() - Dbl(_lastRoot, "updated")) > 8)
-                    ArchiveAndHide(wt2);
-            };
-            right.Children.Add(relBtn);
+            var menu = BuildCardMenu(w, name, goal, conv, status, reason, closed, terminal);
+            right.Children.Add(CardKebabBtn(menu.Labels.ToArray(), menu.Actions.ToArray(), w));
         }
         Grid.SetColumn(right, 1); top.Children.Add(right);
 
