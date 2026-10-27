@@ -146,6 +146,8 @@ jobs:
             relay/test_a_one_line_answer_is_still_an_answer.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
+            tools/test_refused_record_and_force.py \
+            ui/test_a_refused_request_is_shown_and_can_be_forced.py \
             tools/overnight/test_overnight_input.py \
             tools/overnight/test_overnight_runner.py \
             tools/overnight/test_overnight_detect.py \
@@ -400,9 +402,12 @@ jobs:
             relay/test_no_test_writes_into_the_operators_approval_queue.py \
             relay/test_the_panel_shows_the_floor_the_run_uses.py \
             relay/test_a_floor_says_where_it_came_from.py \
+            relay/test_floor_warning_tracks_the_disagreement.py \
+            relay/test_status_json_powershell_safe.py \
             ui/test_a_warning_that_is_always_on_is_not_a_warning.py \
             ui/test_the_last_setting_is_reachable.py \
             ui/test_the_list_scrolls_to_the_end_after_a_clear.py \
+            ui/test_open_button_starts_the_main_chat.py \
             ui/test_an_answer_does_not_rewrap_when_it_settles.py \
             ui/test_the_same_decision_does_not_flood_the_approval_history.py \
             relay/test_a_kept_for_claim_names_a_real_consumer.py \

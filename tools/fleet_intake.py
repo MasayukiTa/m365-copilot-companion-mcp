@@ -578,6 +578,61 @@ def _log_similarity_observed(text: str, source: str, similar_to: str = "",
         pass
 
 
+#: Where a refused goal's FULL record is written, one file per refusal, beside the queue it did
+#: not enter. The existing .fleet/fleet_submit_refusals.jsonl (tools/obs_log) is a one-line
+#: digest with the goal HEAD only and no id to act on; it is left exactly as it was. This is the
+#: other half the cockpit needs: the WHOLE goal (so a forced resubmission sends the real
+#: instruction, not an 80-char head), the reason KIND, the job it looked like with the measured
+#: overlap, the time, and who sent it -- addressed by a stable id so a person can point at one
+#: refusal and force it through. It lives under TASKS so a test that moves TR.TASKS moves this
+#: too, the same way obs_log rides tool_ledger's directory.
+REFUSED_DIR = "refused"
+
+
+def _refused_dir() -> str:
+    return os.path.join(TR.TASKS, REFUSED_DIR)
+
+
+def _refused_path(refused_id: str) -> str:
+    return os.path.join(_refused_dir(), "%s.json" % refused_id)
+
+
+def _write_refused_record(reason, goal_text, source, similar_to="", similarity=None):
+    """Write .fleet/tasks/refused/<id>.json for a refused goal and return its id (or None).
+
+    Unlike the jsonl digest this keeps the goal IN FULL -- it is the thing a forced resubmission
+    re-sends, and an instruction cut to 80 characters is a different instruction. `source` is
+    cleaned the same way the queued job's provenance is (address redacted, capped) because it
+    reaches the same readers; the goal is the person's own words and is left whole. Never raises:
+    a refusal whose record could not be written still refuses, it just cannot be forced later.
+    """
+    try:
+        rid = uuid.uuid4().hex[:12]
+        rec = {
+            "id": rid,
+            "kind": "fleet_submit_refusal",
+            "reason": str(reason or ""),
+            "goal": str(goal_text or ""),
+            "source": _clean(source or "agent", MAX_SOURCE_CHARS),
+            "refused_at": time.time(),
+            "forced": False,
+        }
+        if similar_to:
+            rec["similar_to"] = str(similar_to)
+        if similarity is not None:
+            # 0..1, the measured word overlap, so the card can say "NN% 一致" without recomputing.
+            rec["similarity"] = round(float(similarity), 4)
+        os.makedirs(_refused_dir(), exist_ok=True)
+        path = _refused_path(rid)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        return rid
+    except Exception:
+        return None
+
+
 def fleet_submit(goal: str, note: str = "", source: str = "",
                  priority: bool = False, resume_conv: str = "") -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
@@ -603,13 +658,16 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     text = " ".join(str(goal or "").split())
     if not text:
         _log_refusal("missing_goal", text, source)
+        _write_refused_record("missing_goal", text, source)
         return "[fleet_submit: refused -- an empty goal is not an instruction]"
     if len(text) > MAX_GOAL_CHARS:
         _log_refusal("too_long", text, source)
+        _write_refused_record("too_long", text, source)
         return ("[fleet_submit: refused -- the goal is %d characters, over the %d limit. "
                 "Send the instruction, not the document.]" % (len(text), MAX_GOAL_CHARS))
     if TR.is_local_loop_control_submission(text, source):
         _log_refusal("local_loop", text, source)
+        _write_refused_record("local_loop", text, source)
         return (
             "[fleet_submit: refused -- LOCAL_LOOP control messages are not Fleet goals. "
             "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
@@ -641,6 +699,7 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     n = _pending_count()
     if n >= MAX_PENDING:
         _log_refusal("pending_full", text, source)
+        _write_refused_record("pending_full", text, source)
         return ("[fleet_submit: refused -- %d jobs are already waiting and nothing is "
                 "draining the queue. Ask the owner to look before sending more.]" % n)
 
@@ -719,3 +778,154 @@ def fleet_queue() -> str:
             names = []
         lines.append("%-9s %d" % (sub, len(names)))
     return "\n".join(lines)
+
+
+# === Operator-only forced intake ============================================================
+#
+# WHY THIS IS NOT A fleet_submit FLAG, AND NOT AN MCP TOOL.
+#
+# fleet_submit's whole job is to say no -- to a repeat, to a pasted document, to a queue nobody
+# is draining -- because the caller is an AGENT reaching this machine over a tunnel, and the
+# refusals exist precisely to stop a worker that failed one way from flooding the fleet another.
+# A "skip the checks" argument on that same door would hand the exact capability the checks
+# exist to deny to the exact caller they exist to deny it to. So the override is a SEPARATE
+# function, and it is deliberately kept out of main.py's TOOLS tuple: it is never imported there,
+# so it is not in the catalogue an agent fetches and cannot be reached through call_tool. The
+# only callers are the cockpit's "force" button (ui/) and the operator CLI, both of which are a
+# PERSON acting at this machine, not an instruction arriving as an argument.
+#
+# It takes a refused-record id, not a goal, for the same reason: a person forces a SPECIFIC
+# refusal they can see on screen, carrying its original full goal and provenance forward, rather
+# than retyping an instruction the override would then not check.
+
+def _read_refused_record(refused_id):
+    """The refused record for `refused_id`, or None. Validates the id shape first so a crafted
+    value cannot walk out of the refused directory."""
+    rid = str(refused_id or "")
+    if not rid or not all(ch.isalnum() or ch in "-_" for ch in rid):
+        return None
+    try:
+        with open(_refused_path(rid), encoding="utf-8") as fh:
+            rec = json.load(fh)
+        return rec if isinstance(rec, dict) else None
+    except (OSError, ValueError):
+        return None
+
+
+def _mark_refused_forced(refused_id, forced_jid):
+    """Stamp the refused record as forced-in, so the card stops offering the button and a second
+    press cannot double-submit. Never raises."""
+    try:
+        rec = _read_refused_record(refused_id)
+        if rec is None:
+            return
+        rec["forced"] = True
+        rec["forced_jid"] = str(forced_jid)
+        rec["forced_at"] = time.time()
+        path = _refused_path(refused_id)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(rec, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
+def force_submit_refused(refused_id, source=""):
+    """OPERATOR ONLY. Queue the goal of a refused record, SKIPPING every admission check.
+
+    This is the override the owner asked for: a refusal is a proposal the system makes, not a
+    verdict it enforces silently, and the person must be able to overrule it. It reads
+    .fleet/tasks/refused/<refused_id>.json, writes the same goal straight into tasks/pending/
+    with no duplicate/length/capacity/loop check, stamps the job as forced by a user and carries
+    the originating refusal id on it, and marks the refused record forced. Returns the new job
+    id string, or a "[force_submit_refused: ...]" message when the record is missing or the
+    write fails.
+
+    NOT EXPOSED TO AGENTS. It is intentionally absent from main.py's TOOLS, so call_tool cannot
+    reach it; the callers are the cockpit button and the operator CLI -- a person at the machine.
+    """
+    rec = _read_refused_record(refused_id)
+    if rec is None:
+        return ("[force_submit_refused: no refused record with id %r -- nothing to force]"
+                % str(refused_id))
+    if rec.get("forced"):
+        return ("[force_submit_refused: refusal %s was already forced in as %s]"
+                % (rec.get("id"), rec.get("forced_jid")))
+    text = " ".join(str(rec.get("goal") or "").split())
+    if not text:
+        return "[force_submit_refused: the refused record carries no goal to queue]"
+
+    jid = uuid.uuid4().hex[:12]
+    # The ONLY source the override composes is a short tag naming that a person forced this and
+    # which refusal it came from; the goal and the recorded original source are the person's own
+    # words and travel unchanged. forced_by_user and refused_id sit ON THE PAYLOAD beside the
+    # goal, the same place fleet_submit puts `priority`, so the router and every reader that
+    # already walks the payload sees the override without a new code path.
+    forced_tag = "operator-force" + ((" <- " + _clean(source, 80)) if source else "")
+    job = {
+        "id": jid,
+        "type": "fleet_goal",
+        "payload": {
+            "goal": text,
+            "note": _clean(rec.get("source") or "", 500),
+            "priority": False,
+            "forced_by_user": True,
+            "refused_id": str(rec.get("id") or refused_id),
+        },
+        "created": time.time(),
+        "origin": {
+            "via": "operator_force",
+            "forced_by_user": True,
+            "refused_id": str(rec.get("id") or refused_id),
+            "source": _clean(forced_tag, MAX_SOURCE_CHARS),
+        },
+    }
+    try:
+        TR.ensure_dirs()
+        path = os.path.join(TR.TASKS, "pending", "%s.json" % jid)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(job, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+    except Exception as exc:
+        return "[force_submit_refused: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
+
+    _mark_refused_forced(str(rec.get("id") or refused_id), jid)
+    return jid
+
+
+# === Operator CLI (NOT an MCP tool) =========================================================
+#
+# The cockpit's "force" button and an operator at a shell reach force_submit_refused THROUGH
+# HERE, by running this module as a script -- never through call_tool, because the function is
+# deliberately absent from main.py's TOOLS. A person launching `python -m tools.fleet_intake
+# --force-refused <id>` is exactly the human override the owner asked for; an agent over the
+# tunnel has no catalogue entry to invoke and no code path that reaches this branch. Kept out of
+# the module import surface (guarded by __main__) so importing tools.fleet_intake never parses a
+# command line or touches argv.
+
+def _cli(argv=None):
+    import argparse
+    parser = argparse.ArgumentParser(
+        prog="fleet_intake",
+        description="Operator-only fleet intake actions. Not reachable by agents (not an MCP tool).")
+    parser.add_argument(
+        "--force-refused", metavar="REFUSED_ID",
+        help="Force in the goal of a refused record by its id, skipping every admission check.")
+    parser.add_argument(
+        "--source", default="",
+        help="Optional short tag naming who forced it (shown on the job's provenance).")
+    args = parser.parse_args(argv)
+    if args.force_refused:
+        result = force_submit_refused(args.force_refused, source=args.source or "operator-cli")
+        print(result)
+        # A bracketed message is a failure; a bare job id is success.
+        return 0 if not str(result).startswith("[") else 1
+    parser.print_help()
+    return 2
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(_cli())
