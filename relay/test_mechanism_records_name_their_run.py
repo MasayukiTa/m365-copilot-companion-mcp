@@ -208,6 +208,17 @@ BLANK_BY_DESIGN = {
         "a housekeeping sweep over the whole .fleet directory that runs between runs, not inside "
         "one; the ledger it warns about holds campaigns from many runs, so there is no single "
         "run to name and a blank id is the honest answer",
+    ("relay/fleet_retention.py", "playwright_artifacts_nonempty"):
+        "an INSTRUMENT, not a sweep: it scans %TEMP% for aged non-empty playwright-artifacts-* "
+        "dirs left by CDP browsers across many runs and merely records their byte total. The "
+        "stray dirs live in the system temp root, not inside any one fleet run, and the warning "
+        "is emitted from apply()'s between-run housekeeping, so there is no single run to name "
+        "and a blank id is the honest answer",
+    ("relay/fleet_retention.py", "vs_tests_stray"):
+        "an INSTRUMENT, not a sweep: it measures aged vs_tests_* pytest scratch that the SIBLING "
+        "repo validity-studio leaves in %TEMP% from its own process, which this fleet never ran. "
+        "The bytes belong to another program's exited process, not to any fleet run, so a run id "
+        "would be a field nobody could fill and a blank id is the honest answer",
 }
 
 _MECH_NAME = re.compile(r'_mt\.record\(\s*"([a-z_]+)"')

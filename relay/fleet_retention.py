@@ -1178,6 +1178,106 @@ def campaigns_ledger_warning(fleet_dir, dry_run=False, warn_mb=None):
     return size
 
 
+def vs_tests_warning(temp_root=None, now=None, dry_run=False, max_age_h=None):
+    """MEASURE the bytes held in AGED top-level vs_tests_* dirs and return a candidate list;
+    remove NOTHING. Returns (total_bytes, [paths]). Never raises, never deletes.
+
+    This is the INSTRUMENT, not a sweep. The disk_causal survey (remediation_gaps.md) found that
+    validity-studio's pytest scratch (tempfile.mkdtemp(prefix="vs_tests_"), no dir=) lands in
+    %TEMP% with its contents and no existing rule reaches it -- up to 56 dirs / 915 MB observed.
+    The sibling repo cannot clean it once its process has exited, so the only durable place to
+    act is here. BUT the brief for this change forbids deleting files: delete-code must instead
+    emit a candidate list. So this records a `vs_tests_stray` mechanism row (byte total + dir
+    count) and returns the aged directories as candidates for a human/owner to remove; it never
+    deletes. The age gate is TEMP_HOME_MAX_AGE_H (24 h), the same age the m365-companion rule
+    already uses -- no new number is introduced.
+    """
+    now = time.time() if now is None else now
+    max_age_h = TEMP_HOME_MAX_AGE_H if max_age_h is None else max_age_h
+    cutoff = now - max_age_h * 3600.0
+    total, cands = 0, []
+    try:
+        if temp_root is None:
+            from relay import temp_home as _th
+            temp_root = _th.system_temp()
+        if os.path.isdir(temp_root):
+            for e in list(os.scandir(temp_root)):
+                try:
+                    if not _VS_TESTS_DIR.match(e.name):
+                        continue
+                    if not e.is_dir(follow_symlinks=False) or _is_link(e.path):
+                        continue
+                    newest, size = _newest_mtime_and_size(e.path)
+                    newest = newest or os.lstat(e.path).st_mtime
+                    if newest < cutoff:
+                        total += size
+                        cands.append(e.path)
+                except OSError:
+                    continue
+    except Exception:
+        return 0, []
+    if total and not dry_run:
+        try:
+            from relay import mechanism_telemetry as _mt
+            _mt.record("vs_tests_stray", configured=True, eligible=True,
+                       triggered=True, extra={"bytes": total, "dirs": len(cands),
+                                              "max_age_h": max_age_h})
+        except Exception:
+            pass
+    return total, cands
+
+
+def playwright_nonempty_warning(temp_root=None, now=None, dry_run=False, max_age_h=None):
+    """Record how many bytes sit in AGED, NON-EMPTY top-level playwright-artifacts-* dirs, and
+    remove nothing. Returns the total bytes seen (0 when none). Never raises, never deletes.
+
+    This is the INSTRUMENT half of the playwright story. sweep_temp_home deletes only the EMPTY
+    artifact dirs because the disk_causal survey could tie those to a cause (a CDP browser that
+    was killed). The non-empty ones stayed at correlation: there was no measured dwell time to
+    set an age against, and a capture that is still live may be writing into one, so deleting
+    them blind could take a file a reader still wants. Rather than guess, this leaves a measured
+    trail -- a `playwright_artifacts_nonempty` mechanism row with the byte total and directory
+    count -- so the dwell time the survey lacked can be gathered from real runs before anyone
+    writes a delete rule. `max_age_h` defaults to PLAYWRIGHT_NONEMPTY_WARN_AGE_H (6 h), the same
+    age the empty-dir rule already uses; no new number is introduced.
+    """
+    now = time.time() if now is None else now
+    max_age_h = PLAYWRIGHT_NONEMPTY_WARN_AGE_H if max_age_h is None else max_age_h
+    cutoff = now - max_age_h * 3600.0
+    total, dirs = 0, 0
+    try:
+        if temp_root is None:
+            from relay import temp_home as _th
+            temp_root = _th.system_temp()
+        if os.path.isdir(temp_root):
+            for e in list(os.scandir(temp_root)):
+                try:
+                    if not _PLAYWRIGHT_DIR.match(e.name):
+                        continue
+                    if not e.is_dir(follow_symlinks=False) or _is_link(e.path):
+                        continue
+                    if not os.listdir(e.path):  # empty: that is sweep_temp_home's job
+                        continue
+                    newest, size = _newest_mtime_and_size(e.path)
+                    newest = newest or os.lstat(e.path).st_mtime
+                    if newest < cutoff:
+                        total += size
+                        dirs += 1
+                except OSError:
+                    continue
+    except Exception:
+        return 0
+    if total and not dry_run:
+        try:
+            from relay import mechanism_telemetry as _mt
+            _mt.record("playwright_artifacts_nonempty", configured=True, eligible=True,
+                       triggered=True, extra={"bytes": total, "dirs": dirs,
+                                              "max_age_h": max_age_h})
+        except Exception:
+            pass
+    return total
+
+
 #: Age after which an entry under %TEMP%\m365-companion\ is swept (hours; newest file inside).
 TEMP_HOME_MAX_AGE_H = float(os.environ.get("MCP_TEMP_HOME_MAX_AGE_H", "24"))
 #: An EMPTY top-level playwright-artifacts-* directory (left when a CDP-attached browser is
@@ -1186,6 +1286,24 @@ PLAYWRIGHT_EMPTY_MAX_AGE_H = 6.0
 #: Exactly the name PasteImage() in ui/CopilotChat.cs gives a pasted picture.
 _PASTE_PNG = re.compile(r"^copilot_paste_[0-9a-f]{8}\.png$")
 _PLAYWRIGHT_DIR = re.compile(r"^playwright-artifacts-[A-Za-z0-9_\-]+$")
+#: A pytest run in the sibling repo validity-studio makes its scratch with
+#: tempfile.mkdtemp(prefix="vs_tests_") and no `dir=`, so it lands directly in %TEMP%. It is
+#: left behind with its contents, and sweep_temp_home's three existing rules never looked at it
+#: (docstring: "Anything else in %TEMP% is somebody else's"). The disk_causal survey measured
+#: this as a class that persists -- up to 56 directories / 915 MB observed -- and it is the one
+#: stray the sibling repo cannot clean from its own side once its process has exited.
+#: The brief for this change forbids deleting files ("delete-code must instead list candidates"),
+#: so this is NOT swept here. vs_tests_warning() MEASURES the bytes held in aged vs_tests_* dirs
+#: and returns the directory paths as a candidate list -- it removes nothing. The age used for
+#: the measurement gate is the same TEMP_HOME_MAX_AGE_H (24 h) the m365-companion rule uses,
+#: not a new number.
+_VS_TESTS_DIR = re.compile(r"^vs_tests_[A-Za-z0-9_\-]+$")
+#: A top-level playwright-artifacts-* directory that still has contents is NOT deleted here.
+#: The disk_causal survey could tie the EMPTY ones to a cause (a killed CDP browser) but left
+#: the non-empty ones at correlation only -- no measured dwell time to justify a size, and a
+#: live capture may still be writing into one. So this stays an INSTRUMENT, not a delete: the
+#: bytes sitting in aged non-empty artifact dirs are recorded and nothing is removed.
+PLAYWRIGHT_NONEMPTY_WARN_AGE_H = 6.0
 
 
 def _is_link(path):
@@ -1263,6 +1381,9 @@ def sweep_temp_home(fleet_dir=None, now=None, dry_run=False, max_age_h=None, tem
          `max_age_h` (default 24) -- including agents' venvs under agents\\<name>\\;
       2. top-level %TEMP%\\playwright-artifacts-* directories that are EMPTY and older than 6 h;
       3. top-level %TEMP%\\copilot_paste_<8 hex>.png files older than `max_age_h`.
+    %TEMP%\\vs_tests_* directories (validity-studio's pytest scratch, left with contents) are
+    NOT deleted here: the brief forbids deleting files, so they are only MEASURED and listed as
+    candidates by vs_tests_warning() -- see _VS_TESTS_DIR for the measurement, not a delete.
     Anything else in %TEMP% is somebody else's and is not looked at. Links and junctions are
     removed as links, never followed; a locked file is skipped, not an error. `fleet_dir` is
     accepted only so apply() can call every rule the same way."""
@@ -1375,6 +1496,23 @@ def apply(fleet_dir=None, now=None, dry_run=False):
     try:
         rep["campaigns_ledger_bytes_over_warning"] = campaigns_ledger_warning(
             fleet_dir, dry_run=dry_run)
+    except Exception:
+        pass
+    # INSTRUMENT, NOT A DELETE. Record the bytes held in aged non-empty playwright artifact
+    # dirs without removing them (the empty ones are swept by temp_home above). This is the
+    # measurement the disk_causal survey lacked for the non-empty class; it must not fail apply.
+    try:
+        rep["playwright_artifacts_nonempty_bytes"] = playwright_nonempty_warning(
+            now=now, dry_run=dry_run)
+    except Exception:
+        pass
+    # INSTRUMENT, NOT A DELETE. The brief forbids deleting files, so aged vs_tests_* dirs (the
+    # sibling repo's pytest scratch the disk_causal survey found leaking) are MEASURED and listed
+    # as candidates -- never removed here. Must not fail apply.
+    try:
+        _vs_bytes, _vs_cands = vs_tests_warning(now=now, dry_run=dry_run)
+        rep["vs_tests_stray_bytes"] = _vs_bytes
+        rep["vs_tests_stray_candidates"] = _vs_cands
     except Exception:
         pass
     return rep
