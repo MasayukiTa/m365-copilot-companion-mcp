@@ -2543,6 +2543,31 @@ def dispatch_once(now_ts=None):
     return out
 
 
+def _cold_start_order(names):
+    """`names` reordered so a parked PRIORITY goal is offered first on a cold start.
+
+    Stable and total-order-preserving within each class: priority files keep their mutual
+    name order and so do the rest, so same-priority goals stay FIFO by jid and the only
+    change is that a priority goal no longer waits behind the plain goals queued before it.
+    Reading a file's priority is best-effort: an unreadable or malformed file counts as
+    non-priority and keeps its place. Never raises -- a sort failure returns `names`
+    untouched, so the delivery pass degrades to the old name order rather than stalling.
+    """
+    def _is_priority(name):
+        if not name.endswith(".txt"):
+            return False
+        try:
+            with open(_p("for_fleet", name), encoding="utf-8") as fh:
+                _goal, parked_priority, _rc = read_for_fleet(fh.read())
+            return bool(parked_priority)
+        except Exception:
+            return False
+    try:
+        return sorted(names, key=lambda n: (0 if _is_priority(n) else 1,))
+    except Exception:
+        return names
+
+
 def _deliver_waiting_goals(now_ts=None, state_dir=None):
     """Hand the fleet the goals that arrived while it was not running.
 
@@ -2599,6 +2624,16 @@ def _deliver_waiting_goals(now_ts=None, state_dir=None):
     except OSError:
         return out
     live = fleet_is_live(state_dir)
+    # COLD START ONLY: hand the operator's priority goal over FIRST. When no run is live,
+    # exactly one goal is offered per pass (see below), and the pick used to be whichever
+    # name sorted first -- a jid is time-ordered, so a priority goal submitted into a batch
+    # waited behind every goal queued before it. A live fleet is untouched: it takes the
+    # whole backlog in one pass, so the order it is handed in does not gate anything, and
+    # keeping the plain name order there changes nothing a caller can observe. Stable: a
+    # file whose priority cannot be read counts as non-priority (never raises) and keeps
+    # its name-order place, so same-priority goals stay FIFO by jid.
+    if not live:
+        names = _cold_start_order(names)
     offered_cold = False
     for name in names:
         if not name.endswith(".txt"):
