@@ -1054,7 +1054,8 @@ jobs:
             scripts/test_bootstrap_pip_tls.py \
             tests/test_reload_main_leaves_a_restore_behind.py \
             tools/test_reldisc.py \
-            tests/test_owner_verbatim_realuse.py
+            tests/test_owner_verbatim_realuse.py \
+            scripts/test_stability_replay.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
