@@ -3364,6 +3364,31 @@ def goal_fields(goal):
     return str(goal), [], None
 
 
+def reorder_pending_by_boost(pending, boosted_jids):
+    """Return `pending` reordered as boosted-first, STABLY. Pure: no I/O, never raises.
+
+    `pending` is the admission queue of not-yet-attached workers; admission walks it from the
+    front, so an item's position IS its place in line for the next free slot. `boosted_jids` is
+    the set of admission ids a human has boosted (relay/priority_boost.list_boosted()). A worker
+    whose `jid` is in that set is lifted ahead of the rest; both the boosted group and the rest
+    keep their existing relative order, so this only ever raises the boosted ones past the
+    others -- it never reshuffles equals, and a non-boosted goal is pushed back, never dropped.
+
+    A worker with no jid (a bare -g goal, an interactive retry) can carry no boost marker and so
+    is always treated as non-boosted. Returns a NEW list; the caller rewrites its queue in place
+    from it. When nothing is boosted, or everything is, the returned order equals the input.
+    """
+    if not pending or not boosted_jids:
+        return list(pending)
+    boosted, rest = [], []
+    for w in pending:
+        if (getattr(w, "jid", None) or "") in boosted_jids:
+            boosted.append(w)
+        else:
+            rest.append(w)
+    return boosted + rest
+
+
 # Escalating/varying CONTINUE nudge (fixes the "identical nudge re-injected every turn"
 # degradation: a worker that never emits DONE used to get the byte-for-byte-identical
 # CONTINUE_JOB constant every single turn, up to max_turns -- observed to degrade the
@@ -10754,6 +10779,57 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     workers = [_worker_for(i, g) for i, g in enumerate(goals)]
     pending = list(workers)            # FIFO queue of not-yet-attached workers
 
+    #: jids whose boost has already been announced in the log, so the "X jumped ahead of Y"
+    #: line is printed once per boosted goal and not on every sweep for the life of the run.
+    _boost_announced = set()
+
+    def _reorder_pending_for_boost(pend, run_id=""):
+        """Lift boosted goals to the front of the admission queue, stably.
+
+        A boost is a human act stored as .fleet/tasks/boosts/<jid>.json and read through
+        relay/priority_boost.py (the read side the owner asked to keep separate from the act of
+        moving work). This is the consumer: once per sweep it partitions `pend` into boosted and
+        non-boosted, keeping each group's existing order, and rewrites `pend` in place as
+        boosted-then-rest. Because admission walks `pend` from the front and defers (never kills)
+        when a slot or the disk is short, lifting a boosted goal here is exactly what makes it
+        take the next free slot ahead of the others and what pushes a non-boosted goal's next
+        turn back -- without stopping it.
+
+        A worker with no jid (a bare -g goal, an interactive retry -- see RelayWorker.jid) never
+        carries a boost marker, so it stays where it was. Best-effort and never raises: a boost
+        read that fails leaves the queue untouched, which is the pre-feature order.
+        """
+        if not pend or len(pend) < 2:
+            return
+        try:
+            from relay import priority_boost as _pb
+            if not _pb.is_enabled():
+                return
+            boosted_jids = set(_pb.list_boosted())
+        except Exception:
+            return
+        if not boosted_jids:
+            return
+        reordered = reorder_pending_by_boost(pend, boosted_jids)
+        if reordered == list(pend):
+            return                         # already boosted-first -- no reorder, no log
+        _n_rest = sum(1 for _w in pend if (getattr(_w, "jid", None) or "") not in boosted_jids)
+        # ANNOUNCE ONCE PER GOAL, WITH ITS REASON. The record shows why a goal that was next in
+        # line is now behind another: a human boosted jid, and these non-boosted goals had their
+        # next turn deferred for it. Not kill, not stop -- a deferral, said out loud so a stalled
+        # goal's cause is on the record (the owner's point (6)).
+        for _w in pend:
+            _jid = getattr(_w, "jid", None) or ""
+            if _jid and _jid in boosted_jids and _jid not in _boost_announced:
+                _boost_announced.add(_jid)
+                try:
+                    print("[priority] %s (jid=%s) boosted to the front of the admission queue "
+                          "ahead of %d non-boosted goal(s); their next turn is deferred, not "
+                          "stopped" % (getattr(_w, "name", "?"), _jid, _n_rest), flush=True)
+                except Exception:
+                    pass
+        pend[:] = reordered
+
     def _active_open():
         # Worker (MAIN-tab) count -- the DISK accounting unit: only main agent tabs run the
         # Docker eval, so the disk gate reserves per main tab, not per sub-agent side-page.
@@ -11164,7 +11240,19 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                         pass
                     continue
                 workers.append(nw)
-                if item.get("priority"):
+                # A goal added mid-run goes to the front when it carries the admission-time
+                # priority flag OR when it was already boosted while it waited (its jid has a
+                # boost marker). The per-sweep _reorder_pending_for_boost below would lift a
+                # boosted one anyway; placing it at the front here just saves it one sweep's wait.
+                _item_boosted = False
+                _ijid = item.get("jid") or ""
+                if _ijid:
+                    try:
+                        from relay import priority_boost as _pb
+                        _item_boosted = _pb.is_boosted(_ijid)
+                    except Exception:
+                        _item_boosted = False
+                if item.get("priority") or _item_boosted:
                     pending.insert(0, nw)
                 else:
                     pending.append(nw)
@@ -11204,6 +11292,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     _consider_socket_refresh(route, agent_url)
         except Exception:
             pass
+
+        # PRIORITY BOOST: move boosted goals to the FRONT of the admission queue so they take
+        # the next free slot ahead of non-boosted work. The boost is a human act recorded as
+        # .fleet/tasks/boosts/<jid>.json (relay/priority_boost.py); it is read here, once per
+        # sweep, and applied as a STABLE reorder -- boosted workers keep their order among
+        # themselves and so do the rest, so this only ever lifts the boosted ones past the
+        # others, it never shuffles equals. Non-boosted goals are pushed back, never dropped or
+        # killed: a boost delays another goal's NEXT turn, it does not stop it. The reorder is
+        # logged with its reason the first sweep it actually changes the order, so the record
+        # shows why a goal that was next is suddenly behind another.
+        _reorder_pending_for_boost(pending, run_id=run_id)
 
         while pending:
             # NO TOKEN YET / ROUTE SHUT: HOLD THE GOAL. There is no tab to fall back to (owner

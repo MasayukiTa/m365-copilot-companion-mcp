@@ -113,6 +113,28 @@ partial class CockpitWindow
             col.Children.Add(metaTb);
         }
 
+        // Boosted count + over-threshold warning. Shown only when the feature is enabled AND at
+        // least one worker is boosted, so an operator who never uses it never sees a new line.
+        // Counts over the WHOLE board (_toolbarAll), not just the goals gathered above.
+        if (_priorityBoostEnabled)
+        {
+            int boosted = PriorityBoostCount(_toolbarAll);
+            if (boosted > 0)
+            {
+                int thr = PriorityBoostThreshold();
+                bool tooMany = boosted > thr;
+                var pbTb = new TextBlock();
+                pbTb.Text = T("boost_count") + ": " + boosted
+                          + (tooMany ? "  \u2014 " + T("boost_too_many") : "");
+                pbTb.Foreground = tooMany ? Theme.Br(Theme.Danger(_dark)) : Theme.Br(Theme.Muted(_dark));
+                pbTb.FontSize = Theme.FsMeta;
+                pbTb.FontWeight = tooMany ? FontWeights.SemiBold : FontWeights.Normal;
+                pbTb.TextWrapping = TextWrapping.Wrap;
+                pbTb.Margin = new Thickness(0, 0, 0, 8);
+                col.Children.Add(pbTb);
+            }
+        }
+
         outer.Child = col;
         return outer;
     }
@@ -360,6 +382,47 @@ partial class CockpitWindow
             _autoArchiveBtn.Background = BtnBg; _autoArchiveBtn.Foreground = Muted; _autoArchiveBtn.BorderBrush = Border;
         }
     }
+
+    void PaintPriorityBoostBtn()
+    {
+        if (_priorityBoostBtn == null) return;
+        _priorityBoostBtn.Content = T("boost_setting") + ": " + (_priorityBoostEnabled ? "ON" : "OFF");
+        if (_priorityBoostEnabled)
+        {
+            _priorityBoostBtn.Background = Theme.Br(Theme.SurfaceSubtle(_dark));
+            _priorityBoostBtn.Foreground = Theme.Br(Theme.Success(_dark));
+            _priorityBoostBtn.BorderBrush = Theme.Br(Theme.Success(_dark));
+        }
+        else
+        {
+            _priorityBoostBtn.Background = BtnBg; _priorityBoostBtn.Foreground = Muted; _priorityBoostBtn.BorderBrush = Border;
+        }
+    }
+
+    // Is this worker currently flagged top-priority by the fleet? The fleet writes priority_boost
+    // back into the worker dict once it applies the set_priority_boost command; the UI only reads it.
+    static bool IsBoosted(Dictionary<string, object> w)
+    {
+        return w != null && string.Equals(S(w, "priority_boost"), "True", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // How many on-board workers are boosted right now.
+    int PriorityBoostCount(List<Dictionary<string, object>> all)
+    {
+        int n = 0;
+        if (all != null)
+            foreach (Dictionary<string, object> w in all)
+                if (IsBoosted(w)) n++;
+        return n;
+    }
+
+    // Threshold at which "最優先" stops meaning anything and we warn. MEASUREMENT-GROUNDED, not a
+    // magic number: priority only front-runs a worker into one of the concurrently-running tabs,
+    // so once the boosted set exceeds the live concurrency ceiling (_maxtabs) EVERY free slot is
+    // already a boosted worker and boosting one more cannot move it ahead of another boosted one.
+    // That is exactly the point the operator described (330 queued, a handful of slots): past here
+    // the control is diluted. Clamped to at least 1 so a tiny tab cap still warns sensibly.
+    int PriorityBoostThreshold() { return Math.Max(1, _maxtabs); }
 
     void SetAutoRetryMax(int v)
     {

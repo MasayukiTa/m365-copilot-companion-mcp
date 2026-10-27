@@ -309,6 +309,12 @@ partial class CockpitWindow : Window
     bool _autoArchive = false;  // P2: when ON, move this run's completed cards to History as soon
                                 // as the RUN reaches its finished state -> settings.txt autoarchive=
     Button _autoArchiveBtn;     // gear-popup toggle for _autoArchive
+    // Manual priority boost ("make this top priority"). ON by default: the control is the point of
+    // the feature; turning it OFF only hides the card action + count line for operators who don't
+    // want it. Persisted as priority_boost_ui= in the SHARED settings.txt. Does NOT gate the fleet:
+    // a boost already applied stays applied in the fleet even if this is switched off here.
+    bool _priorityBoostEnabled = true;
+    Button _priorityBoostBtn;   // gear-popup toggle for _priorityBoostEnabled
     string _archivedRunStarted = "";   // `started` of the run already auto-archived (fire once/run)
     string _tailArchivedRunStarted = "";  // `started` of the run whose FINAL sweep was archived
     // P2 history search: live case-insensitive substring filter over title+result, debounced.

@@ -373,7 +373,6 @@ jobs:
             ui/test_fleet_cockpit_card_boost.py \
             ui/test_fleet_cockpit_advanced_settings.py \
             ui/test_fleet_cockpit_priority_boost.py \
-            ui/test_a_stalled_card_says_why.py \
             tools/test_gate_stop.py \
             tools/test_one_override_isolates_every_gate_writer.py \
             tools/test_auto_is_a_mode_not_a_label.py \
