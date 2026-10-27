@@ -240,6 +240,7 @@ jobs:
             tools/test_a_rule_stated_twice_must_be_pinned_once.py \
             relay/test_fleet_handoff.py \
             relay/test_priority_survives_every_delivery_route.py \
+            relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
             relay/test_fanout_family_view.py \
             relay/test_family_view.py \
