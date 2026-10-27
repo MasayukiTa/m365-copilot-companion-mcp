@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import re
-import unicodedata
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -39,11 +38,6 @@ class ParseResult:
     warnings: list = field(default_factory=list)
     #: (item id, reason) for lines that were read but will not be run (duplicate, over the cap).
     skipped: list = field(default_factory=list)
-
-
-def _norm(text: str) -> str:
-    t = unicodedata.normalize("NFKC", text)
-    return re.sub(r"\s+", "", t).rstrip("。.!！?？").lower()
 
 
 def _clean_preamble(text: str) -> str:
@@ -110,7 +104,6 @@ def parse_items(path, max_items: int = DEFAULT_MAX_ITEMS) -> ParseResult:
     if len(preamble.strip()) > MAX_PREAMBLE_CHARS:
         res.warnings.append("preamble was cut to %d characters" % MAX_PREAMBLE_CHARS)
     used_ids = {e["id"] for e in entries if e["id"]}
-    seen_ask = {}
     seen_id = set()
     auto = 0
     for e in entries:
@@ -136,13 +129,12 @@ def parse_items(path, max_items: int = DEFAULT_MAX_ITEMS) -> ParseResult:
         if len(ask) > MAX_ASK_CHARS:
             res.warnings.append("%s: request longer than %d chars was cut" % (iid, MAX_ASK_CHARS))
             ask = ask[:MAX_ASK_CHARS]
-        key = _norm(ask)
-        if key in seen_ask:
-            res.skipped.append((iid, "duplicate of %s" % seen_ask[key], ask))
-            res.warnings.append("%s duplicates %s: skipped" % (iid, seen_ask[key]))
-            continue
+        # TWO REQUESTS WITH THE SAME WORDING ARE BOTH KEPT. This used to drop a later entry whose
+        # normalised ask matched an earlier one's -- a content match, exactly what the owner said
+        # must never stop a job (2026-10-26/27). Duplicate IDs are still rejected above, because
+        # that is an identity collision (two rows claiming the same id), not a resemblance
+        # between two different requests.
         seen_id.add(iid)
-        seen_ask[key] = iid
         if len(res.items) >= max_items:
             res.skipped.append((iid, "over the item limit (%d)" % max_items, ask))
             continue

@@ -146,16 +146,18 @@ def test_already_submitted_guard(tmp_path):
     assert st.already_submitted("A1", g) and not st.already_submitted("A1", g + "x")
 
 
-def test_duplicate_rejection_is_rephrased_once_then_recorded(tmp_path):
+def test_each_goal_is_submitted_once_as_written(tmp_path):
+    # No reword-on-duplicate and no 重複-skip any more: the door does not refuse on content
+    # resemblance (2026-10-26/27 owner instruction). Each item is submitted once, as written,
+    # and both reach their normal outcome.
     st = _mk(tmp_path, ["a", "b"])
-    sub = FakeSubmitter([SubmitResult(duplicate=True), SubmitResult(ok=True, attempts=1),
-                         SubmitResult(duplicate=True), SubmitResult(duplicate=True)])
-    reader = FakeReader({"A1": [_done()]})
+    sub = FakeSubmitter([SubmitResult(ok=True, attempts=1), SubmitResult(ok=True, attempts=1)])
+    reader = FakeReader({"A1": [_done()], "A2": [_done()]})
     r = _runner(st, FakeClock(), reader, sub)
     r.run()
-    assert st.get("A1")["status"] == S.DONE and st.get("A1")["variant"] == 1
-    assert sub.goals[0] != sub.goals[1]
-    assert st.get("A2")["status"] == S.SKIPPED and "重複" in st.get("A2")["error"]
+    assert st.get("A1")["status"] == S.DONE and st.get("A1")["variant"] == 0
+    assert st.get("A2")["status"] == S.DONE and st.get("A2")["variant"] == 0
+    assert sub.goals[0] != sub.goals[1]       # different items, different goal text
 
 
 def test_submit_failure_marks_item_and_batch_continues(tmp_path):
@@ -290,7 +292,10 @@ def test_submitter_calls_the_gui_script_once_per_goal_and_retries_with_backoff()
     assert calls[0][4:] == ["-Goal", "[A1] 件数を数えて。保存して。"]
 
 
-def test_submitter_does_not_retry_into_a_duplicate_and_probes_before_retry():
+def test_submitter_probes_before_retry_and_does_not_double_submit():
+    # A timed-out call may have landed anyway; the probe catches that so a retry does not create
+    # a second copy. (There is no longer any content-duplicate short-circuit: the door does not
+    # refuse on resemblance -- 2026-10-26/27 owner instruction.)
     outs = [(1, "timeout after 5s")]
     calls = []
 
@@ -301,9 +306,6 @@ def test_submitter_does_not_retry_into_a_duplicate_and_probes_before_retry():
     res = Submitter(script="S.ps1", runner=runner, sleep=lambda s: None, backoff=(1, 1)).submit(
         "[A1] x。", probe=lambda: True)
     assert res.ok and res.landed_anyway and len(calls) == 1
-    res = Submitter(script="S.ps1", runner=lambda c, t: (1, "DUP_SIMILARITY 0.7"),
-                    sleep=lambda s: None).submit("[A1] x。")
-    assert res.duplicate and not res.ok
 
 
 def test_submitter_rejects_a_multiline_goal():

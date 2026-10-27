@@ -347,14 +347,15 @@ def test_a_failing_dup_note_does_not_fail_the_submission(monkeypatch, dup_state)
 
 
 def test_the_guard_still_refuses_a_near_match_when_turned_on(monkeypatch, dup_state):
-    """(e) Turning fleet_submit_dup_guard on restores the old refusal: the near-duplicate second
-    goal is refused and nothing is queued for it."""
+    """(e) Even with fleet_submit_dup_guard on, content resemblance NEVER refuses a submission
+    (owner order 2026-10-26/27): the near-duplicate second goal is still queued; the guard only
+    makes the resemblance observable (possible_duplicate_of), it does not stop the job."""
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     goal = "sales.csv を解析して売上の月次推移をまとめ、グラフを作って報告する"
     FI.fleet_submit(goal)
     out = FI.fleet_submit(goal)
-    assert "refused" in out and "overlap" in out
-    assert len(_jobs()) == 1
+    assert "queued" in out and "refused" not in out
+    assert len(_jobs()) == 2
 
 
 def test_the_guard_setting_is_read_from_the_one_settings_file(monkeypatch, tmp_path):
@@ -415,10 +416,13 @@ def test_a_follow_up_is_not_refused_as_a_near_duplicate(monkeypatch):
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     first = FI.fleet_submit(_GOAL_A)
     assert "queued" in first
-    # A re-worded continuation of the same work, with no resume_conv, is caught as a duplicate.
-    refused = FI.fleet_submit(_GOAL_A + " please")
-    assert "refused" in refused and "overlap" in refused
-    # The SAME near-duplicate, carrying a conversation id, is admitted as a continuation.
+    # A re-worded continuation of the same work is NEVER refused on content resemblance
+    # (owner order 2026-10-26/27): it is queued, only tagged as a possible duplicate in the
+    # background. The guard being on changes the record, not whether the goal starts.
+    accepted = FI.fleet_submit(_GOAL_A + " please")
+    assert "queued" in accepted and "refused" not in accepted
+    # The SAME near-duplicate, carrying a conversation id, is admitted as a continuation too and
+    # carries its resume id.
     ok = FI.fleet_submit(_GOAL_A + " please", resume_conv="sess:xyz789")
     assert "queued" in ok
     payloads = [j["payload"] for j in _jobs()]

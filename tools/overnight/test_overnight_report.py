@@ -242,11 +242,17 @@ def test_cli_run_end_to_end_with_a_fake_fleet_and_resume(tmp_path, monkeypatch):
     rc = cli.batch_main(["run", "--items", str(items), "--out", str(out), "--fleet-dir", str(fleet), "--submit-route", "gui",
                    "--poll-seconds", "0"])
     assert rc == 0
-    assert len(sent) == 2 and all("\n" not in g and g.startswith("[") for g in sent)
+    # All THREE items are submitted. The two identical goal lines ("件数を数えて")
+    # are no longer folded into one: the owner's 2026-10-26/27 order (fix/no-content-based-skip)
+    # is that a content look-alike must never stop a job -- only a duplicate item ID is rejected
+    # (tools/overnight/items.py). Each still arrives rewritten to a single bracketed [Innn] line.
+    assert len(sent) == 3 and all("\n" not in g and g.startswith("[") for g in sent)
     assert (out / "READY.txt").exists() and (out / "overnight.log").exists()
     wb = load_workbook(next(out.glob("朝レポート_*.xlsx")))
     rows = [(wb["サマリ"].cell(r, 1).value, wb["サマリ"].cell(r, 3).value) for r in range(2, wb["サマリ"].max_row + 1)]
-    assert ("I001", "成功") in rows and ("I002", "成功") in rows and any(v == "未実施" for _, v in rows)
+    # All three ran and succeeded -- the duplicate goal line is no longer reported "未実施"
+    # (unsubmitted), because it is no longer folded out; it is submitted as I003 like the rest.
+    assert ("I001", "成功") in rows and ("I002", "成功") in rows and ("I003", "成功") in rows
     # running it again over the same folder is refused; resume sends nothing new
     assert cli.batch_main(["run", "--items", str(items), "--out", str(out)]) == 2
     n = len(sent)

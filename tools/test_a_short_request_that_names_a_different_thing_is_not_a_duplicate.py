@@ -137,8 +137,10 @@ def test_an_exact_resend_of_a_short_goal_is_still_refused_when_the_guard_is_on(
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", "ファイルAを解析してレポートを作成")])
     out = FI.fleet_submit("ファイルAを解析してレポートを作成")
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == []
+    # Never refused on resemblance (owner order 2026-10-26/27): queued, only tagged with run1.
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1 and jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs
 
 
 def test_a_reworded_resend_naming_the_same_thing_is_still_refused_when_the_guard_is_on(
@@ -151,5 +153,7 @@ def test_a_reworded_resend_naming_the_same_thing_is_still_refused_when_the_guard
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", "v2 の設定ファイルを直して確認する")])
     out = FI.fleet_submit("v2 の設定ファイルを修正して確認する")
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == []
+    # Never refused on resemblance (owner order 2026-10-26/27): queued, only tagged with run1.
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1 and jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs

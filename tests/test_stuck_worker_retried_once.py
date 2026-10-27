@@ -7,7 +7,8 @@ Three causes, one test file:
       reason said "not retried";
   (2) the cockpit re-queued the same terminal worker on every tick until a per-goal-text budget
       ran out, and also re-queued a worker the runner had already re-queued;
-  (3) nothing in the runner refused a retry whose goal was already queued or running;
+  (3) nothing in the runner refused a retry of a job (same admission id) already queued or running
+      -- matched on identity (jid), never on goal text, so look-alike goals are not blocked;
   (4) a recycle that overflowed the context on its very first turn repeated up to 8 times.
 """
 import io
@@ -110,8 +111,16 @@ def test_add_goal_path_refuses_only_tagged_retries():
     src = _read("relay", "relay_fleet.py")
     i = src.index("item = add_box.pop(0)")
     block = src[i:src.index("nw = _worker_for(len(workers), item)", i)]
-    assert 'item.get("retry") and _goal_is_live(workers, item.get("text"))' in block
-    assert "continue" in block                      # refused, with a mechanism row
+    # IDENTITY, NOT CONTENT. The guard refuses a re-queue of ONE specific admitted job
+    # (same jid still live), and only when the item is tagged as a retry. It must NOT
+    # refuse on goal text: two different goals that read alike must both run -- the owner's
+    # standing rule. So the retry tag and the jid identity are both required here, and the
+    # old content comparison (_goal_is_live on the goal text) must be gone from this block.
+    assert 'item.get("retry")' in block                # only tagged retries are guarded
+    assert "_jid_is_live(workers, item.get(\"jid\"))" in block   # matched on identity (jid)
+    assert 'item.get("jid")' in block                  # a retry with no jid is let through
+    assert '_goal_is_live(workers, item.get("text"))' not in block  # never blocked on content
+    assert "continue" in block                         # refused, with a mechanism row
     assert "_mt.record" in block
 
 

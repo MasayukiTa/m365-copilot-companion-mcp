@@ -158,8 +158,12 @@ def test_an_exact_resend_is_still_refused_when_the_guard_is_on(isolated_state, m
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     _write_status(isolated_state, [_running_worker("run1", _CHAT_SWITCH)])
     out = FI.fleet_submit(_CHAT_SWITCH)
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == [], "a refused resend must not be queued"
+    # Content resemblance never refuses (owner order 2026-10-26/27). Even an exact resend with the
+    # guard on is QUEUED; the resemblance is only recorded (possible_duplicate_of names run1).
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1, "the resend must be queued, not refused"
+    assert jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs
 
 
 def test_a_resend_with_a_few_words_reworded_is_still_refused_when_the_guard_is_on(
@@ -176,5 +180,8 @@ def test_a_resend_with_a_few_words_reworded_is_still_refused_when_the_guard_is_o
     assert reworded != _CHAT_SWITCH, "the rewording changed nothing; the test proves nothing"
     _write_status(isolated_state, [_running_worker("run1", _CHAT_SWITCH)])
     out = FI.fleet_submit(reworded)
-    assert "refused" in out and "run1" in out, out
-    assert _jobs() == [], "a reworded resend of the same job must not be queued"
+    # Never refused on resemblance (owner order 2026-10-26/27): queued, only tagged.
+    assert "queued" in out and "refused" not in out, out
+    jobs = _jobs()
+    assert len(jobs) == 1, "a reworded resend must be queued, not refused"
+    assert jobs[0]["payload"]["possible_duplicate_of"] == "run1", jobs

@@ -2400,7 +2400,13 @@ def _recycle_is_futile(worker, exhausted):
 
 
 def _goal_is_live(workers, text, exclude=None):
-    """Whether a worker for exactly this goal text is queued or running (not terminal)."""
+    """Whether a worker for exactly this goal text is queued or running (not terminal).
+
+    CONTENT-BASED, AND NO LONGER USED TO BLOCK A SUBMISSION. Kept for callers that only want
+    to know whether some worker is already carrying this text (an observation), never to refuse
+    queueing a goal because another goal resembles it -- that is the owner's standing
+    instruction. The retry double-execution guard uses `_jid_is_live` (identity, not content).
+    """
     text = (text or "").strip()
     if not text:
         return False
@@ -2408,6 +2414,25 @@ def _goal_is_live(workers, text, exclude=None):
         if w is exclude or w.status in TERMINAL:
             continue
         if (getattr(w, "goal", "") or "").strip() == text:
+            return True
+    return False
+
+
+def _jid_is_live(workers, jid, exclude=None):
+    """Whether a NON-TERMINAL worker with exactly this admission id (jid) is already live.
+
+    Identity, not content: two different goals that happen to read alike have different jids and
+    both run; the SAME admitted job re-queued while its own worker is still live is the one real
+    double-execution this prevents. A goal with no jid (legacy / CLI, never admitted) has no
+    identity to collide on, so this returns False for it -- it is never blocked on content.
+    """
+    jid = str(jid or "").strip()
+    if not jid:
+        return False
+    for w in workers:
+        if w is exclude or w.status in TERMINAL:
+            continue
+        if str(getattr(w, "jid", "") or "").strip() == jid:
             return True
     return False
 
@@ -10954,13 +10979,21 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         if add_box:
             while add_box:
                 item = add_box.pop(0)
-                # A RETRY OF A GOAL THAT IS ALREADY QUEUED OR RUNNING IS A DUPLICATE, not a
+                # A RETRY OF A JOB THAT IS ALREADY QUEUED OR RUNNING IS A DUPLICATE, not a
                 # retry. The runner's own re-queue and the cockpit's auto-retry each re-queued the
                 # same STUCK worker (2026-10-01: three concurrent copies of one job). Only items
-                # tagged retry=True are refused; a user's plain resubmit is never blocked.
-                if item.get("retry") and _goal_is_live(workers, item.get("text")):
-                    print("[fleet] refusing a duplicate retry: this goal is already live",
-                          flush=True)
+                # tagged retry=True are guarded; a user's plain resubmit is never blocked.
+                #
+                # IDENTITY, NOT CONTENT. This used to compare goal TEXT (_goal_is_live), which is a
+                # content match -- exactly what the owner forbade: two different jobs that happen to
+                # read alike must both run. A retry item is a re-queue of ONE specific worker and
+                # carries that worker's admission id, so the collision that actually matters is a
+                # worker with the SAME jid still live. Matched on jid (_jid_is_live); a retry with
+                # no jid (legacy / CLI, never admitted) has no identity to collide on and is let
+                # through rather than blocked on its text.
+                if item.get("retry") and item.get("jid") and _jid_is_live(workers, item.get("jid")):
+                    print("[fleet] refusing a duplicate retry: this job (jid=%s) is already live"
+                          % item.get("jid"), flush=True)
                     try:
                         _mt.record("retry", run_id=run_id,
                                    goal_hash=__import__("hashlib").sha256(
@@ -10968,8 +11001,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                                    ).hexdigest()[:24],
                                    configured=True, config_source="run",
                                    eligible=False, triggered=False,
-                                   ineligible_reason="duplicate retry refused: the same goal is "
-                                                     "already queued or running in this run")
+                                   ineligible_reason="duplicate retry refused: a worker with the "
+                                                     "same jid is already queued or running in "
+                                                     "this run")
                     except Exception:
                         pass
                     continue

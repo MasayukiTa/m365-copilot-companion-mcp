@@ -20,8 +20,6 @@ DEFAULT_SCRIPT = REPO / "scripts" / "win" / "submit_via_ui.ps1"
 BACKOFF_SECONDS = (10, 40, 120)
 CALL_TIMEOUT_S = 420
 
-_DUP_RE = re.compile(r"DUP_SIMILARITY|duplicate|near-duplicate|重複|既に投入|同じ目標|not accepted", re.I)
-
 
 @dataclass
 class SubmitResult:
@@ -80,9 +78,9 @@ class Submitter:
             if rc == 0:
                 res.ok = True
                 return res
-            if _DUP_RE.search(out or ""):
-                res.duplicate = True
-                return res
+            # A near-duplicate reply is no longer a special case: the fleet door does not refuse
+            # on content resemblance (2026-10-26/27 owner instruction), so there is nothing to
+            # detect here. A non-zero rc is a real submit failure and is retried/reported as one.
             self.log("submit attempt %d failed (rc=%s): %s" % (n + 1, rc, res.output[-300:].replace("\n", " ")))
             if probe is not None:
                 try:
@@ -139,9 +137,11 @@ class QueueSubmitter:
         m = _QUEUED_RE.match(text.strip())
         if m:
             res.ok, res.job_id = True, m.group(1)
-        elif "reads as the goal already queued" in text or "word overlap" in text:
-            res.duplicate = True
         else:
+            # The door no longer refuses a goal because it resembles one in flight
+            # (2026-10-26/27 owner instruction), so there is no similar-goal reply to map to a
+            # duplicate here. Anything that is not a queued-ok line is a real failure (too long,
+            # queue full, raised) and keeps the door's own message.
             self.log("queue refused: %s" % text[:300])
         return res
 
@@ -149,21 +149,7 @@ class QueueSubmitter:
         return "queue route (no cockpit call)"
 
 
-def fleet_similarity():
-    """The fleet door's own duplicate rule as a function(goal_a, goal_b) -> bool, or None.
-
-    Overnight goals share most of their wording (the same save-folder sentence), so several
-    short requests queued together can read as duplicates of one another. The runner uses this
-    to hold a request back until the similar one in flight has finished, instead of being
-    refused by the door. None when the door's module cannot be loaded (no holding back then).
-    """
-    try:
-        from tools import fleet_intake as FI
-
-        def similar(a: str, b: str) -> bool:
-            wa, wb = FI._dup_words(" ".join(a.split())), FI._dup_words(" ".join(b.split()))
-            return (len(wa) >= FI.DUP_MIN_WORDS and len(wb) >= FI.DUP_MIN_WORDS
-                    and FI._dup_similarity(wa, wb) >= FI.DUP_SIMILARITY)
-        return similar
-    except Exception:
-        return None
+# fleet_similarity() was removed: it exposed the door's content-resemblance rule so the runner
+# could hold a request back until a similarly-worded one finished. The door no longer refuses on
+# content (2026-10-26/27 owner instruction), so there is nothing to mirror and nothing to hold
+# back for -- every request is submitted as written.

@@ -61,8 +61,38 @@ def test_adopt_watcher_is_bounded():
     assert "!File.Exists(commandPath)" in body
 
 
-def test_duplicate_pending_add_is_not_written_twice():
+def test_a_second_command_is_not_written_while_the_first_is_unconsumed():
+    """The double-write guard survives, but keyed on IDENTITY, not content.
+
+    It must defer writing a SECOND add_goal command while THIS UI's previous command is still
+    sitting unconsumed in commands.d (the drain-lag race that turned 3 goals into 5 workers),
+    and it must do so by checking whether that command's FILE still exists -- never by hashing
+    the goal text.
+    """
     s = _cs()
     body = s[s.index("void TryAddGoalsToLiveFleet"):s.index("int LiveAddReceiptState")]
-    assert body.index("_pendingAddCommands.TryGetValue") < body.index("SendTrackedCommand(")
-    assert "File.Exists(pendingPath)" in body
+    # The guard runs before the command is written, and it is the unconsumed-command check.
+    assert body.index("HasUnconsumedAddCommand()") < body.index("SendTrackedCommand(")
+    # Identity, by file existence of this UI's own prior command -- not by goal text.
+    helper = s[s.index("bool HasUnconsumedAddCommand()"):]
+    helper = helper[:helper.index("\n    }\n") + 6]
+    assert "File.Exists(pp)" in helper
+    assert "_pendingAddCommandPaths" in body
+
+
+def test_the_live_add_guard_never_keys_on_goal_text():
+    """Content resemblance must never stop a live add (owner instruction 2026-10-26/27). The
+    guard must not hash the goal text: no AddGoalSetKey, no GoalKey(goal), no content-hash
+    dictionary in the live-add path.
+    """
+    s = _cs()
+    body = s[s.index("void TryAddGoalsToLiveFleet"):s.index("int LiveAddReceiptState")]
+    # Judge CODE only: strip // line comments so historical prose mentioning the old hash in an
+    # explanatory comment does not count as the guard still using it.
+    code = "\n".join(ln.split("//", 1)[0] for ln in body.splitlines())
+    assert "AddGoalSetKey" not in code, "the live-add guard still builds a goal-text hash key"
+    assert "_pendingAddCommands" not in code, "content-hash dictionary guard still present"
+    assert "GoalKey(" not in code, "the live-add guard still hashes goal text"
+    # The goal-set content-hash helper must be gone from the cockpit source entirely (code lines).
+    s_code = "\n".join(ln.split("//", 1)[0] for ln in s.splitlines())
+    assert "static string AddGoalSetKey" not in s_code, "the goal-set content-hash helper was not removed"

@@ -164,28 +164,17 @@ class Runner:
         return len(self.st.by_status(S.SUBMITTING, S.SUBMITTED, S.RUNNING))
 
     def _submit_some(self) -> None:
+        # CONTENT RESEMBLANCE NEVER HOLDS A REQUEST BACK. This used to skip any pending item
+        # that read like one already in flight (_similar_to_active), because the fleet door
+        # would have refused it as a near-duplicate. The door no longer refuses on content
+        # (see tools/fleet_intake.fleet_submit, 2026-10-26/27 owner instruction), so there is
+        # nothing to pre-empt: every pending request is submitted in order. Two requests that
+        # share wording both run; they are kept apart downstream by job id, not by text.
         while self._inflight() < self.cfg.get("max_inflight", DEFAULT_MAX_INFLIGHT):
             pend = self.st.by_status(S.PENDING)
             if not pend or self._past_deadline():
                 return
-            pick = next((i for i in pend if not self._similar_to_active(i)), None)
-            if pick is None:
-                return  # every waiting request reads like one in flight: try again next poll
-            self._submit_one(pick)
-
-    def _similar_to_active(self, iid: str) -> bool:
-        """Would the fleet door refuse this goal as a copy of one of ours still in flight?"""
-        if self.similar is None:
-            return False
-        try:
-            goal = self._goal_for(self.st.get(iid), 0)
-        except ValueError:
-            return False
-        for other in self.st.by_status(S.SUBMITTING, S.SUBMITTED, S.RUNNING):
-            g = self.st.get(other).get("goal") or ""
-            if g and self.similar(goal, g):
-                return True
-        return False
+            self._submit_one(pend[0])
 
     def _goal_for(self, rec, variant: int) -> str:
         item = Item(id=rec["id"], ask=rec["ask"], tags=rec["tags"], max_minutes=rec["max_minutes"])
@@ -203,31 +192,25 @@ class Runner:
             self.log("%s: already submitted with this goal, not sent again" % iid)
             return
         (self.out_dir / iid).mkdir(parents=True, exist_ok=True)
-        variant = 0
-        while True:
-            self.st.set_status(iid, S.SUBMITTING, goal=goal, goal_hash=goal_hash(goal),
-                               variant=variant, attempts=rec["attempts"] + 1)
-            res = self.submitter.submit(goal, probe=lambda i=iid: self._in_fleet(i))
-            if res.ok:
-                self.st.set_status(iid, S.SUBMITTED, submitted_ts=to_epoch(self._now()),
-                                   result_dir=str(self.out_dir / iid),
-                                   job_id=getattr(res, "job_id", "") or "")
-                self.log("%s: submitted (%d attempt(s)); cockpit: %s"
-                         % (iid, res.attempts, self.submitter.readonly_check()))
-                return
-            if res.duplicate and variant == 0:
-                variant = 1
-                goal = self._goal_for(rec, variant)
-                self.log("%s: rejected as a duplicate, asking again in other words" % iid)
-                continue
-            if res.duplicate:
-                self.st.set_status(iid, S.SKIPPED, error="重複で拒否 (fleet duplicate rule)",
-                                   category=classify.OTHER, finished_ts=to_epoch(self._now()))
-            else:
-                self.st.set_status(iid, S.FAILED, error="投入失敗: " + res.output[-300:],
-                                   category=classify.NOT_SUBMITTABLE, finished_ts=to_epoch(self._now()))
-            self.log("%s: not queued (%s)" % (iid, rec["error"][:120]))
+        # ONE SUBMIT, NO REWORDING. This used to loop: if the fleet door refused the goal as a
+        # near-duplicate, it reworded the request once (variant 1) and, if still refused, SKIPPED
+        # it as "重複で拒否". The door no longer refuses on content resemblance (2026-10-26/27
+        # owner instruction), so there is no duplicate reply to reword around or skip on -- the
+        # goal is submitted as written, and anything that is not an ok is a real failure.
+        self.st.set_status(iid, S.SUBMITTING, goal=goal, goal_hash=goal_hash(goal),
+                           variant=0, attempts=rec["attempts"] + 1)
+        res = self.submitter.submit(goal, probe=lambda i=iid: self._in_fleet(i))
+        if res.ok:
+            self.st.set_status(iid, S.SUBMITTED, submitted_ts=to_epoch(self._now()),
+                               result_dir=str(self.out_dir / iid),
+                               job_id=getattr(res, "job_id", "") or "")
+            self.log("%s: submitted (%d attempt(s)); cockpit: %s"
+                     % (iid, res.attempts, self.submitter.readonly_check()))
             return
+        self.st.set_status(iid, S.FAILED, error="投入失敗: " + res.output[-300:],
+                           category=classify.NOT_SUBMITTABLE, finished_ts=to_epoch(self._now()))
+        self.log("%s: not queued (%s)" % (iid, rec["error"][:120]))
+        return
 
     # ---- watching
     def _poll(self) -> None:
