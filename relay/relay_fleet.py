@@ -8232,6 +8232,22 @@ class RelayWorker:
             pass
         print("[relay_fleet] %s: %s" % (self.name, self.reason), flush=True)
 
+    def _saw_output_for_turn(self):
+        """Whether ANY token arrived for the turn in flight. The driver's own delivery evidence.
+
+        The same read the reconnect path makes as `saw_output`: `partial_text()` holds tokens that
+        arrived for THIS attempt (send() clears it, a failed turn leaves it standing) and
+        `_turn_answered` is set once a completion frame lands. True means the frame reached the
+        model, so the turn was DELIVERED. Never raises; a driver that cannot be read is False, which
+        keeps the careful 'unknown' reading.
+        """
+        try:
+            return bool(
+                (self.drv.partial_text() if hasattr(self.drv, "partial_text") else "")
+                or getattr(self.drv, "_turn_answered", False))
+        except Exception:
+            return False
+
     def _journal_shows_executed_calls(self):
         """True when the continue-turn setting is on and this side finished a call in the cut turn.
 
@@ -9391,9 +9407,31 @@ class RelayWorker:
                         self._note_timeout(_origin, _elapsed, "continue", budget_s=_bound)
                         self.reason = "turn timeout -> continue the same conversation"
                         return False
+                    # BEFORE GIVING UP, ASK WHETHER THE TURN WAS DELIVERED. The refusal used to
+                    # hard-code delivery="unknown" and never read the driver's own evidence --
+                    # `partial_text()`/`_turn_answered`, the same `saw_output` the reconnect path
+                    # reads. Under load (2026-10-27 15:53: 90 workers) a turn whose answer was
+                    # merely slow carried real output and was still ended STUCK. When the setting
+                    # is on and output arrived, the turn DID reach the model: keep waiting for the
+                    # reply instead of refusing -- a verbatim resend would ask for the act again.
+                    # Output absent stays "unknown" and keeps the careful refuse below. With the
+                    # setting off, the old hard-coded "unknown" refusal is unchanged.
+                    _delivery = "unknown"
+                    try:
+                        from relay import delivery_verify as _DV
+                        if _DV.verify_on() and self._saw_output_for_turn():
+                            from relay.transport_policy import delivery_seen_from_output
+                            _delivery = delivery_seen_from_output(True)
+                    except Exception:
+                        _delivery = "unknown"
+                    if _delivery == "delivered":
+                        self._note_timeout(_origin, _elapsed, "delivered-wait", budget_s=_bound)
+                        self.reason = ("turn timeout but output arrived -> delivered; "
+                                       "waiting for the reply, not re-sending")
+                        return False
                     self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
                     if self.status != "stuck":
-                        self._refuse_resend("turn timeout without a reply", "unknown")
+                        self._refuse_resend("turn timeout without a reply", _delivery)
                     return True
                 # Read-only / checkably-absent work keeps the existing transient retry path.
                 if self._retry_transient():
