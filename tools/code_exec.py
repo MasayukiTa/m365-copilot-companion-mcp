@@ -11,9 +11,38 @@ from .security import require_unlocked
 from .shell_extra import _gate_detail
 
 
+def default_work_dir() -> str:
+    """Where run_python / shell_exec / pwsh_exec run when the caller names no working_dir.
+
+    This used to be ``os.getcwd()``, which on this server is the production checkout root --
+    so a bare ``open('out.txt','w')`` or ``mkdir foo`` inside a snippet landed a new file or
+    folder directly under the production checkout root. That is exactly the clutter the placement rule is
+    about, and it entered through the one door the file guard cannot see (a subprocess does
+    its own ``open`` without passing through ``_validate_path``). Defaulting the cwd to the
+    per-run work area under ``%TEMP%\\m365-companion\\agents\\<scope>`` moves those relative
+    writes off the checkout root at the source. Falls back to the old cwd only if the temp
+    home cannot be created, so a stripped environment still runs.
+    """
+    try:
+        from relay import temp_home as _th
+        scope = ""
+        try:
+            from . import folder_policy as _fp
+            scope = _fp.current_scope() or ""
+        except Exception:
+            scope = ""
+        name = "agents/" + (scope if scope else "shared")
+        d = _th.temp_dir(name)
+        if d and os.path.isdir(d):
+            return d
+    except Exception:
+        pass
+    return os.getcwd()
+
+
 def _working_dir(path: Optional[str]) -> str:
     if not path:
-        return os.getcwd()
+        return default_work_dir()
     p = _validate_path(path)
     if not p.is_dir():
         raise NotADirectoryError(str(p))
