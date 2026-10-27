@@ -83,23 +83,35 @@ def test_a_too_long_goal_leaves_a_refused_record_with_the_whole_goal():
     assert rec["refused_at"] > 0
 
 
-def test_a_duplicate_refusal_records_the_lookalike_and_the_overlap(monkeypatch):
-    """A near-duplicate names the job it looked like and the measured word overlap, so the card
-    can say 'NN% 一致' without recomputing.
+def test_a_near_duplicate_is_accepted_and_only_noted_not_refused(monkeypatch):
+    """A near-duplicate is NO LONGER refused -- the owner's 2026-10-26/27 order (fix/no-content-
+    based-skip): the fleet door does not turn a goal away on content resemblance. Even with the
+    duplicate guard turned back on (fleet_submit_dup_guard=on), a look-alike is ACCEPTED: the
+    goal is queued, the resemblance is only NOTED in the background (_log_similarity_observed,
+    and the job is tagged possible_duplicate_of), and -- because there was no refusal -- NO
+    refused record is written. There is therefore nothing here to force in later.
 
-    The duplicate guard is OFF by compiled default (the owner's 2026-10-26 order, #293): a
-    look-alike is then ACCEPTED and only noted in the background, so NO refusal -- and hence no
-    refused record -- is produced. A refused record for a duplicate only exists on a machine that
-    turned the guard back on (fleet_submit_dup_guard=on), so this test turns it on to exercise
-    the path it is about."""
+    This replaces the old 'a duplicate refusal records the look-alike and the overlap' case,
+    which asserted the opposite (guard on => refuse => a 'similar' refused record). That path
+    was removed on purpose; keeping both intents is impossible, so the branch's accept-and-note
+    behaviour wins and this test pins it. See <name>_merge_out/explain.md."""
+    noted = []
     monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     monkeypatch.setattr(FI, "_duplicate_of", lambda text: ("job123abc", 0.875))
+    monkeypatch.setattr(FI, "_log_similarity_observed",
+                        lambda text, source, similar_to="", similarity=0.0:
+                        noted.append((similar_to, similarity)))
     out = FI.fleet_submit("do the same big thing again please now", source="x")
-    assert "job123abc" in out
-    (rec,) = _refused_records()
-    assert rec["reason"] == "similar"
-    assert rec["similar_to"] == "job123abc"
-    assert rec["similarity"] == 0.875
+    # accepted, not refused: the reply is a normal queued-ok line, not a refusal
+    assert "queued" in out
+    assert "refused" not in out
+    # the resemblance was noted in the background, naming the look-alike and the overlap
+    assert noted == [("job123abc", 0.875)]
+    # and the queued job carries the tag, so a reader can still see the resemblance
+    (job,) = _pending_jobs()
+    assert job["payload"]["possible_duplicate_of"] == "job123abc"
+    # no refusal happened, so there is no refused record to force later
+    assert _refused_records() == []
 
 
 def test_an_empty_goal_still_leaves_a_record():
