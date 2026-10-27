@@ -82,7 +82,7 @@ def test_a_turn_cut_after_output_is_continued_without_resending_the_goal(tmp_pat
 
 def test_the_same_cut_stays_stuck_when_recovery_is_off(tmp_path, monkeypatch):
     """設定 off: 同じ切断・出力受信済みでも、従来どおり STUCK。再送も新会話もしない。"""
-    H._mode(tmp_path, monkeypatch, None)              # キー無し = off
+    H._mode(tmp_path, monkeypatch, "off")             # 明示 off（既定が on になったため）
     tools = H._Tools()
     A, connect1, drv1 = _cut_after_output(tools)
     H._run(drv1, "THE-JOB")
