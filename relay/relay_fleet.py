@@ -7230,20 +7230,16 @@ class RelayWorker:
                     # C4, SHADOW ONLY: records the team a team-forming rule would have proposed
                     # beside the static one just built. Returns nothing, changes nothing.
                     team_formation.shadow_propose(kids, steps, run_id=getattr(self, "run_id", "") or "")
-                    self._spawn_fn(self.goal, kids,
+                    _spawned = self._spawn_fn(self.goal, kids,
                                    parent_checks=getattr(self, "checks", None) or None,
                                    parent_partial=_partial,
                                    **conv_saving_mod.parent_merge_kwargs(self))
-                    # SPLITTING ENDS THIS WORKER. A parent parked until its children finish
-                    # holds an admission slot the whole time, and with a concurrency cap
-                    # below the number of children that is a deadlock -- the parent waits
-                    # for children that cannot be admitted because the parent is waiting.
-                    # The merge arrives later as its own goal, when there is something to
-                    # merge.
-                    self.status, self.outcome = "done", "FANOUT"
-                    self.reason = ("%d 個のサブタスクに分割して並列実行（完了後に統合）"
-                                   % len(kids))
-                    return
+                    if _spawned is not False:
+                        # Free the admission slot; the merge runs after the children.
+                        self.status, self.outcome = "done", "FANOUT"
+                        self.reason = ("%d 個のサブタスクに分割して並列実行（完了後に統合）"
+                                       % len(kids))
+                        return
                 # An unusable split -- one item, forty, or prose with no list. Do the work
                 # here instead of splitting: refusing to proceed would strand a goal on the
                 # grounds that the agent divided it badly, which is not the goal's fault.
@@ -10008,7 +10004,7 @@ def _campaigns_from_disk(transcript_dir):
                     "checks": list(fam.get("checks") or []),
                     "partial": fam.get("partial") or "",
                     "child_results": list(fam.get("child_results") or []),
-                    "requeue_merge": verdict == "reissue"}
+                    "requeue_merge": verdict == "reissue", "rehydrated": True}
         if fam.get("depth"):
             out[cid]["depth"] = fam["depth"]
         # a nested family keeps the parent slot it fills, so its merge still reaches that slot
@@ -10429,6 +10425,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         """
         cid = kids[0].get("campaign_id") or fanout_mod.campaign_id_for(parent_goal)
         if cid in campaigns:
+            if campaigns[cid].get("rehydrated"):
+                print("[fanout] %s: prior family is not owned by this run; executing parent" % cid, flush=True)
+                return False
             # ALREADY SPLIT IN THIS RUN. Re-queueing would duplicate the children and move the
             # merge's denominator, so the merge would wait for a family larger than the one
             # that exists.
@@ -10443,23 +10442,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             print("[fanout] %s: slot %s of %s already split into %s; not splitting again"
                   % (cid, kids[0].get("parent_subtask_index"),
                      kids[0].get("parent_campaign_id"), _twin), flush=True)
-            return
+            return False
         if _campaign_already_on_disk(cid):
-            # ALREADY SPLIT IN AN EARLIER RUN. The ledger outlives the process, and a resumed
-            # or retried goal reaches here with an empty `campaigns` dict -- which is how the
-            # same split came to be recorded twenty-two times. Adopt the family instead of
-            # minting it again: the children are already queued or already done, and the merge
-            # reads the ledger, not this dict.
-            campaigns[cid] = {"goal": parent_goal, "n": len(kids), "merged": False,
-                              "cwd": (kids[0] or {}).get("cwd"),
-                              "checks": list(parent_checks or []),
-                              "partial": parent_partial or ""}
-            if int((kids[0] or {}).get("depth") or 1) > 1:
-                campaigns[cid]["depth"] = int(kids[0]["depth"])
-            _link_parent_slot(cid, kids)
-            print("[fanout] %s: already split in an earlier run; adopting, not re-queueing"
-                  % cid, flush=True)
-            return
+            # A ledger header alone does not establish that this run owns the children.
+            print("[fanout] %s: prior family is not owned by this run; executing parent" % cid, flush=True)
+            return False
         # THE CHILDREN ALREADY CARRY THE PARENT'S cwd (child_goals puts it there), so the
         # merge takes it from them rather than from a second field that could drift. Without
         # it the merge starts wherever the fleet happens to be, while being asked to write a
