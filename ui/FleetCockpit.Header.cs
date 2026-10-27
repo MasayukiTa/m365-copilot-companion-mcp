@@ -146,6 +146,10 @@ partial class CockpitWindow
         // `ready` (準備: tab prepared, waiting for a concurrency slot) and approval gates are
         // counted on their own, and `pending` stays the queue.
         int cntRunning = 0, cntQueued = 0, cntDoneW = 0, cntIntr = 0, cntReady = 0, cntGate = 0;
+        // Left-rail "done" must match the DONE cards still ON SCREEN: a terminal worker the user
+        // cleared to History (its key is in _hiddenKeys) is removed from the completed list in
+        // BuildRows, so it must not be counted here either. Same hide test as ui/FleetCockpit.Rows.cs.
+        string startedRootHdr = S(root, "started");
         object wo2;
         if (root.TryGetValue("workers", out wo2) && wo2 is object[])
         {
@@ -154,7 +158,12 @@ partial class CockpitWindow
                 var ww = ow as Dictionary<string, object>;
                 if (ww == null) continue;
                 string wst = S(ww, "status");
-                if (IsTerminalWorker(ww)) cntDoneW++;
+                if (IsTerminalWorker(ww))
+                {
+                    if (_hiddenKeys.Count > 0 && _hiddenKeys.Contains(WorkerKey(startedRootHdr, ww)))
+                        continue;   // cleared to History -> not on screen -> not in the left-rail count
+                    cntDoneW++;
+                }
                 else if (IsInterruptedWorker(ww)) cntIntr++;   // not running, not done, not a failure
                 else if (wst == "pending") cntQueued++;
                 else if (wst == "ready") cntReady++;

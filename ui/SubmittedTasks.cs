@@ -694,11 +694,15 @@ sealed class SubmittedTasks
             return c != 0 ? c : idx[a].CompareTo(idx[b]);
         });
         outList.AddRange(fresh);
-        // Active (1) and older pending (2) keep status.json order, so a card holds its place
-        // while unrelated workers tick.
+        // Active (1) and older pending (2), NEWEST FIRST within each bucket: the most recently
+        // submitted worker (largest Wnn, appended last to status.json) sits on top, so the task a
+        // user just dispatched is what they see first; W0 falls to the bottom (owner request
+        // 2026-10-26). Walk `ranked` (status.json order) in reverse to achieve this. Terminal (3)
+        // is NOT walked here: it is ordered by completion time just below, which already places the
+        // newest-finished card on top.
         for (int rank = 1; rank <= 2; rank++)
-            foreach (SubmittedDisplayItem x in ranked)
-                if (x.Rank == rank) outList.Add(x);
+            for (int i = ranked.Count - 1; i >= 0; i--)
+                if (ranked[i].Rank == rank) outList.Add(ranked[i]);
         // Terminal (3): the completed group, ordered by completion time, NEWEST FIRST -- the most
         // recently finished task on top. Stable: List.Sort is not, so the original index breaks
         // ties (two workers with the same/zero completion ts keep status.json order).

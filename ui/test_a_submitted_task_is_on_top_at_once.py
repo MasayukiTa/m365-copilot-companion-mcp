@@ -497,8 +497,8 @@ def test_the_order_is_submitted_then_fresh_pending_then_active_then_older_pendin
     assert step["order"] == [
         "S:newest submission", "S:older submission",        # submitted, newest first
         "W:wFresh2", "W:wFresh",                            # fresh pending, newest first
-        "W:wActive", "W:wActive2",                          # active, status.json order
-        "W:wOldPending", "W:wEdge", "W:wNoEvents",          # older pending (180 s is not fresh)
+        "W:wActive2", "W:wActive",                          # active, newest (largest Wnn) first
+        "W:wNoEvents", "W:wEdge", "W:wOldPending",          # older pending (180 s not fresh), newest first
         "W:wFreed", "W:wDone",                              # terminal, newest completion first
         "W:wTieA", "W:wTieB",                               # oldest completion; equal ts -> status.json order
     ], step["order"]
