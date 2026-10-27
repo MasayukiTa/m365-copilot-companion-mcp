@@ -8390,7 +8390,7 @@ class RelayWorker:
         """See socket_fault_is_transport. A method so the worker reads as one object."""
         return socket_fault_is_transport(reason)
 
-    def _retry_socket(self, reason):
+    def _retry_socket(self, reason, assume_landed=False):
         """Rebuild the connection and re-send the same turn. NOT a fallback -- no tab is opened.
 
         The conversation survives the socket: `driver_for(conversation_id=...)` continues the
@@ -8482,6 +8482,12 @@ class RelayWorker:
         # effect with a working checker does it replace the guess with a look -- re-sending an
         # already-present commit as a safe no-op, or re-sending a genuinely-absent one as the
         # recovery the reconnect budget was for.
+        # A TURN TIMEOUT IS A TURN THAT MAY HAVE LANDED. The timeout path has no frame-level
+        # evidence, so `delivery` is "unknown" and `landed` stays False; an acting goal would then
+        # skip the continue planning below and be re-sent verbatim. `assume_landed` makes the
+        # acting goal go through the same continue-or-refuse decision a dropped socket gets.
+        if assume_landed and self._goal_may_act():
+            landed = True
         if str(reason or "").startswith("continue refused"):
             # THE CONTINUE TURN WAS REFUSED (relay/continue_recovery.py): the conversation did not
             # prove it holds its history, or the model reported an action of its own. Neither a
@@ -9237,8 +9243,27 @@ class RelayWorker:
                 _timeout_policy = getattr(self, "_timeout_resend_decision", None)
                 _timeout_resend = _timeout_policy() if callable(_timeout_policy) else "resend"
                 if _timeout_resend != "resend":
+                    # TRY THE CONTINUE TURN BEFORE GIVING UP. The reconnect path always planned a
+                    # continue (same conversation, `continue_recovery`) before refusing; this path
+                    # refused outright, so 260 timed-out acting goals ended STUCK without one try.
+                    # `_retry_socket(assume_landed=True)` continues the interrupted turn, or ends
+                    # the worker with the same named refusal as before when no continue is safe.
+                    _tried_continue = False
+                    try:
+                        _tried_continue = bool(getattr(self, "socket", False)
+                                               and _socket_route().open()
+                                               and self._retry_socket("turn timeout without a reply",
+                                                                      assume_landed=True))
+                    except Exception as exc:
+                        print("[relay_fleet] %s: continue after timeout unavailable (%s)"
+                              % (getattr(self, "name", "worker"), type(exc).__name__), flush=True)
+                    if _tried_continue:
+                        self._note_timeout(_origin, _elapsed, "continue", budget_s=_bound)
+                        self.reason = "turn timeout -> continue the same conversation"
+                        return False
                     self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
-                    self._refuse_resend("turn timeout without a reply", "unknown")
+                    if self.status != "stuck":
+                        self._refuse_resend("turn timeout without a reply", "unknown")
                     return True
                 # Read-only / checkably-absent work keeps the existing transient retry path.
                 if self._retry_transient():
