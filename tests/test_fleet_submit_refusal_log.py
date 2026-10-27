@@ -67,12 +67,28 @@ def test_a_resemblance_is_observed_not_refused(state, monkeypatch):
     # heuristic finds a 90%-overlap in-flight goal, the submission is QUEUED; the match is only
     # recorded in fleet_submit_similarity.jsonl, and nothing lands in the refusals log.
     monkeypatch.setattr(FI, "_duplicate_of", lambda text: ("job123abc", 0.9))
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: True)
     out = FI.fleet_submit("do the same thing again please", source="x")
     assert "queued" in out and "refused" not in out
     assert _rows(state) == []                       # no refusal was recorded
     (o,) = _observed(state)                          # the resemblance was noted instead
     assert o["similar_to"] == "job123abc" and o["queued"] is True
     assert o["similarity"] == 0.9
+
+
+def test_a_near_match_is_not_refused_when_the_guard_is_off(state, monkeypatch, tmp_path):
+    """Default guard (off): a goal that resembles an in-flight one is queued, not refused, and
+    leaves NO refusal line. The dup note itself is exercised in test_fleet_intake; here the only
+    claim is that the refusal log stays empty. TASKS is redirected so the accepted job lands in a
+    throwaway queue rather than the real one."""
+    monkeypatch.setattr(FI.TR, "TASKS", str(tmp_path / "tasks"))
+    FI.TR.ensure_dirs()
+    monkeypatch.setattr(FI, "_duplicate_of", lambda text: ("job123abc", 0.9))
+    monkeypatch.setattr(FI, "_dup_guard_on", lambda: False)
+    monkeypatch.setattr(FI, "_note_possible_duplicate", lambda *a, **k: None)
+    out = FI.fleet_submit("do the same thing again please", source="x")
+    assert "queued" in out
+    assert _rows(state) == []
 
 
 def test_pending_full(state, monkeypatch):

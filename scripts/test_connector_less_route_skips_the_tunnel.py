@@ -98,11 +98,36 @@ def test_start_all_gates_each_tunnel_step_on_the_route():
     assert 'elseif ($script:ToolRoute -eq "connector-less")' in sa[confirm - 500:confirm]
 
 
-def test_supervisor_neither_hosts_nor_logs_in_for_connector_less():
+def test_supervisor_still_gates_hosting_on_whether_a_tunnel_is_wanted():
+    # The supervisor asks ONE question -- Test-TunnelRouteWanted -- and hosts only when it is true.
+    # What makes it true changed (see below): connector-less no longer forces it false. But the
+    # gate itself, and the two places that honour it, are unchanged.
     sup = _read("scripts/supervisor.ps1")
     assert "function Test-TunnelRouteWanted" in sup
     assert sup.count("Test-TunnelRouteWanted") >= 3          # definition + startup fast path + tick
     assert "if (-not (Test-TunnelRouteWanted)) {" in sup
+
+
+def test_connector_less_still_hosts_a_tunnel_for_an_external_client_by_default():
+    # The new default (host_tunnel_for_external_clients=on) is what keeps the tunnel up after a
+    # reboot on a connector-less PC: Test-TunnelRouteWanted reads the setting and, when on, wants
+    # the tunnel whatever the route is. The reason is logged so the tick that hosts it explains why.
+    sup = _read("scripts/supervisor.ps1")
+    assert "host_tunnel_for_external_clients_setting" in sup
+    assert '$wanted = ($t -ne "connector-less") -or $hostForExternal' in sup
+    assert "Dev Tunnel is hosted and watched for an external client" in sup
+
+
+def test_off_restores_the_old_connector_less_behaviour():
+    # With the setting off, the one condition that makes the tunnel wanted is the route being not
+    # connector-less -- i.e. exactly the pre-change rule. The Python reader that supervisor.ps1
+    # calls returns the connector-less default (on) unless the file says off, and off only.
+    from relay import code_staleness
+    assert code_staleness.HOST_TUNNEL_DEFAULT == "on"
+    assert code_staleness.HOST_TUNNEL_MODES == ("off", "on")
+    sup = _read("scripts/supervisor.ps1")
+    # off -> $hostForExternal is false -> $wanted collapses to ($t -ne "connector-less"), the old rule
+    assert '$hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"' in sup
 
 
 def test_doctor_replaces_the_tunnel_chain_with_one_info_row():

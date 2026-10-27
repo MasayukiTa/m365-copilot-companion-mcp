@@ -655,6 +655,47 @@ partial class CockpitWindow
         _rtBox.Background = BtnBg; _rtBox.Foreground = Fg; _rtBox.BorderBrush = Border;
         StyleFlatCombo(_rtBox);
     }
+    // Continue-turn recovery (off|on), in the Tools section under the resident-tools switch.
+    // Persists through SaveKey only. relay/continue_recovery.py re-reads the key at every send
+    // and retry decision (each_gate). Default on. Words: ContinueRecoveryView.
+    UIElement ContinueRecoveryControl()
+    {
+        _crLbl = new TextBlock(); _crLbl.VerticalAlignment = VerticalAlignment.Center;
+        _crLbl.FontSize = 12;
+
+        _crBox = new ComboBox();
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_crBox, "continueRecoveryBox");
+        _crBox.ToolTip = ContinueRecoveryView.Help(_lang == 0) + "\n" + ContinueRecoveryView.TakeEffectTip(_lang == 0);
+        _crBox.Cursor = Cursors.Hand; _crBox.FontSize = 12;
+        _crBox.FontWeight = FontWeights.SemiBold; _crBox.MinWidth = 64;
+        _crBox.Padding = new Thickness(8, 2, 4, 2);
+        _crBox.VerticalAlignment = VerticalAlignment.Center;
+        var crHelp = new Dictionary<string, string>();
+        foreach (string m in ContinueRecoveryView.Modes) crHelp[m] = ContinueRecoveryView.ModeLabel(m, _lang == 0);
+        FillComboWithHelp(_crBox, ContinueRecoveryView.Modes, crHelp, _crVal);
+        _crBox.DropDownOpened += delegate { CloseHeaderPopups("settings"); };
+        _crBox.SelectionChanged += delegate
+        {
+            string sel = ComboVal(_crBox);
+            if (!ContinueRecoveryView.IsMode(sel) || sel == _crVal) return;   // unchanged -> no write, no re-fire
+            _crVal = sel;
+            SaveKey(ContinueRecoveryView.Key, _crVal);
+        };
+
+        var wrap = SettingsComboBlock(_crLbl, _crBox, new TextBlock(), new TextBlock());
+        PaintContinueRecovery();
+        return wrap;
+    }
+    void PaintContinueRecovery()
+    {
+        if (_crLbl != null) { _crLbl.Text = ContinueRecoveryView.Label(_lang == 0); _crLbl.Foreground = Muted; }
+        if (_crBox == null) return;
+        // assign only when different so SelectionChanged (which persists) does not re-fire
+        if (!Equals(ComboVal(_crBox), _crVal)) ComboSelectVal(_crBox, _crVal);
+        _crBox.ToolTip = ContinueRecoveryView.Help(_lang == 0) + "\n" + ContinueRecoveryView.TakeEffectTip(_lang == 0);
+        _crBox.Background = BtnBg; _crBox.Foreground = Fg; _crBox.BorderBrush = Border;
+        StyleFlatCombo(_crBox);
+    }
     // Read-only result cache (off|shadow), under Tools. Persists through SaveKey only;
     // relay/result_cache.py re-reads the key at every read-only tool call (each_gate).
     // Words: ResultCacheView.
