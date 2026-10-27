@@ -474,3 +474,86 @@ def test_a_fresh_nonempty_playwright_dir_is_not_counted(tmp_path):
     _touch(str(d / "trace.zip"), size=5000, age_days=0.01, now=now)
     total = R.playwright_nonempty_warning(temp_root=str(tmp_path), now=now, dry_run=True)
     assert total == 0, "a dir newer than the age gate was counted: %d" % total
+
+
+# -- briefs: the store that replaced fleet_submit's per-call length cap ------------------------
+#
+# A long goal spills to .fleet/briefs/<id>.md instead of being refused (tools.fleet_intake), so a
+# flood of long goals -- including a single sender submitting many -- grows THIS store, and this is
+# what bounds it: by total size and by file count, oldest first, while never deleting a brief a
+# live job still points at or one inside the recent floor.
+
+import json as _json
+
+
+def _brief(tmp_path, name, size=1024, age_days=0.0, now=None):
+    return _touch(str(tmp_path / "briefs" / name), size=size, age_days=age_days, now=now)
+
+
+def _queue_job(tmp_path, sub, jid, brief_path):
+    import os as _os
+    d = tmp_path / "tasks" / sub
+    _os.makedirs(str(d), exist_ok=True)
+    job = {"id": jid, "payload": {"goal": "see brief", "brief": str(brief_path)}}
+    (d / (jid + ".json")).write_text(_json.dumps(job), encoding="utf-8")
+
+
+def test_briefs_within_both_budgets_remove_nothing(tmp_path):
+    now = time.time()
+    for i in range(10):
+        _brief(tmp_path, "b%02d.md" % i, size=1024, age_days=100 - i, now=now)
+    # Defaults (64 MB / 500 files): 10 tiny briefs breach neither budget, so nothing is removed.
+    freed, removed = R.briefs(str(tmp_path), now=now)
+    assert removed == []
+    assert freed == 0
+
+
+def test_a_runaway_of_long_briefs_is_trimmed_to_the_size_budget(tmp_path, monkeypatch):
+    # SIMULATE THE RUNAWAY the old length cap was meant to stop: one sender spills many large
+    # briefs. The store is bounded as a WHOLE, so the oldest go until it is back under budget --
+    # the queue directory is never touched.
+    now = time.time()
+    monkeypatch.setattr(R, "BRIEFS_KEEP_MB", 0.05)      # 50 KB total budget
+    monkeypatch.setattr(R, "BRIEFS_KEEP_MIN", 2)        # keep only the 2 newest as the floor
+    monkeypatch.setattr(R, "BRIEFS_KEEP_DAYS", 0.0)     # no age floor, so old briefs are eligible
+    for i in range(40):
+        _brief(tmp_path, "run%02d.md" % i, size=10 * 1024, age_days=40 - i * 0.5, now=now)
+    freed, removed = R.briefs(str(tmp_path), now=now)
+    left = os.listdir(str(tmp_path / "briefs"))
+    assert freed > 0 and removed, "a runaway briefs store was not trimmed at all"
+    total_left = sum(os.path.getsize(str(tmp_path / "briefs" / n)) for n in left)
+    assert total_left <= int(0.05 * 1024 * 1024)
+    assert len(left) >= 2            # the keep_min newest were never removed
+    assert "run39.md" in left and "run38.md" in left   # newest two are the floor
+
+
+def test_a_brief_a_live_job_points_at_is_never_trimmed(tmp_path, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(R, "BRIEFS_KEEP_MB", 0.0)       # budget of 0: everything eligible is removed
+    monkeypatch.setattr(R, "BRIEFS_KEEP_MIN", 0)        # no count floor
+    monkeypatch.setattr(R, "BRIEFS_KEEP_DAYS", 0.0)     # no age floor
+    pinned = _brief(tmp_path, "pinned.md", size=10 * 1024, age_days=100, now=now)
+    _brief(tmp_path, "free.md", size=10 * 1024, age_days=100, now=now)
+    _queue_job(tmp_path, "pending", "job1", pinned)
+    freed, removed = R.briefs(str(tmp_path), now=now)
+    left = os.listdir(str(tmp_path / "briefs"))
+    assert "pinned.md" in left, "a brief a live job points at was deleted"
+    assert "free.md" not in left, "an unreferenced over-budget brief was not trimmed"
+
+
+def test_briefs_floor_keeps_recent_even_over_budget(tmp_path, monkeypatch):
+    now = time.time()
+    monkeypatch.setattr(R, "BRIEFS_KEEP_MB", 0.0)       # 0 budget: trim everything eligible
+    monkeypatch.setattr(R, "BRIEFS_KEEP_MIN", 0)
+    monkeypatch.setattr(R, "BRIEFS_KEEP_DAYS", 7.0)     # anything newer than a week is kept
+    _brief(tmp_path, "old.md", size=4096, age_days=30, now=now)
+    _brief(tmp_path, "recent.md", size=4096, age_days=1, now=now)
+    freed, removed = R.briefs(str(tmp_path), now=now)
+    left = os.listdir(str(tmp_path / "briefs"))
+    assert "recent.md" in left, "a brief inside the age floor was deleted"
+    assert "old.md" not in left, "an old over-budget brief was kept"
+
+
+def test_no_briefs_directory_is_not_an_error(tmp_path):
+    freed, removed = R.briefs(str(tmp_path), now=time.time())
+    assert (freed, removed) == (0, [])
