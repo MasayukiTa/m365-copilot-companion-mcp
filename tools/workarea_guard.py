@@ -2,7 +2,7 @@
 
 THE PROBLEM THIS MEASURES AND THEN STOPS. Workers (and external clients sharing the same
 token) were creating fresh top-level folders and files directly under the checkout
-(``resonac-mcp``) instead of under the folder a request named or under the per-run work area.
+(the production checkout root) instead of under the folder a request named or under the per-run work area.
 The 2026-10-26 census of ``.fleet/tool_events.jsonl`` over ten days found 114 write-tool
 calls whose path sat directly at the checkout root; the offenders were new untracked names
 like ``secure_desktop``/``audit_fixes_20261022``/``reviews``/``_pr_body.md``, alongside a
@@ -252,7 +252,7 @@ def check_write(path: str) -> None:
     _record(path, seg, enforced, reason)
     if enforced:
         raise PermissionError(
-            "resonac-mcp \u306e\u76f4\u4e0b\u306b\u306f\u65b0\u3057\u3044\u30d5\u30a9\u30eb\u30c0\u30fb\u30d5\u30a1\u30a4\u30eb\u3092\u4f5c\u308c\u307e\u305b\u3093"
+            "\u672c\u756a\u30c1\u30a7\u30c3\u30af\u30a2\u30a6\u30c8\u306e\u76f4\u4e0b\u306b\u306f\u65b0\u3057\u3044\u30d5\u30a9\u30eb\u30c0\u30fb\u30d5\u30a1\u30a4\u30eb\u3092\u4f5c\u308c\u307e\u305b\u3093"
             " (%s)\u3002\u8a31\u3055\u308c\u308b\u5834\u6240: " % path + _allowed_places_text())
 
 

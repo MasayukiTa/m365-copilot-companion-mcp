@@ -16,7 +16,7 @@ def default_work_dir() -> str:
 
     This used to be ``os.getcwd()``, which on this server is the production checkout root --
     so a bare ``open('out.txt','w')`` or ``mkdir foo`` inside a snippet landed a new file or
-    folder directly under ``resonac-mcp``. That is exactly the clutter the placement rule is
+    folder directly under the production checkout root. That is exactly the clutter the placement rule is
     about, and it entered through the one door the file guard cannot see (a subprocess does
     its own ``open`` without passing through ``_validate_path``). Defaulting the cwd to the
     per-run work area under ``%TEMP%\\m365-companion\\agents\\<scope>`` moves those relative
