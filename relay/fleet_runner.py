@@ -1961,6 +1961,12 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # the run started doing its real work. A capture that blocked the main loop for ten
         # minutes on 2026-08-26 went unnoticed for precisely that reason.
         "running": (done < total) or int(queued or 0) > 0,
+        # STILL READING THE COMMAND CHANNEL. Every live sweep writes this True; the one place
+        # it becomes False is _mark_not_accepting_goals, stamped the instant the sweep loop
+        # exits and on_tick/_drain_commands stop running. task_router routes add_goal only
+        # while this is not explicitly False, so a goal that arrives during the post-run
+        # cleanup window goes to autostart instead of into a channel nobody will drain.
+        "accepting_goals": True,
         "paused": bool(paused),        # fleet frozen by the cockpit (pause toggle)
         "max_concurrent": max_concurrent,
         "open_tabs": open_tabs,
@@ -2216,6 +2222,35 @@ def _write_atomic(path, payload):
             if time.time() >= deadline:
                 raise
             time.sleep(0.05)
+
+
+def _mark_not_accepting_goals(status_path):
+    """Stamp the live status.json so the router stops add_goal'ing into a run that has stopped
+    draining its command channel.
+
+    Called the moment the sweep loop exits (run_relay_fleet has returned, so on_tick /
+    _drain_commands will not run again) and BEFORE the long cleanup that ends with running:false.
+    Through that whole window status.json still reads running:True with a fresh mtime, so
+    task_router.fleet_is_live() returns True and a goal submitted here is add_goal'd into a
+    channel nobody will read -- the 2-minute stall this function exists to remove.
+
+    MERGE, DON'T REPLACE: the existing snapshot is loaded and only `accepting_goals` (plus a
+    touched `updated`) is set, so the row the cockpit is reading keeps running / workers / the
+    rest. `updated` is refreshed so the stamp lands inside the FLEET_LIVE_MAX_AGE_S window the
+    router trusts -- a stamp on a file already judged stale would never be read. A missing or
+    unreadable status.json is left alone: there is nothing to stamp, and the router's existing
+    stale/marker logic already handles that case.
+    """
+    try:
+        with open(status_path, encoding="utf-8-sig") as fh:
+            snap = json.load(fh)
+    except Exception:
+        return  # no readable snapshot to stamp; the ack-grace path still covers a lost goal
+    if not isinstance(snap, dict):
+        return
+    snap["accepting_goals"] = False
+    snap["updated"] = time.time()
+    _write_atomic(status_path, snap)
 
 
 # ── RUN-RESUME ledger ──────────────────────────────────────────────────────────
@@ -5246,6 +5281,21 @@ def main():
 
     stop_wd.set()
 
+    # NEW GOALS ARE NO LONGER READ FROM HERE ON. The last turn of run_relay_fleet above was
+    # the last call to on_tick/_drain_commands, so the command channel (commands.d/ add_goal)
+    # has stopped being drained -- but status.json still says running:True and its mtime is
+    # within FLEET_LIVE_MAX_AGE_S, so task_router.fleet_is_live() keeps returning True for the
+    # whole cleanup window below. A goal submitted now would be add_goal'd into a channel this
+    # run will never read again, and sit "dispatched" until the 90s landing-ack grace expires
+    # (measured ~2 min end-to-end). Stamp the status so the router can tell "live" from
+    # "live but no longer accepting goals" and route straight to autostart instead. Best-effort:
+    # the stamp is an optimisation, not the only safety net (the ack grace still catches a lost
+    # goal), so a failed write must never take the clean completion path down.
+    try:
+        _mark_not_accepting_goals(status_path)
+    except Exception as _acc_exc:
+        print("[status] WARN: could not mark accepting_goals=false: %s" % _acc_exc, flush=True)
+
     # Deactivate the autonomy contract so the gate goes INERT after the run.
     try:
         from tools.contract_gate import deactivate_contract
@@ -5347,18 +5397,29 @@ def main():
         if r["reason"]:
             print("       reason: %s" % r["reason"])
 
-    # Printed at the end of the run, because a detector whose output nobody reads is
-    # the defect this repository keeps rediscovering.
-    report_duplicate_completions(args.state_dir)
-
-    # CLEAN COMPLETION: this point is reached whenever the run ends on its own -- goals
-    # ran to a terminal outcome, OR a graceful `stop` command (bench/fleet_ctl.py stop /
-    # the cockpit) cancelled everything and the loop above still exited normally. Either
-    # way nothing is "interrupted" -- clear the ACTIVE marker so a supervisor never
-    # mistakes a normal finish for a crash.
+    # RELEASE THE START LOCK AS SOON AS DURABLE STATE IS SAFE, BEFORE the read-only
+    # end-of-run reporting below. Measured 2026-10-26: a GUI fresh-Start waits on this
+    # same OS lock with --wait-for-state-dir-seconds 60, but report_duplicate_completions
+    # (which reads and reconciles EVERY transcript on disk) kept the lock held for ~1m48s
+    # after status.json already said running:false -- so the waiting coordinator timed out
+    # (exit 3) and the submission never reached the fleet.
+    #
+    # SAFE TO MOVE EARLIER because everything that still mutates durable run-state has
+    # already happened: the final status.json is written (above) and _merge_final_done_map
+    # has committed this chunk's DONE outcomes to last_run_done.json (needed for --resume).
+    # _clear_active_marker only deletes a marker whose recorded pid == THIS pid (ownership
+    # check), so a fresh run that has already written its own marker is never disturbed; a
+    # new coordinator that acquires the lock here finds a consistent, fully-persisted state
+    # dir. report_duplicate_completions / report_status below are read-only and best-effort,
+    # so running them after releasing the lock cannot corrupt a newly started run.
     _clear_active_marker(args.state_dir, owner_pid=os.getpid())
     _release_run_lock(_ACTIVE_RUN_LOCK)
     _ACTIVE_RUN_LOCK = None
+
+    # Printed at the end of the run, because a detector whose output nobody reads is
+    # the defect this repository keeps rediscovering. Read-only; intentionally AFTER the
+    # lock release above so it no longer delays the next coordinator's start.
+    report_duplicate_completions(args.state_dir)
 
 
 if __name__ == "__main__":

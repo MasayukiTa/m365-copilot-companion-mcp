@@ -256,6 +256,65 @@ partial class CockpitWindow
         }
     }
 
+    // ── fresh-start launch timing instrumentation (submit-box-clear-immediately) ──────────
+    // _fleetLaunchPending (declared in FleetCockpit.cs) is raised the moment a fresh run is
+    // spawned and must come back down even if the run is never confirmed; this records WHEN it
+    // went up so WatchFreshFleetLaunch can time it out instead of leaving Start wedged forever.
+    DateTime _fleetLaunchPendingSinceUtc = DateTime.MinValue;
+    // The exact text that was in the composer when the fresh run was spawned. The box is cleared
+    // at spawn now (not at accept), so if the launch fails we put THIS back -- but only if the
+    // operator has not meanwhile typed something new (see SubmitRestoreBox).
+    string _fleetLaunchSubmittedText = "";
+
+    // How long _fleetLaunchPending may stay up without the fresh run being confirmed before we
+    // give up on it. Matched to the runner's own --wait-for-state-dir-seconds 60 (SpawnFleet),
+    // which is the longest the spawned process legitimately takes to write its first snapshot;
+    // a couple of seconds of slack is added so the timeout cannot beat a run that is about to
+    // be accepted.
+    static readonly TimeSpan _freshLaunchConfirmWindow = TimeSpan.FromSeconds(62);
+
+    // Timestamped one-liners to .fleet/submit_timing.jsonl, written the same no-BOM way as
+    // autofix.jsonl/ui_errors.jsonl (File.AppendAllText + NoBomUtf8), so "when did the box
+    // clear" can be measured after the fact. A trace that can break submit is worse than none.
+    void SubmitDbg(string what)
+    {
+        try
+        {
+            string line = "{\"ts\":" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
+                        + ",\"iso\":\"" + DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                        + "\",\"what\":\"" + (what ?? "").Replace("\\", "/").Replace("\"", "'") + "\"}";
+            string path = Path.Combine(Path.GetDirectoryName(ResolvePath(null)), "submit_timing.jsonl");
+            File.AppendAllText(path, line + Environment.NewLine, NoBomUtf8);
+        }
+        catch (Exception) { }
+    }
+
+    // Put the spawned goal text back in the composer after a failed launch WITHOUT clobbering
+    // anything the operator typed in the meantime. Chosen to APPEND (not overwrite) when the box
+    // is non-empty and different: this file already treats _goalInput as operator-owned (the
+    // accept path only clears it when it still equals what was submitted), so silently replacing
+    // freshly typed text would be the one destructive move the rest of the code avoids.
+    void SubmitRestoreBox(string submittedText)
+    {
+        if (string.IsNullOrEmpty(submittedText)) return;
+        string cur = _goalInput == null ? "" : (_goalInput.Text ?? "");
+        if (cur.Length == 0)
+        {
+            if (_goalInput != null) _goalInput.Text = submittedText;
+            SubmitDbg("restore_box_into_empty");
+        }
+        else if (cur.Trim() == submittedText.Trim())
+        {
+            SubmitDbg("restore_box_already_present");   // unchanged since submit: nothing to do
+        }
+        else
+        {
+            // Operator typed new text: keep theirs, append the un-launched goal below it.
+            if (_goalInput != null) _goalInput.Text = cur.TrimEnd() + "\n" + submittedText;
+            SubmitDbg("restore_box_appended_below_new_input");
+        }
+    }
+
     void NoteSubmitted(IEnumerable<string> goals)
     {
         NoteSubmitted(goals, CaptureSubmissionBaseline());
@@ -294,6 +353,7 @@ partial class CockpitWindow
     {
         try
         {
+            SubmitDbg("start_click");
             if (_durableStartPending)
             {
                 _startNote.Text = _lang == 0
@@ -963,43 +1023,91 @@ partial class CockpitWindow
         psi.WorkingDirectory = repo;
         psi.UseShellExecute = false;
         psi.CreateNoWindow = true;
-        // CAPTURE stderr. The whole defect is that a run that fails to start said only its exit
-        // code (or nothing), so the person at the machine was told "could not start" with no
-        // reason -- the traceback went to a redirected pipe nobody read, or to a window that was
-        // never created. Redirect it and drain it on a background handler into a bounded buffer,
-        // so WatchFreshFleetLaunch can put the runner's OWN last words on screen when it dies.
+        // CAPTURE THE COORDINATOR'S STDOUT/STDERR. Two defects are fixed here together:
+        //  - (gui_start) a GUI-launched coordinator that printed "TIMED OUT WAITING TO START"
+        //    and exited 3 left no trace anywhere, so the operator saw a stuck "投入済み" card
+        //    with no way to learn why. Redirect BOTH streams and drain them asynchronously (a
+        //    sync ReadToEnd here would block the UI thread / risk a pipe deadlock) into
+        //    .fleet/gui_start_<time>.log.
+        //  - (refused_ux) a run that fails to start said only its exit code (or nothing), so the
+        //    person at the machine was told "could not start" with no reason. In addition to the
+        //    log file, stderr is drained into a bounded in-memory buffer so WatchFreshFleetLaunch
+        //    can put the runner's OWN last words on screen when it dies.
+        psi.RedirectStandardOutput = true;
         psi.RedirectStandardError = true;
         try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+        string launchLogPath = Path.Combine(stateDir, "gui_start_"
+                             + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + ".log");
         System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
         if (proc == null) return false;
+        // Drain both streams to the log file (gui_start) AND keep stderr's tail in a bounded
+        // in-memory buffer (refused_ux) so the failure reason can also reach the operator's card.
         StringBuilder errBuf = new StringBuilder();
         try
         {
+            var logLock = new object();
+            System.IO.StreamWriter logw = null;
+            try { logw = new System.IO.StreamWriter(launchLogPath, true, new UTF8Encoding(false)); }
+            catch (Exception) { logw = null; }
+            System.Diagnostics.DataReceivedEventHandler sink = delegate (object s2, System.Diagnostics.DataReceivedEventArgs e)
+            {
+                if (e == null || e.Data == null || logw == null) return;
+                try { lock (logLock) { logw.WriteLine(e.Data); logw.Flush(); } } catch (Exception) { }
+            };
+            proc.OutputDataReceived += sink;
             proc.ErrorDataReceived += delegate (object s, System.Diagnostics.DataReceivedEventArgs e)
             {
+                // Log file (via sink) AND the bounded tail buffer: keep only the TAIL, since a
+                // runaway traceback must not grow unbounded in the UI process and the last lines
+                // are the ones that name the failure.
+                sink(s, e);
                 if (e == null || e.Data == null) return;
                 lock (errBuf)
                 {
-                    // Keep only the TAIL: a runaway traceback must not grow unbounded in the UI
-                    // process, and the last lines are the ones that name the failure.
                     if (errBuf.Length < 8000) errBuf.Append(e.Data).Append('\n');
                 }
             };
+            proc.BeginOutputReadLine();
             proc.BeginErrorReadLine();
+            // Close the log writer when the coordinator exits so the handle is not leaked.
+            proc.EnableRaisingEvents = true;
+            proc.Exited += delegate { try { lock (logLock) { if (logw != null) { logw.Flush(); logw.Dispose(); logw = null; } } } catch (Exception) { } };
         }
         catch (Exception) { }
-        // On top of the list NOW, before the new run's first snapshot exists. Every spawn path
-        // comes through here: the composer's StartFleet, a retry or bulk retry with no live run,
-        // and the continue flows (whose lines are {"text":..} objects -- GoalTextOf reads them).
-        NoteSubmitted(goals, submitBaseline);
+        SubmitDbg("spawn_ok waitForClosingRun=" + waitForClosingRun);
+        // WHERE THE "投入済み" CARD IS RAISED.
+        // For the fresh-Start path (waitForClosingRun) the card is NOT raised here: the coordinator
+        // may still time out waiting for the previous run's lock (exit 3) and never accept this
+        // submission, and a card raised at spawn time then stuck forever with no run behind it
+        // (gui_start fix). WatchFreshFleetLaunch raises it the moment the new run is confirmed
+        // accepted, and -- below -- retries or stands down on timeout. The composer box, however,
+        // is emptied NOW on spawn success (ui_submit fix) so the operator is not left staring at
+        // text that looks un-sent; a failed/timed-out launch restores it. Because the card is not
+        // raised yet, the submitted text is surfaced in the start-note (its leading chars) so the
+        // work stays visible to the operator during the "waiting to start" gap.
+        // Non-waiting spawns (retry / bulk retry / continue with no live run) do NOT watch, so
+        // they raise the card now, as before.
         if (waitForClosingRun)
         {
             _fleetLaunchPending = true;
+            _fleetLaunchPendingSinceUtc = DateTime.UtcNow;
+            _fleetLaunchSubmittedText = submittedText ?? "";
+            // Box clears NOW, at spawn success -- not when the fresh run is confirmed. The card is
+            // raised later (at acceptance), so clearing only empties the composer (if it still holds
+            // exactly what we spawned); a failed/timed-out launch restores it.
+            if (_goalInput != null && _goalInput.Text == (submittedText ?? ""))
+            {
+                _goalInput.Text = "";
+                SubmitDbg("box_cleared_at_spawn");
+            }
             WatchFreshFleetLaunch(proc, submitBaseline, goalsFile, submittedText ?? "",
-                                  goals, planMode, errBuf);
+                                  goals, planMode, errBuf, 0);
         }
         else
         {
+            // Non-waiting spawn paths do not watch for acceptance, so the "投入済み" card must be
+            // raised here -- there is no later point that would raise it.
+            NoteSubmitted(goals, submitBaseline);
             try { proc.Dispose(); } catch (Exception) { }
         }
         return true;
@@ -1044,9 +1152,20 @@ partial class CockpitWindow
         return true;
     }
 
+    // Fresh-Start retry budget. The coordinator the GUI launches waits up to 60s
+    // (--wait-for-state-dir-seconds 60) for a closing prior run to release the state-dir
+    // lock; a prior run's cleanup was MEASURED at ~1m48s on 2026-10-26, longer than that 60s,
+    // so the launched coordinator can exit 3 ("TIMED OUT WAITING TO START") through no fault of
+    // the submission. The companion fix shortens the prior run's lock-hold to just after its
+    // final persistence, so one more 60s attempt almost always lands; 2 total attempts bounds
+    // the worst case at ~2 minutes. The 1.5s gap lets the timed-out process fully exit and its
+    // lock clear before the retry spawns.
+    const int FreshLaunchMaxAttempts = 2;
+    static readonly TimeSpan FreshLaunchRetryGap = TimeSpan.FromMilliseconds(1500);
+
     void WatchFreshFleetLaunch(System.Diagnostics.Process proc, SubmissionBaseline baseline,
                                string goalsFile, string submittedText, List<string> goals, bool planMode,
-                               StringBuilder errBuf)
+                               StringBuilder errBuf, int attempt)
     {
         var timer = new System.Windows.Threading.DispatcherTimer();
         timer.Interval = TimeSpan.FromMilliseconds(200);
@@ -1065,7 +1184,13 @@ partial class CockpitWindow
                 {
                     timer.Stop();
                     _fleetLaunchPending = false;
-                    if (_goalInput.Text == submittedText) _goalInput.Text = "";
+                    _fleetLaunchPendingSinceUtc = DateTime.MinValue;
+                    // RAISE THE 投入済み CARD NOW -- the new run is confirmed accepted. Raising it at
+                    // spawn time (as before) left a stuck card when the coordinator timed out waiting
+                    // for the prior run's lock and never accepted this work (gui_start fix).
+                    NoteSubmitted(goals, baseline);
+                    // Box was already emptied at spawn success (ui_submit fix); nothing to clear here.
+                    SubmitDbg("accepted goals=" + goals.Count);
                     try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
                     if (_startNote != null)
                         _startNote.Text = (_lang == 0 ? "開始しました（" : "Started (") + goals.Count
@@ -1080,7 +1205,27 @@ partial class CockpitWindow
                 }
 
                 proc.Refresh();
-                if (!proc.HasExited) return;
+                if (!proc.HasExited)
+                {
+                    // Neither confirmed nor exited. Bound the wait so _fleetLaunchPending cannot stay
+                    // raised forever (ui_submit fix): past the confirm window, stand down and restore.
+                    if (_fleetLaunchPendingSinceUtc != DateTime.MinValue
+                        && (DateTime.UtcNow - _fleetLaunchPendingSinceUtc) > _freshLaunchConfirmWindow)
+                    {
+                        timer.Stop();
+                        _fleetLaunchPending = false;
+                        _fleetLaunchPendingSinceUtc = DateTime.MinValue;
+                        SubmitDbg("timeout_unconfirmed");
+                        try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                        SubmitRestoreBox(submittedText);
+                        if (_startNote != null)
+                            _startNote.Text = _lang == 0
+                                ? "起動を確認できませんでした。入力は戻しました。"
+                                : "Could not confirm the launch; your input was restored.";
+                        try { proc.Dispose(); } catch (Exception) { }
+                    }
+                    return;
+                }
                 if (exitSeenAt == DateTime.MinValue)
                 {
                     exitSeenAt = DateTime.UtcNow;
@@ -1089,17 +1234,58 @@ partial class CockpitWindow
                 if ((DateTime.UtcNow - exitSeenAt).TotalSeconds < 2.0) return;
 
                 timer.Stop();
-                _fleetLaunchPending = false;
                 int code = -1;
                 try { code = proc.ExitCode; } catch (Exception) { }
+                try { proc.Dispose(); } catch (Exception) { }
+                SubmitDbg("spawn_exited_early code=" + code);
+
+                // EXIT 3 == "TIMED OUT WAITING TO START": the prior run had not released the state-dir
+                // lock within the coordinator's 60s wait. The submission was never accepted and no card
+                // was raised, so retrying the SAME goals is safe. Retry up to the budget (gui_start fix).
+                if (code == 3 && attempt + 1 < FreshLaunchMaxAttempts)
+                {
+                    try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
+                    if (_startNote != null)
+                        _startNote.Text = (_lang == 0
+                            ? "前の実行の後片付けを待っています。もう一度開始を試みます…"
+                            : "Previous run is still closing; retrying the start...");
+                    var retry = new System.Windows.Threading.DispatcherTimer();
+                    retry.Interval = FreshLaunchRetryGap;
+                    retry.Tick += delegate
+                    {
+                        retry.Stop();
+                        string freshFile = "fresh_start_" + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString()
+                                         + "_" + Guid.NewGuid().ToString("N").Substring(0, 8) + ".jsonl";
+                        if (!SpawnFleetRetry(goals, freshFile, planMode, submittedText, baseline, attempt + 1))
+                        {
+                            _fleetLaunchPending = false;
+                            _fleetLaunchPendingSinceUtc = DateTime.MinValue;
+                            SubmitRestoreBox(submittedText);
+                            if (_startNote != null)
+                                _startNote.Text = (_lang == 0
+                                    ? "新しい実行を開始できませんでした。入力は戻しました。"
+                                    : "Could not start the new run; your input was restored.");
+                        }
+                    };
+                    retry.Start();
+                    return;
+                }
+
+                // Out of retries (or a non-timeout failure): stand down. The box was emptied at spawn,
+                // so restore the operator's text (ui_submit fix) and say so.
+                _fleetLaunchPending = false;
+                _fleetLaunchPendingSinceUtc = DateTime.MinValue;
                 try { if (File.Exists(goalsFile)) File.Delete(goalsFile); } catch (Exception) { }
-                // The reason, not just the number. StartFailureReason returns the runner's last
-                // stderr line (empty if it was silent); append it so the person sees WHY.
+                // The box was emptied at spawn (ui_submit fix), so restore the operator's text
+                // (gui_start fix), then show the exit code AND the reason: StartFailureReason
+                // returns the runner's last stderr line (empty if it was silent), appended so the
+                // person sees WHY, not just the number (refused_ux fix).
+                SubmitRestoreBox(submittedText);
                 string why = StartFailureReason(errBuf);
                 if (_startNote != null)
                     _startNote.Text = (_lang == 0
-                        ? "新しい実行を開始できませんでした。入力は残しています。終了コード "
-                        : "Could not start the new run; your input was kept. Exit code ")
+                        ? "新しい実行を開始できませんでした。入力は戻しました。終了コード "
+                        : "Could not start the new run; your input was restored. Exit code ")
                         + code
                         + (why.Length > 0 ? (_lang == 0 ? "。理由: " : ". Reason: ") + why : "");
                 try { proc.Dispose(); } catch (Exception) { }
@@ -1108,15 +1294,91 @@ partial class CockpitWindow
             {
                 timer.Stop();
                 _fleetLaunchPending = false;
+                _fleetLaunchPendingSinceUtc = DateTime.MinValue;
+                SubmitDbg("confirm_failed " + ex.GetType().Name);
+                SubmitRestoreBox(submittedText);
                 if (_startNote != null)
                     _startNote.Text = (_lang == 0
-                        ? "新しい実行の開始確認に失敗しました。入力は残しています。 "
-                        : "Could not confirm the new run start; your input was kept. ")
+                        ? "新しい実行の開始確認に失敗しました。入力は戻しました。 "
+                        : "Could not confirm the new run start; your input was restored. ")
                         + ex.Message;
                 try { proc.Dispose(); } catch (Exception) { }
             }
         };
         timer.Start();
+    }
+
+    // The retry arm of the fresh-Start path. Mirrors the spawn block inside SpawnFleet's
+    // waitForClosingRun branch, but re-enters WatchFreshFleetLaunch carrying the incremented
+    // attempt count and the ORIGINAL baseline, so the card still lands against the right
+    // pre-submission snapshot. Kept separate so the primary SpawnFleet signature is unchanged.
+    bool SpawnFleetRetry(List<string> goals, string goalsFileName, bool planMode,
+                         string submittedText, SubmissionBaseline baseline, int attempt)
+    {
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            string stateDir = Path.GetDirectoryName(_statusPath);
+            string goalsFile = Path.Combine(stateDir, goalsFileName);
+            File.WriteAllText(goalsFile, GoalsToJsonl(goals), new UTF8Encoding(false));
+
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
+                            + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+            if (planMode) psi.Arguments += " --plan";
+            psi.Arguments += " --wait-for-state-dir-seconds 60";
+            psi.Arguments += _fanout ? " --fanout" : " --no-fanout";
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            psi.RedirectStandardOutput = true;
+            psi.RedirectStandardError = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            string launchLogPath = Path.Combine(stateDir, "gui_start_"
+                                 + DateTimeOffset.UtcNow.ToUnixTimeMilliseconds().ToString() + ".log");
+            System.Diagnostics.Process proc = System.Diagnostics.Process.Start(psi);
+            if (proc == null) return false;
+            // Same dual drain as the primary spawn path: both streams to the log file (gui_start)
+            // and stderr's tail into a bounded buffer (refused_ux) so a retry that also fails can
+            // still name WHY on the operator's card.
+            StringBuilder errBuf = new StringBuilder();
+            try
+            {
+                var logLock = new object();
+                System.IO.StreamWriter logw = null;
+                try { logw = new System.IO.StreamWriter(launchLogPath, true, new UTF8Encoding(false)); }
+                catch (Exception) { logw = null; }
+                System.Diagnostics.DataReceivedEventHandler sink = delegate (object s2, System.Diagnostics.DataReceivedEventArgs e)
+                {
+                    if (e == null || e.Data == null || logw == null) return;
+                    try { lock (logLock) { logw.WriteLine(e.Data); logw.Flush(); } } catch (Exception) { }
+                };
+                proc.OutputDataReceived += sink;
+                proc.ErrorDataReceived += delegate (object s, System.Diagnostics.DataReceivedEventArgs e)
+                {
+                    sink(s, e);
+                    if (e == null || e.Data == null) return;
+                    lock (errBuf)
+                    {
+                        if (errBuf.Length < 8000) errBuf.Append(e.Data).Append('\n');
+                    }
+                };
+                proc.BeginOutputReadLine();
+                proc.BeginErrorReadLine();
+                proc.EnableRaisingEvents = true;
+                proc.Exited += delegate { try { lock (logLock) { if (logw != null) { logw.Flush(); logw.Dispose(); logw = null; } } } catch (Exception) { } };
+            }
+            catch (Exception) { }
+            _fleetLaunchPending = true;
+            _fleetLaunchPendingSinceUtc = DateTime.UtcNow;
+            _fleetLaunchSubmittedText = submittedText ?? "";
+            WatchFreshFleetLaunch(proc, baseline, goalsFile, submittedText ?? "", goals, planMode, errBuf, attempt);
+            return true;
+        }
+        catch (Exception) { return false; }
     }
 
     // Render a goals list as the JSONL text SpawnFleet writes to its goals-file: one JSON object
