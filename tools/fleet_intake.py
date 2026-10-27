@@ -180,6 +180,16 @@ def _consumer_sentence() -> str:
 #: DUP_SIMILARITY -- so this is belt, not braces, but the reasoning is the same reasoning either
 #: way: digits are the signal that keeps near-identical-by-construction goals apart.)
 _DUP_WORD = re.compile(r"[A-Za-z]{3,}|[0-9]+|[一-鿿]{2,}|[゠-ヿ]{2,}")
+
+#: A goal's IDENTIFIERS: maximal runs of Latin letters/digits, keeping internal . _ / - so a
+#: filename (sales.csv), a version (v2, beta.12) or a path stays one token. Unlike _DUP_WORD this
+#: KEEPS one- and two-letter runs, because a single letter is often the ONE thing that tells two
+#: short human requests apart -- "ファイルAを解析" vs "ファイルBを解析" differ only in A vs B, and
+#: _DUP_WORD's three-letter floor drops both, leaving two goals that look word-for-word identical.
+#: Used only to ask "do these two goals name DIFFERENT specific things"; it does not feed the
+#: Jaccard measure (that stays on _dup_words, where the floor keeps stray short fragments from
+#: being counted as shared vocabulary).
+_DUP_IDENT = re.compile(r"[A-Za-z0-9]+(?:[._/-][A-Za-z0-9]+)*")
 _DUP_STOPWORDS = frozenset(
     "the and for with from this that you your please into out all any are was were have "
     "has had not but its use using can will should".split())
@@ -197,10 +207,48 @@ _DUP_STOPWORDS = frozenset(
 #: really is new -- cheap next to the failure mode this exists to close.
 DUP_SIMILARITY = 0.5
 
+#: OWNER ORDER 2026-10-26: refusing a goal at the door on word overlap is OFF by default.
+#: 177 measured refusals (144 of them goals under 200 characters) stopped DIFFERENT work -- two
+#: short goals sharing a verb, or two unrelated coding goals sharing one appended block of common
+#: rules -- and that was the single biggest source of a person being turned away at the door. The
+#: owner's decision is that near-duplicates are NORMALISED IN THE BACKGROUND (a note on the job and
+#: one line in .fleet/dup_notes.jsonl), not refused in front of the person. The whole similarity
+#: machinery below is kept, because it is still exactly what the background note needs; it simply no
+#: longer gates admission. The old refusing behaviour can be restored per-machine with the
+#: `fleet_submit_dup_guard=on` setting (see tools/settings_keys.py), for an operator who wants it
+#: back; absent or anything but `on` is off.
+DUP_GUARD_ENABLED = False
+
 #: Same floor and same reason as skill_lessons.MIN_WORDS: below this many content words, overlap
 #: is not evidence either way, and a short goal ("do a thing", used throughout this file's own
 #: tests) must never be compared at all rather than compared unreliably.
 DUP_MIN_WORDS = 4
+
+#: MEASURED 2026-10-26 on the owner's two real refused goals (goal1.txt, goal2.txt). Two
+#: UNRELATED coding requests -- a desktop chat-switch bug fix, and a post-quantum config
+#: migration -- were each rejected as near-duplicates of the other. The cause was not the
+#: threshold: measured on those two goals, whole-goal Jaccard of content words was 0.539, just
+#: over DUP_SIMILARITY, and 0.515-0.55 is the band the incident report quotes. But the two goals
+#: END with the SAME long shared "common rules" paragraph (anchored at "共通の守ること"): 212
+#: trailing tokens are IDENTICAL on both sides. Of the 152 content words the two goals shared,
+#: 107 -- 70.4% -- appear only inside that boilerplate tail and in neither goal's own head. Strip
+#: the shared tail and compare the goals' OWN text (the request title and body before it) and the
+#: similarity falls to 0.15 -- plainly different work. So the fix is not to move DUP_SIMILARITY (which
+#: still has to catch a real paraphrase) but to stop a paragraph that is identical ACROSS
+#: submissions from counting as evidence that two goals are the same job. _goal_specific_words
+#: below removes, for each PAIR, the longest run of trailing tokens the two goals share verbatim,
+#: and _duplicate_of compares what is left. A true resubmission (same text, a few words reworded,
+#: words reordered) keeps almost all of its OWN words in common, so it still clears the bar; two
+#: different jobs that merely carry the same appended rules no longer do.
+#:
+#: Tokens, not the word-SET, because the shared tail has to be found as a contiguous block at the
+#: end -- a set cannot tell where the boilerplate begins. Case-folded, whitespace already
+#: collapsed by fleet_submit. Only the TAIL is stripped (common rules are appended, never
+#: prepended), so a goal that happens to open with a stock sentence is untouched.
+#: Below this many goal-specific words survive the strip, the stripped comparison is not trusted
+#: and the whole-goal similarity is used instead -- the same "too little to judge on" floor as
+#: DUP_MIN_WORDS, applied to the residue.
+DUP_SPECIFIC_MIN_WORDS = 4
 
 #: relay_fleet.TERMINAL, copied rather than imported. relay_fleet.py is the live fleet loop -- a
 #: run is live on this machine while this file is edited -- and importing it here would pull that
@@ -221,6 +269,76 @@ def _dup_similarity(a, b):
     if not a or not b:
         return 0.0
     return len(a & b) / float(len(a | b))
+
+
+def _dup_tokens(text):
+    """The content words of `text` IN ORDER, lower-cased, stopwords kept.
+
+    _dup_words returns a SET (what two goals share); this returns the SEQUENCE, which is what
+    is needed to find the shared block at the end. Stopwords are NOT dropped here: the shared
+    'common rules' tail is matched verbatim token-for-token, and dropping stopwords first would
+    let two tails that differ only in a stopword still look identical, stripping more than the
+    two goals actually share.
+    """
+    return [w.lower() for w in _DUP_WORD.findall(text or "")]
+
+
+def _shared_tail_len(ta, tb):
+    """How many tokens at the END of `ta` and `tb` are identical, compared from the back.
+
+    This is the appended shared paragraph ('common rules'): the owner's two refused goals end
+    with 115 identical content tokens. Returns 0 when the goals do not share a tail.
+    """
+    n = 0
+    la, lb = len(ta), len(tb)
+    while n < la and n < lb and ta[la - 1 - n] == tb[lb - 1 - n]:
+        n += 1
+    return n
+
+
+def _goal_specific_words(text, other):
+    """The content-word SET of `text` with the tail it shares VERBATIM with `other` removed.
+
+    The pair is compared, not one goal in isolation, because 'which trailing block is shared'
+    is only defined relative to the other goal in the comparison -- there is no global list of
+    boilerplate to subtract, and inventing one (a hard-coded '共通の守ること' marker, a length
+    cutoff) would be the kind of ungrounded constant this change is meant to avoid. The shared
+    tail is found per pair, from the real text, every time.
+
+    Returns (specific_word_set, specific_token_count). When the two goals share no tail the
+    result is just _dup_words(text); when one goal is entirely a tail of the other (a true
+    resubmission) almost nothing is removed, because the SHARED block is only the part that is
+    identical token-for-token from the end -- a reworded body stops the match as soon as the
+    first differing token is reached.
+    """
+    ta = _dup_tokens(text)
+    tb = _dup_tokens(other)
+    tail = _shared_tail_len(ta, tb)
+    head = ta[: len(ta) - tail] if tail else ta
+    words = {w for w in head} - _DUP_STOPWORDS
+    return words, len(words)
+
+
+def _goal_specific_identifiers(text, other):
+    """The identifiers `text` carries that are NOT part of the tail it shares verbatim with
+    `other` -- the SPECIFIC things this goal names, with the appended common-rules paragraph
+    (which names git, diff, sharepoint, ... in EVERY goal that carries it) subtracted.
+
+    Same shared-tail removal as _goal_specific_words, but on identifiers (_DUP_IDENT, which
+    keeps one- and two-letter runs) rather than content words. The tail's identifiers are found
+    from the shared trailing tokens and removed, so two unrelated goals that merely append the
+    same rules do not look as though they name the same things. Returns a set.
+    """
+    all_ids = {m.lower() for m in _DUP_IDENT.findall(text or "")}
+    ta = _dup_tokens(text)
+    tb = _dup_tokens(other)
+    tail = _shared_tail_len(ta, tb)
+    if tail:
+        tail_ids = {m.lower()
+                    for tok in ta[len(ta) - tail:]
+                    for m in _DUP_IDENT.findall(tok)}
+        all_ids -= tail_ids
+    return all_ids
 
 
 def _job_dicts(sub):
@@ -317,19 +435,124 @@ def _in_flight_goals():
 def _duplicate_of(text: str):
     """The (job_id, similarity) of the closest in-flight goal, or None if nothing clears
     DUP_SIMILARITY. `text` is the ALREADY-NORMALISED goal (whitespace collapsed) fleet_submit
-    is about to queue."""
-    words = _dup_words(text)
-    if len(words) < DUP_MIN_WORDS:
+    is about to queue.
+
+    The comparison is made on each PAIR's goal-SPECIFIC words -- the content words left after
+    the longest run of trailing tokens the two goals share verbatim is removed (see
+    _goal_specific_words). That stops a long 'common rules' paragraph, appended identically to
+    many unrelated submissions, from counting as evidence that two goals are the same job: the
+    owner's two real refused goals (goal1.txt, goal2.txt) share 212 trailing tokens, and their
+    whole-goal Jaccard of 0.539 cleared the old bar even though their OWN text (title and body
+    before the shared tail) has a Jaccard of only 0.15. A true resubmission (same text, a few
+    words reworded or reordered) keeps almost all of its OWN words, so it still clears the bar.
+
+    When stripping the shared tail leaves either side with fewer than DUP_SPECIFIC_MIN_WORDS
+    goal-specific words, the residue is too small to judge on, so the whole-goal similarity
+    (_dup_words) is used for that pair instead -- the same 'too little to judge' floor as
+    DUP_MIN_WORDS, applied to the residue. That keeps a short goal that is almost entirely a
+    shared tail from slipping through on an empty head.
+    """
+    whole = _dup_words(text)
+    if len(whole) < DUP_MIN_WORDS:
         return None
     best = None
     for jid, existing in _in_flight_goals():
         w = _dup_words(existing)
         if len(w) < DUP_MIN_WORDS:
             continue
-        sim = _dup_similarity(words, w)
+        # DIFFERENT SPECIFIC THINGS -> different work, whatever the word overlap. A short human
+        # request ('ファイルAを解析して' vs 'ファイルBを解析して', 'sales.csv を...' vs
+        # 'orders.csv を...') is mostly shared verb-and-template vocabulary; the ONE token that
+        # distinguishes the jobs is the name/number/path/filename. _dup_words drops the one- and
+        # two-letter runs that carry that distinction (its three-letter floor exists to keep the
+        # Jaccard measure clean), so measured on content words alone the two goals score 1.0 and
+        # the second is refused as a resend of the first. So before the word measure: if BOTH
+        # goals name identifiers of their OWN (outside the shared common-rules tail) and share
+        # NONE of them, they are about different things and this is not a duplicate. A real
+        # resend keeps the same identifiers (or names none), so it is unaffected and still
+        # caught below. The tail is stripped first so the git/diff/sharepoint tokens that appear
+        # in every goal carrying the same appended rules are not mistaken for shared specifics.
+        id_a = _goal_specific_identifiers(text, existing)
+        id_b = _goal_specific_identifiers(existing, text)
+        if id_a and id_b and not (id_a & id_b):
+            continue
+        spec_a, na = _goal_specific_words(text, existing)
+        spec_b, nb = _goal_specific_words(existing, text)
+        if na >= DUP_SPECIFIC_MIN_WORDS and nb >= DUP_SPECIFIC_MIN_WORDS:
+            sim = _dup_similarity(spec_a, spec_b)
+        else:
+            # The shared tail ate almost everything -- on this pair the only thing left to
+            # compare IS the overlap, so fall back to the whole-goal measure rather than
+            # judging on a handful of residual words (or an empty set, which scores 0 and
+            # would wave a genuine resubmission straight through).
+            sim = _dup_similarity(whole, w)
         if sim >= DUP_SIMILARITY and (best is None or sim > best[1]):
             best = (jid, sim)
     return best
+
+
+#: off|on. When on, a near-duplicate is REFUSED at the door exactly as before (the old behaviour,
+#: kept for an operator who wants it). When off (the default, DUP_GUARD_ENABLED is False), a
+#: near-duplicate is ACCEPTED and recorded in the background. Read fresh on every submission, like
+#: tools/approval_policy.current_approval_mode, so turning it on takes effect on the next call with
+#: no restart. Tests set it directly by patching this function so the admission decision is tested
+#: in isolation from settings-file parsing.
+_DUP_GUARD_SETTING = "fleet_submit_dup_guard"
+
+
+def _dup_guard_on() -> bool:
+    """Whether the word-overlap guard REFUSES a near-duplicate right now.
+
+    DUP_GUARD_ENABLED is the compiled default (False -- the owner's 2026-10-26 order). The
+    `fleet_submit_dup_guard` setting can turn it back on per-machine: an explicit `on` in the one
+    settings file restores the old refusal; absent, unreadable, or anything but `on` leaves it off.
+    Read at each call so a change lands on the next submission with no restart, and swallow any
+    read error to off -- the door must never fail because a settings file could not be read.
+    """
+    try:
+        from tools import settings_path as SP
+        raw = SP.read_key(SP.settings_file(), _DUP_GUARD_SETTING)
+        if raw is not None:
+            return raw.strip().lower() == "on"
+    except Exception:
+        pass
+    return bool(DUP_GUARD_ENABLED)
+
+
+def _note_possible_duplicate(new_jid: str, dup_jid: str, similarity: float, text: str) -> None:
+    """Record, in the background, that `new_jid` resembles the in-flight `dup_jid` -- the
+    replacement for refusing the person at the door.
+
+    Appends one line to .fleet/dup_notes.jsonl: the time, the new job id, the one it resembles,
+    the similarity, and the first 80 characters of the goal (same head rule and same address
+    redaction as the refusal log, so a note never carries an address or a goal body). The job's
+    own payload is tagged separately by fleet_submit (possible_duplicate_of / similarity) so a
+    reader of the queue sees it without opening this log.
+
+    NEVER RAISES, and never fails the submission: a dup note is an after-the-fact record, and the
+    owner's order is that a near-duplicate is ACCEPTED. A write failure here is written to
+    .fleet/dup_notes_errors.log and swallowed -- the exception is recorded, not re-raised and not
+    silently dropped, so a broken note leaves a trail without ever turning into a second gate.
+    """
+    try:
+        from tools import obs_log
+        obs_log.append("dup_notes.jsonl", {
+            "new": str(new_jid),
+            "possible_duplicate_of": str(dup_jid),
+            "similarity": round(float(similarity), 4),
+            "goal_head": obs_log.head(text, 80),
+        })
+    except Exception as exc:
+        try:
+            from tools import obs_log
+            import time as _time
+            path = os.path.join(obs_log._state_dir(), "dup_notes_errors.log")
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("%s %s: %s\n" % (_time.strftime("%Y-%m-%dT%H:%M:%S"),
+                                          type(exc).__name__, exc))
+        except Exception:
+            pass
 
 
 def _log_refusal(reason: str, text: str, source: str, similar_to: str = "") -> None:
@@ -379,18 +602,27 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
             "Repair/publish the LOCAL_LOOP Agent Instructions instead of routing RUN/control "
             "messages back into Fleet.]"
         )
-    # A CONTINUATION IS EXEMPT FROM THE DUPLICATE CHECK. resume_conv names an existing
-    # conversation this goal is meant to CONTINUE, and a follow-up is deliberately short and
-    # terse ("write the changelog", "now do the other half") -- exactly the shape _duplicate_of
-    # reads as the resubmission of something already in flight. Refusing it is the specific way
-    # a continuation stopped being a continuation: the terse second turn was rejected as a
-    # near-duplicate of the first, and the conversation it was meant to resume was never
-    # answered. So a goal that carries resume_conv skips the overlap test entirely; the worker
-    # keeps the conversation apart by its id, which is what the overlap heuristic was standing
-    # in for.
+    # NEAR-DUPLICATE, with two gates layered (both #293 and #294 survive here):
+    #
+    #   * A CONTINUATION IS EXEMPT ENTIRELY (#294). resume_conv names an existing conversation
+    #     this goal is meant to CONTINUE, and a follow-up is deliberately short and terse
+    #     ("write the changelog", "now do the other half") -- exactly the shape _duplicate_of
+    #     reads as a resubmission of something already in flight. Refusing it is the specific
+    #     way a continuation stopped being a continuation: the terse second turn was rejected
+    #     as a near-duplicate of the first, and the conversation it meant to resume was never
+    #     answered. So a goal carrying resume_conv skips the duplicate machinery altogether --
+    #     no match is computed, no tag is written -- and dup stays None so the tag/dup-note
+    #     block below is a no-op for it. The worker keeps the conversation apart by its id,
+    #     which is what the overlap heuristic was standing in for.
+    #
+    #   * OTHERWISE, refuse ONLY when the guard is explicitly on; else accept and record in the
+    #     background (owner order 2026-10-26, #293). _duplicate_of still runs when the guard is
+    #     off, because its answer is what the background note needs -- it just no longer gates
+    #     admission.
+    dup = None
     if not resume_conv:
         dup = _duplicate_of(text)
-        if dup is not None:
+        if dup is not None and _dup_guard_on():
             dup_jid, sim = dup
             _log_refusal("similar", text, source, similar_to=dup_jid)
             return ("[fleet_submit: refused -- this reads as the goal already queued or running "
@@ -427,6 +659,14 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         # into the queue instead of being lost at the door.
         "origin": {"via": "mcp", "source": _clean(source or "agent", MAX_SOURCE_CHARS)},
     }
+    # ACCEPTED-BUT-SIMILAR: tag the job itself so a reader of the queue sees the resemblance
+    # without opening the dup-notes log. Only set when a near-duplicate was found AND it was not
+    # refused (guard off); a refused one never reaches here. The dup-notes line is written AFTER
+    # the job is safely on disk, so a failed note never leaves a tagged job the log does not
+    # mention, and a failed write never produces an orphan note.
+    if dup is not None:
+        job["payload"]["possible_duplicate_of"] = dup[0]
+        job["payload"]["similarity"] = round(float(dup[1]), 4)
     try:
         TR.ensure_dirs()
         path = os.path.join(TR.TASKS, "pending", "%s.json" % jid)
@@ -437,6 +677,9 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     except Exception as exc:
         _log_refusal("other", text, source)
         return "[fleet_submit: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
+
+    if dup is not None:
+        _note_possible_duplicate(jid, dup[0], dup[1], text)
 
     # COUNTED AFTER THE WRITE, NOT BEFORE. Four devices submitting at the same instant each
     # read the queue before any of them had written, so all four were told "1 job waiting"

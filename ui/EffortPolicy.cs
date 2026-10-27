@@ -1169,6 +1169,56 @@ public static class ResidentToolsView
     }
 }
 
+// The host-tunnel-for-external-clients selector's words and parsing, WPF-free. The Python side
+// decides: scripts/supervisor.ps1 asks relay/code_staleness.py host_tunnel_for_external_clients_setting
+// (on|off, default on) every supervisor cycle. on: a Dev Tunnel is hosted and watched even on the
+// connector-less route, because an external client (not a fleet agent) reaches the local server
+// through it. off: the old behaviour, a connector-less route hosts no tunnel. A tunnel already
+// running is never killed either way.
+public static class HostTunnelExternalView
+{
+    //: must equal tools/settings_keys.py and relay/code_staleness.py KEY / DEFAULT / MODES.
+    public const string Key = "host_tunnel_for_external_clients";
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one host_tunnel_for_external_clients= line; null when the line is
+    /// not that key or the value is not off|on (the caller keeps its value, on). A byte order mark
+    /// is tolerated and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "外部クライアント用トンネルの常時ホスト" : "Host a tunnel for external clients"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ(コネクタ経路のときだけ)" : "Off (only on the connector route)";
+        if (mode == "on") return ja ? "オン(経路に関わらず)" : "On (whatever the route)";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "エージェント自身のツール経路(コネクタ有/無)とは別に、外部のクライアント(別のセッションなど)がこのPCのローカルサーバーへ Dev Tunnel 経由で接続するためのホストを、常に維持するかどうかです。オンだと、コネクタなし経路でもスーパーバイザーがトンネルをホストし監視します。オフだと旧来の挙動(コネクタなし経路ではトンネルを立てない)に戻ります。既にあるトンネルはどちらでも止めません。"
+                  : "Whether to keep hosting a Dev Tunnel so an external client (a separate session, say) can reach this PC's local server, independently of the route the agent itself uses for tools. On: the supervisor hosts and watches the tunnel even on the connector-less route. Off: the old behaviour, a connector-less route hosts no tunnel. A tunnel already running is left alone either way.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次のスーパーバイザー周期で反映。再起動不要。"
+                  : "Applies on the next supervisor cycle, no restart.";
+    }
+}
+
 // The read-only result-cache selector's words and parsing, WPF-free. The Python side decides:
 // relay/result_cache.py reads `result_cache` at every read-only tool call and, for `shadow`,
 // records beside the real call whether a cache would have served the same answer and the time it
@@ -1816,5 +1866,58 @@ public static class OrgAbView
     {
         return ja ? "次の実行から有効(実行中のものは変わりません)。"
                   : "Applies from the next run; a run in progress keeps its mode.";
+    }
+}
+
+// The continue-turn recovery selector's words and parsing, WPF-free. The Python side decides:
+// relay/continue_recovery.py reads `socket_continue_recovery` at every send on the socket route and
+// every retry decision (each_gate). The DEFAULT is ON when no line is present
+// (relay/continue_recovery.DEFAULT). An explicit on/off line always wins. on:
+// for connector-less repository work, a turn cut after unknown delivery is continued in the SAME
+// conversation instead of ending STUCK -- it checks the conversation still holds its history,
+// re-quotes the results of calls this process already ran, and never runs the same call twice.
+public static class ContinueRecoveryView
+{
+    //: must equal tools/settings_keys.py and relay/continue_recovery.py KEY / DEFAULT.
+    public const string Key = "socket_continue_recovery";
+    //: The default when no line is present, matching relay/continue_recovery.py DEFAULT and
+    //: SK.default("socket_continue_recovery"). A test pins this to both.
+    public const string Default = "on";
+
+    public static readonly string[] Modes = { "off", "on" };
+
+    public static bool IsMode(string v) { return v == "off" || v == "on"; }
+
+    /// <summary>The mode named by one socket_continue_recovery= line; null when the line is not that
+    /// key or the value is not off|on (the caller keeps its value). A byte order mark is tolerated
+    /// and the value is case-insensitive, as in Python.</summary>
+    public static string ParseLine(string line)
+    {
+        if (line == null) return null;
+        string ln = line.TrimStart('\uFEFF').Trim();
+        if (!ln.StartsWith(Key + "=", StringComparison.Ordinal)) return null;
+        string v = ln.Substring(Key.Length + 1).Trim().ToLowerInvariant();
+        return IsMode(v) ? v : null;
+    }
+
+    public static string Label(bool ja) { return ja ? "続きのターンによる回復" : "Continue-turn recovery"; }
+
+    public static string ModeLabel(string mode, bool ja)
+    {
+        if (mode == "off") return ja ? "オフ" : "Off";
+        if (mode == "on") return ja ? "オン" : "On";
+        return mode ?? "";
+    }
+
+    public static string Help(bool ja)
+    {
+        return ja ? "オン(既定)=コネクタなし経路で、接続が切れて届いたか分からないまま止まったリポジトリ作業を、同じ会話の続きのターンで回復します。会話が履歴を保っているか確認し、このPCで実行済みの呼び出しの結果を再掲し、同じ呼び出しを二度実行しません。オフ=従来どおりその作業はSTUCKで終わります。"
+                  : "On (default) recovers, on the connector-less route, repository work cut after unknown delivery by sending a continue turn in the SAME conversation. It checks the conversation still holds its history, re-quotes the results of calls this PC already ran, and never runs the same call twice. Off: such work ends STUCK, as before.";
+    }
+
+    public static string TakeEffectTip(bool ja)
+    {
+        return ja ? "次に送るターン/再試行の判断から有効。再起動不要。実行中の会話は始めた状態のまま続きます。"
+                  : "Applies to the next send or retry decision, no restart. Conversations already running keep what they started with.";
     }
 }

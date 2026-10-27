@@ -239,6 +239,11 @@ partial class CockpitWindow
                     string rtv = ResidentToolsView.ParseLine(ln);   // off|on only; junk keeps the value
                     if (rtv != null) _rtVal = rtv;
                 }
+                else if (ln.StartsWith("socket_continue_recovery="))
+                {
+                    string crv = ContinueRecoveryView.ParseLine(ln);   // off|on only; junk keeps the value
+                    if (crv != null) _crVal = crv;
+                }
                 else if (ln.StartsWith("tool_transport="))
                 {
                     string trv = ToolRouteView.ParseLine(ln);   // connector|connector-less (bridge = old spelling); junk keeps the value
