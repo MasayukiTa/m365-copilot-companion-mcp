@@ -269,6 +269,7 @@ partial class CockpitWindow
             case "fleet_auto_resume":
             case "rate_ceiling_rpm":
             case "supervisor_self_restart":
+            case "host_tunnel_for_external_clients":
             case "job_approval_mode":
             case "fanout_write_scope":
             case "fanout_load_routing":

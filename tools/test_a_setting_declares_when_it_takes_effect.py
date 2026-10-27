@@ -155,6 +155,13 @@ def _reader_auto_resume():
 def _reader_supervisor_self_restart():
     from relay.code_staleness import self_restart_setting
     return self_restart_setting()
+
+
+def _reader_host_tunnel_for_external_clients():
+    from relay.code_staleness import host_tunnel_for_external_clients_setting
+    return host_tunnel_for_external_clients_setting()
+
+
 def _reader_tool_probe_idle_min():
     from tools.tool_probe import idle_min_setting
     return idle_min_setting()
@@ -218,6 +225,7 @@ _LIVE_READERS = {
     "org_ab": (_reader_org_ab, "shadow", "off"),
     "fleet_auto_resume": (_reader_auto_resume, "off", "on"),
     "supervisor_self_restart": (_reader_supervisor_self_restart, "off", "on"),
+    "host_tunnel_for_external_clients": (_reader_host_tunnel_for_external_clients, "off", "on"),
     "tool_probe_idle_min": (_reader_tool_probe_idle_min, "15", "60"),
     "merge_conversation": (_reader_merge_conversation, "parent", "fresh"),
     "tool_transport": (_reader_tool_transport, "connector-less", "connector"),
