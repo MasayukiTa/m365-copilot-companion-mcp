@@ -8425,6 +8425,20 @@ class RelayWorker:
         if saw_output:
             self._landed_pending = True
         landed = (delivery == "delivered") or getattr(self, "_landed_pending", False)
+        # A REASON THAT PROVES THE FRAME NEVER LEFT (an expired token, a failed capture or
+        # handshake) means THIS turn did not land, whatever an earlier turn did. Without this,
+        # a worker that produced output on a previous turn carries `_landed_pending=True` into
+        # a later token-expiry fault and is refused a re-send -- the 2026-10-26 10:34 bundle,
+        # where w18/w23/w25/w28 went STUCK on "the supplied token has expired" although the
+        # turn was never delivered. The fresh token (captured here or by the sweep) then lets
+        # the same goal be re-sent safely. `executed` is still honoured below: a call that RAN
+        # on this side is a local effect regardless of whether the frame was sent.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason):
+                landed = False
+        except Exception:
+            pass
 
         # WHAT THE GOAL ASKS FOR, which nothing here was reading. A count bounds how many
         # times a turn is repeated; it says nothing about whether repeating it is safe. For a
@@ -8469,6 +8483,22 @@ class RelayWorker:
                 if recovery is None and (landed or executed):
                     self._refuse_resend(reason, delivery)
                     return False
+
+        # KICK A REFRESH NOW, exactly as _fall_back_to_tab does -- the two paths are the two
+        # ways a worker reacts to a dropped socket, and a proven token expiry is a shared-`exp`
+        # event that hits the whole fleet within seconds (every worker captured off the same
+        # page). Starting the off-thread capture the moment the first worker on THIS path hits
+        # it, rather than waiting for the next sweep lap, shortens the window before a fresh
+        # token is installed and the reconnect below (driver_for, which needs a live token)
+        # succeeds. Guarded by needs_refresh() and a no-op while a capture is already in flight
+        # or inside the policy backoff (_consider_socket_refresh -> AsyncCaptureManager.consider),
+        # so adding it to both paths cannot double-launch.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None)
+        except Exception:
+            pass
 
         spent = getattr(self, "_socket_reconnects_total", 0)
         cap = SOCKET_RECONNECTS_IF_DELIVERED if landed else SOCKET_RECONNECTS_PER_GOAL
@@ -8574,8 +8604,20 @@ class RelayWorker:
             _delivery = "unknown"
         # A call that already ran on this side counts too (continue-turn setting on): the tab
         # re-sends the goal verbatim.
-        if (_delivery == "delivered" or getattr(self, "_landed_pending", False)
-                or self._journal_shows_executed_calls()) and self._goal_may_act():
+        # A PROVEN-NOT-SENT reason (expired token / failed capture or handshake) clears the
+        # sticky `_landed_pending` left by an earlier turn: this turn never reached the server,
+        # so re-sending it with a fresh token is the recovery, not a duplicate. A call that RAN
+        # on this side (`_journal_shows_executed_calls`) is still honoured -- it is a local
+        # effect whether or not the frame was sent.
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            _not_sent = delivery_proves_not_sent(reason)
+        except Exception:
+            _not_sent = False
+        _may_have_landed = (_delivery == "delivered"
+                            or (getattr(self, "_landed_pending", False) and not _not_sent)
+                            or self._journal_shows_executed_calls())
+        if _may_have_landed and self._goal_may_act():
             decision = "refuse"
             try:
                 from relay.transport_policy import resend_decision_for_landed_act
@@ -8626,6 +8668,18 @@ class RelayWorker:
             pass
         self.socket, self.drv = False, None
         self._needs_socket_rebind = True
+        # KICK A REFRESH NOW, don't only wait for the next sweep lap. When the fault is a proven
+        # token expiry the whole fleet shares one `exp` (every worker captured off the same page),
+        # so they fail within seconds of each other -- the 2026-10-26 10:34 bundle. Starting the
+        # off-thread capture here, the moment the first worker hits it, shortens the window before
+        # a fresh token is installed and the rebind below succeeds. It is a cheap no-op while a
+        # capture is already in flight or inside the policy's backoff (relay/socket_capture_async).
+        try:
+            from relay.transport_policy import delivery_proves_not_sent
+            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None)
+        except Exception:
+            pass
         # BACKOFF, because nothing ends this wait but the route recovering: 4, 8 ... 60 s.
         self._socket_rebinds = getattr(self, "_socket_rebinds", 0) + 1
         self._cooldown_until = time.time() + min(60.0, 2.0 * (2 ** min(self._socket_rebinds, 5)))
