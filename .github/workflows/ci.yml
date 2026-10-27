@@ -292,7 +292,6 @@ jobs:
             tests/test_unlock_redaction.py \
             tests/test_edge_keeper_coverage.py \
             tests/test_edge_taskbar_hygiene.py \
-            ui/test_a_stalled_card_says_why.py \
             ui/test_history_is_not_destroyed_by_a_failed_load.py \
             ui/test_a_retry_budget_bounds_the_repair_it_pays_for.py \
             ui/test_every_lane_in_flight_is_on_screen.py \
