@@ -480,27 +480,36 @@ partial class CockpitWindow
         cm.MinWidth = 240;
         cm.HorizontalOffset = -250;
 
+        // Lazy menu build: with ~330 cards on screen, materializing every card's MenuItems up
+        // front is wasted work (most menus are never opened). Defer the item construction to the
+        // menu's first Opened, and guard with a built flag so re-opening does not rebuild.
         string[] lbls = labels;
         Action[] acts = actions;
-        for (int i = 0; i < lbls.Length; i++)
+        bool menuBuilt = false;
+        cm.Opened += delegate (object s3, RoutedEventArgs e3)
         {
-            int idx = i;
-            if (lbls[idx] == null)
+            if (menuBuilt) return;
+            menuBuilt = true;
+            for (int i = 0; i < lbls.Length; i++)
             {
-                cm.Items.Add(new Separator { Margin = new Thickness(4, 3, 4, 3) });
-                continue;
+                int idx = i;
+                if (lbls[idx] == null)
+                {
+                    cm.Items.Add(new Separator { Margin = new Thickness(4, 3, 4, 3) });
+                    continue;
+                }
+                var mi = new MenuItem();
+                mi.Header = lbls[idx];
+                mi.Background = Brushes.Transparent;
+                mi.Foreground = Theme.Br(Theme.Text(_dark));
+                mi.BorderThickness = new Thickness(0);
+                mi.Padding = new Thickness(12, 6, 12, 6);
+                mi.FontSize = 12.5;
+                Action a = acts[idx];
+                mi.Click += delegate (object s2, RoutedEventArgs e2) { a(); };
+                cm.Items.Add(mi);
             }
-            var mi = new MenuItem();
-            mi.Header = lbls[idx];
-            mi.Background = Brushes.Transparent;
-            mi.Foreground = Theme.Br(Theme.Text(_dark));
-            mi.BorderThickness = new Thickness(0);
-            mi.Padding = new Thickness(12, 6, 12, 6);
-            mi.FontSize = 12.5;
-            Action a = acts[idx];
-            mi.Click += delegate (object s2, RoutedEventArgs e2) { a(); };
-            cm.Items.Add(mi);
-        }
+        };
         btn.ContextMenu = cm;
 
         btn.Click += delegate (object s, RoutedEventArgs e)
