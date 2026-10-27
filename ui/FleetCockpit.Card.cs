@@ -550,6 +550,19 @@ partial class CockpitWindow
                     meta.Append(name.ToUpper());
                 }
                 if (turn > 0) meta.Append(" · ").Append(T("turn")).Append(' ').Append(turn);
+                // RUN DURATION (start..done), placed to the RIGHT of the turn count. Only a completed
+                // card shows it, and only when BOTH the transcript start ts and the last phase_event ts
+                // are known; otherwise nothing is appended (we never guess an elapsed from one endpoint).
+                if (terminal)
+                {
+                    double runDoneTs = SubmittedTasks.CompletedUnix(w);
+                    if (startTs > 0 && runDoneTs > 0)
+                    {
+                        string runDur = DurationHuman(runDoneTs - startTs, _lang == 0);
+                        if (runDur.Length > 0)
+                            meta.Append(" · ").Append(_lang == 0 ? "所要 " : "took ").Append(runDur);
+                    }
+                }
                 if (reviews > 0) meta.Append(" · ").Append(_lang == 0 ? ("確認 " + reviews + " 回") : ("reviewed " + reviews));
                 if (verifiedOk) meta.Append(" · ").Append(_lang == 0 ? "検証OK" : "verified");
                 if (execution != null)
