@@ -42,6 +42,26 @@ partial class CockpitWindow
         DockPanel.SetDock(clear, Dock.Right);
         head.Children.Add(clear);
 
+        // "却下をすべて消す": beside the history Clear, hide every refused card still on screen in one
+        // action (DismissAllRefused -> tools.fleet_intake --dismiss-all-refused). Shown ONLY when a
+        // not-yet-forced, not-yet-dismissed refused card is actually visible, so an empty board never
+        // grows a dead button and nothing else (the left-side counts, the history caption) is touched.
+        // No confirmation, by spec; the records are kept, only the cards are hidden.
+        if (ReadRefusedCards().Count > 0)
+        {
+            var dropRefused = new Button();
+            dropRefused.Content = _lang == 0 ? "却下をすべて消す" : "Dismiss all refused";
+            dropRefused.Cursor = Cursors.Hand; dropRefused.BorderThickness = new Thickness(1);
+            dropRefused.Background = BtnBg; dropRefused.Foreground = Fg; dropRefused.BorderBrush = Border;
+            dropRefused.Padding = new Thickness(12, 2, 12, 2); dropRefused.FontSize = 12;
+            dropRefused.Margin = new Thickness(0, 0, 8, 0);
+            dropRefused.ToolTip = _lang == 0 ? "却下カードをすべて表示から消す（記録は残ります）"
+                                             : "Hide all refused cards from view (the records are kept)";
+            dropRefused.Click += delegate { DismissAllRefused(); };
+            DockPanel.SetDock(dropRefused, Dock.Right);
+            head.Children.Add(dropRefused);
+        }
+
         // P2 (b): live search box. Docked right of the caption; typing filters the rows below with a
         // ~300ms debounce (so it doesn't rebuild on every keystroke). Built ONCE and preserved across
         // renders (the header row's signature is static), so focus + caret survive a re-filter.

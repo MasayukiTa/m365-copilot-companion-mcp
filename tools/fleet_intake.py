@@ -597,6 +597,93 @@ def _refused_path(refused_id: str) -> str:
     return os.path.join(_refused_dir(), "%s.json" % refused_id)
 
 
+DISMISSED_REFUSED_FILE = "dismissed_refused.json"
+
+
+#: Where the cockpit records which refused cards the PERSON has hidden from view. The refused
+#: record itself is NEVER deleted (the ui keeps every artifact and only hides on an explicit user
+#: action, never on a timer); dismissing a card appends its id here, and both the cockpit and this
+#: module read this set to drop a hidden card without touching the record it points at. It sits in
+#: .fleet (FLEET_STATE_DIR), beside status.json, not under tasks/refused, so clearing or forcing a
+#: refusal never disturbs the dismiss list and vice versa.
+def _dismissed_refused_path() -> str:
+    return os.path.join(TR.FLEET_STATE_DIR, DISMISSED_REFUSED_FILE)
+
+
+def _read_dismissed_refused():
+    """The set of refused-record ids the person has hidden. A torn or missing file is an empty
+    set -- a dismiss list that cannot be read hides nothing, it never resurfaces a forced job."""
+    try:
+        with open(_dismissed_refused_path(), encoding="utf-8") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return set()
+    ids = data.get("ids") if isinstance(data, dict) else data
+    if not isinstance(ids, list):
+        return set()
+    return set(str(x) for x in ids if str(x))
+
+
+def _write_dismissed_refused(ids) -> bool:
+    """Replace the dismiss list with `ids` (a set/iterable), sorted, atomically. Never raises."""
+    try:
+        payload = {"ids": sorted(set(str(x) for x in ids if str(x)))}
+        os.makedirs(TR.FLEET_STATE_DIR, exist_ok=True)
+        path = _dismissed_refused_path()
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(payload, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def dismiss_refused(refused_id) -> bool:
+    """Hide one refused card: append its id to the dismiss list and persist, so it stays hidden
+    across a cockpit restart. Idempotent -- a second dismiss of the same id is a no-op that still
+    reports success. The refused record on disk is LEFT IN PLACE. Returns whether the id is now in
+    the list (True unless the write failed)."""
+    rid = str(refused_id or "")
+    if not rid:
+        return False
+    current = _read_dismissed_refused()
+    if rid in current:
+        return True
+    current.add(rid)
+    return _write_dismissed_refused(current)
+
+
+def dismiss_all_refused(ids=None) -> int:
+    """Hide many refused cards at once. With `ids` given, dismiss exactly those. With no ids, read
+    every refused record under tasks/refused that is not already forced in and dismiss each -- the
+    cockpit\'s "却下をすべて消す" action. Records are never deleted. Returns how many ids the list
+    grew by."""
+    if ids is None:
+        ids = []
+        try:
+            for name in os.listdir(_refused_dir()):
+                if not name.endswith(".json"):
+                    continue
+                rec = _read_refused_record(name[:-5])
+                if rec is None or rec.get("forced"):
+                    continue
+                rid = str(rec.get("id") or name[:-5])
+                if rid:
+                    ids.append(rid)
+        except OSError:
+            ids = []
+    current = _read_dismissed_refused()
+    before = len(current)
+    for x in ids:
+        sx = str(x or "")
+        if sx:
+            current.add(sx)
+    if len(current) == before:
+        return 0
+    return (len(current) - before) if _write_dismissed_refused(current) else 0
+
+
 def _write_refused_record(reason, goal_text, source, similar_to="", similarity=None):
     """Write .fleet/tasks/refused/<id>.json for a refused goal and return its id (or None).
 
@@ -914,6 +1001,12 @@ def _cli(argv=None):
         "--force-refused", metavar="REFUSED_ID",
         help="Force in the goal of a refused record by its id, skipping every admission check.")
     parser.add_argument(
+        "--dismiss-refused", metavar="REFUSED_ID",
+        help="Hide one refused card from the cockpit by its id. The record is NOT deleted.")
+    parser.add_argument(
+        "--dismiss-all-refused", action="store_true",
+        help="Hide every refused card not already forced in. The records are NOT deleted.")
+    parser.add_argument(
         "--source", default="",
         help="Optional short tag naming who forced it (shown on the job's provenance).")
     args = parser.parse_args(argv)
@@ -922,6 +1015,15 @@ def _cli(argv=None):
         print(result)
         # A bracketed message is a failure; a bare job id is success.
         return 0 if not str(result).startswith("[") else 1
+    if args.dismiss_refused:
+        ok = dismiss_refused(args.dismiss_refused)
+        print("dismissed %s" % args.dismiss_refused if ok else
+              "[dismiss_refused: could not record the dismissal]")
+        return 0 if ok else 1
+    if args.dismiss_all_refused:
+        n = dismiss_all_refused()
+        print("dismissed %d refused card(s)" % n)
+        return 0
     parser.print_help()
     return 2
 

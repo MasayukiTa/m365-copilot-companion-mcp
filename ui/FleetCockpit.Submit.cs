@@ -56,6 +56,12 @@ partial class CockpitWindow
     // submitted group -- it did not enter the queue -- but it is drawn in the same top area so a
     // turned-away request is seen at the machine and can be forced in by the person.
     volatile List<RefusedView> _refusedNow = new List<RefusedView>();
+    // The refused cards the PERSON has chosen to hide. Re-read each tick from
+    // .fleet/dismissed_refused.json the same way _refusedNow is re-read, so a dismiss survives a
+    // cockpit restart. The refused record on disk is NEVER deleted -- this set only tells
+    // ReadRefusedCards which cards to drop, matching the ui's standing rule: hide on an explicit
+    // user action, never on a timer, and never destroy the artifact behind a card.
+    volatile HashSet<string> _dismissedRefused = new HashSet<string>(StringComparer.Ordinal);
 
     static string TasksDir()
     {
@@ -66,6 +72,14 @@ partial class CockpitWindow
     static string RefusedDir()
     {
         return Path.Combine(TasksDir(), "refused");
+    }
+
+    // Where the dismiss list lives: .fleet/dismissed_refused.json, beside status.json, NOT under
+    // tasks/refused. Must match tools.fleet_intake._dismissed_refused_path so the × written by the
+    // CLI and this read point at the same file. _fleetDir is the .fleet state dir.
+    string DismissedRefusedPath()
+    {
+        return Path.Combine(_fleetDir, "dismissed_refused.json");
     }
 
     // What the "submitted" group shows right now: the merged list, newest first, as of the
@@ -84,8 +98,10 @@ partial class CockpitWindow
         var outp = new List<RefusedView>();
         List<RefusedView> now = _refusedNow;
         if (now == null) return outp;
+        HashSet<string> hidden = _dismissedRefused;
         foreach (RefusedView v in now)
-            if (v != null && !v.Forced) outp.Add(v);
+            if (v != null && !v.Forced && (hidden == null || !hidden.Contains(v.Id)))
+                outp.Add(v);
         return outp;
     }
 
@@ -120,6 +136,24 @@ partial class CockpitWindow
             ForceRefusedGoal(refusedId);
         };
         DockPanel.SetDock(force, Dock.Right); dp.Children.Add(force);
+        // The × hides THIS refused card from view, mirroring SubmittedRow's dismiss. It appends the
+        // record's id to .fleet/dismissed_refused.json (DismissRefused) and never deletes the record
+        // behind the card, matching the ui's standing rule: hide on an explicit user action, never
+        // on a timer, and never destroy the artifact. Drawn to the right of 強制投入 so forcing in
+        // stays the primary action and the person can still overrule a refusal after seeing it.
+        var close = IconButton("close", 14, ja ? "この却下を表示から消す" : "Dismiss this refusal");
+        close.Width = 28; close.Height = 28; close.Margin = new Thickness(8, 0, 0, 0);
+        close.Padding = new Thickness(0); close.BorderThickness = new Thickness(0);
+        close.Background = Brushes.Transparent; close.Foreground = Muted;
+        close.Template = FlatButtonTemplate();
+        close.ToolTip = ja ? "この却下を表示から消す（記録は残ります）"
+                           : "Dismiss this refusal from view (the record is kept)";
+        close.Click += delegate (object sender, RoutedEventArgs e)
+        {
+            e.Handled = true;
+            DismissRefused(refusedId);
+        };
+        DockPanel.SetDock(close, Dock.Right); dp.Children.Add(close);
         var stack = new StackPanel();
         stack.Children.Add(new TextBlock {
             Text = SubmittedTasks.RefusedReasonText(v, ja),
@@ -160,6 +194,70 @@ partial class CockpitWindow
         ForceRender();
     }
 
+    // Hide ONE refused card from view. Appends the record's id to .fleet/dismissed_refused.json via
+    // tools.fleet_intake --dismiss-refused <id>; the record under tasks/refused is LEFT IN PLACE, so
+    // nothing is destroyed and the dismiss simply survives a restart (RefreshSubmitted re-reads the
+    // list every tick). Also hides the card at once in this process -- adding the id to the live set
+    // and re-rendering -- so the person does not wait a poll for the × to take effect. Never throws
+    // into the click: a failed write still leaves the optimistic hide, and the next successful write
+    // (or the CLI) makes it durable. Force in is untouched by this path.
+    void DismissRefused(string refusedId)
+    {
+        if (string.IsNullOrEmpty(refusedId)) return;
+        RunIntakeDismiss("--dismiss-refused \"" + refusedId + "\"");
+        try
+        {
+            var next = new HashSet<string>(_dismissedRefused ?? new HashSet<string>(StringComparer.Ordinal), StringComparer.Ordinal);
+            next.Add(refusedId);
+            _dismissedRefused = next;
+        }
+        catch (Exception) { }
+        ForceRender();
+    }
+
+    // Hide EVERY refused card not already forced in -- the "却下をすべて消す" action beside the
+    // history controls. Runs tools.fleet_intake --dismiss-all-refused (no confirmation, by spec),
+    // which appends each not-yet-forced record's id to the dismiss list; the records are kept. Also
+    // hides the cards now in this process by folding the currently shown ids into the live set, so
+    // the list clears immediately rather than on the next poll. Never throws into the click.
+    void DismissAllRefused()
+    {
+        RunIntakeDismiss("--dismiss-all-refused");
+        try
+        {
+            var next = new HashSet<string>(_dismissedRefused ?? new HashSet<string>(StringComparer.Ordinal), StringComparer.Ordinal);
+            List<RefusedView> now = _refusedNow;
+            if (now != null)
+                foreach (RefusedView v in now)
+                    if (v != null && !v.Forced && !string.IsNullOrEmpty(v.Id)) next.Add(v.Id);
+            _dismissedRefused = next;
+        }
+        catch (Exception) { }
+        ForceRender();
+    }
+
+    // Launch the operator-only dismiss path, off the MCP surface, exactly like ForceRefusedGoal:
+    // tools.fleet_intake writes .fleet/dismissed_refused.json (DISMISS the card, keep the record).
+    // Kept out of the MCP tool list so only a person at this machine reaches it. Never throws.
+    void RunIntakeDismiss(string args)
+    {
+        try
+        {
+            string repo = Path.GetFullPath(Path.Combine(AppDomain.CurrentDomain.BaseDirectory, ".."));
+            string py = Path.Combine(repo, ".venv", "Scripts", "python.exe");
+            if (!File.Exists(py)) py = "python";
+            var psi = new System.Diagnostics.ProcessStartInfo();
+            psi.FileName = py;
+            psi.Arguments = "-m tools.fleet_intake " + args;
+            psi.WorkingDirectory = repo;
+            psi.UseShellExecute = false;
+            psi.CreateNoWindow = true;
+            try { psi.EnvironmentVariables["PYTHONIOENCODING"] = "utf-8"; } catch (Exception) { }
+            System.Diagnostics.Process.Start(psi);
+        }
+        catch (Exception) { }
+    }
+
     // Once per tick: read the three on-disk sources and merge them with this window's own
     // submissions. NEVER THROWS INTO THE TICK -- SubmittedTasks.ReadFiles swallows a torn or
     // half-written file, and anything else here leaves the previous list on screen.
@@ -185,6 +283,10 @@ partial class CockpitWindow
             // Read the refusals the same tick, from the same tasks dir, so the submitted group
             // and its refused cards cannot point at different places. ReadRefused never throws.
             _refusedNow = SubmittedTasks.ReadRefused(RefusedDir());
+            // The person's dismiss list, re-read the same tick so a × survives a restart and a
+            // card hidden on one tick stays hidden on the next. ReadDismissedRefused never throws:
+            // a torn or missing file is an empty set, which hides nothing.
+            _dismissedRefused = SubmittedTasks.ReadDismissedRefused(DismissedRefusedPath());
         }
         catch (Exception) { }
     }

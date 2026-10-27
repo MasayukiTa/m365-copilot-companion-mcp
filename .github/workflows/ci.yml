@@ -149,6 +149,7 @@ jobs:
             tools/test_fleet_intake.py \
             tools/test_refused_record_and_force.py \
             ui/test_a_refused_request_is_shown_and_can_be_forced.py \
+            tools/test_dismiss_refused_card.py \
             tools/overnight/test_overnight_input.py \
             tools/overnight/test_overnight_runner.py \
             tools/overnight/test_overnight_detect.py \
