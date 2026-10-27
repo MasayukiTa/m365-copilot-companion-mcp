@@ -751,6 +751,7 @@ jobs:
             relay/test_fanout_worker.py \
             relay/test_splittability.py \
             relay/test_wants_fanout.py \
+            relay/test_natural_language_fanout_e2e.py \
             relay/test_fanout_reevaluates_per_goal.py \
             tests/test_stack_guard.py \
             tests/test_reap_orphan_edge.py \
