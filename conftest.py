@@ -102,6 +102,7 @@ LIVE_RECORD_REDIRECTS = {
                          "_STATE_FILE": "lock_state.json",
                          "_TOKEN_GAP_FILE": "unlock_token_gap.json"},
     "relay.socket_route": {"DEFAULT_LOG": "socket_route.jsonl"},
+    "relay.disk_series": {"_state_dir": "disk_series_state"},
     # The work-area guard's refusal ledger. A test that drives the guard would otherwise append
     # refusals to the operator's own .fleet\workarea_refusals.jsonl.
     "tools.workarea_guard": {"LEDGER_PATH": "workarea_refusals.jsonl"},
@@ -723,6 +724,8 @@ def _no_writes_to_the_live_records(tmp_path_factory, monkeypatch):
                 # Path breaks on concatenation. Neither failure would look like this fixture.
                 from pathlib import Path as _P
                 value = _P(str(target)) if isinstance(current, _P) else str(target)
+                if callable(current):
+                    value = lambda path=value: path
                 monkeypatch.setattr(mod, const, value, raising=False)
             except Exception:
                 pass
