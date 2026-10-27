@@ -75,7 +75,7 @@ _USER_PROFILE_FOLDER_NAMES = {
 }
 
 
-def _validate_path(path: str) -> Path:
+def _validate_path(path: str, for_write: bool = False) -> Path:
     p = None
     try:
         pp = Path(path)
@@ -110,6 +110,18 @@ def _validate_path(path: str) -> Path:
     # function, and a rule enforced in one caller is a rule with as many holes as there are
     # other callers.
     _refuse_security_state(p, path)
+    # Placement rule: a write may not create a NEW untracked top-level name directly under the
+    # production checkout. Reads are never affected (for_write stays False for them). The guard
+    # fails open and, in its default 'warn' mode, only records -- so this changes nothing for a
+    # write that lands somewhere legitimate, and nothing at all until the switch is flipped.
+    if for_write:
+        try:
+            from . import workarea_guard
+            workarea_guard.check_write(str(p))
+        except PermissionError:
+            raise
+        except Exception:
+            pass                          # the placement guard must never break the file tools
     if not bases:
         return p  # unrestricted: the default when MCP_ALLOWED_BASE is unset, empty or '*'
     for base in bases:
@@ -324,7 +336,7 @@ def write_file(path: str, content: str, encoding: str = "utf-8") -> str:
     if locked:
         return locked
     try:
-        p = _validate_path(path)
+        p = _validate_path(path, for_write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding=encoding)
         return f"Wrote {p} ({len(content)} characters)"
@@ -338,7 +350,7 @@ def append_file(path: str, content: str, encoding: str = "utf-8") -> str:
     if locked:
         return locked
     try:
-        p = _validate_path(path)
+        p = _validate_path(path, for_write=True)
         p.parent.mkdir(parents=True, exist_ok=True)
         with p.open("a", encoding=encoding) as f:
             f.write(content)
@@ -412,7 +424,7 @@ def create_directory(path: str) -> str:
     if locked:
         return locked
     try:
-        p = _validate_path(path)
+        p = _validate_path(path, for_write=True)
         p.mkdir(parents=True, exist_ok=True)
         return f"Created directory {p}"
     except Exception as e:
@@ -426,7 +438,7 @@ def copy_path(source: str, destination: str, overwrite: bool = False) -> str:
         return locked
     try:
         src = _validate_path(source)
-        dst = _validate_path(destination)
+        dst = _validate_path(destination, for_write=True)
         if dst.exists() and not overwrite:
             return f"[copy skipped: destination exists: {dst}]"
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -480,7 +492,7 @@ def move_path(source: str, destination: str, overwrite: bool = False) -> str:
         return locked
     try:
         src = _validate_path(source)
-        dst = _validate_path(destination)
+        dst = _validate_path(destination, for_write=True)
         if not src.exists():
             return f"[move skipped: source missing: {src}]"
         if src == ALLOWED_BASE:
