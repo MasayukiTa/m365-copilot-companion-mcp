@@ -246,6 +246,7 @@ jobs:
             relay/test_priority_survives_every_delivery_route.py \
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
+            relay/test_every_intake_route_leaves_one_receipt.py \
             relay/test_fanout_family_view.py \
             relay/test_family_view.py \
             relay/test_family_view_nesting.py \
