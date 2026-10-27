@@ -23,8 +23,8 @@ import pytest
 
 
 #: THIS WORKTREE MUST WIN OVER THE INSTALLED REPO. The environment's sitecustomize
-#: (resonac-mcp/tools/_pptx_autostamp/sitecustomize.py) inserts MCP_COMPANION_REPO
-#: (= C:\Users\...\resonac-mcp) at sys.path[0] in every interpreter, so `import tools.*`
+#: (the companion repo's tools/_pptx_autostamp/sitecustomize.py) inserts MCP_COMPANION_REPO
+#: (= the companion repo's checkout) at sys.path[0] in every interpreter, so `import tools.*`
 #: would resolve to that OTHER checkout and silently test its (older) code instead of the
 #: files under this worktree. conftest.py is imported by pytest before collection, which is
 #: early enough to correct it: put this worktree at the front of sys.path and drop any
