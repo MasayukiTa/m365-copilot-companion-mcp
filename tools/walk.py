@@ -20,6 +20,69 @@ import os
 import time
 from pathlib import Path
 
+#: Search bounds are read from the settings file so a running server can be told to allow a
+#: heavier search without a restart -- the same promise the fleet's other EACH_GATE knobs make.
+#: The defaults are the values these searches used as hard-coded constants before #328, chosen
+#: so a legitimate heavy search is not broken: the owner raises a bound by editing the setting
+#: (or passing an explicit per-call argument), never by the bound silently being low. Declared
+#: in tools/settings_keys.py (search_timeout_seconds / search_concurrency / search_max_depth)
+#: with the reason: 2026-10-27..28 the gateway jammed three times, each time on an unbounded
+#: find_files / glob, recoverable then only by restarting the server.
+
+
+def _setting(key, cast, default):
+    """Read one search bound from the settings file, cast it, fall back to `default`.
+
+    Never raises: a search must not die because a setting is missing or malformed. Read fresh
+    per search (a search is already the expensive thing, so one extra file read is noise), so
+    an operator who raises a bound reaches the next search with no restart.
+    """
+    try:
+        from . import settings_path as _sp
+        raw = _sp.read_key(_sp.settings_file(), key)
+        if raw is None or str(raw).strip() == "":
+            return default
+        return cast(str(raw).strip())
+    except Exception:
+        return default
+
+
+#: Hard-coded fallbacks == the pre-#328 constants. A bound a caller passes explicitly wins
+#: over the setting, which wins over these.
+_DEFAULT_TIMEOUT_SECONDS = 20
+_DEFAULT_CONCURRENCY = 4
+#: None == no depth limit, which is what every search did before #328. The depth guard exists
+#: so a caller CAN cap descent (issue #328 proposal 3 lists max depth as one of the bounds a
+#: search may be required to carry), and so the owner can set a floor-wide cap; the default
+#: stays None so no existing legitimate deep search changes behaviour until someone asks.
+_DEFAULT_MAX_DEPTH = None
+
+
+def search_timeout_seconds() -> int:
+    """Wall-clock budget for one search walk, from settings or the pre-#328 default of 20."""
+    v = _setting("search_timeout_seconds", lambda s: int(float(s)), _DEFAULT_TIMEOUT_SECONDS)
+    return v if isinstance(v, int) and v > 0 else _DEFAULT_TIMEOUT_SECONDS
+
+
+def search_concurrency() -> int:
+    """How many searches may run at once, from settings or the pre-#328 default of 4."""
+    v = _setting("search_concurrency", lambda s: int(float(s)), _DEFAULT_CONCURRENCY)
+    return v if isinstance(v, int) and v > 0 else _DEFAULT_CONCURRENCY
+
+
+def search_max_depth():
+    """Deepest directory level a walk descends, from settings, or None (no limit, the default).
+
+    Depth is counted from the search root: a file directly under the root is depth 0. A value
+    of 0 therefore searches only the root directory itself. A missing or non-positive setting
+    means None (unbounded), so nothing a legitimate deep search does changes until the owner
+    sets a cap or a caller passes max_depth explicitly.
+    """
+    v = _setting("search_max_depth", lambda s: int(float(s)), _DEFAULT_MAX_DEPTH)
+    if v is None:
+        return None
+    return v if isinstance(v, int) and v >= 0 else None
+
 #: Directories no search descends into. Not a performance list -- a correctness one: a hit
 #: inside .venv is a hit in somebody else's source, and a hit inside .git is a hit in a
 #: compressed object nobody can act on.
@@ -40,12 +103,21 @@ def pruning_enabled() -> bool:
         "1", "true", "yes", "on")
 
 
-SEARCH_TIMEOUT_SECONDS = 20
+#: Kept as a module name for callers/tests that imported it before #328; the live value now
+#: comes from search_timeout_seconds() so a setting change is honoured without a restart.
+SEARCH_TIMEOUT_SECONDS = _DEFAULT_TIMEOUT_SECONDS
 
 
 class WalkDeadline:
-    def __init__(self):
-        self.seconds = SEARCH_TIMEOUT_SECONDS
+    def __init__(self, seconds=None):
+        # An explicit `seconds` (a per-call override) wins; otherwise the live setting; the
+        # setting itself falls back to the pre-#328 default. So a caller can ask for a heavier
+        # search, an operator can raise the floor without a restart, and neither path can make
+        # the budget zero or negative (search_timeout_seconds already clamps that).
+        if seconds is not None and seconds > 0:
+            self.seconds = int(seconds)
+        else:
+            self.seconds = search_timeout_seconds()
         self.end = time.monotonic() + self.seconds
         self.cut = False
 
@@ -55,7 +127,7 @@ class WalkDeadline:
         return self.cut
 
 
-def iter_files(base: Path, skipped=None, deadline=None):
+def iter_files(base: Path, skipped=None, deadline=None, max_depth=None):
     """Yield every file under `base`, skipping PRUNED_DIRS. A generator, never a list.
 
     os.walk rather than rglob because rglob cannot be told not to descend -- the pruning has
@@ -64,11 +136,21 @@ def iter_files(base: Path, skipped=None, deadline=None):
     `skipped`, when given a set, collects the names actually pruned. Callers disclose on that
     rather than on the setting: a note saying "vendored directories were not searched" is a
     lie about a tree that contains none, and about a search of a single file.
+
+    `max_depth` caps how deep the walk descends, counted from `base`: a file directly under
+    `base` is depth 0, so max_depth=0 searches only `base` itself. None (the default) is the
+    pre-#328 behaviour -- no depth limit. An explicit argument wins; otherwise the settings
+    value (search_max_depth) is used, so the owner can set a floor-wide cap without a restart.
+    Pruning by depth happens WHILE walking (dirs[:] is trimmed) so the cost of the deeper tree
+    is never paid, exactly like the vendored-dir pruning beside it.
     """
     own_deadline = deadline is None
     deadline = deadline or WalkDeadline()
     prune = pruning_enabled()
-    for root, dirs, files in os.walk(str(base)):
+    if max_depth is None:
+        max_depth = search_max_depth()
+    base_str = str(base)
+    for root, dirs, files in os.walk(base_str):
         if deadline.expired():
             if own_deadline:
                 raise TimeoutError("search deadline exceeded; results may be incomplete")
@@ -82,6 +164,16 @@ def iter_files(base: Path, skipped=None, deadline=None):
                 else:
                     keep.append(d)
             dirs[:] = keep
+        if max_depth is not None:
+            # Depth of the directory whose children we are about to consider. os.path.relpath
+            # of root against base is "." at the root (depth 0 for the files it holds), and one
+            # path component deeper per level. A file in `root` sits at `depth`; descending
+            # into a child directory would put its files at `depth + 1`. So once depth reaches
+            # max_depth we still YIELD this directory's files but DO NOT descend further.
+            rel = os.path.relpath(root, base_str)
+            depth = 0 if rel == os.curdir else rel.count(os.sep) + 1
+            if depth >= max_depth:
+                dirs[:] = []
         # SORTED, SO THE SAME QUESTION GETS THE SAME ANSWER TWICE.
         #
         # os.walk yields whatever the filesystem hands it: NTFS enumerates a directory in name

@@ -7,9 +7,22 @@ from pathlib import Path
 from typing import Optional
 
 from .file_ops import _validate_path
-from .walk import PRUNED_DIRS, WalkDeadline, is_pruned, iter_files, pruned_note
+from .walk import (
+    PRUNED_DIRS,
+    WalkDeadline,
+    is_pruned,
+    iter_files,
+    pruned_note,
+    search_concurrency,
+)
 
-SEARCH_CONCURRENCY = 4
+#: The cap on simultaneous searches. Sized once at import from the settings value (default 4,
+#: the pre-#328 constant) because a BoundedSemaphore cannot be resized in place; raising the
+#: setting takes effect on the next server start. The number is declared in
+#: tools/settings_keys.py (search_concurrency) with the reason it exists: an unbounded
+#: find_files / glob jammed the gateway three times on 2026-10-27..28, recoverable only by a
+#: restart, so a hard cap on how many such walks can run at once is one of the guards.
+SEARCH_CONCURRENCY = search_concurrency()
 _SEARCH_SLOTS = threading.BoundedSemaphore(SEARCH_CONCURRENCY)
 
 
@@ -17,7 +30,11 @@ def _bounded_search(func):
     @wraps(func)
     def wrapped(*args, **kwargs):
         if not _SEARCH_SLOTS.acquire(blocking=False):
-            return f"busy: {SEARCH_CONCURRENCY} searches already running, retry later"
+            # FAIL FAST, DO NOT QUEUE. issue #328 proposal 4: a search that cannot get a slot
+            # is refused immediately with a message that says why, rather than blocking a
+            # gateway thread for an unbounded time waiting behind the ones already running.
+            return (f"busy: {SEARCH_CONCURRENCY} searches already running, retry later "
+                    f"(raise search_concurrency in settings to allow more)")
         try:
             return func(*args, **kwargs)
         finally:
@@ -36,6 +53,7 @@ def glob(
     path: str = ".",
     max_results: int = 200,
     include_hidden: bool = False,
+    max_depth: Optional[int] = None,
 ) -> str:
     """Find files matching a glob pattern, sorted by most recently modified.
 
@@ -45,6 +63,11 @@ def glob(
         path: Base directory to search under. Must be inside the allowed base.
         max_results: Maximum number of matches to return.
         include_hidden: When false, skip dotfiles and dot-directories.
+        max_depth: For a recursive (`**`) pattern only, the deepest directory level below
+            `path` to descend into, counted from `path` (depth 0 == directly under `path`).
+            None (default) descends without a depth limit unless the owner has set the
+            search_max_depth setting. A non-recursive pattern does not walk, so this does not
+            apply to it (issue #328).
     """
     try:
         # 呼び出し側は path ではなく pattern 側にパスごと書くことが多い
@@ -82,7 +105,7 @@ def glob(
                 break
             if "**" in pat:
                 tail = pat.replace("\\", "/").split("**/", 1)[-1]
-                for match in iter_files(base, gskipped, deadline):
+                for match in iter_files(base, gskipped, deadline, max_depth=max_depth):
                     try:
                         rel = match.relative_to(base).as_posix()
                     except ValueError:
@@ -197,6 +220,7 @@ def find_files(
     name_contains: str,
     path: str = ".",
     max_results: int = 200,
+    max_depth: Optional[int] = None,
 ) -> str:
     """Find files whose name contains a substring. Case-insensitive.
 
@@ -206,6 +230,11 @@ def find_files(
         name_contains: Substring to look for in filenames.
         path: Base directory.
         max_results: Maximum matches.
+        max_depth: Deepest directory level below `path` to descend into, counted from `path`
+            (a file directly under `path` is depth 0, so max_depth=0 searches only `path`
+            itself). None (default) descends without a depth limit unless the owner has set a
+            floor-wide cap via the search_max_depth setting. Use this to bound a search to a
+            known sub-tree instead of walking an entire drive (issue #328).
     """
     try:
         base = _validate_path(path)
@@ -227,7 +256,7 @@ def find_files(
         truncated = False
         skipped: set = set()
         deadline = WalkDeadline()
-        for p in iter_files(base, skipped, deadline):
+        for p in iter_files(base, skipped, deadline, max_depth=max_depth):
             if needle not in p.name.lower():
                 continue
             try:

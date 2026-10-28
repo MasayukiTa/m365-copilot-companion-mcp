@@ -236,6 +236,22 @@ def _reader_dup_guard():
     return "on" if FI._dup_guard_on() else "off"
 
 
+def _reader_search_timeout():
+    # search_timeout_seconds reads SP.read_key(SP.settings_file(), ...) fresh at the start of every
+    # search, so with SP.NEW_PATH pointed at the test's file an operator's change is seen on the
+    # next search with no restart.
+    from tools.walk import search_timeout_seconds
+    return search_timeout_seconds()
+
+
+def _reader_search_max_depth():
+    # search_max_depth follows the file the same way. Returned as a string so None (no limit)
+    # and an integer compare cleanly against the behavioural check's expected values.
+    from tools.walk import search_max_depth
+    v = search_max_depth()
+    return "" if v is None else str(v)
+
+
 def _fanout_limit_reader(field):
     def _read():
         from relay.fanout_budget import limits_from_settings
@@ -282,6 +298,8 @@ _LIVE_READERS = {
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
     "fanout_max_turns": (_fanout_limit_reader("turns"), "100", "500"),
     "fanout_max_wall_min": (_fanout_limit_reader("wall_min"), "30", "90"),
+    "search_timeout_seconds": (_reader_search_timeout, "20", "45"),
+    "search_max_depth": (_reader_search_max_depth, "2", "5"),
 }
 
 
