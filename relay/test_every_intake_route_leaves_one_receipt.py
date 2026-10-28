@@ -18,15 +18,18 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-# Load the modules under test from THIS repository, not whichever copy a stray PYTHONPATH (e.g.
-# a production checkout on sys.path) resolved first. Dropping any already-imported "relay"/"tools"
-# modules after putting this repo root at the front of sys.path forces the imports below to bind
-# to the tree these tests live in -- the whole point is to pin this repo's seam, not another's.
-for _m in [_n for _n in list(sys.modules) if _n == "relay" or _n == "tools"
-           or _n.startswith("relay.") or _n.startswith("tools.")]:
-    del sys.modules[_m]
+# Make this repository importable WITHOUT disturbing modules already imported by the rest of the
+# suite. pytest collects every test file into ONE process, so a top-level `del sys.modules[...]`
+# here would evict the `relay`/`tools` modules that sibling test files (collected earlier) are
+# already bound to -- their monkeypatches would then land on one module object while the code
+# under test re-imports and runs against a second, and the symptom is a tmp file that was never
+# created (FileNotFoundError) or a setting whose live-reload never took (value drift). The only
+# thing this file needs is for the repo root to be on sys.path so `import relay.*` resolves; add
+# it idempotently and leave the module table alone. pytest already collects from this repo's
+# rootdir, so these imports bind to the tree these tests live in without any eviction.
+_repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _repo_root not in sys.path:
+    sys.path.insert(0, _repo_root)
 
 import relay.intake_journal as ij
 import relay.task_router as tr

@@ -4786,13 +4786,13 @@ def main():
                 # goal that was being admitted.
                 try:
                     from relay import intake_journal as _ij
-                    for _g in (_new_cmd_goals or []):
-                        _o = _g.get("origin") if isinstance(_g.get("origin"), dict) else None
+                    for g in _new_cmd_goals:
+                        _o = g.get("origin") if isinstance(g.get("origin"), dict) else None
                         _via = (_o or {}).get("via", "")
                         if _o and str(_via).startswith("ui"):
-                            _ij.record(jid=_g.get("jid", ""), route=str(_via),
+                            _ij.record(jid=g.get("jid", ""), route=str(_via),
                                        submitter=_o.get("source", ""),
-                                       goal=_g.get("text", ""), state_dir=args.state_dir)
+                                       goal=g.get("text", ""), state_dir=args.state_dir)
                 except Exception:
                     pass
             by_name = {w.name: w for w in workers}
