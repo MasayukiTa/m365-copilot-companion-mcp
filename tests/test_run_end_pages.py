@@ -19,7 +19,7 @@ SRC = os.path.join(ROOT, "relay", "relay_fleet.py")
 def _cleanup_src():
     src = open(SRC, encoding="utf-8").read()
     i = src.index("LEAVE NO COPILOT PAGE BEHIND")
-    return src[i:i + 1600]
+    return src[i:i + 1900]
 
 
 def test_only_copilot_pages_are_closed():
@@ -31,18 +31,20 @@ def test_only_copilot_pages_are_closed():
 
 def test_a_keepalive_is_opened_before_the_last_page_goes():
     """Edge exits with its final page. Taking the browser down as a tidiness measure would
-    end the next run's SSO with it."""
+    end the next run's SSO with it. The keep-alive is now secured through the shared helper
+    (行#243), which REUSES an existing blank rather than opening a second one."""
     body = _cleanup_src()
-    i = body.index("new_page")
+    i = body.index("ensure_keepalive_blank")
     j = body.index("p.close()")
-    assert i < j, "the replacement page must be opened before the stale ones are closed"
+    assert i < j, "the keep-alive must be secured before the stale ones are closed"
 
 
 def test_a_failed_keepalive_cancels_the_close():
-    """If the blank page cannot be opened, closing anyway would kill the browser."""
+    """If the blank page cannot be secured, closing anyway would kill the browser. The helper
+    returns None in that case (行#243), and the cleanup must then abandon the close."""
     body = _cleanup_src()
-    assert re.search(r"except Exception:\s*\n\s*stale = \[\]", body), \
-        "failing to create a keep-alive must abandon the cleanup, not proceed"
+    assert re.search(r"ensure_keepalive_blank\(context\) is None:\s*\n\s*stale = \[\]", body), \
+        "a failed keep-alive (helper returns None) must abandon the cleanup, not proceed"
 
 
 def test_the_cleanup_can_never_break_the_run():
