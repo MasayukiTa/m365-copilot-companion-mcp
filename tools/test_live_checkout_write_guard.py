@@ -132,6 +132,7 @@ def test_block_refuses_a_worker_write_to_tracked_source(checkout, monkeypatch):
         G.check_write(str(checkout / "ui" / "FleetCockpit.Rows.cs"))
     msg = str(ei.value)
     assert "clone" in msg.lower()           # the refusal names the way out
+    assert str(checkout) in msg              # identifies the protected checkout
     rows = _ledger_rows(checkout)
     assert len(rows) == 1 and rows[0]["action"] == "refused"
 

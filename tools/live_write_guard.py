@@ -293,7 +293,7 @@ def check_write(path: str) -> None:
     if blocked:
         raise PermissionError(
             "Refused: a fleet worker must not write the production checkout's tracked source "
-            "(%s). %s" % (path, _clone_hint()))
+            "(%s) under %s. %s" % (path, describe()["checkout_root"], _clone_hint()))
 
 
 def describe() -> dict:
