@@ -617,7 +617,7 @@ async def exec_status(request: Request) -> JSONResponse:
     /health's server_pid already implies is reachable) without disclosing what is running.
 
     It reports; it does not act. Stopping a stuck call needs a worker-process model this server
-    does not have (proposals 1/5; see explain.md). Naming the occupant is the safe half, and it
+    does not have (proposals 1/5). Naming the occupant is the safe half, and it
     is the half that was missing.
     """
     try:

@@ -16,8 +16,7 @@ exposes a snapshot over an HTTP route that is SEPARATE from tools/list and from 
 itself, so reading "what is running" never has to queue behind the thing that is stuck.
 
 WHAT IT IS NOT. It does not stop, kill, or cancel anything -- it only reports. Terminating a
-stuck call needs a worker-process model this server does not have (proposal 1/5; see
-explain.md). Visibility is the part that is safe to add to the current in-thread model, and it
+stuck call needs a worker-process model this server does not have (proposals 1/5). Visibility is the part that is safe to add to the current in-thread model, and it
 is the part that turns "restart and hope" into "name the occupant".
 
 The elapsed seconds come from time.monotonic(), which never goes backwards, so an elapsed value

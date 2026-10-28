@@ -33,8 +33,7 @@ def _bounded_search(func):
             # FAIL FAST, DO NOT QUEUE. issue #328 proposal 4: a search that cannot get a slot
             # is refused immediately with a message that says why, rather than blocking a
             # gateway thread for an unbounded time waiting behind the ones already running.
-            return (f"busy: {SEARCH_CONCURRENCY} searches already running, retry later "
-                    f"(raise search_concurrency in settings to allow more)")
+            return f"busy: {SEARCH_CONCURRENCY} searches already running, retry later"
         try:
             return func(*args, **kwargs)
         finally:
@@ -105,7 +104,7 @@ def glob(
                 break
             if "**" in pat:
                 tail = pat.replace("\\", "/").split("**/", 1)[-1]
-                for match in iter_files(base, gskipped, deadline, max_depth=max_depth):
+                for match in iter_files(base, gskipped, deadline, **({"max_depth": max_depth} if max_depth is not None else {})):
                     try:
                         rel = match.relative_to(base).as_posix()
                     except ValueError:
@@ -256,7 +255,7 @@ def find_files(
         truncated = False
         skipped: set = set()
         deadline = WalkDeadline()
-        for p in iter_files(base, skipped, deadline, max_depth=max_depth):
+        for p in iter_files(base, skipped, deadline, **({"max_depth": max_depth} if max_depth is not None else {})):
             if needle not in p.name.lower():
                 continue
             try:

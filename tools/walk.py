@@ -60,8 +60,8 @@ _DEFAULT_MAX_DEPTH = None
 
 def search_timeout_seconds() -> int:
     """Wall-clock budget for one search walk, from settings or the pre-#328 default of 20."""
-    v = _setting("search_timeout_seconds", lambda s: int(float(s)), _DEFAULT_TIMEOUT_SECONDS)
-    return v if isinstance(v, int) and v > 0 else _DEFAULT_TIMEOUT_SECONDS
+    v = _setting("search_timeout_seconds", lambda s: int(float(s)), SEARCH_TIMEOUT_SECONDS)
+    return v if isinstance(v, int) and v > 0 else SEARCH_TIMEOUT_SECONDS
 
 
 def search_concurrency() -> int:
