@@ -67,7 +67,7 @@ def test_refusals_write_nothing(tmp_path, monkeypatch):
     same = {"fanout_max_depth": base["fanout_max_depth"]}
     assert L.record(path, {}, base=base)["status"] == "refused"          # no-op
     assert L.record(path, same, base=base)["status"] == "refused"        # base value written out
-    assert L.record(path, {"fanout_max_depth": 99}, base=base)["status"] == "refused"
+    assert L.record(path, {"fanout_max_depth": 0}, base=base)["status"] == "refused"
     assert L.record(path, {"nope": 1}, base=base)["status"] == "refused"
     assert L.record(path, {"transport": "x"}, base=base)["status"] == "refused"
     assert not os.path.exists(path)

@@ -32,7 +32,8 @@ def neighbours(gene, value):
     lo, hi = gene.allowed
     out = []
     for v in (value - 1, value + 1, lo, hi):
-        if lo <= v <= hi and v != value and v not in out:
+        if (v is not None and (lo is None or lo <= v)
+                and (hi is None or v <= hi) and v != value and v not in out):
             out.append(v)
     return out
 

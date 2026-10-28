@@ -121,7 +121,7 @@ def test_a_deeper_setting_changes_nothing_while_the_guard_is_off(monkeypatch, co
 
 def test_the_setting_is_declared_and_clamped(monkeypatch):
     assert SK.effect("fanout_max_depth") == SK.EACH_GATE and SK.default("fanout_max_depth") == 2
-    for raw, want in ((None, 2), (0, 1), (-4, 1), (1, 1), (2, 2), (3, 3), (9, 3)):
+    for raw, want in ((None, 2), (0, 1), (-4, 1), (1, 1), (2, 2), (3, 3), (4, 4), (100, 100)):
         _set_depth(monkeypatch, raw)
         assert fo.configured_max_depth() == want, raw
 
@@ -365,7 +365,7 @@ def test_the_cockpit_depth_constants_equal_the_python_side():
     cs = _read("ui", "EffortPolicy.cs")
     assert 'public const string Key = "%s";' % fo.DEPTH_SETTING_KEY in cs
     assert re.search(r"public const int Low = %d;" % fo.DEPTH_SETTING_BOUNDS[0], cs)
-    assert re.search(r"public const int High = %d;" % fo.DEPTH_SETTING_BOUNDS[1], cs)
+    assert fo.DEPTH_SETTING_BOUNDS[1] is None  # the cockpit offers presets, not a backend bound
     assert re.search(r"public const int Default = %d;" % SK.default("fanout_max_depth"), cs)
 
 

@@ -17,9 +17,8 @@ exactly that label. Text is referenced by the hash relay/org/definitions already
 (`base`), never stored here. Free text of any kind is refused (typed values only).
 
 NOTHING IS COPIED. Ranges are read from fanout.DEPTH_SETTING_BOUNDS, fanout_budget.BOUNDS and
-manifest.PARAMETER_TYPES; defaults are read through the live readers. Where fanout.py's comment
-at HIERARCHICAL_MERGE_READY says the nested merge is "default off" the reader returns "on"
-(HIERARCHICAL_SETTING_DEFAULT); the reader's value is the one used.
+manifest.PARAMETER_TYPES; defaults are read through the live readers. Hierarchical merging
+is on by default.
 
 IDENTITY IS THE MATERIALISED VALUES. A candidate that names a gene at its base value, and one
 that leaves it out, are the same program and get the same hash (the manifest.materialize incident,
@@ -134,8 +133,9 @@ def _check(table, name, value):
     gene = table[name]
     if gene.kind == "int":
         lo, hi = gene.allowed
-        if not _is_int(value) or not lo <= value <= hi:
-            raise GenotypeError("%s=%r is outside %d..%d (integers only)" % (name, value, lo, hi))
+        if not _is_int(value) or value < lo or (hi is not None and value > hi):
+            bounds = "%d..%s" % (lo, hi if hi is not None else "unbounded")
+            raise GenotypeError("%s=%r is outside %s (integers only)" % (name, value, bounds))
     else:
         if not isinstance(value, str) or value not in gene.allowed:
             raise GenotypeError("%s=%r is not one of %s" % (name, value, list(gene.allowed)))

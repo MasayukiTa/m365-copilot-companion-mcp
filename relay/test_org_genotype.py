@@ -94,7 +94,7 @@ def test_explicit_base_value_and_omitted_gene_are_the_same_program(tmp_path, mon
 
 
 @pytest.mark.parametrize("genes, fragment", [
-    ({"fanout_max_depth": 4}, "outside"),
+    ({"fanout_max_depth": -1}, "outside"),
     ({"fanout_max_depth": 0}, "outside"),
     ({"max_retries": True}, "outside"),            # a bool is not an integer here
     ({"max_retries": 2.5}, "outside"),
@@ -165,3 +165,8 @@ def test_a_non_test_caller_exists_and_runtime_does_not_import_it():
                 with open(os.path.join(root, fn), encoding="utf-8", errors="replace") as fh:
                     src = fh.read()
                 assert "org.genotype" not in src and "org import genotype" not in src, fn
+
+
+def test_depth_accepts_large_positive_integers():
+    for value in (4, 100):
+        G.validate({"fanout_max_depth": value})

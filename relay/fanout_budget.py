@@ -2,10 +2,8 @@
 """A per-tree budget for fan-out: how many workers, how much work, how long one root may use.
 
 WHY. A fan-out tree is a root campaign and everything split from it (every worker carries the
-tree's `root_id`). Today the tree is bounded only by two accidents: a child cannot split again
-(MAX_DEPTH = 1) and one split yields at most MAX_CHILDREN. Both are properties of the current
-shape, not limits on the tree, so the day depth grows nothing here would stop one goal from
-multiplying workers. This module is the limit that does not depend on the shape.
+tree's `root_id`). The default depth is 2 when hierarchical merging is on, and one split
+yields at most MAX_CHILDREN. Per-tree budgets bound resource use independently of tree shape.
 
 WHAT IT IS. Two pure functions and a few helpers around them:
 
@@ -21,7 +19,7 @@ or start time cannot be read) is "cannot grant more", never "nothing used". A fr
 workers and no campaign line is KNOWN to have used nothing, which is how a first split at depth 1
 sees an empty tree and is granted exactly what it asked for.
 
-DEFAULTS CHANGE NOTHING AT DEPTH 1. The first split of a root requests at most MAX_CHILDREN (12)
+DEFAULTS DO NOT RESTRICT THE FIRST SPLIT. The first split of a root requests at most MAX_CHILDREN (12)
 children against a total of 24 with one slot held back for the merge, a tree with no workers yet,
 no turns and no wall clock, so the grant equals the request. tests/test_fanout_budget.py proves it
 over every split size.
