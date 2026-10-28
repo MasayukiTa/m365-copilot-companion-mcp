@@ -189,7 +189,11 @@ def test_receipt_failure_is_a_pending_commit_and_retries_from_the_existing_tombs
 def test_live_apply_enqueues_only_newly_durable_goals():
     src = Path(fr.__file__).read_text(encoding="utf-8")
     i = src.index("def _apply_command(cmd, workers, submission_id=None):")
-    block = src[i:i + 5000]
+    # Widened from 5000 to 6000: the shared intake-journal admission block (relay/intake_journal)
+    # was inserted between return_new=True and the enqueue loop, pushing the loop past the old
+    # window. The property under test -- only newly-durable goals are enqueued -- is unchanged;
+    # the window must simply reach the loop that still sits in this one function body.
+    block = src[i:i + 6000]
     assert "return_new=True" in block
     assert "for g in _new_cmd_goals:" in block
     assert "for g in _cmd_goals:" not in block
