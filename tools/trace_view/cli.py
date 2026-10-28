@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 import time
 
 from . import report as _report
+from .edge_origin import attribute_edge_burst
 from .render_md import render_markdown  # noqa: F401  (kept importable for callers)
 from .timeutil import DEFAULT_TZ, fmt_duration, fmt_time, parse_tz, parse_time
 
@@ -15,7 +17,7 @@ def _parser():
     p = argparse.ArgumentParser(
         prog="python -m tools.trace_view",
         description="Read-only per-session trace viewer for the server's tool ledger.")
-    p.add_argument("command", nargs="?", choices=("report", "list"), default="report")
+    p.add_argument("command", nargs="?", choices=("report", "list", "edges"), default="report")
     p.add_argument("--since", help="start, 'YYYY-MM-DD HH:MM[:SS]' in --tz (default: one hour before --until)")
     p.add_argument("--until", help="end, same format (default: now)")
     p.add_argument("--session", default="", help="session id prefix")
@@ -25,7 +27,34 @@ def _parser():
     p.add_argument("--lang", choices=("ja", "en"), default="ja")
     p.add_argument("--out", default=None, help="output directory (report mode)")
     p.add_argument("--format", default="md", help="comma list of md,html,xlsx (default md)")
+    p.add_argument("--snapshot", default=None,
+                   help="edges mode: a JSON list of process rows (name, cmdline, ppid) to attribute")
     return p
+
+
+def _edges(path) -> int:
+    """Name the process that opened a burst of msedge.exe, from a saved process snapshot."""
+    if not path:
+        print("error: edges needs --snapshot FILE", file=sys.stderr)
+        return 2
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            rows = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print("error: cannot read snapshot: %s" % exc, file=sys.stderr)
+        return 2
+    if not isinstance(rows, list):
+        print("error: snapshot must be a JSON list of process rows", file=sys.stderr)
+        return 2
+    names = {}
+    for row in rows:
+        if isinstance(row, dict):
+            pid = row.get("pid", row.get("ProcessId"))
+            nm = row.get("name", row.get("Name"))
+            if pid is not None and nm:
+                names[pid] = str(nm)
+    print(json.dumps(attribute_edge_burst(rows, names), ensure_ascii=False, indent=2))
+    return 0
 
 
 def main(argv=None) -> int:
@@ -35,6 +64,9 @@ def main(argv=None) -> int:
         except Exception:
             pass
     args = _parser().parse_args(argv)
+
+    if args.command == "edges":
+        return _edges(args.snapshot)
     try:
         tz = parse_tz(args.tz)
         until = parse_time(args.until, tz) if args.until else time.time()
