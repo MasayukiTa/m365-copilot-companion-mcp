@@ -11,7 +11,7 @@
 Auto の行は無限高さで測るので、仮想化 OFF の全行が実体化され、上限は1パス
 遅れて決まる。履歴を消して大きく行が減った直後、viewport == content に落ち着き
 スクローラーが死ぬ（= 報告 2）、そうならないときも extent が短く最後の行に
-届かない（= 報告 1）。固定 '*' 行 + リストを下揃えにすれば、高さが自分の内容に
+届かない（= 報告 1）。固定 '*' 行いっぱいにリストを広げれば（Stretch）、高さが自分の内容に
 依存せず、端は常に到達可能になる。
 """
 from __future__ import annotations
@@ -61,11 +61,23 @@ def test_the_list_is_bottom_anchored_without_a_self_referential_max_height():
     assert not re.search(
         r"_list\.SetBinding\(\s*FrameworkElement\.MaxHeightProperty", body), (
         "_list に MaxHeight バインディングが残っている。固定 '*' 行で高さを決める")
-    # The list hugs the composer when short and clips-and-scrolls when tall: bottom alignment.
+    # TALL CASE: the list must FILL the fixed '*' row (Stretch), not bottom-anchor inside it.
+    # A non-virtualizing ListBox reports its full content height as its desired size; a
+    # Bottom-aligned child taller than the row is arranged at that desired height and pinned
+    # to the row's bottom edge, so its top overflows above the row and the ListBox's own
+    # ScrollViewer takes content-height as its viewport -- viewport and extent disagree and the
+    # last row is pushed under the composer (the "履歴の一番下が欠ける" regression). Stretch pins the
+    # list to the row so viewport == row height and extent == content height: the end is
+    # always reachable.
     assert re.search(
+        r"_list\.VerticalAlignment\s*=\s*VerticalAlignment\.Stretch", body), (
+        "_list が Stretch になっていない。固定 '*' 行にリストを密着させ、"
+        "viewport == 行高 / extent == 内容高 にすることで最下部まで届く")
+    # And it must NOT bottom-anchor inside that row (the pattern that caused the clip).
+    assert not re.search(
         r"_list\.VerticalAlignment\s*=\s*VerticalAlignment\.Bottom", body), (
-        "_list が下揃えになっていない。短いときはコンポーザに寄せ、高いときは"
-        "行にクリップされてスクロールするために必要")
+        "_list が固定 '*' 行の中で下揃えになっている。"
+        "内容が行より高いとき上端がはみ出し、最下部が欠ける")
 
 
 def test_the_last_row_has_breathing_room_above_the_input_area():

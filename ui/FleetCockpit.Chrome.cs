@@ -214,7 +214,20 @@ partial class CockpitWindow
         // height that does not depend on its own content, so the end is always reachable.
         var listWrap = new Grid();
         listWrap.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
-        _list.VerticalAlignment = VerticalAlignment.Bottom;   // hug the composer when short; clip-and-scroll when tall
+        // STRETCH, NOT BOTTOM -- the bottom-anchor regressed the very defect it was meant to cure.
+        // The list is non-virtualizing, so it reports its FULL content height as its desired size.
+        // In a fixed '*' row a Bottom-aligned child taller than the row is arranged at that desired
+        // height and pinned to the row's bottom edge, so its arrange rect's TOP overflows ABOVE the
+        // row -- the ListBox's own ScrollViewer then takes content-height as its viewport, the
+        // visible clip (row height) and the scrollable extent disagree, and scrolling to the end
+        // leaves the last row pushed under the composer: "the history's bottom is clipped again".
+        // Stretch pins the list to the '*' row exactly, so viewport == row height and extent ==
+        // content height, and the end is always reachable regardless of how tall the content grows.
+        // (A short list now rests at the TOP of the row with slack below, over the composer -- the
+        // old bottom-hug cannot be restored by aligning the items panel, because a ScrollViewer
+        // measures its content under infinite height and the alignment is a no-op there; reachability
+        // of the last row is the defect being fixed and takes precedence over the cosmetic hug.)
+        _list.VerticalAlignment = VerticalAlignment.Stretch;
         Grid.SetRow(_list, 0);
         listWrap.Children.Add(_list);
 
