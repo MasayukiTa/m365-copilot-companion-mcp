@@ -413,6 +413,25 @@ partial class CockpitWindow : Window
     // side once history itself grows past 2 MB, so raising it here covers both directions.
     JavaScriptSerializer _js = new JavaScriptSerializer { MaxJsonLength = int.MaxValue };
 
+    // Serialize cache access and periodically re-read to catch same-metadata replacements.
+    readonly object _statusCacheLock = new object();
+    long _statusCacheMtime;
+    long _statusCacheSize = -1;
+    Dictionary<string, object> _statusCacheRoot;
+    bool _statusCacheValid;
+    DateTime _statusCacheReadAt;
+
+    const double TickBaseMs = 700.0;
+    const double TickMaxMs = 5000.0;
+
+    // ── PERF: history row cap ─────────────────────────────────────────────────────
+    // The list is non-virtualized, so every history row emitted is a realized UIElement. Build at
+    // most this many by default; a "さらに表示" row lifts the cap (_histShowAll) for the session.
+    // The header/left-rail count stays the full _history.Count -- only the number of DRAWN rows
+    // changes. A new query or a reopened window resets _histShowAll back to the capped default.
+    const int HISTORY_DEFAULT_ROWS = 50;
+    bool _histShowAll;
+
     // Cached meta string for the directive-band row Sig (avoids per-tick rebuild when nothing changed).
     string _directiveBandMeta = "";
     // The on-board (non-History) workers the directive band aggregates its goals/lane counts from.
@@ -563,8 +582,10 @@ partial class CockpitWindow : Window
         this.PreviewKeyDown += OnScaleKeyDown;
         this.PreviewMouseWheel += OnScaleMouseWheel;
         _timer = new DispatcherTimer();
-        _timer.Interval = TimeSpan.FromMilliseconds(700);
-        _timer.Tick += new EventHandler(OnTick);
+        _timer.Interval = TimeSpan.FromMilliseconds(TickBaseMs);
+        // PERF: OnTickTimed wraps OnTick to measure its cost and adapt the next interval (adaptive
+        // backoff on a heavy fleet; snaps back to the 700 ms base when ticks are cheap again).
+        _timer.Tick += new EventHandler(OnTickTimed);
         _timer.Start();
         OnTick(null, null);
     }

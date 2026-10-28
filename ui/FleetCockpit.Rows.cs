@@ -357,11 +357,17 @@ partial class CockpitWindow
         }
         if (filtered.Count == 0) return;              // header still shown so the search box stays reachable
 
+        // Cap realized history rows, retaining the full ledger and count. Show more
+        // lets the user opt in to the remaining rows.
+        bool capped = !_histShowAll && filtered.Count > HISTORY_DEFAULT_ROWS;
+        int shownCount = capped ? HISTORY_DEFAULT_ROWS : filtered.Count;
+
         // P2 (a) DATE GROUPS: emit a subheader (今日 / 昨日 / YYYY-MM-DD / その他) whenever the day
         // bucket changes. `visible` is already newest-first, so groups come out most-recent-first.
         string lastGroup = null;
-        foreach (Dictionary<string, object> e in filtered)
+        for (int i = 0; i < shownCount; i++)
         {
+            Dictionary<string, object> e = filtered[i];
             string grp = HistoryGroupLabel(e);
             if (grp != lastGroup)
             {
@@ -371,6 +377,12 @@ partial class CockpitWindow
                 lastGroup = grp;
             }
             rows.Add(MkRow(3, null, e));             // one history row per visible entry
+        }
+        if (capped)
+        {
+            var md = new Dictionary<string, object>();
+            md["remaining"] = filtered.Count - shownCount;   // how many more exist
+            rows.Add(MkRow(11, null, md));           // "さらに表示 (残り M 件)" -> sets _histShowAll
         }
     }
 
@@ -444,6 +456,8 @@ partial class CockpitWindow
                        + "|" + (rv.Forced ? "f" : "-") + "|" + StableShortHash(rv.Goal);
             }
             case 4: return "DV|" + g;                          // "完了 (this run)" divider
+            case 11:                                           // history "さらに表示": keyed on how many more remain
+                return "HM|" + g + "|" + (hist != null ? I(hist, "remaining") : 0);
             case 5: return "ES|" + g + "|" + ReadQueuedJobs().Count;   // empty state: its headline counts the submitted group
             case 6:                                            // directive band: keyed on first-worker goal + started
                 return "DB|" + g + "|" + (w != null ? S(w, "goal") + "|" + S(w, "name") : "")
@@ -571,6 +585,8 @@ partial class CockpitWindow
     // 9=submitted-not-picked-up-yet (Hist["view"] is its SubmittedView),
     // 10=refused-not-submitted (Hist["refused"] is its RefusedView): a goal fleet_submit turned
     //    away, drawn in the submitted area with its reason and a person-only "force" button.
+    // 11=history "さらに表示" (Hist["remaining"] = how many more archived rows exist): PERF cap on
+    //    the non-virtualized list; clicking it sets _histShowAll and re-renders the full ledger.
     class Row
     {
         public int Kind;
@@ -610,6 +626,7 @@ partial class CockpitWindow
             if (r.Kind == 8) return _w.ResumeAffordance(
                 r.Hist != null ? I(r.Hist, "n") : 0,
                 r.Hist != null ? S(r.Hist, "signature") : "");
+            if (r.Kind == 11) return _w.HistoryMoreRow(r.Hist != null ? I(r.Hist, "remaining") : 0);
             return null;
         }
         public object ConvertBack(object value, Type targetType, object parameter, CultureInfo culture)
