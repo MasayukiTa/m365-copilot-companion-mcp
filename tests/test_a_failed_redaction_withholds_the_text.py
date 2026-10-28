@@ -34,25 +34,20 @@ def _boom(*a, **k):
 
 
 @pytest.fixture
-def no_db(monkeypatch, tmp_path):
-    """Capture batches written by the async writer in an isolated database."""
+def no_db(monkeypatch):
+    """Capture async writer batches without writing them to the database."""
     import bridge.session_store as store
     assert store.flush_fleet_turns(timeout=10)
-    monkeypatch.setenv(store.STORE_DIR_ENV, str(tmp_path / "store"))
     rows = []
-    original = store._write_fleet_turn_batch
 
     def capture(conn, batch):
-        # The writer may already hold a connection from an earlier test. Use a fresh
-        # isolated connection so this test never writes to that database.
-        isolated = store._db(import_files=False)
-        try:
-            original(isolated, batch)
-            rows.extend(obj for _, obj, _, _ in batch)
-        finally:
-            isolated.close()
+        rows.extend(obj for _, obj, _, _ in batch)
 
     monkeypatch.setattr(store, "_write_fleet_turn_batch", capture)
+    # Do not start the persistent writer before another module selects its store.
+    monkeypatch.setattr(store, "record_fleet_turn_async",
+                        lambda key, obj, name="", goal="":
+                        capture(None, [(key, obj, name, goal)]))
     yield rows
     assert store.flush_fleet_turns(timeout=10)
 
