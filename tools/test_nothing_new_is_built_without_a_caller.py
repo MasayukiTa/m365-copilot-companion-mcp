@@ -120,7 +120,6 @@ NO_CALLER_BUT_TESTED = {
     "relay/project_memory.py::list_themes",                      # 15 lines
     "tools/tool_probe.py::next_probe_instruction",               # 15 lines
     "relay/selfimprove/autonomy.py::lower_to",                   # 14 lines
-    "relay/selfimprove/harness_tree.py::branches",               # 14 lines
     "relay/turn_outcome.py::classify_turns",                     # 13 lines
     "relay/provenance.py::outranks",                             # 12 lines
     "relay/provenance.py::resolved_value",                       # 12 lines
@@ -340,7 +339,6 @@ REASONS: dict[str, tuple[str, str]] = {
                                                               "docs/unreached_burndown.md"),
     "relay/selfimprove/harness_tree.py::justified": ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/autonomy.py::lower_to": ("deliberate", "docs/unreached_burndown.md"),
-    "relay/selfimprove/harness_tree.py::branches": ("deliberate", "docs/unreached_burndown.md"),
     "relay/selfimprove/guards.py::partition_outcomes": ("deliberate",
                                                         "docs/unreached_burndown.md"),
     "relay/selfimprove/compare.py::transport_versions_differ": ("deliberate",
