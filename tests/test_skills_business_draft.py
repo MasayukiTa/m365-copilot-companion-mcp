@@ -345,3 +345,44 @@ def test_the_conftest_redirect_itself_is_in_place():
     production = Path(skill_draft.REPO) / ".fleet" / "skill_proposals"
     assert Path(skill_draft.PROPOSALS_DIR).resolve() != production.resolve()
     assert skill_lessons.MIN_SIMILARITY > 0
+
+
+# ----------------------------------------- 行#87: 過去参照つき多段フロー(ogf型)が一つのSkillになる
+#
+# 「過去のAAA資料を見てskillsを作り、別テーマBBBで過去参照しながら、
+#  データ抽出 -> 集計 -> 図作成 -> 資料作成 の一連の流れを曖昧指示で完遂する」。
+# 多段の goal が、月ごとに参照先が変わっても ONE group に正規化され、各工程と
+# 参照元パスが草案に保持されることを、合成 ledger で固定する(回帰)。
+
+OGF = ("D:/ogf/%s の実績を抽出し、得意先別に集計して、推移の図を作成し、"
+       "月次報告の資料(pptx)にまとめてください。"
+       "出力形式は 得意先,金額 の2列を図と資料に厳守。")
+
+
+def test_a_multistage_flow_with_past_references_becomes_one_skill(world):
+    # 3か月分を同じ手順で回した(参照先の月だけ違う)曖昧めの反復指示。
+    world["write_ledger"](extra=[(OGF % "2026-07", "DONE", 1),
+                                 (OGF % "2026-08", "DONE", 1),
+                                 (OGF % "2026-09", "DONE", 1)])
+    got = skill_candidates.candidates(ledger=str(world["ledger"]))
+    keys = {g["key"]: g for g in got["qualified"]}
+    flows = [g for k, g in keys.items() if "図を作成" in k]
+    assert len(flows) == 1, "参照先の月が違っても多段フローは ONE group"
+    assert (flows[0]["runs"], flows[0]["done"]) == (3, 3)
+
+
+def test_the_multistage_proposal_keeps_every_stage_and_the_reference_paths(world):
+    world["write_ledger"](extra=[(OGF % "2026-07", "DONE", 1),
+                                 (OGF % "2026-08", "DONE", 1),
+                                 (OGF % "2026-09", "DONE", 1)])
+    result = _propose(world)
+    flow = [x for x in result["new"] if x["goal"].startswith("D:/ogf/")]
+    assert len(flow) == 1, "多段フローが一つの新規提案になる"
+    p = flow[0]
+    # 過去参照: 3か月分の参照元パスが提案に残る。
+    assert set(p["paths"]) == {"D:/ogf/2026-07", "D:/ogf/2026-08", "D:/ogf/2026-09"}
+    # 各工程(抽出->集計->図->資料)が本文に保持される。
+    for stage in ("抽出", "集計", "図を作成", "資料"):
+        assert stage in p["body"], stage
+    # 出力契約も拾う。
+    assert {"出力形式", "厳守"} <= set(p["contracts"])
