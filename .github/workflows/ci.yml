@@ -112,6 +112,7 @@ jobs:
             tests/test_search_deadline.py \
             tools/test_child_env_credentials.py \
             tools/test_web_fetch_encoding.py \
+            tools/test_web_search_no_gpu_no_clone.py \
             tools/test_arg_repair.py \
             tools/test_tool_catalogue.py \
             tools/test_trace_view.py \
