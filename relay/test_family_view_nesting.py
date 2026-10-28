@@ -118,8 +118,8 @@ def test_orphan_child_group_is_reported_not_attached():
     assert g["merge_state"] == "pending"
 
 
-def test_depth_is_capped_and_a_loop_cannot_hang():
-    n = fv.MAX_DEPTH + 5
+def test_deep_chain_renders_without_orphans():
+    n = 40
     ws, lines = [], []
     for k in range(n):
         cid = "g%02d" % k
@@ -128,13 +128,34 @@ def test_depth_is_capped_and_a_loop_cannot_hang():
         ws.append(_w(name="n%d" % k, campaign_id=cid, task_id="t%02d" % k, parent_task_id=ptid,
                      role="subtask", status="done", outcome="FANOUT" if k < n - 1 else "DONE"))
     gs = fv.build_groups(ws, lines)
-    assert len(gs) == n and max(g["depth"] for g in gs) <= fv.MAX_DEPTH
-    assert any(g["orphan"] for g in gs)
-    # a two-group loop terminates and nothing is left depth-less
-    loop = [_w(name="a", campaign_id="cA", task_id="ta", parent_task_id="tb", role="subtask"),
-            _w(name="b", campaign_id="cB", task_id="tb", parent_task_id="ta", role="subtask")]
-    out = fv.build_groups(loop, [_head("cA", "tb", "cB"), _head("cB", "ta", "cA")])
-    assert len(out) == 2 and all(isinstance(g["depth"], int) for g in out)
+    assert len(gs) == n and max(g["depth"] for g in gs) == n - 1
+    assert not any(g["orphan"] for g in gs)
+    assert any(line.startswith("    " * (n - 1)) and "g39" in line
+               for line in fv.render_text(gs).splitlines())
+
+
+def test_cycles_and_chain_into_cycle_terminate():
+    for parents in ({"A": "B", "B": "A"}, {"A": "A"},
+                    {"A": "B", "B": "A", "C": "A", "D": "C"}):
+        ws = [_w(name=cid, campaign_id=cid, task_id="t" + cid, role="subtask")
+              for cid in parents]
+        lines = [_head(cid, "missing", parent) for cid, parent in parents.items()]
+        groups = fv.build_groups(ws, lines)
+        assert len(groups) == len(parents)
+        assert all(isinstance(g["depth"], int) and g["depth"] < len(parents) for g in groups)
+        assert len(fv.render_text(groups)) < 10000
+
+
+def test_deep_header_only_ancestors_are_read(tmp_path):
+    path = tmp_path / "campaigns.jsonl"
+    lines = [_head("g%02d" % k, "missing", "g%02d" % (k - 1) if k else "")
+             for k in range(40)]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    loaded = fv.read_campaign_lines(str(path), {"g39"})
+    assert len(loaded) == 40
+    ws = [_w(name="leaf", campaign_id="g39", task_id="leaf", role="subtask")]
+    group = fv.build_groups(ws, loaded)[0]
+    assert group["depth"] == 39 and not group["orphan"]
 
 
 def test_child_group_ids_are_clipped_but_the_count_is_exact():
