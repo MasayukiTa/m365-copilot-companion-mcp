@@ -50,8 +50,7 @@ relay.task_tree). Each group also carries:
       "descendant_count": 0,      # nested groups below this one (exact, not clipped)
       "descendant_turns": 0,      # sum of worker `turn` over those nested groups
       "orphan":           False   # a parent was recorded but is not in the data (reported, never
-                                  #   attached to a guess); loops / chains deeper than
-                                  #   MAX_DEPTH are cut the same way
+                                  #   attached to a guess); loops are cut the same way
 
 `merge_state` additionally takes "waiting_on_subgroups" (a nested group under one of its slots is
 not merged yet) and "unknown" (a slot reports FANOUT but no nested group is found for it, or a
@@ -78,7 +77,6 @@ CONSTRAINT_CAP = 120
 MAX_CONSTRAINTS = 5
 MAX_TOKENS = 8
 TOKEN_CAP = 30
-MAX_DEPTH = 16            # deeper chains are cut: the over-deep group is reported as an orphan
 MAX_CHILD_IDS = 50        # child_group_ids is clipped here; descendant_count stays exact
 MAX_TREE_ROWS = 20000     # rows handed to relay.task_tree
 
@@ -326,19 +324,19 @@ def _link_parents(groups, ws, heads):
     # Ancestor groups known only from their header (no live rows) get a link of their own so the
     # chain can still be walked; they are never reported as groups themselves.
     for cid in list(links):
-        cur, hops = links[cid][0], 0
-        while cur is not None and cur not in links and hops <= MAX_DEPTH:
-            hops += 1
+        cur, seen = links[cid][0], set()
+        while cur is not None and cur not in links and cur not in seen:
+            seen.add(cur)
             nxt = (heads.get(cur) or {}).get("parent_campaign_id") or None
             if nxt == cur or (nxt is not None and nxt not in groups and nxt not in heads):
                 nxt = None
             links[cur] = (nxt, "", False)
             cur = nxt
-    # Cut loops and over-deep chains: those groups are reported as orphans.
+    # Cut loops: the affected group is reported as an orphan.
     for cid in list(links):
-        seen, cur = [], cid
-        while cur is not None and cur not in seen and len(seen) <= MAX_DEPTH:
-            seen.append(cur)
+        seen, cur = set(), cid
+        while cur is not None and cur not in seen:
+            seen.add(cur)
             cur = links[cur][0]
         if cur is not None:
             links[cid] = (None, "", True)
@@ -369,8 +367,9 @@ def build_groups(workers, campaign_lines=None, ledger_fn=None):
                 fan_slots.setdefault(cid, []).append(str(w.get("task_id") or ""))
     depth, root = {}, {}
     for cid in sorted(gmap):
-        chain, cur = [], cid
-        while cur is not None:
+        chain, cur, seen = [], cid, set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
             chain.append(cur)
             cur = links[cur][0]
         top = chain[-1]
@@ -433,7 +432,7 @@ def render_text(groups):
     lines = []
     for g in _tree_order(groups or []):
         p, c = g["parent"], g["children"]
-        pad = "    " * min(int(g.get("depth") or 0), MAX_DEPTH)
+        pad = "    " * int(g.get("depth") or 0)
         block = ["%s  親: %s" % (g["label"], p["display_label"] or p["status"] or "-"),
                  "  子 %d 件: 待機 %d / 実行中 %d / 完了 %d / 失敗 %d / 中断 %d" % (
                      g["children_total"], c["queued"], c["running"], c["done"], c["failed"],
@@ -548,9 +547,8 @@ def read_campaign_lines(path, wanted_cids):
         _LINES_CACHE.pop(next(iter(_LINES_CACHE)))
     out, seen = list(state["kept"]), set(wanted)
     for cid in wanted:                 # ancestors known only from their header
-        cur, hops = (state["heads"].get(cid) or ("", ""))[0], 0
-        while cur and cur not in seen and hops <= MAX_DEPTH:
-            hops += 1
+        cur = (state["heads"].get(cid) or ("", ""))[0]
+        while cur and cur not in seen:
             seen.add(cur)
             head = state["heads"].get(cur)
             if not head:
