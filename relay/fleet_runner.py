@@ -1823,9 +1823,11 @@ def _close_idle_copilot_pages(context) -> int:
         if not stale:
             return 0
         if len(stale) >= len(context.pages):
-            try:
-                context.new_page().goto("about:blank", timeout=10000)
-            except Exception:
+            # REUSE an existing blank keep-alive instead of opening a second one
+            # (行#243). An unconditional open left a stray about:blank in a
+            # surfaced browser and accumulated one per sweep.
+            from relay.keepalive import ensure_keepalive_blank
+            if ensure_keepalive_blank(context) is None:
                 return 0
         closed = 0
         for p in stale:

@@ -11671,9 +11671,11 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         stale = [p for p in context.pages if "m365.cloud.microsoft" in (p.url or "")]
         if stale:
             if len(stale) >= len(context.pages):
-                try:
-                    context.new_page().goto("about:blank", timeout=10000)
-                except Exception:
+                # REUSE an existing blank keep-alive instead of opening a second
+                # one (行#243). An unconditional open left a stray about:blank in
+                # a surfaced browser and grew one per sweep.
+                from relay.keepalive import ensure_keepalive_blank
+                if ensure_keepalive_blank(context) is None:
                     stale = []          # no keep-alive -> do not risk closing the browser
             for p in stale:
                 try:
