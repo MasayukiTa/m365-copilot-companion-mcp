@@ -136,3 +136,45 @@ def test_read_image_still_says_what_it_actually_returns():
         "the docstring no longer records what it used to return, so the mistake can return"
     assert "model_picker=None" in body, \
         "ANALYZE is named without the caveat that it runs on a model nobody can pick"
+
+
+def test_the_fallback_without_an_image_block_refuses_to_pass_as_a_picture(monkeypatch):
+    """THE LAST PLACE THE DEFECT CAN HIDE, PINNED. The return-type fix is guarded above for the
+    normal path; this guards the OTHER exit. When fastmcp.utilities.types cannot be imported --
+    no Image content block can be built -- read_image falls back to a string. The original
+    defect was precisely a string that read as a successful picture and rendered nothing, so
+    this exit must not quietly become a bare data URI again. It has to (a) stay a string, so a
+    caller cannot misread an Image, (b) SAY it is not a rendered picture, and (c) still carry
+    the bytes so the data is not simply lost. A bare data URI here would re-create the exact
+    thing the refuter caught on 2026-09-17."""
+    import builtins
+
+    from PIL import Image as PILImage
+
+    import tools.image_ops as IO
+
+    real_import = builtins.__import__
+
+    def _no_fastmcp_image(name, *args, **kwargs):
+        if name == "fastmcp.utilities.types":
+            raise ImportError("forced: no FastMCP Image content block in this environment")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_fastmcp_image)
+
+    tmp = os.path.join(os.environ.get("TEMP", "."), "_no_block_fallback_probe.png")
+    PILImage.new("RGB", (72, 36), (20, 110, 190)).save(tmp)
+    try:
+        out = IO.read_image(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+
+    assert isinstance(out, str), \
+        "with no Image content block the only honest return is a string that admits it"
+    assert "no image content block" in out, \
+        "the fallback stopped warning that nothing renders this, so it reads as a picture"
+    assert "data:image/" in out and ";base64," in out, \
+        "the fallback dropped the bytes it promised to carry"
