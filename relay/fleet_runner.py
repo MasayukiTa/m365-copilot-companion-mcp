@@ -303,6 +303,67 @@ def merge_conv_rows(existing, entries, now=None):
     return rows, changed
 
 
+# ── STAGE B: skip workers that are finished or terminally stuck in the on_tick
+# consumers that only need LIVE workers. In a ~540-worker run the coordinator's
+# periodic pass took 430-470 s; Stage A moved the sqlite transcript writes off the
+# loop, and the cost left is on_tick handing the WHOLE worker list to every consumer
+# each tick -- terminal workers included. These three helpers are the set machinery,
+# kept at module level (not inside on_tick) so they can be tested in isolation. The
+# optimisation MUST NOT change any consumer's output: the status snapshot still lists
+# terminal workers (it is called with the full list), and only consumers whose result
+# is provably identical with the terminal rows removed are given the live-only view.
+# merge_conv_rows() above is such a consumer -- once a worker's row carries its url and
+# transcript, a later tick produces no change for it (changed stays False), so dropping
+# it from the input leaves the written registry byte-for-byte identical. The equality is
+# pinned by a test, not asserted here.
+
+
+def worker_is_terminal(w):
+    """True when this worker is finished or terminally stuck (status in TERMINAL).
+
+    TERMINAL is relay_fleet's own tuple -- done/stuck/maxturns/error/cancelled/
+    content_refused -- the exact set the sweep loop uses to decide a worker is over and
+    to release its tab. 'pending'/'awaiting_execution' are NOT terminal (the worker has
+    not run yet), and 'interrupted' is deliberately absent from TERMINAL (only a dead
+    coordinator's reaper writes it), so neither is skipped here."""
+    return getattr(w, "status", "") in TERMINAL
+
+
+def update_terminal_ids(workers, terminal_ids):
+    """Refresh the set of terminal worker names IN PLACE and return it.
+
+    A worker JOINS the set the first tick its status is in TERMINAL. It LEAVES the set
+    the moment an event touches it so that it is no longer terminal -- a state change
+    (e.g. a stuck worker re-attached, or a goal re-submitted onto the same worker name)
+    flips status back out of TERMINAL, and the next refresh drops the name. Names of
+    workers that no longer exist in the list are also dropped, so the set cannot grow
+    without bound across reconnect chunks that rebuild the worker list.
+
+    This derives the set from the live status each tick rather than hooking individual
+    events: it is O(workers) like the tick already is, and it cannot drift out of sync
+    with the real statuses the way an event-sourced set can when an event path is missed.
+    """
+    names = {getattr(w, "name", "") for w in (workers or [])}
+    live_terminal = {getattr(w, "name", "") for w in (workers or [])
+                     if worker_is_terminal(w)}
+    # drop names that left TERMINAL (state change / resubmission) or vanished from the list
+    terminal_ids.intersection_update(names)
+    terminal_ids.difference_update(terminal_ids - live_terminal)
+    terminal_ids.update(live_terminal)
+    return terminal_ids
+
+
+def live_only(workers, terminal_ids):
+    """The worker list with the terminal ones removed, order preserved.
+
+    Only for consumers that need live workers AND whose output is identical without the
+    terminal rows. The status snapshot must NOT be built from this -- it has to list
+    terminal workers -- so callers pass the FULL list to _snapshot and this view only to
+    the live-only consumers."""
+    skip = terminal_ids or set()
+    return [w for w in (workers or []) if getattr(w, "name", "") not in skip]
+
+
 def report_unused_steers(workers, reported=None, log=None):
     """Name every steering message a worker took to its grave.
 
@@ -4998,31 +5059,66 @@ def main():
 
 
     _steer_reported = set()
+    # STAGE B STATE, kept across ticks. `_terminal_ids` is the set of worker names that are
+    # finished or terminally stuck (see update_terminal_ids): refreshed each tick, used to
+    # hand the live-only consumers a shorter list. `_tick_metrics["last_log"]` throttles the
+    # measurement line to at most once every 30 s so it is visible in production without
+    # being one line per second (a log nobody reads).
+    _terminal_ids = set()
+    _tick_metrics = {"last_log": 0.0}
+    TICK_LOG_EVERY_S = 30.0
 
     def on_tick(workers):
         # BEFORE the commands, so that a live cockpit push in this same sweep is the
         # later word and wins. The operator moving a knob sends both -- the file is
         # saved and the command is pushed -- and they must not race to a different
         # answer depending on which the coordinator happened to read first.
+        _t_tick0 = time.time()
+        _spent = {}
+
+        def _timed(_name, _fn):
+            # Time one consumer. The measurement must never change behaviour or swallow an
+            # error the consumer would otherwise raise, so it only brackets the call.
+            _t0 = time.time()
+            try:
+                return _fn()
+            finally:
+                _spent[_name] = _spent.get(_name, 0.0) + (time.time() - _t0)
+
         for _key, _val in settings_follower.poll():
             print("[settings] %s -> %s (adopted live from the settings panel)"
                   % (_key, _val), flush=True)
-        _drain_commands(workers)
+        # Refresh the terminal set from live status FIRST, so every consumer below sees the
+        # same view this tick. A worker that left TERMINAL (state change / resubmission) or
+        # vanished from the list is dropped here; one that just went terminal is added.
+        update_terminal_ids(workers, _terminal_ids)
+        # The live-only view: terminal workers removed. Given ONLY to consumers whose output
+        # is provably identical without them (pinned by tests). The snapshot and the other
+        # consumers still receive the full `workers` list unchanged.
+        _live = live_only(workers, _terminal_ids)
+        _timed("drain_commands", lambda: _drain_commands(workers))
         # THE BUTTON'S JOB, DONE BY THE HARNESS. A refusal nobody classified used to need a
         # person to notice and press "re-unlock"; it is asked for here every sweep instead.
         # See sweep_unclaimed_refusals for the two incidents that bought this.
-        for _receipt in sweep_unclaimed_refusals(workers):
-            if isinstance(_receipt, dict):
-                reunlock_box[0] = _receipt
-        report_unused_steers(workers, _steer_reported)
-        _register_convs(workers)
+        def _sweep_refusals():
+            for _receipt in sweep_unclaimed_refusals(workers):
+                if isinstance(_receipt, dict):
+                    reunlock_box[0] = _receipt
+        _timed("sweep_unclaimed_refusals", _sweep_refusals)
+        _timed("report_unused_steers",
+               lambda: report_unused_steers(workers, _steer_reported))
+        # LIVE-ONLY. A terminal worker's registry row stops changing once its url and
+        # transcript are recorded (merge_conv_rows returns changed=False for it), so omitting
+        # it leaves conversations.json byte-for-byte identical. Pinned by
+        # tests/test_a_finished_worker_need_not_be_swept_every_tick.py.
+        _timed("register_convs", lambda: _register_convs(_live))
         # RUN-RESUME: refresh the completion map so a crash after this sweep can resume
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
-        _update_done_map(args.state_dir, workers)
+        _timed("update_done_map", lambda: _update_done_map(args.state_dir, workers))
         _sample_free_space(args.state_dir, disk_box[0])
-        _write_scope_tick(workers)      # shadow: record overlapping sibling writes (off = no-op)
+        _timed("write_scope_tick", lambda: _write_scope_tick(workers))      # shadow: record overlapping sibling writes (off = no-op)
         try:
-            _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
+            _timed("snapshot", lambda: _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
                                                  ram_floor_mb=ram_box[0], directive=directive,
                                                  run_label=run_label, goal_count=goal_count,
@@ -5031,7 +5127,7 @@ def main():
                                                  # next sweep admits them.
                                                  queued=len(add_box or []),
                                                  reunlock=reunlock_box[0],
-                                                 command_rejections=rejections_box))
+                                                 command_rejections=rejections_box)))
         except Exception as _status_exc:
             # SILENT HERE USED TO MEAN INVISIBLE, AND task_router.fleet_is_live() TRUSTED THE
             # FILE'S MTIME TO MEAN THE PROCESS. `_write_atomic`'s own docstring says a write
@@ -5046,7 +5142,28 @@ def main():
             # to take the run down, so we still swallow and continue.
             print("[status] WARN: could not write status.json this sweep: %s" % _status_exc,
                   flush=True)
-        _print_table(workers)
+        _timed("print_table", lambda: _print_table(workers))
+
+        # MEASURE, at most once every 30 s. One line per tick would be a log nobody reads;
+        # this is the number the Stage B change is meant to move -- how many workers were
+        # handed to the consumers, how many of those are live (the rest were skipped by the
+        # live-only view), the whole-tick cost, and each consumer's own cost -- so the effect
+        # is visible in production without a profiler. INFO level (plain print, the module's
+        # convention; it uses no logging module) and never allowed to disturb the tick.
+        try:
+            _tick_s = time.time() - _t_tick0
+            _now = time.time()
+            if _now - _tick_metrics["last_log"] >= TICK_LOG_EVERY_S:
+                _tick_metrics["last_log"] = _now
+                _total_n = len(workers or [])
+                _live_n = len(_live)
+                _parts = " ".join("%s=%.3f" % (_k, _spent[_k])
+                                  for _k in sorted(_spent))
+                print("[tick] workers=%d live=%d terminal_skipped=%d tick=%.3fs %s"
+                      % (_total_n, _live_n, _total_n - _live_n, _tick_s, _parts),
+                      flush=True)
+        except Exception:
+            pass
 
     from playwright.sync_api import sync_playwright
     from relay.relay_fleet import FleetContextLost, reset_socket_route

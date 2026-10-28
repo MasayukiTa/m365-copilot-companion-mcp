@@ -1090,7 +1090,8 @@ jobs:
             tests/test_reload_main_leaves_a_restore_behind.py \
             tools/test_reldisc.py \
             tests/test_owner_verbatim_realuse.py \
-            scripts/test_stability_replay.py
+            scripts/test_stability_replay.py \
+            relay/test_a_finished_worker_need_not_be_swept_every_tick.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
