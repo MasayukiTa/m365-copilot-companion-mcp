@@ -67,20 +67,20 @@ def _pending_jobs():
 
 # -- 1. a refusal leaves a full record -------------------------------------------------------
 
-def test_a_too_long_goal_leaves_a_refused_record_with_the_whole_goal():
-    """The jsonl digest keeps only an 80-char head; the forced resubmission re-sends the WHOLE
-    instruction, so the refused record must keep the goal in full."""
-    goal = "xy " * 2000                       # well over MAX_GOAL_CHARS once whitespace-collapsed
+def test_a_long_goal_is_spilled_not_refused_so_leaves_no_refused_record():
+    """A long goal is NO LONGER refused (owner order 2026-10-27): the whole text spills to a
+    brief outside the queue and the goal is queued inline as a short pointer. Because nothing
+    was refused, there is no refused record -- the old 'too_long leaves a record' case is gone.
+    """
+    goal = "xy " * 2000                       # well over SPILL_GOAL_CHARS once whitespace-collapsed
     out = FI.fleet_submit(goal, source="phone")
-    assert "over the" in out                   # it really was refused
-    (rec,) = _refused_records()
-    assert rec["reason"] == "too_long"
-    assert rec["source"] == "phone"
-    assert rec["forced"] is False
-    # the WHOLE goal, not a head: normalised (whitespace-collapsed) but not truncated
-    assert rec["goal"] == " ".join(goal.split())
-    assert "id" in rec and rec["id"]
-    assert rec["refused_at"] > 0
+    assert "queued" in out and "refused" not in out
+    assert _refused_records() == []
+    # the whole instruction is preserved in the brief, not truncated
+    (job,) = _pending_jobs()
+    assert job["payload"]["goal_spilled"] is True
+    with open(job["payload"]["brief"], encoding="utf-8") as fh:
+        assert fh.read() == " ".join(goal.split())
 
 
 def test_a_near_duplicate_is_accepted_and_only_noted_not_refused(monkeypatch):

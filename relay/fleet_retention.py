@@ -188,6 +188,21 @@ def scratch(fleet_dir, now=None, dry_run=False, keep_days=None):
 #: Per-run worker transcripts (transcripts/r<run>_a0_w<n>.jsonl) and the benchmark scratch
 #: beside them. The single biggest non-database category: 4199 files, 80 MB, of which 34 MB
 #: predates the last thirty days.
+#: .fleet/briefs holds the FULL text of every goal that was too long to queue inline (tools.
+#: fleet_intake spills it there and hands the worker a short pointer). It is bounded as a WHOLE --
+#: by total size and by file count -- which is what replaced the per-call length cap: a runaway
+#: that submits a thousand long goals grows THIS store, and this store is what gets trimmed, so the
+#: queue directory it used to threaten is never the thing that fills. Oldest briefs go first.
+#:
+#: A BRIEF A QUEUED JOB STILL POINTS AT IS NEVER REMOVED, however old or over-budget -- deleting it
+#: would leave a pending/running worker reading a pointer to a file that is gone, which is the exact
+#: failure spilling was built to avoid. Only briefs no live job references are eligible, and even
+#: those keep a recent floor (BRIEFS_KEEP_MIN newest, and anything newer than BRIEFS_KEEP_DAYS).
+BRIEFS_KEEP_MB = float(os.environ.get("MCP_FLEET_BRIEFS_MB", "64"))
+BRIEFS_KEEP_MAX = int(os.environ.get("MCP_FLEET_BRIEFS_MAX", "500"))
+BRIEFS_KEEP_MIN = int(os.environ.get("MCP_FLEET_BRIEFS_KEEP", "20"))
+BRIEFS_KEEP_DAYS = float(os.environ.get("MCP_FLEET_BRIEFS_DAYS", "14"))
+
 STORE_KEEP_DAYS = float(os.environ.get("MCP_FLEET_STORE_DAYS", "30"))
 
 #: Subdirectories the age rule may enter, BY NAME. An allow-list rather than a deny-list: a
@@ -285,6 +300,106 @@ def stores(fleet_dir, now=None, dry_run=False, keep_days=None, names=None):
                 continue
             freed += _rm(p, dry_run)
             removed.append(os.path.relpath(p, fleet_dir))
+    return freed, removed
+
+
+def _live_brief_paths(fleet_dir):
+    """Absolute, normcased paths of every brief a NOT-yet-finished job still points at.
+
+    Reads payload.brief out of each job json in tasks/{pending,running,awaiting}. A job in done/ is
+    finished and its brief is free to age; a job still waiting or running is not, and its brief is
+    the full instruction its worker has not necessarily opened yet -- so it is pinned here and the
+    trimmer below skips it whatever its age or the budget. Unreadable job files pin nothing (a
+    half-written queue entry is not yet a live reference); the trimmer's floors still protect a
+    recent brief even if the job that owns it could not be parsed this pass.
+    """
+    live = set()
+    for sub in ("pending", "running", "awaiting"):
+        d = os.path.join(fleet_dir, "tasks", sub)
+        if not os.path.isdir(d):
+            continue
+        try:
+            names = os.listdir(d)
+        except OSError:
+            continue
+        for nm in names:
+            if not nm.endswith(".json"):
+                continue
+            try:
+                with open(os.path.join(d, nm), encoding="utf-8") as fh:
+                    job = json.load(fh)
+                bp = (job.get("payload") or {}).get("brief")
+            except Exception:
+                continue
+            if bp:
+                live.add(os.path.normcase(os.path.abspath(bp)))
+    return live
+
+
+def briefs(fleet_dir, now=None, dry_run=False):
+    """Bound .fleet/briefs as a WHOLE -- by total size and file count -- deleting oldest first.
+
+    This is the store that replaced fleet_submit's per-call length cap: long goals spill here
+    (tools.fleet_intake._write_brief) instead of being refused, so this is where a flood of long
+    goals lands and this is what gets trimmed. The queue the old cap guarded is never touched by
+    goal length at all.
+
+    THREE THINGS ARE NEVER DELETED, so trimming can never strand a worker or erase a just-arrived
+    instruction:
+      * a brief a pending/running/awaiting job still points at (_live_brief_paths), at any age;
+      * the BRIEFS_KEEP_MIN newest briefs;
+      * any brief newer than BRIEFS_KEEP_DAYS.
+    Everything else is eligible, and is removed oldest-first only while the store is over EITHER
+    its size budget (BRIEFS_KEEP_MB) or its count budget (BRIEFS_KEEP_MAX).
+    """
+    now = time.time() if now is None else now
+    root = os.path.join(fleet_dir, "briefs")
+    if not os.path.isdir(root):
+        return 0, []
+    keep_mb = _setting("fleet_briefs_mb", BRIEFS_KEEP_MB)
+    keep_max = int(_setting("fleet_briefs_max", BRIEFS_KEEP_MAX))
+    keep_min = int(_setting("fleet_briefs_keep", BRIEFS_KEEP_MIN))
+    keep_days = _setting("fleet_briefs_days", BRIEFS_KEEP_DAYS)
+    budget = int(keep_mb * 1024 * 1024)
+
+    live = _live_brief_paths(fleet_dir)
+    files = []
+    try:
+        with os.scandir(root) as it:
+            for e in it:
+                try:
+                    if not e.is_file(follow_symlinks=False):
+                        continue
+                    st = e.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                files.append((e.path, st.st_mtime, st.st_size))
+    except OSError:
+        return 0, []
+
+    total = sum(sz for _, _, sz in files)
+    count = len(files)
+    # Newest first: everything at or before index keep_min is inside the count floor and kept.
+    files.sort(key=lambda t: t[1], reverse=True)
+
+    freed, removed = 0, []
+    # Walk oldest -> newest so the first file we consider deleting is the oldest.
+    for idx in range(len(files) - 1, -1, -1):
+        if total <= budget and count <= keep_max:
+            break  # both budgets satisfied, nothing more to do
+        path, mtime, size = files[idx]
+        if idx < keep_min:
+            break  # reached the newest keep_min; these are the recent floor, stop
+        if (now - mtime) / 86400.0 <= keep_days:
+            continue  # within the age floor: skip it, but older ones past it may still go
+        if os.path.normcase(os.path.abspath(path)) in live:
+            continue  # a live job still points here; never delete, try the next-oldest
+        n = _rm(path, dry_run)
+        if n or dry_run:
+            freed += n
+            removed.append(path)
+            total -= size
+            count -= 1
     return freed, removed
 
 
@@ -1476,6 +1591,7 @@ def apply(fleet_dir=None, now=None, dry_run=False):
                      ("rotations", rotations),
                      ("scratch", scratch),
                      ("stores", stores),
+                     ("briefs", briefs),
                      ("workspace_clones", workspace_clones),
                      ("conversations", conversations),
                      ("cap_jsonl", cap_jsonl),
@@ -1483,7 +1599,7 @@ def apply(fleet_dir=None, now=None, dry_run=False):
         try:
             if fn is cap_jsonl:
                 freed, items = cap_jsonl(fleet_dir, dry_run=dry_run)
-            elif fn in (coordinator_logs, scratch, stores, compress, conversations,
+            elif fn in (coordinator_logs, scratch, stores, briefs, compress, conversations,
                      workspace_clones, sweep_temp_home):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:

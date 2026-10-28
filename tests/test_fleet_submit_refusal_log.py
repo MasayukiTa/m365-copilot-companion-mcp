@@ -37,14 +37,16 @@ def test_missing_goal(state):
     assert r["reason"] == "missing_goal" and r["goal_len"] == 0 and r["source"] == "phone"
 
 
-def test_too_long(state):
+def test_a_long_goal_is_spilled_and_leaves_no_refusal(state, tmp_path, monkeypatch):
+    # A long goal is NO LONGER refused for length (owner order 2026-10-27): it spills to a brief
+    # and is queued, so the refusals log stays empty. TASKS is redirected so the accepted job
+    # (and its brief) land in a throwaway queue, not the real .fleet.
+    monkeypatch.setattr(FI.TR, "TASKS", str(tmp_path / "tasks"))
+    FI.TR.ensure_dirs()
     goal = "word\n" * 2000
     out = FI.fleet_submit(goal, source="s" * 200)
-    assert "over the %d limit" % FI.MAX_GOAL_CHARS in out
-    (r,) = _rows(state)
-    assert r["reason"] == "too_long" and r["goal_len"] == len(" ".join(goal.split()))
-    assert "\n" not in r["goal_head"] and len(r["goal_head"]) == 80
-    assert len(r["source"]) == 80
+    assert "queued" in out and "refused" not in out
+    assert _rows(state) == []
 
 
 def test_local_loop(state, monkeypatch):

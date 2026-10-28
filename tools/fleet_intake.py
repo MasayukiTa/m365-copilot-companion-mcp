@@ -43,10 +43,22 @@ import uuid
 
 from relay import task_router as TR
 
-#: A goal longer than this is a pasted document, not an instruction. The cap is generous --
-#: real SWE-bench goals run to a few hundred characters -- and it exists so a runaway agent
-#: cannot fill the queue directory with one call.
-MAX_GOAL_CHARS = 4000
+#: A goal longer than this is not REFUSED -- it is a pasted document, and the harness does with it
+#: exactly what an agent used to do by hand: it writes the whole thing to a brief file outside the
+#: queue (.fleet/briefs/<job id>.md) and hands the worker a short goal that points at it. Nothing is
+#: ever turned away for length (owner order 2026-10-27: "the runaway submission is the thing to fix,
+#: not the length"). MEASURED: the 5 goals this door ever refused as too_long were 4,078-5,562 chars
+#: (median 4,197), every one a separate Claude session that had put a worker's WHOLE instruction in
+#: the goal -- which the docstring and docs/agent_contract.md tell callers to do ("the whole
+#: instruction, standalone"). So length is the EXPECTED shape of a real goal, not a runaway signal;
+#: no same-sender burst appears in any record (.fleet/tasks/done, tool_events.jsonl, socket_route.jsonl).
+#: The queue directory is protected instead by bounding the briefs store as a whole (relay/
+#: fleet_retention.briefs), not by a per-call length cap.
+#:
+#: A goal at or under this length is queued inline exactly as before; only a longer one spills to a
+#: brief. Sized well above the longest real goal ever seen (5,562) so an ordinary instruction never
+#: spills, and generously above a few hundred chars so the inline path stays the common one.
+SPILL_GOAL_CHARS = 4000
 
 #: How many jobs may sit unclaimed before intake refuses. The queue is a handoff, not a
 #: mailbox: if nothing is draining it, the honest answer is to say so rather than to keep
@@ -800,12 +812,84 @@ def _write_refused_record(reason, goal_text, source, similar_to="", similarity=N
         return None
 
 
+# === Long goals spill to a brief, they are never refused ======================================
+#
+# WHY THIS EXISTS. docs/agent_contract.md and fleet_submit's own docstring both tell a caller to
+# send "the whole instruction, standalone -- whatever runs it will not see this conversation". A
+# real goal therefore CARRIES its context, and the 5 goals this door ever refused as too_long were
+# exactly that: 4,078-5,562 chars, each a separate session that had done what it was told. Refusing
+# them turned a correctly-formed instruction away at the door. The agent's own workaround was
+# already the right shape -- write the long part to a file and hand the worker a short pointer to
+# it -- so the harness now does that itself instead of asking the caller to.
+#
+# OUTSIDE THE QUEUE, ON PURPOSE. The brief is written under .fleet/briefs/, not into tasks/pending/,
+# so the thing a per-call length cap was meant to protect -- the queue directory a runaway could
+# flood -- is never touched by goal length at all. The queue entry stays small (a 600-char summary
+# plus a path) however long the real instruction is. The briefs store is bounded as a WHOLE by
+# relay/fleet_retention.briefs (total size + file count), which is where a genuine flood is caught.
+
+#: Where a spilled goal's FULL text is written, one UTF-8 file per job, named by the job id. Write
+#: once and never append or rewrite: the brief is the instruction as it arrived, and a worker that
+#: re-reads it must see the same bytes every time.
+BRIEFS_DIR = "briefs"
+
+#: How much of the goal the inline summary carries. The worker gets this plus "the rest is in
+#: <path>, read it" -- enough to recognise the job on the queue and in the cockpit without opening
+#: the file, and small enough that the queue entry stays tiny whatever the brief holds.
+BRIEF_SUMMARY_CHARS = 600
+
+
+def _briefs_dir() -> str:
+    # The .fleet root is the parent of TR.TASKS (.fleet/tasks). Derived from TASKS rather than a
+    # separate constant so a test that redirects TR.TASKS to a tmp dir moves the briefs store with
+    # it -- writing briefs into the real .fleet while the queue is redirected is the split-brain a
+    # retention test exists to prevent.
+    return os.path.join(os.path.dirname(TR.TASKS), BRIEFS_DIR)
+
+
+def _brief_path(jid: str) -> str:
+    return os.path.join(_briefs_dir(), "%s.md" % jid)
+
+
+def _write_brief(jid: str, goal_text: str) -> str:
+    """Write the WHOLE goal to .fleet/briefs/<jid>.md and return its absolute path (or "" on
+    failure). UTF-8, written once via tmp-then-replace so a crash mid-write never leaves a worker
+    reading half a brief. The caller falls back to queuing the goal inline when this returns "".
+    """
+    try:
+        d = _briefs_dir()
+        os.makedirs(d, exist_ok=True)
+        path = _brief_path(jid)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(goal_text)
+        os.replace(tmp, path)
+        return os.path.abspath(path)
+    except Exception:
+        return ""
+
+
+def _short_goal_for_brief(goal_text: str, brief_path: str) -> str:
+    """The short goal the worker is handed in place of a spilled one: the first BRIEF_SUMMARY_CHARS
+    of the real instruction, then a plain line telling the worker the full text is in `brief_path`
+    and to read it. This is the SAME short-pointer shape an agent used to compose by hand; the
+    harness now builds it so no caller has to.
+    """
+    head = goal_text[:BRIEF_SUMMARY_CHARS]
+    return ("%s\n\n[goal truncated at %d of %d chars -- the FULL instruction for this job is saved at\n"
+            "%s\nRead that file in full before acting; it is the whole goal, standalone.]"
+            % (head, BRIEF_SUMMARY_CHARS, len(goal_text), brief_path))
+
+
 def fleet_submit(goal: str, note: str = "", source: str = "",
                  priority: bool = False, resume_conv: str = "") -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
 
     goal: the whole instruction, standalone -- whatever runs it will not see this
-    conversation. note: context for the human reviewing the queue; never executed.
+    conversation. This is EXPECTED to be long, and a long goal is never refused: past
+    SPILL_GOAL_CHARS the whole text is saved to .fleet/briefs/<job id>.md and the worker is
+    handed a short summary that points at that file (see _write_brief). note: context for the
+    human reviewing the queue; never executed.
     source: where the instruction came from.
     priority: jump the fleet's pending queue when a slot frees up. NOT a way to run sooner
     than the machine can -- the fleet still waits for a free worker slot, and a priority goal
@@ -827,11 +911,6 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         _log_refusal("missing_goal", text, source)
         _write_refused_record("missing_goal", text, source)
         return "[fleet_submit: refused -- an empty goal is not an instruction]"
-    if len(text) > MAX_GOAL_CHARS:
-        _log_refusal("too_long", text, source)
-        _write_refused_record("too_long", text, source)
-        return ("[fleet_submit: refused -- the goal is %d characters, over the %d limit. "
-                "Send the instruction, not the document.]" % (len(text), MAX_GOAL_CHARS))
     if TR.is_local_loop_control_submission(text, source):
         _log_refusal("local_loop", text, source)
         _write_refused_record("local_loop", text, source)
@@ -871,6 +950,18 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
                 "draining the queue. Ask the owner to look before sending more.]" % n)
 
     jid = uuid.uuid4().hex[:12]
+    # SPILL A LONG GOAL TO A BRIEF, do not refuse it. A goal past SPILL_GOAL_CHARS is written WHOLE
+    # to .fleet/briefs/<jid>.md and the worker is handed a short summary that points at that file --
+    # the same short-pointer an agent used to compose by hand, now built by the harness. The brief
+    # lives OUTSIDE the queue directory, so a long goal never enlarges a queue entry. If the brief
+    # cannot be written for any reason, the goal is queued inline unchanged (a worker reading the
+    # whole instruction is never worse than being refused), and that is the only fallback.
+    queued_goal = text
+    brief_path = ""
+    if len(text) > SPILL_GOAL_CHARS:
+        brief_path = _write_brief(jid, text)
+        if brief_path:
+            queued_goal = _short_goal_for_brief(text, brief_path)
     job = {
         "id": jid,
         "type": "fleet_goal",
@@ -885,7 +976,7 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         # fleet, and from here it has to survive all three delivery routes as the goal-item
         # field `resume_conv`. Only set when non-empty, so an ordinary (non-continuation) job's
         # record is unchanged and `resume_conv not in payload` keeps meaning "start fresh".
-        "payload": dict({"goal": text, "note": _clean(note, 500), "priority": bool(priority)},
+        "payload": dict({"goal": queued_goal, "note": _clean(note, 500), "priority": bool(priority)},
                         **({"resume_conv": resume_conv} if resume_conv else {})),
         "created": time.time(),
         # PROVENANCE TRAVELS WITH THE JOB. This arrived over a tunnel from an agent, which is
@@ -899,6 +990,13 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
     # refused (guard off); a refused one never reaches here. The dup-notes line is written AFTER
     # the job is safely on disk, so a failed note never leaves a tagged job the log does not
     # mention, and a failed write never produces an orphan note.
+    # A SPILLED GOAL CARRIES ITS BRIEF PATH ON THE PAYLOAD, beside goal/priority, so the router,
+    # the cockpit and the worker can find the full instruction without parsing it back out of the
+    # summary text. Only set when the goal actually spilled, so an ordinary job's record is
+    # unchanged and `brief not in payload` keeps meaning "the goal IS the whole goal".
+    if brief_path:
+        job["payload"]["brief"] = brief_path
+        job["payload"]["goal_spilled"] = True
     if dup is not None:
         job["payload"]["possible_duplicate_of"] = dup[0]
         job["payload"]["similarity"] = round(float(dup[1]), 4)
