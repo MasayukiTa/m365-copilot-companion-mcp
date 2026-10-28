@@ -790,6 +790,7 @@ jobs:
             tests/test_refuter_source_check.py \
             tests/test_refuter_subject_check.py \
             tests/test_no_domain_words_in_harness.py \
+            tests/test_skills_fairtest.py \
             tests/test_skills_business_draft.py \
             tests/test_skills_business_lifecycle.py \
             tests/test_skills_business_matching.py \

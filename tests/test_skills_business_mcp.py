@@ -189,6 +189,7 @@ MATCH_CALLERS = {
     ("relay/relay_fleet.py", "_with_matched_skill"): "AUTOMATIC: injects it into a worker prompt",
     ("bridge/copilot_bridge.py", "_stream"): "AUTOMATIC: renders it into the bridge chat",
     ("scripts/win/skill_match_bench.py", "score"): "measurement script",
+    ("tools/skill_fairtest.py", "fires_on_short_prompt"): "measurement tool: reads only, judges a Skill",
 }
 #: The ONLY permitted caller of candidate_match(): the tool whose text says it is a candidate.
 CANDIDATE_CALLERS = {("tools/skill_ops.py", "skill_match")}
