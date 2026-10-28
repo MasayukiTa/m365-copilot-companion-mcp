@@ -154,6 +154,7 @@ partial class CockpitWindow
     {
         if (_histSearchBox == null) return;
         _histQuery = _histSearchBox.Text ?? "";
+        _histShowAll = false;   // PERF: a new query returns to the capped (recent-50) view; "さらに表示" re-opens it
         if (_histSearchTimer == null)
         {
             _histSearchTimer = new DispatcherTimer();
@@ -188,6 +189,28 @@ partial class CockpitWindow
         t.Foreground = Muted; t.FontSize = 12.5; t.VerticalAlignment = VerticalAlignment.Center;
         head.Children.Add(t);
         return head;
+    }
+
+    // PERF: the "さらに表示 (残り M 件)" row shown when the history list is capped to the most recent
+    // HISTORY_DEFAULT_ROWS entries (the list is non-virtualized, so each drawn row is a realized
+    // UIElement -- see AppendHistoryRows). Clicking it lifts the cap for the session (_histShowAll)
+    // and re-renders the full ledger. The header/left-rail count is unaffected; this only controls
+    // how many rows are DRAWN. Rendered as a plain full-width button styled like the Clear button.
+    UIElement HistoryMoreRow(int remaining)
+    {
+        var b = new Button();
+        b.Content = _lang == 0 ? ("さらに表示（残り " + remaining + " 件）")
+                               : ("Show more (" + remaining + " more)");
+        b.Cursor = Cursors.Hand; b.BorderThickness = new Thickness(1);
+        b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border;
+        b.Padding = new Thickness(12, 6, 12, 6); b.FontSize = 12;
+        b.Margin = new Thickness(8, 6, 8, 8);
+        b.HorizontalAlignment = HorizontalAlignment.Stretch;
+        b.HorizontalContentAlignment = HorizontalAlignment.Center;
+        b.ToolTip = _lang == 0 ? "残りの履歴をすべて表示します（件数は変わりません）"
+                               : "Show the rest of the history (the count does not change)";
+        b.Click += delegate { _histShowAll = true; ForceRender(); };
+        return b;
     }
 
     Border HistoryRow(Dictionary<string, object> e)
