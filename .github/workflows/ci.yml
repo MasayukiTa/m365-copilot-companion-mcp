@@ -328,6 +328,7 @@ jobs:
             ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py \
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
+            ui/test_the_cockpit_stays_responsive_with_many_workers.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
             ui/test_boosted_goal_takes_the_next_slot.py \
             ui/test_a_submitted_card_waits_for_the_run_to_be_accepted.py \
