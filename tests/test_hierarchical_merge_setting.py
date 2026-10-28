@@ -68,7 +68,7 @@ def test_with_no_settings_at_all_the_default_depth_is_two_and_in_force(tmp_path,
     assert fo.effective_max_depth() == 2
 
 
-@pytest.mark.parametrize("configured", [1, 2, 3])
+@pytest.mark.parametrize("configured", [1, 2, 3, 4, 100])
 @pytest.mark.parametrize("extra", [[KEY + "=off"], [KEY + "=junk"], [KEY + "="]])
 def test_off_or_unrecognised_caps_the_depth_at_one(tmp_path, monkeypatch, configured, extra):
     # off must now be explicit (or junk/empty, which still reads as off)
@@ -186,3 +186,10 @@ def test_the_tooltip_says_what_on_does():
     cs = _read("ui", "EffortPolicy.cs")
     assert "On lets fan-out depth above 1 take effect; verify with small goals first." in cs
     assert "System.Windows" not in cs and "PresentationFramework" not in cs
+
+
+@pytest.mark.parametrize("configured", [4, 100])
+def test_large_depth_is_effective_when_merge_is_on(tmp_path, monkeypatch, configured):
+    _settings(tmp_path, monkeypatch, "fanout_max_depth=%d" % configured, KEY + "=on")
+    assert fo.configured_max_depth() == configured
+    assert fo.effective_max_depth() == configured
