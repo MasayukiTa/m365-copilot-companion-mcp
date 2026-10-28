@@ -174,7 +174,22 @@ def main(argv=None) -> int:
     sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding="utf-8", errors="replace")
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--json", action="store_true", help="machine-readable help summary")
+    ap.add_argument("--skill", help="judge this trusted Skill instead of printing the help")
+    ap.add_argument("--ideal-file", help="text file holding the withheld ideal output (read only)")
+    ap.add_argument("--prompt", action="append", default=[],
+                    help="a short ordinary prompt; repeat for several")
+    ap.add_argument("--topic-vocab", default=None, help="generic words of the task (optional)")
     args = ap.parse_args(argv)
+    if args.skill:
+        if not args.ideal_file or not args.prompt:
+            print("error: --skill needs --ideal-file and at least one --prompt", file=sys.stderr)
+            return 2
+        from relay.skills import SkillStore
+        with open(args.ideal_file, encoding="utf-8-sig") as fh:
+            ideal = fh.read()
+        verdict = fairtest(SkillStore(REPO), args.skill, ideal, args.prompt, args.topic_vocab)
+        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+        return 0 if verdict["fair"] else 1
     if args.json:
         print(json.dumps({
             "reads_only": True,
