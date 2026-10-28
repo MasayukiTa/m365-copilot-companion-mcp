@@ -40,12 +40,15 @@ transcripts (.fleet/transcripts/*.jsonl):
 from __future__ import annotations
 
 import hashlib
+import atexit
 import json
 import logging
 import os
+import queue
 import random
 import re
 import sqlite3
+import threading
 import time
 from pathlib import Path
 
@@ -867,6 +870,95 @@ def record_fleet_turn(key, obj, name="", goal=""):
         _log.error("record_fleet_turn failed for key=%r: %s: %s", str(key)[:80],
                    type(exc).__name__, str(exc)[:200])
         return False
+
+
+_fleet_turn_queue = queue.Queue()
+_fleet_writer_lock = threading.Lock()
+_fleet_writer_thread = None
+
+
+def _write_fleet_turn_batch(conn, batch):
+    """Write a batch atomically on the writer's connection."""
+    conn.execute("BEGIN")
+    try:
+        for key, obj, name, goal in batch:
+            if not isinstance(obj, dict):
+                continue
+            # One malformed row must not discard its neighbours (the synchronous
+            # record_fleet_turn isolated rows the same way): skip it, say so, carry on.
+            try:
+                role = obj.get("role") or ("meta" if obj.get("meta") else
+                                           ("guid" if obj.get("guid") else "note"))
+                extra = {k: v for k, v in obj.items() if k not in ("turn", "role", "text", "ts")}
+                conn.execute(
+                    "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                    "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                    (str(key), str(name or ""), _intern_goal(conn, goal), obj.get("turn"),
+                     str(role), str(obj.get("text") or ""),
+                     json.dumps(extra, ensure_ascii=False, default=str),
+                     float(obj.get("ts") or time.time())))
+            except sqlite3.OperationalError:
+                raise
+            except Exception as exc:
+                _log.error("fleet transcript row skipped for key=%r: %s: %s",
+                           str(key)[:80], type(exc).__name__, str(exc)[:200])
+        conn.execute("COMMIT")
+    except Exception:
+        conn.rollback()
+        raise
+
+
+def _fleet_turn_writer():
+    conn = None
+    while True:
+        batch = [_fleet_turn_queue.get()]
+        while len(batch) < 200:
+            try:
+                batch.append(_fleet_turn_queue.get_nowait())
+            except queue.Empty:
+                break
+        try:
+            if conn is None:
+                conn = _db(import_files=False)
+            _write_fleet_turn_batch(conn, batch)
+        except Exception as exc:
+            _log.error("fleet transcript batch failed (%d rows): %s: %s",
+                       len(batch), type(exc).__name__, str(exc)[:200])
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = None
+        finally:
+            for _ in batch:
+                _fleet_turn_queue.task_done()
+
+
+def record_fleet_turn_async(key, obj, name="", goal=""):
+    """Queue a transcript row without waiting for SQLite."""
+    global _fleet_writer_thread
+    with _fleet_writer_lock:
+        if _fleet_writer_thread is None or not _fleet_writer_thread.is_alive():
+            _fleet_writer_thread = threading.Thread(target=_fleet_turn_writer,
+                                                    name="fleet-transcript-writer", daemon=True)
+            _fleet_writer_thread.start()
+    _fleet_turn_queue.put_nowait((key, obj, name, goal))
+
+
+def flush_fleet_turns(timeout=None):
+    """Wait for queued writes to finish; return False if the timeout expires."""
+    deadline = None if timeout is None else time.monotonic() + max(0, timeout)
+    with _fleet_turn_queue.all_tasks_done:
+        while _fleet_turn_queue.unfinished_tasks:
+            remaining = None if deadline is None else deadline - time.monotonic()
+            if remaining is not None and remaining <= 0:
+                return False
+            _fleet_turn_queue.all_tasks_done.wait(remaining)
+    return True
+
+
+atexit.register(flush_fleet_turns)
 
 
 #: How many characters of ONE stored text are kept. 0 = no cap. The default is far above any
