@@ -2203,9 +2203,9 @@ class _Transcript:
         bridge package that is somehow unavailable cannot take the fleet down with it.
         """
         try:
-            from bridge.session_store import record_fleet_turn
-            record_fleet_turn(self.key, obj, name=getattr(self, "_name", ""),
-                              goal=getattr(self, "_goal", ""))
+            from bridge.session_store import record_fleet_turn_async
+            record_fleet_turn_async(self.key, obj, name=getattr(self, "_name", ""),
+                                    goal=getattr(self, "_goal", ""))
         except Exception as exc:
             # NOT `pass`: a mirror that fails without a word is a database that silently holds
             # nothing (the chat-persist lesson, #130). The fleet still carries on.
