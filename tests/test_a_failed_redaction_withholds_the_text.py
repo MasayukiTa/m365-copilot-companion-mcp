@@ -35,13 +35,21 @@ def _boom(*a, **k):
 
 @pytest.fixture
 def no_db(monkeypatch):
-    """The transcript mirrors every line into bridge.session_store's real database. Capture
-    those rows instead, so the test reads what WOULD have been stored and touches nothing."""
+    """Capture async writer batches without writing them to the database."""
     import bridge.session_store as store
+    assert store.flush_fleet_turns(timeout=10)
     rows = []
-    monkeypatch.setattr(store, "record_fleet_turn",
-                        lambda key, obj, name="", goal="": rows.append(obj))
-    return rows
+
+    def capture(conn, batch):
+        rows.extend(obj for _, obj, _, _ in batch)
+
+    monkeypatch.setattr(store, "_write_fleet_turn_batch", capture)
+    # Do not start the persistent writer before another module selects its store.
+    monkeypatch.setattr(store, "record_fleet_turn_async",
+                        lambda key, obj, name="", goal="":
+                        capture(None, [(key, obj, name, goal)]))
+    yield rows
+    assert store.flush_fleet_turns(timeout=10)
 
 
 # ------------------------------------------------------------------ the shared redactor
@@ -115,6 +123,8 @@ def _transcript(tmp_path):
 
 
 def _persisted(t, rows):
+    import bridge.session_store as store
+    assert store.flush_fleet_turns(timeout=10)
     with open(t.path, encoding="utf-8") as fh:
         return fh.read() + json.dumps(rows, ensure_ascii=False)
 
