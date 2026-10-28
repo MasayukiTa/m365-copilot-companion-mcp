@@ -497,6 +497,13 @@ class FleetAgent:
         # isolation this class advertises did not exist. FLEET_STATE_DIR carries it
         # explicitly; the cwd carries it for anything that still resolves relatively.
         env["FLEET_STATE_DIR"] = state
+        # THIS IS A BENCH RUN, AND THE CHILD SHOULD BE TOLD SO. The six screen_* computer-use
+        # tools stay in the fleet's allowed set because refusing them outright made the
+        # capability untestable (relay/fleet_toolset.py), but a bench worker driving the
+        # operator's desktop is precisely what that comment said a bench run should not do.
+        # Declaring the run kind here lets fleet_toolset.check refuse those six to this child
+        # while an office-work run -- which never takes this path -- keeps reaching them.
+        env["FLEET_RUN_KIND"] = "bench"
         # THE CHILD MUST EMIT UTF-8, not merely be decoded as it. Decoding was fixed
         # on the parent side, which stops the reader thread dying -- but a child
         # printing ensure_ascii=False JSON through a cp932 stdout can raise
