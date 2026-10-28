@@ -204,7 +204,7 @@ partial class CockpitWindow
         b.Cursor = Cursors.Hand; b.BorderThickness = new Thickness(1);
         b.Background = BtnBg; b.Foreground = Fg; b.BorderBrush = Border;
         b.Padding = new Thickness(12, 6, 12, 6); b.FontSize = 12;
-        b.Margin = new Thickness(8, 6, 8, 10);
+        b.Margin = new Thickness(8, 6, 8, 8);
         b.HorizontalAlignment = HorizontalAlignment.Stretch;
         b.HorizontalContentAlignment = HorizontalAlignment.Center;
         b.ToolTip = _lang == 0 ? "残りの履歴をすべて表示します（件数は変わりません）"
