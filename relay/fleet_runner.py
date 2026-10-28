@@ -3118,7 +3118,7 @@ _AUTOSCALE_KEYS = frozenset({"on", "max", "default"})
 _STEER_KEYS = frozenset({"worker", "text"})
 #: Exactly the fields goals_from_command carries through.
 _GOAL_KEYS = frozenset({"text", "priority", "checks", "cwd", "jid", "follow_up_to",
-                        "resume_conv", "new_task", "retry"})
+                        "resume_conv", "new_task", "retry", "origin"})
 
 #: A job id / ack stem: what task_router mints (uuid hex) with room for other callers' ids,
 #: and nothing that can name a different directory or a device.
@@ -3377,6 +3377,11 @@ def _goal_item_error(it):
             return "%s must be true/false" % key
     if it.get("jid") is not None and not _is_safe_id(it["jid"]):
         return "jid must be a plain id"
+    if it.get("origin") is not None:
+        origin = it["origin"]
+        if (not isinstance(origin, dict) or set(origin) - {"via", "source"}
+                or any(not _text_ok(v, MAX_COMMAND_TEXT) for v in origin.values())):
+            return "origin must contain only bounded via and source strings"
     checks = it.get("checks")
     if checks is not None:
         rows = checks if isinstance(checks, list) else [checks]
