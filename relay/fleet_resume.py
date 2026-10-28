@@ -884,7 +884,7 @@ def resume_gate(record, now, free_bytes, floor_gb, signature, coordinator_live=F
         if prev_free is None:
             prev_free = _num((record.get("interrupted") or {}).get("free_bytes_at_death"))
     no_gain = free is None or prev_free is None or free <= prev_free
-    if signature and signature == resume.get("last_signature") and no_gain:
+    if signature and signature != "0" and signature == resume.get("last_signature") and no_gain:
         return False, "same_crash_no_more_space"
     if enospc and (free is None or prev_free is None or free <= prev_free):
         return False, "disk_full_no_more_space"

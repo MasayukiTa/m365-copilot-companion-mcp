@@ -348,6 +348,11 @@ def _snapshot_payload(status: dict, marker, evidence: dict, run_id: str,
                                    if isinstance(marker, dict) else None)
         if inherited:
             resume = inherited
+            # A long-lived coordinator is not a crash loop. Preserve its lineage for
+            # campaign scope, but start a new retry budget after ten minutes of service.
+            started = (marker or {}).get("start_ts")
+            if isinstance(started, (int, float)) and time.time() - started >= 600:
+                resume = {"count": 0, "history": [], "lineage": resume.get("lineage")}
     except Exception:
         pass
     return {

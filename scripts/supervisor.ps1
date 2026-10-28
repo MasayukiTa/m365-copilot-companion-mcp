@@ -2367,7 +2367,7 @@ function Get-FleetResumeGate {
     $noGain = ($null -eq $free) -or ($null -eq $prev) -or ($free -le $prev)
     $lastSig = ""
     if ($res -and $res.last_signature) { $lastSig = [string]$res.last_signature }
-    if ($Signature -and ($Signature -eq $lastSig) -and $noGain) { return "same_crash_no_more_space" }
+    if ($Signature -and $Signature -ne "0" -and ($Signature -eq $lastSig) -and $noGain) { return "same_crash_no_more_space" }
     if ($Enospc -and $noGain) { return "disk_full_no_more_space" }
     return "ok"
 }
@@ -2488,10 +2488,10 @@ function Invoke-FleetAutoResume {
             if ($f -and [double]::TryParse(([string]$f).Trim(), [System.Globalization.NumberStyles]::Float, [System.Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and $parsed -gt 0) { $floorGb = $parsed }
         } catch { $floorGb = $null }
         try {
-            $sigOut = & $Py -c "import sys, json; sys.path.insert(0, r'$Root'); sys.path.insert(0, r'$Root\scripts\win'); import resume_interrupted_fleet as r; d = r.fleet_resume_record(r'$($snap.Path)'); s, e = r.signature_for(r'$FleetDir', d, d.get('marker') or {}); print(s + ' ' + str(int(e)))" 2>$null
-            $parts = ([string]$sigOut).Trim() -split ' '
-            if ($parts.Count -ge 1 -and $parts[0]) { $signature = $parts[0] }
-            if ($parts.Count -ge 2 -and $parts[1] -eq "1") { $enospc = $true }
+            $sigOut = & $Py -c "import sys, json; sys.path.insert(0, r'$Root'); sys.path.insert(0, r'$Root\scripts\win'); import resume_interrupted_fleet as r; d = r.fleet_resume_record(r'$($snap.Path)'); s, e = r.signature_for(r'$FleetDir', d, d.get('marker') or {}); print(json.dumps({'signature': s, 'enospc': e}))" 2>$null
+            $sigData = ([string]$sigOut) | ConvertFrom-Json -ErrorAction Stop
+            if ($sigData.signature) { $signature = [string]$sigData.signature }
+            $enospc = ($sigData.enospc -eq $true)
         } catch { }
         $reason = Get-FleetResumeGate -Record $snap.Data -Now 0 -FreeBytes $freeNow -FloorGb $floorGb `
             -Signature $signature -CoordinatorLive:($runningCoordinators.Count -gt 0) -Enospc:$enospc
