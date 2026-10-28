@@ -34,14 +34,27 @@ def _boom(*a, **k):
 
 
 @pytest.fixture
-def no_db(monkeypatch):
-    """The transcript mirrors every line into bridge.session_store's real database. Capture
-    those rows instead, so the test reads what WOULD have been stored and touches nothing."""
+def no_db(monkeypatch, tmp_path):
+    """Capture batches written by the async writer in an isolated database."""
     import bridge.session_store as store
+    assert store.flush_fleet_turns(timeout=10)
+    monkeypatch.setenv(store.STORE_DIR_ENV, str(tmp_path / "store"))
     rows = []
-    monkeypatch.setattr(store, "record_fleet_turn",
-                        lambda key, obj, name="", goal="": rows.append(obj))
-    return rows
+    original = store._write_fleet_turn_batch
+
+    def capture(conn, batch):
+        # The writer may already hold a connection from an earlier test. Use a fresh
+        # isolated connection so this test never writes to that database.
+        isolated = store._db(import_files=False)
+        try:
+            original(isolated, batch)
+            rows.extend(obj for _, obj, _, _ in batch)
+        finally:
+            isolated.close()
+
+    monkeypatch.setattr(store, "_write_fleet_turn_batch", capture)
+    yield rows
+    assert store.flush_fleet_turns(timeout=10)
 
 
 # ------------------------------------------------------------------ the shared redactor
@@ -115,6 +128,8 @@ def _transcript(tmp_path):
 
 
 def _persisted(t, rows):
+    import bridge.session_store as store
+    assert store.flush_fleet_turns(timeout=10)
     with open(t.path, encoding="utf-8") as fh:
         return fh.read() + json.dumps(rows, ensure_ascii=False)
 
