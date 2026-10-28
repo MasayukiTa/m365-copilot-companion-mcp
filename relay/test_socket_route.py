@@ -1724,8 +1724,9 @@ def _fallback_worker(monkeypatch, route, reason):
     monkeypatch.setattr(rf, "report_route_fault", lambda *_a, **_k: None)
     kicks = []
 
-    def _kick(r, a):
-        kicks.append((r, a))
+    def _kick(r, a, expired=False):
+        # 失効経路は expired=True で即時更新を1回だけ要求する(フロア/バックオフを跨ぐ)。
+        kicks.append((r, a, bool(expired)))
         route.kicked += 1
         return True
 
@@ -1751,6 +1752,8 @@ def test_fallback_path_recovers_from_expiry_and_kicks_a_refresh(monkeypatch):
     assert w._needs_socket_rebind is True
     # 失効を掴んだワーカーが、次の sweep を待たずに更新を1回起動した。
     assert route.kicked == 1 and len(kicks) == 1
+    # かつ expired=True で起動した: フロアとバックオフを跨ぐ即時更新を要求している。
+    assert kicks[0][2] is True, "失効なのに expired フラグなしで更新を蹴っている"
 
 
 def test_fallback_path_still_refuses_an_unknown_landed_act(monkeypatch):
@@ -1816,8 +1819,9 @@ class _RetryRefreshRoute:
 def _retry_refresh_worker(monkeypatch, route, reason, goal):
     kicks = []
 
-    def _kick(r, a):
-        kicks.append((r, a))
+    def _kick(r, a, expired=False):
+        # 失効経路は expired=True で即時更新を1回だけ要求する(フロア/バックオフを跨ぐ)。
+        kicks.append((r, a, bool(expired)))
         route.kicked = getattr(route, "kicked", 0) + 1
         return True
 
@@ -1844,6 +1848,8 @@ def test_retry_socket_recovers_from_expiry_and_kicks_a_refresh(monkeypatch):
     assert w._retry_socket(EXPIRED) is True, \
         "失効ターンは未配送なのに、前ターンの着地状態で再接続を拒んでいる"
     assert route.kicked == 1 and len(kicks) == 1
+    # かつ expired=True で起動した: フロアとバックオフを跨ぐ即時更新を要求している。
+    assert kicks[0][2] is True, "失効なのに expired フラグなしで更新を蹴っている"
 
 
 def test_retry_socket_does_not_kick_on_an_unknown_drop(monkeypatch):
