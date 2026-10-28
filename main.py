@@ -172,6 +172,7 @@ from tools.pptx_ops import (
     pptx_add_table,
     pptx_export_png,
     pptx_from_markdown,
+    pptx_from_reference,
     pptx_info,
     pptx_replace_image,
 )
@@ -716,7 +717,7 @@ TOOLS = (
     # ODBC (corporate DBs via Windows / Entra auth)
     odbc_drivers, odbc_connections, odbc_tables, odbc_columns, odbc_query, odbc_to_excel,
     # pptx
-    create_pptx, pptx_from_markdown, pptx_info,
+    create_pptx, pptx_from_markdown, pptx_from_reference, pptx_info,
     pptx_add_slide, pptx_add_image, pptx_add_table, pptx_replace_image,
     pptx_export_png,
     # docx (Word documents)
