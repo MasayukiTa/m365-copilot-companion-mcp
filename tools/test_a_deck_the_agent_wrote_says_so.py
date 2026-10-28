@@ -40,14 +40,45 @@ from tools import _subproc, pptx_provenance as prov  # noqa: E402
 pytest.importorskip("pptx", reason="python-pptx is what carries the stale properties")
 
 
+def _strip_companion_tag(path):
+    """Remove any Companion* custom property from a deck, in place.
+
+    A SOURCE DECK MUST START CLEAN. When this test process itself runs with the child
+    interpreter's ``_pptx_autostamp`` directory on ``PYTHONPATH`` -- which happens whenever the
+    running MCP server handed its own environment down, measured 2026-10-28 -- that
+    ``sitecustomize`` hooks ``python-pptx``'s ``save`` and stamps *this* process's decks too,
+    so a deck a fixture builds to stand in for untouched past material is born already claiming
+    the agent made it. The stamp under test is the one a *child* writes; a tag the parent put
+    on its own fixture is noise from the harness, not the behaviour, so strip it here and keep
+    the fixture's promise (an unstamped source) true regardless of how this process was launched.
+    """
+    with zipfile.ZipFile(str(path)) as z:
+        items = [(i, z.read(i.filename)) for i in z.infolist()]
+    cleaned = []
+    for i, data in items:
+        if i.filename == prov.CUSTOM_PART:
+            props = prov._parse_custom(data.decode("utf-8", "replace"))
+            kept = {k: v for k, v in props.items() if not k.startswith(prov.PREFIX)}
+            if not kept:
+                continue  # drop an all-Companion part entirely
+            data = prov._render_custom(kept)
+        cleaned.append((i, data))
+    tmp = str(path) + ".clean"
+    with zipfile.ZipFile(tmp, "w", zipfile.ZIP_DEFLATED) as out:
+        for i, data in cleaned:
+            out.writestr(i, data)
+    os.replace(tmp, str(path))
+
+
 @pytest.fixture
 def deck(tmp_path):
-    """A minimal real .pptx, made the way a worker makes one."""
+    """A minimal real .pptx, made the way a worker makes one -- and guaranteed unstamped."""
     from pptx import Presentation
     p = tmp_path / "source.pptx"
     prs = Presentation()
     prs.slides.add_slide(prs.slide_layouts[6])
     prs.save(str(p))
+    _strip_companion_tag(p)  # see the helper: keep this source clean even under a stamped parent
     return p
 
 

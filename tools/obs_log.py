@@ -35,6 +35,15 @@ REFUSALS_NAME = "fleet_submit_refusals.jsonl"
 #: file from REFUSALS_NAME on purpose: a row here is an observation, not a refusal, and must not
 #: be miscounted as one.
 SIMILAR_OBSERVED_NAME = "fleet_submit_similarity.jsonl"
+#: Where a submission carrying SEVERAL INDEPENDENT GOALS in one prompt is NOTED without refusing
+#: it. The owner's instruction (2026-09-12, jsonl L6695) is that "複数のゴールは投げるべきでは
+#: ない。人間はそこまで詳細にプロンプトを書くはずがない" -- a real person types one instruction,
+#: not a numbered battery of them, so a prompt packed with many goals is the agent over-specifying,
+#: not the person. Following the same owner rule that governs similarity (2026-10-26/27), this is
+#: RECORDED, never refused: the goal is queued whole and the observation only keeps the pattern
+#: visible. A separate file from REFUSALS_NAME and SIMILAR_OBSERVED_NAME on purpose, so a row here
+#: is never miscounted as a refusal or as a near-duplicate.
+MULTI_GOAL_OBSERVED_NAME = "fleet_submit_multigoal.jsonl"
 
 _LOCK = threading.Lock()
 _WARNED = False
@@ -318,5 +327,23 @@ def log_similarity_observed(goal_text: str, source: str, similar_to: str = "",
         if similarity:
             row["similarity"] = round(float(similarity), 4)
         append(SIMILAR_OBSERVED_NAME, row)
+    except Exception as exc:
+        _note_failure(exc)
+
+
+def log_multi_goal_observed(goal_text: str, source: str, goal_count: int) -> None:
+    """Record that an incoming prompt carried SEVERAL INDEPENDENT GOALS -- WITHOUT refusing it.
+
+    The owner's rule (2026-09-12, jsonl L6695) is that a person does not write one prompt packed
+    with many goals; a submission that does is the agent over-specifying. Following the same
+    owner instruction that governs similarity (never refuse, only record), the goal is queued
+    whole and the count is noted here only so the pattern stays visible. Written to
+    MULTI_GOAL_OBSERVED_NAME, never REFUSALS_NAME, because nothing was refused. Never raises.
+    """
+    try:
+        row = {"goal_len": len(str(goal_text or "")),
+               "goal_head": head(goal_text, 80), "source": head(source, 80),
+               "goal_count": int(goal_count), "queued": True}
+        append(MULTI_GOAL_OBSERVED_NAME, row)
     except Exception as exc:
         _note_failure(exc)

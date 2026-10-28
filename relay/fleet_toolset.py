@@ -87,6 +87,40 @@ FLEET_TOOLS = {
     "screen_windows":   "what is open, which is often enough to decide without a picture",
 }
 
+# THE RUN-KIND DISTINCTION THAT THE BLOCK ABOVE SAID THIS FILE COULD NOT EXPRESS.
+#
+# The six screen_* tools are in FLEET_TOOLS because this list is consulted for EVERY fleet
+# run and a fleet worker is the only caller that can exercise computer use at all -- refusing
+# them outright made the capability untestable rather than a bench run safer (fa10aa26). But
+# the distinction actually wanted is by RUN KIND: a bench worker fixing a bug in a checkout
+# has no business driving the operator's desktop, while an office-work run is exactly the
+# caller that should reach it. That could not be said before because `check` took only a
+# name; now it takes an optional run kind, and these are the tools that answer differently to
+# it. A run that does not say which kind it is keeps the old behaviour (allowed), so the
+# office-work path that this whole capability exists to measure is unchanged; only a run that
+# declares itself a bench run is refused these.
+OFFICE_ONLY_TOOLS = frozenset((
+    "screen_look", "screen_click", "screen_scroll",
+    "screen_type", "screen_press", "screen_windows",
+))
+
+# Set by the caller that knows it is a bench run (the bench harness exports it to its worker
+# child, see bench/companionbench/fleet_agent.py). Absent for an office-work run and for the
+# operator's own calls, which is why absence means 'do not restrict'.
+RUN_KIND_ENV = "FLEET_RUN_KIND"
+
+
+def run_kind(explicit=None):
+    """'bench' | 'office' | '' (unknown). An explicit argument wins over the environment so a
+    caller that knows can say so without setting a process-global var; otherwise the bench
+    harness's exported FLEET_RUN_KIND is read. Anything unrecognised is treated as unknown,
+    which does not restrict."""
+    import os as _os2
+    k = (explicit if explicit is not None else _os2.environ.get(RUN_KIND_ENV, ""))
+    k = (k or "").strip().lower()
+    return k if k in ("bench", "office") else ""
+
+
 # Named so a reader can see what was considered and refused, rather than guessing that it was
 # forgotten. Absence is a decision; this records which decision.
 DELIBERATELY_EXCLUDED = {
@@ -186,7 +220,7 @@ DELIBERATELY_EXCLUDED = {
 # ---------------------------------------------------------------------------------------
 _OFFICE = ("create_docx create_pptx docx_from_markdown docx_info pdf_info read_docx read_excel "
            "read_pdf write_excel pptx_add_image pptx_add_slide pptx_add_table pptx_export_png "
-           "pptx_from_markdown pptx_info pptx_replace_image ocr_image ocr_pdf read_image "
+           "pptx_from_markdown pptx_from_reference pptx_info pptx_replace_image ocr_image ocr_pdf read_image "
            "image_info render_diagram render_math render_mermaid_png summarize_table "
            "sqlite_to_excel odbc_to_excel "
            "chart_render excel_chart_export chart_from_python").split()
@@ -227,9 +261,23 @@ for _n in _GIT_EXTRA:
     DELIBERATELY_EXCLUDED.setdefault(_n, "history is not needed to fix the bug at the base commit and invites reading other branches")
 
 
-def is_allowed(name: str) -> bool:
-    """The only question this module answers."""
-    return name in FLEET_TOOLS
+def is_allowed(name: str, run_kind_value=None) -> bool:
+    """Whether a fleet worker may reach `name`, now answered by RUN KIND too.
+
+    The base answer is unchanged: a tool not in FLEET_TOOLS is not allowed. The one thing run
+    kind changes is the six OFFICE_ONLY_TOOLS -- allowed for an office-work run (and for a run
+    that does not declare its kind, which keeps the old behaviour) and refused for a bench run,
+    which is the distinction the FLEET_TOOLS comment said this file could not express.
+
+    `run_kind_value` is an explicit kind ('bench'/'office'/None); None falls back to the
+    environment via run_kind(). A caller that passes nothing gets exactly the old result unless
+    the environment declares a bench run.
+    """
+    if name not in FLEET_TOOLS:
+        return False
+    if name in OFFICE_ONLY_TOOLS and run_kind(run_kind_value) == "bench":
+        return False
+    return True
 
 
 def unknown_tools(catalogue):
@@ -344,18 +392,30 @@ def _fleet_run_active():
         return False
 
 
-def check(name):
-    """(allowed, note). Never raises: a policy that can crash the gateway is worse than none."""
+def check(name, run_kind_hint=None):
+    """(allowed, note). Never raises: a policy that can crash the gateway is worse than none.
+
+    `run_kind_hint` is passed straight to is_allowed, so a bench run (declared explicitly or
+    through FLEET_RUN_KIND) is refused the six OFFICE_ONLY_TOOLS while an office-work run and an
+    undeclared run keep reaching them. Omitting it reproduces the old one-argument behaviour
+    exactly unless the environment declares a bench run -- which is the whole point: the old
+    call site in main.py did not change and still gets the right answer.
+    """
     try:
         m = mode()
-        if m == "off" or is_allowed(name):
+        if m == "off" or is_allowed(name, run_kind_hint):
             return True, ""
         if not _fleet_run_active():
             return True, ""
+        _rk = run_kind(run_kind_hint)
+        if name in OFFICE_ONLY_TOOLS and _rk == "bench":
+            _why = ("a bench worker fixing a bug in a checkout has no business driving the "
+                    "operator's desktop; office-work runs reach it")
+        else:
+            _why = DELIBERATELY_EXCLUDED.get(name, "never decided about")
         note = ("tool %r is outside the fleet's allowed set (%d tools); "
                 "reason it is not there: %s"
-                % (name, len(FLEET_TOOLS),
-                   DELIBERATELY_EXCLUDED.get(name, "never decided about")))
+                % (name, len(FLEET_TOOLS), _why))
         try:
             with open(SHADOW_LOG, "a", encoding="utf-8") as f:
                 f.write(_json.dumps({"t": _time.time(), "tool": name, "mode": m,

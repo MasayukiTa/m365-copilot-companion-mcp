@@ -110,12 +110,15 @@ jobs:
             tests/test_outcome_enum_closed.py \
             tests/test_unlock_oracle.py \
             tests/test_search_deadline.py \
+            tests/test_env_example_states_standard_tunnel_effect.py \
             tools/test_child_env_credentials.py \
             tools/test_web_fetch_encoding.py \
+            tools/test_web_search_no_gpu_no_clone.py \
             tools/test_arg_repair.py \
             tools/test_tool_catalogue.py \
             tools/test_trace_view.py \
             tools/test_edge_origin.py \
+            tools/test_origin_attribution.py \
             tools/test_semantic_layer.py \
             tools/test_semantic_tools_gate.py \
             tools/test_semantic_gaps.py \
@@ -247,6 +250,7 @@ jobs:
             relay/test_priority_survives_every_delivery_route.py \
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
+            relay/test_every_intake_route_leaves_one_receipt.py \
             relay/test_fanout_family_view.py \
             relay/test_family_view.py \
             relay/test_family_view_nesting.py \
@@ -326,6 +330,7 @@ jobs:
             ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py \
             ui/test_the_chat_window_sends_what_was_typed.py \
             ui/test_both_windows_can_be_constructed.py \
+            ui/test_the_cockpit_stays_responsive_with_many_workers.py \
             ui/test_a_submitted_task_is_on_top_at_once.py \
             ui/test_boosted_goal_takes_the_next_slot.py \
             ui/test_a_submitted_card_waits_for_the_run_to_be_accepted.py \
@@ -414,8 +419,11 @@ jobs:
             tools/test_no_window_opens_on_the_operators_desktop_during_a_test.py \
             tools/test_a_completion_marker_is_not_an_output_contract.py \
             tools/test_a_deck_the_agent_wrote_says_so.py \
+            tools/test_pptx_inherits_reference_template.py \
+            tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
             tests/test_flow_map_docs_name_files_that_exist.py \
+            tests/test_docs_research_plan_files_exist.py \
             tests/test_fleet_operation_routes_gui_and_invariant3.py \
             relay/test_whose_refusal_it_was_is_recorded_so_stop_guessing_from_length.py \
             relay/test_running_out_of_review_budget_is_not_passing_review.py \
@@ -533,6 +541,7 @@ jobs:
             relay/test_no_turn_capture_live.py \
             relay/test_lanes_default_and_send_bucket.py \
             relay/test_no_goal_path_opens_a_tab.py \
+            relay/test_aboutblank_is_reused_not_reopened.py \
             relay/test_socket_capacity.py \
             relay/test_sweep_hot_path.py \
             relay/test_the_cockpit_retry_is_accepted.py \
@@ -753,6 +762,7 @@ jobs:
             relay/test_fanout_worker.py \
             relay/test_splittability.py \
             relay/test_wants_fanout.py \
+            relay/test_natural_language_fanout_e2e.py \
             relay/test_fanout_reevaluates_per_goal.py \
             tests/test_stack_guard.py \
             tests/test_reap_orphan_edge.py \
@@ -1033,6 +1043,7 @@ jobs:
             tests/test_durable_access_log.py \
             tests/test_mcp_inbound_log.py \
             tests/test_fleet_submit_refusal_log.py \
+            tests/test_fleet_submit_multi_goal.py \
             tests/test_launch_gate_asks_only_what_it_reads.py \
             tools/test_notify_ops_gate_reachability.py \
             tools/test_no_toast_that_nobody_can_answer.py \
