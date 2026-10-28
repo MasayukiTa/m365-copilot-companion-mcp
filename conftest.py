@@ -106,6 +106,8 @@ LIVE_RECORD_REDIRECTS = {
     # The work-area guard's refusal ledger. A test that drives the guard would otherwise append
     # refusals to the operator's own .fleet\workarea_refusals.jsonl.
     "tools.workarea_guard": {"LEDGER_PATH": "workarea_refusals.jsonl"},
+    # Guard warnings and refusals are appended to an operator ledger; isolate test writes.
+    "tools.live_write_guard": {"LEDGER_PATH": "live_write_refused.jsonl"},
     # Approved/unknown Work IQ cards (counts, tool names, conversation ids). A test that drives
     # the recorder would otherwise add rows to the operator's own approval record.
     "relay.consent_approve": {"LOG_PATH": "consent_approvals.jsonl"},
@@ -364,6 +366,9 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    ("tools.live_write_guard", "describe"):
+        "read-only status function reporting LEDGER_PATH, which is redirected for tests; "
+        "it does not write a record",
     # NOT A PATH -- A SET OF TOP-LEVEL NAMES the work-area guard allows at the checkout root
     # (".fleet", ".jobs", "generated" ...). Nothing is written through it; redirecting it would
     # make the guard refuse the product's own directories.

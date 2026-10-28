@@ -259,6 +259,32 @@ def _fanout_limit_reader(field):
     return _read
 
 
+def _reader_live_checkout_write_guard():
+    # live_checkout_write_guard follows the file at every write through file_ops._validate_path.
+    # mode() reads settings.txt fresh (mtime-cached); _reset_for_test drops that cache so the
+    # test's second write is seen without a restart. Env would beat the file, so it is cleared
+    # by the parametrized test before the first read.
+    from tools import live_write_guard
+    live_write_guard._reset_for_test()
+    return live_write_guard.mode()
+
+
+def _reader_child_process_priority():
+    # child_process_priority is read once per child spawned through tree_popen_kwargs. The
+    # reader re-reads settings.txt each call (no module cache of its own), so pointing
+    # SP.NEW_PATH at the test's file makes the next read see the operator's change.
+    from tools import childproc
+    return childproc._priority_name()
+
+
+def _reader_live_checkout_write_allow():
+    # The raw value an operator would see take effect: the one scope name they allow-listed.
+    from tools import live_write_guard
+    live_write_guard._reset_for_test()
+    scopes = sorted(live_write_guard._allow_scopes())
+    return scopes[0] if scopes else ""
+
+
 #: The reader whose return value an operator would see change, per key that claims to follow
 #: the file. A registry rather than a literal parameter list: a key declared live with no
 #: entry here FAILS the next test instead of quietly not being checked, which is how the
@@ -293,6 +319,9 @@ _LIVE_READERS = {
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
     "workarea_guard": (_reader_workarea_guard, "warn", "enforce"),
     "workarea_allow": (_reader_workarea_allow, "audit_alpha", "audit_beta"),
+    "live_checkout_write_guard": (_reader_live_checkout_write_guard, "warn", "block"),
+    "live_checkout_write_allow": (_reader_live_checkout_write_allow, "ops_alpha", "ops_beta"),
+    "child_process_priority": (_reader_child_process_priority, "below_normal", "idle"),
     "fleet_submit_dup_guard": (_reader_dup_guard, "off", "on"),
     "fanout_max_total": (_fanout_limit_reader("total"), "10", "30"),
     "fanout_max_active": (_fanout_limit_reader("active"), "2", "6"),
