@@ -1917,7 +1917,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     from relay.relay_fleet import (free_disk_gb, floor_source as _floor_source,
                                    floor_source_text as _floor_source_text,
                                    floor_warning as _floor_warning,
-                                   active_worker_count, priority_extra_slots)
+                                   active_worker_count, verification_worker_count, priority_extra_slots)
     total = len(workers)        # dynamic: goals can be added mid-run (native chat queue)
     done = sum(1 for w in workers if w.status in TERMINAL)
     # open_tabs = ACTUAL browser tabs across the fleet: main agent tabs PLUS open sub-agent
@@ -1950,6 +1950,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "paused": bool(paused),        # fleet frozen by the cockpit (pause toggle)
         "max_concurrent": max_concurrent,
         "active_concurrent": active_worker_count(workers),
+        "verification_concurrent": verification_worker_count(workers),
         "priority_extra_slots": priority_extra_slots(),
         "open_tabs": open_tabs,
         "avail_mb": round(avail_phys_mb()),

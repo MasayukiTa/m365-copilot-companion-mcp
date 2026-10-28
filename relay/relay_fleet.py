@@ -2439,8 +2439,15 @@ def _jid_is_live(workers, jid, exclude=None):
 
 
 def active_worker_count(workers):
-    """Count running workers identically for socket and tab routes."""
-    return sum(1 for w in workers if w.status not in TERMINAL and w.status != PENDING)
+    """Count admitted goal work, excluding review and deferred resumption."""
+    # ready/waiting, researching, awaiting gates and replay belong to the goal's
+    # execution; verifying/refuting are independent checks, not goal execution.
+    return sum(1 for w in workers if w.status not in TERMINAL
+               and w.status not in (PENDING, "verifying", "refuting", "awaiting_execution"))
+
+
+def verification_worker_count(workers):
+    return sum(1 for w in workers if w.status in ("verifying", "refuting"))
 
 
 def priority_extra_slots():
@@ -11412,13 +11419,21 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             ceiling = asc_box[1] or autoscale_max
         _lane_ceiling = max(1, int(ceiling)) if asc_on else max(1, int(mc_box[0]))
         _socket_cap = min(_lane_ceiling, socket_capacity.ram_safeguard_cap(
-            _active_open(), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
+            active_worker_count(workers), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
             _lane_ceiling))
         _priority_ram_cap = socket_capacity.ram_safeguard_cap(
-            _active_open(), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
+            active_worker_count(workers), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
             _lane_ceiling + 100)
         if asc_on:
             mc_box[0] = _socket_cap          # shown as the live cap; the ceiling is separate
+
+        # Resume reviewed goals before admitting new ones. A review can finish when
+        # all execution slots are occupied; hold its next turn until a slot opens.
+        for _w in workers:
+            if _w.status == "awaiting_execution" and concurrency_admits(
+                    workers, _socket_cap, getattr(_w, "priority", False),
+                    priority_extra_slots(), _priority_ram_cap):
+                _w.status = "ready"
 
         # KEEP THE TOKEN FRESH WHILE ANY GOAL IS UNFINISHED -- NOT ONLY WHILE THE ADMISSION QUEUE IS
         # NON-EMPTY. This kick used to sit inside `while pending:`. When every goal had been
@@ -11612,10 +11627,15 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # status flip. Until that exists, a steer that arrives too late is reported as
             # never used (fleet_runner.report_unused_steers) rather than acted on -- the
             # honest half of the feature, which is that the message is not silently lost.
-            if w.status in TERMINAL or w.status == PENDING:
+            if w.status in TERMINAL or w.status in (PENDING, "awaiting_execution"):
                 continue
+            _was_reviewing = w.status in ("verifying", "refuting")
             try:
                 w.poll()
+                if (_was_reviewing and w.status == "ready" and not concurrency_admits(
+                        [x for x in workers if x is not w], _socket_cap,
+                        getattr(w, "priority", False), priority_extra_slots(), _priority_ram_cap)):
+                    w.status = "awaiting_execution"
             except Exception as e:
                 w.status, w.outcome = "error", "ERROR"
                 w.reason = type(e).__name__ + ": " + str(e)

@@ -238,18 +238,17 @@ def test_continuous_admission_no_barrier():
         _restore_worker(orig)
 
 
-# ── (c) verify-in-flight counts toward the cap ─────────────────────────────────────────────
-def test_verifying_counts_in_cap():
+# ── (c) verify-in-flight does not count toward the cap ─────────────────────────────────────────────
+def test_verifying_does_not_count_in_cap():
     rf.avail_phys_mb = lambda: 64000.0
     rf.free_disk_gb = lambda path=None: 500.0
     state = {"control": {}}
     orig = _install_fake_worker(state)
     try:
         # cap of 1: the first worker goes into 'verifying' and STAYS there for several sweeps.
-        # A verifying tab still holds its slot, so the SECOND goal must NOT be admitted while
-        # w0 verifies. We let w0 verify for a few sweeps, then finish it; only then may w1 open.
+        # The second goal can be admitted while w0 verifies, but not while w0 executes.
         goals = ["g0", "g1"]
-        observed = {"second_open_during_verify": False, "ticks": 0}
+        observed = {"second_open_during_verify": False, "second_open_during_execution": False, "ticks": 0}
 
         def on_tick(workers):
             observed["ticks"] += 1
@@ -262,19 +261,23 @@ def test_verifying_counts_in_cap():
             else:
                 if w0 is not None and w0.page is not None:
                     state["control"]["w0"] = "done"
-            # the violation we are testing for: w1 holding a tab while w0 is still verifying
+            # Record whether w1 opens while w0 is verifying or still executing.
             if (w1 is not None and getattr(w1, "page", None) is not None
                     and w0 is not None and w0.status == "verifying"):
                 observed["second_open_during_verify"] = True
-            # once w0 is terminal, let w1 finish too so the loop can exit (it was admitted only
-            # after w0 freed its slot -- exactly the behavior under test).
+            if (w1 is not None and getattr(w1, "page", None) is not None
+                    and w0 is not None and w0.status not in ("verifying", "done")):
+                observed["second_open_during_execution"] = True
+            # Let w1 finish so the loop can exit.
             if w1 is not None and getattr(w1, "page", None) is not None and w1.status == "waiting":
                 state["control"]["w1"] = "done"
 
         res = run_relay_fleet(FakeContext(), goals, "http://agent", max_concurrent=1,
                               poll_s=0, on_tick=on_tick, notify=lambda *a, **k: None)
-        check("verify_blocks_second_admit",
-              observed["second_open_during_verify"] is False)
+        check("verify_allows_second_admit",
+              observed["second_open_during_verify"] is True)
+        check("execution_blocks_second_admit",
+              observed["second_open_during_execution"] is False)
         check("verify_both_eventually_done",
               len(res) == 2 and all(r["outcome"] == "DONE" for r in res))
     finally:
@@ -1321,7 +1324,7 @@ def main():
                 test_socket_workers_respect_the_live_cap,
                 test_soft_shrink_does_not_close_running_tabs,
                 test_continuous_admission_no_barrier,
-                test_verifying_counts_in_cap,
+                test_verifying_does_not_count_in_cap,
                 test_disk_floor_blocks_in_loop,
                 test_stop_cancels_running_fleet,
                 test_pause_freezes_then_resumes,
