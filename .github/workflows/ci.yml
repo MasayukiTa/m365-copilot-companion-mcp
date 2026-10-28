@@ -117,6 +117,7 @@ jobs:
             tools/test_arg_repair.py \
             tools/test_tool_catalogue.py \
             tools/test_trace_view.py \
+            tools/test_edge_origin.py \
             tools/test_origin_attribution.py \
             tools/test_semantic_layer.py \
             tools/test_semantic_tools_gate.py \
