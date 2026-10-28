@@ -27,6 +27,32 @@ partial class CockpitWindow
 {
 
     // ── poll loop ─────────────────────────────────────────────────────────────────
+    // PERF: adaptive-interval wrapper around the real tick. We time how long a tick's own work
+    // takes and, when it runs long on a large fleet, push the next interval out so the UI thread
+    // is not saturated by back-to-back heavy ticks (a tick that costs ~1 s must not fire every
+    // 700 ms). Rule: next interval = clamp(max(base, ~3x last cost), base, max). With the parse
+    // cache most ticks are cheap and the interval sits at the 700 ms base; only genuinely heavy
+    // ticks (a real status change on a big fleet) stretch it, and it snaps back as soon as work
+    // is cheap again. Bounds: [700 ms, 5 s] (see TickBaseMs/TickMaxMs in FleetCockpit.cs).
+    void OnTickTimed(object sender, EventArgs e)
+    {
+        var started = DateTime.UtcNow;
+        try { OnTick(sender, e); }
+        finally
+        {
+            double costMs = (DateTime.UtcNow - started).TotalMilliseconds;
+            double next = costMs * 3.0;
+            if (next < TickBaseMs) next = TickBaseMs;
+            if (next > TickMaxMs) next = TickMaxMs;
+            if (_timer != null)
+            {
+                var want = TimeSpan.FromMilliseconds(next);
+                if (Math.Abs(_timer.Interval.TotalMilliseconds - next) > 1.0)
+                    _timer.Interval = want;   // DispatcherTimer applies the new interval after this tick
+            }
+        }
+    }
+
     // TOP-LEVEL GUARD. OnTick is a DispatcherTimer handler, so an exception that escapes it is
     // unhandled on the UI thread and TERMINATES the process -- which is exactly how the cockpit
     // died three times on 2026-10-27 (a NullReferenceException deep in the first RenderCards,
@@ -41,6 +67,13 @@ partial class CockpitWindow
 
     void OnTickCore(object sender, EventArgs e)
     {
+        // PERF: while the window is MINIMIZED there is nothing on screen to update, so skip the
+        // whole tick body -- no status parse, no render. A minimized cockpit used to keep parsing
+        // 1.2 MB and rebuilding 280+ rows every 700 ms for pixels no one could see; that is a large
+        // part of why the machine felt heavy with the window tucked away. We still run again on the
+        // next tick, so the moment it is restored the first visible tick refreshes everything.
+        if (WindowState == WindowState.Minimized) return;
+
         // follow external theme/lang/maxtabs edits (e.g. the chat toggled the theme)
         try
         {
@@ -119,7 +152,8 @@ partial class CockpitWindow
             bool resumeDismissed = resumeN > 0 && ResumeStateDismissed(resumeSig);
             string isig = "IDLE" + _history.Count + (_dark ? "D" : "L") + _lang + "|q" + (_histQuery ?? "")
                           + "|r" + resumeN + "|rs" + resumeSig + "|rd" + (resumeDismissed ? "1" : "0")
-                          + "|s" + _submittedSig;
+                          + "|s" + _submittedSig
+                          + "|ha" + (_histShowAll ? "1" : "0");   // PERF: cap vs full history must re-render
             if (_lastSig != isig)
             {
                 _lastRoot = null;
@@ -185,7 +219,7 @@ partial class CockpitWindow
         // PaintComposerMode: show "steer" surface while run is live.
         RefreshSpine(root, false);
         PaintComposerMode(runningNow);
-        string sig = Sig(root) + "|s" + _submittedSig;
+        string sig = Sig(root) + "|s" + _submittedSig + "|ha" + (_histShowAll ? "1" : "0");   // PERF: history cap state
         if (sig == _lastSig) return;
         _lastSig = sig;
         RenderCards(root);
@@ -267,19 +301,38 @@ partial class CockpitWindow
         }
     }
 
+    // Metadata avoids repeated parsing; bounded expiry catches same-metadata replacements.
     Dictionary<string, object> ReadStatus()
     {
-        try
+        lock (_statusCacheLock)
         {
-            if (!File.Exists(_statusPath)) return null;
-            string text;
-            using (var fs = new FileStream(_statusPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
-            using (var sr = new StreamReader(fs, Encoding.UTF8))
-                text = sr.ReadToEnd();
-            if (string.IsNullOrEmpty(text)) return null;
-            return (Dictionary<string, object>)_js.DeserializeObject(text);
+            try
+            {
+                if (!File.Exists(_statusPath)) { _statusCacheValid = false; return null; }
+                long mtime = File.GetLastWriteTimeUtc(_statusPath).Ticks;
+                long size = new FileInfo(_statusPath).Length;
+                double age = (DateTime.UtcNow - _statusCacheReadAt).TotalSeconds;
+                if (_statusCacheValid && mtime == _statusCacheMtime && size == _statusCacheSize
+                    && age >= 0 && age < 5) return _statusCacheRoot;
+                string text;
+                using (var fs = new FileStream(_statusPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                using (var sr = new StreamReader(fs, Encoding.UTF8))
+                    text = sr.ReadToEnd();
+                if (string.IsNullOrEmpty(text)) { _statusCacheValid = false; return null; }
+                var root = (Dictionary<string, object>)_js.DeserializeObject(text);
+                _statusCacheValid = File.GetLastWriteTimeUtc(_statusPath).Ticks == mtime
+                                    && new FileInfo(_statusPath).Length == size;
+                if (_statusCacheValid)
+                {
+                    _statusCacheRoot = root;
+                    _statusCacheMtime = mtime;
+                    _statusCacheSize = size;
+                    _statusCacheReadAt = DateTime.UtcNow;
+                }
+                return root;
+            }
+            catch (Exception ex) { _statusCacheValid = false; NoteStatusReadFailure(ex); return null; }
         }
-        catch (Exception ex) { NoteStatusReadFailure(ex); return null; }
     }
 
     bool _statusReadFailLogged;
