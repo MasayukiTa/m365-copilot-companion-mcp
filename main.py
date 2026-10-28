@@ -599,6 +599,15 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
+def _inflight_count(snap: dict) -> int:
+    """The bare in-flight count for the unauthenticated /exec_status reply; never raises."""
+    try:
+        from tools import exec_inflight as _inflight
+        return int(_inflight.executing_count())
+    except Exception:
+        return int(snap.get("executing_count", 0))
+
+
 @mcp.custom_route("/exec_status", methods=["GET"])
 async def exec_status(request: Request) -> JSONResponse:
     """What the gateway is executing RIGHT NOW -- the fact the 2026-10-27..28 jams lacked.
@@ -632,7 +641,7 @@ async def exec_status(request: Request) -> JSONResponse:
     xff = request.headers.get("x-forwarded-for", "")
     is_local, _identity_ip = derive_identity(peer, xff)
     if not is_local and not _health_bearer_ok(request):
-        return JSONResponse({"status": "ok", "executing_count": snap.get("executing_count", 0)})
+        return JSONResponse({"status": "ok", "executing_count": _inflight_count(snap)})
     payload = {"status": "ok"}
     payload.update(snap)
     return JSONResponse(payload)
