@@ -35,7 +35,7 @@ from tools import live_write_guard as G  # noqa: E402
 
 @pytest.fixture
 def checkout(tmp_path, monkeypatch):
-    root = tmp_path / "resonac-mcp"
+    root = tmp_path / "live-checkout"
     (root / "ui").mkdir(parents=True)
     (root / ".fleet").mkdir(parents=True)
     monkeypatch.setattr(G, "CHECKOUT_ROOT", root)
@@ -99,5 +99,5 @@ def test_an_untracked_path_under_the_checkout_passes_validation(checkout, monkey
     monkeypatch.setenv(G.MODE_ENV, "block")
     # .fleet runtime state is not tracked source; a worker writes it normally.
     out = F._validate_path(str(checkout / ".fleet" / "status.json"), for_write=True)
-    assert str(out).replace("\\", "/").endswith("resonac-mcp/.fleet/status.json")
+    assert str(out).replace("\\", "/").endswith("live-checkout/.fleet/status.json")
     assert _ledger(checkout) == []

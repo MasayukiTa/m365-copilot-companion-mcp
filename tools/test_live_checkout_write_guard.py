@@ -52,7 +52,7 @@ def checkout(tmp_path, monkeypatch):
     is made, clears every cache and the two env overrides, and resets again on the way out so
     one test's env never leaks into the next.
     """
-    root = tmp_path / "resonac-mcp"
+    root = tmp_path / "live-checkout"
     (root / "ui").mkdir(parents=True)
     (root / ".fleet").mkdir(parents=True)
     monkeypatch.setattr(G, "CHECKOUT_ROOT", root)
