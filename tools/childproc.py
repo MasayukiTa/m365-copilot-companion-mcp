@@ -188,6 +188,9 @@ def priority_creationflags(name: Optional[str] = None) -> int:
     return getattr(subprocess, _WIN_PRIORITY_FLAGS.get(nm, ""), 0)
 
 
+_PREEXEC_BY_INC: dict = {}
+
+
 def _priority_preexec(name: Optional[str] = None):
     """A POSIX preexec_fn that renices the child, or None when nothing to do.
 
@@ -202,13 +205,18 @@ def _priority_preexec(name: Optional[str] = None):
     if not inc or not hasattr(os, "nice"):
         return None
 
-    def _apply():
-        try:
-            os.nice(inc)
-        except Exception:
-            pass
+    # One function object per increment: tree_popen_kwargs then returns equal dicts on every
+    # call, so callers (and relay/test_acceptance.py) can compare the kwargs they passed.
+    fn = _PREEXEC_BY_INC.get(inc)
+    if fn is None:
+        def fn():
+            try:
+                os.nice(inc)
+            except Exception:
+                pass
 
-    return _apply
+        _PREEXEC_BY_INC[inc] = fn
+    return fn
 
 
 def tree_popen_kwargs(headless: bool = False, priority: bool = True) -> dict:
