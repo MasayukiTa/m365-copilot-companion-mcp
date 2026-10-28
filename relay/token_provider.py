@@ -44,6 +44,28 @@ NO_TOKEN_BASE_S = float(os.environ.get("MCP_TOKEN_NO_TOKEN_BASE_S", "30"))
 #: measured at 77-134 s on 2026-10-14). There is no longer a real-turn stage in a capture.
 CAPTURE_TIMEOUT_S = float(os.environ.get("MCP_SOCKET_CAPTURE_TIMEOUT_S", "180"))
 
+#: Fraction of a token's ORIGINAL life at or below which a pre-emptive refresh is due. Replaces
+#: the fleet's fixed 1500 s margin for the *pre-expiry* decision only (the route still keeps its
+#: own fixed margin, which a test pins above the longest turn). A ratio scales with the token:
+#: a 14-minute token and a 52-minute token both refresh at the same fraction of life left, so a
+#: short token does NOT sit permanently inside a fixed margin and spin a capture every few
+#: seconds (the 3.8/min defect). 0.20 of a 58-min life is ~11.6 min of head-room.
+PREEMPT_REFRESH_FRACTION = float(os.environ.get("MCP_TOKEN_PREEMPT_FRACTION", "0.20"))
+#: Half-width of the per-key jitter band around that fraction. The whole fleet shares one `exp`,
+#: so without this every worker crosses the threshold in the same second and they all refuse
+#: together (the 2026-10-27 16:00 burst: 498 refusals in one hour). A deterministic per-key
+#: offset in [-BAND, +BAND] spreads the crossings so captures stagger instead of stampeding.
+PREEMPT_JITTER_BAND = float(os.environ.get("MCP_TOKEN_PREEMPT_JITTER", "0.08"))
+
+
+def _key_jitter(key, band) -> float:
+    """A stable offset in [-band, +band] derived from the key, so a given agent always lands at
+    the same point in the band (no flapping) but different agents land at different points."""
+    import hashlib
+    h = int(hashlib.sha256(str(key or "").encode("utf-8")).hexdigest()[:8], 16)
+    frac = (h % 10000) / 10000.0        # [0, 1)
+    return (frac * 2.0 - 1.0) * float(band)
+
 
 def exp_of(token) -> float:
     """The `exp` claim of a token (seconds since epoch), 0 when unreadable."""
@@ -66,17 +88,35 @@ class CapturePolicy:
         #: Base of the failure backoff while no token is in hand. None = same as `base_s`.
         self.no_token_base_s = (self.base_s if no_token_base_s is None
                                 else float(no_token_base_s))
+        #: Pre-expiry refresh trigger: a fraction of the token's original life, with a per-key
+        #: jitter band so the shared-`exp` fleet does not all cross it at once. See the module
+        #: constants of the same name.
+        self.preempt_fraction = PREEMPT_REFRESH_FRACTION
+        self.preempt_band = PREEMPT_JITTER_BAND
         self._now = now
         self._lock = threading.Lock()
         # key -> {"exp", "streak", "fails", "next_at", "set_at", "why", "attempts", "last_error",
-        #         "last_error_at", "last_ok_at"}
+        #         "last_error_at", "last_ok_at", "force"}
         self._st = {}
 
     def _state(self, key):
         return self._st.setdefault(key, {"exp": 0.0, "streak": 0, "fails": 0,
                                          "next_at": 0.0, "set_at": 0.0, "why": "",
                                          "attempts": 0, "last_error": "",
-                                         "last_error_at": 0.0, "last_ok_at": 0.0})
+                                         "last_error_at": 0.0, "last_ok_at": 0.0,
+                                         "force": False, "life0": 0.0})
+
+    def arm_expired(self, key):
+        """A turn was just refused with an EXPIRED token: the shared `exp` really is past, so the
+        next capture must not be held back by the floor or by a same-exp/failure backoff that was
+        set when the token still had life. Opens a one-shot window that `allow` honours exactly
+        once; a genuine capture then resets the streak and the window closes on its own.
+
+        This cannot become a spin: one expired response arms at most one immediate capture, and
+        that capture either installs a newer `exp` (streak resets) or fails (backoff resumes from
+        `on_failure`)."""
+        with self._lock:
+            self._state(key)["force"] = True
 
     def allow(self, key, now=None, held=False) -> bool:
         """May a capture start now?
@@ -88,10 +128,49 @@ class CapturePolicy:
         now = float(self._now() if now is None else now)
         with self._lock:
             st = self._state(key)
+            if st.get("force"):
+                # A proven expiry armed this: bypass the floor and the backoff exactly once,
+                # then close the window so the normal pacing governs every later attempt.
+                st["force"] = False
+                return True
             due = st["next_at"]
             if held and st["set_at"]:
                 due = min(due, st["set_at"] + self.max_no_token_s)
             return now >= due
+
+    def due_for_preemptive_refresh(self, key, token=None, now=None,
+                                   fraction=None, band=None) -> bool:
+        """Should a refresh be kicked BEFORE the token expires?
+
+        Replaces the fleet's fixed 1500 s margin for the pre-expiry decision. The whole fleet
+        shares one `exp`; a fixed margin makes every worker cross it in the same second, so they
+        refuse together. Here the trigger is a FRACTION of the token's original life, offset by a
+        deterministic per-key jitter so the crossings stagger.
+
+        True when  remaining / life0  <=  fraction + jitter(key).
+
+        Why this cannot spin on a short token (the fixed-margin 3.8/min defect): the test is a
+        ratio, so right after a capture  remaining ~= life0  and the ratio ~= 1.0, far above any
+        threshold in (0, 1); it only becomes due once the token has actually spent (1 - thr) of
+        its life, whatever that life is. A 14-min token and a 52-min token both get head-room
+        proportional to their own life instead of a 25-min margin that a 14-min token can never
+        satisfy. With no readable life0 yet, it returns False (nothing proven to refresh)."""
+        now = float(self._now() if now is None else now)
+        exp = exp_of(token) if token else 0.0
+        with self._lock:
+            st = self._state(key)
+            exp = exp or st.get("exp") or 0.0
+            life0 = float(st.get("life0") or 0.0)
+        if exp <= 0.0 or life0 <= 0.0:
+            return False
+        remaining = exp - now
+        if remaining <= 0.0:
+            return True  # already expired: certainly due
+        frac = self.preempt_fraction if fraction is None else float(fraction)
+        bnd = self.preempt_band if band is None else float(band)
+        thr = frac + _key_jitter(key, bnd)
+        thr = min(0.95, max(0.01, thr))     # keep the threshold a sane fraction
+        return (remaining / life0) <= thr
 
     def _delay(self, n, have_token):
         if have_token:
@@ -125,6 +204,11 @@ class CapturePolicy:
                 st["streak"] = 0
                 st["why"] = ""
             st["exp"] = exp or st["exp"]
+            # Original life of THIS token (exp - now at capture), the denominator the ratio uses.
+            # Recorded only for a genuinely newer exp; a same-exp return keeps the first life0 so
+            # the ratio keeps shrinking toward 0 as the shared token ages.
+            if exp and not st["streak"]:
+                st["life0"] = max(0.0, exp - now)
             delay = self._delay(st["streak"], have_token) if st["streak"] else self.base_s
             st["next_at"] = now + delay
             st["set_at"] = now
@@ -323,6 +407,15 @@ class _CaptureState:
                 "next_attempt_in_s": (max(0, int(self.next_at - now)) if self.next_at else 0),
             }
 
+    def unresolved_failure(self) -> bool:
+        """A capture failed and has not been followed by a success: the reason is still the live
+        state of the token supply. Used so the reason surfaces in status.json even on a lap when
+        no goal happens to be held -- a silent WAIT was the whole defect (a capture that raised
+        NotAnAgentSurface left the goal waiting with nothing said)."""
+        with self._lock:
+            return bool(self.last_error and self.last_error_at > self.last_ok_at
+                        and not self.inflight)
+
 
 _CAPTURE = _CaptureState()
 
@@ -337,9 +430,18 @@ def status_block() -> dict:
     no goal is waiting -- the cockpit reads a non-empty block as "goals are held"."""
     try:
         blk = hold().summary()
+        cap = capture_state()
         if blk:
             blk = dict(blk)
-            blk["capture"] = capture_state().snapshot()
+            blk["capture"] = cap.snapshot()
+            return blk
+        # No goal is held this instant, but if the last capture FAILED and nothing has
+        # recovered since, the reason is still live and must be visible -- otherwise a capture
+        # that raised (NotAnAgentSurface, a crashed helper) leaves the fleet in a silent WAIT
+        # with `token_wait` empty, which is exactly the state this change removes.
+        if cap.unresolved_failure():
+            return {"waiting": 0, "reason": "last capture failed; no token installed",
+                    "capture": cap.snapshot()}
         return blk
     except Exception:
         return {}
