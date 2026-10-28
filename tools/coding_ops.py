@@ -345,6 +345,7 @@ def replace_in_file(
             return "[replace skipped: old text was not found]"
         if expected_replacements is not None and count != expected_replacements:
             return f"[replace skipped: expected {expected_replacements}, found {count}]"
+        _validate_path(path, for_write=True)   # placement + live-checkout write guards
         p.write_text(original.replace(old, new), encoding=encoding)
         return f"Replaced {count} occurrence(s) in {p}"
     except Exception as e:
@@ -495,6 +496,7 @@ def multi_edit_local(
             applied.append(f"#{idx}: {count} replacement(s)")
         if current == original:
             return "[multi_edit skipped: no net changes]"
+        _validate_path(path, for_write=True)   # placement + live-checkout write guards
         p.write_text(current, encoding=encoding)
         return f"Applied {len(edits)} edit(s) to {p}\n" + "\n".join(applied)
     except Exception as e:

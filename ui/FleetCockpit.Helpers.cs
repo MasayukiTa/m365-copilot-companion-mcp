@@ -230,7 +230,7 @@ partial class CockpitWindow
     }
 
     static string S(Dictionary<string, object> d, string k)
-    { if (d.ContainsKey(k) && d[k] != null) return d[k].ToString(); return ""; }
+    { if (d != null && d.ContainsKey(k) && d[k] != null) return d[k].ToString(); return ""; }
 
     // Cheap deterministic FNV-1a 32-bit hash over a string. Used for RowSig so two strings
     // of the same length but different content produce different signatures, forcing a re-render.
@@ -247,9 +247,9 @@ partial class CockpitWindow
     }
 
     static int I(Dictionary<string, object> d, string k)
-    { try { if (d.ContainsKey(k) && d[k] != null) return Convert.ToInt32(d[k]); } catch (Exception) { } return 0; }
+    { try { if (d != null && d.ContainsKey(k) && d[k] != null) return Convert.ToInt32(d[k]); } catch (Exception) { } return 0; }
     static double Dbl(Dictionary<string, object> d, string k)
-    { try { if (d.ContainsKey(k) && d[k] != null) return Convert.ToDouble(d[k]); } catch (Exception) { } return 0; }
+    { try { if (d != null && d.ContainsKey(k) && d[k] != null) return Convert.ToDouble(d[k]); } catch (Exception) { } return 0; }
 
     static Dictionary<string, object> Obj(Dictionary<string, object> d, string k)
     {

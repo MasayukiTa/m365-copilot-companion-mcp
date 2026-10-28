@@ -36,6 +36,7 @@ def test_background_jobs_own_killable_trees_and_watchdog_kills_the_tree():
 
 def test_tree_policy_has_posix_session_and_windows_taskkill_contract():
     s = _text("tools/childproc.py")
-    assert 'return {"start_new_session": True}' in s
+    assert 'kw = {"start_new_session": True}' in s
+    assert "return kw" in s[s.index('kw = {"start_new_session": True}'):s.index("def kill_tree(")]
     assert '["taskkill", "/PID", str(proc.pid), "/T", "/F"]' in s
     assert "os.killpg(int(proc.pid), signal.SIGKILL)" in s

@@ -122,6 +122,19 @@ def _validate_path(path: str, for_write: bool = False) -> Path:
             raise
         except Exception:
             pass                          # the placement guard must never break the file tools
+        # Live-checkout rule: a fleet worker may not write the TRACKED SOURCE of the
+        # production checkout (ui/, relay/, tools/, ...). Operations updates that checkout
+        # through git/PowerShell below this layer, not through a write tool, so a write-tool
+        # call that lands on tracked source is a worker write -- refuse it (in 'block') with
+        # the reason and a "work in a clone" instruction, or record it (default 'warn').
+        # Fails open; reads are never affected (for_write stays False for them).
+        try:
+            from . import live_write_guard
+            live_write_guard.check_write(str(p))
+        except PermissionError:
+            raise
+        except Exception:
+            pass                          # the live-checkout guard must never break the file tools
     if not bases:
         return p  # unrestricted: the default when MCP_ALLOWED_BASE is unset, empty or '*'
     for base in bases:
