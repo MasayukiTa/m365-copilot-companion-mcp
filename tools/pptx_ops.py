@@ -22,7 +22,8 @@ LAYOUT_TITLE_ONLY = 5
 LAYOUT_BLANK = 6
 
 
-def create_pptx(path: str, slides: list[dict], title: Optional[str] = None) -> str:
+def create_pptx(path: str, slides: list[dict], title: Optional[str] = None,
+                template: Optional[str] = None) -> str:
     """Create a .pptx file from a list of slide specs.
 
     Each slide is a dict supporting these keys (all optional unless noted):
@@ -36,10 +37,20 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None) -> s
 
     If layout is omitted, a sensible default is chosen.
 
+    When `template` names an existing .pptx, the deck is BUILT ON THAT FILE rather
+    than on python-pptx's blank default: its slide masters, layouts, theme colours,
+    fonts and slide size are inherited, so "this month's report from the past
+    material" actually looks like the past material instead of a stock white deck.
+    The template's own slides are not copied into the output (the new slides are the
+    content); only its design is carried across. This is the reference-first path --
+    prefer it whenever a source deck exists, so output is not a from-scratch deck that
+    ignores what it was asked to resemble.
+
     Args:
         path: Output .pptx path under the allowed base.
         slides: Ordered list of slide spec dicts. Must contain at least one slide.
         title: Optional deck title used for file metadata.
+        template: Optional path to an existing .pptx whose design is inherited.
 
     Self-verify before reporting done: call pptx_export_png on the output, then check a
     slide or two with ocr_image (does the text you put there come back?) or run_python with
@@ -59,9 +70,20 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None) -> s
             return "[create_pptx error: path must end with .pptx]"
         out.parent.mkdir(parents=True, exist_ok=True)
 
-        prs = Presentation()
-        prs.slide_width = Inches(13.333)
-        prs.slide_height = Inches(7.5)
+        if template:
+            src = _validate_path(template)
+            if not src.exists():
+                return f"[create_pptx error: template not found: {template}]"
+            if src.suffix.lower() != ".pptx":
+                return "[create_pptx error: template must be a .pptx file]"
+            # Build on the reference deck so its masters, layouts, theme and size are
+            # inherited; drop the template's own slides so only the design carries over.
+            prs = Presentation(str(src))
+            _strip_existing_slides(prs)
+        else:
+            prs = Presentation()
+            prs.slide_width = Inches(13.333)
+            prs.slide_height = Inches(7.5)
         if title:
             prs.core_properties.title = title
 
@@ -76,7 +98,8 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None) -> s
         return f"[create_pptx error: {type(e).__name__}: {e}]"
 
 
-def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None) -> str:
+def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None,
+                       template: Optional[str] = None) -> str:
     """Convert a markdown document into slides.
 
     Conventions:
@@ -90,6 +113,8 @@ def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None) ->
         path: Output .pptx path under the allowed base.
         markdown: Markdown source text.
         title: Optional deck title used for file metadata.
+        template: Optional path to an existing .pptx whose design is inherited
+            (reference-first path; see create_pptx).
 
     Self-verify before reporting done: call pptx_export_png on the output, then check a
     slide or two with ocr_image (does the text you put there come back?) or run_python with
@@ -101,7 +126,8 @@ def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None) ->
     slides = _markdown_to_slide_specs(markdown)
     if not slides:
         return "[pptx_from_markdown error: no headings found; nothing to render]"
-    return create_pptx(path, slides, title=title or slides[0].get("title"))
+    return create_pptx(path, slides, title=title or slides[0].get("title"),
+                       template=template)
 
 
 def pptx_info(path: str) -> str:
@@ -372,10 +398,38 @@ def pptx_export_png(
 
 # ---------- internals ----------
 
+def _strip_existing_slides(prs: Presentation) -> None:
+    """Remove every slide a template deck arrived with, keeping its masters and layouts.
+
+    Inheriting a reference deck's design means opening it with Presentation(); that also
+    opens its slides. The output should carry the template's look, not its content, so
+    the sample slides are dropped here before the new ones are added. Masters, layouts
+    and the theme live on the presentation part, not on the slides, so they survive.
+    """
+    slides_part = prs.slides
+    xml_slides = slides_part._sldIdLst
+    for sld_id in list(xml_slides):
+        rId = sld_id.get(
+            "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id")
+        # Drop the slide part itself (and its package relationship), not just its entry
+        # in the id list, so the output zip does not keep an orphaned slide1.xml.
+        if rId is not None:
+            try:
+                slides_part.part.drop_rel(rId)
+            except Exception:
+                pass
+        xml_slides.remove(sld_id)
+
+
 def _add_slide(prs: Presentation, spec: dict) -> None:
     layout_name = spec.get("layout")
     layout_idx = _pick_layout(spec, layout_name)
-    layout = prs.slide_layouts[layout_idx]
+    # A template deck may carry fewer layouts than the default's six; fall back to the
+    # last available one rather than raising IndexError on a reference-first build.
+    layouts = prs.slide_layouts
+    if layout_idx >= len(layouts):
+        layout_idx = len(layouts) - 1
+    layout = layouts[layout_idx]
     slide = prs.slides.add_slide(layout)
 
     title = spec.get("title")
