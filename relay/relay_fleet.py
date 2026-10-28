@@ -529,6 +529,140 @@ def _stuck_converged(previous_reason, current_reason):
         return False
     return len(a & b) / float(len(a | b)) >= STUCK_CONVERGENCE_SIMILARITY
 
+
+# ---------------------------------------------------------------------------
+# CONTENT-BASED CONVERGENCE (the PRIMARY judge; the word-set Jaccard above is
+# demoted to a fallback). The 2026-10-28 audit of the four stops reasoned
+# "worker reached the same conclusion on consecutive turns" found three genuine
+# repeats (w13/w19/w27, each restating that the target repo/worktree was absent)
+# and ONE false positive (w34). w34's replies ENDED in DONE and merely QUOTED
+# the relay's own "STUCK:" source line while reporting a finished read-only
+# investigation: reported_stuck() matched the quoted marker, stuck_reason_text()
+# then extracted the quoted code fragment, and two consecutive DONE replies that
+# quoted the same code tokenised to the same word set -> settled as "the same
+# conclusion". A finished worker was stopped as if looping.
+#
+# The fix compares the CONCLUSION ITSELF, not the words of its prose. A worker
+# may close a STUCK reply with a machine-readable line:
+#
+#     CONCLUSION: kind=<slug>; evidence=<id,id,...>; next=<slug>
+#
+# (Japanese aliases 結論種別 / 根拠 / 次手 are accepted; evidence ids split on
+# commas, Japanese commas, or spaces into an order-independent SET.) Two
+# consecutive STUCK replies converge only when all THREE of kind, the evidence
+# SET, and next match. A one-token difference in an error id -- a DIFFERENT
+# failure the word set used to lose in the noise -- now changes the evidence set
+# and does NOT converge. Replies with no such line fall back to the historical
+# word-set Jaccard, so every pre-existing worker and its tests behave exactly as
+# before. And a reply that CLAIMS COMPLETION (ends in DONE / 完了) never counts
+# as a converged STUCK -- the specific guard w34 needed.
+
+_STUCK_CONCLUSION_MARK = re.compile(
+    r"CONCLUSION\s*[:：]|結論種別\s*[:：]", re.IGNORECASE)
+
+#: Canonical field name -> accepted labels (ASCII + Japanese alias).
+_STUCK_CONCLUSION_FIELDS = (
+    ("kind", ("kind", "結論種別")),
+    ("evidence", ("evidence", "根拠")),
+    ("next", ("next", "次手")),
+)
+
+#: Evidence-id separators: ASCII/Japanese commas, spaces, semicolons.
+_EVIDENCE_SPLIT = re.compile(r"[\s,，、;；]+")
+
+#: A reply whose final non-empty line declares completion. Matched on that line
+#: only, so merely discussing the word earlier does not trip it.
+_DONE_TAIL = re.compile(r"^(?:done\b|完了(?:しました)?(?:$|[^\w]))", re.IGNORECASE)
+
+
+def _reply_claims_done(resp):
+    """True when the reply's final non-empty line declares completion (DONE / 完了).
+    A finished result is not a stuck restatement and must never be settled by the
+    convergence detector -- the w34 false stop of 2026-10-28."""
+    for line in reversed((resp or "").splitlines()):
+        stripped = line.strip().lstrip("#*->・ ").strip()
+        if not stripped:
+            continue
+        return _DONE_TAIL.match(stripped) is not None
+    return False
+
+
+def _parse_stuck_conclusion(text):
+    """Parse a machine-readable 'CONCLUSION: kind=..; evidence=..; next=..' line
+    out of a reply. Returns {'kind': str, 'evidence': frozenset, 'next': str} or
+    None when no such line is present or it lacks kind+next (evidence may validly
+    be empty). The LAST matching line wins, mirroring stuck_reason_text()."""
+    if not text:
+        return None
+    marks = list(_STUCK_CONCLUSION_MARK.finditer(text))
+    if not marks:
+        return None
+    start = text.rfind("\n", 0, marks[-1].start()) + 1
+    nl = text.find("\n", marks[-1].start())
+    line = text[start:(nl if nl != -1 else len(text))]
+    # drop the leading CONCLUSION:/結論種別: label entirely; the first segment that
+    # carries no key= of its own is then treated as the kind value.
+    line = _STUCK_CONCLUSION_MARK.sub("", line, count=1).strip()
+    fields = {}
+    for i, seg in enumerate(re.split(r"[;；]", line)):
+        if "=" in seg:
+            key, _, val = seg.partition("=")
+        elif "：" in seg:
+            key, _, val = seg.partition("：")
+        elif ":" in seg:
+            key, _, val = seg.partition(":")
+        elif i == 0 and seg.strip():
+            # bare leading value right after the stripped CONCLUSION: label is the kind
+            key, val = "kind", seg
+        else:
+            continue
+        key = key.strip().lower()
+        if key and key not in fields:
+            fields[key] = val.strip()
+    norm = {}
+    for canon, aliases in _STUCK_CONCLUSION_FIELDS:
+        norm[canon] = ""
+        for alias in aliases:
+            if fields.get(alias.lower()):
+                norm[canon] = fields[alias.lower()]
+                break
+    if not norm["kind"] or not norm["next"]:
+        return None
+    ev = frozenset(t.lower() for t in _EVIDENCE_SPLIT.split(norm["evidence"]) if t)
+    return {"kind": norm["kind"].lower(), "evidence": ev, "next": norm["next"].lower()}
+
+
+def _conclusions_match(a, b):
+    """True when two parsed conclusions agree on all three axes: kind, the SET of
+    evidence identifiers (order/separator independent), and next action."""
+    return (a is not None and b is not None
+            and a["kind"] == b["kind"]
+            and a["evidence"] == b["evidence"]
+            and a["next"] == b["next"])
+
+
+def _stuck_converged_v2(previous_reason, current_reason,
+                        previous_resp=None, current_resp=None):
+    """Primary convergence judge. A reply claiming completion (DONE) never
+    converges. When BOTH consecutive STUCK replies carry a machine-readable
+    CONCLUSION line, converge iff the three structured elements match; otherwise
+    fall back to the historical word-set Jaccard so replies without the line
+    behave exactly as before.
+
+    previous_resp/current_resp are the FULL replies (used for the DONE guard and
+    to find the structured line); previous_reason/current_reason are the
+    stuck_reason_text() extracts kept for the fallback path and existing tests."""
+    if _reply_claims_done(current_resp) or _reply_claims_done(previous_resp):
+        return False
+    cur_struct = _parse_stuck_conclusion(
+        current_resp if current_resp is not None else current_reason)
+    prev_struct = _parse_stuck_conclusion(
+        previous_resp if previous_resp is not None else previous_reason)
+    if cur_struct is not None and prev_struct is not None:
+        return _conclusions_match(prev_struct, cur_struct)
+    return _stuck_converged(previous_reason, current_reason)
+
+
 # EXHAUSTIVE-COVERAGE-CLAIM OVERRIDE -- a second defect found in the SAME mined incident.
 # Turns 3-11 didn't just restate the same conclusion in different words; several asserted
 # outright that every route had already been checked ("結論不変。全経路実測済みのため再照会
@@ -4027,6 +4161,10 @@ class RelayWorker:
         # also why the very first STUCK of a streak can never converge (there's nothing to
         # compare it to yet) -- it always earns its one retry.
         self._last_stuck_reason = None
+        # The FULL preceding STUCK reply, for the content-based convergence judge
+        # (_stuck_converged_v2): it carries the structured CONCLUSION line and the
+        # DONE guard that the extracted reason text alone cannot.
+        self._last_stuck_resp = None
         # phase_events MUST be initialized before `self.status = PENDING` so the setter
         # can append the initial "Queued" event immediately on construction.
         self.phase_events = []
@@ -4175,6 +4313,7 @@ class RelayWorker:
         self.last_norm = None
         # A fresh conversation has no memory of the old one's STUCK streak either.
         self._last_stuck_reason = None
+        self._last_stuck_resp = None
         # Nor of a standing gate -- a fresh replay only ever starts from a status that isn't
         # 'awaiting_gate' (raising a gate holds the worker, so no new turn -- and therefore no
         # policy-refusal replay -- can begin while one stands), but reset defensively rather
@@ -5002,6 +5141,7 @@ class RelayWorker:
             self.no_progress = 0
             self.last_norm = None
             self._last_stuck_reason = None
+            self._last_stuck_resp = None
         else:
             self._last_was_steer = False
         # A DEFERRED SEND LEAVES self.job INTACT, SO THE NEXT SWEEP RE-SENDS IT VERBATIM.
@@ -7061,8 +7201,16 @@ class RelayWorker:
             # nothing yet to have converged WITH, so it always gets its one retry, same as
             # before this detector existed.
             reason_text = stuck_reason_text(resp)
+            # CONTENT-based convergence (2026-10-28): compare the worker's actual
+            # CONCLUSION (kind/evidence/next), not the words of its prose, and never
+            # settle a reply that claims completion. _stuck_converged_v2 falls back to
+            # the historical word-set Jaccard when no structured conclusion is present,
+            # so legacy workers are unaffected. The FULL replies (self._last_stuck_resp
+            # and resp) carry the structured line and the DONE guard; the reason_text
+            # extracts remain the fallback inputs.
             if self._last_stuck_reason is not None \
-                    and _stuck_converged(self._last_stuck_reason, reason_text):
+                    and _stuck_converged_v2(self._last_stuck_reason, reason_text,
+                                            self._last_stuck_resp, resp):
                 if self._salvage_via_checks():
                     return
                 # ASK, DON'T JUST SETTLE (operator E, wired in -- see GATE_AFTER_STUCK_RETRIES
@@ -7079,6 +7227,7 @@ class RelayWorker:
                                % reason_text)
                 return
             self._last_stuck_reason = reason_text
+            self._last_stuck_resp = resp
             # RETRY-COUNT BACKSTOP (GATE_AFTER_STUCK_RETRIES, see its definition above): the
             # convergence check just above is the SMARTER catch and normally fires first (the
             # mined incident's wording only clears STUCK_CONVERGENCE_SIMILARITY at turns 5-6),
@@ -7133,6 +7282,7 @@ class RelayWorker:
             return
         self.transient = 0   # a real (non-stuck) response -> the transient issue cleared
         self._last_stuck_reason = None  # a real reply breaks the STUCK-convergence streak too
+        self._last_stuck_resp = None    # and clears the full-reply memory used by the content judge
         self.first_transient_ts = 0.0   # reset the outage window on a healthy reply
         self._toolerr_ts = 0.0          # tool path is back -> clear the tool-unreachable window
         self._throttle_ts = 0.0         # the quota refilled -> clear the throttle window
