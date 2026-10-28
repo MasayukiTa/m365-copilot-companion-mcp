@@ -10,6 +10,7 @@ from __future__ import annotations
 import collections
 
 from . import load as _load
+from .origin_attribution import attribute_by_origin, dominant_origin
 from . import redact as R
 
 try:  # the ledger's own verdict helpers; the viewer still works if they cannot be imported
@@ -296,6 +297,8 @@ def build(loaded: dict, since=None, until=None, gap_s: float = DEFAULT_GAP_S) ->
     inbound = _load.attribute_inbound(loaded.get("inbound", []))
     for row in inbound:
         sess_of(str(row.get("session") or ""))["inbound"].append(row)
+    origin = attribute_by_origin(inbound)
+    origin["dominant"] = dominant_origin(origin)
     events_global = []
     _attach_lock_log(sessions, loaded.get("lock", []), events_global)
     _attach_submit_log(sessions, loaded.get("submit_refusals", []), events_global)
@@ -350,6 +353,7 @@ def build(loaded: dict, since=None, until=None, gap_s: float = DEFAULT_GAP_S) ->
                  "n_steps": len(all_steps), "orphan_outcomes": orphan_outcomes,
                  "health": health},
         "sessions": out_sessions,
+        "origin_attribution": origin,
         "global_gaps": find_gaps(all_steps, gap_s),
         "stats": _stats(all_steps),
         "findings": findings,

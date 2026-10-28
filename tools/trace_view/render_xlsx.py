@@ -55,6 +55,13 @@ def render_xlsx(report, tz, path, lang="ja", max_steps=None) -> None:
     wb = Workbook()
     wb.remove(wb.active)
 
+    origin = report.get("origin_attribution", {"total": 0, "origins": {}, "order": [], "dominant": "unknown"})
+    origin_rows = [[name, origin["origins"][name]["rows"], origin["origins"][name]["sessions"],
+                    origin["origins"][name]["client_ips"]] for name in origin["order"]]
+    origin_rows += [["Total", origin["total"]], ["Dominant", origin["dominant"]]]
+    _sheet(wb, "Origins (UA heuristic)", ["Origin", "Inbound rows", "Sessions", "Client IPs"],
+           origin_rows, [24, 16, 12, 12])
+
     rows = []
     for s in report["sessions"]:
         st = s["stats"]["status"]
