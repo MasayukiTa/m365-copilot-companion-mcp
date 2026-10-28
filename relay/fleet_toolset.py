@@ -220,7 +220,7 @@ DELIBERATELY_EXCLUDED = {
 # ---------------------------------------------------------------------------------------
 _OFFICE = ("create_docx create_pptx docx_from_markdown docx_info pdf_info read_docx read_excel "
            "read_pdf write_excel pptx_add_image pptx_add_slide pptx_add_table pptx_export_png "
-           "pptx_from_markdown pptx_info pptx_replace_image ocr_image ocr_pdf read_image "
+           "pptx_from_markdown pptx_from_reference pptx_info pptx_replace_image ocr_image ocr_pdf read_image "
            "image_info render_diagram render_math render_mermaid_png summarize_table "
            "sqlite_to_excel odbc_to_excel "
            "chart_render excel_chart_export chart_from_python").split()
