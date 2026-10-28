@@ -480,7 +480,7 @@ KEYS = OrderedDict([
 
     _k("fanout_max_depth", EACH_GATE, 2,
        "relay/fanout.py:configured_max_depth (every split decision)",
-       "How many levels deep a fan-out tree may split (1..3). 1 means only the top-level goal "
+       "How many levels deep a fan-out tree may split (1 or greater). 1 means only the top-level goal "
        "splits. The value reported as in effect (status.json fanout_depth) can be lower than "
        "the setting while the merge of nested splits is not enabled."),
 

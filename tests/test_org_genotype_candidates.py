@@ -75,3 +75,12 @@ def test_cli_prints_json_and_writes_nothing(tmp_path):
     after = set(os.listdir(os.path.join(REPO, ".fleet"))) if os.path.isdir(os.path.join(REPO, ".fleet")) else None
     assert before == after
     assert os.listdir(str(tmp_path)) == []
+
+
+def test_neighbours_support_unbounded_integer_ranges():
+    for bounds, value, expected in [((1, None), 1, [2]),
+                                    ((None, 3), 3, [2]),
+                                    ((None, None), 0, [-1, 1]),
+                                    ((1, 3), 2, [1, 3])]:
+        gene = G.Gene("example", "int", bounds, None, None)
+        assert C.neighbours(gene, value) == expected

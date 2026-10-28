@@ -56,10 +56,10 @@ def test_deep_tree_merge_contents(tmp_path, monkeypatch, depth):
     print("depth=%d merge_order=%s root_output=%s" % (depth, ",".join(c["cid"] for c in calls), root))
 
 
-def test_depth_four_is_not_available_from_normal_settings(monkeypatch):
+def test_depth_four_is_available_from_normal_settings(monkeypatch):
     from relay import fleet_runner
     monkeypatch.setattr(fleet_runner, "_settings_int", lambda *args: 4)
     monkeypatch.setattr(fanout, "hierarchical_merge_setting", lambda: "on")
-    assert fanout.effective_max_depth() == 3
-    assert not fanout.may_split_at(3)
-    print("configured=4 effective=3 split_at_depth_3=False")
+    assert fanout.effective_max_depth() == 4
+    assert fanout.may_split_at(3)
+    assert not fanout.may_split_at(4)
