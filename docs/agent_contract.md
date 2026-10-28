@@ -50,6 +50,11 @@ one you have is decidable:**
 fleet_submit(goal="<the whole instruction, standalone>", source="<who asked>")
 ```
 
+Send the **whole** instruction even when it is long — a long goal is never refused for length.
+Past a threshold the harness writes the full text to `.fleet/briefs/<job id>.md` and hands the
+worker a short summary that points at that file, which is exactly the short-pointer an agent used
+to compose by hand. You no longer have to split it yourself.
+
 **Route B — through the gateway, when it does not.** Most clients cap the tool list, and this
 server has ~170 tools, so `fleet_submit` being absent from your list is **expected** and proves
 nothing:
@@ -122,8 +127,10 @@ newest half is kept), and never contain arguments, bodies, tokens or passwords:
   `session` (the same hash as `session` in `tool_events.jsonl`), `client_ip`, `ua` (80 chars).
   A request refused before its body was read appears as `(body-unread status=NNN)`.
 - `.fleet/fleet_submit_refusals.jsonl` — one line per refused `fleet_submit`: `reason`
-  (`missing_goal`, `too_long`, `local_loop`, `similar`, `pending_full`, `other`), `goal_len`,
-  `goal_head` (80 chars), `source` (80 chars) and, for `similar`, `similar_to` (the job id).
+  (`missing_goal`, `local_loop`, `pending_full`, `other`), `goal_len`, `goal_head` (80 chars),
+  `source` (80 chars). (Historic lines may also carry `too_long` or `similar`: both of those
+  refusals were retired — a long goal now spills to a brief instead of being refused, and a
+  near-duplicate is accepted and only noted — so new lines never carry them, but old ones remain.)
 
 ---
 

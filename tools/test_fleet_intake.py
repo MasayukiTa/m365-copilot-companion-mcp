@@ -119,10 +119,29 @@ def test_an_ordinary_task_about_local_loop_is_not_mistaken_for_control():
     assert len(_jobs()) == 1
 
 
-def test_a_pasted_document_is_refused_rather_than_queued():
-    out = FI.fleet_submit("x" * (FI.MAX_GOAL_CHARS + 1))
-    assert "refused" in out and "characters" in out
-    assert _jobs() == []
+def test_a_long_goal_is_spilled_to_a_brief_not_refused():
+    # A goal past SPILL_GOAL_CHARS is NOT refused (owner order 2026-10-27): the whole text is
+    # written to a brief outside the queue and the queued goal is a short pointer at it.
+    goal = "x" * (FI.SPILL_GOAL_CHARS + 5000)
+    out = FI.fleet_submit(goal, source="phone")
+    assert "queued" in out and "refused" not in out
+    (job,) = _jobs()
+    # the queue entry stays small: the inline goal is the summary pointer, not the whole document
+    assert len(job["payload"]["goal"]) < len(goal)
+    assert job["payload"]["goal_spilled"] is True
+    brief = job["payload"]["brief"]
+    assert os.path.isfile(brief)
+    with open(brief, encoding="utf-8") as fh:
+        assert fh.read() == goal            # the WHOLE instruction, verbatim
+
+
+def test_a_short_goal_is_queued_inline_with_no_brief():
+    out = FI.fleet_submit("a short ordinary instruction", source="phone")
+    assert "queued" in out
+    (job,) = _jobs()
+    assert job["payload"]["goal"] == "a short ordinary instruction"
+    assert "brief" not in job["payload"]
+    assert "goal_spilled" not in job["payload"]
 
 
 def test_a_queue_nothing_is_draining_stops_accepting():
