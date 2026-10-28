@@ -232,7 +232,16 @@ tests/test_copper_scatter_target.py
 # published with it: they name internal priorities, effort estimates and unreleased
 # research directions. The implementation they produce IS committed -- only the brief
 # itself stays local.
-docs/research/
+# Ignore the CONTENTS rather than the directory itself, so the two files named below can be
+# re-included: once a directory is ignored outright, git will not look inside it and a later
+# negation cannot bring a file back.
+docs/research/*
+# Exception: the folder's own README and the ordered implementation-order plan carry no
+# internal estimates or unreleased directions -- only the sequence of work and why -- and
+# must be committed so "keep this order under docs/research so it is not forgotten" survives
+# a fresh checkout and can be verified by tests.
+!docs/research/README.md
+!docs/research/2026-09-08-implementation-order.md
 
 # PROBE SCRATCH INSIDE A COMMITTED RESULTS DIRECTORY. A live unlock token reached a public
 # repository through `bench/companionbench/results/.agent_token_goal.json`: a probe wrote it
