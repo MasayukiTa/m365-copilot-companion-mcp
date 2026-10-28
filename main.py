@@ -600,6 +600,54 @@ async def health(request: Request) -> JSONResponse:
     return JSONResponse(payload)
 
 
+def _inflight_count(snap: dict) -> int:
+    """The bare in-flight count for the unauthenticated /exec_status reply; never raises."""
+    try:
+        from tools import exec_inflight as _inflight
+        return int(_inflight.executing_count())
+    except Exception:
+        return int(snap.get("executing_count", 0))
+
+
+@mcp.custom_route("/exec_status", methods=["GET"])
+async def exec_status(request: Request) -> JSONResponse:
+    """What the gateway is executing RIGHT NOW -- the fact the 2026-10-27..28 jams lacked.
+
+    SEPARATE FROM BOTH tools/list AND THE TOOL PATH (issue #328 proposal 2). When the worker
+    threads are all held by one unbounded find_files / glob, tools/list still answers (it runs
+    on the event loop) but it cannot say WHICH call is holding them or for how long, and the
+    tool path itself cannot answer because that is the thing that is stuck. This route reads an
+    in-memory snapshot (tools.exec_inflight) on the event loop -- it takes a short lock and
+    touches no tool, no file, no subprocess -- so it answers even while every tool thread is
+    occupied. That is what lets an operator NAME the occupant instead of restarting blind.
+
+    AUTH: identical to /health -- a genuine local peer or a valid bearer token. The occupant
+    tool names and their elapsed times are operational detail, so a caller that is neither gets
+    only {"status": "ok", "executing_count": N}: enough to see THAT the gateway is busy (which
+    /health's server_pid already implies is reachable) without disclosing what is running.
+
+    It reports; it does not act. Stopping a stuck call needs a worker-process model this server
+    does not have (proposals 1/5). Naming the occupant is the safe half, and it
+    is the half that was missing.
+    """
+    try:
+        from tools import exec_inflight as _inflight
+        snap = _inflight.snapshot()
+    except Exception:
+        # A visibility route must never 500 -- that would read as "the server is down" when it
+        # is merely busy, the exact confusion this route exists to remove.
+        snap = {"executing_count": 0, "executing": [], "longest_elapsed_s": 0.0}
+    client = getattr(request, "client", None)
+    peer = client.host if client else ""
+    xff = request.headers.get("x-forwarded-for", "")
+    is_local, _identity_ip = derive_identity(peer, xff)
+    if not is_local and not _health_bearer_ok(request):
+        return JSONResponse({"status": "ok", "executing_count": _inflight_count(snap)})
+    payload = {"status": "ok"}
+    payload.update(snap)
+    return JSONResponse(payload)
+
+
 TOOLS = (
     # code execution
     run_python, shell_exec,
@@ -1046,6 +1094,18 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             _cid = _ledger.record_call(name, _args, task=_task, worker=_worker)
         except Exception:
             _ledger = None
+        # IN-FLIGHT VISIBILITY (issue #328 proposal 2). Registered the moment the call enters the
+        # execute path and removed in the finally below, so a call that never returns stays
+        # visible -- which is the whole point: the jams of 2026-10-27..28 were a call that had
+        # entered and not left, and nothing could name it. begin()/end() are total and never
+        # raise; main.py's /exec_status route reads the snapshot over a path separate from
+        # tools/list and from the tool path itself. call_id joins this live row to the ledger.
+        _inflight_token = None
+        try:
+            from tools import exec_inflight as _inflight
+            _inflight_token = _inflight.begin(name, call_id=_cid, started_ts=_t0)
+        except Exception:
+            _inflight = None
         try:
             # REPAIR A GUESSED ARGUMENT NAME BEFORE REJECTING THE CALL.
             #
@@ -1165,6 +1225,17 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                     _msg += ". The accepted form is %s%s -- retry with those names." % (name, _sig)
             return "[call_tool %s error: %s]" % (name, _msg)
         finally:
+            # LEAVE THE IN-FLIGHT INVENTORY FIRST (issue #328 proposal 2). Unconditional and
+            # total: end() is a no-op for an absent token, so a begin() that raised leaves
+            # nothing to clean and this still runs safely. Done in the finally so a tool that
+            # raises, returns, or is abandoned all remove their row -- the snapshot never shows
+            # a call that has actually left.
+            if _inflight_token is not None:
+                try:
+                    from tools import exec_inflight as _inflight2
+                    _inflight2.end(_inflight_token)
+                except Exception:
+                    pass
             # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
             # the same class of defect as the identity it replaces.
             # RESET TO WHAT THIS CONTEXT HELD BEFORE, rather than blanking. Blanking erases a

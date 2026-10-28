@@ -295,6 +295,27 @@ KEYS = OrderedDict([
        "list plus the product dirs are the whole allow-set. Changing it reaches the next write "
        "with no restart."),
 
+    # File-search wall-clock budget (tools/walk.py). The seconds one find_files / glob walk may
+    # run before it stops and returns a clearly-marked partial result. Re-read from the settings
+    # file at the start of every search (a search is already the expensive thing, so one file
+    # read is noise), so an operator who needs a heavier search raises this and the NEXT search
+    # honours it with no restart. WHY IT EXISTS: an unbounded walk jammed the gateway three times
+    # on 2026-10-27..28; a deadline is the guard that makes a walk always return (#328). Default
+    # 20 is the pre-#328 constant. A per-call override still wins over this.
+    _k("search_timeout_seconds", EACH_GATE, 20,
+       "tools/walk.py:search_timeout_seconds (WalkDeadline, at the start of every search)",
+       "Seconds one file search may run before it returns a marked-partial result. Read fresh at the start of every search, so a change reaches the next search with no restart. Default 20 (the pre-#328 constant). An explicit per-call budget overrides it."),
+
+    # File-search depth cap (tools/walk.py). The deepest directory level a find_files / glob walk
+    # descends into, counted from the search root (depth 0 == directly under the root). Read
+    # fresh at every search. Default is NO limit (the pre-#328 behaviour), so no existing deep
+    # search changes until the owner sets a cap here or a caller passes max_depth. WHY IT EXISTS:
+    # bounding how deep a walk goes is one of the guards #328 lists for a search that would
+    # otherwise cross an entire drive. An absent, empty or negative value means no limit.
+    _k("search_max_depth", EACH_GATE, None,
+       "tools/walk.py:search_max_depth (iter_files, at the start of every search)",
+       "Deepest directory level a file search descends into, counted from the search root (0 == only the root directory). Read fresh at every search, so a change reaches the next one with no restart. Absent/empty/negative means NO limit, which is the default and the pre-#328 behaviour. A per-call max_depth overrides it."),
+
     # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
     # which queued goal a router using the remaining admission margins and the role profile
     # would have admitted, beside the one that was. There is deliberately no value that routes.
@@ -536,6 +557,18 @@ KEYS = OrderedDict([
     _k("session_max_mb", BRIDGE_START, None,
        "bridge/session_store.py:read_retention via apply_retention",
        "Applied once when the bridge starts. None/0 means no cap."),
+
+    # Search concurrency cap (tools/search_ops.py). The number of find_files / glob walks that
+    # may run at once. Sized once at import because a BoundedSemaphore cannot be resized in
+    # place, so raising it needs the server restarted. WHY IT EXISTS: 2026-10-27..28 the
+    # gateway jammed three times, each on an unbounded find_files / glob, recoverable only by
+    # restarting the server; a hard cap on simultaneous walks is one of the guards (#328).
+    # Default 4 is the pre-#328 constant -- enough for the fleet's normal parallel reads, low
+    # enough that a storm of walks cannot take every gateway thread. A search that cannot get a
+    # slot is refused immediately (fail fast) rather than queued.
+    _k("search_concurrency", BRIDGE_START, 4,
+       "tools/walk.py:search_concurrency (read once when tools/search_ops.py is imported)",
+       "How many file searches (find_files/glob) may run at once. Applied once at server start; raising it needs a restart because the semaphore is sized at import. A search beyond the cap is refused immediately, not queued. Default 4 (the pre-#328 constant)."),
 
     # ---------------------------------------------------------------- ui_only
     _k("priority_boost_ui", UI_ONLY, 1, "ui/FleetCockpit.Settings.cs",
