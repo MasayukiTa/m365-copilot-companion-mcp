@@ -23,6 +23,7 @@ decision. It stopped being true when the per-goal judge landed:
 
 ```python
 self.fanout = bool(fanout) and _depth0 and _goal_splittable
+# _depth0 means the worker is below the effective depth limit and is not an aggregator.
 ```
 
 A goal that fits is judged `NO_SPLIT` and costs nothing, so the flag only decides whether the
@@ -86,8 +87,8 @@ for. The worker's previous answer to that evidence was `status, outcome = "stuck
 `RelayWorker._ask_for_a_midrun_split()` now runs first. It returns `False` — leaving the old
 STUCK path byte-for-byte intact — unless all of:
 
-- `self._fanout_capable` — the run is capable **and** this worker is depth 0 **and** a
-  `spawn_fn` exists. Kept separately from `self.fanout`, which is the *verdict* taken before
+- `self._fanout_capable` — the run is capable **and** this worker is below the effective depth limit, is not an
+  aggregator, **and** a `spawn_fn` exists. Kept separately from `self.fanout`, which is the *verdict* taken before
   the work started; the whole point is that the verdict was made when nothing was known.
 - not already split (`_fanout_done`), and not already offered (`_midrun_split_asked`).
 
@@ -352,5 +353,10 @@ needs paired runs.
 - **An LLM call inside `splittability.judge()`.** The module is pure and offline on purpose —
   fast, unit-testable, no network in the hot path. The live judgement belongs to the agent, which
   is already in a conversation and already reading the goal.
-- **Recursive splitting.** `MAX_DEPTH = 1`, and `_fanout_capable` is false for any child, so a
-  mid-run split cannot produce grandchildren either.
+- **Unbounded recursive splitting.** The default depth is `fanout_max_depth` = **2**, and
+  `fanout_hierarchical_merge` defaults to **on**, so a tree splits to depth 2 by default.
+  The default is not an upper limit: the depth is a setting read at each split, and deeper
+  trees are allowed. Other split and budget gates still apply. With hierarchical merge off,
+  the effective depth is capped at 1 whatever `fanout_max_depth` says.
+  (The setting's own description in `tools/settings_keys.py` gives the range as 1..3. That
+  text is not reconciled here and is left for the implementation owner to check.)
