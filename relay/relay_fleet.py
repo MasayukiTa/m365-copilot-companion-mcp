@@ -2541,11 +2541,16 @@ def capture_inflight():
 _REOPEN_POLICY = None
 
 
-def _consider_socket_refresh(route, agent_url):
+def _consider_socket_refresh(route, agent_url, expired=False):
     """Kick a credential refresh without ever blocking the fleet sweep.
 
     The manager lives on the route instance so a reset automatically gets a fresh manager and a
     late result from the old browser can only install into the old, unreachable route object.
+
+    ``expired=True`` is passed by the two expiry paths (a refused resend and a tab fallback whose
+    reason proves the frame never left): it arms a one-shot immediate capture that skips the
+    floor and the backoff, so the fleet-wide expiry does not wait out a backoff set while the
+    token still had life.
     """
     try:
         manager = getattr(route, "_async_capture_manager", None)
@@ -2554,7 +2559,8 @@ def _consider_socket_refresh(route, agent_url):
             manager = AsyncCaptureManager(log=lambda m: print(m, flush=True))
             setattr(route, "_async_capture_manager", manager)
         return bool(manager.consider(route, agent_url,
-                                     os.environ.get("MCP_CDP_URL", "http://localhost:9222")))
+                                     os.environ.get("MCP_CDP_URL", "http://localhost:9222"),
+                                     expired=bool(expired)))
     except Exception as exc:
         try:
             print("[socket_capture_async] launch declined: %s: %s"
@@ -8647,8 +8653,10 @@ class RelayWorker:
         # so adding it to both paths cannot double-launch.
         try:
             from relay.transport_policy import delivery_proves_not_sent
-            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
-                _consider_socket_refresh(route, route.default_agent_url or None)
+            _expired = delivery_proves_not_sent(reason)
+            if _expired and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None,
+                                         expired=True)
         except Exception:
             pass
 
@@ -8828,8 +8836,10 @@ class RelayWorker:
         # capture is already in flight or inside the policy's backoff (relay/socket_capture_async).
         try:
             from relay.transport_policy import delivery_proves_not_sent
-            if delivery_proves_not_sent(reason) and route.open() and route.needs_refresh():
-                _consider_socket_refresh(route, route.default_agent_url or None)
+            _expired = delivery_proves_not_sent(reason)
+            if _expired and route.open() and route.needs_refresh():
+                _consider_socket_refresh(route, route.default_agent_url or None,
+                                         expired=True)
         except Exception:
             pass
         # BACKOFF, because nothing ends this wait but the route recovering: 4, 8 ... 60 s.

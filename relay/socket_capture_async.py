@@ -63,22 +63,44 @@ class AsyncCaptureManager:
         self._failed = 0
         self._discarded = 0
 
-    def consider(self, route, agent_url, cdp_url=None) -> bool:
+    def consider(self, route, agent_url, cdp_url=None, expired=False) -> bool:
         """Start a helper if this route needs one; return immediately.
 
         True means a helper was started, not that capture already succeeded.  Repeated calls for
         the same agent while a helper is live, or inside the capture floor, are cheap no-ops.
+
+        ``expired=True`` means a turn was just refused with a proven-expired token: arm a one-shot
+        window on the policy so the capture below bypasses the floor and the backoff exactly once.
+        It does not bypass the in-flight guard (one helper per agent is still enough) and it still
+        requires `needs_refresh` -- a token that is somehow live again needs no capture.
         """
+        key = str(agent_url or "")
+        if expired:
+            try:
+                self.policy.arm_expired(key)
+            except Exception:
+                pass
         try:
             if not route.open():
                 return False
             # A TOKEN THE PREVIOUS COORDINATOR CAPTURED, before opening any page for one.
-            self._adopt_cached(route, str(agent_url or ""))
-            if not route.needs_refresh(agent_url):
+            self._adopt_cached(route, key)
+            # Two independent reasons to refresh BEFORE expiry:
+            #  * the route's own fixed margin (kept, and pinned above the longest turn), and
+            #  * the policy's RATIO trigger -- a fraction of the token's life, jittered per key,
+            #    so the shared-`exp` fleet does not all cross a single fixed margin in the same
+            #    second and refuse together. Either one being due is enough; `expired` forces it.
+            due = expired or route.needs_refresh(agent_url)
+            if not due:
+                try:
+                    tok = route.token_for(agent_url)
+                    due = self.policy.due_for_preemptive_refresh(key, token=tok, now=self._now())
+                except Exception:
+                    due = False
+            if not due:
                 return False
         except Exception:
             return False
-        key = str(agent_url or "")
         now = float(self._now())
         try:
             have_token = bool(route.ready(key))
