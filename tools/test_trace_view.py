@@ -379,7 +379,7 @@ def test_excel_round_trip_with_conditional_formatting(tmp_path):
     from tools.trace_view.render_xlsx import render_xlsx
     render_xlsx(rep, TZ, str(path), "ja")
     wb = load_workbook(str(path))
-    assert wb.sheetnames == ["セッション一覧", "ステップ", "空白", "検出事項", "ツール別"]
+    assert wb.sheetnames == ["Origins (UA heuristic)", "セッション一覧", "ステップ", "空白", "検出事項", "ツール別"]
     steps = wb["ステップ"]
     rows = list(steps.iter_rows(values_only=True))
     assert [r[4] for r in rows[1:]] == ["read_file", "run_python", "fleet_submit", "glob"]
@@ -476,3 +476,32 @@ def test_the_package_reads_but_never_writes_the_state_directory(tmp_path):
     after = {n: (os.path.getsize(os.path.join(state, n)), os.path.getmtime(os.path.join(state, n)))
              for n in os.listdir(state)}
     assert before == after
+
+
+def test_origin_split_through_report_and_outputs(tmp_path):
+    from openpyxl import load_workbook
+
+    inbound = [
+        {"ts": BASE, "session": "claude-1", "ua": "claude-code/1", "method": "initialize", "client_ip": "10.0.0.1"},
+        {"ts": BASE + 1, "session": "copilot-1", "ua": "python-httpx/1", "method": "tools/call", "client_ip": "10.0.0.2"},
+        {"ts": BASE + 2, "session": "copilot-1", "ua": "python-httpx/1", "method": "ping", "client_ip": "10.0.0.2"},
+        {"ts": BASE + 100, "session": "outside", "ua": "claude-code/1", "method": "ping"},
+    ]
+    state = _state(tmp_path, inbound=inbound)
+    report = _report(state, t1=10)
+    origin = report["origin_attribution"]
+    assert origin["total"] == 3 and origin["dominant"] == "copilot"
+    assert origin["origins"]["claude"]["rows"] == 1
+    assert origin["origins"]["copilot"]["rows"] == 2
+    filtered = _report(state, t1=10, session="claude")
+    assert filtered["origin_attribution"]["total"] == 1
+    assert filtered["origin_attribution"]["dominant"] == "claude"
+    paths = RP.write_outputs(report, str(tmp_path / "out"), ("md", "html", "xlsx"), TZ, "en")
+    for path in paths[:2]:
+        text = open(path, encoding="utf-8").read()
+        assert "MCP request origins" in text and "claude" in text and "copilot" in text
+    wb = load_workbook(paths[2], read_only=True)
+    rows = list(wb["Origins (UA heuristic)"].values)
+    assert ("claude", 1, 1, 1) in rows
+    assert ("copilot", 2, 1, 1) in rows
+    wb.close()

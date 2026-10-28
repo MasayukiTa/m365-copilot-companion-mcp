@@ -120,6 +120,15 @@ def render_html(report, tz, lang="ja", max_steps=None) -> str:
     o.append('<p class="legend">%s</p>' % "".join(
         '<span><i class="sw %s"></i>%s</span>' % (k, _e(lab[k])) for k in
         ("ok", "error", "refused", "unavailable", "no_outcome")))
+    origin = report.get("origin_attribution", {"total": 0, "origins": {}, "order": [], "dominant": "unknown"})
+    o.append("<h2>MCP request origins (user-agent heuristic)</h2><p>Inbound rows: %d; dominant: %s</p>" %
+             (origin["total"], _e(origin["dominant"])))
+    o.append("<table><tr><th>Origin</th><th>Inbound rows</th><th>Sessions</th><th>Client IPs</th></tr>")
+    for name in origin["order"]:
+        bucket = origin["origins"][name]
+        o.append("<tr><td>%s</td><td>%d</td><td>%d</td><td>%d</td></tr>" %
+                 (_e(name), bucket["rows"], bucket["sessions"], bucket["client_ips"]))
+    o.append("</table>")
     if not sessions:
         o.append("<p>%s</p></body></html>" % _e(lab["no_sessions"]))
         return "".join(o)

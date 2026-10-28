@@ -755,12 +755,24 @@ partial class CockpitWindow
         // after the UI had already cleared the input. Always land the tracked command; its applied
         // receipt + WatchLiveAddHandoff resolve whether the old run consumes it or a new run adopts it.
 
+        // WHO SUBMITTED, AND BY WHICH ROUTE. The cockpit's "追加" wrote an add_goal with no
+        // provenance, so a goal that joined a live run read origin=null while the same goal
+        // through fleet_submit carried its origin into history.json. Stamp it here in the same
+        // {via, source} shape fleet_intake uses, so goals_from_command threads it onto the goal
+        // and it reaches the worker row and history.json. via "ui_add" tells this apart from an
+        // mcp/cli goal joining a live run; source names the machine user and this process so the
+        // submitter is recoverable. Built once for the whole batch.
+        var uiOrigin = new Dictionary<string, object>();
+        uiOrigin["via"] = "ui_add";
+        uiOrigin["source"] = "cockpit " + Environment.UserName + " pid "
+                            + System.Diagnostics.Process.GetCurrentProcess().Id;
         var adds = new List<object>();
         foreach (string goal in goals)
         {
             var item = new Dictionary<string, object>();
             item["text"] = goal;
             item["priority"] = false;
+            item["origin"] = uiOrigin;
             adds.Add(item);
         }
         var patch = Cmd1("add_goal", adds);
@@ -1123,6 +1135,14 @@ partial class CockpitWindow
         psi.FileName = py;
         psi.Arguments = "-m relay.fleet_runner --goals-file \"" + goalsFile + "\""
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort;
+        // THE "開始" DOOR NAMES ITSELF. This start reaches the fleet through --goals-file, not
+        // commands.d, so the runner records its admission from these two flags BEFORE the run
+        // lock -- the one place a start refused for a held lock (exit 3) still leaves a receipt,
+        // and where "which screen/session asked" survives instead of being journalled as "cli".
+        // Same {route, submitter} shape as the "追加" button's uiOrigin above.
+        psi.Arguments += " --submit-route ui_start --submit-origin \"cockpit "
+                        + Environment.UserName + " pid "
+                        + System.Diagnostics.Process.GetCurrentProcess().Id + "\"";
         if (planMode) psi.Arguments += " --plan";
         if (waitForClosingRun) psi.Arguments += " --wait-for-state-dir-seconds 60";
         // BOTH VALUES ARE SAID OUT LOUD. This used to append "--fanout" when on and nothing
@@ -1567,6 +1587,14 @@ partial class CockpitWindow
         psi.FileName = py;
         psi.Arguments = "-m relay.fleet_runner --resume"
                         + " --state-dir \"" + stateDir + "\" --effort " + _effort
+                        // THE "続き" DOOR NAMES ITSELF, for the same reason the "開始" door does: a
+                        // resume is an ingress too, it reaches the fleet through --resume (never
+                        // commands.d), and before this it recorded no admission distinct from the
+                        // run. These two flags make the runner write one receipt for it, before
+                        // the run lock, as route ui_resume with the submitting screen and user.
+                        + " --submit-route ui_resume --submit-origin \"cockpit "
+                        + Environment.UserName + " pid "
+                        + System.Diagnostics.Process.GetCurrentProcess().Id + "\""
                         // RESUME NEVER CARRIED THIS AT ALL, so the setting was ignored on the
                         // resume path in BOTH directions -- off before the runner's default
                         // flipped, on after. A resumed run is the same run; it gets the same

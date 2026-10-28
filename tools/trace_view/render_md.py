@@ -44,6 +44,13 @@ def render_markdown(report, tz, lang="ja", max_steps=None, max_sessions=None) ->
     out.append("- %s: %d / %s: %d" % (lab["sessions"], meta["n_sessions"], lab["calls"], meta["n_steps"]))
     out += ["- " + lab["withheld_note"], "- " + lab["limits"], ""]
 
+    origin = report.get("origin_attribution", {"total": 0, "origins": {}, "order": [], "dominant": "unknown"})
+    out += ["## MCP request origins (user-agent heuristic)", "",
+            "Inbound rows: %d; dominant: %s" % (origin["total"], origin["dominant"]), ""]
+    out += _table(["Origin", "Inbound rows", "Sessions", "Client IPs"],
+                  [[name, origin["origins"][name]["rows"], origin["origins"][name]["sessions"],
+                    origin["origins"][name]["client_ips"]] for name in origin["order"]]) + [""]
+
     sessions = report["sessions"]
     if not sessions:
         out += [lab["no_sessions"], ""]
