@@ -417,6 +417,7 @@ jobs:
             tools/test_a_completion_marker_is_not_an_output_contract.py \
             tools/test_a_deck_the_agent_wrote_says_so.py \
             tools/test_pptx_inherits_reference_template.py \
+            tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
             tests/test_flow_map_docs_name_files_that_exist.py \
             tests/test_docs_research_plan_files_exist.py \

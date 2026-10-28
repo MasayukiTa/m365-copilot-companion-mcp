@@ -1,3 +1,4 @@
+import os
 import re
 import subprocess
 import sys
@@ -394,6 +395,204 @@ def pptx_export_png(
             pythoncom.CoUninitialize()
     except Exception as e:
         return f"[pptx_export_png error: {type(e).__name__}: {e}]"
+
+
+def _resolve_reference(reference: str, search_dir: Optional[str]) -> tuple[Optional[Path], str]:
+    """Resolve a reference deck given as a path, or as a provenance id (RunId or digest).
+
+    Returns (path, note). The path is the deck to edit in place; note explains how it was
+    resolved. The point of accepting an id is the operator's own words: a deck must be
+    addressable by the id it was stamped with (CompanionRunId) or by its content digest, so
+    "this month from last month's" can name the source without knowing where it sits on disk.
+    When an id is given, every .pptx under search_dir is scanned and matched against its
+    stamped RunId or its content digest; a path is tried as a path first.
+    """
+    from . import pptx_provenance as _prov
+
+    # A literal path wins when it points at a real file.
+    try:
+        cand = _validate_path(reference)
+        if cand.is_file() and cand.suffix.lower() == ".pptx":
+            return cand, f"path: {cand}"
+    except Exception:
+        pass
+
+    # Otherwise treat `reference` as a provenance id (RunId, or a content digest prefix).
+    if not search_dir:
+        return None, ("reference is not a .pptx path and no search_dir was given to resolve "
+                      "it as a provenance id")
+    try:
+        base = _validate_path(search_dir)
+    except Exception as e:
+        return None, f"search_dir invalid: {e}"
+    if not base.is_dir():
+        return None, f"search_dir not a directory: {base}"
+
+    want = reference.strip()
+    by_run = None
+    by_digest = None
+    # scan() returns rows whose "path" is RELATIVE to base, and already carries the stamped
+    # "run" id -- so resolve each path against base and match the run id without re-reading.
+    for row in _prov.scan(str(base)):
+        rel = row.get("path") if isinstance(row, dict) else None
+        if not rel:
+            continue
+        fpath = os.path.join(str(base), rel)
+        if row.get("run") and row.get("run") == want:
+            by_run = fpath
+            break
+        d = _prov.digest(fpath)
+        if d and want and (d == want or d.startswith(want) or want.startswith(d)):
+            by_digest = by_digest or fpath
+    hit = by_run or by_digest
+    if hit:
+        how = "CompanionRunId" if by_run else "content digest"
+        return Path(hit), f"id {want!r} matched by {how}: {hit}"
+    return None, f"no deck under {base} carries the provenance id {want!r}"
+
+
+def _apply_text_updates(slide, upd: dict) -> int:
+    """Edit one slide's text in place, preserving its existing formatting.
+
+    Only text is changed; runs keep their font/size/colour because we overwrite run.text
+    rather than rebuilding the shape. Supported keys in `upd`:
+      - title: str                       set the slide's title placeholder text
+      - body:  str                       set the first body placeholder (joined lines)
+      - bullets: list[str]               set the first body placeholder, one bullet per line
+      - replace: dict[str, str]          substring replacement across every text run
+    Returns the number of text edits applied, so a caller can tell a no-op from a real edit.
+    """
+    edits = 0
+    title = upd.get("title")
+    if title is not None and slide.shapes.title is not None:
+        slide.shapes.title.text = str(title)
+        edits += 1
+
+    body_text = None
+    if isinstance(upd.get("bullets"), list):
+        body_text = "\n".join(str(b) for b in upd["bullets"])
+    elif upd.get("body") is not None:
+        body_text = str(upd["body"])
+    if body_text is not None:
+        for ph in slide.placeholders:
+            if ph == slide.shapes.title:
+                continue
+            if ph.has_text_frame:
+                ph.text_frame.text = body_text
+                edits += 1
+                break
+
+    repl = upd.get("replace")
+    if isinstance(repl, dict) and repl:
+        for shp in slide.shapes:
+            if not shp.has_text_frame:
+                continue
+            for para in shp.text_frame.paragraphs:
+                for run in para.runs:
+                    new = run.text
+                    for old, rep in repl.items():
+                        if old:
+                            new = new.replace(str(old), str(rep))
+                    if new != run.text:
+                        run.text = new
+                        edits += 1
+    return edits
+
+
+def pptx_from_reference(
+    output_path: str,
+    reference: str,
+    updates: Optional[list[dict]] = None,
+    search_dir: Optional[str] = None,
+    run_id: str = "",
+) -> str:
+    """Build a deck FROM a past deck by editing that deck's own contents in place.
+
+    WHY THIS EXISTS, in the operator's words: 「作成されたpptxがまったくもって過去のものを
+    参照できていない」「参照元があるならば参照元を直接中身の編集がなされるべき」「idでもてるは
+    初期構想としてmust」. create_pptx starts from an empty python-pptx template, so its output
+    inherits nothing from the material it was supposedly based on -- same words, from scratch,
+    none of the source deck's master, theme, layout, colours or existing slide design. This
+    tool instead OPENS the reference deck and rewrites only the text the caller names, leaving
+    every visual element of the original intact, which is what "edit the source directly" means.
+
+    The reference can be a .pptx path, OR a provenance id -- either the CompanionRunId a prior
+    agent run stamped, or a content-digest prefix. Given an id and a search_dir, the matching
+    deck is found by scanning stamped decks, so a deck is addressable by id as the initial
+    design required. The output is stamped with CompanionSources pointing back at the source
+    (its digest), so the chain source -> product stays legible later.
+
+    Args:
+        output_path: Where to write the edited deck (.pptx). The reference is copied first;
+            the source file on disk is never modified.
+        reference: Path to the source .pptx, or a provenance id (CompanionRunId or digest).
+        updates: Optional list of per-slide edits. Entry N edits slide N (1-based via order).
+            Each dict may carry title/body/bullets/replace -- see _apply_text_updates. A dict
+            may instead carry {"slide": <1-based index>, ...} to target a specific slide; when
+            "slide" is omitted, entries apply to slides in order starting at slide 1.
+        search_dir: Folder to scan when `reference` is a provenance id rather than a path.
+        run_id: Run id to stamp on the output (CompanionRunId), tying it to this transcript.
+
+    Self-verify before reporting done: call pptx_export_png on the output, then look at a
+    slide with `ANALYZE: <png path> | does it carry the source deck's design`. NOT read_image.
+    """
+    locked = require_unlocked()
+    if locked:
+        return locked
+    try:
+        out = _validate_path(output_path)
+        if out.suffix.lower() != ".pptx":
+            return "[pptx_from_reference error: output_path must end with .pptx]"
+        src, note = _resolve_reference(reference, search_dir)
+        if src is None:
+            return f"[pptx_from_reference error: {note}]"
+
+        out.parent.mkdir(parents=True, exist_ok=True)
+        # Open the SOURCE and save AS the output: every part of the source deck (master,
+        # theme, layouts, existing slides and their formatting) is carried over, and the
+        # source file on disk is left untouched.
+        prs = Presentation(str(src))
+
+        applied = 0
+        touched_slides = 0
+        if updates:
+            if not isinstance(updates, list):
+                return "[pptx_from_reference error: 'updates' must be a list of slide edits]"
+            n = len(prs.slides)
+            for i, upd in enumerate(updates, start=1):
+                if not isinstance(upd, dict):
+                    return "[pptx_from_reference error: each update must be an object]"
+                idx = upd.get("slide", i)
+                try:
+                    idx = int(idx)
+                except (TypeError, ValueError):
+                    return f"[pptx_from_reference error: slide index not an int: {upd.get('slide')!r}]"
+                if idx < 1 or idx > n:
+                    return f"[pptx_from_reference error: slide index {idx} out of range (1..{n})]"
+                e = _apply_text_updates(prs.slides[idx - 1], upd)
+                applied += e
+                if e:
+                    touched_slides += 1
+
+        prs.save(str(out))
+
+        # Stamp provenance: mark it agent-made, record the run, and point CompanionSources at
+        # the source deck's digest so the product can be traced back to what it was built from.
+        stamp_note = ""
+        try:
+            from . import pptx_provenance as _prov
+            _prov.stamp(str(out), sources=[str(src)], run_id=run_id)
+            stamp_note = " provenance stamped (CompanionSources -> source digest)"
+        except Exception as se:
+            stamp_note = f" [provenance stamp skipped: {type(se).__name__}: {se}]"
+
+        return (
+            f"Wrote {out} from reference ({note}); "
+            f"{len(prs.slides)} slide(s), {applied} text edit(s) across {touched_slides} slide(s)."
+            f"{stamp_note}"
+        )
+    except Exception as e:
+        return f"[pptx_from_reference error: {type(e).__name__}: {e}]"
 
 
 # ---------- internals ----------
