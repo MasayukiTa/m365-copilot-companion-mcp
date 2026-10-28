@@ -110,6 +110,7 @@ jobs:
             tests/test_outcome_enum_closed.py \
             tests/test_unlock_oracle.py \
             tests/test_search_deadline.py \
+            tests/test_env_example_states_standard_tunnel_effect.py \
             tools/test_child_env_credentials.py \
             tools/test_web_fetch_encoding.py \
             tools/test_web_search_no_gpu_no_clone.py \
