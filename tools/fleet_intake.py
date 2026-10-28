@@ -261,6 +261,75 @@ _WORKER_TERMINAL = frozenset(("done", "stuck", "maxturns", "error", "cancelled",
                                "content_refused"))
 
 
+#: OWNER RULE 2026-09-12 (jsonl L6695): "複数のゴールは投げるべきではない。人間はそこまで詳細に
+#: プロンプトを書くはずがない。" A real person types ONE instruction; a prompt that is a numbered
+#: battery of independent goals is the AGENT over-specifying, not the person. This is NOT a refusal
+#: -- the same owner instruction that governs similarity (2026-10-26/27) is that a submission is
+#: never stopped for its shape, only RECORDED -- so the goal is queued whole and the count is noted
+#: in the background (fleet_submit_multigoal.jsonl). Below this many detected independent goals the
+#: prompt is a single instruction and nothing is recorded; a two-goal floor is the smallest thing
+#: that is a "battery" at all, matching MIN_CHILDREN's reasoning in relay/fanout.py.
+MULTI_GOAL_MIN = 2
+
+#: A detected goal item must have at least this many content words of its OWN to count. A bare
+#: "1. yes 2. no" is not two goals; the floor keeps a numbered list of short tokens (an agent
+#: enumerating options, a checklist) from reading as a battery of instructions. Set to 2, not
+#: DUP_MIN_WORDS's 4: _dup_words counts a Japanese item in whole-word chunks (2+-character runs
+#: of kanji/kana), so a real one-line instruction -- 在庫表を更新して差分を出す is three words,
+#: 顧客名簿を洗って重複を消す is two -- clears a 2-word floor but not a 4-word one. Two content
+#: words is the smallest an actual instruction carries (a verb and the thing it acts on); a
+#: one-word fragment (yes / no / maybe) stays below it and is not counted.
+MULTI_GOAL_ITEM_MIN_WORDS = 2
+
+#: A numbered-list marker at the START of a line: "1.", "2)", "3）", "(4)", optionally indented.
+#: Only the ENUMERATION shape counts as evidence of several goals -- a person asking for one thing
+#: does not number it. Prose that merely contains a digit ("fix the 2 bugs") is untouched because
+#: the digit must open a line and be followed by a list punctuation. Both ASCII and full-width
+#: punctuation, because the owner's own prompts are Japanese.
+_MULTI_GOAL_MARKER = re.compile(
+    r"^\s*[\(\uFF08]?([0-9]{1,2}|[\uFF10-\uFF19]{1,2})[.)\uFF0E\uFF09\u3001\u3002]\s*\S")
+
+
+def _count_multiple_goals(text: str) -> int:
+    """How many INDEPENDENT numbered goals `text` packs into one prompt, or 0 when it is a single
+    instruction. `text` is the raw goal (before whitespace is collapsed), because the detection
+    reads LINE STARTS -- a numbered list is a line-oriented shape and collapsing newlines first
+    would erase exactly the evidence.
+
+    Conservative on purpose: only a NUMBERED enumeration counts (`_MULTI_GOAL_MARKER`), the
+    numbers must be CONSECUTIVE from 1 (1,2,3... -- a stray "1." in prose, or "step 2 of 3"
+    quoted mid-sentence, does not make a list), and each item must carry at least
+    MULTI_GOAL_ITEM_MIN_WORDS content words of its own. A prompt that fails any of these is read
+    as one goal and returns 0, so an ordinary instruction -- even a long one that happens to
+    mention a number -- is never recorded. Returns the item count (>= MULTI_GOAL_MIN) or 0.
+    """
+    nums = []
+    bodies = []
+    for line in str(text or "").splitlines():
+        m = _MULTI_GOAL_MARKER.match(line)
+        if not m:
+            continue
+        raw = m.group(1)
+        try:
+            n = int(raw.translate({c: c - 0xFF10 + 0x30 for c in range(0xFF10, 0xFF1A)}))
+        except ValueError:
+            continue
+        nums.append(n)
+        bodies.append(line[m.end() - 1:])
+    if len(nums) < MULTI_GOAL_MIN:
+        return 0
+    # The markers must run 1,2,3,... consecutively: a genuine battery of goals is numbered in
+    # order, while a lone "1." in prose or a quoted "2)" is not. Allow the list to start at 1 only.
+    if nums != list(range(1, len(nums) + 1)):
+        return 0
+    # Every item must say something of its own -- a numbered list of short fragments (options,
+    # a yes/no checklist) is not a battery of instructions.
+    for body in bodies:
+        if len(_dup_words(body)) < MULTI_GOAL_ITEM_MIN_WORDS:
+            return 0
+    return len(nums)
+
+
 def _dup_words(text):
     return {w.lower() for w in _DUP_WORD.findall(text or "")} - _DUP_STOPWORDS
 
@@ -578,6 +647,17 @@ def _log_similarity_observed(text: str, source: str, similar_to: str = "",
         pass
 
 
+def _log_multi_goal_observed(text: str, source: str, goal_count: int) -> None:
+    """Note that an incoming prompt carried SEVERAL INDEPENDENT GOALS, WITHOUT refusing it. The
+    goal is queued whole; this only records the count so the pattern stays visible. Never
+    raises, never alters the reply the caller gets."""
+    try:
+        from tools import obs_log
+        obs_log.log_multi_goal_observed(text, source, goal_count)
+    except Exception:
+        pass
+
+
 #: Where a refused goal's FULL record is written, one file per refusal, beside the queue it did
 #: not enter. The existing .fleet/fleet_submit_refusals.jsonl (tools/obs_log) is a one-line
 #: digest with the goal HEAD only and no id to act on; it is left exactly as it was. This is the
@@ -835,6 +915,16 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
 
     if dup is not None:
         _note_possible_duplicate(jid, dup[0], dup[1], text)
+
+    # SEVERAL GOALS IN ONE PROMPT are noted in the background, never refused (owner rule
+    # 2026-09-12, jsonl L6695). The raw `goal` is read, not the whitespace-collapsed `text`,
+    # because the numbered-list shape is line-oriented. A continuation (resume_conv) is exempt:
+    # a follow-up legitimately references earlier numbered items and is one instruction in its
+    # thread, not a battery. Recorded only after the job is safely on disk, like the dup note.
+    if not resume_conv:
+        _ngoals = _count_multiple_goals(goal)
+        if _ngoals >= MULTI_GOAL_MIN:
+            _log_multi_goal_observed(text, source, _ngoals)
 
     # COUNTED AFTER THE WRITE, NOT BEFORE. Four devices submitting at the same instant each
     # read the queue before any of them had written, so all four were told "1 job waiting"
