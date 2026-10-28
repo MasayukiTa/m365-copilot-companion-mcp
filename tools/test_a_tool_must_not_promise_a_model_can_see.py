@@ -136,3 +136,41 @@ def test_read_image_still_says_what_it_actually_returns():
         "the docstring no longer records what it used to return, so the mistake can return"
     assert "model_picker=None" in body, \
         "ANALYZE is named without the caveat that it runs on a model nobody can pick"
+
+
+def test_without_an_image_content_block_the_fallback_refuses_to_look_like_a_picture(monkeypatch):
+    """THE FALLBACK, PINNED. When FastMCP cannot build an Image content block, read_image has to
+    return the bytes AND say out loud that nothing rendered them -- so a caller cannot read the
+    data URI as a picture it merely failed to look at. The original defect was exactly a value
+    that looked like a successful read while showing nobody anything; the fallback must not
+    quietly re-create it. Returning a bare data URI here would be that same silent failure."""
+    import builtins
+
+    from PIL import Image as PILImage
+
+    import tools.image_ops as IO
+
+    real_import = builtins.__import__
+
+    def _no_fastmcp_image(name, *args, **kwargs):
+        if name == "fastmcp.utilities.types":
+            raise ImportError("forced: no FastMCP Image in this environment")
+        return real_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", _no_fastmcp_image)
+
+    tmp = os.path.join(os.environ.get("TEMP", "."), "_fallback_probe.png")
+    PILImage.new("RGB", (80, 40), (30, 120, 200)).save(tmp)
+    try:
+        out = IO.read_image(tmp)
+    finally:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+    assert isinstance(out, str), \
+        "with no Image content block the only honest return is a string that admits it"
+    assert "no image content block" in out, \
+        "the fallback does not warn that nothing renders this, so it reads as a picture"
+    assert "data:image/" in out and ";base64," in out, \
+        "the fallback dropped the bytes it promised to carry"
