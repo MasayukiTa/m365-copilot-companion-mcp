@@ -84,6 +84,88 @@ def test_missing_marker_or_head_is_unknown_not_a_pass():
     assert S.classify_staleness("oldsha", "", server_running=True) == "unknown"
 
 
+# ----------------------------------------------- classify_staleness watched_changed gate
+# THE REPORT THIS ANSWERS (2026-09-17, owner msg #40): "main.py を触ると変わるなら
+# エージェントで改修したら全黄になる=虚報" -- i.e. the dot going amber on an ordinary
+# commit that moved HEAD but changed nothing the running server imports. aad4d22 added
+# the watched_changed parameter so a different SHA is no longer staleness on its own; the
+# three tests below PROVE the gate, which the SHA-only cases above never exercise.
+
+def test_a_different_sha_that_touched_no_imported_code_is_not_stale():
+    """THE VINDICATION OF THE REPORT. A docs-only, cockpit-only or tests-only commit moves
+    HEAD -- oldsha != newsha -- yet changes nothing under WATCHED. Before the gate this was
+    reported stale (amber) every time; now watched_changed=False keeps it current, so an
+    agent's ordinary non-server edit does NOT turn the dot amber."""
+    assert S.classify_staleness("oldsha", "newsha", server_running=True,
+                                watched_changed=False) == "current"
+
+
+def test_a_different_sha_that_did_touch_imported_code_is_still_stale():
+    """The gate must not swing too far: a commit that DID change relay/tools/main.py while
+    the server kept running is genuinely stale, and watched_changed=True preserves that --
+    exactly the live case the whole check exists for, so main.py edits are not swept under."""
+    assert S.classify_staleness("oldsha", "newsha", server_running=True,
+                                watched_changed=True) == "stale"
+
+
+def test_an_unknown_watched_changed_falls_back_to_the_conservative_sha_rule():
+    """watched_changed=None means the caller could not tell what changed; the SHA rule then
+    stands, because reporting stale when it might be is the safe side. Default (omitted) is
+    None, so any caller that does not pass the flag keeps the pre-gate behaviour."""
+    assert S.classify_staleness("oldsha", "newsha", server_running=True,
+                                watched_changed=None) == "stale"
+    assert S.classify_staleness("oldsha", "newsha", server_running=True) == "stale"
+
+
+def test_the_gate_never_overrides_a_matching_sha_or_a_dead_server():
+    """watched_changed only decides the different-SHA case. A matching SHA is current and a
+    dead server is no_server whatever the flag says -- the gate cannot manufacture staleness
+    where the SHA already settled it."""
+    assert S.classify_staleness("same", "same", server_running=True,
+                                watched_changed=True) == "current"
+    assert S.classify_staleness("old", "new", server_running=False,
+                                watched_changed=True) == "no_server"
+
+
+# ----------------------------------------------- the import-scope the gate depends on
+
+def test_an_ordinary_agent_edit_outside_watched_does_not_read_as_stale_end_to_end():
+    """THE MEASUREMENT THE REPORT ASKED FOR, end to end rather than by hand. Build a real
+    tree, start the clock, then make the edits an agent's ordinary non-server change makes --
+    a doc, the cockpit C#, a test file, a data file -- all AFTER the server started. If
+    deploy_freshness.newer_than finds nothing, watched_changed is False and the dot stays
+    green. This is the same walk the supervisor's --server-action feeds into the gate."""
+    import os
+    import tempfile
+    import time
+
+    import tools.deploy_freshness as F
+
+    with tempfile.TemporaryDirectory() as d:
+        os.makedirs(os.path.join(d, "tools"))
+        os.makedirs(os.path.join(d, "relay"))
+        os.makedirs(os.path.join(d, "docs"))
+        os.makedirs(os.path.join(d, "ui"))
+        for rel in ("main.py", os.path.join("tools", "a.py"),
+                    os.path.join("relay", "b.py")):
+            with open(os.path.join(d, rel), "w", encoding="utf-8") as fh:
+                fh.write("x = 1\n")
+        started = time.time()
+        time.sleep(0.01)
+        # the ordinary agent edits: NONE of them under a watched import path
+        for rel in (os.path.join("docs", "NOTES.md"),
+                    os.path.join("ui", "FleetCockpit.cs"),
+                    os.path.join("tools", "test_a.py"),
+                    os.path.join("tools", "data.json")):
+            with open(os.path.join(d, rel), "w", encoding="utf-8") as fh:
+                fh.write("touched\n")
+        newer = F.newer_than(started, root=d)
+        watched_changed = bool(newer)
+        assert newer == [], "ordinary non-server edits must not be seen as imported: %r" % newer
+        assert S.classify_staleness("oldsha", "newsha", server_running=True,
+                                    watched_changed=watched_changed) == "current"
+
+
 # -------------------------------------------------------------- decide_post_update_action
 
 def test_scenario_1_python_update_no_run_is_swap_needed():
