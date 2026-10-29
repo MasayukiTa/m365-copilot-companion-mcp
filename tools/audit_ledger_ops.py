@@ -27,3 +27,30 @@ def validity_audit_ledger(claim_id: str = "", limit: int = 200, max_chars: int =
     except Exception as exc:
         return json.dumps({"error": "%s: %s" % (type(exc).__name__, str(exc)[:300])},
                           ensure_ascii=False)
+
+
+def validity_past_runs(config_id: str = "", limit: int = 200, store_path: str = "") -> str:
+    """Past validity VERDICTS for a pre-registered claim id, as JSON, for use as judge-flow input.
+
+    This is the public wiring that lets a judging agent feed the past-analysis DB into its
+    decision: call it with the claim id (e.g. 'MCL_D1') before/alongside validity_judge to see
+    whether that claim was already judged and what the verdict was. It reads the sessions DB
+    (validity_audit, falling back to fleet_turns -- the raw past-analysis table the ledger is
+    distilled from), and returns ONLY the distilled, allow-listed verdict fields
+    (id/verdict/finding/reasons/notes/hashes/ts). No raw conversation row, measurement or
+    employee id is ever surfaced (same data-minimisation guarantee as past_runs()).
+
+    config_id: the analysis id. limit: most records. store_path: override the DB path (tests).
+    Returns {"claim_id": <id>, "runs": [...]} or {"error": ...}.
+    """
+    try:
+        from tools.validity_harness import past_runs
+        cid = str(config_id or "").strip()
+        if not cid:
+            return json.dumps({"error": "config_id is required", "code": "BAD_ARGS"},
+                              ensure_ascii=False)
+        runs = past_runs(cid, store_path=(store_path or None), limit=int(limit))
+        return json.dumps({"claim_id": cid, "runs": runs}, ensure_ascii=False)
+    except Exception as exc:
+        return json.dumps({"error": "%s: %s" % (type(exc).__name__, str(exc)[:300])},
+                          ensure_ascii=False)

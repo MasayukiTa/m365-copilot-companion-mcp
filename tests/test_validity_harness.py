@@ -231,3 +231,72 @@ def test_past_runs_fallback_emits_no_raw_rows():
                  "notes", "hashes", "ts"}
             ), "fallback leaked an unexpected field: %s" % sorted(r)
             assert "secret raw measurement" not in json.dumps(r, ensure_ascii=False)
+
+
+# ---- WIRING: past_runs is reachable from the judge flow as a public tool ------
+# The gap the reviewer named: past_runs() existed but nothing in the validity
+# tool flow called it, so an agent judging a claim could not feed the past-
+# analysis DB into the decision. validity_past_runs (tools/audit_ledger_ops.py)
+# is the public tool that wires it in -- same registration path as
+# validity_audit_ledger -- so call_tool(name='validity_past_runs', ...) reads the
+# past DB as judge-flow input. These tests pin that the wrapper exists, calls
+# past_runs, returns JSON, and keeps the same data-minimisation allow-list.
+
+def _seed_validity_audit(path):
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE validity_audit (claim_id TEXT, run_id TEXT, seq INT, "
+            "role_tag TEXT, ts REAL, text TEXT, source_table TEXT, source_key TEXT, extra TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO validity_audit VALUES (?,?,?,?,?,?,?,?,?)",
+            ("MCL_D1", "run1", 0, "tool_result", 1.0,
+             json.dumps({"id": "MCL_D1", "verdict": "HOLD",
+                         "reasons": ["A_FAIL_SPARSE_LOTS"],
+                         "hashes": {"input_sha256": "deadbeef"}}),
+             "tool_events.jsonl", "outcome:c1",
+             json.dumps({"secret": "raw blob 0.12345 lot=679"})),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_validity_past_runs_public_tool_wires_past_runs_into_the_flow():
+    # the public tool must exist and be importable from the same ops module that
+    # already publishes validity_audit_ledger into the judge tool category
+    from tools.audit_ledger_ops import validity_past_runs
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "sessions.sqlite3")
+        _seed_validity_audit(db)
+        out = validity_past_runs("MCL_D1", store_path=db)
+        assert isinstance(out, str), "a public tool must return a JSON string"
+        payload = json.loads(out)
+        assert payload.get("claim_id") == "MCL_D1"
+        runs = payload.get("runs")
+        assert isinstance(runs, list) and runs, "past verdicts must reach the judge flow"
+        assert runs[0].get("verdict") == "HOLD"
+
+
+def test_validity_past_runs_public_tool_keeps_data_minimisation():
+    from tools.audit_ledger_ops import validity_past_runs
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "sessions.sqlite3")
+        _seed_validity_audit(db)
+        out = validity_past_runs("MCL_D1", store_path=db)
+        assert "raw blob" not in out and "lot=679" not in out
+        for r in json.loads(out)["runs"]:
+            assert set(r).issubset(
+                {"claim_id", "run_id", "verdict", "finding", "reasons",
+                 "notes", "hashes", "ts"}
+            ), "public tool leaked an unexpected field: %s" % sorted(r)
+
+
+def test_validity_past_runs_unknown_claim_returns_empty_runs():
+    from tools.audit_ledger_ops import validity_past_runs
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "sessions.sqlite3")
+        _seed_validity_audit(db)
+        payload = json.loads(validity_past_runs("NOPE", store_path=db))
+        assert payload["claim_id"] == "NOPE" and payload["runs"] == []
