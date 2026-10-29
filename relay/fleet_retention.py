@@ -956,6 +956,125 @@ def compress(fleet_dir, now=None, dry_run=False, after_hours=None, keep_plain=No
     return saved, done
 
 
+#: How many completed rows history.json keeps before the older ones are moved to archive.
+#: 200 was chosen because the cockpit draws at most HISTORY_DEFAULT_ROWS=50 at once and lifts
+#: the cap to "show all" rarely; 200 keeps several screens of recent finished work on the fast
+#: path while bounding a file the cockpit re-reads every idle tick. Measured 2026-10-29 the
+#: file held 941 rows / 4.88 MB with no ceiling at all.
+HISTORY_KEEP = int(os.environ.get("MCP_FLEET_HISTORY_KEEP", "200"))
+
+#: The statuses the fleet treats as terminal -- a row may be archived/dropped ONLY if its
+#: status is one of these. Mirror of relay.fleet_reaper.TERMINAL_STATUSES (pinned by a test).
+#: A running/ready/pending/interrupted row is live or resumable and is never touched here.
+HISTORY_TERMINAL = frozenset({"done", "stuck", "maxturns", "error", "cancelled",
+                              "content_refused"})
+
+
+def history_archive(fleet_dir, now=None, dry_run=False, keep=None):
+    """Move the OLDEST completed rows out of history.json into a gzip archive, and trim the
+    history list to the most recent ``keep`` -- WITHOUT losing a record and WITHOUT ever
+    touching a row that is still running, queued, or interrupted (resumable).
+
+    Returns (bytes_freed_from_history_json, [archived_row_keys]).
+
+    .fleet/history.json is the cockpit's archive of finished workers (relay/fleet_reaper.py's
+    docstring: "an array of per-worker archive entries the WPF cockpit itself creates"). It had
+    no ceiling -- it stacked until a human pressed Clear -- so it grew without bound and the
+    cockpit re-reads it on every idle tick. This rule gives it one.
+
+    WHAT IS SAFE TO MOVE. Only rows whose ``status`` is in HISTORY_TERMINAL. A row that is
+    still live (running/ready/pending) or resumable (interrupted) is never archived and never
+    dropped, whatever its age -- the same rule the reaper and the cockpit already hold. Those
+    rows stay in history.json in place.
+
+    NOTHING IS LOST. The oldest terminal rows are first written, newline-delimited, into a
+    gzip file under .fleet/archive, and only once that file exists and is non-empty is
+    history.json rewritten without them. A crash between the two leaves history.json intact --
+    the same "write fully, then remove" order compress() uses above. The archive plus the
+    trimmed history together still contain every original row.
+    """
+    import gzip as _gzip
+    now = time.time() if now is None else now
+    keep = HISTORY_KEEP if keep is None else keep
+    path = os.path.join(fleet_dir, "history.json")
+    if not os.path.isfile(path):
+        return 0, []
+    try:
+        with io.open(path, encoding="utf-8-sig") as f:
+            rows = json.load(f)
+    except (OSError, ValueError):
+        return 0, []
+    if not isinstance(rows, list):
+        return 0, []
+
+    before = _size(path)
+
+    # The terminal rows, oldest first (history.json is append order: newest last). Only these
+    # are candidates; everything else is kept in place no matter what.
+    terminal_idx = [i for i, r in enumerate(rows)
+                    if isinstance(r, dict) and r.get("status") in HISTORY_TERMINAL]
+    excess = len(terminal_idx) - keep
+    if excess <= 0:
+        return 0, []
+
+    # The oldest `excess` terminal rows leave; every other row (live, resumable, or a terminal
+    # row within the keep window) stays, in its original order.
+    drop_positions = set(terminal_idx[:excess])
+    moving = [rows[i] for i in sorted(drop_positions)]
+    kept = [r for i, r in enumerate(rows) if i not in drop_positions]
+    moved_keys = [r.get("key", "") for r in moving if isinstance(r, dict)]
+
+    if dry_run:
+        return 0, moved_keys
+
+    adir = os.path.join(fleet_dir, "archive")
+    try:
+        os.makedirs(adir, exist_ok=True)
+    except OSError:
+        return 0, []
+    stamp = time.strftime("%Y%m%d-%H%M%S", time.localtime(now))
+    gz = os.path.join(adir, "history_completed_%s.jsonl.gz" % stamp)
+    # Avoid clobbering a file written in the same second (two sweeps, a fast loop).
+    _n = 1
+    while os.path.exists(gz):
+        gz = os.path.join(adir, "history_completed_%s_%d.jsonl.gz" % (stamp, _n))
+        _n += 1
+    try:
+        # WRITE THE ARCHIVE FULLY, THEN REWRITE HISTORY. One JSON object per line so the file
+        # is appendable/streamable and a single corrupt row costs only itself, not the file.
+        with _gzip.open(gz, "wt", encoding="utf-8", compresslevel=6) as dst:
+            for r in moving:
+                dst.write(json.dumps(r, ensure_ascii=False) + "\n")
+        if _size(gz) <= 0:
+            raise IOError("empty archive")
+    except (OSError, IOError):
+        try:
+            if os.path.exists(gz):
+                os.remove(gz)
+        except OSError:
+            pass
+        return 0, []
+
+    # Atomic rewrite: tmp + os.replace, same pattern as the reaper's _write_atomic.
+    tmp = path + ".tmp"
+    try:
+        with io.open(tmp, "w", encoding="utf-8") as f:
+            json.dump(kept, f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except OSError:
+        # The archive is already written; leaving history.json untouched means the rows are
+        # now in BOTH places -- duplicated, never lost. The next sweep retries the trim.
+        try:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+        except OSError:
+            pass
+        return 0, moved_keys
+
+    freed = max(0, before - _size(path))
+    return freed, moved_keys
+
+
 def cap_jsonl(fleet_dir, dry_run=False, max_mb=None):
     """Hold each append-only ledger under a ceiling, KEEPING THE TAIL.
 
@@ -1587,6 +1706,7 @@ def apply(fleet_dir=None, now=None, dry_run=False):
     # 185 MB that age rules must not touch -- and running it first means the deletions that
     # follow are working on files already a fiftieth of their size.
     for name, fn in (("compress", compress),
+                     ("history_archive", history_archive),
                      ("coordinator_logs", coordinator_logs),
                      ("rotations", rotations),
                      ("scratch", scratch),
@@ -1600,7 +1720,7 @@ def apply(fleet_dir=None, now=None, dry_run=False):
             if fn is cap_jsonl:
                 freed, items = cap_jsonl(fleet_dir, dry_run=dry_run)
             elif fn in (coordinator_logs, scratch, stores, briefs, compress, conversations,
-                     workspace_clones, sweep_temp_home):
+                     workspace_clones, sweep_temp_home, history_archive):
                 freed, items = fn(fleet_dir, now=now, dry_run=dry_run)
             else:
                 freed, items = fn(fleet_dir, dry_run=dry_run)
