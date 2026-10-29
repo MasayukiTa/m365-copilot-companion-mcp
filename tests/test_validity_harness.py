@@ -172,3 +172,62 @@ def test_lot_independence_check_runs_and_reports():
     diag = vh.lot_independence_check(y=y, x=x, lot=lot)
     assert "checked" in diag and diag["checked"] is True
     assert "independent" in diag
+
+
+# ---- (c) fallback: read past results straight from fleet_turns ----------------
+# validity_audit is a derived view over fleet_turns; if a verdict was never
+# distilled into it, past_runs() must still find it in fleet_turns.
+
+def _make_fleet_turns_only_db(path):
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            "CREATE TABLE validity_audit (claim_id TEXT, run_id TEXT, seq INT, "
+            "role_tag TEXT, ts REAL, text TEXT, source_table TEXT, source_key TEXT, extra TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO validity_audit VALUES (?,?,?,?,?,?,?,?,?)",
+            ("OTHER", "runzzzz", 0, "tool_result", 1.0,
+             json.dumps({"id": "OTHER", "verdict": "NA"}), "tool_events.jsonl", "k", "{}"),
+        )
+        conn.execute(
+            "CREATE TABLE fleet_turns (id INTEGER PRIMARY KEY, key TEXT, name TEXT, "
+            "goal TEXT, turn INT, role TEXT, text TEXT, extra TEXT, ts REAL, goal_id TEXT)"
+        )
+        conn.execute(
+            "INSERT INTO fleet_turns (key,name,goal,turn,role,text,extra,ts,goal_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("r_run_x1", "w0", "judge claim MCL_X1 superiority", 7, "verdict",
+             "GO", "{}", 2000.0, "MCL_X1"),
+        )
+        conn.execute(
+            "INSERT INTO fleet_turns (key,name,goal,turn,role,text,extra,ts,goal_id) "
+            "VALUES (?,?,?,?,?,?,?,?,?)",
+            ("r_run_x1", "w0", "judge claim MCL_X1 superiority", 6, "worker_reply",
+             "secret raw measurement blob 0.12345 lot=679", "{}", 1999.0, "MCL_X1"),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def test_past_runs_falls_back_to_fleet_turns():
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "sessions.sqlite3")
+        _make_fleet_turns_only_db(db)
+        runs = vh.past_runs("MCL_X1", store_path=db)
+        assert isinstance(runs, list) and runs, "fleet_turns-only verdict must still be found"
+        assert any(r.get("verdict") == "GO" for r in runs), "fleet_turns verdict token must be read"
+
+
+def test_past_runs_fallback_emits_no_raw_rows():
+    with tempfile.TemporaryDirectory() as td:
+        db = os.path.join(td, "sessions.sqlite3")
+        _make_fleet_turns_only_db(db)
+        runs = vh.past_runs("MCL_X1", store_path=db)
+        for r in runs:
+            assert set(r).issubset(
+                {"claim_id", "run_id", "verdict", "finding", "reasons",
+                 "notes", "hashes", "ts"}
+            ), "fallback leaked an unexpected field: %s" % sorted(r)
+            assert "secret raw measurement" not in json.dumps(r, ensure_ascii=False)

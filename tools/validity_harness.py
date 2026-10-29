@@ -79,29 +79,88 @@ def past_runs(claim_id: str, store_path: str | None = None, limit: int = 200) ->
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
     try:
+        out = _read_from_validity_audit(conn, claim_id, limit)
+        if out:
+            return out
+        # FALLBACK to the raw past-analysis table the ledger is distilled FROM.
+        # validity_audit is a normalised view over fleet_turns + tool_events; if a
+        # claim's verdict was never distilled into it (or the table is absent), the
+        # past results still live in fleet_turns, which the owner decision names as
+        # the DB the harness must read. We read it here with the same allow-list.
+        return _read_from_fleet_turns(conn, claim_id, limit)
+    finally:
+        conn.close()
+
+
+def _distill_payload(rec: dict, text) -> dict:
+    """Pull the allow-listed verdict fields out of one row's text into rec.
+
+    text may be the engine's verdict JSON (a dict) or a bare verdict token such as
+    "GO"/"HOLD"/"NA" written by a fleet_turns `verdict` row. Both are accepted; raw
+    conversation text is never surfaced -- only the allow-listed fields survive.
+    """
+    try:
+        payload = json.loads(text or "{}")
+    except (ValueError, TypeError):
+        payload = {}
+    if isinstance(payload, dict) and payload:
+        for k in ("verdict", "finding", "reasons", "notes", "hashes"):
+            if k in payload:
+                rec[k] = payload[k]
+    elif isinstance(text, str):
+        token = text.strip()
+        # a short bare verdict token only (GO/HOLD/NA/...); never a conversation blob
+        if token and len(token) <= 24 and "verdict" not in rec:
+            rec["verdict"] = token
+    return {k: v for k, v in rec.items() if k in _ALLOWED_RUN_FIELDS}
+
+
+def _read_from_validity_audit(conn, claim_id: str, limit: int) -> list[dict]:
+    """Distilled verdicts from the normalised validity_audit ledger.
+
+    Reads both the engine `tool_result` JSON and any fleet_turns-sourced `verdict`
+    row, so a final verdict recorded only as a conversation turn is not missed.
+    """
+    try:
+        cur = conn.execute(
+            "SELECT claim_id, run_id, ts, text, role_tag FROM validity_audit "
+            "WHERE claim_id = ? AND role_tag IN ('tool_result','verdict') "
+            "ORDER BY ts, seq LIMIT ?",
+            (str(claim_id), int(limit)))
+    except sqlite3.OperationalError:
+        return []
+    out: list[dict] = []
+    for row in cur:
+        rec = {"claim_id": row["claim_id"], "run_id": row["run_id"], "ts": row["ts"]}
+        out.append(_distill_payload(rec, row["text"]))
+    return out
+
+
+def _read_from_fleet_turns(conn, claim_id: str, limit: int) -> list[dict]:
+    """Fallback: read past verdicts straight from fleet_turns (the raw past-analysis
+    table). validity_audit is derived from this table; when a verdict was not
+    distilled, it is still here. The claim id appears as the turn's goal/key; we
+    accept a `verdict`/`outcome` role or a text that names the claim, and apply the
+    SAME allow-list so no raw conversation blob is surfaced.
+    """
+    for sql, args in (
+        ("SELECT goal_id AS cid, key AS run_id, ts, text, role FROM fleet_turns "
+         "WHERE role IN ('verdict','outcome') AND "
+         "(goal LIKE ? OR text LIKE ?) ORDER BY ts LIMIT ?",
+         ("%" + str(claim_id) + "%", "%" + str(claim_id) + "%", int(limit))),
+    ):
         try:
-            cur = conn.execute(
-                "SELECT claim_id, run_id, ts, text FROM validity_audit "
-                "WHERE claim_id = ? AND role_tag = 'tool_result' ORDER BY ts, seq LIMIT ?",
-                (str(claim_id), int(limit)))
+            cur = conn.execute(sql, args)
         except sqlite3.OperationalError:
             return []
         out: list[dict] = []
         for row in cur:
-            rec: dict = {"claim_id": row["claim_id"], "run_id": row["run_id"], "ts": row["ts"]}
-            try:
-                payload = json.loads(row["text"] or "{}")
-            except (ValueError, TypeError):
-                payload = {}
-            if isinstance(payload, dict):
-                for k in ("verdict", "finding", "reasons", "notes", "hashes"):
-                    if k in payload:
-                        rec[k] = payload[k]
-            # keep only the allow-listed fields (data minimisation)
-            out.append({k: v for k, v in rec.items() if k in _ALLOWED_RUN_FIELDS})
-        return out
-    finally:
-        conn.close()
+            rec = {"claim_id": str(claim_id),
+                   "run_id": row["run_id"], "ts": row["ts"]}
+            out.append(_distill_payload(rec, row["text"]))
+        if out:
+            return out
+    return []
 
 
 # ---------------------------------------------------------------------------- (a)
