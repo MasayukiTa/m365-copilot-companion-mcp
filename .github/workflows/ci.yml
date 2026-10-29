@@ -208,6 +208,7 @@ jobs:
             scripts/test_set_setting_via_ui_ids.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
+            tests/test_validity_harness.py \
             tests/test_listing_counts.py \
             tests/test_child_output_decoding.py \
             bench/test_skill_use_log.py \
