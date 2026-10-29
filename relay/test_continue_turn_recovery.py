@@ -612,6 +612,14 @@ def test_executed_calls_with_a_refused_plan_are_not_resent_on_a_tab(tmp_path, mo
     from relay import continue_recovery as CR
     tools, route, w, reason = _executed_but_not_known_to_have_landed(
         tmp_path, monkeypatch, used=CR.MAX_CONTINUES_PER_GOAL)
+    # `_fall_back_to_tab` reads `self.drv.failed`. The invariant under test -- an executed,
+    # un-continuable turn is NOT verbatim-resent on a tab -- holds for a reason that does NOT
+    # prove the frame was never sent (a bare socket close: delivery "unknown", `_not_sent`
+    # False). A PROVEN-NOT-SENT reason (expired token / socket-could-not-open) is a separate
+    # case: the frame never left, so the turn is held for a fresh token rather than refused
+    # (see test_expired_token_after_output_is_not_a_refusal.py and _retry_socket ~8777-8793).
+    with w.drv._lock:
+        w.drv.failed = "ChatHubError: no close frame received or sent"
     assert w._fall_back_to_tab() is False        # _open_fresh は呼ばれたら失敗する
     assert w.outcome == "STUCK" and "not re-sent" in w.reason
 

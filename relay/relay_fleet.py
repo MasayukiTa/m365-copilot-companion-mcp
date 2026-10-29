@@ -8924,9 +8924,21 @@ class RelayWorker:
             _not_sent = delivery_proves_not_sent(reason)
         except Exception:
             _not_sent = False
+        # The `executed` term is guarded by `not _not_sent` for the SAME reason `_landed_pending`
+        # is, and for the same reason `_retry_socket` holds instead of refusing (relay_fleet.py
+        # ~8777-8793, "Mirrors `_fall_back_to_tab`"). A PROVEN-NOT-SENT reason -- an expired
+        # token, a socket that could not be opened -- means the frame never reached the server,
+        # so the turn is still owed; ending the worker strands it. #360 cleared the sticky landed
+        # flag on expiry but left THIS term unguarded, so a goal that finished its artefact and
+        # then had its next turn's send fail on an expired token was read as a landed act and
+        # refused -> STUCK although nothing was sent (job r6ae37139_a0_w0 / run r6ae36308 w0
+        # turn 3, 2026-10-30 00:55: continue_plan ok=false reason_not_continuable, then
+        # resend_refused delivery=not_delivered). A reason that does NOT prove non-delivery
+        # (a bare socket close, `carried no text`) keeps `_not_sent` False and still refuses, so
+        # the "don't verbatim-resend an executed, un-continuable turn" guarantee is intact.
         _may_have_landed = (_delivery == "delivered"
                             or (getattr(self, "_landed_pending", False) and not _not_sent)
-                            or self._journal_shows_executed_calls())
+                            or (self._journal_shows_executed_calls() and not _not_sent))
         if _may_have_landed and self._goal_may_act():
             decision = "refuse"
             try:
