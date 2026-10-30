@@ -66,20 +66,33 @@ def test_an_ordinary_worker_is_untouched():
 
 # ---- the split reply ----------------------------------------------------------------------
 
-def test_a_split_spawns_the_children_and_ENDS_the_parent():
-    """The parent must let go of its slot. Parked until its children finish, with a
-    concurrency cap below the number of children, it waits for children that cannot start."""
+def test_a_split_spawns_the_children_and_PARKS_the_parent():
+    """The parent lets go of its TAB (admission slot) but is NOT finished: it parks in
+    awaiting_children until every child is done, then resumes its OWN conversation to merge.
+    No separate 'receiver' worker is created for the merge (owner note 2026-10-30).
+
+    Earlier this asserted the parent ended in TERMINAL -- that was the very assumption the
+    owner rejected: a merge handed to a fresh worker instead of back to the splitter.
+    """
     got = []
-    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='': got.append((goal, kids)))
+    w = _worker(spawn=lambda goal, kids, parent_checks=None, parent_partial='', **kw: got.append((goal, kids)))
     w._decide(SPLIT_REPLY)
 
     assert len(got) == 1
     parent_goal, kids = got[0]
     assert parent_goal == w.goal
     assert len(kids) == 3
-    assert w.status in rf.TERMINAL, "a parent that stays alive holds a slot its children need"
+    # NOT terminal: the splitter stays as the worker that will merge its own family.
+    assert w.status not in rf.TERMINAL
+    assert w.status == fo.AWAITING_CHILDREN
     assert w.outcome == "FANOUT"
-    assert "3 個" in w.reason
+    # Its tab was released so it does not hold an admission slot its children need.
+    assert w.closed is True
+    # Campaign id is remembered so the sweep can hand the finished family back to THIS worker.
+    assert w._fanin_campaign_id
+    # No live socket/drv in this unit build, so no conversation id could be captured.
+    assert w._fanin_parent_conv == ""
+    assert "統合" in w.reason
 
 
 def test_the_children_carry_the_parents_goal_and_their_own_slice():
@@ -346,3 +359,67 @@ def test_another_campaigns_merge_is_not_borrowed():
                      campaign=fo.campaign_id_for("goal B"), result="merged B")
     _publish([parent, agg])
     assert parent.display_result == "split A"
+
+
+# --- 分割元自身による統合への復帰 (adopt_parent_merge) ------------------------
+#
+# 待機 (awaiting_children) に入った分割元が、子完了後に『自分の会話の続き』で統合を
+# 走らせるために ready へ戻る経路。ここが固めるのは attach() を呼ぶ前の worker 状態:
+# admission が resume_conv で同じ会話へ接ぎ直し、新しい driver を張れること、そして
+# 統合ターンが再び分割を打診しないこと。driver/route は触らない (属性のみ) ので I/O 不要。
+
+def _merge_item(goal="1〜3月のメールを一覧化する", parent_conv="conv-parent-xyz"):
+    records = [
+        {"text": "2026年1月分", "outcome": "DONE", "result": "1月の結果"},
+        {"text": "2026年2月分", "outcome": "DONE", "result": "2月の結果"},
+    ]
+    return fo.parent_resume_goal(goal, records,
+                                 campaign_id=fo.campaign_id_for(goal),
+                                 resume_conv=parent_conv)
+
+
+def test_adopt_parent_merge_points_resume_at_the_parents_own_conversation():
+    w = _worker()
+    w.adopt_parent_merge(_merge_item(parent_conv="conv-parent-xyz"), "conv-parent-xyz")
+    assert w.resume_conv == "conv-parent-xyz"
+
+
+def test_adopt_parent_merge_leaves_the_worker_ready_to_be_reattached():
+    w = _worker()
+    w.closed = True
+    w.socket = True
+    w.drv = object()
+    w.adopt_parent_merge(_merge_item(), "conv-parent-xyz")
+    assert w.closed is False
+    assert w.drv is None
+    assert w.socket is False
+    assert w.status == "ready"
+
+
+def test_adopt_parent_merge_clears_the_terminal_flags():
+    w = _worker()
+    w.outcome = "STUCK"
+    w.adopt_parent_merge(_merge_item(), "conv-parent-xyz")
+    assert w.outcome is None
+
+
+def test_adopt_parent_merge_disarms_further_splitting():
+    w = _worker()
+    w.adopt_parent_merge(_merge_item(), "conv-parent-xyz")
+    assert w.fanout is False
+    assert w._fanout_done is True
+    assert w._midrun_split_asked is True
+
+
+def test_adopt_parent_merge_marks_the_worker_as_resumed_for_the_sweep_guard():
+    w = _worker()
+    assert w._fanin_resumed is False
+    w.adopt_parent_merge(_merge_item(), "conv-parent-xyz")
+    assert w._fanin_resumed is True
+
+
+def test_adopt_parent_merge_loads_the_merge_goal_as_the_job():
+    w = _worker()
+    item = _merge_item(goal="1〜3月のメールを一覧化する")
+    w.adopt_parent_merge(item, "conv-parent-xyz")
+    assert fo.SPLIT_JOB not in w.job
