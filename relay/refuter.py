@@ -70,6 +70,25 @@ SUBJECT_CHECK_RULE = (
     "ない場合は UPHELD にせず、INCONCLUSIVE: 使った対象が不明 とすること。"
 )
 
+#: THE JUDGE CHECK (2026-10-30). Generic on purpose, like the source/subject checks above.
+#: OWNER RULE (2026-10-27): a data-analysis answer must pass a final small-sample judge before it
+#: is delivered. MEASURED 2026-10-30: an analysis was re-run three times and the judge was not
+#: called automatically after it; nothing in the review caught the omission. This rule makes the
+#: reviewer verify, on every data-analysis answer, that the judge was run -- or that a concrete
+#: reason it was not is stated. It names no system, tool, data kind or engine: whether a given
+#: answer is a data analysis, and which judge applies, lives in the procedure/skill, not here.
+JUDGE_CHECK_RULE = (
+    "【判定器チェック(必須)】回答が**データ解析の結果**(データ源を照会して表・相関・群間比較"
+    "などの数値的結論を出す仕事)である場合、その結論を出す前に**最終の判定器を通したか**を確認"
+    "すること。回答に、判定(採否)・理由コード・区間・標本数 n のいずれも載っておらず、かつ"
+    "判定器を通せなかった具体的な理由も書かれていない場合は、たとえ数字が内部で整合していても "
+    "REFUTED とし、理由を『判定器未通過: 解析結果だが最終判定器を通した形跡(判定・理由コード・"
+    "区間・n)も、通せなかった理由も無い』の形で書くこと。判定器を通せなかったと回答が明記し、"
+    "その具体的理由(どこで何が失敗したか)が書かれている場合は未通過とはしない。回答がデータ解析"
+    "ではない(調査・要約・文章整形・コード修正など)場合は、このチェックは当てはめない。"
+)
+
+
 # Nudge sent when the reviewer answered without a clear verdict (e.g. it only said
 # "I'll check the files"). Asks it to finish and emit the marker now.
 REFUTER_NUDGE = (
@@ -236,7 +255,8 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
     `procedure` is the matched approved procedure's one-line identity ("name: description"), or
     "" when the harness matched none; SOURCE_CHECK_RULE is present either way.
     """
-    base = REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE + "\n" + SUBJECT_CHECK_RULE
+    base = (REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE + "\n" + SUBJECT_CHECK_RULE
+            + "\n" + JUDGE_CHECK_RULE)
     if unverifiable:
         base = UNVERIFIABLE_PREAMBLE + "\n\n" + base
     if lens and lens in LENS_PROMPTS:
@@ -254,7 +274,7 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
 def _preamble_id(lens="", unverifiable=False):
     """A short id of the instruction text a reviewer is given (base + lens + unverifiable framing)."""
     import hashlib
-    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE + SUBJECT_CHECK_RULE
+    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE + SUBJECT_CHECK_RULE + JUDGE_CHECK_RULE
             + (LENS_PROMPTS.get(lens, "") if lens else ""))
     if unverifiable:
         text = UNVERIFIABLE_PREAMBLE + text
