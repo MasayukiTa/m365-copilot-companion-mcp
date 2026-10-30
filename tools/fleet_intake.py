@@ -1067,6 +1067,220 @@ def fleet_queue() -> str:
     return "\n".join(lines)
 
 
+# === Every submission, including the ones the fleet never received ==========================
+#
+# WHY fleet_queue() WAS NOT ENOUGH. fleet_queue() counts the task directories, and `status`
+# shows live workers -- so a submission that reached only the SCREEN (a 'queued/unconfirmed'
+# row in .fleet/health_strip.json with an EMPTY jid) and never the fleet intake was invisible
+# to both. 2026-10-30 one such submission sat unseen for >12 minutes. The owner's order: every
+# unsubmitted job, and every submitted-but-unstarted job, must be visible from the CLI, in one
+# command, whatever route it arrived by.
+#
+# fleet_admissions() is that one command's data: a READ-ONLY sweep of every place a submission
+# can be sitting before it is finished, each reduced to the same row shape. It writes nothing,
+# so it is always safe against a live queue.
+
+#: A worker row in status.json whose status is one of these has finished -- it is not an
+#: unstarted or in-flight admission. Mirrors _WORKER_TERMINAL used by _in_flight_goals.
+_ADMISSION_HEAD_CHARS = 120
+
+
+def _admission_row(state, jid, goal_head, submitted_ts, age_s, where):
+    """One admission, in the shape every source is flattened to. `goal_head` is already short."""
+    if age_s is None and submitted_ts is not None:
+        try:
+            age_s = max(0.0, time.time() - float(submitted_ts))
+        except (TypeError, ValueError):
+            age_s = None
+    head = " ".join(str(goal_head or "").split())
+    if len(head) > _ADMISSION_HEAD_CHARS:
+        head = head[:_ADMISSION_HEAD_CHARS] + _TRUNCATED
+    return {"state": state, "jid": jid if jid is not None else "",
+            "goal_head": head, "submitted_ts": submitted_ts,
+            "age_s": age_s, "where": where}
+
+
+def _health_strip_waiting():
+    """Rows the SCREEN wrote to health_strip.json but the fleet intake never received.
+
+    These carry an empty `id` (no jid was ever issued) and `unconfirmed` true. This is the
+    exact class the 2026-10-30 incident produced and the class fleet_queue()/status could not
+    see -- so it is listed first and as its own state, `awaiting_intake`.
+    """
+    rows = []
+    path = os.path.join(TR.FLEET_STATE_DIR, "health_strip.json")
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            strip = json.load(fh)
+    except (OSError, ValueError):
+        return rows
+    for q in (strip.get("queued") or []):
+        if not isinstance(q, dict):
+            continue
+        jid = str(q.get("id") or "")
+        # A queued row that already carries a jid is a task-directory job we will also find
+        # below; only the id-less, unconfirmed screen submissions are unique to this source.
+        if jid:
+            continue
+        age = q.get("age_s")
+        ts = None
+        if isinstance(age, (int, float)):
+            ts = time.time() - float(age)
+        rows.append(_admission_row("awaiting_intake", "", q.get("goal_head"),
+                                   ts, age, q.get("where") or "screen"))
+    return rows
+
+
+def _tasks_admissions():
+    """Submissions sitting in the task directories: accepted (pending), awaiting_fleet
+    (for_fleet), dispatched (awaiting/awaiting_ack). running/ is a transient claim the router
+    holds mid-dispatch and is reported as `accepted` -- it has not reached a worker yet."""
+    rows = []
+    for sub, state in (("pending", "accepted"), ("running", "accepted")):
+        for job in _job_dicts(sub):
+            goal = (job.get("payload") or {}).get("goal") or ""
+            rows.append(_admission_row(state, job.get("id") or "", goal,
+                                       job.get("created"), None, sub))
+
+    d = os.path.join(TR.TASKS, "for_fleet")
+    try:
+        names = sorted(os.listdir(d))
+    except OSError:
+        names = []
+    for name in names:
+        if not name.endswith(".txt"):
+            continue
+        try:
+            with open(os.path.join(d, name), encoding="utf-8") as fh:
+                goal, _prio, _rc = TR.read_for_fleet(fh.read())
+        except (OSError, ValueError):
+            goal = ""
+        ts = None
+        try:
+            ts = os.path.getmtime(os.path.join(d, name))
+        except OSError:
+            pass
+        rows.append(_admission_row("awaiting_fleet", name[:-4], goal, ts, None, "for_fleet"))
+
+    for sub in ("awaiting", "awaiting_ack"):
+        for job in _job_dicts(sub):
+            goal = job.get("goal") or (job.get("payload") or {}).get("goal") or ""
+            rows.append(_admission_row("dispatched", job.get("id") or "", goal,
+                                       job.get("created"), None, sub))
+    return rows
+
+
+def _worker_started_ts(w):
+    """When this worker's goal was first queued, from the earliest phase_events ts. None if the
+    record carries no phase timeline."""
+    evs = w.get("phase_events")
+    if not isinstance(evs, list):
+        return None
+    tss = [e.get("ts") for e in evs
+           if isinstance(e, dict) and isinstance(e.get("ts"), (int, float))]
+    return min(tss) if tss else None
+
+
+def _worker_admissions():
+    """Goals a LIVE worker is holding right now (status.json), excluding closed/terminal ones.
+    These are the jobs a worker has started -- state `running`.
+
+    IDENTITY IS task_id, NOT jid. A fanout parent's children share ONE jid but each has its own
+    task_id (measured 2026-10-30: c56eee6a4a96 had six live children c56eee6a4a966-1..-6). Keying
+    on jid collapsed them into six identical-looking rows; keying on task_id shows each child
+    once. The parent jid is carried alongside so a reader can still group them.
+    """
+    rows = []
+    try:
+        with open(os.path.join(TR.FLEET_STATE_DIR, "status.json"), encoding="utf-8-sig") as fh:
+            status = json.load(fh)
+    except (OSError, ValueError):
+        return rows
+    for w in status.get("workers") or []:
+        if not isinstance(w, dict) or w.get("closed"):
+            continue
+        if str(w.get("status") or "").lower() in _WORKER_TERMINAL:
+            continue
+        goal = w.get("goal") or ""
+        ident = w.get("task_id") or w.get("jid") or ""
+        row = _admission_row("running", ident, goal, _worker_started_ts(w), None, "worker")
+        row["parent_jid"] = w.get("jid") or ""
+        rows.append(row)
+    return rows
+
+
+#: The order admissions are reported in: the least-progressed first, so a submission stuck at
+#: the screen -- the incident's class -- is at the top where it cannot be missed.
+_ADMISSION_STATE_ORDER = {"awaiting_intake": 0, "accepted": 1, "awaiting_fleet": 2,
+                          "dispatched": 3, "running": 4}
+
+
+def fleet_admissions():
+    """Every submission not yet finished, from every route it can arrive by, as a list of rows.
+
+    One row per submission: {state, jid, goal_head, submitted_ts, age_s, where}. `state` is one
+    of awaiting_intake (at the screen, no jid, fleet never received it), accepted (in
+    pending/running), awaiting_fleet (parked in for_fleet/), dispatched (handed off, in
+    awaiting*/), running (a live worker holds it). Read-only. A finished job is deliberately
+    absent -- this answers 'what has NOT started/finished', which is the owner's question.
+    """
+    try:
+        TR.ensure_dirs()
+    except Exception:
+        pass
+    rows = []
+    rows.extend(_health_strip_waiting())
+    rows.extend(_tasks_admissions())
+    rows.extend(_worker_admissions())
+    # DE-DUPLICATE on (state, identity). The same submission can legitimately surface from two
+    # sources in the brief window it is moving between them -- e.g. a pending/ file not yet
+    # deleted while a worker has just picked the goal up. One row per (state, jid) keeps the
+    # list honest without hiding a genuinely distinct fanout child (those differ by task_id,
+    # which is the identity used for worker rows). An id-less screen row is never collapsed:
+    # each keeps its own slot by object identity.
+    seen = set()
+    deduped = []
+    for r in rows:
+        ident = r.get("jid") or ""
+        key = (r.get("state"), ident) if ident else (id(r),)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(r)
+    deduped.sort(key=lambda r: (_ADMISSION_STATE_ORDER.get(r.get("state"), 9),
+                                -(r.get("age_s") or 0)))
+    return deduped
+
+
+def _fmt_age(age_s):
+    if age_s is None:
+        return "?"
+    age_s = int(age_s)
+    if age_s < 60:
+        return "%ds" % age_s
+    if age_s < 3600:
+        return "%dm%02ds" % (age_s // 60, age_s % 60)
+    return "%dh%02dm" % (age_s // 3600, (age_s % 3600) // 60)
+
+
+def fleet_admissions_text():
+    """fleet_admissions() rendered as a table a person reads at a shell."""
+    rows = fleet_admissions()
+    if not rows:
+        return "no submissions waiting or in flight (nothing at the screen, in the queue, or on a worker)."
+    # JID column is wide enough for a fanout child id (parent hex + "-N"), and is NOT truncated:
+    # truncating to the parent's width made c56eee6a4a966-1..-6 all read as c56eee6a4a96, hiding
+    # that they are six distinct children (measured 2026-10-30).
+    jid_w = max(3, max((len(str(r.get("jid") or "-")) for r in rows), default=3))
+    header = "%-15s %-*s %-8s %s" % ("STATE", jid_w, "JID", "AGE", "GOAL")
+    out = ["%d submission(s) not yet finished:" % len(rows), header]
+    for r in rows:
+        out.append("%-15s %-*s %-8s %s" % (
+            r.get("state") or "?", jid_w, (r.get("jid") or "-"),
+            _fmt_age(r.get("age_s")), r.get("goal_head") or ""))
+    return "\n".join(out)
+
+
 # === Operator-only forced intake ============================================================
 #
 # WHY THIS IS NOT A fleet_submit FLAG, AND NOT AN MCP TOOL.
@@ -1209,7 +1423,17 @@ def _cli(argv=None):
     parser.add_argument(
         "--source", default="",
         help="Optional short tag naming who forced it (shown on the job's provenance).")
+    parser.add_argument(
+        "action", nargs="?", choices=["admissions"], default=None,
+        help="admissions: list EVERY submission not yet finished -- including ones stuck at "
+             "the screen (health_strip.queued, no jid) that the fleet never received, plus "
+             "accepted/awaiting_fleet/dispatched/running. Read-only; shows state, jid, age "
+             "and goal for each. This is the owner's 'show me every unsubmitted and "
+             "submitted-but-unstarted job' command.")
     args = parser.parse_args(argv)
+    if args.action == "admissions":
+        print(fleet_admissions_text())
+        return 0
     if args.force_refused:
         result = force_submit_refused(args.force_refused, source=args.source or "operator-cli")
         print(result)
