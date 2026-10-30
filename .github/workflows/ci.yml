@@ -157,6 +157,10 @@ jobs:
             relay/test_a_one_line_answer_is_still_an_answer.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
+            relay/test_judge_gate_harness.py \
+            tests/test_validity_harness.py \
+            tools/test_gui_submission_reaches_fleet.py \
+            tools/test_fleet_admissions.py \
             tools/test_refused_record_and_force.py \
             ui/test_a_refused_request_is_shown_and_can_be_forced.py \
             tools/test_dismiss_refused_card.py \
@@ -186,7 +190,6 @@ jobs:
             relay/test_route_breaker_per_conversation.py \
             relay/test_mcp_attribution.py \
             relay/test_a_running_tool_call_is_progress_not_a_stall.py \
-            relay/test_judge_gate_harness.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
@@ -209,7 +212,6 @@ jobs:
             scripts/test_set_setting_via_ui_ids.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
-            tests/test_validity_harness.py \
             tests/test_listing_counts.py \
             tests/test_child_output_decoding.py \
             bench/test_skill_use_log.py \
