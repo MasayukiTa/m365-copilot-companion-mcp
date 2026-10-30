@@ -773,6 +773,8 @@ jobs:
             tests/test_steer_followup.py \
             tests/test_launch_gate.py \
             relay/test_fanout_worker.py \
+            relay/test_fanout_parent_waits.py \
+            relay/test_fanout_parent_waits_sweep.py \
             relay/test_splittability.py \
             relay/test_wants_fanout.py \
             relay/test_natural_language_fanout_e2e.py \

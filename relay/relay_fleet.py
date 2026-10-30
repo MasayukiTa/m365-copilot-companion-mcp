@@ -2577,7 +2577,8 @@ def active_worker_count(workers):
     # ready/waiting, researching, awaiting gates and replay belong to the goal's
     # execution; verifying/refuting are independent checks, not goal execution.
     return sum(1 for w in workers if w.status not in TERMINAL
-               and w.status not in (PENDING, "verifying", "refuting", "awaiting_execution"))
+               and w.status not in (PENDING, "verifying", "refuting", "awaiting_execution",
+                                    fanout_mod.AWAITING_CHILDREN))
 
 
 def verification_worker_count(workers):
@@ -4124,6 +4125,11 @@ class RelayWorker:
         # when nothing was known.
         self._fanout_capable = bool(fanout) and _depth0 and self._spawn_fn is not None
         self._fanout_done = False
+        # 分割後に待機 (awaiting_children) へ入った分割元が、子完了後に自分の会話の続きで統合
+        # するために控える値。分割が起きるまでは空。
+        self._fanin_campaign_id = ""
+        self._fanin_parent_conv = ""
+        self._fanin_resumed = False
         #: A mid-run split is offered ONCE. A second refusal is the agent telling us the
         #: same thing twice, and asking again would spend the remaining turns on the question
         #: instead of on the work.
@@ -4460,6 +4466,39 @@ class RelayWorker:
                 age_s=time.time() - self._attached_ts, where=where, has_id=has_id)
         except Exception:
             pass
+
+    def adopt_parent_merge(self, agg_item, parent_conv):
+        """子が全部終わった分割元 (awaiting_children) を、統合担当として『自分自身で』復帰させる。
+
+        別の RelayWorker (別担当) を立てずに、この分割元ワーカーに統合 goal を載せ、
+        resume_conv に自分の会話 id を入れて ready に戻す。次の sweep が attach() を呼ぶと、
+        その会話 id で同じ会話に再接続し、続きとして統合が書かれる -- オーナーの
+        『統合は分割元自身が行う。別担当を立てない』を満たす (指摘 2026-10-30)。
+
+        待機中に close() でタブ (driver) は手放しているので、再接続できるよう closed を戻す。
+        会話 id は parent_resume_goal が agg_item['resume_conv'] に入れて渡す。
+        """
+        _goal = dict(agg_item)
+        _goal["resume_conv"] = parent_conv
+        self.resume_conv = parent_conv
+        self.goal_record = freeze_goal_dict(_goal)
+        text, checks, cwd = goal_fields(_goal)
+        self.goal, self.checks = text, checks
+        if cwd:
+            self.cwd = cwd
+        self.task_envelope = task_envelope_from_goal(_goal)
+        self.job = _goal.get("text") or self.goal
+        # これ以上は分割しない (統合ターンが再び分割を打診するのを防ぐ)。
+        self.fanout = False
+        self._fanout_done = True
+        self._midrun_split_asked = True
+        self._fanin_resumed = True
+        # 再接続できるよう、待機中に閉じた driver 状態を戻す。attach() が新しい driver を張る。
+        self.closed = False
+        self.page, self.drv, self.socket = None, None, False
+        self.outcome = ""
+        self.reason = "子の完了を確認 -> 分割元自身の会話で統合を続行"
+        self.status = "ready"
 
     def close(self):
         """Release this worker and every resource it owns. Idempotent; never raises."""
@@ -7427,10 +7466,35 @@ class RelayWorker:
                                    parent_partial=_partial,
                                    **conv_saving_mod.parent_merge_kwargs(self))
                     if _spawned is not False:
-                        # Free the admission slot; the merge runs after the children.
-                        self.status, self.outcome = "done", "FANOUT"
-                        self.reason = ("%d 個のサブタスクに分割して並列実行（完了後に統合）"
+                        # 分割元は『完了』にしない。子が全部終わるまで待機 (awaiting_children) し、
+                        # 統合は分割元自身の会話の続きで行う -- 受け取り専用の別担当は立てない
+                        # (オーナー指摘 2026-10-30)。待機中はタブを解放するので admission slot は
+                        # 占有せず、aggregation_goal docstring が警告するデッドロックは起きない。
+                        #
+                        # 分割元の会話 id を今のうちに控える: 待機後に再 attach して同じ会話の続きで
+                        # 統合するための resume 先。socket が立っていて実際に発話済みのときだけ取れる
+                        # (parent_conversation_ref と同じ条件; 取れなければ sweep が別担当で統合する)。
+                        self._fanin_campaign_id = (kids[0].get("campaign_id")
+                                                   or fanout_mod.campaign_id_for(self.goal))
+                        try:
+                            _ids = (self.drv.conversation_ids()
+                                    if getattr(self, "socket", False)
+                                    and getattr(self, "drv", None) is not None else {}) or {}
+                            self._fanin_parent_conv = (str(_ids.get("client")
+                                                           or _ids.get("server") or "").strip()
+                                                       if int(_ids.get("turns") or 0) >= 1 else "")
+                        except Exception:
+                            self._fanin_parent_conv = ""
+                        # outcome は FANOUT のまま (子が親スロットを埋める slot_record 等、FANOUT を
+                        # 読む既存経路を壊さない)。status だけ非終端の待機にする。
+                        self.outcome = "FANOUT"
+                        self.status = fanout_mod.AWAITING_CHILDREN
+                        self.reason = ("%d 個のサブタスクに分割して並列実行（完了を待って自分で統合）"
                                        % len(kids))
+                        if not self.closed:
+                            # タブ (admission slot) を解放。会話 id は上で控えてあるので、待機明けに
+                            # resume_conv で同じ会話に再 attach できる。
+                            self.close()
                         return
                 # An unusable split -- one item, forty, or prose with no list. Do the work
                 # here instead of splitting: refusing to proceed would strand a goal on the
@@ -11007,39 +11071,75 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     queued += _stall_check(_cid, _camp, _live_idx)
                 continue
             _stall_sweeps.pop(_cid, None)
+            # 統合の『受け手』を先に決める。分割元ワーカーが待機 (awaiting_children) していて
+            # 自分の会話 id を控えているなら、別担当を立てず分割元ワーカー自身に統合させる
+            # (オーナー指摘 2026-10-30『統合は分割元自身が行う。別担当を立てない』)。会話 id が
+            # 無い (別プロセスで家族を再構築した等) ときだけ、従来どおり別担当にフォールバック。
+            # ここで先に決めるのは _note_merged に渡す resume_key を『実際に走る goal』のものに
+            # するため: 分割元継続 (role=parent_merge, task_id ...-parentmerge) と別担当
+            # (role=aggregator, ...-merge) は resume_key が違い、取り違えると復帰時の
+            # 『統合済み』判定がズレて二重統合しうる。
+            _parent_w = next(
+                (w for w in workers
+                 if getattr(w, "_fanin_campaign_id", "") == _cid
+                 and w.status == fanout_mod.AWAITING_CHILDREN
+                 and not getattr(w, "_fanin_resumed", False)),
+                None)
+            _parent_conv = getattr(_parent_w, "_fanin_parent_conv", "") if _parent_w else ""
+            _resume_here = _parent_w is not None and bool(_parent_conv)
             # THE PARENT'S WORKING DIRECTORY GOES WITH IT. The children get it from
             # child_goals; the merge was starting wherever the fleet happened to be, while
             # being asked to write a combined file and report its path.
-            _agg = fanout_mod.aggregation_goal(_camp["goal"], _recs,
-                                               campaign_id=_cid,
-                                               cwd=_camp.get("cwd"),
-                                               parent_checks=_camp.get("checks"),
-                                               parent_partial=_camp.get("partial"),
-                                               parent_level=_camp.get("parent_level"),
-                                               run_id=run_id,
-                                               board_lines=agent_board.pointer_lines(),
-                                               **({"depth": _camp["depth"]}
-                                                  if _camp.get("depth") else {}))
-            # WHICH CONVERSATION THE MERGE RUNS IN (setting merge_conversation): fresh, as ever,
-            # or the parent's. Only the goal's transport changes; `merged` just below is what
-            # keeps the merge to once.
-            _agg = conv_saving_mod.apply_merge_conversation(_agg, _camp, _recs, run_id=run_id)
+            if _resume_here:
+                # parent_resume_goal は aggregation_goal と同じ統合プロンプト・checks・cwd・
+                # 失敗スライスの名指しに、分割元の会話 id と role=parent_merge を付けたもの。
+                # apply_merge_conversation (別担当前提の計測と resume_conv 付与) は通さない:
+                # 継続は resume_conv を parent_resume_goal 自身が持つ。
+                _merge_item = fanout_mod.parent_resume_goal(
+                    _camp["goal"], _recs, campaign_id=_cid,
+                    resume_conv=_parent_conv, cwd=_camp.get("cwd"),
+                    parent_checks=_camp.get("checks"),
+                    parent_partial=_camp.get("partial"),
+                    parent_level=_camp.get("parent_level"),
+                    run_id=run_id, board_lines=agent_board.pointer_lines(),
+                    **({"depth": _camp["depth"]} if _camp.get("depth") else {}))
+            else:
+                _merge_item = fanout_mod.aggregation_goal(
+                    _camp["goal"], _recs, campaign_id=_cid, cwd=_camp.get("cwd"),
+                    parent_checks=_camp.get("checks"),
+                    parent_partial=_camp.get("partial"),
+                    parent_level=_camp.get("parent_level"),
+                    run_id=run_id, board_lines=agent_board.pointer_lines(),
+                    **({"depth": _camp["depth"]} if _camp.get("depth") else {}))
+                # WHICH CONVERSATION THE MERGE RUNS IN (setting merge_conversation): fresh, as
+                # ever, or the parent's. Only the goal's transport changes.
+                _merge_item = conv_saving_mod.apply_merge_conversation(
+                    _merge_item, _camp, _recs, run_id=run_id)
             if _camp.get("parent_campaign_id"):
                 # a NESTED family: remember which slices this merge goes without, so the parent
                 # slot it fills is marked MISSING rather than complete
                 _camp["missing"] = fanout_mod.missing_slices(_recs)
+            # `merged` just below is what keeps the merge to once.
             _camp["merged"] = True
-            _note_merged(_cid, resume_mod.goal_resume_key(_agg), missing=_camp.get("missing"))
+            _note_merged(_cid, resume_mod.goal_resume_key(_merge_item),
+                         missing=_camp.get("missing"))
             if _camp.get("requeue_merge"):
                 # A merge queued before a death that never finished is re-issued once; the
                 # cap (fleet_resume.rehydrate_decision) reads this line.
                 _camp["requeue_merge"] = False
                 _note_marker({"kind": "merge_requeued", "campaign_id": _cid, "attempt": 1})
-            add_box.append(_agg)
+            _done_n = sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE")
+            if _resume_here:
+                # 分割元ワーカー自身を統合担当として復帰させる (add_box には積まない)。
+                _parent_w.adopt_parent_merge(_merge_item, _parent_conv)
+                queued += 1
+                print("[fanout] %s: %d/%d subtask(s) done -> 分割元自身が統合 (%s)"
+                      % (_cid, _done_n, len(_recs), _parent_w.name), flush=True)
+                continue
+            add_box.append(_merge_item)
             queued += 1
             print("[fanout] %s: %d/%d subtask(s) done -> merging"
-                  % (_cid, sum(1 for r in _recs if (r["outcome"] or "").upper() == "DONE"),
-                     len(_recs)), flush=True)
+                  % (_cid, _done_n, len(_recs)), flush=True)
         return queued
 
     # EFFORT IS THE RUN'S UNLESS A GOAL NAMED ITS OWN. --effort was read once and every
@@ -11799,7 +11899,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             # status flip. Until that exists, a steer that arrives too late is reported as
             # never used (fleet_runner.report_unused_steers) rather than acted on -- the
             # honest half of the feature, which is that the message is not silently lost.
-            if w.status in TERMINAL or w.status in (PENDING, "awaiting_execution"):
+            if w.status in TERMINAL or w.status in (PENDING, "awaiting_execution",
+                                                    fanout_mod.AWAITING_CHILDREN):
                 continue
             _was_reviewing = w.status in ("verifying", "refuting")
             try:
