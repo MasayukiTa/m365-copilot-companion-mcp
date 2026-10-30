@@ -762,7 +762,7 @@ def test_the_production_callers_are_the_ones_the_board_is_wired_through():
     rf_src = src("relay/relay_fleet.py")
     assert rf_src.count("agent_board.post_result(") == 1
     assert rf_src.count("agent_board.begin_run()") == 1
-    assert rf_src.count("board_lines=agent_board.pointer_lines()") == 1
+    assert rf_src.count("board_lines=agent_board.pointer_lines()") == 2
     assert "agent_board.status_block" in src("relay/fleet_runner.py")
     assert "agent_board.digest(" in src("tools/board_tool.py")
     assert '"board_digest":' in src("relay/fleet_toolset.py")

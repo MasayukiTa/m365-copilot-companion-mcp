@@ -53,7 +53,7 @@ def _run(tmp_path, monkeypatch, mode):
                                              ("alive", [1, 2])])
 def test_verified_adoption(tmp_path, monkeypatch, mode, expected):
     seen, queued = _run(tmp_path, monkeypatch, mode)
-    assert seen[0][0:2] == ("done", "FANOUT")
+    assert seen[0][0:2] == ("awaiting_children", "FANOUT")
     assert sorted(seen[0][2]) == ([] if mode == "alive" else expected)
     assert sorted(queued) == expected
 

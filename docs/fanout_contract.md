@@ -106,12 +106,51 @@ and that time the worker really does stop.
   instruction it can only obey.
 
 **The parent's own work travels with the split.** A worker splitting at turn seven has produced
-seven turns of output, and `FANOUT` ends it — the merge reads child records only. So its partial
+seven turns of output. The parent does **not** end here (see §2a): it `close()`s its tab and
+parks in `awaiting_children`, keeping `outcome = "FANOUT"` so the existing slot/ledger readers are
+unchanged, while `status` becomes the non-terminal `awaiting_children`. Its partial
 result goes into the campaign (`partial`), onto the ledger header, and reaches
-`aggregation_goal(parent_partial=...)`, which prepends it as `subtask_index: 0, outcome: DONE`.
+`aggregation_goal(parent_partial=...)` / `parent_resume_goal(parent_partial=...)`, which prepends
+it as `subtask_index: 0, outcome: DONE`.
 Slice 0 because it came first, and DONE because `missing_slices` only counts non-DONE records:
 it adds material without moving the gap check. Losing six turns of real work to the mechanism
 meant to rescue them would be worse than the failure it replaces.
+
+## 2a. The splitter waits and merges itself — it does not finish at the split
+
+> **Owner note (2026-10-30 14:40):** 「fanout のときに、分割元が、分割したら『完了』で止まっている
+> のが問題。完了を待たなければならない。統合を受け取る用の担当を立てるのは、違うと思う。」
+
+Before this, a split set `status, outcome = "done", "FANOUT"`: the splitter **finished** at the
+split, and a **separate** aggregator worker was spawned to merge the children. That made three
+things disagree with reality — the cockpit showed the campaign 「完了」 while its answer did not yet
+exist, the status counts booked the splitter as done, and the refuter targeted a worker that had
+stopped. The contract now:
+
+1. **The splitter does not finish.** On a successful split it `close()`s its tab (so it does **not**
+   hold an admission slot its own children need — the deadlock `aggregation_goal`'s docstring warns
+   of) and parks in `fanout.AWAITING_CHILDREN` (`"awaiting_children"`), a non-terminal status
+   excluded from `active_worker_count`, from steer delivery, and from `TERMINAL`.
+   `fanout.parent_waits_for_children(spawned=True)` is the rule; it holds at any `depth`, so a
+   nested splitter waits exactly as a top-level one does (the depth-unlimited nesting of #361 is
+   preserved).
+2. **The splitter merges in its own conversation.** When the family finishes, the sweep hands the
+   records back to **the same worker** via `RelayWorker.adopt_parent_merge(...)`, which loads
+   `fanout.parent_resume_goal(...)` (role `parent_merge`, `task_id` `…-parentmerge`) and resumes on
+   the splitter's own conversation id. **No receiver/aggregator worker is created.** The merge
+   prompt, checks, cwd and failed-slice naming are identical to `aggregation_goal` — only the
+   transport (same conversation) and role differ.
+   - *Fallback.* The splitter's conversation id is captured only when it actually spoke on a live
+     socket (the `parent_conversation_ref` condition). If it is absent — e.g. the family was
+     rebuilt in a fresh process from the ledger — `parent_resume_goal` drops `resume_conv`, the
+     sweep's `_resume_here` is False, and it falls back to the **old** separate aggregator. The
+     distinct `task_id`s (`…-parentmerge` vs `…-merge`) keep the two merge routes from colliding on
+     the resume key, so a rehydrated run cannot merge twice.
+3. **A failed or stopped child does not strand the parent.** `ready_to_aggregate` requires every
+   child `finished`, not every child `DONE`, so one `STUCK` child still releases the merge; the
+   failed slice is named 未取得/未完了 in the merge prompt (`missing_slices` /
+   `merge_acceptance_checks`) rather than silently dropped. A child still running
+   (`finished=False`) keeps the parent waiting.
 
 ## 3. A child is not judged by the whole goal
 

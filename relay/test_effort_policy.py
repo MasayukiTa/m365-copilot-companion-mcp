@@ -287,7 +287,7 @@ def test_a_failing_hook_cannot_fail_the_worker(monkeypatch):
     w = rf.RelayWorker({"text": "1〜3月のメールを一覧化する", "depth": 0}, "w0", fanout=True,
                        spawn_fn=lambda *a, **k: None)
     w._decide(SPLIT)
-    assert w.status in rf.TERMINAL and w.outcome == "FANOUT"
+    assert w.status == rf.fanout_mod.AWAITING_CHILDREN and w.outcome == "FANOUT"
 
 
 def test_the_mechanism_is_registered_so_summaries_read_it():
