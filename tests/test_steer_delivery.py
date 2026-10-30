@@ -278,5 +278,5 @@ def test_the_reason_stays_where_somebody_would_re_add_it():
     src = open(os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                             "relay", "relay_fleet.py"), encoding="utf-8").read()
     i = src.index("NO, A PENDING STEER MAY NOT REVIVE")
-    j = src.index('if w.status in TERMINAL or w.status in (PENDING, "awaiting_execution"):', i)
+    j = src.index('if w.status in TERMINAL or w.status in (PENDING, "awaiting_execution",', i)
     assert j - i < 1800, "the note has drifted away from the line it explains"

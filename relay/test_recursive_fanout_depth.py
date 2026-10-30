@@ -316,7 +316,7 @@ def test_the_coordinators_grant_takes_the_root_and_defaults_to_the_campaign():
 def test_a_refused_grant_takes_the_run_directly_branch():
     src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
     i = src.index("A NESTED SPLIT (depth > 0)")
-    body = src[i:i + 4500]
+    body = src[i:src.index('if short_loop:', i)]
     assert "kids = (fanout_mod.child_goals(" in body and "if steps else [])" in body
     assert "分割予算の上限のため単独実行に切り替え" in body
 
@@ -350,7 +350,7 @@ def test_a_resumed_degraded_child_reads_its_depth_from_the_header(tmp_path):
 
 def test_a_merge_queued_for_a_nested_family_uses_that_familys_depth():
     src = open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8").read()
-    i = src.index("_agg = fanout_mod.aggregation_goal(")
+    i = src.index("_merge_item = fanout_mod.parent_resume_goal(")
     body = src[i:src.index("_camp[\"merged\"] = True", i)]
     assert '**({"depth": _camp["depth"]}' in body
     assert 'campaigns[cid]["depth"] = int(kids[0]["depth"])' in src
