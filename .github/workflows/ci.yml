@@ -37,6 +37,13 @@ jobs:
           # vacuously, which is a green tick that means nothing.
           fetch-depth: 2
 
+      - name: Reject CRLF in tracked Python, Markdown and YAML
+        shell: bash
+        run: |
+          git ls-files --eol -- '*.py' '*.md' '*.yml' | awk '
+            /^i\/crlf[[:space:]]/ { print "CRLF in index: " substr($0, index($0, "\t") + 1); bad = 1 }
+            END { exit bad ? 1 : 0 }
+          '
       - name: Set up Python 3.10
         uses: actions/setup-python@v7
         with:

@@ -11,12 +11,18 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 
-# .ps1 and .vbs are deliberately NOT given an eol. Measured on this repository
-# (`git ls-files --eol`): every .ps1 and .vbs is LF in the index and working copies already mix
-# LF and CRLF (autocrlf-dependent), and both PowerShell 5.1 and wscript run either -- the daily
-# launcher start_all_hidden.vbs runs as LF on the owner's machine. Forcing a conversion would
-# rewrite 60 files for no behavioural gain, and PowerShell cares about ENCODING (a BOM or
-# ASCII-only), not line endings. So they keep what they have.
+# Keep source and documentation stable across Windows and Unix checkouts.
+# PowerShell accepts LF; UTF-8 BOMs needed by Windows PowerShell are preserved.
+*.py text eol=lf
+*.md text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.json text eol=lf
+*.toml text eol=lf
+*.txt text eol=lf
+*.ps1 text eol=lf
+
+# .vbs retains its existing autocrlf-dependent checkout behavior.
 
 # The work ledger is append-only: every PR adds a dated entry at the END, so concurrent
 # PRs always touch the same last lines. merge=union keeps both sides' added lines instead of
