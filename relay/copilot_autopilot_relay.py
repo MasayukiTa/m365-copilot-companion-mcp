@@ -2755,6 +2755,29 @@ def run_relay(
                     job = VERIFY_FIX_JOB % (detail or "(no detail)")
                     time.sleep(sleep_s + backoff_s)
                     continue
+            # spec 2 FINAL-STEP VALIDITY JUDGE GATE (owner task 2026-10-27): for a DATA-ANALYSIS
+            # goal, a candidate DONE whose final answer carries NO validity-judge block (and no
+            # stated reason the judge could not run) is sent back to be re-done through the judge
+            # harness -- record the result/data hash + fetch time, register+lock the claim, run
+            # the frozen engine (A, read-only), and put verdict / reason codes / interval / n on
+            # the final answer; if the judge cannot run, SAY WHY on the answer (never silently
+            # omit). This fixes the 679かすれ case where the analysis was delivered 3x with no
+            # judge call. Bounded by the same verify budget so it cannot loop forever.
+            from .judge_gate import needs_judge_rework, rework_job_text
+            if needs_judge_rework(goal, resp):
+                verify_attempts += 1
+                runlog_append(run_id, {"turn": turn, "event": "judge_gate",
+                                       "verdict": "MISSING", "attempt": verify_attempts})
+                print(f"[relay turn {turn}] judge_gate: data-analysis answer has no judge block")
+                if verify_attempts >= max_verify_attempts:
+                    outcome = "STUCK"
+                    reason = "data-analysis answer never passed the validity judge after " \
+                             f"{verify_attempts} attempts"
+                    break
+                job = rework_job_text(goal, resp)
+                time.sleep(sleep_s + backoff_s)
+                continue
+
             # spec 4B refuter (operator B): machine checks passed (or none) -> a CANDIDATE
             # DONE. Optionally have an independent reviewer try to refute it before we
             # accept. A real refutation is fed back; otherwise the DONE stands. OFF by
