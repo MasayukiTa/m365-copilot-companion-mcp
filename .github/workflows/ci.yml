@@ -230,6 +230,7 @@ jobs:
             relay/test_continue_turn_recovery.py \
             relay/test_a_cut_after_output_is_continued_not_resent.py \
             relay/test_socket_tools.py \
+            relay/test_unfenced_call_label.py \
             relay/test_first_turn_preflight.py \
             relay/test_token_prestart.py \
             relay/test_batching_rule_in_prompt.py \
