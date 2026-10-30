@@ -881,6 +881,150 @@ def _short_goal_for_brief(goal_text: str, brief_path: str) -> str:
             % (head, BRIEF_SUMMARY_CHARS, len(goal_text), brief_path))
 
 
+def _consumer_is_draining() -> bool:
+    """True only when a supervisor is live and therefore owns commands.d's drain.
+
+    The intake sweep below exists to admit a cockpit add_goal when NOTHING is draining the
+    command channel -- that was the whole defect: the cockpit's 追加 writes commands.d and the
+    only reader is the live runner's _drain_commands, so with no run in flight the goal sat
+    unadmitted with no jid. But when a run IS in flight it drains commands.d itself, and a
+    second admitter would queue the same goal twice. So the sweep stands down exactly when the
+    runner is there to do the job.
+
+    consumer_watch.consumer_alive() answers True (a supervisor holds the mutex), False (nobody
+    does) or None (the question could not be asked -- non-Windows, or the mutex API refused).
+    Only a hard True stands the sweep down. None and False both mean "no one is proven to be
+    draining", and an unadmitted goal is a worse failure than a command briefly contended: the
+    claim-then-commit seam below makes a genuine double-claim a no-op anyway, so treating the
+    unknown as "not draining" is safe.
+    """
+    try:
+        from relay import consumer_watch as _cw
+        return _cw.consumer_alive() is True
+    except Exception:
+        return False
+
+
+def _write_pending_job(job: dict) -> bool:
+    """Write one job into tasks/pending atomically, the SAME way fleet_submit does.
+
+    Named deterministically by job id, so re-admitting the same command (whose id is derived
+    from the command file + item index by goals_from_command) overwrites rather than duplicates.
+    That is what makes the sweep idempotent under crash-replay.
+    """
+    try:
+        TR.ensure_dirs()
+        path = os.path.join(TR.TASKS, "pending", "%s.json" % job["id"])
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8", newline="\n") as fh:
+            json.dump(job, fh, ensure_ascii=False, indent=1)
+        os.replace(tmp, path)
+        return True
+    except Exception:
+        return False
+
+
+def _job_from_promoted_goal(g: dict) -> dict:
+    """Build a tasks/pending job from one goal produced by fleet_runner.goals_from_command.
+
+    The job shape is fleet_submit's, field for field, so a goal that enters through the cockpit
+    is indistinguishable downstream from one typed at the CLI -- EXCEPT its origin, which records
+    that it was admitted from the command channel by the intake sweep rather than handed straight
+    to the door. The cockpit is a person at this machine, so provenance is `ui`; `via` names the
+    exact route so a reader can tell a run-time drain from a no-supervisor sweep.
+    """
+    text = " ".join(str(g.get("text") or "").split())
+    jid = str(g.get("jid") or "").strip() or uuid.uuid4().hex[:12]
+    queued_goal = text
+    brief_path = ""
+    if len(text) > SPILL_GOAL_CHARS:
+        brief_path = _write_brief(jid, text)
+        if brief_path:
+            queued_goal = _short_goal_for_brief(text, brief_path)
+    payload = {"goal": queued_goal, "note": "", "priority": bool(g.get("priority"))}
+    if g.get("resume_conv"):
+        payload["resume_conv"] = " ".join(str(g["resume_conv"]).split())
+    if brief_path:
+        payload["brief"] = brief_path
+        payload["goal_spilled"] = True
+    # ORIGIN. A goal the cockpit wrote carries its own origin dict through goals_from_command
+    # (see fleet_runner's "WHO SUBMITTED IT"); honour it when present, else stamp the sweep's
+    # own. Either way `via` begins with "ui" so the queue can tell a cockpit submission from the
+    # mcp door's `via:"mcp"`.
+    origin = g.get("origin")
+    if not isinstance(origin, dict) or not origin.get("via"):
+        origin = {"via": "ui_admission", "source": _clean("fleet cockpit", MAX_SOURCE_CHARS)}
+    return {"id": jid, "type": "fleet_goal", "payload": payload,
+            "created": time.time(), "origin": origin}
+
+
+def admit_commands_to_pending(state_dir: str) -> int:
+    """Promote add_goal commands left in commands.d into tasks/pending, issuing a jid for each.
+
+    THE DEFECT THIS CLOSES. The Fleet Cockpit's 追加 button does not call fleet_submit; it writes
+    an add_goal into <state_dir>/commands.d (relay/task_router.write_command). The only consumer
+    of commands.d is the live runner's _drain_commands, which runs ONLY while a supervisor run is
+    in flight. So a goal typed into the cockpit with no run draining sat in commands.d with no
+    jid issued and never reached tasks/pending -- while the same goal submitted through the CLI
+    (fleet_submit, which writes tasks/pending directly) was admitted in seconds. This sweep gives
+    the command channel a reader when the runner is not there to be one.
+
+    SAFE BESIDE A LIVE RUNNER. When a supervisor is draining (consumer_is_draining), the sweep
+    stands down entirely -- the runner owns the channel and a second admitter would double-queue.
+    When it runs, it uses the runner's OWN claim/commit seam (fleet_runner.claim_next_command /
+    commit_command_claim): each command is atomically renamed to a .claim-<pid> file before it is
+    read, so a runner that starts mid-sweep cannot also claim it. Only add_goal commands are
+    consumed; steer/stop and other live-control verbs are left in place for the runner, because
+    they are meaningless without a live run to steer.
+
+    Returns the number of goals promoted.
+    """
+    if _consumer_is_draining():
+        return 0
+    from relay import fleet_runner as _fr
+    promoted = 0
+    while True:
+        claim = _fr.claim_next_command(state_dir)
+        if claim is None:
+            break
+        cmd = claim.get("cmd") or {}
+        # ONLY add_goal IS OURS. A command with no add_goal (a steer, a stop, a bare control
+        # verb) belongs to the live runner; restore it to its original name and stop -- leaving
+        # it claimed under our pid would strand it, and admitting past it is fine but we must not
+        # swallow it. We put it back and return what we have; the runner will drain it when it
+        # next runs. Returning rather than continuing avoids re-claiming the very file we just
+        # restored in a tight loop.
+        if not isinstance(cmd, dict) or cmd.get("add_goal") is None:
+            _fr.restore_command_claim(claim)
+            break
+        goals = _fr.goals_from_command(cmd, submission_id=claim.get("name"))
+        wrote_all = True
+        for g in goals:
+            if not g.get("text"):
+                continue
+            if not _write_pending_job(_job_from_promoted_goal(g)):
+                wrote_all = False
+                break
+        # COMMIT ONLY WHAT LANDED. If every goal reached tasks/pending, consume the command so a
+        # later sweep does not re-admit it. If a write failed, DO NOT commit: leave the claim for
+        # recovery so the goal is retried rather than lost -- the same crash-window discipline the
+        # runner's claim/commit pair was built for.
+        if wrote_all:
+            _fr.commit_command_claim(state_dir, claim, applied=True)
+            promoted += sum(1 for g in goals if g.get("text"))
+        else:
+            # Put the claim back for the next sweep / the runner's recovery, then stop. This is
+            # restore (rename .claim-* back to the original .json), NOT commit(applied=False):
+            # committing would consume the command as a REJECTION and the goal would be lost,
+            # while restore leaves it as ordinary input for the next sweep or the live runner.
+            try:
+                _fr.restore_command_claim(claim)
+            except Exception:
+                pass
+            break
+    return promoted
+
+
 def fleet_submit(goal: str, note: str = "", source: str = "",
                  priority: bool = False, resume_conv: str = "") -> str:
     """Queue a goal for this machine's worker fleet. Returns the job id.
@@ -1057,6 +1201,17 @@ def fleet_queue() -> str:
         TR.ensure_dirs()
     except Exception as exc:
         return "[fleet_queue: %s: %s]" % (type(exc).__name__, exc)
+    # ADMIT BEFORE COUNTING. The cockpit's 追加 writes an add_goal into commands.d and then re-reads
+    # the queue; if nothing is draining that channel the goal has no jid and would not be counted
+    # here -- the exact defect this change closes. So reading the queue first promotes any waiting
+    # cockpit goal into tasks/pending (a no-op when a supervisor is live and owns the drain, and
+    # when there is nothing to admit). state_dir is .fleet, the parent of TR.TASKS, the same root
+    # the live door locates. Best-effort: a sweep failure must never stop the owner from seeing
+    # the queue, so it is swallowed and the counts below still render.
+    try:
+        admit_commands_to_pending(os.path.dirname(TR.TASKS))
+    except Exception:
+        pass
     lines = []
     for sub in ("pending", "running", "awaiting", "for_fleet", "done"):
         try:
