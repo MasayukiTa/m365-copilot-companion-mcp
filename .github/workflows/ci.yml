@@ -158,6 +158,7 @@ jobs:
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
             tools/test_gui_submission_reaches_fleet.py \
+            tools/test_fleet_admissions.py \
             tools/test_refused_record_and_force.py \
             ui/test_a_refused_request_is_shown_and_can_be_forced.py \
             tools/test_dismiss_refused_card.py \
