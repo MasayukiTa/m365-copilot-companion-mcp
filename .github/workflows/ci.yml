@@ -186,6 +186,7 @@ jobs:
             relay/test_route_breaker_per_conversation.py \
             relay/test_mcp_attribution.py \
             relay/test_a_running_tool_call_is_progress_not_a_stall.py \
+            relay/test_judge_gate_harness.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \

@@ -70,6 +70,26 @@ SUBJECT_CHECK_RULE = (
     "ない場合は UPHELD にせず、INCONCLUSIVE: 使った対象が不明 とすること。"
 )
 
+#: THE JUDGE CHECK (2026-10-27 owner task, wired 2026-10-30). Generic like the two checks above.
+#: WHY IT IS NEEDED. Owner instruction: every DATA-ANALYSIS answer must pass the frozen validity
+#: engine (少標本評価 validity_judge) before it is delivered. Measured 2026-10-30: the 679かすれ
+#: analysis was re-run three times and the judge was never called after the analysis, and no
+#: refuter asked about it. So the reviewer must now confirm the judge was passed -- and if it was
+#: not, that the final answer SAYS WHY (never silently omitted). It applies ONLY to data-analysis
+#: goals (relay/judge_gate.is_data_analysis_goal); for non-analysis goals the absence of a judge
+#: block is not a defect.
+JUDGE_CHECK_RULE = (
+    "【判定器チェック(データ解析の回答のみ必須)】このゴールがDB照会(ADAMS/MCL/odbc等)の結果を"
+    "表・相関・群間比較にする**データ解析の仕事**である場合、最終回答が少標本評価の判定器"
+    "(validity_judge)を通した結果(判定・理由コード・区間・n)を載せているかを確認すること。"
+    "判定器を通していない、または判定・理由コード・区間・nのいずれかが載っていないのに、"
+    "**なぜ通せなかったかの理由が最終回答に書かれていない**場合は REFUTED とし、理由を"
+    "『判定器未通過: データ解析だが validity_judge の判定が最終回答に無く、理由の記載も無い』"
+    "の形で書くこと。判定器が使えず、その理由(例: 未登録ID、エンジン不在、タイムアウト)が"
+    "最終回答に明記されている場合は、判定器未通過を理由に REFUTED としない。ゴールがデータ解析"
+    "でない(M365照会・コード変更・文章作成等)場合は、判定器ブロックが無くても欠陥としない。"
+)
+
 # Nudge sent when the reviewer answered without a clear verdict (e.g. it only said
 # "I'll check the files"). Asks it to finish and emit the marker now.
 REFUTER_NUDGE = (
@@ -236,7 +256,8 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
     `procedure` is the matched approved procedure's one-line identity ("name: description"), or
     "" when the harness matched none; SOURCE_CHECK_RULE is present either way.
     """
-    base = REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE + "\n" + SUBJECT_CHECK_RULE
+    base = (REFUTER_INSTRUCTION + "\n" + SOURCE_CHECK_RULE + "\n" + SUBJECT_CHECK_RULE
+            + "\n" + JUDGE_CHECK_RULE)
     if unverifiable:
         base = UNVERIFIABLE_PREAMBLE + "\n\n" + base
     if lens and lens in LENS_PROMPTS:
@@ -254,7 +275,7 @@ def build_refuter_prompt(goal: str, final_response: str, lens: str = "",
 def _preamble_id(lens="", unverifiable=False):
     """A short id of the instruction text a reviewer is given (base + lens + unverifiable framing)."""
     import hashlib
-    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE + SUBJECT_CHECK_RULE
+    text = (REFUTER_INSTRUCTION + SOURCE_CHECK_RULE + SUBJECT_CHECK_RULE + JUDGE_CHECK_RULE
             + (LENS_PROMPTS.get(lens, "") if lens else ""))
     if unverifiable:
         text = UNVERIFIABLE_PREAMBLE + text
