@@ -29,10 +29,15 @@ SEARCH_CONCURRENCY = search_concurrency()
 _SEARCH_SLOTS = threading.BoundedSemaphore(SEARCH_CONCURRENCY)
 
 
-def case_reference_search(goal, roots=None, timeout=3.0, max_results=30):
+# 2026-11-01, this Windows host, depth 4 and 10,000 entries/root: Downloads
+# 7,189 entries/0.657s; work 0/0s; m365-work 10,000/0.843s (capped);
+# companion/work 0/0s. Depth 4 bounds nested trees (485 Downloads cutoffs);
+# the entry cap bounds large roots. Five seconds globally limits worker delay;
+# 30 results bounds prompt size. Filesystem calls can individually exceed this soft deadline.
+def case_reference_search(goal, roots=None, timeout=5.0, max_results=30):
     """Resolve a short person_case-id-topic reference within local case roots.
 
-    An incomplete walk is never evidence of uniqueness. Symlink directories are not followed.
+    Incomplete walks are reported to the caller. Symlink directories are not followed.
     """
     match = re.match(r"^\s*([^\s/\\]{1,40}?[ _＿-]+(\d{2,})[^\s/\\]{2,40})\s+", goal)
     if not match or len(goal) > 150:
@@ -56,6 +61,7 @@ def case_reference_search(goal, roots=None, timeout=3.0, max_results=30):
         if not root.exists():
             continue
         stack = [(root, 0)]
+        scanned = 0
         while stack:
             if time.monotonic() >= deadline:
                 result["errors"].append("search timeout")
@@ -64,6 +70,11 @@ def case_reference_search(goal, roots=None, timeout=3.0, max_results=30):
             try:
                 with os.scandir(directory) as entries:
                     for entry in entries:
+                        scanned += 1
+                        if scanned > 10000:
+                            result["truncated"] = True
+                            stack.clear()
+                            break
                         if time.monotonic() >= deadline:
                             result["errors"].append("search timeout")
                             return result
@@ -84,10 +95,10 @@ def case_reference_search(goal, roots=None, timeout=3.0, max_results=30):
                         if source.is_file() and source.suffix.lower() in {".txt", ".md"}:
                             with source.open("r", encoding="utf-8-sig", errors="replace") as f:
                                 excerpt = f.read(600)
-                            if time.monotonic() >= deadline:
-                                result["errors"].append("search timeout")
-                                return result
                         result["candidates"].append({"path": str(path), "kind": "directory" if is_dir else "file", "request": str(source) if is_dir and source.is_file() else "", "excerpt": excerpt, "root": str(root), "case_id": case_id})
+                        if time.monotonic() >= deadline:
+                            result["errors"].append("search timeout")
+                            return result
                         if len(result["candidates"]) >= max_results:
                             result["truncated"] = True
                             return result
