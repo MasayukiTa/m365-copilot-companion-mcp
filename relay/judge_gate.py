@@ -85,22 +85,24 @@ MISCLASSIFICATION_NOTE = (
 )
 
 
-def is_data_analysis_goal(goal) -> bool:
+def is_data_analysis_goal(goal, request_text="", tool_names=()) -> bool:
     """True when `goal` asks for a DB-backed analysis whose answer should pass the judge.
 
-    Reuses relay/task_kind.py's fixed, deterministic rules: a goal is data analysis exactly
-    when its derived kind is DATA_QUERY. task_kind already orders the narrower non-analysis
-    kinds (CODE_CHANGE / M365_LOOKUP / WRITING / ...) ahead of DATA_QUERY, so a code or prose
-    goal that merely mentions a dataset does not get pulled in. Non-text input is not analysis.
+    Apply the existing task-kind rules independently to the goal and resolved request. At
+    completion, attributed data-tool calls also signal analysis even if the text did not.
     """
-    if not isinstance(goal, str) or not goal.strip():
-        return False
-    return task_kind(goal) == DATA_QUERY
+    # The resolved request supplies the substance hidden by a short case reference.
+    if any(task_kind(text) == DATA_QUERY for text in (goal, request_text)):
+        return True
+    # Recorded data-tool calls are evidence of work actually attempted, even when neither
+    # the reference nor request described its analysis in the classifier's vocabulary.
+    return any(name in {"odbc_query", "odbc_to_excel", "run_python"}
+               for name in tool_names)
 
 
-def complete_judge_request(goal, output_folder, *, strict=False):
+def complete_judge_request(goal, output_folder, *, strict=False, request_text="", tool_names=()):
     """Evaluate the worker's request at completion; return (accept, visible detail)."""
-    if not is_data_analysis_goal(goal):
+    if not is_data_analysis_goal(goal, request_text, tool_names):
         return True, ""
     path = os.path.join(output_folder, "judge_request.json") if output_folder else ""
     if not path or not os.path.exists(path):

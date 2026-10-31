@@ -1,4 +1,5 @@
 import json
+from types import SimpleNamespace
 
 from relay import judge_gate
 from relay.relay_fleet import RelayWorker
@@ -116,6 +117,50 @@ def test_strict_missing_request_is_rejected(tmp_path, monkeypatch):
     w._settle_done()
     assert w.status == "stuck" and w.outcome == "VERIFY_FAILED"
     assert "judge: none" in w.reason
+
+
+def test_resolved_case_request_classifies_short_reference(tmp_path):
+    from tools.search_ops import case_reference_search
+    folder = tmp_path / "枝さん_679かすれ調査"
+    folder.mkdir()
+    (folder / "やりたいこと.txt").write_text(
+        "検査データの不良件数とロット別の設備条件を集計し相関を調べる。", encoding="utf-8")
+    goal = "枝さん_679かすれ調査　これ調べて"
+    result = case_reference_search(goal, roots=[tmp_path])
+    request = next(c for c in result["candidates"] if c["kind"] == "directory")
+    text = (folder / "やりたいこと.txt").read_text(encoding="utf-8")
+    assert request["request"] == str(folder / "やりたいこと.txt")
+    assert not judge_gate.is_data_analysis_goal(goal)
+    assert judge_gate.is_data_analysis_goal(goal, text)
+    assert judge_gate.complete_judge_request(goal, str(tmp_path), request_text=text) == (True, "judge: none")
+
+
+def test_recorded_tools_at_completion_and_strict(tmp_path, monkeypatch):
+    from relay import relay_fleet
+    monkeypatch.delenv("MCP_JUDGE_STRICT", raising=False)
+    w = worker(tmp_path)
+    w.goal, w.name, w._first_turn_sent_at = "案件を調べて", "w0", 100
+    w._conversation_ids_for_binding = lambda: {"client": "conv"}
+    w._ledger_rows = lambda: [
+        {"event": "call", "ts": 101, "session": "other", "tool": "odbc_query"},
+        {"event": "call", "ts": 102, "session": "mine", "tool": "run_python"}]
+    bindings = {"mine": {"worker": "w0", "conversation": "conv", "how": "id"},
+                "other": {"worker": "w1", "conversation": "other", "how": "id"}}
+    monkeypatch.setattr(relay_fleet, "_socket_route", lambda: SimpleNamespace(
+        mcp_bindings=SimpleNamespace(snapshot=lambda: bindings)))
+    assert w._judge_tool_names() == {"run_python"}
+    w._settle_done()
+    assert w.status == "done" and "judge: none" in w.last_response
+    w._ledger_rows = lambda: [{"event": "call", "ts": 104, "session": "mine", "tool": "odbc_query"}]
+    assert w._judge_tool_names() == {"odbc_query"}
+    monkeypatch.setenv("MCP_JUDGE_STRICT", "1")
+    w._settle_done()
+    assert w.outcome == "VERIFY_FAILED" and "judge: none" in w.reason
+    w._ledger_rows = lambda: [{"event": "call", "ts": 103, "session": "other", "tool": "odbc_query"}]
+    monkeypatch.delenv("MCP_JUDGE_STRICT")
+    w.last_response, w.reason = "answer", ""
+    w._settle_done()
+    assert w.status == "done" and w.last_response == "answer" and not w.reason
 
 
 def test_engine_refuses_a_manifest_with_a_different_fetch_time(tmp_path):
