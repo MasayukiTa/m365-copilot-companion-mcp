@@ -1888,4 +1888,17 @@ if __name__ == "__main__":
     except Exception:
         pass
     _run_kwargs = {"log_config": _log_config} if _log_config is not None else {}
+    # timeout_keep_alive: how long uvicorn holds an idle keep-alive connection open before
+    # closing it. uvicorn's default is 5 s, and a client that reused the same connection after
+    # an idle gap of >=6 s got the connection aborted (measured 2026-10-31: 3 s -> OK; 6 s, 12 s,
+    # 30 s -> RemoteDisconnected / WinError 10053), which users see as "RemoteDisconnected, not
+    # even a response" on initialize and which the access log cannot show (the connection is
+    # closed before any request is read). Raise the idle window via MCP_KEEPALIVE_S (default
+    # 120 s) so normal think-time pauses no longer drop the connection. Only this one option is
+    # added; every other uvicorn setting above is left unchanged.
+    try:
+        _keepalive_s = int(os.environ.get("MCP_KEEPALIVE_S", "120"))
+    except (TypeError, ValueError):
+        _keepalive_s = 120
+    _run_kwargs["timeout_keep_alive"] = _keepalive_s
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
