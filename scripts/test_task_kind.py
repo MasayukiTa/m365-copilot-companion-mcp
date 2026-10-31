@@ -124,7 +124,13 @@ def test_only_the_report_uses_the_label_and_it_really_calls_it():
             if imported:
                 users.append(os.path.relpath(path, REPO).replace("\\", "/"))
                 break
-    assert users == ["scripts/capability_profile.py"], users
+    # relay/task_kind.py has two sanctioned callers:
+    #   - scripts/capability_profile.py: the (role, kind) report (the original caller).
+    #   - relay/judge_gate.py: the final-step validity-judge gate (owner rule 2026-10-27) --
+    #     it reuses task_kind's DATA_QUERY classification to decide which goals are data
+    #     analysis and must pass the judge. Order-independent so os.walk order cannot flip it.
+    assert sorted(users) == sorted(
+        ["scripts/capability_profile.py", "relay/judge_gate.py"]), users
     # the real caller: derive hands TK.task_kind to build_records, which calls kind_of(...)
     with open(os.path.join(REPO, "scripts", "capability_profile.py"), encoding="utf-8") as fh:
         src = fh.read()

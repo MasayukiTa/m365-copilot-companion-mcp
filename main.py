@@ -143,7 +143,7 @@ from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
-from tools.audit_ledger_ops import validity_audit_ledger
+from tools.audit_ledger_ops import validity_audit_ledger, validity_past_runs
 from tools.trace_view.tool import trace_session
 from tools.jobs import (
     job_kill,
@@ -192,6 +192,7 @@ EXECUTION_PROFILE_TOOLS = (
 # Optional helper tools are registered only when the operator opts in (default: off).
 EXT_HELPER_TOOLS = (
     validity_audit_ledger,
+    validity_past_runs,
 ) if os.environ.get("MCP_EXT_HELPER", "0") == "1" else ()
 
 API_KEY = require_api_key()
