@@ -537,6 +537,25 @@ def _server_identity():
     }
 
 
+def _tunnel_channels_summary() -> dict:
+    """Last-10-minute Dev Tunnel channel counts for /health, read from the jsonl file.
+
+    relay.tunnel_channels owns the thresholds and the file format; this is a thin,
+    never-raising wrapper so a missing or malformed file can never turn a /health poll
+    into a 500. When the file is absent every value is -1 (see health_counts), which is
+    how /health signals "the host-log analyzer has not written anything yet".
+    """
+    absent = {"tunnel_channels": -1, "tunnel_no_response": -1,
+              "tunnel_remote_closed_early": -1}
+    try:
+        from relay.tunnel_channels import health_counts
+        jsonl = str(Path(__file__).resolve().parent / ".setup" / "logs"
+                    / "tunnel_channels.jsonl")
+        return health_counts(jsonl)
+    except Exception:
+        return absent
+
+
 def _health_bearer_ok(request: Request) -> bool:
     """True iff the caller presented this server's own MCP_API_KEY as a bearer token.
 
@@ -614,6 +633,10 @@ async def health(request: Request) -> JSONResponse:
     # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
     payload.update(await asyncio.to_thread(_self_test_summary))
     payload.update(await asyncio.to_thread(_tool_probe_summary))
+    # THREE FIELDS ONLY, FROM THE HOST-LOG ANALYZER (relay.tunnel_channels). Counts of
+    # forwarded channels, no_response and remote_closed_early seen in the last 10 minutes,
+    # read from .setup/logs/tunnel_channels.jsonl. -1 for each when that file is absent.
+    payload.update(await asyncio.to_thread(_tunnel_channels_summary))
     # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
     # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
     # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
