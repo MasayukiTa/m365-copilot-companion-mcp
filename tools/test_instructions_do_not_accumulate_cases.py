@@ -33,8 +33,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 MAX_INSTRUCTIONS_CHARS = 6000
 
 
-def _eval_instructions(node):
-    """Evaluate main.py's instructions= expression statically, as the DEFAULT server renders it.
+def _eval_instructions(node, unlock_on=True):
+    """Evaluate the full instruction expression statically with unlock enabled.
 
     The expression is string literals joined with `+`, plus `_u(on, off)` picks for the owner's
     unlock switch (tools/unlock_switch.py). The default is the switch ON, so `_u` yields its
@@ -42,10 +42,10 @@ def _eval_instructions(node):
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        return _eval_instructions(node.left) + _eval_instructions(node.right)
+        return _eval_instructions(node.left, unlock_on) + _eval_instructions(node.right, unlock_on)
     if (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
             and node.func.id == "_u" and len(node.args) == 2):
-        return _eval_instructions(node.args[0])
+        return _eval_instructions(node.args[0 if unlock_on else 1], unlock_on)
     raise ValueError("instructions= holds an expression this reader does not know: %s"
                      % ast.dump(node)[:80])
 
@@ -53,9 +53,26 @@ def _eval_instructions(node):
 def instructions_text():
     tree = ast.parse(io.open(os.path.join(REPO, "main.py"), encoding="utf-8").read())
     for node in ast.walk(tree):
-        if isinstance(node, ast.keyword) and node.arg == "instructions":
+        if (isinstance(node, ast.Assign) and any(isinstance(target, ast.Name)
+                and target.id == "FULL_INSTRUCTIONS" for target in node.targets)):
             return _eval_instructions(node.value)
-    raise AssertionError("main.py no longer passes instructions= to the server")
+    raise AssertionError("main.py no longer defines FULL_INSTRUCTIONS")
+
+
+@pytest.mark.parametrize("unlock_on", [True, False])
+def test_compact_unlock_rule_follows_switch(unlock_on):
+    tree = ast.parse(io.open(os.path.join(REPO, "main.py"), encoding="utf-8").read())
+    node = next(n.value for n in tree.body if isinstance(n, ast.Assign)
+                and any(isinstance(t, ast.Name) and t.id == "COMPACT_INSTRUCTIONS"
+                        for t in n.targets))
+    text = _eval_instructions(node, unlock_on)
+    if unlock_on:
+        assert "Ordinary reads need no unlock" in text
+        assert "Unlock before changes or execution" in text
+        assert "If you lack it, submit the whole request" in text
+    else:
+        assert "No tool needs unlock" in text
+        assert "Unlock before changes or execution" not in text
 
 
 def skill_names():
