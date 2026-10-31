@@ -40,6 +40,7 @@ interval range; they are not a measured optimum. Anything else is INSUFFICIENT a
 requirements are listed.
 
   python scripts/result_cache_report.py [--fleet-dir .fleet] [--format text|json]
+      [--tool NAME ...]
 """
 from __future__ import annotations
 
@@ -188,11 +189,16 @@ def main(argv=None):
     ap.add_argument("--same-fingerprint", action="store_true",
                     help="compare only hits with two available, equal pre-call fingerprints")
     ap.add_argument("--by-tool", action="store_true", help="show per-tool comparison rates")
+    ap.add_argument("--tool", action="append", default=None, metavar="NAME",
+                    help="include only this exact tool name; repeat to include multiple tools")
     args = ap.parse_args(argv)
     # Resolved here, not as a module constant: nothing in this script writes, and a module-level
     # path to the live record directory would have to be classified by the isolation guard.
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     rows, bad = read_rows(os.path.join(fleet_dir, LOG_NAME))
+    if args.tool is not None:
+        selected = set(args.tool)
+        rows = [row for row in rows if row.get("tool") in selected]
     if args.same_fingerprint:
         pairs = [r for r in rows if r.get("read_only", True) and r.get("hit")
                  and isinstance(r.get("fingerprint"), dict) and r["fingerprint"]
@@ -211,12 +217,16 @@ def main(argv=None):
                    "differed_share": _share(differed, len(pairs)), "unreadable": bad}
         if args.by_tool:
             summary["by_tool"] = dict(sorted(by_tool.items()))
+        if args.tool is not None:
+            summary["selected_tools"] = sorted(selected)
         if args.format == "json":
             text = json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         else:
             text = ("Same pre-call fingerprint: %d pairs, %d differed (%s).\n"
                     "Metadata fingerprints are incomplete and do not prove unchanged state or safe serving.\n"
                     % (len(pairs), differed, _pct(summary["differed_share"])))
+            if args.tool is not None:
+                text = "Selected tools: %s\n\n" % ", ".join(sorted(selected)) + text
             if args.by_tool:
                 for name, item in sorted(by_tool.items()):
                     text += "- %s: %d pairs, %d differed (%s)\n" % (
@@ -226,10 +236,15 @@ def main(argv=None):
     s = summarise(rows)
     label, unmet = verdict(s)
     if args.format == "json":
-        text = json.dumps({"summary": s, "verdict": label, "unmet": unmet, "unreadable": bad},
+        result = {"summary": s, "verdict": label, "unmet": unmet, "unreadable": bad}
+        if args.tool is not None:
+            result["selected_tools"] = sorted(selected)
+        text = json.dumps(result,
                           ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     else:
         text = render(s, label, unmet, bad)
+        if args.tool is not None:
+            text = "Selected tools: %s\n\n" % ", ".join(sorted(selected)) + text
     try:
         sys.stdout.write(text)
     except UnicodeEncodeError:
