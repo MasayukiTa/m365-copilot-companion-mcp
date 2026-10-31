@@ -8,7 +8,7 @@ from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from tools.archive_ops import zip_create, zip_extract, zip_list
 from tools.clipboard_ops import clipboard_get, clipboard_set
@@ -141,6 +141,7 @@ from tools.sqllib.mcp_tools import (
 )
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
+from tools.response_telemetry import health_counters as _resp_telemetry_counters
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
 from tools.audit_ledger_ops import validity_audit_ledger, validity_past_runs
@@ -647,6 +648,14 @@ async def health(request: Request) -> JSONResponse:
         payload.update(await asyncio.to_thread(_fleet_tool_summary))
     except Exception:
         pass
+    # Response-delivery telemetry rollup over the last 10 minutes (tools/response_telemetry.py):
+    # resp_total_10m, resp_client_gone_10m, resp_short_10m. In-memory ring read, never raises,
+    # so this stays a non-blocking probe. Surfaces the muse 'response cut mid-stream' signal to
+    # the supervisor/cockpit without grepping the jsonl.
+    try:
+        payload.update(_resp_telemetry_counters())
+    except Exception:
+        pass
     return JSONResponse(payload)
 
 
@@ -696,6 +705,41 @@ async def exec_status(request: Request) -> JSONResponse:
     payload = {"status": "ok"}
     payload.update(snap)
     return JSONResponse(payload)
+
+
+@mcp.custom_route("/diag/bytes", methods=["GET"])
+async def diag_bytes(request: Request) -> Response:
+    """Hand back EXACTLY n bytes of 'x' with an exact Content-Length -- a size probe for the
+    muse 'responses cut above ~2.1 KB' incident (2026-10-31). The server host completes these
+    24/24 up to 8 KB and the tunnel host log shows every byte sent; this endpoint lets the
+    REMOTE client ask for a known size over the same path, so a cut can be located by the
+    size at which it starts, independent of any tool.
+
+    OFF BY DEFAULT. The only gate is a token equal to the environment variable MCP_DIAG_TOKEN,
+    compared in constant time. When that variable is empty the route answers 404 -- so it does
+    not exist unless an operator sets the token. No other auth: a bare diagnostic that only
+    emits 'x' * n discloses nothing, and binding it to the normal bearer would make it useless
+    for a client that is debugging exactly that credential.
+
+    n is 1..65536 (inclusive); out of range or non-integer is a 400. The reply is
+    application/octet-stream with an exact Content-Length so the client can compare declared
+    against received. It is itself recorded by the response telemetry like any other request."""
+    token = os.environ.get("MCP_DIAG_TOKEN", "") or ""
+    if not token:
+        # Off by default: no token configured means the endpoint is not there.
+        return PlainTextResponse("not found", status_code=404)
+    supplied = request.query_params.get("t", "") or ""
+    if not hmac.compare_digest(supplied, token):
+        return PlainTextResponse("not found", status_code=404)
+    raw = request.query_params.get("n", "")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return PlainTextResponse("n must be an integer between 1 and 65536", status_code=400)
+    if n < 1 or n > 65536:
+        return PlainTextResponse("n must be between 1 and 65536", status_code=400)
+    body = b"x" * n
+    return Response(content=body, media_type="application/octet-stream")
 
 
 TOOLS = (
@@ -1897,6 +1941,14 @@ if __name__ == "__main__":
     # auth middleware sees the request (see _BearerPrefix docstring). Lifespan events pass
     # straight through, so the inner Starlette startup/shutdown still runs under uvicorn.
     app = _BearerPrefix(app)
+
+    # OUTERMOST layer, applied LAST so it observes every byte of every send and every receive --
+    # including the _BearerPrefix rewrite and FastMCP's auth. _ResponseTelemetry records one
+    # JSON line per HTTP request (what was declared, what was handed to send, whether the client
+    # vanished mid-response) and never alters a response. This is the missing eye on what happens
+    # to a response AFTER the server hands it to the transport (the muse mid-stream cut, 2026-10-31).
+    from tools.response_telemetry import ResponseTelemetry as _ResponseTelemetry
+    app = _ResponseTelemetry(app)
 
     # Durable, timestamped copy of uvicorn's access/error log (tools/access_log.py): server.log
     # is recreated on every launch and has no timestamps, so a restart erased the request record.
