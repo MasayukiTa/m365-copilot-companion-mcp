@@ -13,6 +13,21 @@ if REPO not in sys.path:
 from scripts import result_cache_report as R  # noqa: E402
 
 
+def test_same_fingerprint_pairs_exclude_changed_and_legacy_rows(tmp_path, capsys):
+    base = _row(1, hit=True)
+    fp = {"kind": "file", "mtime_ns": 1, "size": 4}
+    same = dict(base, fingerprint=fp, previous_fingerprint=fp,
+                result_hash="new", previous_result_hash="old")
+    changed = dict(same, fingerprint=dict(fp, size=5))
+    _write(str(tmp_path), [base, same, changed])
+    assert R.main(["--fleet-dir", str(tmp_path), "--same-fingerprint", "--by-tool", "--format", "json"]) == 0
+    summary = json.loads(capsys.readouterr().out)
+    assert summary["pairs"] == 1 and summary["differed"] == 1
+    assert summary["by_tool"]["read_file"]["differed_share"] == 1
+    assert R.main(["--fleet-dir", str(tmp_path), "--format", "json"]) == 0
+    assert json.loads(capsys.readouterr().out)["summary"]["calls"] == 3
+
+
 def _row(i, run="r1", tool="read_file", hit=False, differed=False, saved=0.5):
     return {"v": 1, "ts": 1000.0 + i, "run_id": run, "mode": "shadow", "tool": tool,
             "arg_hash": "h%d" % i, "read_only": True, "hit": hit,

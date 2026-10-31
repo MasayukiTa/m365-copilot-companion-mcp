@@ -19,6 +19,28 @@ if REPO not in sys.path:
 from relay import result_cache as RC  # noqa: E402
 
 
+def test_fingerprint_and_hash_are_recorded_without_content(tmp_path, monkeypatch):
+    monkeypatch.setattr(RC, "LOG", str(tmp_path / "record.jsonl"))
+    monkeypatch.setattr(RC, "mode", lambda *a: "shadow")
+    RC._reset_for_test()
+    path = tmp_path / "sample.txt"
+    path.write_text("private file contents", encoding="utf-8")
+    fp = RC.fingerprint_before("read_file", {"path": str(path)})
+    assert fp and fp["size"] == len("private file contents")
+    RC.shadow_observe("read_file", {"path": str(path)}, "secret result one", True, now=1, fingerprint=fp)
+    RC.shadow_observe("read_file", {"path": str(path)}, "secret result two", True, now=2, fingerprint=fp)
+    blob = (tmp_path / "record.jsonl").read_text(encoding="utf-8")
+    rows = [json.loads(line) for line in blob.splitlines()]
+    assert "secret result" not in blob and str(path) not in blob
+    assert rows[1]["fingerprint"] == rows[1]["previous_fingerprint"] == fp
+    assert rows[1]["result_hash"] != rows[1]["previous_result_hash"]
+    assert rows[1]["tool_class"] == "state_dependent_read"
+    assert RC.fingerprint_before("read_file", {"path": "relative"}) is None
+    assert RC.fingerprint_before("list_directory", {"path": str(tmp_path), "recursive": True}) is None
+    directory = RC.fingerprint_before("list_directory", {"path": str(tmp_path)})
+    assert directory["count"] == 2 and directory["max_child_mtime_ns"] is not None
+
+
 def _settings(tmp_path, value):
     p = tmp_path / "settings.txt"
     p.write_text("result_cache=%s\n" % value, encoding="utf-8")
