@@ -14,7 +14,7 @@ record of whether the PC end actually answered a request.
 
 This module does two things, both pure enough to test without a tunnel:
 
-* :func:`parse_channel_events` / :func:`analyze_log` read the ts-stamped log that
+* :func:`parse_channel_events` reads the ts-stamped log that
   :mod:`relay.tunnel_host_log` writes and yield one dict per *closed* channel:
   time, channel id, sent/received bytes, who closed first, open time and duration,
   plus the two flags ``no_response`` and ``remote_closed_early``.
@@ -164,15 +164,6 @@ def parse_channel_events(lines):
         }
         remote_closed.pop(cid, None)
         yield rec
-
-
-def analyze_log(path):
-    """Read a whole ts log file and return the list of close records. [] if absent."""
-    try:
-        with open(path, "r", encoding="utf-8", errors="replace") as fh:
-            return list(parse_channel_events(fh))
-    except FileNotFoundError:
-        return []
 
 
 def append_new_records(log_path, jsonl_path, offset_path=None):

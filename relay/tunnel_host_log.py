@@ -196,7 +196,7 @@ def pump_stream(stream, sink, on_line=None):
                 pass
 
 
-def run_once(cmd, sink, on_exit=None):
+def run_once(cmd, sink, on_exit=None, hook=None):
     """Spawn ``cmd``, pump its stdout and stderr into ``sink`` until it exits.
 
     Returns the process exit code. Used by :func:`serve_forever` and, with a fake command,
@@ -216,7 +216,7 @@ def run_once(cmd, sink, on_exit=None):
     for stream in (proc.stdout, proc.stderr):
         if stream is None:
             continue
-        t = threading.Thread(target=pump_stream, args=(stream, sink), daemon=True)
+        t = threading.Thread(target=pump_stream, args=(stream, sink, hook), daemon=True)
         t.start()
         threads.append(t)
     rc = proc.wait()
@@ -268,7 +268,7 @@ def serve_forever(tunnel_name, root=None, devtunnel="devtunnel",
         while True:
             started = time.time()
             try:
-                rc = _run_with_hook(cmd, sink, hook)
+                rc = run_once(cmd, sink, hook=hook)
             except FileNotFoundError as e:
                 sink.write_line("[tunnel_host_log] cannot start host: %s" % e)
                 rc = 127
@@ -285,23 +285,6 @@ def serve_forever(tunnel_name, root=None, devtunnel="devtunnel",
             time.sleep(wait)
     finally:
         sink.close()
-
-
-def _run_with_hook(cmd, sink, hook):
-    """run_once with the analyzer hook attached to each line."""
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=-1,
-                            **childproc.tree_popen_kwargs(headless=True, priority=False))
-    threads = []
-    for stream in (proc.stdout, proc.stderr):
-        if stream is None:
-            continue
-        t = threading.Thread(target=pump_stream, args=(stream, sink, hook), daemon=True)
-        t.start()
-        threads.append(t)
-    rc = proc.wait()
-    for t in threads:
-        t.join(timeout=5)
-    return rc
 
 
 def main(argv=None):

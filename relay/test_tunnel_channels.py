@@ -131,10 +131,3 @@ def test_a_close_without_an_open_still_yields_a_record():
     assert len(recs) == 1
     assert recs[0]["channel_id"] == 9 and recs[0]["open_time"] is None
     assert recs[0]["duration_s"] is None
-
-
-def test_analyze_log_reads_a_whole_file_and_tolerates_absence(tmp_path):
-    log = tmp_path / "devtunnel-host-ts.log"
-    log.write_text(SAMPLE, encoding="utf-8")
-    assert tc.analyze_log(str(log)) == _records()
-    assert tc.analyze_log(str(tmp_path / "missing.log")) == []

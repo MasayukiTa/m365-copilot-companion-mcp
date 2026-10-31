@@ -102,9 +102,10 @@ def test_serve_forever_restarts_with_backoff_and_logs_exit_codes(tmp_path, monke
     # Point serve_forever at our fake by overriding the command it builds: devtunnel bin is
     # the python exe and the args become `-v host <name>` -- but our fake ignores args and
     # just exits 3, which is all the restart loop needs to observe.
+    real_run_once = thl.run_once
     monkeypatch.setattr(
-        thl, "_run_with_hook",
-        lambda cmd, sink, hook: thl.run_once(fake, sink),
+        thl, "run_once",
+        lambda cmd, sink, on_exit=None, hook=None: real_run_once(fake, sink, hook=hook),
     )
     thl.serve_forever("any-tunnel", root=str(tmp_path), devtunnel=sys.executable,
                       max_bytes=10 * 1024 * 1024, backups=2, max_restarts=3)
@@ -122,10 +123,10 @@ def test_serve_forever_survives_a_missing_binary(tmp_path, monkeypatch):
     log = tmp_path / "ts.log"
     monkeypatch.setattr(thl.time, "sleep", lambda s: None)
 
-    def _boom(cmd, sink, hook):
+    def _boom(cmd, sink, on_exit=None, hook=None):
         raise FileNotFoundError("devtunnel not found")
 
-    monkeypatch.setattr(thl, "_run_with_hook", _boom)
+    monkeypatch.setattr(thl, "run_once", _boom)
     thl.serve_forever("any-tunnel", root=str(tmp_path), devtunnel="nope",
                       max_restarts=1)
     log = tmp_path / ".setup" / "logs" / "devtunnel-host-ts.log"
