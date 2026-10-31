@@ -4045,6 +4045,17 @@ class RelayWorker:
             _with_theme_memory(_with_matched_skill(self.goal, want_body=bool(fanout),
                                                    report=_skill_report),
                                theme_text=self.goal))
+        from relay.judge_gate import is_data_analysis_goal
+        if is_data_analysis_goal(self.goal) and self.cwd:
+            composed_goal = ("For this data analysis, write judge_request.json in the output "
+                             "folder %s before DONE. It must be a JSON object with claim_id, "
+                             "data_location (absolute file path), and fetched_at (ISO timestamp). "
+                             "Optional sections: manifest {path, dataset_id, result}; "
+                             "registration {root, claim, registered_at}; and "
+                             "lot_diagnosis {y, x, lot} (equal-length arrays). Paths may be "
+                             "relative to the output folder. Supply actual values only; omit "
+                             "a section when its inputs are unavailable.\n\n" % self.cwd
+                             + composed_goal)
         self._skill_proc = _skill_report
         initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)
         # Kept for the branches that REBUILD the job for a fresh conversation -- a replay and
@@ -7997,6 +8008,16 @@ class RelayWorker:
         protect nothing, and this repository has watched that happen with an MFA gate that sat
         on one branch while every other path walked past.
         """
+        from relay.judge_gate import complete_judge_request
+        judge_ok, judge_text = complete_judge_request(
+            getattr(self, "goal", ""), getattr(self, "cwd", ""),
+            strict=os.environ.get("MCP_JUDGE_STRICT", "").lower()
+            in ("1", "true", "yes", "on"))
+        if not judge_ok:
+            self.status, self.outcome, self.reason = "stuck", "VERIFY_FAILED", judge_text
+            return
+        if judge_text:
+            self.last_response = (self.last_response or "") + "\n" + judge_text
         self.status = "done"
         # BEFORE THE VERDICT, because it is about the tree the verdict is about. It cannot
         # change the verdict yet, by design.
@@ -8005,6 +8026,8 @@ class RelayWorker:
         except Exception:
             pass
         self.outcome = outcome_override or self._claim_verdict()
+        if judge_text:
+            self.reason = ((self.reason + " | ") if self.reason else "") + judge_text[:200]
         # THE CHILD'S ANSWER IS MADE DURABLE HERE, not on a later sweep: a coordinator killed
         # between the outcome and that sweep left the done-map saying DONE with no
         # `child_result` line, and the family could then never merge. Never raises.

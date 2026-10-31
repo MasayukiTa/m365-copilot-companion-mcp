@@ -107,7 +107,8 @@ def test_every_exclusion_has_a_reason_and_still_exists(view):
 def test_the_validity_tools_are_in_the_index_and_in_their_own_category(view):
 
     names = {"validity_list_claims", "validity_judge", "validity_negative_control",
-             "validity_verify_lock", "validity_explain_reason", "validity_audit_ledger"}
+             "validity_verify_lock", "validity_explain_reason", "validity_audit_ledger",
+             "validity_past_runs"}
     assert names <= set(view["table"]), sorted(names - set(view["table"]))
     assert set(view["categories"].values()) == {"validity"}, view["categories"]
     for n in names:
