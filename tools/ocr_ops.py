@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Optional
 
@@ -8,6 +10,32 @@ from ._untrusted import wrap_if_content
 # (a few hundred MB the first time, then cached on disk), which takes ~10-20s, so we
 # keep one per language set for the life of the process.
 _EASYOCR_READERS: dict = {}
+
+# Thread-leak fix (2026-10-31). EasyOCR runs on PyTorch, whose CPU backend (OpenMP/MKL)
+# spins up an intra-op native thread pool THE FIRST TIME a torch op runs ON A GIVEN OS
+# THREAD, and that pool is tied to that thread and is NOT released when the thread
+# returns to its caller. The MCP server dispatches every tool on a fresh anyio worker
+# thread, so running OCR on the calling thread leaks ~9-11 native (py-spy-invisible,
+# Wait-state) threads per distinct worker thread -- hundreds over a long-lived server.
+# Measured: 40 distinct worker threads each running one torch op -> +360 OS threads;
+# funnelling the same work through ONE dedicated worker thread -> +0.
+# Fix: every EasyOCR call (Reader build + readtext) runs on a single dedicated worker,
+# so the torch native pool is created once and reused. Lazily created, daemon, so it
+# never blocks shutdown and costs nothing until the first OCR call.
+_OCR_EXECUTOR: Optional[ThreadPoolExecutor] = None
+_OCR_EXECUTOR_LOCK = threading.Lock()
+
+
+def _ocr_executor() -> ThreadPoolExecutor:
+    """The one worker thread that all EasyOCR/torch work runs on (see module note)."""
+    global _OCR_EXECUTOR
+    if _OCR_EXECUTOR is None:
+        with _OCR_EXECUTOR_LOCK:
+            if _OCR_EXECUTOR is None:
+                _OCR_EXECUTOR = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="ocr-easyocr"
+                )
+    return _OCR_EXECUTOR
 
 
 def _wants_japanese(lang: str) -> bool:
@@ -57,6 +85,11 @@ def _easyocr_image_text(im, lang: str) -> Optional[str]:
     Takes a numpy array rather than a path: EasyOCR loads paths through OpenCV,
     whose Windows imread returns None for any path containing non-ASCII characters
     (and then fails deep inside the library). Passing pixels sidesteps that entirely.
+
+    The actual EasyOCR/torch work is funnelled through one dedicated worker thread
+    (see the module note on _OCR_EXECUTOR) so PyTorch's native CPU thread pool is
+    created once and reused, instead of leaking a fresh pool onto every anyio worker
+    thread the MCP server happens to dispatch an OCR call on.
     """
     try:
         import numpy as np
@@ -64,16 +97,23 @@ def _easyocr_image_text(im, lang: str) -> Optional[str]:
         return None
     langs = _easyocr_langs(lang)
     key = "+".join(sorted(langs))
+
+    def _run() -> Optional[str]:
+        try:
+            reader = _EASYOCR_READERS.get(key)
+            if reader is None:
+                import easyocr
+                reader = easyocr.Reader(langs, gpu=False, verbose=False)
+                _EASYOCR_READERS[key] = reader
+            arr = np.array(im.convert("RGB"))
+            parts = reader.readtext(arr, detail=0)
+            text = "\n".join(s for s in (str(x).strip() for x in parts) if s)
+            return text or None
+        except Exception:
+            return None
+
     try:
-        reader = _EASYOCR_READERS.get(key)
-        if reader is None:
-            import easyocr
-            reader = easyocr.Reader(langs, gpu=False, verbose=False)
-            _EASYOCR_READERS[key] = reader
-        arr = np.array(im.convert("RGB"))
-        parts = reader.readtext(arr, detail=0)
-        text = "\n".join(s for s in (str(x).strip() for x in parts) if s)
-        return text or None
+        return _ocr_executor().submit(_run).result()
     except Exception:
         return None
 
