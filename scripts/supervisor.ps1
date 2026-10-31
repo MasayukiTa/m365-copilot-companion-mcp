@@ -2083,25 +2083,38 @@ function Start-TunnelHost {
     # events that drop the cached devtunnel login answer (see Test-DevtunnelLoggedInCached).
     $script:TunnelHostProc = $null
     Reset-TunnelProbeBackoff
-    # ITS OUTPUT IS KEPT. On 2026-09-24 a host this supervisor launched exited 27 s after it
-    # "established", and the only record was that it had exited: the window was hidden and
-    # nothing was redirected, so whatever devtunnel said about why was gone. The host's output
-    # goes to .setup\logs\devtunnel-host.*.log (gitignored) and the main loop quotes its last
-    # lines when the host exits.
+    # ITS OUTPUT IS KEPT, AND NOW IT IS ALWAYS READ. On 2026-09-24 a host this supervisor
+    # launched exited 27 s after it "established" and the only record was that it had exited;
+    # on 2026-10-31 a reader-less host left no log for the minutes a user reported a
+    # disconnect, because the short-lived starter that redirected its pipes had already
+    # exited and nothing drained them. The host is now owned by a supervisor-launched,
+    # LONG-LIVED Python reader (relay.tunnel_host_log): it spawns `devtunnel -v host`, drains
+    # BOTH streams continuously, stamps every line with a millisecond local time, writes to
+    # .setup\logs\devtunnel-host-ts.log (opened shared-read, rotated at 20 MB keeping 5,
+    # appended across host restarts), restarts the host with a backoff and logs its exit code.
+    # $script:TunnelHostProc is that reader; its own exit is still the login-cache
+    # invalidation event the main loop watches. The reader is modelled on the disk-series
+    # sampler launch above (same $Py, same windowless redirect-or-fallback shape).
+    Update-PythonInterpreter "the devtunnel host log reader"
     $logDir = Join-Path $Root ".setup\logs"
-    $script:TunnelHostOut = Join-Path $logDir "devtunnel-host.out.log"
-    $script:TunnelHostErr = Join-Path $logDir "devtunnel-host.err.log"
+    $script:TunnelHostOut = Join-Path $logDir "devtunnel-host-reader.out.log"
+    $script:TunnelHostErr = Join-Path $logDir "devtunnel-host-reader.err.log"
+    $script:TunnelHostTsLog = Join-Path $logDir "devtunnel-host-ts.log"
+    $env:MCP_DEVTUNNEL_BIN = $DevTunnel
+    $readerArgs = @("-m", "relay.tunnel_host_log", $TunnelName)
     try {
         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
-        $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden `
+        $script:TunnelHostProc = Start-Process -FilePath $Py -ArgumentList $readerArgs `
+            -WorkingDirectory $Root -WindowStyle Hidden `
             -RedirectStandardOutput $script:TunnelHostOut -RedirectStandardError $script:TunnelHostErr -PassThru
     } catch {
-        Write-Log "devtunnel host output could not be redirected ($($_.Exception.Message)); starting without it"
+        Write-Log "devtunnel host reader output could not be redirected ($($_.Exception.Message)); starting without it"
         $script:TunnelHostOut = $null
         $script:TunnelHostErr = $null
-        $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden -PassThru
+        $script:TunnelHostProc = Start-Process -FilePath $Py -ArgumentList $readerArgs `
+            -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     }
-    Write-Log "devtunnel host starting for $TunnelName (bin=$DevTunnel) ..."
+    Write-Log "devtunnel host reader starting for $TunnelName (python=$Py, bin=$DevTunnel; ts-log=$script:TunnelHostTsLog) ..."
     # A freshly-started host can take 15-30s to register with the relay. Block until it
     # actually shows >=1 connection (up to ~50s) so the monitor loop never kills a host
     # that is still in the middle of connecting (which would cause a restart churn loop).
@@ -2128,6 +2141,7 @@ function Start-TunnelHost {
 $script:TunnelHostProc = $null
 $script:TunnelHostOut = $null
 $script:TunnelHostErr = $null
+$script:TunnelHostTsLog = $null
 
 function Get-TunnelHostExitDetail {
     # " (code N; it said: ...)" for the host this supervisor launched, from its exit code and the
@@ -2135,7 +2149,7 @@ function Get-TunnelHostExitDetail {
     $parts = @()
     try { if ($script:TunnelHostProc) { $parts += ("code " + $script:TunnelHostProc.ExitCode) } } catch { }
     $said = @()
-    foreach ($f in @($script:TunnelHostErr, $script:TunnelHostOut)) {
+    foreach ($f in @($script:TunnelHostErr, $script:TunnelHostOut, $script:TunnelHostTsLog)) {
         if (-not $f) { continue }
         try {
             if (Test-Path -LiteralPath $f) {
