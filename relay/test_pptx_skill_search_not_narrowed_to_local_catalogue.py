@@ -167,7 +167,7 @@ def test_the_live_instructions_string_actually_contains_the_new_text():
         pytest.skip("main.py could not be imported in this process (pre-existing, "
                     "unrelated to this fix): %r" % (exc,))
     else:
-        instr = main.mcp.instructions
+        instr = main.FULL_INSTRUCTIONS
         assert "NO-MATCH RESULT MEANS" in instr
         assert "Keep going with your other tools" in instr
     finally:

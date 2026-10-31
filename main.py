@@ -219,10 +219,7 @@ def _u(on: str, off: str) -> str:
     return on if _UNLOCK_ON else off
 
 
-mcp = FastMCP(
-    "m365-copilot-companion-mcp",
-    auth=auth,
-    instructions=(
+FULL_INSTRUCTIONS = (
         "m365-copilot-companion-mcp toolkit. "
         # The catalogue is reachable ONLY through the call_tool gateway. Naming tools as
         # though they were directly callable made agents look for read_file/list_directory
@@ -376,7 +373,36 @@ mcp = FastMCP(
         "for a confident trusted match. Skill trust never grants extra execution rights; "
         "every mutating, shell, or outbound tool keeps its normal " +
         _u("unlock/contract gate.", "contract gate.")
-    ),
+)
+
+COMPACT_INSTRUCTIONS = (
+    "Every tool is behind the call_tool gateway. A bare tool name is not callable; "
+    "its absence from your own tool list is expected. "
+    "RULE 1: First call call_tool(name='') and read the index before saying what is "
+    "impossible. Open categories with call_tool(name='<category>'); show a tool's "
+    "parameters with call_tool(name='<tool>'). "
+    "RULE 2: Call skill_match with the user's request before domain work. Load and "
+    "follow a confident trusted match as written. No match means only that the local "
+    "catalogue has nothing for this; continue with other tools. Skill trust never grants "
+    "extra execution rights. "
+    + _u(
+        "RULE 3: Ordinary reads need no unlock; clipboard, mail, calendar, database and "
+        "registry reads are gated. Unlock before changes or execution. If locked and you "
+        "have the password, call unlock(password) once in this conversation and retry; "
+        "the session carries authorization. If you lack it, submit the whole request to "
+        "the fleet; do not search .env or abandon a read. ",
+        "RULE 3: No tool needs unlock. Never seek a password or stop because a tool "
+        "description mentions unlocking. Report actual errors. ",
+    )
+    + "For long or multi-step work, use fleet_submit directly if listed, or "
+    "call_tool(name='fleet_submit', arguments={...}). QUEUED means not started."
+)
+
+mcp = FastMCP(
+    "m365-copilot-companion-mcp",
+    auth=auth,
+    instructions=COMPACT_INSTRUCTIONS if os.environ.get("MCP_INSTRUCTIONS_COMPACT", "1") != "0"
+    else FULL_INSTRUCTIONS,
 )
 
 def _git_head_sha(repo_root=None):

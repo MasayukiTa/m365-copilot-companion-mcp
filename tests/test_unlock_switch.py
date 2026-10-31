@@ -258,3 +258,37 @@ def test_main_picks_unlock_free_instructions_when_off():
     assert "_UNLOCK_ON = _unlock_switch.unlock_required()" in src
     assert "RULE 3 -- NOTHING NEEDS UNLOCKING" in src
     assert "_unlock_switch.audit_start()" in src
+
+
+def test_compact_initialize_response_fits_transport_budget(monkeypatch):
+    """Measure a real in-process client handshake, including the JSON-RPC envelope."""
+    import asyncio
+    import importlib
+    import fastmcp
+    from mcp.types import JSONRPCResponse
+
+    monkeypatch.setenv("MCP_API_KEY", "test-key-not-used")
+    monkeypatch.setenv("MCP_INSTRUCTIONS_COMPACT", "1")
+    # The suite's autouse notification stub has *args, which FastMCP cannot register.
+    monkeypatch.setenv("MCP_TOOL_MAP", "1")
+    monkeypatch.setenv("MCP_TOOL_MAP_MAX", "2")
+    import main
+    main = importlib.reload(main)
+
+    async def exchange():
+        async with fastmcp.Client(main.mcp, mode="legacy") as client:
+            result = await client.initialize()
+            response = JSONRPCResponse(jsonrpc="2.0", id=1, result=result.model_dump(
+                mode="json", by_alias=True, exclude_none=True))
+            return response.model_dump_json(by_alias=True, exclude_none=True).encode("utf-8")
+
+    wire = asyncio.run(exchange())
+    assert b'"instructions"' in wire
+    print("compact instructions bytes:", len(main.COMPACT_INSTRUCTIONS.encode("utf-8")))
+    print("compact initialize bytes:", len(wire))
+    monkeypatch.setenv("MCP_INSTRUCTIONS_COMPACT", "0")
+    main = importlib.reload(main)
+    assert main.mcp.instructions == main.FULL_INSTRUCTIONS
+    full_wire = asyncio.run(exchange())
+    print("full initialize bytes:", len(full_wire))
+    assert len(wire) <= 2000, f"initialize response is {len(wire)} bytes"
