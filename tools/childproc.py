@@ -84,13 +84,84 @@ def run(cmd, **kw):
     # Making every call site remember instead is the version of this that keeps biting.
     if isinstance(kw.get("input"), str):
         kw["input"] = kw["input"].encode("utf-8")
-    proc = subprocess.run(cmd, **kw)
+    # TIMEOUT MUST KILL THE WHOLE TREE, OR THE READER THREADS LEAK.
+    #
+    # subprocess.run(timeout=) kills only the DIRECT child on expiry and then calls
+    # communicate() to join its pipe-reader threads. If that child spawned a grandchild
+    # that inherited the stdout/stderr pipe write handles, those handles stay open, the
+    # reader threads never see EOF, communicate() blocks, and the threads park in Wait
+    # forever -- invisible to py-spy (no Python frame) but counted by the OS. 22h of this,
+    # a few per timed-out notify/chart/pip call, is the 500-thread leak this function was
+    # the common path for. The fix is the proven autoloop._run / ext_helper._call shape:
+    # run through Popen, and on TimeoutExpired kill the tree (taskkill /T) BEFORE the
+    # second communicate(), so the write ends close and the readers reach EOF and exit.
+    timeout = kw.pop("timeout", None)
+    if timeout is None:
+        proc = subprocess.run(cmd, **kw)
+        try:
+            proc.stdout = decode(proc.stdout)
+            proc.stderr = decode(proc.stderr)
+        except AttributeError:      # capture_output=False -> both are None already
+            pass
+        return proc
+    # timeout given: drive Popen ourselves so a timeout can kill the whole tree.
+    capture = kw.pop("capture_output", True)
+    stdin_input = kw.pop("input", None)
+    check = kw.pop("check", False)
+    if capture:
+        kw.setdefault("stdout", subprocess.PIPE)
+        kw.setdefault("stderr", subprocess.PIPE)
+    if stdin_input is not None:
+        kw.setdefault("stdin", subprocess.PIPE)
+    # Make the child the root of a killable tree. Without this, taskkill /T has no
+    # descendant group to walk on Windows and killpg has no dedicated session on POSIX --
+    # i.e. the tree kill degrades to a direct kill and the leak is not actually closed.
+    #
+    # The policy comes from tree_popen_kwargs(), expanded INLINE at the Popen call on
+    # purpose: tools/launch_sites.py recognises `**childproc.tree_popen_kwargs(...)` as a
+    # stated console/process-ownership policy, so this new spawn site counts as DECIDED and
+    # does not read as a window-allocating launch that inherits whatever console it is given.
+    # headless=False: this is the general-purpose runner, so it must keep inheriting the
+    # parent's console (ssh/git credential prompts depend on it); only the kill-ability of
+    # the tree is being added here. priority=False: a timeout path must not quietly change
+    # the child's scheduling priority relative to the no-timeout path above.
+    #
+    # For the timeout path specifically the tree policy OWNS process/console ownership, so a
+    # caller-supplied spawn kwarg for the same concern is dropped rather than collided with
+    # (Popen would raise on a duplicate **-key); every current caller leaves these unset.
+    for _owned in ("creationflags", "start_new_session", "preexec_fn"):
+        kw.pop(_owned, None)
+    # Attribute form `childproc.tree_popen_kwargs(...)` is required: launch_sites keys its
+    # policy-factory allowlist on the module-qualified name (("childproc","tree_popen_kwargs")),
+    # so a bare import or an alias would not read as a stated policy. Importing this module by
+    # its own name is cheap and non-circular -- it is already in sys.modules by the time run()
+    # executes.
+    from tools import childproc
+    proc = subprocess.Popen(cmd, **kw, **childproc.tree_popen_kwargs(headless=False, priority=False))
     try:
-        proc.stdout = decode(proc.stdout)
-        proc.stderr = decode(proc.stderr)
-    except AttributeError:          # capture_output=False -> both are None already
-        pass
-    return proc
+        out, err = proc.communicate(input=stdin_input, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Kill the whole tree so the grandchildren release the pipe write ends; THEN
+        # communicate() again so the reader threads reach EOF and are joined -- not left
+        # parked. Bounded so a wedged kill cannot itself hang the server.
+        kill_tree(proc, wait_s=5)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            # Last resort: detach the pipes so the readers are not waited on forever here.
+            out, err = None, None
+            for stream in (proc.stdout, proc.stderr):
+                try:
+                    if stream is not None:
+                        stream.close()
+                except Exception:
+                    pass
+        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    retcode = proc.poll()
+    completed = subprocess.CompletedProcess(cmd, retcode, decode(out), decode(err))
+    if check and retcode:
+        raise subprocess.CalledProcessError(retcode, cmd, completed.stdout, completed.stderr)
+    return completed
 
 
 def headless_creationflags() -> int:
