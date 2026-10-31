@@ -31,6 +31,75 @@ def test_present_request_calls_judge_and_completes(tmp_path, monkeypatch):
     assert calls == [("SYN1", {"data_location": data, "fetched_at": request["fetched_at"]})]
     assert w.status == "done" and w.outcome == "DONE"
     assert "HOLD" in w.last_response
+    assert "manifest: not run:" in w.last_response
+    assert "registration: not run:" in w.last_response
+    assert "lot diagnosis: not run:" in w.last_response
+
+
+def test_complete_request_calls_harness_with_supplied_values(tmp_path, monkeypatch):
+    from tools import validity_harness as vh
+    request = {"claim_id": "SYN1", "data_location": "data.csv",
+               "fetched_at": "2026-10-30T00:00:00+09:00",
+               "manifest": {"path": "manifest.json", "dataset_id": "ds", "result": {"n": 2}},
+               "registration": {"root": "reg", "claim": {"id": "SYN1", "test": 1},
+                                "registered_at": "2026-10-29T00:00:00+09:00"},
+               "lot_diagnosis": {"y": [1, 2], "x": [0, 1], "lot": ["a", "b"]}}
+    (tmp_path / "judge_request.json").write_text(json.dumps(request), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(vh, "record_manifest", lambda *a, **kw: calls.append(("manifest", a, kw)))
+    def register(*a, **kw):
+        calls.append(("registration", a, kw))
+        return {"order_ok": True}
+    monkeypatch.setattr(vh, "register_and_lock", register)
+    def diagnose(**kw):
+        calls.append(("lot", (), kw))
+        return {"checked": True}
+    monkeypatch.setattr(vh, "lot_independence_check", diagnose)
+    monkeypatch.setattr(judge_gate, "run_engine_judge", lambda *a, **kw: {"engine_available": False})
+    ok, status = judge_gate.complete_judge_request(GOAL, str(tmp_path))
+    assert ok and "not run:" not in status
+    assert calls == [
+        ("manifest", (str(tmp_path / "manifest.json"),),
+         {"dataset_id": "ds", "data_path": str(tmp_path / "data.csv"),
+          "result": {"n": 2}, "fetched_at": request["fetched_at"]}),
+        ("registration", (str(tmp_path / "reg"),),
+         {"claim": request["registration"]["claim"], "data_fetched_at": request["fetched_at"],
+          "registered_at": request["registration"]["registered_at"]}),
+        ("lot", (), request["lot_diagnosis"])]
+
+
+def test_partial_request_runs_only_complete_section(tmp_path, monkeypatch):
+    from tools import validity_harness as vh
+    request = {"claim_id": "SYN1", "data_location": "data.csv", "fetched_at": "today",
+               "manifest": {"path": "m.json", "dataset_id": "ds", "result": {}},
+               "registration": {"root": "reg"}, "lot_diagnosis": {"y": [1]}}
+    (tmp_path / "judge_request.json").write_text(json.dumps(request), encoding="utf-8")
+    calls = []
+    monkeypatch.setattr(vh, "record_manifest", lambda *a, **kw: calls.append("manifest"))
+    monkeypatch.setattr(vh, "register_and_lock", lambda *a, **kw: calls.append("registration"))
+    monkeypatch.setattr(vh, "lot_independence_check", lambda **kw: calls.append("lot"))
+    monkeypatch.setattr(judge_gate, "run_engine_judge", lambda *a, **kw: {"engine_available": False})
+    ok, status = judge_gate.complete_judge_request(GOAL, str(tmp_path))
+    assert ok and calls == ["manifest"]
+    assert "registration: not run: root, claim and registered_at are required" in status
+    assert "lot diagnosis: not run: y, x and lot are required" in status
+
+
+def test_complete_request_runs_real_harness(tmp_path, monkeypatch):
+    (tmp_path / "data.csv").write_text("x,y\n0,1\n1,2\n", encoding="utf-8")
+    request = {"claim_id": "SYN1", "data_location": "data.csv",
+               "fetched_at": "2026-10-30T00:00:00+09:00",
+               "manifest": {"path": "manifest.json", "dataset_id": "ds", "result": {"n": 2}},
+               "registration": {"root": "reg", "claim": {"id": "SYN1"},
+                                "registered_at": "2026-10-29T00:00:00+09:00"},
+               "lot_diagnosis": {"y": [1, 2], "x": [0, 1], "lot": ["a", "b"]}}
+    (tmp_path / "judge_request.json").write_text(json.dumps(request), encoding="utf-8")
+    monkeypatch.setattr(judge_gate, "run_engine_judge", lambda *a, **kw: {"engine_available": False})
+    ok, status = judge_gate.complete_judge_request(GOAL, str(tmp_path))
+    assert ok and "manifest: recorded" in status and "order_ok=True" in status
+    assert '"checked": true' in status and '"independent": false' in status
+    assert json.loads((tmp_path / "manifest.json").read_text(encoding="utf-8"))["datasets"]["ds"]
+    assert json.loads((tmp_path / "reg" / "registry" / "SYN1.json").read_text(encoding="utf-8")) == {"id": "SYN1"}
 
 
 def test_absent_request_completes_with_visible_marker(tmp_path, monkeypatch):

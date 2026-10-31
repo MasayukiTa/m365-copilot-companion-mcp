@@ -4050,7 +4050,11 @@ class RelayWorker:
             composed_goal = ("For this data analysis, write judge_request.json in the output "
                              "folder %s before DONE. It must be a JSON object with claim_id, "
                              "data_location (absolute file path), and fetched_at (ISO timestamp). "
-                             "Use actual values; do not invent them.\n\n" % self.cwd
+                             "Optional sections: manifest {path, dataset_id, result}; "
+                             "registration {root, claim, registered_at}; and "
+                             "lot_diagnosis {y, x, lot} (equal-length arrays). Paths may be "
+                             "relative to the output folder. Supply actual values only; omit "
+                             "a section when its inputs are unavailable.\n\n" % self.cwd
                              + composed_goal)
         self._skill_proc = _skill_report
         initial_body, preflight_unlock = _initial_job_with_unlock(composed_goal, plan_mode)

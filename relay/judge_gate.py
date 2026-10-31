@@ -117,10 +117,68 @@ def complete_judge_request(goal, output_folder, *, strict=False):
             raise ValueError("invalid claim id")
         if not os.path.isabs(data_location):
             data_location = os.path.abspath(os.path.join(output_folder, data_location))
+        from tools import validity_harness
+
+        statuses = []
+        order_record = None
+        manifest = request.get("manifest")
+        if not isinstance(manifest, dict) or not all(
+                k in manifest for k in ("path", "dataset_id", "result")):
+            statuses.append("manifest: not run: path, dataset_id and result are required")
+        else:
+            try:
+                if (not isinstance(manifest["path"], str) or not manifest["path"].strip()
+                        or not isinstance(manifest["dataset_id"], str)
+                        or not manifest["dataset_id"].strip()
+                        or not isinstance(manifest["result"], dict)):
+                    raise ValueError("invalid manifest fields")
+                manifest_path = os.path.abspath(os.path.join(output_folder, manifest["path"]))
+                validity_harness.record_manifest(manifest_path, dataset_id=manifest["dataset_id"],
+                                                 data_path=data_location, result=manifest["result"],
+                                                 fetched_at=fetched_at)
+                statuses.append("manifest: recorded")
+            except (OSError, ValueError, TypeError) as e:
+                statuses.append("manifest: not run: %s" % e)
+        registration = request.get("registration")
+        if not isinstance(registration, dict) or not all(
+                k in registration for k in ("root", "claim", "registered_at")):
+            statuses.append("registration: not run: root, claim and registered_at are required")
+        else:
+            try:
+                claim = registration["claim"]
+                if (not isinstance(registration["root"], str) or not registration["root"].strip()
+                        or not isinstance(claim, dict) or claim.get("id") != claim_id
+                        or not isinstance(registration["registered_at"], str)
+                        or not registration["registered_at"].strip()):
+                    raise ValueError("invalid registration fields or claim id mismatch")
+                # Validate timestamps before register_and_lock writes the claim.
+                validity_harness._parse_iso(registration["registered_at"])
+                validity_harness._parse_iso(fetched_at)
+                root = os.path.abspath(os.path.join(output_folder, registration["root"]))
+                order_record = validity_harness.register_and_lock(
+                    root, claim=claim, data_fetched_at=fetched_at,
+                    registered_at=registration["registered_at"])
+                statuses.append("registration: recorded (order_ok=%s)" % order_record["order_ok"])
+            except (OSError, ValueError, TypeError, OverflowError) as e:
+                statuses.append("registration: not run: %s" % e)
+        lot = request.get("lot_diagnosis")
+        if not isinstance(lot, dict) or not all(k in lot for k in ("y", "x", "lot")):
+            statuses.append("lot diagnosis: not run: y, x and lot are required")
+        else:
+            try:
+                if (not all(isinstance(lot[k], list) and lot[k] for k in ("y", "x", "lot"))
+                        or len({len(lot[k]) for k in ("y", "x", "lot")}) != 1):
+                    raise ValueError("y, x and lot must be non-empty arrays of equal length")
+                diagnosis = validity_harness.lot_independence_check(
+                    y=lot["y"], x=lot["x"], lot=lot["lot"])
+                statuses.append("lot diagnosis: " + json.dumps(diagnosis, ensure_ascii=False))
+            except (ValueError, TypeError, ImportError) as e:
+                statuses.append("lot diagnosis: not run: %s" % e)
         verdict = run_engine_judge(claim_id, data_location=data_location, fetched_at=fetched_at)
         footer = build_judge_footer(verdict=verdict,
-                                    engine_available=verdict.get("engine_available", False))
-        return True, "judge: requested\n" + footer
+                                    engine_available=verdict.get("engine_available", False),
+                                    order_record=order_record)
+        return True, "judge: requested\n" + "\n".join(statuses) + "\n" + footer
     except (OSError, ValueError, TypeError, KeyError) as e:
         return False, "judge: invalid request (%s)" % e
 
