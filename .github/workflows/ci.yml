@@ -167,6 +167,8 @@ jobs:
             relay/test_a_one_line_answer_is_still_an_answer.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
+            tools/test_case_reference_search.py \
+            relay/test_fleet_case_reference.py \
             relay/test_judge_gate_harness.py \
             relay/test_fleet_judge_request.py \
             tests/test_validity_harness.py \
