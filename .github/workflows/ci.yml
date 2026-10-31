@@ -1120,6 +1120,8 @@ jobs:
             tests/test_owner_verbatim_realuse.py \
             scripts/test_stability_replay.py \
             relay/test_a_finished_worker_need_not_be_swept_every_tick.py \
+            relay/test_tunnel_channels.py \
+            relay/test_tunnel_host_log.py \
             tests/test_response_telemetry.py
 
       - name: Run script-style tracer tests
