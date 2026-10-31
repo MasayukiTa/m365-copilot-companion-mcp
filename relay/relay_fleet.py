@@ -4471,7 +4471,7 @@ class RelayWorker:
         """子が全部終わった分割元 (awaiting_children) を、統合担当として『自分自身で』復帰させる。
 
         別の RelayWorker (別担当) を立てずに、この分割元ワーカーに統合 goal を載せ、
-        resume_conv に自分の会話 id を入れて ready に戻す。次の sweep が attach() を呼ぶと、
+        resume_conv に自分の会話 id を入れて pending に戻す。次の sweep が attach() を呼ぶと、
         その会話 id で同じ会話に再接続し、続きとして統合が書かれる -- オーナーの
         『統合は分割元自身が行う。別担当を立てない』を満たす (指摘 2026-10-30)。
 
@@ -4498,7 +4498,7 @@ class RelayWorker:
         self.page, self.drv, self.socket = None, None, False
         self.outcome = None
         self.reason = "子の完了を確認 -> 分割元自身の会話で統合を続行"
-        self.status = "ready"
+        self.status = PENDING
 
     def close(self):
         """Release this worker and every resource it owns. Idempotent; never raises."""
@@ -11132,6 +11132,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             if _resume_here:
                 # 分割元ワーカー自身を統合担当として復帰させる (add_box には積まない)。
                 _parent_w.adopt_parent_merge(_merge_item, _parent_conv)
+                # The waiting parent released its driver. Re-enter normal admission so
+                # attach() restores the conversation before poll() can send the merge.
+                pending.append(_parent_w)
                 queued += 1
                 print("[fanout] %s: %d/%d subtask(s) done -> 分割元自身が統合 (%s)"
                       % (_cid, _done_n, len(_recs), _parent_w.name), flush=True)

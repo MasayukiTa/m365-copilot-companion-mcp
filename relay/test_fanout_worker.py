@@ -393,7 +393,7 @@ def test_adopt_parent_merge_leaves_the_worker_ready_to_be_reattached():
     assert w.closed is False
     assert w.drv is None
     assert w.socket is False
-    assert w.status == "ready"
+    assert w.status == rf.PENDING
 
 
 def test_adopt_parent_merge_clears_the_terminal_flags():
