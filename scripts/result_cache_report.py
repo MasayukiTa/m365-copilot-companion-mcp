@@ -185,11 +185,44 @@ def main(argv=None):
     ap.add_argument("--fleet-dir", default=None,
                     help="directory holding the fleet records (default: the live one, read-only)")
     ap.add_argument("--format", choices=("text", "json"), default="text")
+    ap.add_argument("--same-fingerprint", action="store_true",
+                    help="compare only hits with two available, equal pre-call fingerprints")
+    ap.add_argument("--by-tool", action="store_true", help="show per-tool comparison rates")
     args = ap.parse_args(argv)
     # Resolved here, not as a module constant: nothing in this script writes, and a module-level
     # path to the live record directory would have to be classified by the isolation guard.
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     rows, bad = read_rows(os.path.join(fleet_dir, LOG_NAME))
+    if args.same_fingerprint:
+        pairs = [r for r in rows if r.get("read_only", True) and r.get("hit")
+                 and isinstance(r.get("fingerprint"), dict) and r["fingerprint"]
+                 and r.get("fingerprint") == r.get("previous_fingerprint")
+                 and isinstance(r.get("result_hash"), str) and r.get("result_hash")
+                 and isinstance(r.get("previous_result_hash"), str) and r.get("previous_result_hash")]
+        by_tool = {}
+        for r in pairs:
+            item = by_tool.setdefault(str(r.get("tool") or ""), {"pairs": 0, "differed": 0})
+            item["pairs"] += 1
+            item["differed"] += r["result_hash"] != r["previous_result_hash"]
+        for item in by_tool.values():
+            item["differed_share"] = _share(item["differed"], item["pairs"])
+        differed = sum(item["differed"] for item in by_tool.values())
+        summary = {"pairs": len(pairs), "differed": differed,
+                   "differed_share": _share(differed, len(pairs)), "unreadable": bad}
+        if args.by_tool:
+            summary["by_tool"] = dict(sorted(by_tool.items()))
+        if args.format == "json":
+            text = json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
+        else:
+            text = ("Same pre-call fingerprint: %d pairs, %d differed (%s).\n"
+                    "Metadata fingerprints are incomplete and do not prove unchanged state or safe serving.\n"
+                    % (len(pairs), differed, _pct(summary["differed_share"])))
+            if args.by_tool:
+                for name, item in sorted(by_tool.items()):
+                    text += "- %s: %d pairs, %d differed (%s)\n" % (
+                        name, item["pairs"], item["differed"], _pct(item["differed_share"]))
+        sys.stdout.write(text)
+        return 0
     s = summarise(rows)
     label, unmet = verdict(s)
     if args.format == "json":

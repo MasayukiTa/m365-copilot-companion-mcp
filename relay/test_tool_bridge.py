@@ -217,6 +217,20 @@ def test_a_successful_call_returns_ok_and_the_text():
     assert log[0][1]["arguments"]["table"] == "t"
 
 
+def test_fingerprint_is_captured_before_the_gateway_call(monkeypatch):
+    from relay import result_cache as RC
+    events = []
+    monkeypatch.setattr(RC, "fingerprint_before", lambda tool, args: events.append("before") or {"x": 1})
+    monkeypatch.setattr(RC, "shadow_observe", lambda *a, **kw: events.append(kw["fingerprint"]))
+    class Client(_FakeClient):
+        async def call_tool(self, name, arguments):
+            events.append("call")
+            return await super().call_tool(name, arguments)
+    run = TB.make_run_tool("w", client_factory=_factory(Client(_Result("answer"))))
+    assert run("call_tool", {"name": "read_file", "arguments": {"path": "x"}})[0]
+    assert events == ["before", "call", {"x": 1}]
+
+
 def test_the_worker_name_is_attached_for_the_ledger_but_never_overwrites():
     log = []
     run = TB.make_run_tool("w3", client_factory=_factory(_FakeClient(_Result("x"), log=log)))
