@@ -171,6 +171,7 @@ jobs:
             tools/test_dismiss_refused_card.py \
             ui/test_priority_boost_persists_and_audits.py \
             ui/test_a_boosted_parent_lifts_its_children.py \
+            ui/test_clicking_a_worker_changes_spine.py \
             tools/overnight/test_overnight_input.py \
             tools/overnight/test_overnight_runner.py \
             tools/overnight/test_overnight_detect.py \

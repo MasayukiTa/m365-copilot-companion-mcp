@@ -25,6 +25,14 @@ using System.Runtime.CompilerServices;
 
 partial class CockpitWindow
 {
+    string _spineWorkerName = "";
+
+    void SelectSpineWorker(string name)
+    {
+        if (string.IsNullOrEmpty(name)) return;
+        _spineWorkerName = name;
+        if (_lastRoot != null) RefreshSpine(_lastRoot, false);
+    }
 
     // A2-2: Refresh the Evidence Spine panel on each tick. Keyed off a signature so the
     // heavy DOM rebuild (and col-width change) only happens when the run state changes.
@@ -200,6 +208,9 @@ partial class CockpitWindow
     Dictionary<string, object> SpineFocusWorker(List<Dictionary<string, object>> workers)
     {
         if (workers == null || workers.Count == 0) return null;
+        if (!string.IsNullOrEmpty(_spineWorkerName))
+            foreach (var w in workers)
+                if (w != null && S(w, "name") == _spineWorkerName) return w;
         if (_expanded != null && _expanded.Count > 0)
             foreach (var w in workers)
             {
