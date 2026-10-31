@@ -133,6 +133,7 @@ BASELINE = {
     "scripts/run_script_style_tests.py::run_one::subprocess.run": 1,
     "scripts/run_transport_series.py::run_one::subprocess.run": 1,
     "scripts/status.py::processes::subprocess.run": 1,
+    "tools/childproc.py::run::subprocess.Popen": 1,
     "tools/childproc.py::run::subprocess.run": 1,
     "tools/code_exec.py::run_python::subprocess.run": 1,
     "tools/coding_ops.py::_git_raw::subprocess.run": 1,
