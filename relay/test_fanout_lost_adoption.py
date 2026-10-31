@@ -63,3 +63,41 @@ def test_ledger_write_failure_runs_parent(tmp_path, monkeypatch, capsys):
     assert seen[0][0:2] == ("ready", None)
     assert not queued
     assert "campaign ledger write failed" in capsys.readouterr().out
+
+
+def test_parent_is_readmitted_before_its_merge(tmp_path, monkeypatch):
+    h = helpers._install(monkeypatch, {})
+    tdir = h._crashed_run(tmp_path, [])
+    attachments = []
+    sent = []
+
+    class Driver:
+        def conversation_ids(self):
+            return {"client": "parent-conversation", "turns": 1}
+
+    def attach(self, context, agent_url):
+        attachments.append((self.name, self.resume_conv))
+        self.drv = Driver()
+        self.socket = True
+        self.status = "ready"
+        return True
+
+    def poll(self):
+        if self.name == "w0" and not self._fanin_resumed:
+            self.fanout = True
+            self._decide("1. first slice\n2. second slice\n" + fanout.SUBTASKS_READY)
+        else:
+            assert self.drv is not None
+            if self._fanin_resumed:
+                sent.append(self.resume_conv)
+            self.display_result = self.last_response = "finished"
+            self._settle_done(outcome_override="DONE")
+        return True
+
+    monkeypatch.setattr(rf.RelayWorker, "attach", attach)
+    monkeypatch.setattr(rf.RelayWorker, "poll", poll)
+    rf.run_relay_fleet(h._FakeContext(), ["a goal to split"], "http://agent",
+                       max_concurrent=1, poll_s=0, transcript_dir=tdir,
+                       notify=lambda *a, **k: None)
+    assert [conv for name, conv in attachments if name == "w0"] == [None, "parent-conversation"]
+    assert sent == ["parent-conversation"]
