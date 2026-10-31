@@ -2,6 +2,9 @@ import fnmatch
 import heapq
 import stat
 import threading
+import os
+import re
+import time
 from functools import wraps
 from pathlib import Path
 from typing import Optional
@@ -24,6 +27,73 @@ from .walk import (
 #: restart, so a hard cap on how many such walks can run at once is one of the guards.
 SEARCH_CONCURRENCY = search_concurrency()
 _SEARCH_SLOTS = threading.BoundedSemaphore(SEARCH_CONCURRENCY)
+
+
+def case_reference_search(goal, roots=None, timeout=3.0, max_results=30):
+    """Resolve a short person_case-id-topic reference within local case roots.
+
+    An incomplete walk is never evidence of uniqueness. Symlink directories are not followed.
+    """
+    match = re.match(r"^\s*([^\s/\\]{1,40}?[ _＿-]+(\d{2,})[^\s/\\]{2,40})\s+", goal)
+    if not match or len(goal) > 150:
+        return None
+    title, case_id = match.group(1), match.group(2)
+    if roots is None:
+        configured = os.environ.get("M365_CASE_ROOTS", "")
+        roots = ([Path(p) for p in configured.split(os.pathsep) if p] if configured else [
+            Path.home() / "Downloads",
+            Path.cwd() / "work",
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Temp" / "m365-work",
+            Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "Temp" / "m365-companion" / "work",
+        ])
+    result = {"candidates": [], "errors": [], "truncated": False}
+    deadline = time.monotonic() + max(0, timeout)
+    if len(roots) > 8:
+        result["errors"].append("root limit exceeded")
+        roots = roots[:8]
+    for root in roots:
+        root = Path(root)
+        if not root.exists():
+            continue
+        stack = [(root, 0)]
+        while stack:
+            if time.monotonic() >= deadline:
+                result["errors"].append("search timeout")
+                return result
+            directory, depth = stack.pop()
+            try:
+                with os.scandir(directory) as entries:
+                    for entry in entries:
+                        if time.monotonic() >= deadline:
+                            result["errors"].append("search timeout")
+                            return result
+                        if entry.is_symlink() or entry.name.startswith('.'):
+                            continue
+                        is_dir = entry.is_dir(follow_symlinks=False)
+                        if is_dir and entry.name not in {"node_modules", "__pycache__", ".git"}:
+                            if depth < 4:
+                                stack.append((Path(entry.path), depth + 1))
+                            else:
+                                result["truncated"] = True
+                        # Full title avoids treating the same numeric ID as a task identity.
+                        if title.casefold() not in entry.name.casefold():
+                            continue
+                        path = Path(entry.path)
+                        source = path / "やりたいこと.txt" if is_dir else path
+                        excerpt = ""
+                        if source.is_file() and source.suffix.lower() in {".txt", ".md"}:
+                            with source.open("r", encoding="utf-8-sig", errors="replace") as f:
+                                excerpt = f.read(600)
+                            if time.monotonic() >= deadline:
+                                result["errors"].append("search timeout")
+                                return result
+                        result["candidates"].append({"path": str(path), "kind": "directory" if is_dir else "file", "request": str(source) if is_dir and source.is_file() else "", "excerpt": excerpt, "root": str(root), "case_id": case_id})
+                        if len(result["candidates"]) >= max_results:
+                            result["truncated"] = True
+                            return result
+            except OSError as exc:
+                result["errors"].append("%s: %s" % (directory, exc))
+    return result
 
 
 def _bounded_search(func):
