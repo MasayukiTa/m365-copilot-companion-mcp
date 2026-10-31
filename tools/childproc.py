@@ -35,6 +35,28 @@ from typing import Optional
 
 __all__ = ["decode", "run", "headless_creationflags", "tree_popen_kwargs", "kill_tree"]
 
+# True only on a Windows build whose kernel32 exposes the Job Object + Toolhelp calls this
+# module needs. Computed once at import; a missing symbol degrades the timeout path to the
+# taskkill fallback rather than raising.
+_WIN_JOB_OK = False
+if os.name == "nt":
+    try:
+        import ctypes as _ct
+        from ctypes import wintypes as _wt
+        _k32 = _ct.WinDLL("kernel32", use_last_error=True)
+        for _sym in ("CreateJobObjectW", "SetInformationJobObject", "OpenProcess",
+                     "AssignProcessToJobObject", "TerminateJobObject", "CloseHandle",
+                     "CreateToolhelp32Snapshot", "Thread32First", "Thread32Next",
+                     "OpenThread", "ResumeThread"):
+            getattr(_k32, _sym)
+        _k32.CreateJobObjectW.restype = _wt.HANDLE
+        _k32.OpenProcess.restype = _wt.HANDLE
+        _k32.OpenThread.restype = _wt.HANDLE
+        _k32.CreateToolhelp32Snapshot.restype = _wt.HANDLE
+        _WIN_JOB_OK = True
+    except Exception:
+        _WIN_JOB_OK = False
+
 
 def decode(raw) -> str:
     """Bytes from a child process, as text, without ever raising.
@@ -137,14 +159,44 @@ def run(cmd, **kw):
     # its own name is cheap and non-circular -- it is already in sys.modules by the time run()
     # executes.
     from tools import childproc
-    proc = subprocess.Popen(cmd, **kw, **childproc.tree_popen_kwargs(headless=False, priority=False))
+
+    # WINDOWS: place the child in a Job Object BEFORE it runs so a timeout can terminate the
+    # whole job (child + every descendant it later spawns) in one atomic call, with no taskkill
+    # timing race. The child is created suspended, assigned to the job, then resumed; a
+    # grandchild it spawns is in the job by kernel rule. On a build without the needed kernel32
+    # calls (_WIN_JOB_OK False) or on POSIX, fall through to the tree_popen_kwargs + kill_tree
+    # path below, which is correct for the common case and only loses the race fix.
+    job = None
+    if os.name == "nt" and _WIN_JOB_OK:
+        popen_kw = dict(kw)
+        popen_kw["creationflags"] = (
+            popen_kw.get("creationflags", 0)
+            | CREATE_SUSPENDED
+            | childproc.tree_popen_kwargs(headless=False, priority=False).get("creationflags", 0)
+        )
+        job = _win_create_job()
+        proc = subprocess.Popen(cmd, **popen_kw)
+        if job is not None and _win_assign_job(job, proc.pid):
+            _win_resume_process(proc.pid)
+        else:
+            # Could not create/assign the job: resume anyway so the child is not left frozen,
+            # and drop back to kill_tree on timeout.
+            _win_close_handle(job)
+            job = None
+            _win_resume_process(proc.pid)
+    else:
+        proc = subprocess.Popen(
+            cmd, **kw, **childproc.tree_popen_kwargs(headless=False, priority=False))
     try:
         out, err = proc.communicate(input=stdin_input, timeout=timeout)
     except subprocess.TimeoutExpired:
         # Kill the whole tree so the grandchildren release the pipe write ends; THEN
         # communicate() again so the reader threads reach EOF and are joined -- not left
         # parked. Bounded so a wedged kill cannot itself hang the server.
-        kill_tree(proc, wait_s=5)
+        if job is not None:
+            _win_terminate_job(job)
+        else:
+            kill_tree(proc, wait_s=5)
         try:
             out, err = proc.communicate(timeout=5)
         except Exception:
@@ -156,7 +208,9 @@ def run(cmd, **kw):
                         stream.close()
                 except Exception:
                     pass
+        _win_close_handle(job)
         raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
+    _win_close_handle(job)
     retcode = proc.poll()
     completed = subprocess.CompletedProcess(cmd, retcode, decode(out), decode(err))
     if check and retcode:
@@ -354,3 +408,121 @@ def kill_tree(proc, wait_s: float = 5.0) -> bool:
         return proc.poll() is not None
     except Exception:
         return False
+
+
+# --- Windows Job Object tree kill ------------------------------------------------------------
+#
+# WHY A JOB OBJECT AND NOT taskkill /T. `taskkill /PID <root> /T /F` resolves the descendant
+# tree from the live process table AT THE INSTANT IT RUNS. A child that spawns a grandchild
+# which inherits the stdout/stderr pipe write ends opens a race: if taskkill runs in the brief
+# window before the grandchild is registered under the child -- or after the child has already
+# died and the grandchild is reparented -- taskkill misses the grandchild, the inherited write
+# end stays open, communicate()'s reader threads never see EOF, and they park in Wait for the
+# grandchild's full lifetime. Measured on this box: ~1 timed-out call in 10-30 hit this and
+# blocked ~127s, which over 22h is the ~500 leaked OS threads reported. A Job Object closes the
+# race structurally: the child is placed in the job BEFORE it runs (CREATE_SUSPENDED, assign,
+# resume), every process it later spawns is in the job by kernel rule, and TerminateJobObject
+# kills them all at once regardless of timing or reparenting.
+
+_JobObjectExtendedLimitInformation = 9
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
+_PROCESS_ALL_ACCESS = 0x1F0FFF
+_THREAD_SUSPEND_RESUME = 0x0002
+_TH32CS_SNAPTHREAD = 0x00000004
+CREATE_SUSPENDED = 0x00000004
+
+
+def _win_job_structs():
+    class _BASIC(_ct.Structure):
+        _fields_ = [("PerProcessUserTimeLimit", _ct.c_int64),
+                    ("PerJobUserTimeLimit", _ct.c_int64),
+                    ("LimitFlags", _wt.DWORD),
+                    ("MinimumWorkingSetSize", _ct.c_size_t),
+                    ("MaximumWorkingSetSize", _ct.c_size_t),
+                    ("ActiveProcessLimit", _wt.DWORD),
+                    ("Affinity", _ct.c_void_p),
+                    ("PriorityClass", _wt.DWORD),
+                    ("SchedulingClass", _wt.DWORD)]
+
+    class _IO(_ct.Structure):
+        _fields_ = [("r", _ct.c_uint64), ("w", _ct.c_uint64), ("o", _ct.c_uint64),
+                    ("rt", _ct.c_uint64), ("wt", _ct.c_uint64), ("ot", _ct.c_uint64)]
+
+    class _EXT(_ct.Structure):
+        _fields_ = [("BasicLimitInformation", _BASIC), ("IoInfo", _IO),
+                    ("ProcessMemoryLimit", _ct.c_size_t), ("JobMemoryLimit", _ct.c_size_t),
+                    ("PeakProcessMemoryUsed", _ct.c_size_t), ("PeakJobMemoryUsed", _ct.c_size_t)]
+
+    class _THREADENTRY32(_ct.Structure):
+        _fields_ = [("dwSize", _wt.DWORD), ("cntUsage", _wt.DWORD),
+                    ("th32ThreadID", _wt.DWORD), ("th32OwnerProcessID", _wt.DWORD),
+                    ("tpBasePri", _ct.c_long), ("tpDeltaPri", _ct.c_long),
+                    ("dwFlags", _wt.DWORD)]
+
+    return _EXT, _THREADENTRY32
+
+
+def _win_create_job():
+    """A Job Object whose processes all die when the job handle closes, or None on failure."""
+    try:
+        _EXT, _ = _win_job_structs()
+        h = _k32.CreateJobObjectW(None, None)
+        if not h:
+            return None
+        info = _EXT()
+        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        _k32.SetInformationJobObject(h, _JobObjectExtendedLimitInformation,
+                                     _ct.byref(info), _ct.sizeof(info))
+        return h
+    except Exception:
+        return None
+
+
+def _win_assign_job(job, pid):
+    try:
+        hp = _k32.OpenProcess(_PROCESS_ALL_ACCESS, False, int(pid))
+        if not hp:
+            return False
+        ok = _k32.AssignProcessToJobObject(job, hp)
+        _k32.CloseHandle(hp)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def _win_resume_process(pid):
+    """Resume every thread of pid (undo CREATE_SUSPENDED). Best-effort; never raises."""
+    try:
+        _, _THREADENTRY32 = _win_job_structs()
+        snap = _k32.CreateToolhelp32Snapshot(_TH32CS_SNAPTHREAD, 0)
+        if not snap or snap == _ct.c_void_p(-1).value:
+            return
+        te = _THREADENTRY32()
+        te.dwSize = _ct.sizeof(te)
+        ok = _k32.Thread32First(snap, _ct.byref(te))
+        while ok:
+            if te.th32OwnerProcessID == int(pid):
+                ht = _k32.OpenThread(_THREAD_SUSPEND_RESUME, False, te.th32ThreadID)
+                if ht:
+                    _k32.ResumeThread(ht)
+                    _k32.CloseHandle(ht)
+            ok = _k32.Thread32Next(snap, _ct.byref(te))
+        _k32.CloseHandle(snap)
+    except Exception:
+        pass
+
+
+def _win_terminate_job(job):
+    try:
+        if job:
+            _k32.TerminateJobObject(job, 1)
+    except Exception:
+        pass
+
+
+def _win_close_handle(job):
+    try:
+        if job:
+            _k32.CloseHandle(job)
+    except Exception:
+        pass
