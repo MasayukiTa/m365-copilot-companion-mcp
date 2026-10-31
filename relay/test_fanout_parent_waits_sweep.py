@@ -55,7 +55,7 @@ def test_a_waiting_parent_resumes_as_its_own_merge_worker():
                                 resume_conv="sess:PARENT", cwd="C:/x")
     w.adopt_parent_merge(agg, "sess:PARENT")
 
-    assert w.status == "ready"                        # 非終端に戻り、次の sweep で走る
+    assert w.status == rf.PENDING                      # 再接続を待つ
     assert w.closed is False                          # 再接続のため driver 状態を戻す
     assert w.resume_conv == "sess:PARENT"             # 分割元自身の会話を継続
     assert w.fanout is False                          # 統合ターンが再び分割を打診しない
