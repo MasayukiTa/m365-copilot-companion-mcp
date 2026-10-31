@@ -219,10 +219,7 @@ def _u(on: str, off: str) -> str:
     return on if _UNLOCK_ON else off
 
 
-mcp = FastMCP(
-    "m365-copilot-companion-mcp",
-    auth=auth,
-    instructions=(
+FULL_INSTRUCTIONS = (
         "m365-copilot-companion-mcp toolkit. "
         # The catalogue is reachable ONLY through the call_tool gateway. Naming tools as
         # though they were directly callable made agents look for read_file/list_directory
@@ -376,7 +373,36 @@ mcp = FastMCP(
         "for a confident trusted match. Skill trust never grants extra execution rights; "
         "every mutating, shell, or outbound tool keeps its normal " +
         _u("unlock/contract gate.", "contract gate.")
-    ),
+)
+
+COMPACT_INSTRUCTIONS = (
+    "Every tool is behind the call_tool gateway. A bare tool name is not callable; "
+    "its absence from your own tool list is expected. "
+    "RULE 1: First call call_tool(name='') and read the index before saying what is "
+    "impossible. Open categories with call_tool(name='<category>'); show a tool's "
+    "parameters with call_tool(name='<tool>'). "
+    "RULE 2: Call skill_match with the user's request before domain work. Load and "
+    "follow a confident trusted match as written. No match means only that the local "
+    "catalogue has nothing for this; continue with other tools. Skill trust never grants "
+    "extra execution rights. "
+    + _u(
+        "RULE 3: Ordinary reads need no unlock; clipboard, mail, calendar, database and "
+        "registry reads are gated. Unlock before changes or execution. If locked and you "
+        "have the password, call unlock(password) once in this conversation and retry; "
+        "the session carries authorization. If you lack it, submit the whole request to "
+        "the fleet; do not search .env or abandon a read. ",
+        "RULE 3: No tool needs unlock. Never seek a password or stop because a tool "
+        "description mentions unlocking. Report actual errors. ",
+    )
+    + "For long or multi-step work, use fleet_submit directly if listed, or "
+    "call_tool(name='fleet_submit', arguments={...}). QUEUED means not started."
+)
+
+mcp = FastMCP(
+    "m365-copilot-companion-mcp",
+    auth=auth,
+    instructions=COMPACT_INSTRUCTIONS if os.environ.get("MCP_INSTRUCTIONS_COMPACT", "1") != "0"
+    else FULL_INSTRUCTIONS,
 )
 
 def _git_head_sha(repo_root=None):
@@ -1862,4 +1888,17 @@ if __name__ == "__main__":
     except Exception:
         pass
     _run_kwargs = {"log_config": _log_config} if _log_config is not None else {}
+    # timeout_keep_alive: how long uvicorn holds an idle keep-alive connection open before
+    # closing it. uvicorn's default is 5 s, and a client that reused the same connection after
+    # an idle gap of >=6 s got the connection aborted (measured 2026-10-31: 3 s -> OK; 6 s, 12 s,
+    # 30 s -> RemoteDisconnected / WinError 10053), which users see as "RemoteDisconnected, not
+    # even a response" on initialize and which the access log cannot show (the connection is
+    # closed before any request is read). Raise the idle window via MCP_KEEPALIVE_S (default
+    # 120 s) so normal think-time pauses no longer drop the connection. Only this one option is
+    # added; every other uvicorn setting above is left unchanged.
+    try:
+        _keepalive_s = int(os.environ.get("MCP_KEEPALIVE_S", "120"))
+    except (TypeError, ValueError):
+        _keepalive_s = 120
+    _run_kwargs["timeout_keep_alive"] = _keepalive_s
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
