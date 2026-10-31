@@ -260,7 +260,17 @@ def test_main_picks_unlock_free_instructions_when_off():
     assert "_unlock_switch.audit_start()" in src
 
 
-def test_compact_initialize_response_fits_transport_budget(monkeypatch):
+@pytest.fixture
+def restore_main_after():
+    # Requested BEFORE monkeypatch, so its teardown runs after monkeypatch has put the
+    # environment back: the reload below then rebuilds main from the real environment.
+    yield
+    import importlib
+    import main
+    importlib.reload(main)
+
+
+def test_compact_initialize_response_fits_transport_budget(restore_main_after, monkeypatch):
     """Measure a real in-process client handshake, including the JSON-RPC envelope."""
     import asyncio
     import importlib
