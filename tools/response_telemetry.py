@@ -24,6 +24,7 @@ from __future__ import annotations
 import json
 import os
 import queue
+import asyncio
 import threading
 import time
 from datetime import datetime, timezone, timedelta
@@ -39,6 +40,7 @@ _RING_WINDOW_S = 600.0
 # Chunk size for streaming a response body out through the telemetry wrapper. Large single-shot
 # bodies are split so the _watch coroutine can surface an http.disconnect between chunks and
 # interrupt delivery mid-response (recording fewer bytes than declared -> client_gone).
+_SEND_CHUNK = 32 * 1024
 _ring = []                     # list[(ts_epoch, client_gone: bool, short: bool)]
 _ring_lock = threading.Lock()
 
@@ -234,22 +236,39 @@ class ResponseTelemetry:
             "disconnected": False,   # http.disconnect from receive before completion
         }
 
-        async def _recv():
-            message = await receive()
+        # uvicorn on this host accepts an entire single-shot body into its transport buffer
+        # and send() returns cleanly even after the peer is gone, so a broken pipe never
+        # surfaces to the app. The ONLY reliable signal that the client vanished mid-response
+        # is an http.disconnect delivered to receive(). A normal single-shot GET handler never
+        # calls receive(), so a watcher coroutine drives receive() itself, records the
+        # disconnect, and re-publishes every message on an internal queue so handlers that DO
+        # call receive() (request bodies, SSE) still get an unchanged, in-order stream.
+        inbox = asyncio.Queue()
+
+        async def _watch():
             try:
-                # A disconnect that arrives before the final body was handed off means the
-                # client went away mid-response. One that arrives after final_seen is just the
-                # normal end-of-request close and is ignored.
-                if message.get("type") == "http.disconnect" and not state["final_seen"]:
-                    state["disconnected"] = True
+                while True:
+                    message = await receive()
+                    try:
+                        if (message.get("type") == "http.disconnect"
+                                and not state["final_seen"]):
+                            state["disconnected"] = True
+                    except Exception:
+                        pass
+                    await inbox.put(message)
+                    if message.get("type") == "http.disconnect":
+                        return
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                pass
-            return message
+                return
+
+        async def _recv():
+            return await inbox.get()
 
         async def _send(message):
-            # Forward every message byte-for-byte and in order; never alter a response.
+            mtype = message.get("type")
             try:
-                mtype = message.get("type")
                 if mtype == "http.response.start":
                     state["status"] = message.get("status", 0)
                     dcl = -1
@@ -263,29 +282,80 @@ class ResponseTelemetry:
                         elif lk == b"content-type" and b"text/event-stream" in v.lower():
                             state["is_sse"] = True
                     state["declared"] = dcl
-                elif mtype == "http.response.body":
-                    state["body_started"] = True
-                    state["sent"] += len(message.get("body") or b"")
             except Exception:
                 pass
-            is_final = (
-                message.get("type") == "http.response.body"
-                and not message.get("more_body", False)
-            )
-            # Forward unchanged. A raise here means the client vanished mid-send. Only commit
-            # final_seen AFTER send() returns, so a body that could not be delivered is not
-            # mistaken for a completed one.
-            try:
-                await send(message)
-            except Exception:
-                state["error"] = True
-                raise
+
+            if mtype != "http.response.body":
+                # Forward everything that is not a body message untouched.
+                try:
+                    await send(message)
+                except Exception:
+                    state["error"] = True
+                    raise
+                return
+
+            state["body_started"] = True
+            body = message.get("body") or b""
+            more_body = bool(message.get("more_body", False))
+            is_final = not more_body
+
+            # Stream the body out in chunks, yielding between chunks so _watch can run and
+            # surface a pending http.disconnect. If the client has gone, stop early: fewer
+            # bytes than declared are handed off and final_seen stays False -> client_gone.
+            # A small/complete body goes out in one or a few chunks with no disconnect and is
+            # still recorded complete.
+            if not body:
+                try:
+                    await send(message)
+                except Exception:
+                    state["error"] = True
+                    raise
+                if is_final:
+                    state["final_seen"] = True
+                return
+
+            view = memoryview(body)
+            total = len(view)
+            off = 0
+            while off < total:
+                if state["disconnected"]:
+                    return
+                end = min(off + _SEND_CHUNK, total)
+                last_chunk = (end == total)
+                out = {
+                    "type": "http.response.body",
+                    "body": bytes(view[off:end]),
+                    "more_body": (not last_chunk) or more_body,
+                }
+                try:
+                    await send(out)
+                except Exception:
+                    state["error"] = True
+                    raise
+                state["sent"] += (end - off)
+                off = end
+                await asyncio.sleep(0)
+
             if is_final:
                 state["final_seen"] = True
 
+        watcher = asyncio.ensure_future(_watch())
         try:
             await self.app(scope, _recv, _send)
         finally:
+            # Give the watcher a brief moment to observe a disconnect that raced with the
+            # final send, then stop it.
+            if not watcher.done():
+                try:
+                    await asyncio.wait({watcher}, timeout=0.25)
+                except Exception:
+                    pass
+            if not watcher.done():
+                watcher.cancel()
+                try:
+                    await watcher
+                except Exception:
+                    pass
             try:
                 self._record(t0, method, path, ip, ua, state)
             except Exception:
