@@ -117,8 +117,15 @@ def run(cmd, **kw):
     # the common path for. The fix is the proven autoloop._run / ext_helper._call shape:
     # run through Popen, and on TimeoutExpired kill the tree (taskkill /T) BEFORE the
     # second communicate(), so the write ends close and the readers reach EOF and exit.
-    timeout = kw.pop("timeout", None)
-    if timeout is None:
+    timeout = kw.get("timeout")
+    # A caller may substitute subprocess.run (for example to simulate a command). Keep
+    # that public seam even for timed calls; only the real stdlib runner needs the
+    # Popen implementation below. Checking its provenance also handles imports made
+    # while subprocess.run is already patched.
+    runner = subprocess.run
+    is_stdlib_runner = (getattr(runner, "__module__", None) == "subprocess"
+                        and getattr(runner, "__name__", None) == "run")
+    if timeout is None or not is_stdlib_runner:
         proc = subprocess.run(cmd, **kw)
         try:
             proc.stdout = decode(proc.stdout)
@@ -127,6 +134,7 @@ def run(cmd, **kw):
             pass
         return proc
     # timeout given: drive Popen ourselves so a timeout can kill the whole tree.
+    kw.pop("timeout")
     capture = kw.pop("capture_output", True)
     stdin_input = kw.pop("input", None)
     check = kw.pop("check", False)
@@ -425,7 +433,6 @@ def kill_tree(proc, wait_s: float = 5.0) -> bool:
 # kills them all at once regardless of timing or reparenting.
 
 _JobObjectExtendedLimitInformation = 9
-_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x2000
 _PROCESS_ALL_ACCESS = 0x1F0FFF
 _THREAD_SUSPEND_RESUME = 0x0002
 _TH32CS_SNAPTHREAD = 0x00000004
@@ -463,17 +470,9 @@ def _win_job_structs():
 
 
 def _win_create_job():
-    """A Job Object whose processes all die when the job handle closes, or None on failure."""
+    """Create a job that can be terminated on timeout without killing successful children."""
     try:
-        _EXT, _ = _win_job_structs()
-        h = _k32.CreateJobObjectW(None, None)
-        if not h:
-            return None
-        info = _EXT()
-        info.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        _k32.SetInformationJobObject(h, _JobObjectExtendedLimitInformation,
-                                     _ct.byref(info), _ct.sizeof(info))
-        return h
+        return _k32.CreateJobObjectW(None, None) or None
     except Exception:
         return None
 

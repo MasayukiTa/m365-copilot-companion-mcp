@@ -123,3 +123,18 @@ def test_timeout_path_tolerates_a_caller_supplied_spawn_kwarg():
     r = childproc.run([sys.executable, "-c", "print('ok')"],
                       capture_output=True, timeout=10, **kw)
     assert r.stdout.strip() == "ok"
+
+
+def test_timed_call_preserves_subprocess_run_stub(monkeypatch):
+    import subprocess
+
+    calls = []
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return subprocess.CompletedProcess(cmd, 0, b"ok", b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    result = childproc.run(["fake-command"], timeout=3, input="hello")
+    assert calls == [(["fake-command"], {"timeout": 3, "input": b"hello",
+                                        "capture_output": True})]
+    assert result.stdout == "ok"
