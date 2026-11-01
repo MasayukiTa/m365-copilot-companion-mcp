@@ -1283,7 +1283,7 @@ function Invoke-StaleServerCycle {
     $drainInterval = 8
     $capHit = $false
     $lastInflight = 0
-    while ($true) {
+    for (;;) {
         $h = Get-HealthInflight
         if ($null -eq $h) {
             Write-Log "stale code cycle: /health in-flight state unreadable -- falling back to the ungated cycle"
