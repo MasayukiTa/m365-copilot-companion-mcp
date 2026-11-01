@@ -4,6 +4,30 @@ import os
 import time
 from pathlib import Path
 
+# Startup timing: _PROC_START is stamped as early as the interpreter reaches this module so
+# MCP_STARTUP_TRACE can report the whole launch->listen span, not just a tail of it. The
+# supervisor log only ever saw "not listening yet" with no breakdown of where the seconds
+# went; this is the breakdown. It is import-cheap (one perf_counter read) and prints nothing
+# unless MCP_STARTUP_TRACE is set, so the default boot path is byte-for-byte unchanged.
+_PROC_START = time.perf_counter()
+
+
+def _startup_trace(event: str) -> None:
+    """Emit one 'STARTUP_TRACE <event> <elapsed_s>' line when MCP_STARTUP_TRACE is truthy.
+
+    Tool registration finishes at module import (the @mcp.tool/mcp.tool calls run while this
+    file and the tools.* packages are imported, well before __main__ binds the socket), so a
+    'registration-complete' event logged just before uvicorn.run() is the measured proof that
+    the tool list is whole before the server listens -- the ordering clients depend on.
+    """
+    if not os.environ.get("MCP_STARTUP_TRACE"):
+        return
+    try:
+        elapsed = time.perf_counter() - _PROC_START
+        print("STARTUP_TRACE %s %.3f" % (event, elapsed), flush=True)
+    except Exception:
+        pass
+
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
@@ -1894,6 +1918,10 @@ class _BearerPrefix:
 
 
 if __name__ == "__main__":
+    # Reached only after every top-level import above has run, i.e. after all tools are
+    # registered on `mcp`. Logging here dates the registration-complete point relative to
+    # _PROC_START; the matching 'about-to-listen' event is emitted just before uvicorn.run().
+    _startup_trace("registration-complete")
     _install_faulthandler()
     _start_approval_watcher()
     try:
@@ -1986,4 +2014,8 @@ if __name__ == "__main__":
     except (TypeError, ValueError):
         _keepalive_s = 120
     _run_kwargs["timeout_keep_alive"] = _keepalive_s
+    # Last line before the socket is bound. The gap between 'registration-complete' and this
+    # event is pure pre-listen setup (watchers, log config); everything tool-registration had
+    # to do is already done. See _startup_trace for why this proves the ordering.
+    _startup_trace("about-to-listen")
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
