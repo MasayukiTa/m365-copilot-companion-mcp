@@ -8211,7 +8211,8 @@ class RelayWorker:
         # classifier fix (tools/search_ops.py full-path resolution) makes such a goal resolve a
         # request_path; here we refuse a DONE that never opened it. Not applied on an
         # outcome_override (an already-decided non-DONE settle) or when the file was in fact read.
-        if outcome_override in (None, "DONE") and self._case_file_unread():
+        _case_unread = getattr(self, "_case_file_unread", None)
+        if outcome_override in (None, "DONE") and callable(_case_unread) and _case_unread():
             self.status, self.outcome = "stuck", "VERIFY_FAILED"
             self.reason = ("case reference resolved a request file that was never read: %s"
                            % (getattr(self, "_review_case", {}) or {}).get("request_path"))[:300]
