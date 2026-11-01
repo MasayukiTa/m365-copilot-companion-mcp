@@ -29,6 +29,89 @@ SEARCH_CONCURRENCY = search_concurrency()
 _SEARCH_SLOTS = threading.BoundedSemaphore(SEARCH_CONCURRENCY)
 
 
+#: The case-identity shape a candidate's own name must have: "<title>_<NN><topic>" where NN is
+#: the 2+ digit case id. Shared by the REFERENCE walk (whole goal) and the PATH resolver (applied
+#: to the pasted path's final component), so both admit exactly the same case names.
+_CASE_NAME_RE = re.compile(r"^([^\s/\\]{1,40}?[ _\uff3f-]+(\d{2,})[^\s/\\]{2,40})$")
+
+
+def _candidate_for(path, case_id):
+    """Build the same candidate dict shape the root walk emits, for one already-known path.
+    A directory's request is its やりたいこと.txt when present; a file is its own request when it
+    is a .txt/.md. Excerpt is the first 600 chars of the request, read defensively."""
+    path = Path(path)
+    is_dir = path.is_dir()
+    source = path / "\u3084\u308a\u305f\u3044\u3053\u3068.txt" if is_dir else path
+    excerpt = ""
+    try:
+        if source.is_file() and source.suffix.lower() in {".txt", ".md"}:
+            with source.open("r", encoding="utf-8-sig", errors="replace") as f:
+                excerpt = f.read(600)
+    except OSError:
+        pass
+    return {"path": str(path), "kind": "directory" if is_dir else "file",
+            "request": str(source) if source.is_file() else "",
+            "excerpt": excerpt, "root": str(path.parent), "case_id": case_id}
+
+
+def _resolve_full_path_goal(goal):
+    """Shape (B): the goal is an ABSOLUTE PATH to the case, optionally followed by words.
+
+    A real user pasted the request file's full Downloads path and added "これ調べて" (job
+    bfa6b22fac93). The reference regex forbids path separators, so this shape fell through to
+    None, the request file was never read, and the goal classified as non-analysis. Here the
+    pasted path is resolved directly: its final component must carry the case-identity shape
+    (so an arbitrary file path is not swept in), and the path must exist on disk. Returns the
+    same result dict the root walk returns (so callers need no new branch), or None when the
+    goal is not an absolute-path shape -- in which case the caller falls back to the walk.
+    """
+    if not isinstance(goal, str) or not goal.strip():
+        return None
+    text = goal.strip()
+    # An absolute path: a drive (C:\ or C:/), a POSIX root (/...), or a UNC root (\\host).
+    if not re.match(r"^([A-Za-z]:[\\/]|[\\/]{2}|/)", text):
+        return None
+    # Split the leading path from any trailing words. The path ends at the first run of
+    # whitespace that is followed by a non-path word; a case folder name can itself contain a
+    # single space ("枝さん_679かすれ調査"), so we locate the path by trying the longest leading
+    # span that names an existing filesystem entry, then shrinking at whitespace boundaries.
+    best = None
+    # Candidate split points: end-of-string, then each whitespace run from the right.
+    spans = [len(text)]
+    spans += [m.start() for m in re.finditer(r"\s+", text)]
+    for end in sorted(set(spans), reverse=True):
+        candidate = text[:end].strip()
+        if not candidate:
+            continue
+        try:
+            p = Path(candidate)
+        except (ValueError, OSError):
+            continue
+        if not p.exists():
+            continue
+        # The case identity may live on the pasted entry's OWN name (a folder, or a request
+        # file that itself carries the shape) or, when the user pasted the request file INSIDE
+        # the case folder (e.g. ...\<case>\やりたいこと.txt), on its PARENT. Accept either, and
+        # resolve to the case FOLDER in the parent case so request/excerpt match the root walk.
+        m = _CASE_NAME_RE.match(p.name)
+        if m:
+            best = (p, m.group(2))
+            break
+        mp = _CASE_NAME_RE.match(p.parent.name) if p.is_file() else None
+        if mp:
+            best = (p.parent, mp.group(2))
+            break
+    if best is None:
+        return None
+    p, case_id = best
+    # If best is a FILE that itself carried the case shape but sits inside another case folder,
+    # the folder is the case; resolve it so request/excerpt match the walk.
+    if p.is_file() and _CASE_NAME_RE.match(p.parent.name):
+        p = p.parent
+    cands = [_candidate_for(p, case_id)]
+    return {"candidates": cands, "errors": [], "truncated": False}
+
+
 # 2026-11-01, this Windows host, depth 4 and 10,000 entries/root: Downloads
 # 7,189 entries/0.657s; work 0/0s; m365-work 10,000/0.843s (capped);
 # companion/work 0/0s. Depth 4 bounds nested trees (485 Downloads cutoffs);
@@ -39,6 +122,16 @@ def case_reference_search(goal, roots=None, timeout=5.0, max_results=30):
 
     Incomplete walks are reported to the caller. Symlink directories are not followed.
     """
+    # A goal may point at the case in one of two shapes. (A) the short REFERENCE shape
+    # "<title_NN_topic> <words>", resolved by walking the roots below. (B) an absolute PATH
+    # shape "<...\case_folder> <words>": a real user pasted the file's full Downloads path and
+    # added "これ調べて". The reference regex below never matches shape (B) because it forbids
+    # path separators, so case resolution did not run, the request file was never read, and the
+    # goal classified as non-analysis (job bfa6b22fac93, judge: none). _resolve_full_path_goal
+    # handles shape (B) directly from the pasted path, before the root walk.
+    direct = _resolve_full_path_goal(goal)
+    if direct is not None:
+        return direct
     match = re.match(r"^\s*([^\s/\\]{1,40}?[ _＿-]+(\d{2,})[^\s/\\]{2,40})\s+", goal)
     if not match or len(goal) > 150:
         return None

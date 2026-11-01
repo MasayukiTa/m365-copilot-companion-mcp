@@ -168,7 +168,9 @@ jobs:
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
             tools/test_case_reference_search.py \
+            tools/test_case_reference_search_full_path.py \
             relay/test_fleet_case_reference.py \
+            relay/test_judge_none_on_full_path_case_ref.py \
             relay/test_judge_gate_harness.py \
             relay/test_fleet_judge_request.py \
             relay/test_judge_correction_turn.py \
