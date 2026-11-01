@@ -221,6 +221,75 @@ def fleet_is_running(marker_states) -> bool:
     return any(present and pid_alive for present, pid_alive in marker_states)
 
 
+#: How long the supervisor may hold off a stale-code cycle while an external client is
+#: mid-response, before cycling anyway. An in-flight tool call normally ends well within
+#: this; the cap is the backstop that keeps the checkout's fixes from never going live if
+#: a request never completes (a wedged client, a hung stream). See decide_stale_drain.
+DRAIN_CAP_SECONDS = 180
+
+#: A request that started fewer than this many seconds ago is treated as "just arrived":
+#: resp_inflight can read zero for the instant between the relay accepting a request and
+#: the telemetry wrapper opening it, so a tiny settle window keeps the gate from cycling
+#: into a request that is about to show up. Matches the drain gate the GOAL specifies.
+DRAIN_SETTLE_SECONDS = 5
+
+
+def decide_stale_drain(inflight, age, waited,
+                       cap=DRAIN_CAP_SECONDS, settle=DRAIN_SETTLE_SECONDS):
+    """Whether the supervisor may cycle a stale server now, or must keep waiting.
+
+    The stale-code cycle kills the server process; a request the external client is still
+    waiting on is lost (the client sees the connection closed mid-response, and the tunnel
+    relay answers new requests 502 for ~40s while the replacement binds). The OLD rule --
+    fleet idle and the bridge not busy -- never looked at live HTTP, so it cycled straight
+    through a client mid-response. This gate adds that missing look.
+
+    Inputs are the two numbers /health now carries (tools/response_telemetry.py):
+
+      * ``inflight`` -- HTTP requests currently open through the telemetry wrapper.
+      * ``age``      -- seconds since the most recent request STARTED, or None when no
+                        request has started since the server came up.
+      * ``waited``   -- seconds this cycle decision has already deferred, accumulated by
+                        the caller across its re-checks.
+
+    Returns one of two words:
+
+      * ``"wait"``   -- a request is open, or one started within ``settle`` seconds, and
+                        the cap has not been reached: defer and re-check.
+      * ``"cycle"``  -- nothing is in flight (and nothing just arrived), OR ``waited`` has
+                        reached ``cap``: cycle now. The caller logs which of the two it was
+                        by comparing ``waited`` to ``cap``.
+
+    Pure: the caller reads /health, accumulates ``waited`` over the normal loop interval,
+    and acts on the word. The cap is checked FIRST, so a request that never finishes still
+    lets the fix go live once the backstop is hit -- the whole point of having a cap.
+
+    ``age`` is tolerant of a missing or unreadable value: ``None`` (never started) and a
+    negative number (a clock that went backwards) both read as "nothing recent", so a
+    damaged age can only ever make the gate MORE willing to cycle, never wedge it.
+    """
+    try:
+        w = float(waited)
+    except (TypeError, ValueError):
+        w = 0.0
+    if w >= cap:
+        return "cycle"
+    try:
+        n = int(inflight)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return "wait"
+    if age is not None:
+        try:
+            a = float(age)
+        except (TypeError, ValueError):
+            a = None
+        if a is not None and 0 <= a < settle:
+            return "wait"
+    return "cycle"
+
+
 # --------------------------------------------------------------------------- CLI
 # doctor invokes this file through Invoke-BoundedPythonFile (see check_unlock_usable.py
 # for the same pattern) with two arguments: the path to the server-start HEAD marker,

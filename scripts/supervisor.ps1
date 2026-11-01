@@ -1179,6 +1179,45 @@ function Get-BridgePortVerdict {
 # AND ONLY AFTER IT PERSISTS. Two consecutive checks, so a commit landing between the health
 # read and the idle read does not cycle a server that was about to be used anyway.
 $script:StaleStreak = 0
+
+# LIVE IN-FLIGHT HTTP, read from the server's own /health (tools/response_telemetry.py adds
+# resp_inflight and resp_last_start_age_s). Returns a hashtable @{ Inflight=<int>; Age=<double
+# or $null> } or $null when /health cannot be read or does not carry the keys -- the caller
+# treats $null as "fall back to the old behaviour", i.e. cycle without a drain gate. Age is
+# $null when no request has started since the server came up; the gate reads that as "nothing
+# recent".
+function Get-HealthInflight {
+    try {
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
+        $req.Method = "GET"; $req.Timeout = 5000; $req.ReadWriteTimeout = 5000
+        $resp = $req.GetResponse()
+        $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd()
+        $resp.Close()
+    } catch {
+        return $null
+    }
+    try { $j = $body | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    if ($null -eq $j.resp_inflight) { return $null }
+    $age = $null
+    if ($null -ne $j.resp_last_start_age_s) { $age = [double]$j.resp_last_start_age_s }
+    return @{ Inflight = [int]$j.resp_inflight; Age = $age }
+}
+
+# THE DRAIN GATE, PURE AND TESTED: scripts/stale_server_check.decide_stale_drain decides
+# "cycle" vs "wait" from (inflight, age, waited). Called the same way the other supervisor
+# gates reach their Python deciders (& $Py -c with the module and function both named, so the
+# cross-language caller scan in tools/unreached.py credits it). Returns "cycle" or "wait";
+# any failure returns "" so the caller can fall back to cycling rather than wedging.
+function Invoke-StaleDrainDecision($inflight, $age, $waited) {
+    $ageArg = if ($null -eq $age) { "None" } else { ([string]$age) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import stale_server_check; print(stale_server_check.decide_stale_drain($inflight, $ageArg, $waited))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
 function Invoke-StaleServerCycle {
     try {
         $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
@@ -1231,7 +1270,44 @@ function Invoke-StaleServerCycle {
     $script:StaleStreak++
     if ($script:StaleStreak -lt 2) { return }
     $script:StaleStreak = 0
-    Write-Log "server is running stale code and nothing is in flight -- cycling it so the checkout's fixes are live"
+
+    # DRAIN GATE. The streak said fleet/bridge are idle, but neither looks at live HTTP from
+    # external clients, so a client could be mid-response right now. Killing the server here
+    # loses that response (the client sees the connection closed; the relay answers new
+    # requests 502 for ~40s while the replacement binds). So before cycling, hold off while a
+    # request is open or one just started, re-checking on the normal loop interval, capped so
+    # a request that never finishes still lets the fix go live. If /health cannot be read we
+    # fall straight through to the old, ungated cycle -- an unreadable health is not a reason
+    # to leave stale code running forever.
+    $waited = 0
+    $drainInterval = 8
+    $capHit = $false
+    $lastInflight = 0
+    for (;;) {
+        $h = Get-HealthInflight
+        if ($null -eq $h) {
+            Write-Log "stale code cycle: /health in-flight state unreadable -- falling back to the ungated cycle"
+            break
+        }
+        $lastInflight = $h.Inflight
+        $decision = Invoke-StaleDrainDecision $h.Inflight $h.Age $waited
+        if ($decision -ne "wait") {
+            # "cycle" (nothing in flight, or the cap was reached) or "" (decider failed ->
+            # do not wedge: cycle). The cap is reached inside the pure function at waited>=180.
+            if ($decision -eq "cycle" -and $waited -ge 180) { $capHit = $true }
+            break
+        }
+        $ageShown = if ($null -eq $h.Age) { "n/a" } else { ([string]$h.Age) }
+        Write-Log ("stale code cycle deferred: {0} request(s) in flight (last start {1}s ago), waited {2}s so far -- re-checking" -f $h.Inflight, $ageShown, $waited)
+        Start-Sleep -Seconds $drainInterval
+        $waited += $drainInterval
+    }
+
+    if ($capHit) {
+        Write-Log ("server is running stale code; drain cap of 180s reached with {0} request(s) still in flight after {1}s -- cycling it so the checkout's fixes are live" -f $lastInflight, $waited)
+    } else {
+        Write-Log ("server is running stale code and nothing is in flight -- cycling it so the checkout's fixes are live (waited {0}s, inflight {1})" -f $waited, $lastInflight)
+    }
     # DECLARE THE REASON BEFORE STOPPING IT. This is the specific, human-legible reason
     # Get-ServerExitRecord (see Start-Server) will show for this cycle's exit record instead of
     # the generic default Start-Server falls back to when nothing upstream has said why.

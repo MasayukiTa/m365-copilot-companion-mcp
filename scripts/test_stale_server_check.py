@@ -292,3 +292,66 @@ def test_a_folder_without_git_passes_the_staleness_check_instead_of_staying_inde
     assert guard < git_call, "the no-.git pass must precede the git call"
     assert "if ($LASTEXITCODE -ne 0 -or -not $head) { return $null }" in block, \
         "a real git failure inside a checkout must stay indeterminate"
+
+
+# ------------------------------------------------------------------ decide_stale_drain
+# The drain gate the supervisor consults before cycling a stale server. It is pure: the
+# caller reads /health (resp_inflight, resp_last_start_age_s), accumulates the seconds it
+# has already waited, and acts on the one word this returns. These assert the three
+# behaviours the gate promises -- hold while a request is open, hold just after one
+# started, and never hold past the cap -- by calling the function directly, so they run
+# identically on the Linux CI runner and a developer's Windows box.
+
+def test_drain_waits_while_a_request_is_in_flight():
+    # A client is mid-response: cycling now would cut it. Hold.
+    assert S.decide_stale_drain(1, 0.3, 0) == "wait"
+    assert S.decide_stale_drain(3, 42.0, 0) == "wait"
+
+
+def test_drain_waits_right_after_a_request_started_even_with_zero_inflight():
+    # resp_inflight can read zero for the instant between the relay accepting a request and
+    # the telemetry wrapper opening it. A fresh start (age < settle) is still "busy".
+    assert S.decide_stale_drain(0, 0.0, 0) == "wait"
+    assert S.decide_stale_drain(0, 4.9, 0) == "wait"
+
+
+def test_drain_cycles_when_nothing_is_in_flight_and_nothing_just_arrived():
+    # No open request and the last one started well past the settle window: safe to cycle.
+    assert S.decide_stale_drain(0, 5.0, 0) == "cycle"
+    assert S.decide_stale_drain(0, 900.0, 0) == "cycle"
+
+
+def test_drain_cycles_when_no_request_has_started_since_startup():
+    # age is None when the ring has seen no request at all. Nothing to protect -> cycle.
+    assert S.decide_stale_drain(0, None, 0) == "cycle"
+
+
+def test_drain_cap_forces_a_cycle_even_with_a_request_still_open():
+    # THE BACKSTOP. A wedged client that never completes must not keep stale code live
+    # forever: once waited reaches the cap, cycle regardless of inflight or age.
+    assert S.decide_stale_drain(5, 1.0, 180) == "cycle"
+    assert S.decide_stale_drain(5, 1.0, 181) == "cycle"
+    # ONE TICK SHORT OF THE CAP STILL WAITS, so the cap boundary is exact, not approximate.
+    assert S.decide_stale_drain(5, 1.0, 179) == "wait"
+
+
+def test_drain_cap_is_checked_before_everything_else():
+    # Even with a request open and freshly started, the cap wins -- it is the only thing that
+    # guarantees the fix eventually goes live.
+    assert S.decide_stale_drain(2, 0.0, 180) == "cycle"
+
+
+def test_drain_tolerates_a_missing_or_broken_age():
+    # A damaged age can only ever make the gate MORE willing to cycle, never wedge it.
+    assert S.decide_stale_drain(0, None, 0) == "cycle"
+    assert S.decide_stale_drain(0, -3.0, 0) == "cycle"      # clock went backwards
+    assert S.decide_stale_drain(0, "not-a-number", 0) == "cycle"
+    # but a real open request still holds, whatever the age reads.
+    assert S.decide_stale_drain(1, None, 0) == "wait"
+
+
+def test_drain_tolerates_a_broken_inflight_or_waited():
+    # Non-numeric inflight reads as zero (nothing proven in flight); non-numeric waited reads
+    # as zero seconds waited. Neither can wedge the gate.
+    assert S.decide_stale_drain("x", 900.0, 0) == "cycle"
+    assert S.decide_stale_drain(1, 900.0, "x") == "wait"

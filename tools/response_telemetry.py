@@ -44,6 +44,64 @@ _SEND_CHUNK = 32 * 1024
 _ring = []                     # list[(ts_epoch, client_gone: bool, short: bool)]
 _ring_lock = threading.Lock()
 
+# -- live in-flight gauge, for /health and the supervisor's drain gate -----------
+# A deploy's "stale code" cycle kills the server process; a request an external client is
+# still waiting on is lost. The supervisor's old idle test (fleet idle, bridge not busy)
+# never counted live HTTP, so it cycled straight through a client mid-response. These two
+# numbers are that missing signal: how many HTTP requests are open right now, and how long
+# since the most recent one started. In-memory only, mutated under a lock on the request
+# path's enter/exit, and read without ever raising (a telemetry fault must never surface to
+# a caller or wedge the gate).
+_inflight = 0                  # HTTP requests currently open through this wrapper
+_last_start_epoch = None       # time.time() when the most recent request started, or None
+_inflight_lock = threading.Lock()
+
+
+def _inflight_enter(now=None):
+    """Record that a request just opened. Never raises."""
+    global _inflight, _last_start_epoch
+    try:
+        with _inflight_lock:
+            _inflight += 1
+            _last_start_epoch = time.time() if now is None else now
+    except Exception:
+        pass
+
+
+def _inflight_exit():
+    """Record that a request just closed. Never raises; never goes below zero."""
+    global _inflight
+    try:
+        with _inflight_lock:
+            if _inflight > 0:
+                _inflight -= 1
+    except Exception:
+        pass
+
+
+def health_inflight(now=None):
+    """The two live-request numbers /health carries, read without ever raising.
+
+    * ``resp_inflight``          -- HTTP requests open through this wrapper right now.
+    * ``resp_last_start_age_s``  -- seconds since the most recent request STARTED, rounded
+                                    to tenths, or ``None`` when none has started since the
+                                    server came up.
+
+    The supervisor reads these to hold off a stale-code cycle while a client is mid-response
+    (scripts/stale_server_check.decide_stale_drain). Any fault collapses to the empty, safe
+    reading (zero in flight, no recent start), so a telemetry bug can never wedge the gate.
+    """
+    try:
+        if now is None:
+            now = time.time()
+        with _inflight_lock:
+            n = _inflight
+            last = _last_start_epoch
+        age = None if last is None else round(max(0.0, now - last), 1)
+        return {"resp_inflight": int(n), "resp_last_start_age_s": age}
+    except Exception:
+        return {"resp_inflight": 0, "resp_last_start_age_s": None}
+
 
 def _truthy(v: str) -> bool:
     return str(v).strip().lower() not in ("0", "false", "no", "off", "")
@@ -221,6 +279,15 @@ class ResponseTelemetry:
         t0 = time.time()
         method = scope.get("method", "")
         path = scope.get("path", "") or ""
+        # Mark this request open for the live gauge /health exposes, EXCEPT the supervisor's
+        # own /health poll and the unauthenticated /exec_status probe. The gate reads
+        # /health to decide whether to cycle; if that poll counted itself, resp_inflight
+        # would never fall to zero and the gate would defer forever. These are local,
+        # sub-millisecond monitoring reads, never the external client responses the gate
+        # exists to protect. Undone in the finally below.
+        gauge = path not in ("/health", "/exec_status")
+        if gauge:
+            _inflight_enter(t0)
         headers = scope.get("headers")
         ua = _header(headers, b"user-agent")[:40]
         ip = _client_ip(scope)
@@ -360,6 +427,11 @@ class ResponseTelemetry:
                 self._record(t0, method, path, ip, ua, state)
             except Exception:
                 pass
+            # Request is no longer open. In the finally so a handler error, a disconnect,
+            # or a telemetry fault above all still decrement the gauge -- a leaked count
+            # would make the supervisor defer a stale-code cycle forever.
+            if gauge:
+                _inflight_exit()
 
     def _record(self, t0, method, path, ip, ua, state):
         duration_ms = round((time.time() - t0) * 1000.0, 1)
