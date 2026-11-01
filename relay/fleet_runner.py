@@ -78,6 +78,9 @@ from relay.relay_fleet import (  # noqa: E402
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
 from relay.fanout import fanout_family_view  # noqa: E402
+from relay.coordinator_reload import (  # noqa: E402
+    COORDINATOR_RELOAD_EXIT_CODE, CoordinatorReloadGate,
+)
 from relay.control_markers import CLOSING_INSTRUCTION  # noqa: E402
 from relay.control_envelopes import is_local_loop_control_submission  # noqa: E402
 
@@ -2029,7 +2032,7 @@ def _submitter_of(jid):
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
-              reunlock=None, command_rejections=None):
+              reunlock=None, command_rejections=None, newest_source_mtime=0.0):
     from relay import priority_boost
     boosted_workers = priority_boost.effective_workers(workers)
     from relay.relay_fleet import (free_disk_gb, floor_source as _floor_source,
@@ -2065,6 +2068,15 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # while this is not explicitly False, so a goal that arrives during the post-run
         # cleanup window goes to autostart instead of into a channel nobody will drain.
         "accepting_goals": True,
+        # COORDINATOR STALENESS, additive and small. `coordinator_started` is this coordinator
+        # process's start epoch; `newest_source_mtime` is the newest mtime among the relay/ source
+        # files it loaded (relay.coordinator_reload.COORDINATOR_SOURCE_FILES). When the latter is
+        # greater than the former, the running coordinator is executing code the checkout has moved
+        # past -- a stale long-lived coordinator the cockpit and reports can now see (see the
+        # 2026-11-01 root cause: an 11:52 coordinator kept running pre-#388 code). 0.0 when the
+        # watch could not stat the sources; never blocks a snapshot.
+        "coordinator_started": started,
+        "newest_source_mtime": round(float(newest_source_mtime or 0.0), 3),
         "paused": bool(paused),        # fleet frozen by the cockpit (pause toggle)
         "max_concurrent": max_concurrent,
         "active_concurrent": active_worker_count(workers),
@@ -4569,6 +4581,15 @@ def main():
         return 5
     _start_forensics(args.state_dir)
     _sample_free_space(args.state_dir, None, force=True)   # floor not resolved yet; ticks carry it
+    # STALE-CODE SELF-RESTART (see relay/coordinator_reload.py and the 2026-11-01 root cause). This
+    # coordinator imported relay/*.py ONCE above and will keep running that in-memory code for its
+    # whole life; a merged source change does not reach it. The gate (built now, so its fingerprint
+    # is of the code THIS process actually loaded) is asked each tick in on_tick: when a watched
+    # source is newer than this start AND nothing is in flight, the coordinator exits with a
+    # distinct code and LEAVES its active marker, so the supervisor's existing fleet auto-resume
+    # relaunches a fresh coordinator on the new code. Reuses relay.code_staleness.CodeWatch (the
+    # same stale-code mechanism #387 wired for the server), never a second one.
+    _reload_gate = CoordinatorReloadGate(_repo_root(), started=started)
     if _adopt_claim is not None:
         if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
             restore_command_claim(_adopt_claim)
@@ -5127,7 +5148,8 @@ def main():
                                                  # next sweep admits them.
                                                  queued=len(add_box or []),
                                                  reunlock=reunlock_box[0],
-                                                 command_rejections=rejections_box)))
+                                                 command_rejections=rejections_box,
+                                                 newest_source_mtime=_reload_gate.newest_source_mtime())))
         except Exception as _status_exc:
             # SILENT HERE USED TO MEAN INVISIBLE, AND task_router.fleet_is_live() TRUSTED THE
             # FILE'S MTIME TO MEAN THE PROCESS. `_write_atomic`'s own docstring says a write
@@ -5162,6 +5184,26 @@ def main():
                 print("[tick] workers=%d live=%d terminal_skipped=%d tick=%.3fs %s"
                       % (_total_n, _live_n, _total_n - _live_n, _tick_s, _parts),
                       flush=True)
+        except Exception:
+            pass
+
+        # STALE-CODE SELF-RESTART, asked LAST so this tick's work (snapshot, commands, registry)
+        # has already been persisted before we may exit. in_flight reuses the SAME notion as
+        # status.json's `running`: an admitted worker is executing, or a goal is queued for
+        # admission. When the gate says restart, exit with the distinct code WITHOUT clearing the
+        # active marker -- the supervisor's existing fleet auto-resume then relaunches a fresh
+        # coordinator on the merged code. A running worker is never killed: a busy tick returns
+        # "wait" and we simply keep sweeping. Fail-safe: the gate swallows its own errors and
+        # returns "none", so a broken check can only ever decline to restart.
+        try:
+            from relay.relay_fleet import active_worker_count as _awc
+            _in_flight = _awc(workers) > 0 or len(add_box or []) > 0
+            _verdict = _reload_gate.should_restart(time.time(), _in_flight, stop_box[0])
+            if _verdict == "restart":
+                print(_reload_gate.restart_log_line(), flush=True)
+                raise SystemExit(COORDINATOR_RELOAD_EXIT_CODE)
+        except SystemExit:
+            raise
         except Exception:
             pass
 
