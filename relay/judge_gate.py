@@ -44,6 +44,7 @@ __all__ = [
     "is_data_analysis_goal",
     "build_judge_footer",
     "run_engine_judge",
+    "judge_result_pointer",
     "ENGINE_ROOT",
     "MISCLASSIFICATION_NOTE",
 ]
@@ -157,9 +158,13 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                 validity_harness._parse_iso(registration["registered_at"])
                 validity_harness._parse_iso(fetched_at)
                 root = os.path.abspath(os.path.join(output_folder, registration["root"]))
+                # Pass data_location so the harness can check the order against the data file's
+                # mtime (evidence), and let the harness stamp a TRUSTED registered_at itself --
+                # the worker-supplied value is kept only as declared, never used for order_ok.
                 order_record = validity_harness.register_and_lock(
                     root, claim=claim, data_fetched_at=fetched_at,
-                    registered_at=registration["registered_at"])
+                    registered_at=registration["registered_at"],
+                    data_location=data_location)
                 statuses.append("registration: recorded (order_ok=%s)" % order_record["order_ok"])
             except (OSError, ValueError, TypeError, OverflowError) as e:
                 statuses.append("registration: not run: %s" % e)
@@ -177,12 +182,109 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
             except (ValueError, TypeError, ImportError) as e:
                 statuses.append("lot diagnosis: not run: %s" % e)
         verdict = run_engine_judge(claim_id, data_location=data_location, fetched_at=fetched_at)
+        engine_available = bool(verdict.get("engine_available", False))
         footer = build_judge_footer(verdict=verdict,
-                                    engine_available=verdict.get("engine_available", False),
+                                    engine_available=engine_available,
                                     order_record=order_record)
-        return True, "judge: requested\n" + "\n".join(statuses) + "\n" + footer
+        full_text = "judge: requested\n" + "\n".join(statuses) + "\n" + footer
+        # THE DURABLE RECORD COMES FROM HERE, NOT FROM THE WORKER. The worker used to run this
+        # function itself and submit the returned text as its own reason; that made the record
+        # forgeable. Write the full footer + structured result to judge_result.json next to the
+        # job output so the authoritative record is harness-authored. A harness-written file
+        # already present is never overwritten (a re-run must not clobber the record). The full
+        # text is still returned for the VISIBLE answer (the footer the owner reads and the gate
+        # checks); only the outcome.json pointer is taken from the harness record, never worker
+        # text -- see RelayWorker._settle_done, which reads judge_result.json for the reason.
+        _write_judge_result(
+            output_folder, claim_id=claim_id, statuses=statuses, footer=footer,
+            verdict=verdict, engine_available=engine_available, order_record=order_record)
+        return True, full_text
     except (OSError, ValueError, TypeError, KeyError) as e:
         return False, "judge: invalid request (%s)" % e
+
+
+def _engine_status_line(verdict: dict, engine_available: bool) -> str:
+    """One-line engine status for the record. When the engine did not run, it names WHY in the
+    'judge: not run (engine unavailable: <reason>)' form the owner asks for (never silent)."""
+    if engine_available and isinstance(verdict, dict):
+        return "judge: ran (verdict=%s)" % verdict.get("verdict")
+    reason = (verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"
+    return "judge: not run (engine unavailable: %s)" % reason
+
+
+def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
+                        engine_available, order_record) -> str:
+    """Write the authoritative judge record next to the job output and return a short pointer.
+
+    Stores judge_result.json = {status, engine_available, engine_status, verdict-or-reason,
+    order (trusted times + order_ok), lot diagnosis lines, full footer}. Returns a one-line
+    pointer ('judge: recorded -> judge_result.json | <first footer line>') for outcome.json so
+    the worker's own text is never taken as the judge result. An existing harness-written
+    judge_result.json is NOT overwritten. Returns '' when there is no folder to write into, so
+    the caller falls back to the full text.
+    """
+    if not output_folder:
+        return ""
+    engine_status = _engine_status_line(verdict, engine_available)
+    record = {
+        "status": "requested",
+        "claim_id": claim_id,
+        "engine_available": bool(engine_available),
+        "engine_status": engine_status,
+        "verdict": verdict if engine_available else None,
+        "unavailable_reason": (None if engine_available
+                               else (verdict.get("unavailable_reason")
+                                     if isinstance(verdict, dict) else None)),
+        "order": order_record,
+        "statuses": list(statuses),
+        "footer": footer,
+        "source": "harness",
+    }
+    path = os.path.join(output_folder, "judge_result.json")
+    # Do not clobber a harness-written record already on disk.
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict) and existing.get("source") == "harness":
+                first = str(existing.get("engine_status") or "").splitlines()[0] if \
+                    existing.get("engine_status") else engine_status
+                return "judge: recorded -> judge_result.json | " + first
+        except (OSError, ValueError, TypeError):
+            pass  # unreadable existing file: overwrite with a good one below
+    try:
+        with open(path, "wb") as f:
+            f.write(json.dumps(record, ensure_ascii=False, indent=1,
+                               sort_keys=True).encode("utf-8"))
+    except OSError:
+        return ""
+    return "judge: recorded -> judge_result.json | " + engine_status
+
+
+def judge_result_pointer(output_folder) -> str:
+    """The one-line, harness-authored pointer to a job's judge_result.json, or ''.
+
+    This is what outcome.json should record for a data-analysis job's judge result: it names the
+    harness-written record file and carries its engine status line, so the durable reason never
+    comes from text the worker produced. Returns '' when no harness record exists. The full
+    footer and structured result live in judge_result.json, so nothing is lost to truncation.
+    """
+    if not output_folder:
+        return ""
+    path = os.path.join(output_folder, "judge_result.json")
+    if not os.path.isfile(path):
+        return ""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            rec = json.load(f)
+    except (OSError, ValueError, TypeError):
+        return ""
+    if not isinstance(rec, dict) or rec.get("source") != "harness":
+        return ""
+    status = str(rec.get("engine_status") or "").splitlines()[0]
+    order = rec.get("order") if isinstance(rec.get("order"), dict) else {}
+    order_bit = (" | order_ok=%s" % order.get("order_ok")) if order else ""
+    return "judge: recorded -> judge_result.json | " + status + order_bit
 
 
 def run_engine_judge(config_id: str, *, data_location: str | None = None,
