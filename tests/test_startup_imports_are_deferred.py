@@ -32,6 +32,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from tools import childproc  # locale-safe child output
+
 # Repo root = parent of this tests/ directory. Pinned into the child's sys.path[0]
 # so the child imports this worktree, never a sibling live checkout.
 ROOT = Path(__file__).resolve().parent.parent
@@ -83,15 +85,15 @@ def test_importing_main_loads_no_heavy_library_at_startup():
         cwd=str(ROOT),
         env=_child_env(),
         capture_output=True,
-        text=True,
         timeout=300,
     )
+    out, err = childproc.decode(proc.stdout), childproc.decode(proc.stderr)
     assert proc.returncode == 0, (
         "importing main failed (rc=%s)\nSTDOUT:\n%s\nSTDERR:\n%s"
-        % (proc.returncode, proc.stdout, proc.stderr[-2000:])
+        % (proc.returncode, out, err[-2000:])
     )
-    line = [l for l in proc.stdout.splitlines() if l.startswith("HEAVY_PRESENT=")]
-    assert line, "probe produced no HEAVY_PRESENT line\nSTDOUT:\n%s" % proc.stdout
+    line = [l for l in out.splitlines() if l.startswith("HEAVY_PRESENT=")]
+    assert line, "probe produced no HEAVY_PRESENT line\nSTDOUT:\n%s" % out
     present = json.loads(line[-1].split("=", 1)[1])
     assert present == [], (
         "importing main loaded heavy libraries at startup: %s -- these must be "

@@ -18,6 +18,10 @@ import sys
 import pytest
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
+
+from tools import childproc  # noqa: E402  -- locale-safe child output
 
 CASES = [
     ("tools.data_ops", "pandas"),
@@ -34,10 +38,11 @@ def test_importing_the_tool_module_does_not_load_the_heavy_library(module, heavy
     )
     out = subprocess.run(
         [sys.executable, "-I", "-c", code],
-        capture_output=True, text=True, timeout=120, cwd=REPO,
+        capture_output=True, timeout=120, cwd=REPO,
     )
-    assert out.returncode == 0, out.stderr[-600:]
-    assert out.stdout.strip().endswith("DEFERRED"), (
+    stdout, stderr = childproc.decode(out.stdout), childproc.decode(out.stderr)
+    assert out.returncode == 0, stderr[-600:]
+    assert stdout.strip().endswith("DEFERRED"), (
         "%s imports %s at module import time again; import it inside the function that uses it"
         % (module, heavy)
     )
