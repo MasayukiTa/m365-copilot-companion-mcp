@@ -292,3 +292,42 @@ def test_rotation_keeps_four_files(tmp_path, monkeypatch):
     assert not (logfile.with_name(logfile.name + ".5")).exists()
     assert len(existing) <= 4
     assert len(existing) >= 1
+
+
+# ---- the live in-flight gauge the supervisor's drain gate reads ---------------------------
+
+def test_health_inflight_unit_enter_and_exit_move_the_gauge():
+    """health_inflight() counts open requests and ages the most recent start. Driven directly
+    (not over HTTP) because enter/exit are the request-path hooks and this asserts their
+    bookkeeping in isolation; the over-HTTP test below proves /health carries the keys."""
+    before = rt.health_inflight()["resp_inflight"]
+    rt._inflight_enter(100.0)
+    try:
+        snap = rt.health_inflight(now=100.5)
+        assert snap["resp_inflight"] == before + 1
+        # age is measured from the most recent start, rounded to tenths.
+        assert snap["resp_last_start_age_s"] == 0.5
+    finally:
+        rt._inflight_exit()
+    assert rt.health_inflight()["resp_inflight"] == before
+
+
+def test_health_inflight_never_goes_below_zero():
+    # An extra exit (a double-decrement, a telemetry fault) must not drive the gauge negative
+    # -- a negative count read as >0 would make the gate wait forever.
+    base = rt.health_inflight()["resp_inflight"]
+    rt._inflight_exit()
+    rt._inflight_exit()
+    assert rt.health_inflight()["resp_inflight"] == max(0, base)
+    assert rt.health_inflight()["resp_inflight"] >= 0
+
+
+def test_health_carries_the_inflight_gauge(telem):
+    read_lines, _ = telem
+    with _Server(_build_app()) as srv:
+        body = json.loads(urllib.request.urlopen(srv.url("/health"), timeout=10).read())
+    for key in ("resp_inflight", "resp_last_start_age_s"):
+        assert key in body, "missing %s in /health: %r" % (key, body)
+    # /health is excluded from the gauge (so the supervisor's own poll cannot keep the count
+    # above zero and defer a cycle forever), so a quiet server reads zero in flight here.
+    assert body["resp_inflight"] == 0

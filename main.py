@@ -142,6 +142,7 @@ from tools.sqllib.mcp_tools import (
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
 from tools.response_telemetry import health_counters as _resp_telemetry_counters
+from tools.response_telemetry import health_inflight as _resp_telemetry_inflight
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
 from tools.audit_ledger_ops import validity_audit_ledger, validity_past_runs
@@ -654,6 +655,14 @@ async def health(request: Request) -> JSONResponse:
     # the supervisor/cockpit without grepping the jsonl.
     try:
         payload.update(_resp_telemetry_counters())
+    except Exception:
+        pass
+    # Live in-flight request gauge (tools/response_telemetry.py): resp_inflight and
+    # resp_last_start_age_s. The supervisor reads these to hold off a stale-code cycle while
+    # an external client is mid-response (scripts/stale_server_check.decide_stale_drain), so
+    # a deploy never cuts a response a client is waiting for. In-memory read, never raises.
+    try:
+        payload.update(_resp_telemetry_inflight())
     except Exception:
         pass
     return JSONResponse(payload)
