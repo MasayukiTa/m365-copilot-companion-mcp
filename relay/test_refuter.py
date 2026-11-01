@@ -117,5 +117,27 @@ def main():
     return 0 if all(results) else 1
 
 
+def test_case_artifact_facts(tmp_path, monkeypatch):
+    from tools import file_ops
+    case = tmp_path / "case"
+    case.mkdir()
+    (case / "found.xlsx").write_text("data")
+    context = {"case_dir": str(case), "output_dir": None}
+    prompt = refuter.build_refuter_prompt("g", "(no matches) found.xlsx missing.sql", case_context=context)
+    assert '"status": "exists"' in prompt
+    assert '"status": "missing-at-path"' in prompt
+    assert "default-root search" in prompt
+    original = file_ops._validate_path
+    def denied(path):
+        if "found.xlsx" in path:
+            raise PermissionError()
+        raise OSError("incomplete")
+    monkeypatch.setattr(file_ops, "_validate_path", denied)
+    facts = refuter._artifact_facts("found.xlsx missing.sql", context)
+    assert [f["status"] for f in facts] == ["denied", "incomplete"]
+    monkeypatch.setattr(file_ops, "_validate_path", original)
+    assert refuter._artifact_facts("missing.sql", {})[0]["status"] == "unknown"
+
+
 if __name__ == "__main__":
     raise SystemExit(main())

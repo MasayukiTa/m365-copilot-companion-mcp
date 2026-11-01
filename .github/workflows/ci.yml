@@ -944,6 +944,7 @@ jobs:
             relay/test_edge_disk_cap.py \
             relay/test_effort_expressible.py \
             relay/test_evidence_manifest.py \
+            relay/test_refuter_evidence_handoff.py \
             relay/test_fleet_retention.py \
             relay/test_completed_jobs_move_to_archive_then_leave_history.py \
             relay/test_disk_series.py \
