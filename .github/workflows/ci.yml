@@ -172,6 +172,7 @@ jobs:
             relay/test_judge_gate_harness.py \
             relay/test_fleet_judge_request.py \
             relay/test_fleet_judge_empty_cwd.py \
+            relay/test_judge_worker_claim_to_engine.py \
             tests/test_validity_harness.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \
