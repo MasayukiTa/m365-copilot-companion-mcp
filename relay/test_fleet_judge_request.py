@@ -36,9 +36,13 @@ def test_present_request_calls_judge_and_completes(tmp_path, monkeypatch):
                               "registered_claim": None, "judge_folder": str(tmp_path)})]
     assert w.status == "done" and w.outcome == "DONE"
     assert "HOLD" in w.last_response
-    assert "manifest: not run:" in w.last_response
-    assert "registration: not run:" in w.last_response
-    assert "lot diagnosis: not run:" in w.last_response
+    # The three optional sections were OMITTED here (not present with bad fields). Omission is
+    # allowed, so the engine still runs and no section reports a field problem. (The old generic
+    # 'manifest: not run: ... required' lines are gone: omission is not an error, only a present
+    # section with a wrong-shaped field is, and that is what the correction turn is for.)
+    assert "manifest: not run:" not in w.last_response
+    assert "registration: not run:" not in w.last_response
+    assert "lot diagnosis: not run:" not in w.last_response
 
 
 def test_complete_request_calls_harness_with_supplied_values(tmp_path, monkeypatch):
@@ -75,6 +79,10 @@ def test_complete_request_calls_harness_with_supplied_values(tmp_path, monkeypat
 
 
 def test_partial_request_runs_only_complete_section(tmp_path, monkeypatch):
+    """A present-but-incomplete section now names the EXACT bad field (not a generic 'required'
+    line). registration is present but missing claim; lot_diagnosis.y has the wrong length vs a
+    missing x/lot. With no correction budget passed, the 2-tuple contract is unchanged and the
+    valid manifest section still runs."""
     from tools import validity_harness as vh
     request = {"claim_id": "SYN1", "data_location": "data.csv", "fetched_at": "today",
                "manifest": {"path": "m.json", "dataset_id": "ds", "result": {}},
@@ -87,8 +95,10 @@ def test_partial_request_runs_only_complete_section(tmp_path, monkeypatch):
     monkeypatch.setattr(judge_gate, "run_engine_judge", lambda *a, **kw: {"engine_available": False})
     ok, status = judge_gate.complete_judge_request(GOAL, str(tmp_path))
     assert ok and calls == ["manifest"]
-    assert "registration: not run: root, claim and registered_at are required" in status
-    assert "lot diagnosis: not run: y, x and lot are required" in status
+    # registration is present but claim is absent -> the claim field is named exactly.
+    assert "registration.claim must be an object" in status
+    # lot_diagnosis has y but x and lot are missing -> the first missing field is named exactly.
+    assert "lot_diagnosis.x must be a non-empty array" in status
 
 
 def test_complete_request_runs_real_harness(tmp_path, monkeypatch):

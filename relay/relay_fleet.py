@@ -40,7 +40,7 @@ from . import splittability as _splittability
 from .send_errors import FreshSubmitAmbiguous
 from .copilot_autopilot_relay import (
     CONTINUE_JOB, COPILOT_SELECTORS, ConversationClosed, CopilotWebDriver, FIX_JOB,
-    GenerationInProgress, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
+    GenerationInProgress, JUDGE_FIX_JOB, PROTOCOL, REFUTE_FIX_JOB, RETRY_JOB, VERIFY_FIX_JOB,
     _is_processing, _next_retry_job, default_notify, extract_analyze, extract_research,
     goal_not_seen, has_end_marker,
     reported_stuck, transient_backoff, conversation_exhausted, RECYCLE_PREFIX,
@@ -3623,6 +3623,32 @@ def _refute_fix_job(reason, attempt=1):
     return "%s（再送%d回目）\n%s" % (phrase, attempt, body)
 
 
+#: How many times a PRESENT-but-INVALID judge_request.json is handed back to the worker to fix
+#: before completion is accepted anyway (or rejected under strict). Two, for the same reason the
+#: refuter budget is two: one turn to act on the first specific, field-named message, and one
+#: more in case the first rewrite still trips a (now different) named field -- beyond that a
+#: third turn has, in the refuter's measured history, almost never converged and mainly risks
+#: degrading the model with repetition. Counted PER JOB (self._judge_correction_attempt), so it
+#: cannot loop. An unavailable engine is never sent back; an absent request is never sent back.
+JUDGE_CORRECTION_BUDGET = 2
+
+
+def _judge_fix_job(messages, schema, attempt=1):
+    """The job text handed to a worker whose judge_request.json was PRESENT but INVALID.
+
+    ``messages`` are the specific, field-named problems (what was wrong, the expected shape and
+    what was received -- never long data); ``schema`` is the expected request shape. attempt is
+    1-based; attempt 2+ prefixes an escalating phrase embedding the count so no two sends of the
+    same correction are byte-identical (same anti-repetition reason as _refute_fix_job).
+    """
+    detail = "\n".join("- " + str(m) for m in (messages or [])) or "(詳細不明)"
+    body = JUDGE_FIX_JOB % (detail + "\n\n" + str(schema or ""))
+    if attempt <= 1:
+        return body
+    phrase = _REFUTE_RESEND_PHRASES[(attempt - 2) % len(_REFUTE_RESEND_PHRASES)]
+    return "%s（再送%d回目）\n%s" % (phrase, attempt, body)
+
+
 _PHASE_LABELS = {
     "pending":     "Queued",
     "ready":       "Starting",
@@ -3854,6 +3880,13 @@ class RelayWorker:
         self._candidate_done_reply = ""
         self._candidate_done_turn = 0
         self._refute_fix_pending = False
+        #: How many bounded judge-request correction turns this job has already spent. A PRESENT
+        #: but INVALID judge_request.json (a named field is the wrong type/shape, or the claim
+        #: ids differ) is something the worker CAN fix, so the harness hands it back with the
+        #: exact problem + schema -- up to JUDGE_CORRECTION_BUDGET times -- instead of silently
+        #: ending as 'judge: not run'. Counts PER JOB so it can never loop. An unavailable engine
+        #: (not the worker's fault) and an absent request are never corrected.
+        self._judge_correction_attempt = 0
         #: The last job text actually sent, so a re-send can be recognised as one.
         self._last_sent_job = ""
         # deep-research delegation (ported from the single-agent relay): a fleet worker can emit
@@ -8140,12 +8173,35 @@ class RelayWorker:
         _judge_dir = getattr(self, "_judge_output_dir", None)
         if not _judge_dir:
             _judge_dir = getattr(self, "cwd", "")
-        judge_ok, judge_text = complete_judge_request(
+        # A BOUNDED CORRECTION TURN FOR A PRESENT-BUT-INVALID REQUEST. Pass the remaining budget
+        # so complete_judge_request returns a 3-tuple: when a named field is wrong (or the claim
+        # ids differ) and turns remain, ``correction`` carries the specific messages + schema and
+        # we send the worker back ONCE (ready, same machinery as the REFUTED branch) rather than
+        # settling DONE with 'judge: not run'. An unavailable engine yields correction=None and is
+        # NOT sent back; an absent request keeps 'judge: none' and is never sent back.
+        _judge_budget = JUDGE_CORRECTION_BUDGET
+        _judge_attempt = getattr(self, "_judge_correction_attempt", 0)
+        judge_ok, judge_text, judge_correction = complete_judge_request(
             getattr(self, "goal", ""), _judge_dir,
             request_text=getattr(self, "_judge_request_text", ""),
             tool_names=RelayWorker._judge_tool_names(self),
             strict=os.environ.get("MCP_JUDGE_STRICT", "").lower()
-            in ("1", "true", "yes", "on"))
+            in ("1", "true", "yes", "on"),
+            correction_budget=_judge_budget, correction_attempt=_judge_attempt)
+        # SEND BACK ONCE when the request is fixably invalid and the budget is not yet spent.
+        # ``exhausted`` marks the final evaluation after the last turn: that one is NOT sent back
+        # again (it is the accept/reject decision), it falls through to the normal settle below.
+        if (judge_correction and not judge_correction.get("exhausted")
+                and _judge_attempt < _judge_budget):
+            self._judge_correction_attempt = _judge_attempt + 1
+            self.job = self._task_anchor(_judge_fix_job(
+                judge_correction.get("messages", []),
+                judge_correction.get("schema", ""),
+                self._judge_correction_attempt))
+            self.reason = ("judge: request invalid, correcting (attempt %d/%d)"
+                           % (self._judge_correction_attempt, _judge_budget))[:300]
+            self.status = "ready"
+            return
         if not judge_ok:
             self.status, self.outcome, self.reason = "stuck", "VERIFY_FAILED", judge_text
             return
