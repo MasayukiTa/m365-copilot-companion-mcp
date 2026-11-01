@@ -8133,7 +8133,7 @@ class RelayWorker:
         protect nothing, and this repository has watched that happen with an MFA gate that sat
         on one branch while every other path walked past.
         """
-        from relay.judge_gate import complete_judge_request
+        from relay.judge_gate import complete_judge_request, judge_result_pointer
         # Use the SAME resolved output folder the injected instruction told the worker to write
         # into (per-job temp dir when cwd was empty), so completion looks where the file was
         # asked for. Fall back to cwd for workers built without __init__ (e.g. unit tests).
@@ -8160,7 +8160,14 @@ class RelayWorker:
             pass
         self.outcome = outcome_override or self._claim_verdict()
         if judge_text:
-            self.reason = ((self.reason + " | ") if self.reason else "") + judge_text[:200]
+            # THE DURABLE REASON COMES FROM THE HARNESS RECORD, NOT FROM judge_text. Prefer the
+            # harness-authored pointer to judge_result.json (full footer + structured result live
+            # in that file, so nothing is lost to a 200-char cut). Only when there is no harness
+            # record (e.g. 'judge: none' for a non-request path) do we fall back to the visible
+            # text, truncated.
+            _ptr = judge_result_pointer(_judge_dir)
+            _durable = _ptr or (judge_text[:200])
+            self.reason = ((self.reason + " | ") if self.reason else "") + _durable
         # THE CHILD'S ANSWER IS MADE DURABLE HERE, not on a later sweep: a coordinator killed
         # between the outcome and that sweep left the done-map saying DONE with no
         # `child_result` line, and the family could then never merge. Never raises.
