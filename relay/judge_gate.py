@@ -181,7 +181,19 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                 statuses.append("lot diagnosis: " + json.dumps(diagnosis, ensure_ascii=False))
             except (ValueError, TypeError, ImportError) as e:
                 statuses.append("lot diagnosis: not run: %s" % e)
-        verdict = run_engine_judge(claim_id, data_location=data_location, fetched_at=fetched_at)
+        # Pass the worker's registered claim (if the request carried a valid one) so the engine
+        # can judge it when the engine owner has not pre-registered configs/<id>.json. A human
+        # pre-registered configs claim still wins inside run_engine_judge. The claim is written to
+        # a temp file UNDER output_folder (outside the engine root), never into the engine's
+        # configs/.
+        reg = request.get("registration")
+        registered_claim = reg.get("claim") if isinstance(reg, dict) else None
+        if not (isinstance(registered_claim, dict)
+                and registered_claim.get("id") == claim_id):
+            registered_claim = None
+        verdict = run_engine_judge(claim_id, data_location=data_location, fetched_at=fetched_at,
+                                   registered_claim=registered_claim,
+                                   judge_folder=output_folder)
         engine_available = bool(verdict.get("engine_available", False))
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
@@ -226,9 +238,20 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
     if not output_folder:
         return ""
     engine_status = _engine_status_line(verdict, engine_available)
+    # Which registry supplied the claim: 'engine configs (human pre-registered)' or
+    # 'worker-registered via harness registry'. Recorded whether or not the engine ran, so the
+    # durable record names the claim source. For a worker-registered claim, append the trusted
+    # registration time from the order record so the record reads
+    # 'worker-registered via harness registry (trusted registration time <t>)'.
+    claim_source = verdict.get("claim_source") if isinstance(verdict, dict) else None
+    if (claim_source == "worker-registered via harness registry"
+            and isinstance(order_record, dict) and order_record.get("registered_at")):
+        claim_source = ("worker-registered via harness registry "
+                        "(trusted registration time %s)" % order_record["registered_at"])
     record = {
         "status": "requested",
         "claim_id": claim_id,
+        "claim_source": claim_source,
         "engine_available": bool(engine_available),
         "engine_status": engine_status,
         "verdict": verdict if engine_available else None,
@@ -289,25 +312,95 @@ def judge_result_pointer(output_folder) -> str:
 
 def run_engine_judge(config_id: str, *, data_location: str | None = None,
                      fetched_at: str | None = None, root: str | None = None,
-                     python_exe: str | None = None, timeout: int = 120) -> dict:
-    """Run the frozen engine's `judge` CLI for a registered claim id and return its verdict JSON.
+                     python_exe: str | None = None, timeout: int = 120,
+                     registered_claim: dict | None = None,
+                     judge_folder: str | None = None) -> dict:
+    """Run the frozen engine's `judge` CLI for a claim and return its verdict JSON.
 
-    This READS (A): it shells `python -m validity judge --claim configs/<id>.json --root . --out
+    This READS (A): it shells `python -m validity judge --claim <path> --root . --out
     results/tool_runs [--lock lock.json]` with the engine checkout as cwd, exactly as the skill
-    prescribes. It changes nothing in (A). On any failure it returns a dict with engine_available
-    False and a reason, so the caller can surface WHY on the final answer rather than omit it.
+    prescribes. It changes nothing in (A) -- it NEVER writes to or edits the engine's configs/,
+    lock.json or any file inside the engine root.
+
+    CLAIM SOURCE (two registries that used to never meet). The claim can come from either place:
+      * engine configs (human pre-registered): ENGINE_ROOT/configs/<id>.json, placed and locked
+        by the engine owner per PREREGISTRATION. If it exists it WINS -- a human-registered,
+        locked claim is always preferred and used exactly as before.
+      * worker-registered via the harness registry: when configs/<id>.json is ABSENT but the
+        judge request carried the registered claim (`registered_claim`), we write that claim to a
+        temporary file OUTSIDE the engine root (under `judge_folder`, the per-job judge folder)
+        and pass its ABSOLUTE path as --claim. The engine root is never touched. The engine CLI
+        accepts an arbitrary --claim path, so the worker's claim reaches the engine this way.
+
+    LOCK. The engine does not require the claim to be present in its lock.json: lock verification
+    (validity/lock.py verify_lock) covers the engine's own configs*/ and validity/ files and the
+    freeze commit; a claim file outside the engine root is not part of locked_paths, so passing a
+    temp claim neither adds an "unlocked file present" failure nor requires the claim to be in the
+    lock. When lock.json is present we still pass --lock so the engine applies its own D gate (a
+    lock failure caps the verdict at HOLD inside the engine); we never weaken or fake that.
+
+    On any failure it returns a dict with engine_available False and a reason that NAMES what to
+    fix, so the caller can surface WHY on the final answer rather than omit it. The returned dict
+    also carries `claim_source` describing which registry supplied the claim.
     """
     root = root or ENGINE_ROOT
     if not os.path.isdir(root):
         return {"engine_available": False,
-                "unavailable_reason": f"engine root not found: {root}"}
+                "unavailable_reason":
+                    f"engine root not found: {root} "
+                    f"(set the VALIDITY_ENGINE_ROOT environment variable to the engine "
+                    f"checkout, or place the engine at this path)"}
     cfg = os.path.join(root, "configs", f"{config_id}.json")
-    if not os.path.isfile(cfg):
-        return {"engine_available": False,
-                "unavailable_reason": f"registered claim not found: configs/{config_id}.json"}
-    if data_location is not None:
-        # The frozen engine obtains fetch time from its manifest, not from a CLI option.
-        # Never run against a different dataset or silently substitute another fetch time.
+    claim_from_configs = os.path.isfile(cfg)
+    claim_path = cfg
+    claim_source = "engine configs (human pre-registered)"
+    temp_claim_path = None
+    if not claim_from_configs:
+        # No human-pre-registered claim. Fall back to the worker's registered claim, if the
+        # judge request carried one, by writing it OUTSIDE the engine root and pointing --claim
+        # at that absolute path. Never create configs/<id>.json in the engine root.
+        if not isinstance(registered_claim, dict) or not registered_claim:
+            registry_hint = (os.path.join(judge_folder, "registry", f"{config_id}.json")
+                             if judge_folder else f"<job>/registry/{config_id}.json")
+            return {"engine_available": False,
+                    "claim_source": None,
+                    "unavailable_reason":
+                        f"registered claim not found for id {config_id}. "
+                        f"Tried the engine configs path ({cfg}) and the harness registry "
+                        f"({registry_hint}). To fix: have the engine owner pre-register and lock "
+                        f"configs/{config_id}.json in the engine root, or include the registered "
+                        f"claim in the judge request so the harness can pass it to the engine."}
+        if not judge_folder or not os.path.isdir(judge_folder):
+            return {"engine_available": False,
+                    "claim_source": None,
+                    "unavailable_reason":
+                        "a worker-registered claim was supplied but there is no per-job judge "
+                        "folder to write the temporary claim into outside the engine root; "
+                        "cannot pass the claim to the engine without writing inside the engine "
+                        "root (which is read-only)"}
+        if registered_claim.get("id") != config_id:
+            return {"engine_available": False,
+                    "claim_source": None,
+                    "unavailable_reason":
+                        f"registered claim id {registered_claim.get('id')!r} does not match the "
+                        f"requested claim id {config_id!r}"}
+        try:
+            temp_claim_path = os.path.abspath(
+                os.path.join(judge_folder, f"engine_claim_{config_id}.json"))
+            with open(temp_claim_path, "wb") as f:
+                f.write(json.dumps(registered_claim, ensure_ascii=False,
+                                   sort_keys=True, indent=1).encode("utf-8"))
+        except (OSError, ValueError, TypeError) as e:
+            return {"engine_available": False, "claim_source": None,
+                    "unavailable_reason": f"could not stage the registered claim: {e}"}
+        claim_path = temp_claim_path
+        claim_source = "worker-registered via harness registry"
+    if data_location is not None and claim_from_configs:
+        # Human-pre-registered claim path: the frozen engine obtains fetch time from its manifest,
+        # not from a CLI option. Never run against a different dataset or silently substitute
+        # another fetch time. (A worker-registered claim's data lives outside the engine root and
+        # is not in the engine manifest, so this manifest check applies only to configs claims;
+        # for a worker claim we pass --data directly below.)
         try:
             with open(os.path.join(root, "data", "manifest.json"), encoding="utf-8-sig") as f:
                 manifest = json.load(f)
@@ -319,12 +412,15 @@ def run_engine_judge(config_id: str, *, data_location: str | None = None,
                        == os.path.normcase(os.path.abspath(data_location))
                        and e.get("fetched_at") == fetched_at]
             if not matches:
-                return {"engine_available": False, "unavailable_reason":
+                return {"engine_available": False, "claim_source": claim_source,
+                        "unavailable_reason":
                         "requested data and fetch time are not recorded in the engine manifest"}
         except (OSError, ValueError, TypeError, AttributeError) as e:
-            return {"engine_available": False, "unavailable_reason": f"manifest unavailable: {e}"}
+            return {"engine_available": False, "claim_source": claim_source,
+                    "unavailable_reason": f"manifest unavailable: {e}"}
     py = python_exe or sys.executable
-    args = [py, "-m", "validity", "judge", "--claim", f"configs/{config_id}.json",
+    claim_arg = f"configs/{config_id}.json" if claim_from_configs else claim_path
+    args = [py, "-m", "validity", "judge", "--claim", claim_arg,
             "--root", ".", "--out", "results/tool_runs"]
     if data_location is not None:
         args += ["--data", data_location]
@@ -341,10 +437,11 @@ def run_engine_judge(config_id: str, *, data_location: str | None = None,
                            encoding="utf-8", timeout=timeout,
                            creationflags=headless_creationflags())
     except subprocess.TimeoutExpired:
-        return {"engine_available": False,
+        return {"engine_available": False, "claim_source": claim_source,
                 "unavailable_reason": f"engine timed out after {timeout}s"}
     except OSError as e:
-        return {"engine_available": False, "unavailable_reason": f"engine exec failed: {e}"}
+        return {"engine_available": False, "claim_source": claim_source,
+                "unavailable_reason": f"engine exec failed: {e}"}
     last = ""
     for line in (p.stdout or "").splitlines():
         if line.strip():
@@ -352,10 +449,11 @@ def run_engine_judge(config_id: str, *, data_location: str | None = None,
     try:
         verdict = json.loads(last)
     except (ValueError, TypeError):
-        return {"engine_available": False,
+        return {"engine_available": False, "claim_source": claim_source,
                 "unavailable_reason": "engine produced no JSON verdict on stdout",
                 "stderr_tail": (p.stderr or "")[-400:]}
     verdict["engine_available"] = True
+    verdict["claim_source"] = claim_source
     return verdict
 
 

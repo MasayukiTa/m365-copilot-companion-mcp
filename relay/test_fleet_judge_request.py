@@ -29,7 +29,11 @@ def test_present_request_calls_judge_and_completes(tmp_path, monkeypatch):
     monkeypatch.setattr(judge_gate, "run_engine_judge", judge)
     w = worker(tmp_path)
     w._settle_done()
-    assert calls == [("SYN1", {"data_location": data, "fetched_at": request["fetched_at"]})]
+    # The gate now also forwards the worker's registered claim (None here -- this request
+    # carried no registration block) and the per-job judge folder, so run_engine_judge can
+    # stage a worker claim outside the engine root when there is no human-pre-registered one.
+    assert calls == [("SYN1", {"data_location": data, "fetched_at": request["fetched_at"],
+                              "registered_claim": None, "judge_folder": str(tmp_path)})]
     assert w.status == "done" and w.outcome == "DONE"
     assert "HOLD" in w.last_response
     assert "manifest: not run:" in w.last_response
