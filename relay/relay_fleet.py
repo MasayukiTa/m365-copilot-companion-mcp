@@ -8158,6 +8158,46 @@ class RelayWorker:
         except (AttributeError, TypeError, ValueError, OSError):
             return set()
 
+    #: Tools that read a file's CONTENT. A case reference points at a request FILE whose body
+    #: is the actual task; opening it necessarily goes through one of these. (search_ops.glob /
+    #: find_files only match names, so they are deliberately NOT here -- listing a folder is not
+    #: reading the request.) Used by _case_file_unread, which cannot see tool ARGUMENTS
+    #: (_judge_tool_names: "without reading arguments"), so it asks the weaker, argument-free
+    #: question "was any content-reading tool used at all".
+    _CONTENT_READ_TOOLS = frozenset({
+        "read_file", "read_json", "grep", "read_small_text_file", "readSmallTextFileFromMyOnedrive",
+        "read_image", "read_pdf", "read_excel", "open_workbook", "catalog_search", "odbc_query",
+    })
+
+    def _case_file_unread(self) -> bool:
+        """A resolved case-reference request file exists, but no content-reading tool ran.
+
+        The root cause behind job bfa6b22fac93 was that the goal only POINTED at a request file
+        (a Downloads path + "これ調べて"); the file's body is the task. A one-turn DONE that never
+        opened it answered a question it never read. This is the completion-side backstop to the
+        classifier fix: when the harness resolved a request_path, the worker must have used at
+        least one content-reading tool before it may finish. Argument-free by necessity -- the
+        ledger records tool names, not paths (see _judge_tool_names) -- so it asks the weaker
+        "did it read anything at all", which a one-turn no-op DONE fails and a real read passes.
+
+        False (do not block) when: no case was resolved, the resolution was incomplete (the
+        worker was already gated for clarification), or the attribution ledger cannot say -- a
+        measurement that cannot see must not fail the work it measures.
+        """
+        case = getattr(self, "_review_case", None) or {}
+        request_path = case.get("request_path")
+        if not request_path or case.get("incomplete"):
+            return False
+        try:
+            used = RelayWorker._judge_tool_names(self)
+        except Exception:
+            return False
+        if not used:
+            # The ledger could not attribute any call to this worker; it cannot prove the file
+            # was skipped any more than it can prove it was read. Do not block on no evidence.
+            return False
+        return not (used & RelayWorker._CONTENT_READ_TOOLS)
+
     def _settle_done(self, outcome_override=None):
         """THE ONLY PLACE THIS WORKER BECOMES DONE.
 
@@ -8167,6 +8207,15 @@ class RelayWorker:
         on one branch while every other path walked past.
         """
         from relay.judge_gate import complete_judge_request, judge_result_pointer
+        # A GOAL THAT ONLY POINTS AT A REQUEST FILE CANNOT FINISH WITHOUT READING IT. The
+        # classifier fix (tools/search_ops.py full-path resolution) makes such a goal resolve a
+        # request_path; here we refuse a DONE that never opened it. Not applied on an
+        # outcome_override (an already-decided non-DONE settle) or when the file was in fact read.
+        if outcome_override in (None, "DONE") and self._case_file_unread():
+            self.status, self.outcome = "stuck", "VERIFY_FAILED"
+            self.reason = ("case reference resolved a request file that was never read: %s"
+                           % (getattr(self, "_review_case", {}) or {}).get("request_path"))[:300]
+            return
         # Use the SAME resolved output folder the injected instruction told the worker to write
         # into (per-job temp dir when cwd was empty), so completion looks where the file was
         # asked for. Fall back to cwd for workers built without __init__ (e.g. unit tests).
