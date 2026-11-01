@@ -138,13 +138,23 @@ def test_record_manifest_writes_data_and_result_hashes():
 # ---- (b) register + lock with recorded time ordering -------------------------
 
 def test_register_and_lock_records_time_order():
+    # TRUSTED CLOCK (欠 2026-11-01): register_and_lock no longer trusts the worker's
+    # registered_at. It stamps the registration time itself from the system clock and keeps
+    # the worker-supplied value only as declared_registered_at. With no data file to check,
+    # order_ok rests on the declared data_fetched_at compared with the trusted (now) time, so a
+    # FAR-FUTURE fetch time models the honest "register now, data fetched later" case.
     with tempfile.TemporaryDirectory() as td:
         claim = {"id": "SYN1", "dataset_id": "SYN1", "data_kind": "synthetic"}
         res = vh.register_and_lock(td, claim=claim,
-                                   data_fetched_at="2026-10-30T01:00:00+09:00",
+                                   data_fetched_at="2999-01-01T00:00:00+09:00",
                                    registered_at="2026-10-30T00:00:00+09:00")
+        # The declared value is kept but is NOT what registered_at becomes.
+        assert res["declared_registered_at"] == "2026-10-30T00:00:00+09:00"
+        assert res["registered_at"] != "2026-10-30T00:00:00+09:00"
+        assert res["registered_at_trusted"] is True
         assert res["registered_at"] < res["data_fetched_at"], \
-            "registration must be strictly before data fetch (D gate)"
+            "trusted registration must be strictly before the (future) data fetch (D gate)"
+        assert res["order_ok"] is True
         assert res["lock_recorded"] is True
 
 
