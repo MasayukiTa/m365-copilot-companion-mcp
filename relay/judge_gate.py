@@ -101,13 +101,112 @@ def is_data_analysis_goal(goal, request_text="", tool_names=()) -> bool:
                for name in tool_names)
 
 
-def complete_judge_request(goal, output_folder, *, strict=False, request_text="", tool_names=()):
-    """Evaluate the worker's request at completion; return (accept, visible detail)."""
+#: The request schema, named once so a correction turn can hand the worker the EXACT shape
+#: expected alongside the field-named message that said what was wrong. No data values here --
+#: only the shape, so it is safe to show.
+JUDGE_REQUEST_SCHEMA = (
+    "judge_request.json は JSON オブジェクトで、必須キー: claim_id (空でない文字列・パス区切りを"
+    "含まない), data_location (データファイルの絶対パスまたは出力フォルダからの相対パス), "
+    "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
+    "manifest {path: 文字列, dataset_id: 文字列, result: オブジェクト}; "
+    "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
+    "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}。"
+    "入力の無いセクションは省略する(空の値で埋めない)。"
+)
+
+
+def _short_type(value) -> str:
+    """A SHORT description of what a value is -- its type, and a short value only for scalars.
+    NEVER a long data blob: a correction message names what was received without echoing data."""
+    if isinstance(value, bool):
+        return "bool %s" % value
+    if isinstance(value, (int, float)):
+        return "%s %s" % (type(value).__name__, value)
+    if isinstance(value, str):
+        v = value if len(value) <= 40 else value[:37] + "..."
+        return "str %r (len %d)" % (v, len(value))
+    if isinstance(value, list):
+        return "array of length %d" % len(value)
+    if isinstance(value, dict):
+        return "object with keys %s" % (sorted(value.keys())[:8])
+    if value is None:
+        return "missing (null)"
+    return type(value).__name__
+
+
+def _validate_manifest(manifest) -> str:
+    """'' when the manifest section is usable; else a message naming the EXACT bad field, the
+    expected shape, and what was received (type/short value, never long data)."""
+    if "path" not in manifest or not isinstance(manifest.get("path"), str) or not manifest["path"].strip():
+        return ("manifest.path must be a non-empty string (the manifest file path), "
+                "got %s" % _short_type(manifest.get("path")))
+    if ("dataset_id" not in manifest or not isinstance(manifest.get("dataset_id"), str)
+            or not manifest["dataset_id"].strip()):
+        return ("manifest.dataset_id must be a non-empty string, got %s"
+                % _short_type(manifest.get("dataset_id")))
+    if "result" not in manifest or not isinstance(manifest.get("result"), dict):
+        return ("manifest.result must be an object (the analysis result), got %s"
+                % _short_type(manifest.get("result")))
+    return ""
+
+
+def _validate_registration(registration, claim_id) -> str:
+    """'' when the registration section is usable; else a message naming the EXACT bad field or,
+    for a claim id mismatch, BOTH ids that differ."""
+    if ("root" not in registration or not isinstance(registration.get("root"), str)
+            or not registration["root"].strip()):
+        return ("registration.root must be a non-empty string (the registry root folder), "
+                "got %s" % _short_type(registration.get("root")))
+    claim = registration.get("claim")
+    if not isinstance(claim, dict):
+        return "registration.claim must be an object, got %s" % _short_type(claim)
+    if claim.get("id") != claim_id:
+        return ("registration.claim.id (%s) does not match the request claim_id (%r); "
+                "the two must be identical"
+                % (_short_type(claim.get("id")), claim_id))
+    if ("registered_at" not in registration
+            or not isinstance(registration.get("registered_at"), str)
+            or not registration["registered_at"].strip()):
+        return ("registration.registered_at must be a non-empty ISO 8601 time string, got %s"
+                % _short_type(registration.get("registered_at")))
+    return ""
+
+
+def _validate_lot(lot) -> str:
+    """'' when the lot_diagnosis section is usable; else a message naming the EXACT bad field."""
+    for k in ("y", "x", "lot"):
+        if k not in lot or not isinstance(lot.get(k), list) or not lot[k]:
+            return ("lot_diagnosis.%s must be a non-empty array, got %s"
+                    % (k, _short_type(lot.get(k))))
+    lengths = {k: len(lot[k]) for k in ("y", "x", "lot")}
+    if len(set(lengths.values())) != 1:
+        return ("lot_diagnosis.y, .x and .lot must be the same length, got %s"
+                % lengths)
+    return ""
+
+
+def complete_judge_request(goal, output_folder, *, strict=False, request_text="",
+                           tool_names=(), correction_budget=None, correction_attempt=0):
+    """Evaluate the worker's request at completion.
+
+    Returns (accept, visible detail) by default. When ``correction_budget`` is not None the
+    caller is prepared to send the worker back to fix a PRESENT-but-INVALID request, so this
+    returns a 3-tuple (accept, visible detail, correction) instead: ``correction`` is None when
+    nothing is correctable, else {"messages": [...], "schema": <text>, "attempt": n} naming the
+    exact field-level problems and the expected schema. A request whose fields are VALID but the
+    engine is merely unavailable is NOT correctable (that is not the worker's fault) and yields
+    correction=None. An ABSENT request keeps the existing 'judge: none' behaviour unchanged.
+    """
+    want_correction = correction_budget is not None
+
+    def _ret(accept, detail, correction=None):
+        return (accept, detail, correction) if want_correction else (accept, detail)
+
     if not is_data_analysis_goal(goal, request_text, tool_names):
-        return True, ""
+        return _ret(True, "")
     path = os.path.join(output_folder, "judge_request.json") if output_folder else ""
     if not path or not os.path.exists(path):
-        return (False, "judge: none (request required)") if strict else (True, "judge: none")
+        return _ret(False, "judge: none (request required)") if strict else _ret(True, "judge: none")
     try:
         with open(path, encoding="utf-8-sig") as f:
             request = json.load(f)
@@ -124,63 +223,101 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
 
         statuses = []
         order_record = None
+        #: Field-level problems the worker CAN fix. A problem lands here only when the section
+        #: was PRESENT but a field was the wrong type/shape (or the claim ids differ) -- not when
+        #: a section was deliberately OMITTED (omission is allowed) and not when the harness
+        #: raised an unexpected OSError. Correcting these is bounded by the caller's budget.
+        corrections = []
         manifest = request.get("manifest")
-        if not isinstance(manifest, dict) or not all(
-                k in manifest for k in ("path", "dataset_id", "result")):
-            statuses.append("manifest: not run: path, dataset_id and result are required")
+        if manifest is None:
+            pass  # omitted on purpose: allowed, not an error
+        elif not isinstance(manifest, dict):
+            msg = "manifest must be an object, got %s" % _short_type(manifest)
+            statuses.append("manifest: not run: %s" % msg)
+            corrections.append(msg)
         else:
-            try:
-                if (not isinstance(manifest["path"], str) or not manifest["path"].strip()
-                        or not isinstance(manifest["dataset_id"], str)
-                        or not manifest["dataset_id"].strip()
-                        or not isinstance(manifest["result"], dict)):
-                    raise ValueError("invalid manifest fields")
-                manifest_path = os.path.abspath(os.path.join(output_folder, manifest["path"]))
-                validity_harness.record_manifest(manifest_path, dataset_id=manifest["dataset_id"],
-                                                 data_path=data_location, result=manifest["result"],
-                                                 fetched_at=fetched_at)
-                statuses.append("manifest: recorded")
-            except (OSError, ValueError, TypeError) as e:
-                statuses.append("manifest: not run: %s" % e)
+            bad = _validate_manifest(manifest)
+            if bad:
+                statuses.append("manifest: not run: %s" % bad)
+                corrections.append(bad)
+            else:
+                try:
+                    manifest_path = os.path.abspath(os.path.join(output_folder, manifest["path"]))
+                    validity_harness.record_manifest(manifest_path, dataset_id=manifest["dataset_id"],
+                                                     data_path=data_location, result=manifest["result"],
+                                                     fetched_at=fetched_at)
+                    statuses.append("manifest: recorded")
+                except (OSError, ValueError, TypeError) as e:
+                    # An engine/filesystem failure is NOT a worker-correctable field problem.
+                    statuses.append("manifest: not run: %s" % e)
         registration = request.get("registration")
-        if not isinstance(registration, dict) or not all(
-                k in registration for k in ("root", "claim", "registered_at")):
-            statuses.append("registration: not run: root, claim and registered_at are required")
+        if registration is None:
+            pass  # omitted on purpose: allowed
+        elif not isinstance(registration, dict):
+            msg = "registration must be an object, got %s" % _short_type(registration)
+            statuses.append("registration: not run: %s" % msg)
+            corrections.append(msg)
         else:
-            try:
-                claim = registration["claim"]
-                if (not isinstance(registration["root"], str) or not registration["root"].strip()
-                        or not isinstance(claim, dict) or claim.get("id") != claim_id
-                        or not isinstance(registration["registered_at"], str)
-                        or not registration["registered_at"].strip()):
-                    raise ValueError("invalid registration fields or claim id mismatch")
-                # Validate timestamps before register_and_lock writes the claim.
-                validity_harness._parse_iso(registration["registered_at"])
-                validity_harness._parse_iso(fetched_at)
-                root = os.path.abspath(os.path.join(output_folder, registration["root"]))
-                # Pass data_location so the harness can check the order against the data file's
-                # mtime (evidence), and let the harness stamp a TRUSTED registered_at itself --
-                # the worker-supplied value is kept only as declared, never used for order_ok.
-                order_record = validity_harness.register_and_lock(
-                    root, claim=claim, data_fetched_at=fetched_at,
-                    registered_at=registration["registered_at"],
-                    data_location=data_location)
-                statuses.append("registration: recorded (order_ok=%s)" % order_record["order_ok"])
-            except (OSError, ValueError, TypeError, OverflowError) as e:
-                statuses.append("registration: not run: %s" % e)
+            bad = _validate_registration(registration, claim_id)
+            if bad:
+                statuses.append("registration: not run: %s" % bad)
+                corrections.append(bad)
+            else:
+                try:
+                    claim = registration["claim"]
+                    # Validate timestamps before register_and_lock writes the claim.
+                    validity_harness._parse_iso(registration["registered_at"])
+                    validity_harness._parse_iso(fetched_at)
+                    root = os.path.abspath(os.path.join(output_folder, registration["root"]))
+                    # Pass data_location so the harness can check the order against the data
+                    # file's mtime (evidence), and let the harness stamp a TRUSTED registered_at
+                    # itself -- the worker-supplied value is kept only as declared.
+                    order_record = validity_harness.register_and_lock(
+                        root, claim=claim, data_fetched_at=fetched_at,
+                        registered_at=registration["registered_at"],
+                        data_location=data_location)
+                    statuses.append("registration: recorded (order_ok=%s)" % order_record["order_ok"])
+                except (ValueError, OverflowError) as e:
+                    # A malformed timestamp string the worker wrote IS correctable.
+                    msg = ("registration timestamp could not be parsed as ISO 8601: %s" % e)
+                    statuses.append("registration: not run: %s" % msg)
+                    corrections.append(msg)
+                except (OSError, TypeError) as e:
+                    statuses.append("registration: not run: %s" % e)
         lot = request.get("lot_diagnosis")
-        if not isinstance(lot, dict) or not all(k in lot for k in ("y", "x", "lot")):
-            statuses.append("lot diagnosis: not run: y, x and lot are required")
+        if lot is None:
+            pass  # omitted on purpose: allowed
+        elif not isinstance(lot, dict):
+            msg = "lot_diagnosis must be an object, got %s" % _short_type(lot)
+            statuses.append("lot diagnosis: not run: %s" % msg)
+            corrections.append(msg)
         else:
-            try:
-                if (not all(isinstance(lot[k], list) and lot[k] for k in ("y", "x", "lot"))
-                        or len({len(lot[k]) for k in ("y", "x", "lot")}) != 1):
-                    raise ValueError("y, x and lot must be non-empty arrays of equal length")
-                diagnosis = validity_harness.lot_independence_check(
-                    y=lot["y"], x=lot["x"], lot=lot["lot"])
-                statuses.append("lot diagnosis: " + json.dumps(diagnosis, ensure_ascii=False))
-            except (ValueError, TypeError, ImportError) as e:
-                statuses.append("lot diagnosis: not run: %s" % e)
+            bad = _validate_lot(lot)
+            if bad:
+                statuses.append("lot diagnosis: not run: %s" % bad)
+                corrections.append(bad)
+            else:
+                try:
+                    diagnosis = validity_harness.lot_independence_check(
+                        y=lot["y"], x=lot["x"], lot=lot["lot"])
+                    statuses.append("lot diagnosis: " + json.dumps(diagnosis, ensure_ascii=False))
+                except (ValueError, TypeError, ImportError) as e:
+                    statuses.append("lot diagnosis: not run: %s" % e)
+        # A BOUNDED CORRECTION TURN, BEFORE THE ENGINE RUNS. If a section was PRESENT but has a
+        # field-level problem the worker can fix (wrong type/shape, or a claim id mismatch), and
+        # the caller gave a budget that is not yet spent, hand the specific messages + schema back
+        # so the worker rewrites the request -- rather than silently ending as 'not run'. An
+        # engine that is merely unavailable is NOT a correction (handled below, never sent back).
+        if corrections and want_correction and correction_attempt < int(correction_budget):
+            detail = ("judge: request invalid (attempt %d/%d)\n" % (
+                          correction_attempt + 1, int(correction_budget))
+                      + "\n".join("- " + m for m in corrections)
+                      + "\n\n" + JUDGE_REQUEST_SCHEMA)
+            _record_correction(output_folder, claim_id=claim_id,
+                               attempt=correction_attempt + 1, messages=corrections)
+            return _ret(True, detail, {"messages": list(corrections),
+                                       "schema": JUDGE_REQUEST_SCHEMA,
+                                       "attempt": correction_attempt + 1})
         # Pass the worker's registered claim (if the request carried a valid one) so the engine
         # can judge it when the engine owner has not pre-registered configs/<id>.json. A human
         # pre-registered configs claim still wins inside run_engine_judge. The claim is written to
@@ -210,9 +347,59 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         _write_judge_result(
             output_folder, claim_id=claim_id, statuses=statuses, footer=footer,
             verdict=verdict, engine_available=engine_available, order_record=order_record)
-        return True, full_text
+        # BUDGET EXHAUSTED WITH THE REQUEST STILL INVALID. The correction turns were spent and a
+        # fixable field problem remains: the completion marker names it, and under strict the job
+        # is rejected (VERIFY_FAILED). A valid request whose only issue is an unavailable engine
+        # reaches here with corrections == [] and is accepted as before (not the worker's fault).
+        if corrections and want_correction:
+            marker = ("judge: request invalid (" + "; ".join(corrections) + ")")
+            invalid_text = full_text + "\n" + marker
+            if strict:
+                return _ret(False, invalid_text,
+                            {"messages": list(corrections), "schema": JUDGE_REQUEST_SCHEMA,
+                             "attempt": correction_attempt, "exhausted": True})
+            return _ret(True, invalid_text,
+                        {"messages": list(corrections), "schema": JUDGE_REQUEST_SCHEMA,
+                         "attempt": correction_attempt, "exhausted": True})
+        return _ret(True, full_text)
     except (OSError, ValueError, TypeError, KeyError) as e:
-        return False, "judge: invalid request (%s)" % e
+        return _ret(False, "judge: invalid request (%s)" % e)
+
+
+def _record_correction(output_folder, *, claim_id, attempt, messages) -> None:
+    """Append one correction turn (attempt number + the specific messages) to judge_result.json
+    so the durable record shows the request was sent back and why. NEVER raises -- a lost record
+    line must not fail the correction it is recording. Does not write the authoritative 'source:
+    harness' verdict record (that only happens once the engine step runs); it keeps a running
+    'corrections' list so each bounded retry is visible even while the request stays invalid.
+    """
+    if not output_folder:
+        return
+    path = os.path.join(output_folder, "judge_result.json")
+    rec = {}
+    if os.path.exists(path):
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                existing = json.load(f)
+            if isinstance(existing, dict):
+                rec = existing
+        except (OSError, ValueError, TypeError):
+            rec = {}
+    # Do not overwrite an authoritative harness verdict record with a correction note.
+    if rec.get("source") == "harness":
+        return
+    history = rec.get("corrections")
+    if not isinstance(history, list):
+        history = []
+    history.append({"attempt": int(attempt), "messages": list(messages)})
+    rec.update({"status": "correcting", "claim_id": claim_id,
+                "corrections": history, "source": "harness-correction"})
+    try:
+        with open(path, "wb") as f:
+            f.write(json.dumps(rec, ensure_ascii=False, indent=1,
+                               sort_keys=True).encode("utf-8"))
+    except OSError:
+        return
 
 
 def _engine_status_line(verdict: dict, engine_available: bool) -> str:
@@ -264,15 +451,23 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
         "source": "harness",
     }
     path = os.path.join(output_folder, "judge_result.json")
-    # Do not clobber a harness-written record already on disk.
+    # Do not clobber a harness-written record already on disk. But DO carry forward a
+    # 'corrections' history left by _record_correction: a harness-correction record (written each
+    # bounded correction turn) is NOT a harness verdict, so it would otherwise be overwritten --
+    # and the record of how many times the request was sent back, and why, would be lost. Reading
+    # it here folds that history into the authoritative record the engine step writes.
     if os.path.exists(path):
         try:
             with open(path, encoding="utf-8-sig") as f:
                 existing = json.load(f)
-            if isinstance(existing, dict) and existing.get("source") == "harness":
-                first = str(existing.get("engine_status") or "").splitlines()[0] if \
-                    existing.get("engine_status") else engine_status
-                return "judge: recorded -> judge_result.json | " + first
+            if isinstance(existing, dict):
+                if existing.get("source") == "harness":
+                    first = str(existing.get("engine_status") or "").splitlines()[0] if \
+                        existing.get("engine_status") else engine_status
+                    return "judge: recorded -> judge_result.json | " + first
+                prior = existing.get("corrections")
+                if isinstance(prior, list) and prior:
+                    record["corrections"] = prior
         except (OSError, ValueError, TypeError):
             pass  # unreadable existing file: overwrite with a good one below
     try:

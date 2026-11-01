@@ -447,6 +447,21 @@ REFUTE_FIX_JOB = (
     "DONE、無理なら STUCK: 理由 と書いてください。"
     " 【規律】修正結果のみ報告。解説・評価・助言は不要。"
 )
+# Sent back when a data-analysis goal produced a judge_request.json that is PRESENT but
+# INVALID or INCOMPLETE (a manifest/registration/lot_diagnosis field is the wrong type/shape,
+# or the registration's claim id does not match the request's claim_id). %s = the specific,
+# field-named messages plus the expected request schema. Unlike the engine being unavailable
+# (not the worker's fault, never sent back), an invalid request is something the worker CAN
+# fix, so it is handed back with exactly what was wrong and what shape is expected.
+JUDGE_FIX_JOB = (
+    "このデータ解析の最終工程で書いた judge_request.json に、具体的な不備があります。"
+    "判定器(validity_judge)に渡せるように、下記の指摘どおりに修正して judge_request.json を"
+    "書き直してください:\n"
+    "--- 判定器リクエストの不備 ---\n%s\n--- 不備ここまで ---\n"
+    "修正後、最後の行に再度 DONE と書いてください。値を捏造せず、入力が無いセクションは"
+    "省略してください(空の値で埋めない)。判定・結果は自作しないこと。"
+    " 【規律】修正結果のみ報告。解説・評価・助言は不要。"
+)
 NUDGE_JOB = (
     "前のステップがまだ完了していないようです。今の状況を1行で報告し、"
     "可能なら次に進んでください。"
