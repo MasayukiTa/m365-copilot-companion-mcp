@@ -197,6 +197,7 @@ jobs:
             tests/test_unlock_revocation.py \
             tests/test_unlock_switch.py \
             tests/test_uvicorn_keepalive_timeout.py \
+            tests/test_startup_imports_are_deferred.py \
             relay/test_stuck_cause_classifier.py \
             relay/test_mcp_ready.py \
             relay/test_side_socket.py \
