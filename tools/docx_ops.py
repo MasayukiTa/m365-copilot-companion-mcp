@@ -1,12 +1,20 @@
+from __future__ import annotations
+
 import re
 from pathlib import Path
 from typing import Optional
 
-from docx import Document
-from docx.shared import Pt
-
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+# python-docx pulls in lxml and costs ~1-3s to import; defer it until a docx tool is
+# actually called by importing inside each function below. Startup no longer pays this.
+
+
+def _docx_imports():
+    from docx import Document
+    from docx.shared import Pt
+    return Document, Pt
 
 
 def create_docx(path: str, sections: list[dict], title: Optional[str] = None) -> str:
@@ -30,6 +38,7 @@ def create_docx(path: str, sections: list[dict], title: Optional[str] = None) ->
     if locked:
         return locked
     try:
+        Document, Pt = _docx_imports()
         if not isinstance(sections, list) or not sections:
             return "[create_docx error: 'sections' must be a non-empty list]"
         out = _validate_path(path)
@@ -75,6 +84,7 @@ def docx_from_markdown(path: str, markdown: str, title: Optional[str] = None) ->
 def read_docx(path: str, max_chars: int = 60_000) -> str:
     """Extract plain text from a .docx (paragraphs and tables)."""
     try:
+        Document, Pt = _docx_imports()
         p = _validate_path(path)
         if not p.is_file():
             return f"[read_docx error: not a file: {p}]"
@@ -100,6 +110,7 @@ def read_docx(path: str, max_chars: int = 60_000) -> str:
 def docx_info(path: str) -> str:
     """Return a structural summary of an existing .docx (paragraph and table counts)."""
     try:
+        Document, Pt = _docx_imports()
         p = _validate_path(path)
         if not p.is_file():
             return f"[docx_info error: not a file: {p}]"
@@ -129,7 +140,8 @@ def docx_info(path: str) -> str:
 
 # ---------- internals ----------
 
-def _render_section(doc: Document, sec: dict) -> None:
+def _render_section(doc: "Document", sec: dict) -> None:
+    _Document, Pt = _docx_imports()
     if sec.get("page_break"):
         doc.add_page_break()
     heading = sec.get("heading")
