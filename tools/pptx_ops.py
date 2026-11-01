@@ -6,10 +6,13 @@ import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+if TYPE_CHECKING:  # annotations only; the real import happens inside each function
+    from pptx import Presentation
 
 # python-pptx costs ~1-2s to import at startup; defer it until a pptx tool is actually
 # called. Each function that needs it calls _pptx_imports() first, so behaviour is

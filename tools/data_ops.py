@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import io
 import json
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+if TYPE_CHECKING:  # annotations only; the real import happens inside each function
+    import pandas as pd
 
 
 def _read_table(path: str, sheet_name: Optional[str] = None) -> "pd.DataFrame":

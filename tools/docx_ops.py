@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+if TYPE_CHECKING:  # annotations only; the real import happens inside each function
+    from docx import Document
 
 # python-docx pulls in lxml and costs ~1-3s to import; defer it until a docx tool is
 # actually called by importing inside each function below. Startup no longer pays this.
