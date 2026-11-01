@@ -1,16 +1,28 @@
+from __future__ import annotations
+
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
-
-from pptx import Presentation
-from pptx.util import Emu, Inches, Pt
+from typing import TYPE_CHECKING, Any, Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+if TYPE_CHECKING:  # annotations only; the real import happens inside each function
+    from pptx import Presentation
+
+# python-pptx costs ~1-2s to import at startup; defer it until a pptx tool is actually
+# called. Each function that needs it calls _pptx_imports() first, so behaviour is
+# unchanged -- the cost just moves from server boot to first pptx use.
+
+
+def _pptx_imports():
+    from pptx import Presentation
+    from pptx.util import Emu, Inches, Pt
+    return Presentation, Emu, Inches, Pt
 
 
 # Layout indices in the default python-pptx blank template.
@@ -66,6 +78,7 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None,
     try:
         if not isinstance(slides, list) or not slides:
             return "[create_pptx error: 'slides' must be a non-empty list]"
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         out = _validate_path(path)
         if out.suffix.lower() != ".pptx":
             return "[create_pptx error: path must end with .pptx]"
@@ -134,6 +147,7 @@ def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None,
 def pptx_info(path: str) -> str:
     """Return a structural summary of an existing .pptx (slide count + titles)."""
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         p = _validate_path(path)
         if p.suffix.lower() != ".pptx":
             return "[pptx_info error: path must end with .pptx]"
@@ -175,6 +189,7 @@ def pptx_add_slide(pptx_path: str, slide: dict) -> str:
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         if not isinstance(slide, dict):
             return "[pptx_add_slide error: slide must be an object]"
         p = _validate_path(pptx_path)
@@ -213,6 +228,7 @@ def pptx_add_image(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         p = _validate_path(pptx_path)
         if not p.is_file():
             return f"[pptx_add_image error: file not found: {p}]"
@@ -259,6 +275,7 @@ def pptx_replace_image(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         p = _validate_path(pptx_path)
         if not p.is_file():
             return f"[pptx_replace_image error: file not found: {p}]"
@@ -309,6 +326,7 @@ def pptx_add_table(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], list):
             return "[pptx_add_table error: rows must be a 2D list]"
         p = _validate_path(pptx_path)
@@ -540,6 +558,7 @@ def pptx_from_reference(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         out = _validate_path(output_path)
         if out.suffix.lower() != ".pptx":
             return "[pptx_from_reference error: output_path must end with .pptx]"
@@ -620,7 +639,8 @@ def _strip_existing_slides(prs: Presentation) -> None:
         xml_slides.remove(sld_id)
 
 
-def _add_slide(prs: Presentation, spec: dict) -> None:
+def _add_slide(prs: "Presentation", spec: dict) -> None:
+    _P, Emu, Inches, Pt = _pptx_imports()
     layout_name = spec.get("layout")
     layout_idx = _pick_layout(spec, layout_name)
     # A template deck may carry fewer layouts than the default's six; fall back to the
@@ -698,6 +718,7 @@ def _pick_layout(spec: dict, explicit: Optional[str]) -> int:
 
 
 def _style_title(title_shape: Any) -> None:
+    _P, _Emu, _Inches, Pt = _pptx_imports()
     tf = title_shape.text_frame
     for para in tf.paragraphs:
         for run in para.runs:
@@ -706,6 +727,7 @@ def _style_title(title_shape: Any) -> None:
 
 
 def _fill_bullets(placeholder: Any, bullets: list) -> None:
+    _P, _Emu, _Inches, Pt = _pptx_imports()
     tf = placeholder.text_frame
     tf.clear()
     first = True
@@ -725,6 +747,7 @@ def _fill_bullets(placeholder: Any, bullets: list) -> None:
 
 
 def _fill_body(placeholder: Any, text: str) -> None:
+    _P, _Emu, _Inches, Pt = _pptx_imports()
     tf = placeholder.text_frame
     tf.clear()
     lines = text.splitlines() or [""]
