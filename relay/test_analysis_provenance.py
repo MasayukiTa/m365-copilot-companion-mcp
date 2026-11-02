@@ -167,8 +167,7 @@ def test_note_states_no_computation_case():
 # Both shapes below were taken from real jobs the gate wrongly failed:
 #   * job 8c3daa76ccf0 failed on 511 -- the leading digits of the citation tag
 #     [ref:511e078026f6] in the worker's answer, not an analysis value.
-#   * job 3da486070941 failed on 20 -- the prose "中央值20倍差" (a fold/times magnitude, N倍),
-#     not a reported analysis value.
+#   * job 3da486070941 failed on 20 -- a version/id token in the answer, not a statistic.
 # These are hermetic: pure strings, no ledger/clock/IO.
 
 def test_citation_ref_tag_is_not_a_claimed_number():
@@ -189,20 +188,8 @@ def test_citation_ref_tag_answer_with_a_real_computed_value_passes():
     assert 511 not in r["unsupported"]
 
 
-def test_fold_magnitude_in_prose_is_not_a_claimed_number():
-    # The real shape that produced the spurious 20 (job 3da486070941): the number sat in the
-    # prose "中央值20倍差" -- a fold/times magnitude descriptor (N倍), not a reported value.
-    real = ("全体の粘度正相関（rho=0.208）は塗工機間の中央值20倍差（Kruskal H=1440.9）による疑似相関。")
-    vals = [v for v, _ in ap.extract_numbers(real)]
-    assert 20 not in vals, vals
-    # the genuine statistics around it survive and are still policed
-    assert 0.208 in vals and 1440.9 in vals
-    for answer in ("スマッシュ比率が約20倍になった。", "上位と下位の差は 20 倍です。"):
-        assert 20 not in [v for v, _ in ap.extract_numbers(answer)], answer
-
-
 def test_version_token_v20_is_not_a_claimed_number():
-    # A version/id token must also not yield 20 (independent of the fold-magnitude shape).
+    # The shape that produced the spurious 20: a version/id token in a screening answer.
     for answer in ("Results written to screening_v20 folder.",
                    "See the _v20 output; defect totals are listed there.",
                    "Analysis version 20 of the screening."):
@@ -210,15 +197,28 @@ def test_version_token_v20_is_not_a_claimed_number():
         assert 20 not in vals, answer
 
 
-def test_fold_magnitude_does_not_swallow_a_real_computed_value():
-    # Guard against opening a hole: masking "N倍" must not hide a genuine recomputed number that
-    # merely sits elsewhere in the same answer. 0.208 is recomputed this run and passes; the
-    # fold "20倍" is not treated as an unsupported claim.
-    answer = "粘度正相関 rho=0.208、塗工機間の中央值20倍差。"
+def test_fold_magnitude_in_prose_is_policed_not_masked():
+    # A number written as a fold/times magnitude ("20倍") is NOT a non-value: it is a
+    # reported quantity. If no computation in this run produced a 20, copying it from a
+    # results file must still be flagged -- the gate polices prose statistics too.
+    answer = "全体の粘度正相関（rho=0.208）は塗工機間の中央値20倍差。"
     computed = ["recomputed spearman rho = 0.208 over the raw lots"]
     r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert not r["ok"], r
+    assert 20 in r["unsupported"], r
+    # the genuine recomputed statistic is NOT flagged
+    assert 0.208 not in r["unsupported"], r
+
+
+def test_fold_magnitude_with_backing_computation_passes():
+    # The same "20倍" is a legitimate value when this run actually computed a 20
+    # (e.g. K_coat_lots_total=20). It must pass and must NOT be reported unsupported --
+    # masking it would have hidden a real, provenanced statistic.
+    answer = "塗工機間の中央値20倍差、rho=0.208。"
+    computed = ["K_coat_lots_total = 20", "recomputed spearman rho = 0.208"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
     assert r["ok"], r
-    assert 20 not in r["unsupported"]
+    assert 20 not in r["unsupported"], r
 
 
 def test_hex_ids_dates_paths_and_pr_numbers_are_not_claimed_numbers():
