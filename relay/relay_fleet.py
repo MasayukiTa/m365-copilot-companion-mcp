@@ -11730,6 +11730,24 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # Durable at the moment of settling: see RelayWorker._settle_done.
         _nw.priority = bool(goal_item.get("priority")) if isinstance(goal_item, dict) else False
         _nw.on_settled_done = _note_one_finished
+        # OWNER'S REAL-DESKTOP RULE, enforced at the one place a goal becomes a worker (each use,
+        # so an operator flipping block_real_desktop_automation reaches the next worker start).
+        # A goal that asks for UI automation / computer use on the real desktop is REFUSED here --
+        # born terminal (cancelled) with the refusal as its reason, so it never opens a tab on the
+        # real screen -- unless it carries the explicit operator field allow_real_desktop. This is
+        # the standing guard that complements the per-jid tombstone: the tombstone stops a known
+        # cancelled job resurrecting; this stops a NEW submission of the same forbidden kind.
+        try:
+            from relay import desktop_guard as _dg
+            _refusal = _dg.refuse_reason(goal_item)
+        except Exception:
+            _refusal = None
+        if _refusal:
+            _nw.status = "cancelled"
+            _nw.outcome = "CANCELLED"
+            _nw.reason = _refusal
+            print("[fleet] %s: 実デスクトップUI自動化のため開始を拒否 / refused real-desktop "
+                  "automation (set allow_real_desktop to override)" % _nw.name, flush=True)
         return _nw
 
     workers = [_worker_for(i, g) for i, g in enumerate(goals)]
