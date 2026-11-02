@@ -225,16 +225,69 @@ def _to_float(digits: str, percent: bool):
         return None
 
 
-def extract_numbers(text) -> list:
+#: The CHARACTERS that, when they sit immediately beside a digit run, make that run part of an
+#: IDENTIFIER rather than a standalone measured quantity: ASCII letters/underscore (already
+#: largely handled by _NUM_RE's own lookaround and the path/version masks), the '#' and path
+#: separators, and -- the gap those leave -- any CJK letter. "679かすれ" reads 679 with a CJK
+#: ideograph glued to its right: that is the requester's case NAME, not a statistic. A Western
+#: digit-then-letter token like "20abc" is already refused by _NUM_RE; this set exists so the
+#: same refusal reaches digit-then-CJK, which _NUM_RE's [A-Za-z_] lookahead does not cover.
+_IDENT_ADJACENT_RE = re.compile(
+    r"[A-Za-z0-9_#/\\"
+    r"\u3040-\u30ff"          # Hiragana + Katakana
+    r"\u3400-\u4dbf"          # CJK Extension A
+    r"\u4e00-\u9fff"          # CJK Unified Ideographs
+    r"\uf900-\ufaff"          # CJK Compatibility Ideographs
+    r"\uff66-\uff9f"          # Half-width Katakana
+    r"]")
+
+#: Units/affixes that turn a digit run into a STATED QUANTITY even when a CJK character is
+#: adjacent: a percent sign, and the common Japanese counters and magnitude words. When one of
+#: these follows the digits ("679 件", "679%", "20倍"), the token is a measurement the gate must
+#: still police -- it is NOT exempted as an identifier, even if the same digits are in the goal.
+#: This is deliberately a quantity-form allow-list layered OVER the identifier test below, so a
+#: name like "679かすれ" (かすれ is not a counter) stays exempt while "679件" does not.
+_QUANTITY_SUFFIX_RE = re.compile(
+    r"\s*(?:%|\uff05|\u500d"                               # %, ％, 倍
+    r"|\u4ef6|\u500b|\u672c|\u53f0|\u56de|\u540d|\u679a"   # 件 個 本 台 回 名 枚
+    r"|\u884c|\u5217|\u793e|\u4eba|\u70b9|\u5272"         # 行 列 社 人 点 割
+    r"|\u30ed\u30c3\u30c8"                                 # ロット
+    r")")
+
+
+def _request_digit_runs(request_text) -> frozenset:
+    """The maximal runs of digits that appear in the requester's own words (goal/request text),
+    as strings, length >= 2.
+
+    These are the digit sequences the gate may treat as part of an IDENTIFIER the requester
+    supplied -- the '679' of "679かすれ調査", "e679_v26", "example_analysis". Length >= 2 keeps a
+    lone '0'/'1'/... (which occurs in almost any text) from exempting real single-digit
+    statistics. Returns an empty set for non-strings so the caller degrades to the old behaviour.
+    """
+    if not isinstance(request_text, str) or not request_text:
+        return frozenset()
+    return frozenset(r for r in re.findall(r"\d+", request_text) if len(r) >= 2)
+
+
+def extract_numbers(text, request_digits=None) -> list:
     """Every numeric quantity in `text`, as (value, had_percent) pairs.
 
     A LIST, NOT A SET, and the percent flag is kept: 0.12 and 12% are different faces of the
     same quantity and the matcher needs to try both. Identifier-shaped numbers (years, and
     anything caught mid-token by the lookbehind) are excluded here so a report's "2026" or
     "engine_v1_8" does not create a spurious claim the answer then has to justify.
+
+    `request_digits` (optional) is the set of digit runs the REQUESTER wrote (see
+    _request_digit_runs). When a matched digit run equals one of those AND sits inside an
+    identifier-like token in the answer -- a CJK/letter/underscore/#/path character glued to
+    one side, as in "679かすれ" -- it is the requester's case NAME, not a computed result, so it
+    is dropped. A run in a QUANTITY form ("679 件", "679%", "n = 679") is NEVER dropped this
+    way: a stated quantity still has to be found in a computation output, even when the same
+    digits occur in the goal.
     """
     if not isinstance(text, str):
         return []
+    req = request_digits or frozenset()
     text = _mask_non_values(text)
     out = []
     for m in _NUM_RE.finditer(text):
@@ -249,8 +302,38 @@ def extract_numbers(text) -> list:
         if (not had_percent and "." not in m.group(1) and "," not in m.group(1)
                 and val == int(val) and _YEAR_RANGE[0] <= val <= _YEAR_RANGE[1]):
             continue
+        # REQUESTER-SUPPLIED IDENTIFIER. The exact digit run the requester wrote (e.g. "679" of
+        # "679かすれ調査"), appearing in the answer glued to a CJK/letter/underscore/#/path
+        # character, is the case NAME, not a statistic -- unless it wears a quantity form
+        # (percent or a counter), which a stated measurement always has to justify.
+        if req and not had_percent:
+            digit_run = re.sub(r"\D", "", m.group(1))
+            if digit_run in req and _is_requester_identifier(text, m):
+                continue
         out.append((val, had_percent))
     return out
+
+
+def _is_requester_identifier(text: str, m) -> bool:
+    """Whether the matched digit run sits inside an identifier-like token rather than standing
+    alone as a stated quantity.
+
+    TRUE only when a letter/underscore/#/path char or a CJK character is glued to one side of
+    the run AND the run is not in a quantity form. A quantity form -- a trailing percent or a
+    Japanese counter/magnitude word (件, 倍, ...) -- returns FALSE so the number stays policed.
+    `text` is the already-masked answer; positions from `m` are valid against it.
+    """
+    start, end = m.start(1), m.end(1)
+    before = text[start - 1] if start > 0 else ""
+    after = text[end] if end < len(text) else ""
+    # A trailing percent was captured by the regex itself (group 2); a quantity suffix
+    # (件/倍/...) immediately after the digits means this is a stated amount, not a name.
+    if m.group(2):
+        return False
+    if _QUANTITY_SUFFIX_RE.match(text[end:]):
+        return False
+    adjacent = bool(_IDENT_ADJACENT_RE.match(before)) or bool(_IDENT_ADJACENT_RE.match(after))
+    return adjacent
 
 
 def _close(a: float, b: float) -> bool:
@@ -327,7 +410,8 @@ class ProvenanceResult(dict):
     """
 
 
-def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool) -> ProvenanceResult:
+def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
+                            request_text="") -> ProvenanceResult:
     """Does every number in the answer trace to a computation this run performed?
 
     `compute_outputs` is the list of result texts from THIS run's compute-tool calls (the
@@ -335,12 +419,21 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool)
     gate's own applicability: when False the check is a no-op pass, because a non-analysis
     answer carries numbers (dates, counts, ids) this rule has no business policing.
 
+    `request_text` (optional) is the requester's own words -- the goal text and/or the resolved
+    request text. Digit runs that appear THERE (a case name like "679かすれ調査", an id like
+    "e679_v26") are treated as identifiers, NOT claims, when they appear in the answer glued to
+    a letter/underscore/#/path/CJK character rather than standing alone as a stated quantity.
+    A quantity form ("679 件", "679%", "n = 679") is still policed even if the same digits are
+    in the goal: a stated measurement must always be found in a computation output. When
+    request_text is empty the check degrades to its prior behaviour exactly.
+
     CONSERVATIVE BY CONSTRUCTION. An answer with no numbers passes. A non-analysis goal passes.
     The only two ways to fail are the two the owner named: a number that is in the answer but
     in no computation output, and an analysis answer that cites numbers with no computation at
     all behind them.
     """
-    claimed = extract_numbers(final_answer) if is_analysis else []
+    request_digits = _request_digit_runs(request_text)
+    claimed = extract_numbers(final_answer, request_digits) if is_analysis else []
     had_compute = bool([t for t in (compute_outputs or []) if str(t or "").strip()])
     computed = _computed_values(compute_outputs) if had_compute else []
 

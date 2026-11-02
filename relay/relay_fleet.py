@@ -8427,8 +8427,16 @@ class RelayWorker:
                                       getattr(self, "_judge_request_text", ""),
                                       RelayWorker._judge_tool_names(self))
                 _answer = getattr(self, "_candidate_done_reply", "") or self.last_response or ""
+                # The requester's own words (goal + resolved request text) name the case: a
+                # digit run that is part of an identifier there ("679" of "679かすれ調査",
+                # "e679_v26") is not a computed result, so the gate must not police it when it
+                # appears glued to a letter/CJK/path character in the answer. A quantity form
+                # ("679 件", "679%") is still policed. See analysis_provenance.extract_numbers.
+                _req_text = ((getattr(self, "goal", "") or "") + "\n"
+                             + (getattr(self, "_judge_request_text", "") or ""))
                 _prov = _ap.check_answer_provenance(
-                    _answer, self._judge_compute_outputs(), is_analysis=_is_an)
+                    _answer, self._judge_compute_outputs(), is_analysis=_is_an,
+                    request_text=_req_text)
                 # ONLY SPEAK WHEN THE GATE ACTUALLY LOOKED. A no-op pass -- a non-analysis
                 # answer, or an analysis answer with no numeric claim to police -- examined
                 # nothing, so it must leave the visible answer and the judge text exactly as
