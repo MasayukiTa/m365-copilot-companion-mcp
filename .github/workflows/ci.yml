@@ -1095,6 +1095,7 @@ jobs:
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
             scripts/test_sibling_cost_report.py \
+            scripts/test_sibling_turn_context_join.py \
             scripts/test_comm_roi_report.py \
             scripts/test_board_report.py \
             scripts/test_ab_compare.py \
