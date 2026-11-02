@@ -975,6 +975,7 @@ jobs:
             relay/test_analysis_provenance.py \
             relay/test_provenance_standard_names.py \
             relay/test_a_planted_results_file_is_not_an_answer.py \
+            relay/test_a_rounded_answer_is_not_a_fake.py \
             relay/test_the_first_recovery_will_announce_itself.py \
             relay/test_an_infrastructure_stop_says_so_where_it_is_kept.py \
             relay/test_the_timeout_record_names_its_own_clock.py \
