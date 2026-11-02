@@ -348,11 +348,17 @@ _FUNCTIONS = (
     "function Get-PortListenerPids", "function Test-IsMainPyCommandLine",
     "function Test-IsThisCheckoutServerCommandLine", "function Get-ProcessVerdict",
     "function Get-HealthServerPid", "function Write-ForeignPortHolderLog",
+    # Test-ServerUp now takes a second, longer look on a 5 s timeout (the slow-vs-down gate);
+    # the two helpers it calls there must be in the driver too, or a timed-out case (tcp)
+    # reaches an undefined function and the whole driver aborts mid-loop.
+    "function Confirm-ServerSlow", "function Invoke-LivenessStrikeDecision",
     "function Test-ServerUp", "function Get-ServerExitRecord", "function Start-Server",
 )
 _INIT_LINES = (
     "$script:PyRecheckSeconds =", "$script:PyRejectedAt = $null", "$script:PyRejectedWhy = $null",
     "$script:ForeignHolderKey =", "$script:ForeignHolderLoggedAt =", "$script:VerifiedServerPid =",
+    # the slow-vs-down confirmation timeout Confirm-ServerSlow reads ($LivenessConfirmSeconds)
+    "$script:LivenessConfirmSeconds = 60",
 )
 
 
