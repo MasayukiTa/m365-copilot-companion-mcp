@@ -255,3 +255,49 @@ def test_a_planted_percentage_next_to_metadata_is_still_rejected():
     r = ap.check_answer_provenance(answer, computed, is_analysis=True)
     assert not r["ok"]
     assert any(abs(v - 12.5) < 1e-9 for v in r["unsupported"])
+
+
+# ── regression: the two REAL VERIFY_FAILED answers that motivated this gate fix ──
+#
+# These pin the end-to-end behaviour (not just extract_numbers) for the two production jobs
+# whose honest answers the gate rejected with a FALSE POSITIVE, so a future change to the
+# masking cannot silently reintroduce either one. Evidence is the two real answers:
+#   * job 8c3daa76ccf0 (w31, 12:43): "...not found in this run's computation outputs: 511" --
+#     the 511 was the leading digits of the citation tag [ref:511e078026f6], not a value.
+#   * job 3da486070941 (w30, 12:35): rejected for 20 -- a version/id token in a screening
+#     answer, not a computed statistic.
+
+
+def test_real_job_8c3daa76ccf0_citation_tag_answer_is_not_a_false_positive():
+    # The worker's analysis answer cited a recomputed rate and carried a [ref:...] tag whose
+    # hex id starts with 511. With the real value recomputed this run, the answer must PASS
+    # and 511 must never appear as an unsupported claim.
+    answer = ("ロット別のかすれ率は 0.12 "
+              "(74 ロット) である [ref:511e078026f6]。")
+    computed = ["recomputed kasure rate = 0.12 over 74 lots"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert r["ok"], r
+    assert 511 not in r["unsupported"], r
+
+
+def test_real_job_3da486070941_version_token_20_is_not_a_false_positive():
+    # The screening answer's only 20 came from a version/id token; with its genuine computed
+    # values present, the answer must PASS and 20 must not be reported unsupported.
+    answer = ("Screening results written to screening_v20; the top defect share is 12.5% "
+              "over 1,234 lots.")
+    computed = ["recomputed top share = 0.125", "lot count = 1234"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert r["ok"], r
+    assert 20 not in r["unsupported"], r
+
+
+def test_a_planted_decimal_beside_the_511_citation_tag_is_still_rejected():
+    # Guard the hole: the 511 citation tag is masked, but a bare decimal sitting right next
+    # to it that was NOT computed this run must still be flagged -- masking must not swallow
+    # a genuine (unprovenanced) statistic.
+    answer = "The defect correlation is 0.834 [ref:511e078026f6]."
+    computed = ["recomputed correlation = 0.207 over 74 lots"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert not r["ok"], r
+    assert any(abs(v - 0.834) < 1e-9 for v in r["unsupported"]), r
+    assert 511 not in r["unsupported"], r
