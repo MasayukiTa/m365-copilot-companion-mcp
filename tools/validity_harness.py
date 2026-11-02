@@ -47,9 +47,15 @@ def _default_store_path() -> str:
 
 def _sha_file(path: str) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except PermissionError as e:
+        # The file exists but access is genuinely denied: report WHICH file by name rather than
+        # letting a bare Errno 13 surface without saying what could not be read.
+        raise PermissionError(
+            "permission denied reading data file %r: %s" % (path, e)) from e
     return h.hexdigest()
 
 
@@ -172,7 +178,18 @@ def record_manifest(manifest_path: str, *, dataset_id: str, data_path: str, resu
     entry {path, sha256, result_sha256, fetched_at} per dataset_id. Idempotent per dataset_id
     (an existing entry is replaced). Returns the entry. No raw data row is stored -- only hashes.
     """
+    # manifest_path is the JSON FILE the manifest is written into, never a directory. A caller
+    # that passes a folder (e.g. the request/output folder) would otherwise make the open() below
+    # try to write the directory itself, surfacing a bare '[Errno 13] Permission denied: <folder>'
+    # that reads as if the harness tried to open the folder as a file. Reject it by name instead.
+    if os.path.isdir(manifest_path):
+        raise IsADirectoryError(
+            "manifest_path must be a file to write the manifest JSON into, not a directory: %r"
+            % manifest_path)
     if not os.path.isfile(data_path):
+        if os.path.isdir(data_path):
+            raise IsADirectoryError(
+                "data_path must be the data FILE, not a directory: %r" % data_path)
         raise FileNotFoundError(data_path)
     fetched_at = fetched_at or _dt.datetime.now(
         _dt.timezone(_dt.timedelta(hours=9))).isoformat()
