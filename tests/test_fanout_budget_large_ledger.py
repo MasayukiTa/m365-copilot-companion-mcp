@@ -57,8 +57,13 @@ def _big_ledger(path, campaigns=80, kids=12):
 
 
 def _old_reader(path):
-    """The reader this fix replaced, minus its size cap: every line parsed into a dict."""
-    out = []
+    """A whole-file baseline for read_campaign_rows: every line parsed into a dict, then the
+    same merge-resolution contract applied that the streaming reader applies -- a header whose
+    tree carries a _TREE_DONE (merged/merge_done/merge_abandoned) row is tagged _finished, so a
+    finished tree's wall clock freezes and its total stops being floored by past header n. This
+    mirrors read_campaign_rows (not its streaming internals); without it the baseline would ignore
+    merge rows and wrongly keep a merged tree live, which is the behaviour this fix removed."""
+    raw = []
     with open(path, encoding="utf-8-sig") as fh:
         for ln in fh.read().splitlines():
             try:
@@ -66,7 +71,16 @@ def _old_reader(path):
             except ValueError:
                 continue
             if isinstance(v, dict):
-                out.append(v)
+                raw.append(v)
+    done = {str(r.get("root_id") or r.get("campaign_id"))
+            for r in raw if r.get("kind") in fb._TREE_DONE
+            and (r.get("root_id") or r.get("campaign_id"))}
+    out = []
+    for r in raw:
+        if r.get("kind") != "campaign":
+            continue
+        rid = str(r.get("root_id") or r.get("campaign_id"))
+        out.append(dict(r, _finished=True) if rid in done else r)
     return out
 
 
