@@ -158,6 +158,7 @@ def _engine_claim_missing_keys_line(missing) -> str:
 #: INITIAL instruction and the correction can never drift: a worker can write a valid
 #: registration.claim the FIRST time instead of learning the keys only after an engine failure.
 JUDGE_REQUEST_SCHEMA = (
+    "judge_request.json and manifest.json must be UTF-8 without BOM.\n"
     "judge_request.json は JSON オブジェクトで、必須キー: claim_id (空でない文字列・パス区切りを"
     "含まない), data_location (データファイルの絶対パスまたは出力フォルダからの相対パス), "
     "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
@@ -348,8 +349,30 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
     if not path or not os.path.exists(path):
         return _ret(False, "judge: none (request required)") if strict else _ret(True, "judge: none")
     try:
-        with open(path, encoding="utf-8-sig") as f:
-            request = json.load(f)
+        try:
+            with open(path, encoding="utf-8-sig") as f:
+                request = json.load(f)
+        except (UnicodeDecodeError, json.JSONDecodeError) as e:
+            if isinstance(e, UnicodeDecodeError):
+                problem = "not valid UTF-8 at byte %d" % e.start
+            else:
+                problem = "not valid JSON at line %d, column %d" % (e.lineno, e.colno)
+            msg = ("judge_request.json is %s; rewrite it as UTF-8 without BOM with "
+                   "json.dump(obj, f, ensure_ascii=False)" % problem)
+            if not want_correction:
+                return _ret(False, "judge: invalid request (%s)" % msg)
+            correction = {"messages": [msg], "schema": JUDGE_REQUEST_SCHEMA,
+                          "attempt": correction_attempt}
+            if correction_attempt < int(correction_budget):
+                correction["attempt"] = correction_attempt + 1
+                detail = ("judge: request invalid (attempt %d/%d)\n- %s\n\n%s"
+                          % (correction_attempt + 1, int(correction_budget), msg,
+                             JUDGE_REQUEST_SCHEMA))
+                _record_correction(output_folder, claim_id=None,
+                                   attempt=correction_attempt + 1, messages=[msg])
+                return _ret(True, detail, correction)
+            correction["exhausted"] = True
+            return _ret(not strict, "judge: request invalid (%s)" % msg, correction)
         claim_id, data_location, fetched_at = (request[k] for k in
                                                ("claim_id", "data_location", "fetched_at"))
         if not all(isinstance(v, str) and v.strip() for v in
