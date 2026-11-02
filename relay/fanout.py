@@ -580,7 +580,7 @@ def _base_goal_of(text):
 def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=0,
                 cwd=None, parent_level=None, run_id="",
                 parent_campaign_id="", parent_subtask_index=None, root_id="",
-                board_lines=""):
+                board_lines="", parent_jid=""):
     """Turn the accepted steps into goal items the fleet can admit.
 
     TASK-TREE IDENTITY (additive, record-only). Each child also carries `parent_campaign_id`
@@ -652,6 +652,12 @@ def child_goals(parent_goal, steps, *, parent_task_id="", campaign_id="", depth=
             "parent_campaign_id": parent_campaign_id or "",
             "parent_subtask_index": parent_subtask_index,
             "root_id": root_id or (parent_campaign_id if depth > 0 and parent_campaign_id else cid),
+            # THE PARENT'S ADMISSION JID, carried so a child inherits a cancelled/closed
+            # parent's durable tombstone (relay/fleet_tombstone.blocked_jid reads parent_jid).
+            # A top-level parent passes its own jid; a grandchild carries the nearest parent's.
+            # Empty for a parent that never passed through admission -- then there is no jid
+            # rule to inherit and the done-map/text path still covers it.
+            "parent_jid": parent_jid or "",
         })
     # EFFORT POLICY (phase 2). Additive: with the policy off, or no parent level, `out` is
     # exactly what it was. `on` adds metadata["effort"] one step below the parent's level.
