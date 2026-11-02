@@ -188,15 +188,22 @@ def test_recorded_tools_at_completion_and_strict(tmp_path, monkeypatch):
         mcp_bindings=SimpleNamespace(snapshot=lambda: bindings)))
     assert w._judge_tool_names() == {"run_python"}
     w._settle_done()
-    assert w.status == "done" and "judge: none" in w.last_response
+    assert w.status == "done" and w.last_response == "answer"
     w._ledger_rows = lambda: [{"event": "call", "ts": 104, "session": "mine", "tool": "odbc_query"}]
     assert w._judge_tool_names() == {"odbc_query"}
     monkeypatch.setenv("MCP_JUDGE_STRICT", "1")
+    w._settle_done()
+    assert w.status == "done" and w.last_response == "answer"
+    # Analysis content still requires a judge even with no attributed data tool.
+    w.goal = GOAL
+    assert judge_gate.is_data_analysis_goal(w.goal)
+    w._ledger_rows = lambda: []
     w._settle_done()
     assert w.outcome == "VERIFY_FAILED" and "judge: none" in w.reason
     w._ledger_rows = lambda: [{"event": "call", "ts": 103, "session": "other", "tool": "odbc_query"}]
     monkeypatch.delenv("MCP_JUDGE_STRICT")
     w.last_response, w.reason = "answer", ""
+    w.goal = "案件を調べて"
     w._settle_done()
     assert w.status == "done" and w.last_response == "answer" and not w.reason
 

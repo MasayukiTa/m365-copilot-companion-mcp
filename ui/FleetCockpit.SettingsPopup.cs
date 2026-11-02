@@ -281,12 +281,12 @@ partial class CockpitWindow
             case "team_mode":
             case "org_proposals":
             case "fanout_max_depth":
+            case "analysis_provenance_gate":
             case "fanout_max_total":
             case "fanout_max_active":
             case "fanout_max_turns":
             case "fanout_max_wall_min":
             case "effort_policy":
-            case "analysis_provenance_gate":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":
