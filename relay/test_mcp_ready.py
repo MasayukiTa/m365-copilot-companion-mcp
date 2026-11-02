@@ -284,6 +284,12 @@ def make_worker(rf, **kw):
 
 def test_worker_held_while_server_down_and_released_when_up(rf, monkeypatch):
     from relay import token_provider as tp
+    from relay import tool_bridge
+    # The creation gate exists only for the connector route (it binds connector tools at
+    # conversation creation); pin that route so this asserts connector behaviour. On the
+    # connector-less route the gate is skipped by design -- see
+    # relay/test_mcp_ready_gate_skips_bridge.py.
+    monkeypatch.setattr(tool_bridge, "is_bridge", lambda path=None: False)
     state = {"doc": None}
     gate = mr.ReadyGate(health_fn=lambda: state["doc"], tunnel_fn=lambda p: (True, ""),
                         now=Clock(), recheck_s=0)
