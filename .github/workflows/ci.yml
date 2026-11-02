@@ -179,6 +179,7 @@ jobs:
             relay/test_judge_worker_claim_to_engine.py \
             relay/test_judge_engine_chain_after_395.py \
             relay/test_judge_verdict_not_error.py \
+            relay/test_engine_claim_schema_in_initial_instruction.py \
             tests/test_validity_harness.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \

@@ -101,26 +101,6 @@ def is_data_analysis_goal(goal, request_text="", tool_names=()) -> bool:
                for name in tool_names)
 
 
-#: The request schema, named once so a correction turn can hand the worker the EXACT shape
-#: expected alongside the field-named message that said what was wrong. No data values here --
-#: only the shape, so it is safe to show.
-JUDGE_REQUEST_SCHEMA = (
-    "judge_request.json は JSON オブジェクトで、必須キー: claim_id (空でない文字列・パス区切りを"
-    "含まない), data_location (データファイルの絶対パスまたは出力フォルダからの相対パス), "
-    "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
-    "manifest {path: manifest を書き出す JSON ファイルのパス (フォルダ不可), dataset_id: 文字列, "
-    "result: 解析結果そのものを表す JSON オブジェクト (パス文字列ではない。例 "
-    '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
-    ")}; "
-    "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
-    "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}。"
-    "入力の無いセクションは省略する(空の値で埋めない)。\n"
-    "判定エンジンを走らせるには、claim_id の claim がエンジンに事前登録(configs/<claim_id>.json)"
-    "されているか、さもなければ registration セクションに claim_id と同じ id を持つ claim を入れる"
-    "こと。どちらも無いとエンジンは走らず『registered claim not found』になる。"
-)
-
-
 #: The keys the frozen engine's claim loader REQUIRES (validity/claim.py REQUIRED_KEYS plus
 #: `assumptions`, which claim_schema.json also marks required and whose absence the engine
 #: reports as INPUT_ASSUMPTION_UNDECLARED). Mirrored here because the engine is READ-ONLY and
@@ -153,6 +133,45 @@ _ENGINE_CLAIM_SCHEMA_HINT = (
     "assumptions{distribution:文字列, balance:文字列}。lot_diagnosis の y/x/lot(ロット別の率・曝露・"
     "ロット名)を既に出しているなら、同じロット列を hierarchy.unit_column に、曝露列を exposure.column "
     "に対応させること。statement だけの自由文 claim ではエンジンは INPUT_MISSING_KEY になる。"
+)
+
+
+def _engine_claim_missing_keys_line(missing) -> str:
+    """A SHORT correction line naming ONLY the engine-claim keys still missing, in schema order.
+
+    Used for the SECOND and later correction turns: by then the worker has already seen the full
+    key list and shapes (the first correction carries _ENGINE_CLAIM_SCHEMA_HINT, and so does the
+    initial instruction), so a re-send of that long block mainly repeats bytes the worker already
+    has. Naming only what is STILL missing is shorter and points at the remaining gap. Same single
+    source of truth (the missing-key list the engine screen produced); the harness never invents a
+    value for a missing key -- the worker owns the real column names and levels.
+    """
+    return (
+        "registration.claim にまだ次の必須キーが足りない(値は解析者が実データから埋める。ハーネスは"
+        "値を捏造しない。各キーの型は初回の指示・スキーマ参照): %s。" % ", ".join(missing))
+
+
+#: The request schema, named once so a correction turn can hand the worker the EXACT shape
+#: expected alongside the field-named message that said what was wrong. No data values here --
+#: only the shape, so it is safe to show. The engine's required claim keys are appended from the
+#: SAME single source that builds the first correction message (_ENGINE_CLAIM_SCHEMA_HINT), so the
+#: INITIAL instruction and the correction can never drift: a worker can write a valid
+#: registration.claim the FIRST time instead of learning the keys only after an engine failure.
+JUDGE_REQUEST_SCHEMA = (
+    "judge_request.json は JSON オブジェクトで、必須キー: claim_id (空でない文字列・パス区切りを"
+    "含まない), data_location (データファイルの絶対パスまたは出力フォルダからの相対パス), "
+    "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
+    "manifest {path: manifest を書き出す JSON ファイルのパス (フォルダ不可), dataset_id: 文字列, "
+    "result: 解析結果そのものを表す JSON オブジェクト (パス文字列ではない。例 "
+    '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
+    ")}; "
+    "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
+    "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}。"
+    "入力の無いセクションは省略する(空の値で埋めない)。\n"
+    "判定エンジンを走らせるには、claim_id の claim がエンジンに事前登録(configs/<claim_id>.json)"
+    "されているか、さもなければ registration セクションに claim_id と同じ id を持つ claim を入れる"
+    "こと。どちらも無いとエンジンは走らず『registered claim not found』になる。\n\n"
+    + _ENGINE_CLAIM_SCHEMA_HINT
 )
 
 
@@ -462,20 +481,35 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         if registered_claim is not None:
             gap = engine_claim_schema_gap(registered_claim)
             if gap:
-                gap_msg = (
-                    "judge engine would return INPUT_MISSING_KEY: registration.claim is missing "
-                    "the engine-required key(s) %s. %s" % (", ".join(gap), _ENGINE_CLAIM_SCHEMA_HINT))
+                # The FIRST correction (correction_attempt == 0) carries the full key list with
+                # shapes (_ENGINE_CLAIM_SCHEMA_HINT) and the whole request schema. A SECOND or later
+                # correction (the worker has already seen all that, in this message AND in the
+                # initial instruction) names ONLY the keys STILL missing and drops the long schema:
+                # shorter, and pointed at the remaining gap rather than repeating known bytes.
+                first_turn = correction_attempt < 1
+                if first_turn:
+                    gap_msg = (
+                        "judge engine would return INPUT_MISSING_KEY: registration.claim is missing "
+                        "the engine-required key(s) %s. %s"
+                        % (", ".join(gap), _ENGINE_CLAIM_SCHEMA_HINT))
+                    gap_schema = JUDGE_REQUEST_SCHEMA
+                else:
+                    gap_msg = (
+                        "judge engine would return INPUT_MISSING_KEY: "
+                        + _engine_claim_missing_keys_line(gap))
+                    gap_schema = ""
                 statuses.append("engine: not run: registration.claim missing engine keys: %s"
                                 % ", ".join(gap))
                 corrections.append(gap_msg)
                 if want_correction and correction_attempt < int(correction_budget):
                     detail = ("judge: request invalid (attempt %d/%d)\n" % (
                                   correction_attempt + 1, int(correction_budget))
-                              + "- " + gap_msg + "\n\n" + JUDGE_REQUEST_SCHEMA)
+                              + "- " + gap_msg
+                              + (("\n\n" + gap_schema) if gap_schema else ""))
                     _record_correction(output_folder, claim_id=claim_id,
                                        attempt=correction_attempt + 1, messages=[gap_msg])
                     return _ret(True, detail, {"messages": [gap_msg],
-                                               "schema": JUDGE_REQUEST_SCHEMA,
+                                               "schema": gap_schema,
                                                "attempt": correction_attempt + 1})
         verdict = run_engine_judge(claim_id, data_location=data_location, fetched_at=fetched_at,
                                    registered_claim=registered_claim,
