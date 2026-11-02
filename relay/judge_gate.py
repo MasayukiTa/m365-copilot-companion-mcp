@@ -108,11 +108,111 @@ JUDGE_REQUEST_SCHEMA = (
     "judge_request.json は JSON オブジェクトで、必須キー: claim_id (空でない文字列・パス区切りを"
     "含まない), data_location (データファイルの絶対パスまたは出力フォルダからの相対パス), "
     "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
-    "manifest {path: 文字列, dataset_id: 文字列, result: オブジェクト}; "
+    "manifest {path: manifest を書き出す JSON ファイルのパス (フォルダ不可), dataset_id: 文字列, "
+    "result: 解析結果そのものを表す JSON オブジェクト (パス文字列ではない。例 "
+    '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
+    ")}; "
     "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
     "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}。"
-    "入力の無いセクションは省略する(空の値で埋めない)。"
+    "入力の無いセクションは省略する(空の値で埋めない)。\n"
+    "判定エンジンを走らせるには、claim_id の claim がエンジンに事前登録(configs/<claim_id>.json)"
+    "されているか、さもなければ registration セクションに claim_id と同じ id を持つ claim を入れる"
+    "こと。どちらも無いとエンジンは走らず『registered claim not found』になる。"
 )
+
+
+#: The keys the frozen engine's claim loader REQUIRES (validity/claim.py REQUIRED_KEYS plus
+#: `assumptions`, which claim_schema.json also marks required and whose absence the engine
+#: reports as INPUT_ASSUMPTION_UNDECLARED). Mirrored here because the engine is READ-ONLY and
+#: outside this repo; we never edit it. A worker-registered claim that lacks any of these makes
+#: the engine return verdict=ERROR with reason INPUT_MISSING_KEY (or INPUT_ASSUMPTION_UNDECLARED)
+#: BEFORE any analysis runs -- so when the request supplies the data but the claim is a free-text
+#: {id, statement, data_location} shape, we must name the exact missing keys to the worker rather
+#: than let the engine fail opaquely. We only screen for PRESENCE of the keys (the engine still
+#: owns all value validation); we never fabricate values for missing keys.
+_ENGINE_CLAIM_REQUIRED_KEYS = (
+    "id", "dataset_id", "data_kind", "response", "exposure", "hierarchy",
+    "lot_effect_model", "claim_type", "direction", "delta_min", "mode", "family",
+    "assumptions",
+)
+
+#: A data-free description of the shape each required engine-claim key expects, shown in a
+#: correction so the worker knows what to supply. No measurement values -- only the schema shape,
+#: taken from validity/claim_schema.json. The worker owns the real column names and levels (only
+#: the worker's analysis knows them); the harness never invents them.
+_ENGINE_CLAIM_SCHEMA_HINT = (
+    "判定エンジンに渡す registration.claim は自由文ではなく、次の必須キーを持つ構造化オブジェクト"
+    "である必要がある(値は解析者が実データの列名・水準から埋める。ハーネスは値を捏造しない): "
+    "id(文字列), dataset_id(文字列), data_kind(public|subsampled_public|semi_synthetic|synthetic|"
+    "negative_control), response{column:応答列名, type:continuous|binary|binomial_agg}, "
+    "exposure{column:曝露列名, kind:numeric|categorical, level:within_lot|between_lot, "
+    "contrast:{type:per_unit|range|levels, ...}}, hierarchy{unit_column:ロット列名}, "
+    "lot_effect_model(random_independent|fixed_or_correlated), claim_type(superiority|equivalence), "
+    "direction(positive|negative|either), delta_min{value:>0, scale:'standardized', rationale:文字列, "
+    "source:'preregistration'}, mode(confirmatory|exploratory), family{id:文字列, m:整数>=1}, "
+    "assumptions{distribution:文字列, balance:文字列}。lot_diagnosis の y/x/lot(ロット別の率・曝露・"
+    "ロット名)を既に出しているなら、同じロット列を hierarchy.unit_column に、曝露列を exposure.column "
+    "に対応させること。statement だけの自由文 claim ではエンジンは INPUT_MISSING_KEY になる。"
+)
+
+
+#: Keys that mark a claim as the worker's FREE-TEXT registration shape ({id, statement,
+#: data_location}) rather than an attempt at the engine's structured claim. We only screen a claim
+#: for the engine schema when it is unambiguously free-text: it carries one of these AND carries
+#: none of the engine's structured keys. A claim that already has any structured key (e.g.
+#: dataset_id, claim_type, response) is the worker's own attempt at the engine shape -- we pass it
+#: straight to the frozen engine, which owns all value validation and will itself report any
+#: remaining INPUT_MISSING_KEY. This keeps a minimal {id}-only claim (used by other harness tests)
+#: and a partially structured claim flowing to the engine unchanged, while the three real
+#: free-text folders (statement + data_location) are screened and corrected before the engine runs.
+_FREE_TEXT_CLAIM_MARKERS = ("statement", "data_location")
+
+
+def engine_claim_schema_gap(claim) -> list:
+    """Required engine-claim keys ABSENT from a FREE-TEXT `claim`, in schema order ([] otherwise).
+
+    Returns the missing engine keys ONLY for a claim that is unambiguously the worker's free-text
+    registration shape -- it has a free-text marker (statement/data_location) and NONE of the
+    engine's structured keys (beyond id). For any other claim (a minimal {id}, or one already
+    carrying structured keys) it returns [] so the claim flows to the frozen engine untouched; the
+    engine still owns all value validation and will itself report a genuine INPUT_MISSING_KEY.
+
+    PRESENCE check only -- never fabricates a value for a missing key. This exists so that when a
+    worker registers a free-text {id, statement, data_location} claim but DID supply the analysis
+    data (manifest.result, lot_diagnosis y/x/lot), the harness names the EXACT keys the engine
+    needs instead of surfacing an opaque INPUT_MISSING_KEY.
+    """
+    if not isinstance(claim, dict):
+        return []
+    structured = [k for k in _ENGINE_CLAIM_REQUIRED_KEYS
+                  if k != "id" and k in claim]
+    has_marker = any(k in claim for k in _FREE_TEXT_CLAIM_MARKERS)
+    if structured or not has_marker:
+        # already (partly) structured, or not a free-text claim: let the engine judge it.
+        return []
+    return [k for k in _ENGINE_CLAIM_REQUIRED_KEYS if k not in claim]
+
+
+def post_hoc_order_note(order_record) -> str:
+    """A plain, honest line for a post-hoc (late) registration, or '' when the order is fine.
+
+    A worker analyses data that already exists, so a registration recorded AFTER the data file's
+    mtime can never satisfy a pre-registration order check (order_ok=False). That is NOT an input
+    error: the engine's own rule classes a late registration as D_FAIL_LOCK_AFTER_DATA, which
+    CAPS the verdict at HOLD (it never makes it ERROR -- see README_engine '判定の順序'). We state
+    that plainly so the worker reads 'post-hoc (HOLD上限)' rather than mistaking it for a bug, and
+    we name what would make it valid without faking the order or weakening the engine.
+    """
+    if not isinstance(order_record, dict) or order_record.get("order_ok") is not False:
+        return ""
+    reg = order_record.get("registered_at")
+    mtime = order_record.get("data_file_mtime")
+    return (
+        "事後登録(post-hoc): 主張の登録時刻(%s)がデータファイルの更新時刻(%s)より後です。"
+        "既に存在するデータを解析しているため、事前登録の順序検査は原理的に通りません。"
+        "これは入力不備(ERROR)ではなく、エンジンの規則では事後登録=D_FAIL_LOCK_AFTER_DATA で"
+        "判定は最大でも HOLD(保留)に留まります。妥当にするには、データ取得より前に主張を登録・"
+        "ロックすること(事後にこの順序を偽装はしない)。" % (reg, mtime))
 
 
 def _short_type(value) -> str:
@@ -134,19 +234,40 @@ def _short_type(value) -> str:
     return type(value).__name__
 
 
-def _validate_manifest(manifest) -> str:
+#: A minimal, data-free example of a valid manifest.result object, shown in a correction so the
+#: worker sees the SHAPE expected (an analysis-result object) instead of a path string.
+_MANIFEST_RESULT_EXAMPLE = (
+    '{"n_lots": 6, "kasure_rate_by_lot": {"<lot>": 0.5}, '
+    '"top_correlation_vs_kasure": {"<feature>": 0.9}}')
+
+
+def _validate_manifest(manifest, output_folder="") -> str:
     """'' when the manifest section is usable; else a message naming the EXACT bad field, the
-    expected shape, and what was received (type/short value, never long data)."""
+    expected shape, and what was received (type/short value, never long data).
+
+    manifest.path is the JSON file the manifest is WRITTEN to -- never a directory. A worker that
+    puts the data folder there makes record_manifest open a directory for writing, which fails
+    with Errno 13; catching it here names the field and the mistake instead."""
     if "path" not in manifest or not isinstance(manifest.get("path"), str) or not manifest["path"].strip():
-        return ("manifest.path must be a non-empty string (the manifest file path), "
-                "got %s" % _short_type(manifest.get("path")))
+        return ("manifest.path must be a non-empty string (the JSON file the manifest is written "
+                "to), got %s" % _short_type(manifest.get("path")))
+    # The path must name a FILE to write, not an existing directory. Resolve it the same way the
+    # harness will (relative to output_folder) before asking the filesystem.
+    _mpath = manifest["path"]
+    if output_folder and not os.path.isabs(_mpath):
+        _mpath = os.path.join(output_folder, _mpath)
+    if os.path.isdir(_mpath):
+        return ("manifest.path must be a file to write the manifest JSON into, not a directory; "
+                "got a directory path %s. Point it at e.g. "
+                "'<output_folder>/manifest.json'." % _short_type(manifest.get("path")))
     if ("dataset_id" not in manifest or not isinstance(manifest.get("dataset_id"), str)
             or not manifest["dataset_id"].strip()):
         return ("manifest.dataset_id must be a non-empty string, got %s"
                 % _short_type(manifest.get("dataset_id")))
     if "result" not in manifest or not isinstance(manifest.get("result"), dict):
-        return ("manifest.result must be an object (the analysis result), got %s"
-                % _short_type(manifest.get("result")))
+        return ("manifest.result must be an object (the analysis result itself, NOT a path "
+                "string), got %s. Minimal valid example: result=%s"
+                % (_short_type(manifest.get("result")), _MANIFEST_RESULT_EXAMPLE))
     return ""
 
 
@@ -236,7 +357,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
             statuses.append("manifest: not run: %s" % msg)
             corrections.append(msg)
         else:
-            bad = _validate_manifest(manifest)
+            bad = _validate_manifest(manifest, output_folder)
             if bad:
                 statuses.append("manifest: not run: %s" % bad)
                 corrections.append(bad)
@@ -328,10 +449,67 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         if not (isinstance(registered_claim, dict)
                 and registered_claim.get("id") == claim_id):
             registered_claim = None
+        # WORKER CLAIM PRESENT BUT NOT IN THE ENGINE'S SHAPE. A worker that registers a free-text
+        # {id, statement, data_location} claim DID the analysis (manifest.result / lot_diagnosis),
+        # but the engine's claim loader needs a structured claim (REQUIRED_KEYS). Passing the
+        # free-text claim straight through makes the engine return verdict=ERROR / INPUT_MISSING_KEY
+        # with nothing saying which keys are missing. When there is NO human-pre-registered configs
+        # claim (that one wins and is already structured) and the worker's claim lacks required
+        # keys, name the EXACT missing keys and their shape to the worker -- within the correction
+        # budget -- instead of letting the engine fail opaquely. We never fabricate the values; the
+        # worker owns the real column names and levels. A configs-claim id (human pre-registered)
+        # is not screened here: run_engine_judge prefers it and it is already in the engine shape.
+        if registered_claim is not None:
+            gap = engine_claim_schema_gap(registered_claim)
+            if gap:
+                gap_msg = (
+                    "judge engine would return INPUT_MISSING_KEY: registration.claim is missing "
+                    "the engine-required key(s) %s. %s" % (", ".join(gap), _ENGINE_CLAIM_SCHEMA_HINT))
+                statuses.append("engine: not run: registration.claim missing engine keys: %s"
+                                % ", ".join(gap))
+                corrections.append(gap_msg)
+                if want_correction and correction_attempt < int(correction_budget):
+                    detail = ("judge: request invalid (attempt %d/%d)\n" % (
+                                  correction_attempt + 1, int(correction_budget))
+                              + "- " + gap_msg + "\n\n" + JUDGE_REQUEST_SCHEMA)
+                    _record_correction(output_folder, claim_id=claim_id,
+                                       attempt=correction_attempt + 1, messages=[gap_msg])
+                    return _ret(True, detail, {"messages": [gap_msg],
+                                               "schema": JUDGE_REQUEST_SCHEMA,
+                                               "attempt": correction_attempt + 1})
         verdict = run_engine_judge(claim_id, data_location=data_location, fetched_at=fetched_at,
                                    registered_claim=registered_claim,
                                    judge_folder=output_folder)
         engine_available = bool(verdict.get("engine_available", False))
+        # ENGINE COULD NOT FIND A CLAIM, AND THE WORKER CAN FIX THAT. When the engine did not run
+        # ONLY because no claim was found (no human-pre-registered configs/<id>.json AND the
+        # request carried no matching registration.claim), the worker CAN fix it by adding the
+        # claim to the request -- unlike a genuinely unavailable engine (root missing, timeout),
+        # which is not the worker's fault and is never sent back. We detect the fixable case from
+        # the structured signal run_engine_judge returns (claim_source is None with the
+        # 'registered claim not found' reason) rather than string-matching the whole message, and
+        # name EXACTLY what to send: a registration.claim whose id equals the request claim_id.
+        if (not engine_available and registered_claim is None
+                and isinstance(verdict, dict) and verdict.get("claim_source") is None
+                and str(verdict.get("unavailable_reason", "")).startswith(
+                    "registered claim not found")):
+            claim_msg = (
+                "judge engine did not run: no registered claim for id %r. Add a \"registration\" "
+                "section whose \"claim\" is an object with \"id\": %r (matching the request "
+                "claim_id) and \"registered_at\": an ISO 8601 time, plus \"root\": a registry "
+                "folder path. The harness passes that claim to the engine."
+                % (claim_id, claim_id))
+            statuses.append("engine: not run: %s" % verdict.get("unavailable_reason"))
+            if want_correction and correction_attempt < int(correction_budget):
+                detail = ("judge: request invalid (attempt %d/%d)\n" % (
+                              correction_attempt + 1, int(correction_budget))
+                          + "- " + claim_msg + "\n\n" + JUDGE_REQUEST_SCHEMA)
+                _record_correction(output_folder, claim_id=claim_id,
+                                   attempt=correction_attempt + 1, messages=[claim_msg])
+                return _ret(True, detail, {"messages": [claim_msg],
+                                           "schema": JUDGE_REQUEST_SCHEMA,
+                                           "attempt": correction_attempt + 1})
+            corrections.append(claim_msg)
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
                                     order_record=order_record)
@@ -435,6 +613,11 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
             and isinstance(order_record, dict) and order_record.get("registered_at")):
         claim_source = ("worker-registered via harness registry "
                         "(trusted registration time %s)" % order_record["registered_at"])
+    # A post-hoc (late) registration is surfaced as a FIRST-CLASS field in the durable record,
+    # not only inside the footer text, so a reader of judge_result.json sees order_ok=False was a
+    # post-hoc claim (engine rule: D_FAIL_LOCK_AFTER_DATA, HOLD cap) rather than mistaking it for
+    # the ERROR the engine returned for a separate reason (an unmapped claim). Never faked.
+    post_hoc = post_hoc_order_note(order_record)
     record = {
         "status": "requested",
         "claim_id": claim_id,
@@ -446,6 +629,7 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
                                else (verdict.get("unavailable_reason")
                                      if isinstance(verdict, dict) else None)),
         "order": order_record,
+        "post_hoc": post_hoc or None,
         "statuses": list(statuses),
         "footer": footer,
         "source": "harness",
@@ -682,6 +866,12 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
             "登録→ロックの順序: order_ok=%s (registered_at=%s, data_fetched_at=%s)" % (
                 order_record.get("order_ok"), order_record.get("registered_at"),
                 order_record.get("data_fetched_at")))
+        # Post-hoc (late) registration is NOT an input error: state plainly that the order check
+        # cannot pass for data that already existed, that the engine's own rule caps such a claim
+        # at HOLD (D_FAIL_LOCK_AFTER_DATA), and what would make it valid -- without faking order.
+        _ph = post_hoc_order_note(order_record)
+        if _ph:
+            lines.append(_ph)
     if not engine_available or not verdict:
         reason = unavailable_reason or (
             verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"

@@ -1615,6 +1615,11 @@ function Invoke-TunnelHostingCheck {
         $localPid = Get-HealthPidAt "http://127.0.0.1:$Port/health" 5000
         $tunnelPid = Get-TunnelServerPidBounded
     }
+    # TRACK HOW LONG OUR READER HAS GONE WITHOUT A RELAY, so Start-TunnelHost's duplicate-launch
+    # guard can tell "reconnecting" (wait) from "wedged past 180s" (replace). A reader of ours is
+    # alive when Test-OurTunnelHostRunning says so; this is cheap and reads only $script:TunnelHostProc
+    # plus the devtunnel process table it already consults.
+    Update-ReaderRelayGap -Connections $conn -ReaderAlive (Test-OurTunnelHostRunning)
     $state = Resolve-TunnelHostingState -Connections $conn -OurHostRunning $ourHost `
                                         -LocalPid $localPid -TunnelPid $tunnelPid `
                                         -ProbeOutcome $script:TunnelProbeOutcome -PreviousState $script:TunnelState
@@ -2144,7 +2149,128 @@ function Ensure-DiskSeries {
     }
 }
 
+# -- NEVER TWO READERS FOR ONE TUNNEL (2026-11-02) --------------------------------------------
+# Measured 2026-11-02: a <1 min outbound network drop at 07:34 made the reader started at 21:23
+# (python -m relay.tunnel_host_log, a supervisor child) lose its relay connection; it was
+# retrying with its OWN backoff. The supervisor's "tunnel host connections = 0 (4/4)" rule then
+# fired at 07:34:52 and Start-TunnelHost launched a SECOND reader WITHOUT stopping the first.
+# Two devtunnel hosts for one tunnel took each other's relay session ("Connection lost" in a
+# loop) and the gateway answered 502/timeouts from ~07:34 to ~07:41. The fix: before launching,
+# look for an existing reader; if one is alive and still inside its own measured reconnect
+# window, DO NOT launch another -- wait for its backoff to recover the relay. Only a reader that
+# has been alive but without a relay connection for longer than RECONNECT_GRACE_SECONDS (180s,
+# justified in scripts/supervisor_host_launch.py) is treated as wedged, torn down tree-first,
+# and replaced by exactly one new reader.
+#
+# HOW LONG WITHOUT A RELAY is tracked here, not guessed: Update-ReaderRelayGap is called every
+# tunnel-hosting tick with the live "host connections" count and whether a reader of ours is
+# alive. It stamps the first moment the count hit 0 while a reader was alive, and clears it the
+# moment a connection returns or no reader is alive. Start-TunnelHost reads that stamp to tell
+# the pure decider how long the current reader has gone without a relay.
+$script:ReaderNoRelaySince = $null
+
+function Update-ReaderRelayGap {
+    # Maintain $script:ReaderNoRelaySince: the UTC time our reader first went to 0 relay
+    # connections while alive, or $null when it has a relay (or no reader of ours is alive).
+    param([Nullable[int]]$Connections, [bool]$ReaderAlive)
+    if (-not $ReaderAlive) { $script:ReaderNoRelaySince = $null; return }
+    $hasRelay = ($null -ne $Connections -and [int]$Connections -ge 1)
+    if ($hasRelay) { $script:ReaderNoRelaySince = $null; return }
+    if ($null -eq $script:ReaderNoRelaySince) { $script:ReaderNoRelaySince = [DateTime]::UtcNow }
+}
+
+function Get-ReaderSecondsWithoutRelay {
+    # Seconds the current reader has been alive without a relay connection, or $null when it
+    # cannot be told (never recorded a gap). Passed straight to the pure decider.
+    if ($null -eq $script:ReaderNoRelaySince) { return $null }
+    return [int]([DateTime]::UtcNow - [datetime]$script:ReaderNoRelaySince).TotalSeconds
+}
+
+function Get-ExistingTunnelReaders {
+    # The relay.tunnel_host_log readers for THIS tunnel that are alive right now, as
+    # @{ Pid; CommandLine } records. Command-line match: a python process whose arguments name
+    # relay.tunnel_host_log (module form or path form) AND this tunnel's bare name as a token --
+    # so "abc" does not claim "abc-2". The reader this supervisor launched ($script:TunnelHostProc)
+    # is included even if its command line cannot be read.
+    param([string]$Name)
+    $bare = Get-BareTunnelName $Name
+    $out = @()
+    $trackedPid = 0
+    if ($script:TunnelHostProc) {
+        try { $script:TunnelHostProc.Refresh(); if (-not $script:TunnelHostProc.HasExited) { $trackedPid = $script:TunnelHostProc.Id } } catch { }
+    }
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue)) {
+        $cl = [string]$p.CommandLine
+        if (-not $cl) { continue }
+        if ($cl -notmatch '(?i)relay[\\/.]tunnel_host_log') { continue }
+        if ($bare -and ($cl -notmatch ('(?i)\s"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))) { continue }
+        $out += @{ Pid = [int]$p.ProcessId; CommandLine = $cl }
+    }
+    if ($trackedPid -and -not (@($out | Where-Object { $_.Pid -eq $trackedPid }).Count)) {
+        $out += @{ Pid = $trackedPid; CommandLine = "(the reader this supervisor launched)" }
+    }
+    return @($out)
+}
+
+function Stop-TunnelReaderTree {
+    # Stop a reader process AND its devtunnel host child(ren). The reader (relay.tunnel_host_log)
+    # spawns `devtunnel -v host <name>`; stopping the reader alone can orphan that host, which is
+    # the very process that holds the relay session. So stop the devtunnel children first, then
+    # the reader. Only children whose own command line hosts THIS tunnel are touched -- never a
+    # user's interactive `devtunnel login` or an unrelated tunnel (see Start-TunnelHost's note).
+    param([int]$ReaderPid, [string]$Name)
+    if (-not $ReaderPid -or $ReaderPid -le 0) { return }
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.ParentProcessId -eq $ReaderPid -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) })) {
+        Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $ReaderPid -Force -ErrorAction SilentlyContinue
+}
+
+function Invoke-HostLaunchDecision {
+    # PURE DECIDER, reached the same way the other supervisor gates reach their Python deciders
+    # (& $Py -c with the module and function both named, so tools/unreached.py credits the
+    # cross-language caller): "wait" or "replace" from (reader alive, seconds without relay).
+    # Any failure returns "" so the caller can fall back to its old behaviour rather than wedge.
+    param([bool]$ReaderAlive, $SecondsWithoutRelay)
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    $secArg = if ($null -eq $SecondsWithoutRelay) { "None" } else { ([string][int]$SecondsWithoutRelay) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_host_launch; print(supervisor_host_launch.decide_host_launch($aliveArg, $secArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
 function Start-TunnelHost {
+    # NEVER TWO READERS FOR ONE TUNNEL. Before stopping or launching anything, look for an
+    # existing reader of this tunnel. If one is alive and the pure decider says "wait", log that
+    # the host is reconnecting and return WITHOUT launching a second reader (see the block above
+    # Update-ReaderRelayGap and scripts/supervisor_host_launch.py). Only "replace" (no reader, or
+    # one wedged past the 180s reconnect window) proceeds to stop the old reader tree and launch
+    # exactly one new reader.
+    $existingReaders = @(Get-ExistingTunnelReaders $TunnelName)
+    if ($existingReaders.Count -gt 0) {
+        $waited = Get-ReaderSecondsWithoutRelay
+        $decision = Invoke-HostLaunchDecision -ReaderAlive $true -SecondsWithoutRelay $waited
+        if ($decision -eq "wait") {
+            $waitedStr = if ($null -eq $waited) { "0" } else { ([string]$waited) }
+            foreach ($r in $existingReaders) {
+                Write-Log ("reader pid $($r.Pid) still running, host reconnecting (waited $waitedStr s)")
+            }
+            return $false
+        }
+        # "replace" (or "" fallback / wedged): tear down every existing reader tree first, so
+        # exactly one reader exists after this function -- the one launched below.
+        foreach ($r in $existingReaders) {
+            Write-Log ("replacing reader pid $($r.Pid): alive but no relay for " +
+                       $(if ($null -eq $waited) { "an unknown time" } else { "$waited s (> 180s)" }) +
+                       " -- stopping its tree before launching one new reader")
+            Stop-TunnelReaderTree -ReaderPid $r.Pid -Name $TunnelName
+        }
+        $script:ReaderNoRelaySince = $null
+    }
     # Stop only OUR stale host process(es) -- those whose command line is
     # `devtunnel host <TunnelName>`. NEVER `Get-Process devtunnel | Stop-Process`: that
     # reaps a user's interactive `devtunnel login` (the very command that authenticates
