@@ -120,6 +120,7 @@ jobs:
             tests/test_unlock_oracle.py \
             tests/test_search_deadline.py \
             tests/test_env_example_states_standard_tunnel_effect.py \
+            tests/test_sessions_search_migration.py \
             tools/test_child_env_credentials.py \
             tools/test_childproc_timeout_kills_tree_no_thread_leak.py \
             tools/test_ocr_native_thread_leak.py \
