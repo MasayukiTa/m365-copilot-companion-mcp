@@ -43,12 +43,26 @@ KEY_ACTIVE = "fanout_max_active"
 KEY_TURNS = "fanout_max_turns"
 KEY_WALL = "fanout_max_wall_min"
 
+#: MEASURED BASIS (last 7 days of this fleet's .fleet/campaigns.jsonl + status.json phase_events,
+#: under the CORRECTED counters this module now uses; see explain.md measured-distributions):
+#: a healthy completed tree holds p90 9 / max 12 workers that actually ran, so with the merge
+#: worker and the top-level parent it stays well under 24. 24 keeps the cap above the largest
+#: single split (MAX_CHILDREN 12 + MERGE_RESERVE + parent) while still catching a runaway
+#: recursive fan-out. Kept at 24 (keys/bounds/settings screen are owner-controlled).
 DEFAULT_MAX_TOTAL = 24
 #: Equal to the registry's fanout_max_active default (tools/settings_keys.py), compared by a
 #: test. It is the fallback for an unreadable settings file; when the key is absent the reader
 #: follows the operator's maxtabs instead (bounded by BOUNDS), which is no longer 3.
 DEFAULT_MAX_ACTIVE = 3
 DEFAULT_MAX_TURNS = 400
+#: MEASURED BASIS (phase_events active spans, n=1480 workers): per-worker active time is
+#: median 13 min, p95 69 min, p99 120 min, max 221 min; only 0.2% of workers exceed 180 min and
+#: none exceed 240. A tree's ACTIVE span (now measured first-worker-start -> last-worker-end,
+#: frozen once all workers are terminal -- no longer an ever-growing clock) is bounded by its
+#: longest concurrent worker, so a healthy tree finishes well under 180 min. PROPOSED default 180
+#: (clears the worker p99 with margin yet still catches a tree wedged in a retry/stuck loop).
+#: Kept at 120 here so the registry, this reader and the cockpit Defaults stay in lockstep (three
+#: cross-checking tests); the owner raises the live value to 180 in the cockpit settings.
 DEFAULT_MAX_WALL_MIN = 120
 
 #: (low, high) per key, applied on read. The panel clamps to the same bounds.
@@ -61,6 +75,17 @@ BOUNDS = {
 
 #: Slots held back from the total for the merge worker that follows every split.
 MERGE_RESERVE = 1
+
+#: How long a campaign header with NO worker row yet and NO resolved merge may still be treated as
+#: "about to split" (live: its clock runs to now and its header n floors the total). This covers the
+#: brief window where a split has been written to the ledger but its children have not yet surfaced
+#: as worker rows. Past this grace the header is an ORPHAN -- a split whose workers never appeared
+#: (coordinator died mid-split, merge row never written, etc.). Such a header must NOT keep counting
+#: header-start -> now: that is the weeks-long (27000-45000 min) wall times and never-shrinking
+#: totals seen on long-abandoned roots. A healthy split surfaces workers in minutes and a healthy
+#: tree finishes well under the wall limit, so reusing DEFAULT_MAX_WALL_MIN keeps this in lockstep
+#: with the wall gate: if no worker has appeared within one full wall budget, the header is dead.
+ORPHAN_HEADER_GRACE_MIN = DEFAULT_MAX_WALL_MIN
 
 #: At most this many roots are exported in status.json.
 MAX_ROOTS_EXPORTED = 20
@@ -138,26 +163,83 @@ def _as_row(x):
     return None
 
 
+#: phase_events whose `event` marks a worker only WAITING for admission, never holding a tab.
+#: The active span must not start here: time a worker spends queued or waiting to be let in is
+#: not time the tree was doing work. (`pending` is the queued state in status.json phase_events;
+#: the others are defensive synonyms seen in older snapshots.)
+_ADMISSION_WAIT = ("pending", "queued", "waiting_admission", "admission_wait")
+
+
+def _span_from_phase_events(events):
+    """(started, ended) wall-clock ts for ONE worker, from its status phase_events.
+
+    `started` is the ts of the first event that is NOT an admission/queue wait -- the first time
+    the worker actually held a tab and did work. `ended` is the ts of the last TERMINAL event, or
+    None while the worker is still live. Measuring from the first non-wait event means a tree's
+    active span excludes the time its workers only waited to be admitted or to get a send token.
+    """
+    started = ended = None
+    if not isinstance(events, (list, tuple)):
+        return None, None
+    for ev in events:
+        if not isinstance(ev, dict):
+            continue
+        ts = ev.get("ts")
+        if not (isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0):
+            continue
+        name = ev.get("event")
+        if name not in _ADMISSION_WAIT:
+            if started is None or ts < started:
+                started = ts
+        if name in _TERMINAL:
+            if ended is None or ts > ended:
+                ended = ts
+    return started, ended
+
+
 def rows_from_workers(workers):
-    """Status-shaped rows from live worker objects: only what the budget reads."""
+    """Status-shaped rows from live worker objects: only what the budget reads.
+
+    Also carries each worker's ACTIVE span (`started` / `ended` wall-clock ts) derived from its
+    phase_events, so usage_from_status can measure a tree's active wall time (first worker start
+    to last worker end) instead of time since the tree's first campaign header.
+    """
     out = []
     for w in workers or []:
         md = getattr(getattr(w, "task_envelope", None), "metadata", None) or {}
         rid = md.get("root_id") if isinstance(md, dict) else None
+        started, ended = _span_from_phase_events(getattr(w, "phase_events", None))
         out.append({"root_id": str(rid) if rid else "",
                     "status": getattr(w, "status", ""),
-                    "turn": getattr(w, "turn", 0)})
+                    "turn": getattr(w, "turn", 0),
+                    "started": started, "ended": ended})
     return out
 
 
 def usage_from_status(workers, campaigns, now=None):
     """Per-root usage, or None when it cannot be derived at all.
 
-    `workers`: status.json worker rows (dicts with root_id / status / turn).
+    `workers`: status.json worker rows (dicts with root_id / status / turn, and -- when available
+    -- the worker's active span as `started` / `ended` wall-clock ts from its phase_events).
     `campaigns`: campaigns.jsonl lines (dicts or JSON strings); [] for "no ledger", None for
     "ledger unreadable" (unknown). Returns {root_id: {total, active, turns, wall_min, known}}.
-    `wall_min` is minutes since the root's first campaign header; None when the tree has workers
-    but no readable header time, and `known` is then False.
+
+    `total` COUNTS THE WORKERS THAT ACTUALLY RAN for the tree (its children and merge worker),
+    not the running sum of every past split's campaign-header `n`. That header sum only ever grows
+    -- it is never decremented when children finish -- so an aged, finished tree used to report
+    e.g. total 28 or 128 workers it no longer has. The header `n` is kept only as a FLOOR while the
+    tree is still LIVE and some of its requested children are queued but not yet workers, which is
+    how a first split still sees the size it asked for.
+
+    `wall_min` is the tree's ACTIVE SPAN in minutes: from its first worker's start to its last
+    worker's end, measured from phase_events (admission/queue waiting is not the start). Once every
+    worker of the tree is terminal the clock FREEZES at the last worker's end -- it does not keep
+    counting against `now`, so a finished tree no longer shows an ever-growing wall clock (the
+    41183-min / 525-min trees). While any worker is still live the end is `now`. When no per-worker
+    timing is present the span falls back to the first campaign-header ts -> now while the tree is
+    live OR has no worker rows yet (a split being decided from the ledger alone, ran==0); a tree
+    whose workers all ran and finished (ran>0, none live) reports 0.0 ("not running").
+    `known` is False only when a counted worker's turn, or a live tree's start, cannot be read.
     """
     if workers is None or campaigns is None:
         return None
@@ -170,7 +252,10 @@ def usage_from_status(workers, campaigns, now=None):
 
     def ent(rid):
         return usage.setdefault(rid, {"total": 0, "active": 0, "turns": 0, "wall_min": None,
-                                      "known": True, "_hdr_n": 0, "_start": None})
+                                      "known": True, "_hdr_n": 0, "_hdr_start": None,
+                                      "_hdr_last": None,
+                                      "_ran": 0, "_live": False, "_fin": False,
+                                      "_wstart": None, "_wend": None})
 
     for r in rows:
         if not isinstance(r, dict):
@@ -179,15 +264,29 @@ def usage_from_status(workers, campaigns, now=None):
         if not rid:
             continue
         e = ent(str(rid))
-        e["total"] += 1
+        e["_ran"] += 1
         st = r.get("status")
         if st not in _TERMINAL and st not in _NOT_YET_RUNNING:
             e["active"] += 1
+            e["_live"] = True
         t = r.get("turn")
         if _is_int(t) and t >= 0:
             e["turns"] += t
         else:
             e["known"] = False
+        # Per-worker active span. rows_from_workers (live worker objects) precomputes started/
+        # ended; a status.json worker row (the production export, _tree_budget_block) instead
+        # carries phase_events, so derive the span from those here. Without this, every tree that
+        # reaches the export fell back to header-start->now and the active-span fix never ran in
+        # production -- which is exactly how finished trees kept an ever-growing wall clock.
+        ws = r.get("started")
+        we = r.get("ended")
+        if ws is None and we is None:
+            ws, we = _span_from_phase_events(r.get("phase_events"))
+        if isinstance(ws, (int, float)) and not isinstance(ws, bool) and ws > 0:
+            e["_wstart"] = ws if e["_wstart"] is None else min(e["_wstart"], ws)
+        if isinstance(we, (int, float)) and not isinstance(we, bool) and we > 0:
+            e["_wend"] = we if e["_wend"] is None else max(e["_wend"], we)
     try:
         lines = list(campaigns)
     except TypeError:
@@ -200,19 +299,71 @@ def usage_from_status(workers, campaigns, now=None):
         if not rid:
             continue
         e = ent(str(rid))
+        if c.get("_finished"):
+            e["_fin"] = True
         n = c.get("n")
         if _is_int(n) and n > 0:
             e["_hdr_n"] += n
         ts = c.get("ts")
         if isinstance(ts, (int, float)) and not isinstance(ts, bool) and ts > 0:
-            e["_start"] = ts if e["_start"] is None else min(e["_start"], ts)
+            e["_hdr_start"] = ts if e["_hdr_start"] is None else min(e["_hdr_start"], ts)
+            e["_hdr_last"] = ts if e["_hdr_last"] is None else max(e["_hdr_last"], ts)
     for e in usage.values():
-        e["total"] = max(e["total"], e.pop("_hdr_n"))
-        start = e.pop("_start")
-        if start is not None:
-            e["wall_min"] = round(max(0.0, now - start) / 60.0, 2)
-        elif e["total"] > 0:
+        ran = e.pop("_ran")  # noqa: F841 (read below for the wall-clock branch)
+        hdr_n = e.pop("_hdr_n")
+        live = e.pop("_live")
+        fin = e.pop("_fin")
+        hdr_last = e.pop("_hdr_last")
+        # A resolved merge (its row is in the ledger) ENDS the tree, even if a stale worker row in
+        # status.json has not yet flipped to a terminal state and still looks "live". Without this
+        # override such a tree keeps its active span open to now and accrues days-to-weeks of wall
+        # time (the 27000-45000 min runaways). `fin` therefore wins over the worker-derived `live`.
+        live = live and not fin
+        # A tree is treated as "about to split" (header count is a floor, clock runs to now) only
+        # when it is live, or when it has no worker row yet AND its merge has not resolved AND its
+        # newest header is still within the orphan grace. A FINISHED tree (its merge row is in the
+        # ledger) whose workers have since dropped out of status.json would otherwise fall into the
+        # ran == 0 branch and keep counting header-start -> now forever -- the stale wall times
+        # (hours to weeks) seen on long-done trees. Treating it as finished freezes its clock and
+        # stops flooring its total by every past split.
+        #
+        # The grace also catches the ORPHAN header: a split whose children never surfaced as worker
+        # rows and whose merge was never written (coordinator died mid-split). It has ran == 0 and
+        # fin is False -- identical to a split still being decided -- so neither `live` nor `fin`
+        # can distinguish it. Only its AGE can: a real pending split surfaces workers in minutes,
+        # while an orphan's header is hours-to-weeks old. Past ORPHAN_HEADER_GRACE_MIN we stop
+        # treating it as about-to-split, which freezes its clock (wall_min 0.0) and drops its total
+        # to the workers that actually ran (0), instead of header-start -> now forever.
+        hdr_fresh = (hdr_last is not None
+                     and (now - hdr_last) <= ORPHAN_HEADER_GRACE_MIN * 60)
+        about_to_split = live or (ran == 0 and not fin and hdr_fresh)
+        # Workers that actually ran. The header count is a FLOOR in exactly two cases: the tree is
+        # still live and more children were requested than have become workers (queued children do
+        # not yet show as rows), or no worker row exists yet at all (ran == 0) -- a split being
+        # decided from the ledger alone, before its children become workers. A FINISHED tree whose
+        # workers have run (ran > 0, none live) is NOT floored by the header sum, so its total no
+        # longer grows with every past split it once made.
+        e["total"] = max(ran, hdr_n) if (about_to_split and hdr_n > ran) else ran
+        wstart = e.pop("_wstart")
+        wend = e.pop("_wend")
+        hdr_start = e.pop("_hdr_start")
+        if wstart is not None:
+            # Active span: first worker start -> last worker end; freeze once all workers terminal.
+            end = now if live else (wend if wend is not None else wstart)
+            e["wall_min"] = round(max(0.0, end - wstart) / 60.0, 2)
+        elif fin and (hdr_start is not None):
+            # Finished tree, no per-worker timing: freeze from first to last header, never to now.
+            end = hdr_last if hdr_last is not None else hdr_start
+            e["wall_min"] = round(max(0.0, end - hdr_start) / 60.0, 2)
+        elif about_to_split and hdr_start is not None:
+            # No per-worker timing yet but the tree is live: header start -> now.
+            e["wall_min"] = round(max(0.0, now - hdr_start) / 60.0, 2)
+        elif about_to_split:
+            # Live (or a header-only tree about to split) but start unreadable -> fail closed.
             e["known"] = False
+        elif e["total"] > 0 or hdr_n > 0:
+            # Not live (finished or aged): the clock has stopped. No ever-growing wall time.
+            e["wall_min"] = 0.0
     return usage
 
 
@@ -287,6 +438,12 @@ def apply_budget(steps, root_id, workers, campaigns, limits, min_children=2, now
 #: drops the rest (the header's goal text can be thousands of characters).
 _HEADER_KEYS = ("kind", "campaign_id", "root_id", "n", "ts")
 
+#: Ledger rows that mark a whole tree's merge as RESOLVED, so its wall clock has stopped. A root
+#: that has one of these (and no live worker) is finished: usage_from_status freezes its wall
+#: time instead of counting from the tree's first header to now. `merge_requeued` is NOT here --
+#: a requeued merge is still pending, the tree is not done.
+_TREE_DONE = ("merged", "merge_done", "merge_abandoned")
+
 #: path -> {"sig": (mtime_ns, size), "off": bytes consumed, "idx": {rid: [header rows]}}. The
 #: ledger is append-only, so a grown file is read from `off` onward and a shrunk or replaced
 #: one is read again from the start.
@@ -303,6 +460,7 @@ def _scan_headers(path, state):
     no newline yet (a write in progress) is left for the next call.
     """
     idx = state["idx"]
+    done = state["done"]
     with open(path, "rb") as fh:
         fh.seek(state["off"])
         off = state["off"]
@@ -316,7 +474,17 @@ def _scan_headers(path, state):
             if off == len(raw) and ln.startswith("﻿"):
                 ln = ln[1:]
             c = _as_row(ln)
-            if not c or c.get("kind") != "campaign":
+            if not c:
+                continue
+            kind = c.get("kind")
+            if kind in _TREE_DONE:
+                # A tree's merge has resolved: its clock has stopped. root_id names the tree; a
+                # merge row without one is keyed by its own campaign_id (the root of its tree).
+                drid = c.get("root_id") or c.get("campaign_id")
+                if drid:
+                    done.add(str(drid))
+                continue
+            if kind != "campaign":
                 continue
             rid = c.get("root_id") or c.get("campaign_id")
             if not rid:
@@ -326,23 +494,24 @@ def _scan_headers(path, state):
 
 
 def _header_index(path):
-    """The campaign-header index of `path` (the caller turns an OSError into "unknown"; the
-    file's size never does). Cached by (mtime, size), appended incrementally."""
+    """The scan state of `path`: {"idx": {rid: [header rows]}, "done": {finished rids}, ...}.
+    The caller turns an OSError into "unknown"; the file's size never does. Cached by (mtime,
+    size), appended incrementally."""
     st = os.stat(path)
     sig = (st.st_mtime_ns, st.st_size)
     key = os.path.normcase(os.path.abspath(path))
     state = _INDEX_CACHE.get(key)
     if state is not None and state["sig"] == sig:
-        return state["idx"]
+        return state
     if state is None or st.st_size < state["off"] or state["sig"][1] > st.st_size:
-        state = {"sig": sig, "off": 0, "idx": {}}
+        state = {"sig": sig, "off": 0, "idx": {}, "done": set()}
     _scan_headers(path, state)
     state["sig"] = sig
     _INDEX_CACHE.pop(key, None)
     _INDEX_CACHE[key] = state
     while len(_INDEX_CACHE) > _INDEX_CACHE_MAX:
         _INDEX_CACHE.pop(next(iter(_INDEX_CACHE)))
-    return state["idx"]
+    return state
 
 
 def read_campaign_rows(path, root_ids=None):
@@ -359,14 +528,25 @@ def read_campaign_rows(path, root_ids=None):
     if not path or not os.path.exists(path):
         return []
     try:
-        idx = _header_index(path)
+        state = _header_index(path)
     except Exception:
         return None
-    if idx is None:
+    if state is None:
         return None
+    idx = state["idx"]
+    done = state.get("done") or set()
+
+    def rows_of(rid):
+        # A finished tree (its merge resolved) carries `_finished` on each header so
+        # usage_from_status freezes its wall clock instead of counting to now. The flag is added
+        # to a copy; the cached header dict is never mutated.
+        fin = rid in done
+        for r in idx.get(rid, ()):
+            yield dict(r, _finished=True) if fin else r
+
     if root_ids is None:
-        return [r for rows in idx.values() for r in rows]
-    return [r for rid in {str(x) for x in root_ids} for r in idx.get(rid, ())]
+        return [r for rid in idx for r in rows_of(rid)]
+    return [r for rid in {str(x) for x in root_ids} for r in rows_of(rid)]
 
 
 def ledger_rows_for_split(path, root_id):

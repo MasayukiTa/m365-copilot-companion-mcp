@@ -72,6 +72,13 @@ static class EffortPolicyHarness
                         gobj as Dictionary<string, object>, Bool(c, "ja"), out lv);
                     r["level"] = lv;
                 }
+                else if (op == "group_overlimit")
+                {
+                    object gobj, robj;
+                    c.TryGetValue("group", out gobj); c.TryGetValue("root", out robj);
+                    r["text"] = GroupTreeView.OverLimitNote(robj as Dictionary<string, object>,
+                        gobj as Dictionary<string, object>, Bool(c, "ja"));
+                }
                 else if (op == "group_bar")
                 {
                     int lv;

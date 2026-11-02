@@ -275,7 +275,8 @@ public static class FanoutBudgetView
             case 1: return ja ? "ツリーがさらに分割を求めるとき、同時に動いていてよいワーカー数"
                               : "Most of a tree's workers that may be running when it asks to split more";
             case 2: return ja ? "ツリー全体で使えるターン数の上限" : "Most conversation turns one tree may use";
-            case 3: return ja ? "ツリーの最初の分割からの経過分数の上限" : "Most minutes since a tree's first split";
+            case 3: return ja ? "ツリーのワーカーが実際に動いていた分数(実働時間)の上限。待ち時間は含めず、完了後は増えません"
+                              : "Most minutes a tree's workers actually run (active time); excludes queue waiting and stops climbing once the tree finishes";
         }
         return "";
     }
@@ -673,6 +674,41 @@ public static class GroupTreeView
         return FanoutBudgetView.ShortLabel(idx, ja) + " " + (long)used + " / " + (long)max;
     }
 
+    /// <summary>What reaching a cap ACTUALLY does, so a red bar is not read as "the tree was
+    /// blocked". The budget is consulted ONLY when a worker asks to split further
+    /// (relay/fanout_budget.py grant via relay_fleet _grant_children): over a cap it refuses only
+    /// the NEW children of that further split -- the worker then runs the goal itself. It never
+    /// stops the merge, a retry, or an already-running child, and an already-adopted family is not
+    /// charged. A finished tree (active 0) keeps its final numbers; its minutes no longer climb.
+    /// null unless some dimension is at or over its cap (same test as the bar's level 2).</summary>
+    public static string OverLimitNote(Dictionary<string, object> statusRoot, Dictionary<string, object> g,
+                                       bool ja)
+    {
+        if (g == null || Depth(g) != 0) return null;
+        var tb = Obj(statusRoot, "tree_budget");
+        var e = tb != null ? Obj(tb, Str(g, "root_id").Length > 0 ? Str(g, "root_id") : Str(g, "campaign_id")) : null;
+        if (e == null) return null;
+        var lim = Obj(e, "limits") ?? Obj(statusRoot, "fanout_budget");
+        bool over = false;
+        for (int i = 0; i < FanoutBudgetView.ReportKeys.Length; i++)
+        {
+            string k = FanoutBudgetView.ReportKeys[i];
+            if (!e.ContainsKey(k) || e[k] == null) continue;
+            double max = Num(lim, k, 0);
+            if (max > 0 && Num(e, k, 0) * 100 >= max * 100) { over = true; break; }
+        }
+        if (!over) return null;
+        object ac;
+        bool finished = e.TryGetValue("active", out ac) && ac != null && Num(e, "active", -1) == 0;
+        string note = ja
+            ? "上限到達: 次にさらに分割するときだけ新しい子を増やしません(親が自分で実行)。統合・再試行・実行中の子は止めません。"
+            : "At a cap: only a further split is refused new children (the parent runs the goal itself). It does not stop the merge, a retry, or a running child.";
+        if (finished)
+            note += ja ? " このツリーは完了済みで、数値は最終値のまま(分数はもう増えません)。"
+                       : " This tree has finished; the numbers are final and the minutes no longer climb.";
+        return note;
+    }
+
     /// <summary>The note when the coordinator applies a split depth below the configured one.</summary>
     public static string DepthNote(Dictionary<string, object> statusRoot, bool ja)
     {
@@ -691,8 +727,12 @@ public static class GroupTreeView
     {
         string b = BudgetText(statusRoot, g, ja, out level);
         string n = (g != null && Depth(g) == 0) ? DepthNote(statusRoot, ja) : null;
-        if (b == null) return n;
-        return n == null ? b : b + " / " + n;
+        string o = OverLimitNote(statusRoot, g, ja);
+        string tail = b;
+        if (tail == null) tail = n;
+        else if (n != null) tail = tail + " / " + n;
+        if (o != null) tail = tail == null ? o : tail + " / " + o;
+        return tail;
     }
 }
 
