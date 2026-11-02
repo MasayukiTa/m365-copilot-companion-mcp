@@ -6,6 +6,7 @@ from typing import Optional
 
 from ._subproc import sanitized_child_env
 from . import childproc
+from . import proc_registry
 from .file_ops import _validate_path
 from .security import require_unlocked
 from .shell_extra import _gate_detail
@@ -130,15 +131,8 @@ def run_python(
             f.write(code)
             tmp_path = f.name
 
-        result = subprocess.run(
-            [sys.executable, tmp_path],
-            capture_output=True,
-            timeout=timeout,
-            cwd=_working_dir(working_dir),
-            shell=False,
-            env=sanitized_child_env(),
-        )
-        return _format_output(result, "run_python")
+        return _run_python_tree(
+            [sys.executable, tmp_path], timeout, _working_dir(working_dir))
     except subprocess.TimeoutExpired:
         return f"[timeout: exceeded {timeout} seconds]"
     except Exception as e:
@@ -418,6 +412,12 @@ def _run_with_tree_timeout(command, timeout, cwd):
         env=sanitized_child_env(),
         **childproc.tree_popen_kwargs(headless=True),
     )
+    # ATTRIBUTE THE SPAWN TO THE WORKER (see _run_python_tree). A shell_exec child is a tree
+    # root too, so a worker that is closed/cancelled can reap it before any timeout.
+    try:
+        proc_registry.register(proc.pid, tool="shell_exec")
+    except Exception:
+        pass
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -440,6 +440,55 @@ def _run_with_tree_timeout(command, timeout, cwd):
 def _kill_tree(proc):
     """Compatibility wrapper around the repository-wide process-tree killer."""
     return childproc.kill_tree(proc, wait_s=5)
+
+
+def _run_python_tree(argv, timeout, cwd):
+    """Run a Python child as the root of a KILLABLE TREE, and register it to this worker.
+
+    WHY THIS REPLACED subprocess.run(timeout=). The old body called subprocess.run(timeout=N),
+    which on expiry kills only the DIRECT child -- so a snippet that did
+    `subprocess.Popen([...notepad...])` or launched a UIAutomation driver left a GRANDCHILD
+    alive that outlived the timeout, and (worse) outlived the worker itself. Measured
+    2026-11-02: closed/cancelled workers kept python.exe / powershell.exe running on the real
+    desktop for 20+ minutes. This drives Popen through childproc.tree_popen_kwargs() so a
+    timeout kills the WHOLE tree (the same fix shell_exec already had), and it registers the
+    child's pid with proc_registry so RelayWorker.close()/cancel() -- and the coordinator-start
+    sweep -- can kill the tree the moment the worker ends, long before any timeout.
+
+    stdin is DEVNULL for the same reason shell_exec closes it: a child that blocks on a prompt
+    nobody can answer is how a slow call becomes a permanent one.
+    """
+    proc = subprocess.Popen(
+        argv,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        stdin=subprocess.DEVNULL,
+        cwd=cwd,
+        env=sanitized_child_env(),
+        **childproc.tree_popen_kwargs(headless=True),
+    )
+    # ATTRIBUTE THE SPAWN TO THE WORKER, AT THE SOURCE. register() reads the worker from the
+    # ContextVar the gateway set for this call; outside a worker turn it is a no-op. Never
+    # raises into the tool.
+    try:
+        proc_registry.register(proc.pid, tool="run_python")
+    except Exception:
+        pass
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = b"", b""
+        raise
+
+    class _R(object):
+        pass
+    result = _R()
+    result.stdout, result.stderr, result.returncode = out, err, proc.returncode
+    return _format_output(result, "run_python")
 
 
 #: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
