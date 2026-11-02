@@ -83,8 +83,10 @@ _NUM_RE = re.compile(
 #: Ordered general-to-specific where it matters; applied as a batch in _mask_non_values.
 #: Evidence: two real FALSE positives this gate produced --
 #:   * "[ref:511e078026f6]" was read as the number 511 (citation tag + hex id);
-#:   * a "top 50" screening answer was read as the number 20 (a version/id token "v20"/"_v2 0"
-#:     and list scaffolding, not a statistic).
+#:   * a "top 50" screening answer was read as the number 20, which came from the prose
+#:     "中央值20倍差" -- a fold/times magnitude descriptor (N倍), not a reported, provenanced
+#:     statistic. A bare round integer glued to the Japanese multiplier unit 倍 is verbal
+#:     scale, not a measured value with a computation behind it.
 #: We mask citation tags, hex hashes/ids, file paths and names, dates and times, version
 #: strings, markdown list numbering and headings, and #-prefixed PR/issue numbers. Years are
 #: handled separately by range in extract_numbers. We do NOT mask bare decimals, percentages,
@@ -110,6 +112,13 @@ _MASK_RES = (
     re.compile(r"#\d+\b"),
     # Markdown list numbering / headings at line start: "1.", "2)", "  3. ".
     re.compile(r"(?m)^\s*\d+[.)]\s"),
+    # A fold/times magnitude written in prose with the Japanese multiplier unit 倍, e.g.
+    # "中央值20倍差", "約20倍": the number is a verbal scale descriptor, not a reported value
+    # with a computation behind it. This is the real source of the 20 false positive (job
+    # 3da486070941). Narrow by design: only a digit run glued directly to 倍 is masked, so
+    # decimals, percentages, CIs, p-values, and unit-bearing counts (lots/samples/ロット/件)
+    # are left in place to be policed.
+    re.compile(r"\d[\d,]*(?:\.\d+)?(?=\s*倍)"),
 )
 
 
