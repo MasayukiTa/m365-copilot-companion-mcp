@@ -1221,6 +1221,18 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             _cid = _ledger.record_call(name, _args, task=_task, worker=_worker)
         except Exception:
             _ledger = None
+        # BIND THE WORKER FOR ANY PROCESS THIS CALL SPAWNS. A tool that starts a child
+        # (run_python, shell_exec) records the child under this worker via tools.proc_registry,
+        # so RelayWorker.close()/cancel() -- and the coordinator-start sweep -- can kill the
+        # tree the moment the worker ends. Reset in the finally below so a later call on the
+        # same thread is not mis-attributed. Total: a failure here never stops the tool.
+        _worker_tok = None
+        if _worker:
+            try:
+                from tools import proc_registry as _pr
+                _worker_tok = _pr.set_worker(_worker)
+            except Exception:
+                _worker_tok = None
         # IN-FLIGHT VISIBILITY (issue #328 proposal 2). Registered the moment the call enters the
         # execute path and removed in the finally below, so a call that never returns stays
         # visible -- which is the whole point: the jams of 2026-10-27..28 were a call that had
@@ -1361,6 +1373,15 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 try:
                     from tools import exec_inflight as _inflight2
                     _inflight2.end(_inflight_token)
+                except Exception:
+                    pass
+            # UNBIND THE WORKER SET ABOVE, scoped to this call exactly like the token reset
+            # below: a worker left bound would attribute the next call's spawns to the wrong
+            # worker. reset is total -- a missing or already-reset token is ignored.
+            if _worker_tok is not None:
+                try:
+                    from tools import proc_registry as _pr2
+                    _pr2.reset_worker(_worker_tok)
                 except Exception:
                     pass
             # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
