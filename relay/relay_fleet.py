@@ -3624,13 +3624,18 @@ def _refute_fix_job(reason, attempt=1):
 
 
 #: How many times a PRESENT-but-INVALID judge_request.json is handed back to the worker to fix
-#: before completion is accepted anyway (or rejected under strict). Two, for the same reason the
-#: refuter budget is two: one turn to act on the first specific, field-named message, and one
-#: more in case the first rewrite still trips a (now different) named field -- beyond that a
-#: third turn has, in the refuter's measured history, almost never converged and mainly risks
-#: degrading the model with repetition. Counted PER JOB (self._judge_correction_attempt), so it
-#: cannot loop. An unavailable engine is never sent back; an absent request is never sent back.
-JUDGE_CORRECTION_BUDGET = 2
+#: before completion is accepted anyway (or rejected under strict). THREE (raised from two).
+#: MEASURED REASON (job 049c0d9b8ed4, 14:28): a worker that wrote registration.claim as free text
+#: had NEVER seen the engine-required claim keys; the first correction named them, but the second
+#: correction then re-sent the SAME long key list, and the budget ended before the worker could
+#: act on it -- the job finished EVIDENCE_CONTRADICTED / verdict ERROR (INPUT_MISSING_KEY). Two
+#: identical messages were not enough for a worker seeing the keys for the first time. The initial
+#: instruction now carries the full key list up front (so most first attempts are valid), the
+#: second-and-later corrections name only the keys STILL missing (shorter, see judge_gate), and a
+#: THIRD turn gives the worker one more chance to close a genuinely new remaining gap. Counted PER
+#: JOB (self._judge_correction_attempt), so it cannot loop. An unavailable engine is never sent
+#: back; an absent request is never sent back.
+JUDGE_CORRECTION_BUDGET = 3
 
 
 def _judge_fix_job(messages, schema, attempt=1):
@@ -4153,6 +4158,13 @@ class RelayWorker:
                     self._judge_output_error = (
                         "could not create per-job judge output directory for %r" % job_key)
             if self._judge_output_dir:
+                # The engine's claim loader needs a STRUCTURED registration.claim (not a free-
+                # text {id, statement}). Carry the full required-key list in the INITIAL
+                # instruction, from the SAME single source judge_gate uses for the first
+                # correction message (_ENGINE_CLAIM_SCHEMA_HINT), so the two can never drift and a
+                # worker can write a valid registration.claim the FIRST time instead of learning
+                # the keys only after the engine returns INPUT_MISSING_KEY.
+                from relay.judge_gate import _ENGINE_CLAIM_SCHEMA_HINT as _CLAIM_HINT
                 composed_goal = ("For this data analysis, write judge_request.json in the output "
                                  "folder %s before DONE. It must be a JSON object with claim_id, "
                                  "data_location (absolute file path to the data FILE), and "
@@ -4169,6 +4181,7 @@ class RelayWorker:
                                  "section with a claim whose id equals claim_id; otherwise the "
                                  "engine cannot run ('registered claim not found').\n\n"
                                  % self._judge_output_dir
+                                 + _CLAIM_HINT + "\n\n"
                                  + composed_goal)
             else:
                 # No usable output folder: say why on the composed goal instead of omitting the
