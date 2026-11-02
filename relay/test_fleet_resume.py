@@ -100,6 +100,64 @@ class LedgerTests(unittest.TestCase):
         self.assertEqual(n_unfinished, 2)
         self.assertEqual([g["text"] for g in remainder], ["goal B", "goal C"])
 
+    # ---- case: a user-cancelled goal is NOT re-queued on resume -------------------
+    def test_cancelled_goal_is_not_resumed(self):
+        """A goal the operator stopped (cockpit `close`/cancel -> RelayWorker.cancel ->
+        outcome CANCELLED) is a terminal user decision. It must be recorded in the done-map and
+        skipped by resume -- re-queueing it after a coordinator restart is the "cancelled jobs
+        come back" defect this guards."""
+        goals = ["goal A", "goal B", "goal C"]
+        fr._write_goals_ledger(self.state_dir, goals, started=1.0)
+        # A finished, B the user cancelled, C never ran.
+        workers = [_FakeWorker("goal A", "DONE"),
+                   _FakeWorker("goal B", "CANCELLED"),
+                   _FakeWorker("goal C", None)]
+        fr._update_done_map(self.state_dir, workers)
+
+        done = fr._read_done_map(self.state_dir)
+        self.assertEqual(done, {fr._goal_key("goal A"): "DONE",
+                                fr._goal_key("goal B"): "CANCELLED"})
+
+        remainder, n_unfinished, m_total = fr._resume_goals(self.state_dir)
+        self.assertEqual(m_total, 3)
+        # only C (never ran) resumes; A is DONE and B was cancelled.
+        self.assertEqual([g["text"] for g in remainder], ["goal C"])
+        self.assertEqual(n_unfinished, 1)
+
+    # ---- case: a CRASH-interrupted goal still resumes ----------------------------
+    def test_interrupted_goal_still_resumes(self):
+        """INTERRUPTED (the coordinator died mid-work, written by fleet_reaper) is NOT a user
+        stop: the worker never finished and MUST resume. It must not be written to the done-map
+        nor skipped -- the fix for cancelled jobs must not strand crashed ones."""
+        goals = ["goal A", "goal B"]
+        fr._write_goals_ledger(self.state_dir, goals, started=1.0)
+        workers = [_FakeWorker("goal A", "DONE"),
+                   _FakeWorker("goal B", "INTERRUPTED")]
+        fr._update_done_map(self.state_dir, workers)
+
+        done = fr._read_done_map(self.state_dir)
+        self.assertEqual(done, {fr._goal_key("goal A"): "DONE"})
+
+        remainder, n_unfinished, m_total = fr._resume_goals(self.state_dir)
+        self.assertEqual([g["text"] for g in remainder], ["goal B"])
+        self.assertEqual((n_unfinished, m_total), (1, 2))
+
+    # ---- case: the final-chunk merge also records a cancellation -----------------
+    def test_final_done_merge_records_cancelled(self):
+        """A graceful stop returns the workers active at stop time through _merge_final_done_map;
+        a cancellation there must land in the done-map too, so resume skips it."""
+        fr._write_goals_ledger(self.state_dir, ["goal A", "goal B"], started=1.0)
+        fr._merge_final_done_map(self.state_dir, [
+            {"goal": "goal A", "outcome": "DONE"},
+            {"goal": "goal B", "outcome": "CANCELLED"},
+        ])
+        self.assertEqual(fr._read_done_map(self.state_dir),
+                         {fr._goal_key("goal A"): "DONE",
+                          fr._goal_key("goal B"): "CANCELLED"})
+        remainder, n_unfinished, m_total = fr._resume_goals(self.state_dir)
+        self.assertEqual(remainder, [])
+        self.assertEqual((n_unfinished, m_total), (0, 2))
+
     # ---- case: resume with empty remainder --------------------------------------
     def test_resume_empty_remainder(self):
         goals = ["goal A", "goal B"]
@@ -150,18 +208,23 @@ class LedgerTests(unittest.TestCase):
 
     def test_final_chunk_never_erases_done_from_earlier_chunks(self):
         # A succeeded in an earlier reconnect chunk. The final chunk contains only B cancelled.
+        # The merge adds B's terminal CANCELLED (so resume skips it) WITHOUT erasing A's DONE.
         fr._write_atomic(self._done_path(), {fr._goal_key("goal A"): "DONE"})
         fr._merge_final_done_map(self.state_dir, [
             {"goal": "goal B", "outcome": "CANCELLED"},
         ])
-        self.assertEqual(fr._read_done_map(self.state_dir), {fr._goal_key("goal A"): "DONE"})
+        self.assertEqual(fr._read_done_map(self.state_dir), {
+            fr._goal_key("goal A"): "DONE",
+            fr._goal_key("goal B"): "CANCELLED",
+        })
 
-        # A later successful item is added without removing A.
+        # A later successful item is added without removing earlier records.
         fr._merge_final_done_map(self.state_dir, [
             {"goal": "goal C", "outcome": "DONE"},
         ])
         self.assertEqual(fr._read_done_map(self.state_dir), {
             fr._goal_key("goal A"): "DONE",
+            fr._goal_key("goal B"): "CANCELLED",
             fr._goal_key("goal C"): "DONE",
         })
 
