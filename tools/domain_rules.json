@@ -1,0 +1,14 @@
+{
+  "_comment": "Ordered keyword -> domain rules for classifying fleet goals. First matching rule wins; case-insensitive substring match on the goal text. A goal that matches nothing is classified as 'other'. Keep this data-only so the rules can change without touching code or re-running the whole backfill in code review.",
+  "rules": [
+    {"domain": "manufacturing_analysis", "keywords": ["\u88fd\u9020", "\u89e3\u6790", "\u30d4\u30fc\u30eb", "\u304b\u3059\u308c", "\u6b69\u7559", "\u30ed\u30c3\u30c8", "yield", "defect", "wafer"]},
+    {"domain": "slides", "keywords": ["slide", "\u30b9\u30e9\u30a4\u30c9", "pptx", "powerpoint", "\u30d7\u30ec\u30bc\u30f3"]},
+    {"domain": "mail", "keywords": ["\u30e1\u30fc\u30eb", "mail", "email", "outlook", "\u8fd4\u4fe1", "\u53d7\u4fe1\u7bb1", "inbox"]},
+    {"domain": "validity", "keywords": ["\u691c\u8a3c", "validity", "refuter", "\u53cd\u8a3c", "claim", "verdict"]},
+    {"domain": "calendar", "keywords": ["\u4e88\u5b9a", "calendar", "meeting", "\u4f1a\u8b70", "schedule", "\u30ab\u30ec\u30f3\u30c0\u30fc"]},
+    {"domain": "code", "keywords": ["pr ", "pr#", "pull request", "commit", "bug", "fix/", "feat/", "test", "\u5b9f\u88c5", "\u4fee\u6b63"]},
+    {"domain": "docs", "keywords": ["sharepoint", "onedrive", "document", "\u6587\u66f8", "docx", "word", "excel", "xlsx"]},
+    {"domain": "teams", "keywords": ["teams", "\u30c1\u30e3\u30c3\u30c8", "chat", "channel", "\u30c1\u30e3\u30cd\u30eb"]}
+  ],
+  "default_domain": "other"
+}
