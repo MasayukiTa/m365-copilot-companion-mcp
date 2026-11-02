@@ -7606,9 +7606,6 @@ class RelayWorker:
                     parent_level=(effort_policy_mod.worker_level(self)
                                   if effort_policy_mod.mode() != "off" else None),
                     run_id=getattr(self, "run_id", "") or "",
-                    # CARRY THE PARENT'S ADMISSION JID so a child inherits a cancelled/closed
-                    # parent's durable tombstone and will not be resurrected after a restart.
-                    parent_jid=(getattr(self, "jid", "") or ""),
                     board_lines=agent_board.worker_lines()) if steps else [])
                 if kids and self._spawn_fn:
                     # THE PARENT'S CHECK GOES TO THE MERGE, NOT ONTO EVERY CHILD. It used to
