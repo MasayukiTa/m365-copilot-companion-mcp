@@ -191,31 +191,6 @@ def test_kill_never_touches_this_process_or_an_unrelated_one():
 
 
 # --- sweeps ----------------------------------------------------------------------------------
-def test_sweep_kills_workers_not_in_the_live_set():
-    p = _spawn_sleeper()
-    with PR.worker_scope("w-gone"):
-        PR.register(p.pid, tool="run_python")
-    out = PR.sweep(live_workers=["w-still-here"])   # w-gone is not live
-    assert any(p.pid in rep["killed"] for rep in out["swept"])
-    for _ in range(50):
-        if not _alive(p.pid):
-            break
-        time.sleep(0.1)
-    assert not _alive(p.pid)
-
-
-def test_sweep_keeps_a_live_worker_untouched():
-    p = _spawn_sleeper()
-    try:
-        with PR.worker_scope("w-live"):
-            PR.register(p.pid, tool="run_python")
-        out = PR.sweep(live_workers=["w-live"])
-        assert "w-live" in out["kept"]
-        assert _alive(p.pid)
-    finally:
-        p.kill(); p.wait(timeout=5)
-
-
 def test_sweep_dead_owners_reaps_only_dead_owner_rows():
     """owner-scoped sweep: a row whose owning server pid is dead is reaped; a row whose owner
     is alive (here, this test process) is kept. Concurrent-run safe."""
@@ -272,6 +247,32 @@ def test_all_public_functions_are_total_on_garbage():
     assert PR.register("not-an-int", worker="w") is False
     assert PR.registered("no-such-worker") == []
     assert PR.kill_worker_tree("no-such-worker")["killed"] == []
-    assert PR.sweep(live_workers=None) == {"swept": [], "kept": []}
     assert isinstance(PR.sweep_dead_owners(), dict)
     assert PR.forget("no-such-worker") is False
+
+
+# --- integration: the spawn choke point records under the active worker ----------------------
+def test_childproc_run_registers_its_child_under_the_current_worker():
+    """The wiring, not just the module: a process started through childproc.run()'s timeout path
+    -- the choke point run_python/shell_exec/run_powershell share -- is recorded for whatever
+    worker's turn is running, read from the ContextVar the gateway sets. This is what lets a
+    worker closed mid-call, or a coordinator-start sweep, kill the tree instead of orphaning it.
+    """
+    # A timeout is given so run() drives Popen itself (the branch that registers); the child
+    # exits at once so the call completes well inside the timeout.
+    with PR.worker_scope("w-run"):
+        childproc.run([sys.executable, "-c", "pass"], timeout=30)
+    rows = PR.registered("w-run")
+    assert rows, "childproc.run did not record its child under the active worker"
+    assert all(isinstance(r.get("pid"), int) and r["pid"] > 0 for r in rows)
+    assert any(r.get("tool") == "childproc.run" for r in rows)
+
+
+def test_childproc_run_records_nothing_when_no_worker_is_bound():
+    """Outside a worker turn (a CLI/test spawn) the same call records nothing: an unattributed
+    pid is exactly what a later kill must never act on. The _isolate fixture leaves the worker
+    cleared, so this asserts the no-op path directly."""
+    before = os.listdir(PR.registry_dir()) if os.path.isdir(PR.registry_dir()) else []
+    childproc.run([sys.executable, "-c", "pass"], timeout=30)
+    after = os.listdir(PR.registry_dir()) if os.path.isdir(PR.registry_dir()) else []
+    assert after == before

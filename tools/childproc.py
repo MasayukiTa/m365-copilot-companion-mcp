@@ -195,6 +195,18 @@ def run(cmd, **kw):
     else:
         proc = subprocess.Popen(
             cmd, **kw, **childproc.tree_popen_kwargs(headless=False, priority=False))
+    # RECORD THE SPAWN AT ITS SOURCE. This is the one process-spawning choke point the timed
+    # tool calls (run_python/shell_exec/run_powershell) share, so registering proc.pid here
+    # attributes the whole tree to the worker whose turn is running -- read from the ContextVar
+    # the gateway set, so no caller has to thread a name through. register() is total and
+    # no-ops when there is no current worker (a CLI/test spawn), so this never changes behaviour
+    # for a non-fleet call and never raises into the tool. It is what lets a worker closed
+    # mid-call, or a coordinator-start sweep, kill this tree instead of orphaning it.
+    try:
+        from tools import proc_registry as _proc_registry
+        _proc_registry.register(proc.pid, tool="childproc.run")
+    except Exception:
+        pass
     try:
         out, err = proc.communicate(input=stdin_input, timeout=timeout)
     except subprocess.TimeoutExpired:

@@ -46,7 +46,7 @@ import time
 
 __all__ = [
     "registry_dir", "set_worker", "current_worker", "worker_scope",
-    "register", "registered", "kill_worker_tree", "sweep",
+    "register", "registered", "kill_worker_tree",
 ]
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -322,40 +322,6 @@ def kill_worker_tree(worker: str, timeout_s: float = 5.0) -> dict:
     except Exception:
         pass
     return report
-
-
-def sweep(live_workers, timeout_s: float = 5.0) -> dict:
-    """At coordinator start: kill registered processes whose worker no longer exists.
-
-    `live_workers` is the set/list of worker names the fleet still has. Any registry file whose
-    worker is NOT in that set is a worker that ended (cleanly or in a crash) without its trees
-    being reaped -- exactly the state a restart leaves. Each such file's still-matching
-    processes are killed and the file's workers reported. A worker that IS live is left entirely
-    alone: it may be mid-run and its processes are legitimately working.
-
-    Returns {"swept": [report, ...], "kept": [worker, ...]}. Never raises.
-    """
-    out = {"swept": [], "kept": []}
-    try:
-        live = {str(w or "") for w in (live_workers or [])}
-        live_safe = {_safe(w) for w in live}
-        d = registry_dir()
-        try:
-            names = os.listdir(d)
-        except OSError:
-            return out
-        for fn in names:
-            if not fn.endswith(".jsonl"):
-                continue
-            stem = fn[:-len(".jsonl")]
-            if stem in live_safe:
-                out["kept"].append(stem)
-                continue
-            rep = kill_worker_tree(stem, timeout_s=timeout_s)
-            out["swept"].append(rep)
-    except Exception:
-        pass
-    return out
 
 
 def sweep_dead_owners(timeout_s: float = 5.0) -> dict:
