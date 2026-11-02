@@ -969,6 +969,7 @@ jobs:
             relay/test_a_contract_is_checked_against_its_own_hash.py \
             relay/test_a_diagnosis_is_computed_not_transcribed.py \
             relay/test_analysis_provenance.py \
+            relay/test_provenance_standard_names.py \
             relay/test_a_planted_results_file_is_not_an_answer.py \
             relay/test_the_first_recovery_will_announce_itself.py \
             relay/test_an_infrastructure_stop_says_so_where_it_is_kept.py \
