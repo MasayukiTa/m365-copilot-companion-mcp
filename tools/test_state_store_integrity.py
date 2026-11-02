@@ -220,6 +220,7 @@ AUDITED = {
     "relay/capture_status.py": "latest capture status snapshot, overwritten every time",
     "relay/consumer_watch.py": "alarm marker file",
     "relay/fleet_reaper.py": "status/history snapshots finalised atomically after an interrupted run",
+    "relay/fleet_tombstone.py": "one tombstone file per cancelled/closed jid, written atomically (tmp + os.replace, fsync); it carries no accumulated data -- each jid is an independent terminal marker and re-closing one appends to that file's own events list, never rewriting a shared document",
     "relay/fleet_runner.py": "per-run status/goal snapshots",
     "relay/local_loop_controller.py": "controller marker, atomic tmp+replace, one file per job",
     "relay/org/def_store.py": "override map and per-version text, each file replaced whole by an operator command through temp file + os.replace; nothing accumulates",
