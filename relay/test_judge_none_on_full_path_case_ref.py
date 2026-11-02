@@ -83,12 +83,46 @@ def test_unread_gate_does_not_fire_without_a_resolved_case(tmp_path, monkeypatch
 
 
 def test_unread_gate_is_inert_when_ledger_cannot_attribute(tmp_path, monkeypatch):
-    # Empty attribution set means the ledger cannot say -- a measurement that cannot see must
-    # not fail the work. The gate must not fire on no evidence.
+    # Empty attribution set AND no live attribution means the ledger cannot say -- a measurement
+    # that cannot see must not fail the work. The gate must not fire on genuine no-evidence.
     _make_case(tmp_path, "ADAMS")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
     worker = RelayWorker(_full_path_goal(tmp_path), "noledger-test")
     monkeypatch.setattr(RelayWorker, "_judge_tool_names", lambda self: set())
+    # The ledger is blind to this worker: attribution is not live.
+    monkeypatch.setattr(RelayWorker, "_attribution_is_live", lambda self: False)
     assert worker._case_file_unread() is False
+
+
+def test_unread_gate_fires_on_a_true_no_op_when_attribution_is_live(tmp_path, monkeypatch):
+    # THE PRODUCTION no-op (job 065d8c1c4a14): the worker called NO tool at all, so its
+    # attributed set is empty -- but the ledger IS recording and this worker's session IS bound
+    # (attribution_is_live True). An empty slice then means "this worker ran nothing", which for
+    # a resolved case reference proves the request file was never read. The gate MUST fire.
+    _make_case(tmp_path, "ADAMS")
+    real = search_ops.case_reference_search
+    monkeypatch.setattr(search_ops, "case_reference_search",
+                        lambda goal: real(goal, [tmp_path]))
+    worker = RelayWorker(_full_path_goal(tmp_path), "noop-test")
+    assert worker._review_case["request_path"]
+    monkeypatch.setattr(RelayWorker, "_judge_tool_names", lambda self: set())
+    monkeypatch.setattr(RelayWorker, "_attribution_is_live", lambda self: True)
+    assert worker._case_file_unread() is True
+
+
+def test_no_op_done_is_refused_end_to_end_when_attribution_is_live(tmp_path, monkeypatch):
+    # The same production no-op, driven through _settle_done: a DONE that ran no tool at all on a
+    # resolved case reference must be refused, not reported DONE.
+    _make_case(tmp_path, "ADAMSデータを参照")
+    real = search_ops.case_reference_search
+    monkeypatch.setattr(search_ops, "case_reference_search",
+                        lambda goal: real(goal, [tmp_path]))
+    worker = RelayWorker(_full_path_goal(tmp_path), "noop-settle-test")
+    monkeypatch.setattr(RelayWorker, "_judge_tool_names", lambda self: set())
+    monkeypatch.setattr(RelayWorker, "_attribution_is_live", lambda self: True)
+    worker._settle_done()
+    assert worker.outcome == "VERIFY_FAILED"
+    assert worker.status == "stuck"
+    assert "never read" in worker.reason
