@@ -349,6 +349,13 @@ class ConfirmOutcome:
     reasons: list
     claim_supported: object
     finding: object
+    # Numbers the plain-language report cites (every sentence traceable to one of these).
+    confirmed_ci: list | None = None   # [lo_std, hi_std] on the confirm set
+    screened_ci: list | None = None    # [lo_std, hi_std] on the screen set
+    n_lots: int | None = None          # K = number of lots in the confirm estimate
+    delta_min: float | None = None     # standardized MDES the interval is judged against
+    family_m: int | None = None        # screening family size carried into the claim
+    group_separated: bool = False      # confound stratum removed (within-group centring)
 
 
 def confirm(claims: Sequence[dict], confirm_path: str, *,
@@ -359,13 +366,15 @@ def confirm(claims: Sequence[dict], confirm_path: str, *,
     `judge_fn` has the engine's `judge` signature: (data_path, claim, lock_path=, out_dir=,
     root=) -> output dict with keys verdict, finding, claim_supported, reasons, evidence.
     Maps each engine verdict to adopt/hold/not identifiable in the report layer (see
-    verdict_label). Pure orchestration: every number comes from judge_fn.
+    verdict_label). Pure orchestration: every number comes from judge_fn or the screen pass.
     """
     out: list[ConfirmOutcome] = []
     for c in claims:
         res = judge_fn(confirm_path, c, lock_path=lock_path, out_dir=out_dir, root=root)
         ev = (res.get("evidence") or {})
         fe = screened.get(_factor_of(c))
+        ci = ev.get("ci_std")
+        dm = ((c.get("delta_min") or {}).get("value"))
         out.append(ConfirmOutcome(
             factor=_factor_of(c),
             screened_effect=(fe.estimate_std if fe else None),
@@ -374,6 +383,12 @@ def confirm(claims: Sequence[dict], confirm_path: str, *,
             reasons=list(res.get("reasons") or []),
             claim_supported=res.get("claim_supported"),
             finding=res.get("finding"),
+            confirmed_ci=(list(ci) if ci is not None else None),
+            screened_ci=([fe.lo_std, fe.hi_std] if fe else None),
+            n_lots=ev.get("K"),
+            delta_min=(float(dm) if dm is not None else None),
+            family_m=((c.get("family") or {}).get("m")),
+            group_separated=bool(fe and fe.note == "within_group_centred"),
         ))
     return out
 
