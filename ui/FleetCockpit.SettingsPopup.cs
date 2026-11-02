@@ -259,6 +259,7 @@ partial class CockpitWindow
             case "ram_floor_mb":
             case "maxtabs":
                 return "live";
+            case "analysis_provenance_gate":
             case "tool_probe_idle_min":
             case "merge_conversation":
             case "tool_transport":
@@ -281,7 +282,6 @@ partial class CockpitWindow
             case "team_mode":
             case "org_proposals":
             case "fanout_max_depth":
-            case "analysis_provenance_gate":
             case "fanout_max_total":
             case "fanout_max_active":
             case "fanout_max_turns":
