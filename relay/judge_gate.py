@@ -82,23 +82,53 @@ MISCLASSIFICATION_NOTE = (
     "集計して」だけの依頼は、DATA_QUERY マーカーが無ければ unknown に落ちて False になる。\n"
     "誤判定の例(解析でないのに拾う / 偽陽性): 「MCL のコードを small fix する」のようにデータ"
     "語を含むが実際はコード変更の仕事。task_kind は CODE_CHANGE / M365_LOOKUP / WRITING を先に"
-    "返す順位なので、それらは解析として拾わない。境界が疑わしいときは呼び出し側が強制 ON にできる。"
+    "返す順位なので、それらは解析として拾わない。境界が疑わしいときは呼び出し側が強制 ON にできる。\n"
+    "ツール使用だけでは解析と判別しない: run_python / odbc_query を走らせたコード監査やレビューも"
+    "コード監査であって解析ではない。ツールはテキストが既に解析を指すときに確度を足すだけである"
+    "(2026-11-02: ツール使用のみで解析扱いにした結果、監査系 28 件が誤って却下された回帰の修正)。"
 )
 
 
-def is_data_analysis_goal(goal, request_text="", tool_names=()) -> bool:
-    """True when `goal` asks for a DB-backed analysis whose answer should pass the judge.
+#: Data tools whose PRESENCE, on a goal whose TEXT is already data analysis, adds confidence
+#: that the run really was one. They are NOT a classifier on their own -- see the regression
+#: note on is_data_analysis_goal below.
+_DATA_TOOLS = frozenset({"odbc_query", "odbc_to_excel", "run_python"})
 
-    Apply the existing task-kind rules independently to the goal and resolved request. At
-    completion, attributed data-tool calls also signal analysis even if the text did not.
+
+def is_data_analysis_goal(goal, request_text="", tool_names=()) -> bool:
+    """True when the GOAL (or resolved request) is a data analysis BY ITS CONTENT.
+
+    The classification is the task_kind of the goal and the resolved request text. Tool usage
+    may only ADD CONFIDENCE once the text already points at data analysis; it may NEVER make a
+    goal an analysis on its own.
+
+    REGRESSION THIS PREVENTS (measured 2026-11-02 15:53, status.json of the running fleet).
+    The earlier version returned True whenever the recorded tool names included run_python /
+    odbc_query / odbc_to_excel -- i.e. on TOOL USAGE ALONE. Because almost every job runs a
+    python snippet at some point, that made the provenance gate (relay/analysis_provenance.py,
+    applied where a worker becomes DONE in relay/relay_fleet.py) treat repository audits and
+    code reviews as data analyses: 28 worker answers were rejected VERIFY_FAILED "claimed
+    numbers not found in this run's computation outputs", and many were NOT analyses at all --
+    code-audit and review jobs (submitters h16_14, h16_18, h22a, rv_e_auth and unnamed workers)
+    whose answers legitimately carry line numbers, file counts and ids. A code-audit goal such
+    as "review backend/routers for defects and write review.md" must NOT be gated; a goal whose
+    text asks to analyse / aggregate / screen / estimate from tables, Excel, CSV, DB or
+    manufacturing data (task_kind == DATA_QUERY) must still be.
     """
-    # The resolved request supplies the substance hidden by a short case reference.
-    if any(task_kind(text) == DATA_QUERY for text in (goal, request_text)):
-        return True
-    # Recorded data-tool calls are evidence of work actually attempted, even when neither
-    # the reference nor request described its analysis in the classifier's vocabulary.
-    return any(name in {"odbc_query", "odbc_to_excel", "run_python"}
-               for name in tool_names)
+    # The decision is BY CONTENT: the goal, or the resolved request that supplies the substance
+    # hidden behind a short case reference, classified as a DATA_QUERY by task_kind.
+    text_is_analysis = any(task_kind(text) == DATA_QUERY
+                           for text in (goal, request_text))
+    if not text_is_analysis:
+        # Tool usage alone is NOT data analysis. A code audit that ran run_python to count
+        # matches is still a code audit. Returning False here is the whole fix.
+        return False
+    # The text already points at data analysis; recorded data-tool calls only CONFIRM it
+    # (they cannot change an already-positive decision, but reading them keeps the signal
+    # explicit for callers that inspect it and documents that tools add confidence, not
+    # classification).
+    _ = any(name in _DATA_TOOLS for name in tool_names)
+    return True
 
 
 #: The keys the frozen engine's claim loader REQUIRES (validity/claim.py REQUIRED_KEYS plus
