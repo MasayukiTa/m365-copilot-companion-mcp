@@ -301,3 +301,43 @@ def test_a_planted_decimal_beside_the_511_citation_tag_is_still_rejected():
     assert not r["ok"], r
     assert any(abs(v - 0.834) < 1e-9 for v in r["unsupported"]), r
     assert 511 not in r["unsupported"], r
+
+
+# ── the SECOND real false positive: a source-line locus "name.py:510-511" ───────────────────
+# Job 8c3daa76ccf0 failed on 511, and the 511 was NOT the citation tag (that was already
+# masked) -- it was the tail of a docstring pointer "analysis_stable.py:510-511". The filename
+# mask blanked the name but left ":510-511", and the port mask ate only ":510", so "-511"
+# survived and was read as the claimed number -511. These pin that a colon-prefixed line locus
+# (single or range) yields no claim, while a real interval -- which is never written ":a-b" --
+# stays fully policed.
+
+def test_source_line_range_locus_is_not_a_claimed_number():
+    for answer in (
+        "analysis_stable.py:510-511 — docstring notes the two metrics differ.",
+        "See test_research_endpoints.py:304-320 for the audit test.",
+        "Two fields were renamed (analysis_stable.py:588-589).",
+    ):
+        vals = [v for v, _ in ap.extract_numbers(answer)]
+        assert vals == [], answer
+
+
+def test_source_line_range_locus_answer_with_a_real_value_passes():
+    # The only analysis value (0.12) was recomputed this run; the 510/511 of the code locus
+    # must not be treated as unsupported claims.
+    answer = "The kasure rate is 0.12 (see analysis_stable.py:510-511)."
+    computed = ["recomputed kasure rate = 0.12 over 74 lots"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert r["ok"], r
+    assert 511 not in r["unsupported"] and -511 not in r["unsupported"]
+
+
+def test_a_real_interval_is_not_swallowed_by_the_locus_mask():
+    # The locus mask requires a LEADING colon, so a genuine numeric interval -- written with
+    # brackets, a bare hyphen, or CI parentheses, never as ":a-b" -- keeps all its numbers and
+    # stays policed. A planted CI copied from a results file must still be rejected.
+    answer = "The defect correlation CI is 0.067-0.151 (rho=0.208)."
+    computed = ["recomputed something unrelated = 1.0"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert not r["ok"], r
+    for planted in (0.067, 0.151, 0.208):
+        assert any(abs(v - planted) < 1e-9 for v in r["unsupported"]), (planted, r["unsupported"])
