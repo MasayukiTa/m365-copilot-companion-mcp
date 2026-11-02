@@ -4155,12 +4155,20 @@ class RelayWorker:
             if self._judge_output_dir:
                 composed_goal = ("For this data analysis, write judge_request.json in the output "
                                  "folder %s before DONE. It must be a JSON object with claim_id, "
-                                 "data_location (absolute file path), and fetched_at (ISO timestamp). "
-                                 "Optional sections: manifest {path, dataset_id, result}; "
+                                 "data_location (absolute file path to the data FILE), and "
+                                 "fetched_at (ISO timestamp). Optional sections: "
+                                 "manifest {path: the JSON FILE to write the manifest into (NOT a "
+                                 "folder, e.g. '<output>/manifest.json'), dataset_id, result: the "
+                                 "analysis-result OBJECT itself (not a path string)}; "
                                  "registration {root, claim, registered_at}; and "
                                  "lot_diagnosis {y, x, lot} (equal-length arrays). Paths may be "
                                  "relative to the output folder. Supply actual values only; omit "
-                                 "a section when its inputs are unavailable.\n\n" % self._judge_output_dir
+                                 "a section when its inputs are unavailable. To make the validity "
+                                 "engine run, the claim must be pre-registered in the engine "
+                                 "(configs/<claim_id>.json) OR you must include the registration "
+                                 "section with a claim whose id equals claim_id; otherwise the "
+                                 "engine cannot run ('registered claim not found').\n\n"
+                                 % self._judge_output_dir
                                  + composed_goal)
             else:
                 # No usable output folder: say why on the composed goal instead of omitting the

@@ -108,10 +108,16 @@ JUDGE_REQUEST_SCHEMA = (
     "judge_request.json は JSON オブジェクトで、必須キー: claim_id (空でない文字列・パス区切りを"
     "含まない), data_location (データファイルの絶対パスまたは出力フォルダからの相対パス), "
     "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
-    "manifest {path: 文字列, dataset_id: 文字列, result: オブジェクト}; "
+    "manifest {path: manifest を書き出す JSON ファイルのパス (フォルダ不可), dataset_id: 文字列, "
+    "result: 解析結果そのものを表す JSON オブジェクト (パス文字列ではない。例 "
+    '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
+    ")}; "
     "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
     "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}。"
-    "入力の無いセクションは省略する(空の値で埋めない)。"
+    "入力の無いセクションは省略する(空の値で埋めない)。\n"
+    "判定エンジンを走らせるには、claim_id の claim がエンジンに事前登録(configs/<claim_id>.json)"
+    "されているか、さもなければ registration セクションに claim_id と同じ id を持つ claim を入れる"
+    "こと。どちらも無いとエンジンは走らず『registered claim not found』になる。"
 )
 
 
@@ -134,19 +140,40 @@ def _short_type(value) -> str:
     return type(value).__name__
 
 
-def _validate_manifest(manifest) -> str:
+#: A minimal, data-free example of a valid manifest.result object, shown in a correction so the
+#: worker sees the SHAPE expected (an analysis-result object) instead of a path string.
+_MANIFEST_RESULT_EXAMPLE = (
+    '{"n_lots": 6, "kasure_rate_by_lot": {"<lot>": 0.5}, '
+    '"top_correlation_vs_kasure": {"<feature>": 0.9}}')
+
+
+def _validate_manifest(manifest, output_folder="") -> str:
     """'' when the manifest section is usable; else a message naming the EXACT bad field, the
-    expected shape, and what was received (type/short value, never long data)."""
+    expected shape, and what was received (type/short value, never long data).
+
+    manifest.path is the JSON file the manifest is WRITTEN to -- never a directory. A worker that
+    puts the data folder there makes record_manifest open a directory for writing, which fails
+    with Errno 13; catching it here names the field and the mistake instead."""
     if "path" not in manifest or not isinstance(manifest.get("path"), str) or not manifest["path"].strip():
-        return ("manifest.path must be a non-empty string (the manifest file path), "
-                "got %s" % _short_type(manifest.get("path")))
+        return ("manifest.path must be a non-empty string (the JSON file the manifest is written "
+                "to), got %s" % _short_type(manifest.get("path")))
+    # The path must name a FILE to write, not an existing directory. Resolve it the same way the
+    # harness will (relative to output_folder) before asking the filesystem.
+    _mpath = manifest["path"]
+    if output_folder and not os.path.isabs(_mpath):
+        _mpath = os.path.join(output_folder, _mpath)
+    if os.path.isdir(_mpath):
+        return ("manifest.path must be a file to write the manifest JSON into, not a directory; "
+                "got a directory path %s. Point it at e.g. "
+                "'<output_folder>/manifest.json'." % _short_type(manifest.get("path")))
     if ("dataset_id" not in manifest or not isinstance(manifest.get("dataset_id"), str)
             or not manifest["dataset_id"].strip()):
         return ("manifest.dataset_id must be a non-empty string, got %s"
                 % _short_type(manifest.get("dataset_id")))
     if "result" not in manifest or not isinstance(manifest.get("result"), dict):
-        return ("manifest.result must be an object (the analysis result), got %s"
-                % _short_type(manifest.get("result")))
+        return ("manifest.result must be an object (the analysis result itself, NOT a path "
+                "string), got %s. Minimal valid example: result=%s"
+                % (_short_type(manifest.get("result")), _MANIFEST_RESULT_EXAMPLE))
     return ""
 
 
@@ -236,7 +263,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
             statuses.append("manifest: not run: %s" % msg)
             corrections.append(msg)
         else:
-            bad = _validate_manifest(manifest)
+            bad = _validate_manifest(manifest, output_folder)
             if bad:
                 statuses.append("manifest: not run: %s" % bad)
                 corrections.append(bad)
@@ -332,6 +359,35 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                                    registered_claim=registered_claim,
                                    judge_folder=output_folder)
         engine_available = bool(verdict.get("engine_available", False))
+        # ENGINE COULD NOT FIND A CLAIM, AND THE WORKER CAN FIX THAT. When the engine did not run
+        # ONLY because no claim was found (no human-pre-registered configs/<id>.json AND the
+        # request carried no matching registration.claim), the worker CAN fix it by adding the
+        # claim to the request -- unlike a genuinely unavailable engine (root missing, timeout),
+        # which is not the worker's fault and is never sent back. We detect the fixable case from
+        # the structured signal run_engine_judge returns (claim_source is None with the
+        # 'registered claim not found' reason) rather than string-matching the whole message, and
+        # name EXACTLY what to send: a registration.claim whose id equals the request claim_id.
+        if (not engine_available and registered_claim is None
+                and isinstance(verdict, dict) and verdict.get("claim_source") is None
+                and str(verdict.get("unavailable_reason", "")).startswith(
+                    "registered claim not found")):
+            claim_msg = (
+                "judge engine did not run: no registered claim for id %r. Add a \"registration\" "
+                "section whose \"claim\" is an object with \"id\": %r (matching the request "
+                "claim_id) and \"registered_at\": an ISO 8601 time, plus \"root\": a registry "
+                "folder path. The harness passes that claim to the engine."
+                % (claim_id, claim_id))
+            statuses.append("engine: not run: %s" % verdict.get("unavailable_reason"))
+            if want_correction and correction_attempt < int(correction_budget):
+                detail = ("judge: request invalid (attempt %d/%d)\n" % (
+                              correction_attempt + 1, int(correction_budget))
+                          + "- " + claim_msg + "\n\n" + JUDGE_REQUEST_SCHEMA)
+                _record_correction(output_folder, claim_id=claim_id,
+                                   attempt=correction_attempt + 1, messages=[claim_msg])
+                return _ret(True, detail, {"messages": [claim_msg],
+                                           "schema": JUDGE_REQUEST_SCHEMA,
+                                           "attempt": correction_attempt + 1})
+            corrections.append(claim_msg)
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
                                     order_record=order_record)
