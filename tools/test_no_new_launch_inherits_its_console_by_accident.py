@@ -135,7 +135,6 @@ BASELINE = {
     "scripts/status.py::processes::subprocess.run": 1,
     "tools/childproc.py::run::subprocess.Popen": 1,
     "tools/childproc.py::run::subprocess.run": 1,
-    "tools/code_exec.py::run_python::subprocess.run": 1,
     "tools/coding_ops.py::_git_raw::subprocess.run": 1,
     "tools/env_ops.py::_pip_version::subprocess.run": 1,
     "tools/env_ops.py::pip_install::subprocess.run": 1,

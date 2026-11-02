@@ -4653,6 +4653,19 @@ class RelayWorker:
             pass
         self._active_check = None
         self._pending_checks = []
+        # KILL THE PROCESS TREES THIS WORKER'S TOOL CALLS STARTED. _active_check.cancel() above
+        # only reaps the acceptance check; a run_python / shell_exec call that spawned a
+        # desktop process (the 2026-11-02 incident: Notepad, Calc, a UIAutomation driver that
+        # outlived the closed worker by 20+ minutes) is owned by NOTHING unless it was recorded
+        # at spawn. tools.proc_registry recorded it under this worker's name, keyed by pid AND
+        # creation time, so this kills only processes this worker actually started and still
+        # alive -- never the fleet, the server or a recycled pid. Total; never raises into close.
+        try:
+            from tools import proc_registry as _pr
+            _pr.kill_worker_tree(self.name)
+            _pr.forget(self.name)
+        except Exception:
+            pass
         if self.closed:
             return
         self.closed = True
@@ -10885,6 +10898,17 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
     if not run_id:
         run_id = "r%x" % int(time.time())
     agent_board.begin_run()   # agent_board_mode, read once per run (sweep_start)
+    # REAP LEFTOVER PROCESS TREES FROM A PRIOR RUN THAT CRASHED (2026-11-02 incident). A worker
+    # that was killed, or a server that died, can leave the processes its run_python/shell_exec
+    # calls started alive with nothing owning them. tools.proc_registry recorded each under the
+    # MCP server pid (owner_pid) that spawned it; sweep_dead_owners kills ONLY the trees whose
+    # owning server is no longer alive, keyed by pid AND creation time -- so a process a
+    # concurrently-running server legitimately owns is never touched. Total; never raises.
+    try:
+        from tools import proc_registry as _pr
+        _pr.sweep_dead_owners()
+    except Exception:
+        pass
     org_versions.record_run(run_id, transcript_dir)   # org_version_record: off by default; never raises
     org_shadow_eval.record_run(run_id)   # org_shadow_eval: off by default, shadow only; never raises
     org_ab.record_run(run_id)   # org_ab: off by default, shadow only; records arm assignment, changes nothing
