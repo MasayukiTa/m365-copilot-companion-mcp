@@ -33,11 +33,12 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 def _default_db_path():
     # Mirror bridge/session_store._db_path() without importing the bridge (which pulls in the
-    # whole runtime). Precedence: an explicit full DB path (MCP_SESSIONS_DB), then the store
-    # directory the writers honour (MCP_SESSION_STORE_DIR), then <repo>/.fleet/sessions.
-    full = os.environ.get("MCP_SESSIONS_DB")
-    if full:
-        return full
+    # whole runtime). The bridge resolves the store through exactly one override --
+    # MCP_SESSION_STORE_DIR, the store directory the writers honour -- then <repo>/.fleet/
+    # sessions. We follow that precedence to the letter: no second, full-path override of our
+    # own (an MCP_SESSIONS_DB knob the writers never read would redirect the reader to a store
+    # the writers never touch, and test isolation already covers MCP_SESSION_STORE_DIR). A
+    # caller that wants a specific file passes --db.
     base = os.environ.get("MCP_SESSION_STORE_DIR") or os.path.join(_REPO, ".fleet", "sessions")
     return os.path.join(base, "sessions.sqlite3")
 
@@ -234,6 +235,11 @@ def main(argv=None):
     ap.add_argument("--goal-id", dest="goal_id", type=int, default=None,
                     help="restrict to a single goal_id")
     ap.add_argument("--limit", type=int, default=25, help="max rows (default 25)")
+    ap.add_argument("--mode", default="search",
+                    choices=("search", "text", "domain", "verdict", "domains"),
+                    help="search: unified filter (default); text: FTS/LIKE on --q only; "
+                         "domain: goals in --domain; verdict: goals with --verdict; "
+                         "domains: the domain rollup")
     ap.add_argument("--dump", action="store_true",
                     help="emit every matching turn VERBATIM as JSONL (one row per line)")
     ap.add_argument("--out", default=None,
@@ -250,6 +256,22 @@ def main(argv=None):
             rows = dump_rows(conn, q=args.q, domain=args.domain, since=since, until=until,
                              verdict=args.verdict, goal_id=args.goal_id, limit=limit)
             text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+        elif args.mode == "text":
+            engine, rows = search_text(conn, args.q, limit=args.limit, domain=args.domain)
+            text = json.dumps({"engine": engine, "count": len(rows), "rows": rows},
+                              ensure_ascii=False, indent=2) + "\n"
+        elif args.mode == "domain":
+            rows = list_by_domain(conn, args.domain, limit=args.limit)
+            text = json.dumps({"domain": args.domain, "count": len(rows), "rows": rows},
+                              ensure_ascii=False, indent=2) + "\n"
+        elif args.mode == "verdict":
+            rows = list_by_verdict(conn, args.verdict, limit=args.limit)
+            text = json.dumps({"verdict": args.verdict, "count": len(rows), "rows": rows},
+                              ensure_ascii=False, indent=2) + "\n"
+        elif args.mode == "domains":
+            rows = domains(conn)
+            text = json.dumps({"count": len(rows), "rows": rows},
+                              ensure_ascii=False, indent=2) + "\n"
         else:
             engine, rows = search(conn, q=args.q, domain=args.domain, since=since, until=until,
                                   verdict=args.verdict, goal_id=args.goal_id, limit=args.limit)
