@@ -60,6 +60,12 @@ ABS_FLOOR = 5e-4
 # A run of digits with optional sign, decimal part, thousands separators, exponent, and a
 # trailing percent sign. The percent is captured so a value written as "12.5%" can also be
 # matched against a computed fraction 0.125 (see _match_one).
+#
+# A trailing lookahead rejects a digit run that is immediately followed by a letter, an
+# underscore, or a dot-letter -- i.e. the head of an identifier or hash like "511e078026f6"
+# or "20abc". The original guard only looked BEHIND, so "511" at the start of a hex id slipped
+# through (it is this exact false positive -- the "511" of "[ref:511e078026f6]" -- that this
+# change exists to stop). Pure-digit groups followed by "%" or end-of-number are still matched.
 _NUM_RE = re.compile(
     r"(?<![A-Za-z0-9_.])"           # not mid-identifier and not the tail of a longer number
     r"([+-]?\d{1,3}(?:,\d{3})+(?:\.\d+)?"   # 1,234 or 1,234.5
@@ -68,7 +74,59 @@ _NUM_RE = re.compile(
     r"|[+-]?\d+)"                           # 42
     r"(?:[eE][+-]?\d+)?"                    # 1e-3
     r"(\s*%)?"                             # trailing percent
+    r"(?![A-Za-z_])"                       # not immediately followed by an identifier letter
 )
+
+#: Spans masked out of the answer text BEFORE number extraction, because the digits in them
+#: are identifiers or metadata, never a reported analysis value. Each is replaced by spaces of
+#: equal length (so positions and the lookbehind/lookahead around surviving numbers are kept).
+#: Ordered general-to-specific where it matters; applied as a batch in _mask_non_values.
+#: Evidence: two real FALSE positives this gate produced --
+#:   * "[ref:511e078026f6]" was read as the number 511 (citation tag + hex id);
+#:   * a "top 50" screening answer was read as the number 20 (a version/id token "v20"/"_v2 0"
+#:     and list scaffolding, not a statistic).
+#: We mask citation tags, hex hashes/ids, file paths and names, dates and times, version
+#: strings, markdown list numbering and headings, and #-prefixed PR/issue numbers. Years are
+#: handled separately by range in extract_numbers. We do NOT mask bare decimals, percentages,
+#: or unit-bearing counts: those are exactly the statistics the gate must keep policing.
+_MASK_RES = (
+    # Citation tags like [ref:511e078026f6] (any bracketed ref:/cite:/id: + token).
+    re.compile(r"\[(?:ref|cite|id|cid)\s*:[^\]]*\]", re.IGNORECASE),
+    # Explicitly labelled hashes/ids: sha, commit, job, run, pr-id, uuid, session, hash.
+    re.compile(r"\b(?:sha(?:256|1)?|commit|job|run|session|uuid|guid|hash|id)\b[:#=\s]*[0-9a-fA-F-]{4,}", re.IGNORECASE),
+    # Bare hex-ish ids: a run of [0-9a-f] of length >=5 that contains at least one a-f letter
+    # (so pure-digit numbers are NOT caught). Catches 511e078026f6, 8c3daa76ccf0, 267a5740.
+    re.compile(r"\b(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{5,}\b"),
+    # File paths (contain a slash or backslash) and bare file names (name.ext).
+    re.compile(r"[A-Za-z0-9_./\\-]*[\\/][A-Za-z0-9_./\\-]+"),
+    re.compile(r"\b[\w-]+\.(?:csv|xlsx|xlsm|xls|json|md|py|txt|png|jpg|parquet|sql|yml|yaml|log)\b", re.IGNORECASE),
+    # ISO-ish dates and date-times: 2026-11-02, 2026/11/02, optional T12:43:18(+09:00).
+    re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)?"),
+    # Clock times on their own: 12:43, 09:20:05.
+    re.compile(r"\b\d{1,2}:\d{2}(?::\d{2})?\b"),
+    # Version strings: v20, v1.8, _v2, version 3, ver. 2.1.
+    re.compile(r"(?:\bver(?:sion)?\.?\s*|(?<![A-Za-z0-9])_?v)\d+(?:\.\d+)*", re.IGNORECASE),
+    # #-prefixed PR / issue numbers: #401, #12.
+    re.compile(r"#\d+\b"),
+    # Markdown list numbering / headings at line start: "1.", "2)", "  3. ".
+    re.compile(r"(?m)^\s*\d+[.)]\s"),
+)
+
+
+def _mask_non_values(text: str) -> str:
+    """Blank out identifier/metadata spans so their digits never become claimed numbers.
+
+    Each matched span is replaced by spaces of the SAME length, so byte offsets -- and hence
+    the lookbehind/lookahead that protect surviving numbers -- stay valid. This is applied
+    once before _NUM_RE runs; it is deliberately conservative: it only removes shapes that are
+    not analysis values (citations, hashes, paths, dates, versions, list markers, #numbers),
+    leaving every decimal, percentage, and unit-bearing count in place to be checked.
+    """
+    def blank(m):
+        return " " * (m.end() - m.start())
+    for rx in _MASK_RES:
+        text = rx.sub(blank, text)
+    return text
 
 #: Tokens that are identifiers or labels rather than measured quantities. A version "v1.8", a
 #: year "2026", a claim id "config_12", a path "part 3" -- matching these against computed
@@ -98,6 +156,7 @@ def extract_numbers(text) -> list:
     """
     if not isinstance(text, str):
         return []
+    text = _mask_non_values(text)
     out = []
     for m in _NUM_RE.finditer(text):
         had_percent = bool(m.group(2))
