@@ -2411,6 +2411,13 @@ _RESUME_SUCCESS_OUTCOMES = ("DONE",)
 # in the done-map so resume can tell "split" from "never ran", but it is NOT a success outcome:
 # it counts as finished only if its campaign header is on disk (see _resume_goal_is_done).
 _RESUME_FANOUT_OUTCOME = "FANOUT"
+# A worker a human stopped (the cockpit `close`/cancel command -> RelayWorker.cancel ->
+# outcome CANCELLED). The user's intent is terminal: re-queueing it on the next --resume is
+# repetition, not recovery (relay/outcomes.py keeps CANCELLED in FINISHED for the same reason).
+# It is written to the done-map so resume can tell "user stopped it" from "never ran", and
+# treated as finished by _resume_goal_is_done. INTERRUPTED (the coordinator died mid-work) is
+# deliberately NOT here: that worker did not finish and MUST still resume.
+_RESUME_CANCELLED_OUTCOME = "CANCELLED"
 
 
 def _goal_key(text):
@@ -2568,7 +2575,8 @@ def _update_done_map(state_dir, workers):
         done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
-            if outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME:
+            if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME
+                    or outcome == _RESUME_CANCELLED_OUTCOME):
                 _k = _goal_resume_key({
                     "text": getattr(w, "goal", "") or "",
                     "jid": getattr(w, "jid", None),
@@ -2600,7 +2608,8 @@ def _merge_final_done_map(state_dir, results):
             goal = r.get("goal") or ""
         except Exception:
             continue
-        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME) and goal:
+        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME
+                or outcome == _RESUME_CANCELLED_OUTCOME) and goal:
             _k = _goal_resume_key({"text": goal, "jid": r.get("jid")})
             if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
                 done[_k] = outcome
@@ -2609,7 +2618,8 @@ def _merge_final_done_map(state_dir, results):
 
 
 def _resume_goal_is_done(entry, key, done_map, state_dir):
-    """Did this ledger goal finish? DONE, or FANOUT whose campaign header is on disk.
+    """Did this ledger goal finish? DONE, CANCELLED (a user stop), or FANOUT whose
+    campaign header is on disk.
 
     G1: the FANOUT parent ends `done/FANOUT` at the split and used to be re-queued on every
     resume (one wasted turn, nothing queued). It counts as finished only when the header line
@@ -2618,6 +2628,8 @@ def _resume_goal_is_done(entry, key, done_map, state_dir):
     outcome = done_map.get(key)
     if outcome in _RESUME_SUCCESS_OUTCOMES:
         return True
+    if outcome == _RESUME_CANCELLED_OUTCOME:
+        return True                        # a human stopped it; resume must not resurrect it
     if outcome == _RESUME_FANOUT_OUTCOME:
         try:
             from relay import fleet_resume
