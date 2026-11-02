@@ -44,7 +44,7 @@ ALLOW_FIELD = "allow_real_desktop"
 
 #: The vocabulary. Casefolded substring markers naming the real-desktop UI-automation tools and
 #: the app-automation phrasing the cancelled goals actually used (see
-#: C:/Users/M118A8586/.claude/tools/goals/g_uia_ab.txt and g_uia_ab2.txt). Kept narrow so an
+#: the per-user ~/.claude/tools/goals/g_uia_ab.txt and g_uia_ab2.txt goal files). Kept narrow so an
 #: ordinary coding/data goal that merely MENTIONS a window is not caught: the markers are tool
 #: identifiers and explicit "UI automation of <app>" phrases, not the bare app names alone.
 #: desktop_act.py is the real-desktop UIA tool file; screen_uia_act / screen_uia_dump are its
