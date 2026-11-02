@@ -83,8 +83,13 @@ _NUM_RE = re.compile(
 #: Ordered general-to-specific where it matters; applied as a batch in _mask_non_values.
 #: Evidence: two real FALSE positives this gate produced --
 #:   * "[ref:511e078026f6]" was read as the number 511 (citation tag + hex id);
-#:   * a "top 50" screening answer was read as the number 20 (a version/id token "v20"/"_v2 0"
-#:     and list scaffolding, not a statistic).
+#:   * a "top 50" screening answer was read as the number 20. The 20 that mattered is a
+#:     genuine computed statistic (K_coat_lots_total=20 in this run's outputs) and MUST stay
+#:     policed; the spurious 20s are non-values -- a version/id token ("v20", "_v20") and
+#:     markdown list scaffolding -- which the version and list masks below already remove. A
+#:     number written in prose as a fold/times magnitude (「20倍」) is NOT masked: if it is a
+#:     real reported value it will be found among the computed outputs, and if it was copied
+#:     from a results file with no computation behind it the gate SHOULD flag it.
 #: We mask citation tags, hex hashes/ids, file paths and names, dates and times, version
 #: strings, markdown list numbering and headings, and #-prefixed PR/issue numbers. A SECOND
 #: class -- standard/product/format NAMES and their units (ISO 8601, UTF-8, SHA-256, RFC <n>,

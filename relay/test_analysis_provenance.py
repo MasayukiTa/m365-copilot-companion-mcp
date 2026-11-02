@@ -197,6 +197,30 @@ def test_version_token_v20_is_not_a_claimed_number():
         assert 20 not in vals, answer
 
 
+def test_fold_magnitude_in_prose_is_policed_not_masked():
+    # A number written as a fold/times magnitude ("20倍") is NOT a non-value: it is a
+    # reported quantity. If no computation in this run produced a 20, copying it from a
+    # results file must still be flagged -- the gate polices prose statistics too.
+    answer = "全体の粘度正相関（rho=0.208）は塗工機間の中央値20倍差。"
+    computed = ["recomputed spearman rho = 0.208 over the raw lots"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert not r["ok"], r
+    assert 20 in r["unsupported"], r
+    # the genuine recomputed statistic is NOT flagged
+    assert 0.208 not in r["unsupported"], r
+
+
+def test_fold_magnitude_with_backing_computation_passes():
+    # The same "20倍" is a legitimate value when this run actually computed a 20
+    # (e.g. K_coat_lots_total=20). It must pass and must NOT be reported unsupported --
+    # masking it would have hidden a real, provenanced statistic.
+    answer = "塗工機間の中央値20倍差、rho=0.208。"
+    computed = ["K_coat_lots_total = 20", "recomputed spearman rho = 0.208"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert r["ok"], r
+    assert 20 not in r["unsupported"], r
+
+
 def test_hex_ids_dates_paths_and_pr_numbers_are_not_claimed_numbers():
     answer = ("Job 8c3daa76ccf0 ran on 2026-11-02 at 12:43, see "
               "C:/out/calc_top50_rows.csv, merged in #401, commit 267a5740.")
