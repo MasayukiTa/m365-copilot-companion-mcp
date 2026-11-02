@@ -8183,6 +8183,19 @@ class RelayWorker:
         False (do not block) when: no case was resolved, the resolution was incomplete (the
         worker was already gated for clarification), or the attribution ledger cannot say -- a
         measurement that cannot see must not fail the work it measures.
+
+        THE no-op HOLE THIS CLOSES. job 065d8c1c4a14 pasted the case folder's full path and the
+        worker finished in ONE turn, reporting from result files a PRIOR run had left, WITHOUT
+        calling any tool at all. Its own attributed tool set was therefore empty -- and the old
+        "if not used: return False" read that empty set as "the ledger cannot say" and let the
+        DONE through. But an empty attributed set has two very different causes: (a) the ledger
+        is blind to this worker (no rows recorded at all, or this worker's MCP session was never
+        bound, so nothing CAN be attributed) -- genuine no-evidence, must not block; and (b) the
+        ledger IS recording and this worker's session IS bound, and it still shows zero calls --
+        positive evidence the worker ran no tool, which for a resolved case reference means the
+        request file was certainly never read. (b) is exactly the production no-op and must
+        block. The two are told apart by whether attribution is live at all (any ledger rows
+        exist AND this worker has a bound session), not by the size of this worker's own slice.
         """
         case = getattr(self, "_review_case", None) or {}
         request_path = case.get("request_path")
@@ -8192,11 +8205,50 @@ class RelayWorker:
             used = RelayWorker._judge_tool_names(self)
         except Exception:
             return False
-        if not used:
-            # The ledger could not attribute any call to this worker; it cannot prove the file
-            # was skipped any more than it can prove it was read. Do not block on no evidence.
+        if used:
+            # At least one call is attributed to this worker: the ordinary measured path. Block
+            # only when none of those calls read content (a listing-only or no-read turn).
+            return not (used & RelayWorker._CONTENT_READ_TOOLS)
+        # used is empty. Distinguish positive no-op from a blind ledger: block only when
+        # attribution is actually LIVE (the shared ledger has rows AND this worker's MCP session
+        # is bound), so an empty slice means "this worker ran nothing", not "nothing could be
+        # seen". If either is absent, the measurement cannot see -- do not block on no evidence.
+        try:
+            if not RelayWorker._attribution_is_live(self):
+                return False
+        except Exception:
             return False
-        return not (used & RelayWorker._CONTENT_READ_TOOLS)
+        # Attribution is live and this worker's attributed call set is empty: it ran no tool at
+        # all, so the resolved request file was certainly never read.
+        return True
+
+    def _attribution_is_live(self) -> bool:
+        """True when the tool ledger CAN attribute calls to this worker right now: the shared
+        ledger has at least one row AND this worker has a trusted, bound MCP session. When either
+        is absent, an empty attributed set is "nothing could be seen", not "this worker ran
+        nothing" -- so callers must not read emptiness as a no-op. Never raises; False on doubt.
+        """
+        try:
+            if not self._ledger_rows():
+                return False
+        except Exception:
+            return False
+        try:
+            from relay import mcp_attribution as attr
+            route = _socket_route()
+            if route is None:
+                return False
+            bindings = route.mcp_bindings.snapshot() or {}
+            ids = self._conversation_ids_for_binding() or {}
+            conversation = ids.get("client") or ""
+            if not conversation:
+                return False
+            return any(b.get("worker") == self.name
+                       and b.get("conversation") == conversation
+                       and b.get("how") in attr.TRUSTED_HOW
+                       for b in bindings.values())
+        except Exception:
+            return False
 
     def _settle_done(self, outcome_override=None):
         """THE ONLY PLACE THIS WORKER BECOMES DONE.
