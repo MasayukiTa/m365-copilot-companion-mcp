@@ -161,3 +161,73 @@ def test_note_states_fail_with_the_unsupported_number():
 def test_note_states_no_computation_case():
     r = ap.check_answer_provenance("corr 0.9", [], is_analysis=True)
     assert "no computation" in ap.provenance_note(r)
+
+
+# ── FALSE POSITIVES from two real rejected answers (PR fix) ────────────────────────────────
+# Both shapes below were taken from real jobs the gate wrongly failed:
+#   * job 8c3daa76ccf0 failed on 511 -- the leading digits of the citation tag
+#     [ref:511e078026f6] in the worker's answer, not an analysis value.
+#   * job 3da486070941 failed on 20 -- a version/id token in the answer, not a statistic.
+# These are hermetic: pure strings, no ledger/clock/IO.
+
+def test_citation_ref_tag_is_not_a_claimed_number():
+    # [ref:511e078026f6] must not yield 511 (nor any hash digit) as a claimed number.
+    vals = [v for v, _ in ap.extract_numbers(
+        "The lot-level kasure rate is summarised below [ref:511e078026f6].")]
+    assert 511 not in vals
+    assert vals == []
+
+
+def test_citation_ref_tag_answer_with_a_real_computed_value_passes():
+    # The only analysis value (0.12) was recomputed this run; the 511 of the [ref:...] tag
+    # must not be treated as an unsupported claim.
+    answer = "The kasure rate is 0.12 over the raw lots [ref:511e078026f6]."
+    computed = ["recomputed kasure rate = 0.12 over 74 lots"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert r["ok"], r
+    assert 511 not in r["unsupported"]
+
+
+def test_version_token_v20_is_not_a_claimed_number():
+    # The shape that produced the spurious 20: a version/id token in a screening answer.
+    for answer in ("Results written to screening_v20 folder.",
+                   "See the _v20 output; defect totals are listed there.",
+                   "Analysis version 20 of the screening."):
+        vals = [v for v, _ in ap.extract_numbers(answer)]
+        assert 20 not in vals, answer
+
+
+def test_hex_ids_dates_paths_and_pr_numbers_are_not_claimed_numbers():
+    answer = ("Job 8c3daa76ccf0 ran on 2026-11-02 at 12:43, see "
+              "C:/out/calc_top50_rows.csv, merged in #401, commit 267a5740.")
+    vals = [v for v, _ in ap.extract_numbers(answer)]
+    # None of these id/metadata digits should become a policed claim.
+    for planted in (8, 50, 401, 267, 2026, 11, 12, 43):
+        assert planted not in vals, (planted, vals)
+    assert vals == []
+
+
+def test_markdown_list_numbering_is_not_a_claimed_number():
+    answer = "1. first finding\n2) second finding\n10. tenth finding"
+    vals = [v for v, _ in ap.extract_numbers(answer)]
+    assert vals == []
+
+
+def test_a_planted_decimal_copied_from_a_result_file_is_still_rejected():
+    # Guard against opening a hole: a genuine statistic (a decimal) that appears ONLY in a
+    # results file and in no computation output of this run must still fail. The masking of
+    # ids/tags must not swallow a bare decimal next to a citation.
+    answer = "The defect correlation is 0.834 [ref:511e078026f6]."
+    computed = ["recomputed correlation = 0.207 over 74 lots"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert not r["ok"]
+    assert any(abs(v - 0.834) < 1e-9 for v in r["unsupported"])
+    assert 511 not in r["unsupported"]
+
+
+def test_a_planted_percentage_next_to_metadata_is_still_rejected():
+    answer = "Defect share 12.5% in run 8c3daa76ccf0 on 2026-11-02."
+    computed = ["recomputed share = 0.207"]
+    r = ap.check_answer_provenance(answer, computed, is_analysis=True)
+    assert not r["ok"]
+    assert any(abs(v - 12.5) < 1e-9 for v in r["unsupported"])
