@@ -2,7 +2,7 @@
 
 ジョブ fanbudget。origin/main の worktree (fix/fanout-budget-measurement)。
 対象は relay/fanout_budget.py の usage_from_status()。実測の根拠は本番の
-resonac-mcp/.fleet(読み取りのみ。コーディネータ/コックピットは停止していない)。
+`.fleet/`(読み取りのみ。コーディネータ/コックピットは停止していない)。
 
 ## 症状(実測 .fleet/status.json の tree_budget)
 
