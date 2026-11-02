@@ -286,6 +286,7 @@ partial class CockpitWindow
             case "fanout_max_turns":
             case "fanout_max_wall_min":
             case "effort_policy":
+            case "analysis_provenance_gate":
                 return "each_gate";
             case "session_retention_days":
             case "session_max_mb":

@@ -8380,33 +8380,48 @@ class RelayWorker:
         # The provenance note is appended to the visible judge text so it travels into the
         # judge input and the footer (owner rule 4). Never raises: the collector and checker
         # are both conservative and an error in them must not fail a finished run.
+        #
+        # APPLICABILITY IS BY GOAL CONTENT, NOT TOOL USAGE. is_data_analysis_goal classifies
+        # from the goal/request TEXT (task_kind); tool usage only adds confidence. Before that
+        # scoping (fixed 2026-11-02) the gate fired on run_python usage alone and rejected 28
+        # worker answers VERIFY_FAILED "claimed numbers not found in this run's computation
+        # outputs" -- many of them code-audit/review jobs, not analyses (submitters h16_14,
+        # h16_18, h22a, rv_e_auth and unnamed workers). The analysis_provenance_gate setting
+        # (default ON) lets the owner disable this gate from the settings screen.
         try:
             from relay import analysis_provenance as _ap
             from relay.judge_gate import is_data_analysis_goal as _is_analysis
-            _is_an = _is_analysis(getattr(self, "goal", ""),
-                                  getattr(self, "_judge_request_text", ""),
-                                  RelayWorker._judge_tool_names(self))
-            _answer = getattr(self, "_candidate_done_reply", "") or self.last_response or ""
-            _prov = _ap.check_answer_provenance(
-                _answer, self._judge_compute_outputs(), is_analysis=_is_an)
-            # ONLY SPEAK WHEN THE GATE ACTUALLY LOOKED. A no-op pass -- a non-analysis answer,
-            # or an analysis answer with no numeric claim to police -- examined nothing, so it
-            # must leave the visible answer and the judge text exactly as they were. Adding a
-            # 'provenance: n/a' line there would change last_response on the ordinary M365 /
-            # prose path, which other completion contracts read byte-for-byte. The note is
-            # emitted only when a claim was checked (checked > 0) or the gate FAILED.
-            _spoke = (not _prov.get("ok")) or int(_prov.get("checked") or 0) > 0
-            if _spoke:
-                _note = _ap.provenance_note(_prov)
-                judge_text = ((judge_text + "\n") if judge_text else "") + _note
-            if not _prov.get("ok"):
-                self.last_response = (self.last_response or "") + "\n" + _note
-                self._judge_fix_job_text = _prov.get("correction", "")
-                self.status, self.outcome = "stuck", "VERIFY_FAILED"
-                self.reason = ("provenance: %s | %s"
-                               % (_prov.get("reason", ""),
-                                  _prov.get("correction", "")))[:300]
-                return
+            # OPERATOR SWITCH: analysis_provenance_gate (settings registry, default ON). When the
+            # owner turns it off from the settings screen, skip the gate entirely and leave the
+            # answer and judge text exactly as they were -- no note, no rejection. Read fresh on
+            # each completion (mtime-cached), so a change reaches the next completion with no
+            # restart. Default ON: an absent/unreadable setting keeps the gate on.
+            if _ap.gate_enabled():
+                _is_an = _is_analysis(getattr(self, "goal", ""),
+                                      getattr(self, "_judge_request_text", ""),
+                                      RelayWorker._judge_tool_names(self))
+                _answer = getattr(self, "_candidate_done_reply", "") or self.last_response or ""
+                _prov = _ap.check_answer_provenance(
+                    _answer, self._judge_compute_outputs(), is_analysis=_is_an)
+                # ONLY SPEAK WHEN THE GATE ACTUALLY LOOKED. A no-op pass -- a non-analysis
+                # answer, or an analysis answer with no numeric claim to police -- examined
+                # nothing, so it must leave the visible answer and the judge text exactly as
+                # they were. Adding a 'provenance: n/a' line there would change last_response on
+                # the ordinary M365 / prose path, which other completion contracts read
+                # byte-for-byte. The note is emitted only when a claim was checked (checked > 0)
+                # or the gate FAILED.
+                _spoke = (not _prov.get("ok")) or int(_prov.get("checked") or 0) > 0
+                if _spoke:
+                    _note = _ap.provenance_note(_prov)
+                    judge_text = ((judge_text + "\n") if judge_text else "") + _note
+                if not _prov.get("ok"):
+                    self.last_response = (self.last_response or "") + "\n" + _note
+                    self._judge_fix_job_text = _prov.get("correction", "")
+                    self.status, self.outcome = "stuck", "VERIFY_FAILED"
+                    self.reason = ("provenance: %s | %s"
+                                   % (_prov.get("reason", ""),
+                                      _prov.get("correction", "")))[:300]
+                    return
         except Exception:
             pass
         if judge_text:

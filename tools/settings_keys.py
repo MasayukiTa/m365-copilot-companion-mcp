@@ -140,6 +140,23 @@ KEYS = OrderedDict([
        "tools/approval_policy.py:current_approval_mode (every gate check)",
        "Read fresh at every approval gate, so the panel governs jobs already queued."),
 
+    # The analysis provenance gate (relay/analysis_provenance.py), applied where a worker
+    # becomes DONE in relay/relay_fleet.py. It refuses a data-analysis answer whose numbers
+    # were not recomputed from the raw input in this run (a transcription from a results file
+    # the folder already held). ON by default. The switch lets the owner turn the gate off
+    # from the settings screen without a code change, read fresh on each completion like the
+    # other each_gate keys. Event it prevents and the measurement are recorded in the code
+    # comment at the gate call site (2026-11-02: 28 wrongful rejections of audit/review jobs,
+    # fixed by scoping the classifier to goal content -- this switch is the operator override).
+    _k("analysis_provenance_gate", EACH_GATE, "on",
+       "relay/relay_fleet.py:_settle_done (every data-analysis completion, reads settings.txt mtime-cached)",
+       "off|on. on (default): a data-analysis answer must only report numbers this run "
+       "recomputed from the raw input; a number taken from a results file the folder already "
+       "held fails completion (VERIFY_FAILED) with a correction naming what to do. off: the "
+       "provenance gate is skipped and such an answer completes unchecked. Read fresh at each "
+       "completion with no restart. A present line reads as off only when it says off; anything "
+       "else on a present line, and an absent line, reads as on (the default)."),
+
     # fleet_submit's word-overlap duplicate guard (tools/fleet_intake.py). OFF by default by
     # owner order 2026-10-26: refusing a goal at the door on word overlap turned away DIFFERENT
     # work (two short goals sharing a verb, two coding goals sharing one appended block of common

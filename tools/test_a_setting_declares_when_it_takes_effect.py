@@ -112,6 +112,16 @@ def _reader_effort_policy():
     return mode()
 
 
+def _reader_analysis_provenance_gate():
+    # The gate's file reader, as a token the harness can compare. gate_enabled() returns a bool
+    # and also honours an MCP_ANALYSIS_PROVENANCE_GATE env override; this behavioural test is
+    # about the FILE following, so map the bool back to the on/off word the harness wrote and
+    # read the file path the harness monkeypatched (settings_path). Env is not set in the test
+    # environment, so the file is the only input.
+    from relay import analysis_provenance as _ap
+    return "on" if _ap.gate_enabled() else "off"
+
+
 def _reader_fanout_depth():
     from relay.fanout import configured_max_depth
     return configured_max_depth()
@@ -297,6 +307,7 @@ _LIVE_READERS = {
     "rate_ceiling_rpm": (_reader_rate, "40", "90"),
     "socket_goal_mb": (_reader_socket_goal_mb, "10", "60"),
     "effort_policy": (_reader_effort_policy, "shadow", "on"),
+    "analysis_provenance_gate": (_reader_analysis_provenance_gate, "off", "on"),
     "fanout_max_depth": (_reader_fanout_depth, "2", "3"),
     "fanout_hierarchical_merge": (_reader_hierarchical_merge, "on", "off"),
     "fanout_write_scope": (_reader_write_scope, "shadow", "off"),

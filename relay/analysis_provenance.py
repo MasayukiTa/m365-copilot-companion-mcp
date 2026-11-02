@@ -35,6 +35,7 @@ turned off, and then it protects nothing.
 """
 from __future__ import annotations
 
+import os
 import re
 
 #: Tools whose OUTPUT is a computation over raw data this run performed itself. A number that
@@ -334,3 +335,68 @@ def provenance_note(result) -> str:
         return "provenance: FAIL (%s)" % tag
     except Exception:
         return "provenance: unknown"
+
+
+# --- the operator switch -----------------------------------------------------------------
+#
+# analysis_provenance_gate in the settings registry (tools/settings_keys.py), default ON. The
+# owner can turn the gate off from the settings screen without a code change. Read fresh on
+# each completion (EACH_GATE), mtime-cached like the other per-gate keys (cf.
+# relay/effort_policy.py:_settings_value): one os.stat per call, a re-read only when the file
+# changed, so a change made in the cockpit is seen by the NEXT completion in a running process
+# with no restart. Absent, unreadable, or anything but "off" reads as ON (the conservative
+# default -- a gate that protects against planted results should not silently turn itself off).
+_GATE_KEY = "analysis_provenance_gate"
+_settings_cache = {}  #: path -> ((path, mtime_ns, size), value)
+
+
+def _settings_value(env=None):
+    """The `analysis_provenance_gate=` value from settings.txt, lower-cased, or None when the
+    line is absent/unreadable. With the real environment (env is None) the repository's one
+    resolver (tools.settings_path.settings_file); with an injected env dict, ONLY the file named
+    by its MCP_ANALYSIS_PROVENANCE_GATE_SETTINGS entry, so a test can never be steered by the
+    developer's real .config. A BOM is tolerated. Never raises.
+    """
+    try:
+        if env is None:
+            from tools.settings_path import settings_file
+            path = settings_file()
+        else:
+            path = str(env.get("MCP_ANALYSIS_PROVENANCE_GATE_SETTINGS", "") or "")
+        if not path:
+            return None
+        st = os.stat(path)
+        key = (path, st.st_mtime_ns, st.st_size)
+        hit = _settings_cache.get(path)
+        if hit is not None and hit[0] == key:
+            return hit[1]
+        val = None
+        with open(path, encoding="utf-8-sig") as fh:
+            for ln in fh:
+                ln = ln.strip()
+                if ln.startswith(_GATE_KEY + "="):
+                    val = ln.split("=", 1)[1].strip().lower()
+                    break
+        _settings_cache[path] = (key, val)
+        return val
+    except Exception:
+        return None
+
+
+def gate_enabled(env=None) -> bool:
+    """Whether the analysis provenance gate is ON. Default ON; only an explicit `off` disables
+    it. An MCP_ANALYSIS_PROVENANCE_GATE environment variable, when set to off, beats the file
+    (symmetry with the other gates' env override). Never raises -- on any error the gate stays
+    ON, because the failure it prevents (reporting a planted results file as the answer) is
+    worse than one extra engine check.
+    """
+    try:
+        _env = os.environ if env is None else env
+        ev = str(_env.get("MCP_ANALYSIS_PROVENANCE_GATE", "") or "").strip().lower()
+        if ev == "off":
+            return False
+        if ev == "on":
+            return True
+        return _settings_value(env) != "off"
+    except Exception:
+        return True
