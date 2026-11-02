@@ -2584,6 +2584,25 @@ def _update_done_map(state_dir, workers):
                 # monotonic: a later FANOUT never downgrades a recorded DONE
                 if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
                     done[_k] = outcome
+            # DURABLE TOMBSTONE for a cancelled worker, in addition to the done-map entry.
+            # The done-map is keyed by goal text/jid and is the fast in-run skip; the tombstone
+            # is the jid-keyed floor that survives a restart even when no outcome file was ever
+            # written (the five uia jids had no outcome file yet still ran). Writing it each
+            # tick a worker reads CANCELLED means a close that races the coordinator's death is
+            # still recorded. Idempotent; best-effort.
+            if outcome == _RESUME_CANCELLED_OUTCOME:
+                try:
+                    from relay import fleet_tombstone as _tomb
+                    # Tombstone the worker's jid AND its fan-out identities (task_id /
+                    # parent_task_id / campaign_id / root_id), so a cancelled PARENT also stops
+                    # the children that inherit those ids but carry no jid of their own.
+                    for _id in _tomb.worker_identities(w):
+                        _tomb.write_tombstone(
+                            state_dir, _id, reason=_tomb.REASON_CANCELLED,
+                            worker=getattr(w, "name", None),
+                            goal_text=getattr(w, "goal", None))
+                except Exception:
+                    pass
         _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     except Exception as e:
         # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
@@ -2657,9 +2676,36 @@ def _resume_goals(state_dir):
         stored = entry.get("key") or _goal_key(entry.get("text", ""))
         legacy_key_counts[stored] = legacy_key_counts.get(stored, 0) + 1
 
+    # DURABLE TOMBSTONE FLOOR, checked BEFORE the done-map. A job the operator cancelled or
+    # closed is recorded by jid under tasks/closed/ the moment it was stopped; it must never
+    # resume even if the done-map never learned its CANCELLED outcome (no outcome file, a close
+    # that raced the coordinator's death). The done-map remains the finer in-run signal; this is
+    # the floor that does not depend on a terminal hook having run. A child entry inherits its
+    # parent/family tombstone through blocked_jid.
+    try:
+        from relay import fleet_tombstone as _tomb
+    except Exception:
+        _tomb = None
+
     remainder = []
     for entry in ledger:
         primary = _goal_resume_key(entry)
+        if _tomb is not None:
+            _blocker = _tomb.blocked_jid(state_dir, entry)
+            if _blocker:
+                # A tombstoned job (or a child of one) is terminal across restarts. If it is a
+                # child inheriting an ancestor's tombstone, stamp its own jid so the next resume
+                # is O(1) and the audit trail shows the inheritance.
+                _own = _tomb.goal_jid(entry)
+                if _own and _own != _blocker and not _tomb.is_tombstoned(state_dir, _own):
+                    try:
+                        _tomb.write_tombstone(state_dir, _own,
+                                              reason=_tomb.REASON_INHERITED,
+                                              goal_text=entry.get("text"),
+                                              parent_jid=_blocker)
+                    except Exception:
+                        pass
+                continue                   # operator stopped it; resume must not resurrect it
         if _resume_goal_is_done(entry, primary, done_map, state_dir):
             continue                       # already finished successfully (or split) -- skip
         stored = entry.get("key") or _goal_key(entry.get("text", ""))
@@ -3895,6 +3941,24 @@ def claim_adopt_command(state_dir, path):
     goals = goals_from_command(cmd) if not errors else []
     if not goals and not errors:
         errors.append("adopt command contains no usable goals")
+    # DURABLE TOMBSTONE CHECK at the adopt door. A fresh runner adopting a pending add_goal
+    # command starts a NEW run that never consults the done-map, so without this a cancelled /
+    # closed jid parked in commands.d is resurrected on the next cold start -- one of the paths
+    # the uia jobs came back through. Refuse to adopt a goal whose own or inherited jid is
+    # tombstoned; an operator who really wants it re-submits with a NEW jid (which clears it).
+    if goals and not errors:
+        try:
+            from relay import fleet_tombstone as _tomb
+            for _g in goals:
+                _blk = _tomb.blocked_jid(state_dir, _g)
+                if _blk:
+                    errors.append(
+                        "adopt command carries a stopped job: jid=%s blocked by tombstone %s "
+                        "(operator cancelled/closed it; re-submit with a new jid)"
+                        % (_tomb.goal_jid(_g) or "?", _blk))
+                    break
+        except Exception:
+            pass
     if errors:
         restore_command_claim(claim)
         return None, [], errors
@@ -4906,6 +4970,26 @@ def main():
                 w = by_name.get(nm)
                 if w is not None and w.status not in TERMINAL:
                     w.cancel()
+                # DURABLE TOMBSTONE AT THE CLOSE SITE. The operator stopped this worker; its
+                # intent is terminal across restarts. Write the tombstone here -- not only via
+                # the done-map on the next tick -- because a worker closed as the coordinator
+                # is going down may never reach _update_done_map, which is exactly how the
+                # cancelled uia jobs came back after a restart. Keyed by jid so every
+                # start/resume/adopt path (and the worker's fan-out children) can refuse it.
+                if w is not None:
+                    try:
+                        from relay import fleet_tombstone as _tomb
+                        # Tombstone every identity this worker carries (jid + fan-out
+                        # task_id/parent_task_id/campaign_id/root_id) so a closed PARENT also
+                        # blocks its children, which inherit those ids but have no jid.
+                        for _id in _tomb.worker_identities(w):
+                            _tomb.write_tombstone(
+                                args.state_dir, _id,
+                                reason=_tomb.REASON_OPERATOR_CLOSE,
+                                worker=getattr(w, "name", None),
+                                goal_text=getattr(w, "goal", None))
+                    except Exception:
+                        pass
             if "set_maxtabs" in cmd:
                 # under autoscale this knob is the CEILING (上限); otherwise the fixed cap.
                 try:
@@ -4963,6 +5047,20 @@ def main():
             # A recovered command whose batch was persisted before a crash is therefore a no-op;
             # --resume already reconstructed that work from the same ledger.
             for g in _new_cmd_goals:
+                # DURABLE TOMBSTONE CHECK at the live-add door. A command can re-introduce a
+                # jid the operator already cancelled/closed (a recovered commands.d file, a
+                # child carrying a tombstoned ancestor). Refuse it here so a `close` is not
+                # undone by the very next drain. Text/legacy goals with no jid are unaffected.
+                try:
+                    from relay import fleet_tombstone as _tomb
+                    _blk = _tomb.blocked_jid(args.state_dir, g)
+                    if _blk:
+                        print("[fleet] refusing a live-add of a stopped job: jid=%s blocked by "
+                              "tombstone %s (operator cancelled/closed it; re-submit with a new "
+                              "jid to run it)" % (_tomb.goal_jid(g) or "?", _blk), flush=True)
+                        continue
+                except Exception:
+                    pass
                 add_box.append(g)
                 # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
                 # deleted the moment it is read, and after that this goal looks like any

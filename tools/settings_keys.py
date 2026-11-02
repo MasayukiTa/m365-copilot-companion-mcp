@@ -173,6 +173,21 @@ KEYS = OrderedDict([
        "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
        "anything but on reads as off."),
 
+    # The owner's standing rule after the 2026-11-02 uia incident: the fleet REFUSES to start a
+    # job whose goal asks for UI automation / computer use on the REAL desktop (desktop_act /
+    # screen_uia_act / screen_uia_dump / Notepad+Calculator automation tests). ON by default --
+    # a safety floor, so a missing/unreadable line keeps it on; only an explicit `off` disables
+    # it. A single goal may still run there by carrying the explicit operator field
+    # allow_real_desktop (off by default on the goal dict). Read live at each worker start.
+    _k("block_real_desktop_automation", EACH_GATE, "on",
+       "relay/desktop_guard.py:mode (every worker start, mtime-cached)",
+       "on|off. on (default): a job whose goal text asks for real-desktop UI automation "
+       "(desktop_act, screen_uia_act/dump, 'Notepad and Calculator' automation, '実デスクトップ') "
+       "is REFUSED before a worker opens, with a reason shown in the cockpit, unless the goal "
+       "carries the operator field allow_real_desktop. off: the guard is disabled. The env var "
+       "MCP_BLOCK_REAL_DESKTOP_AUTOMATION beats the file. Read fresh at each start, so a change "
+       "reaches the next worker with no restart; absent or unreadable reads as on (the floor)."),
+
     # ---------------------------------------------------------------- sweep_start
     _k("autoscale", SWEEP_START, 0,
        "relay/fleet_runner.py:settings_autoscale (once, before the sweep)",

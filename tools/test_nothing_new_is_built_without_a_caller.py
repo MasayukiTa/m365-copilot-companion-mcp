@@ -156,6 +156,18 @@ NO_CALLER_BUT_TESTED = {
     # left the list 2026-10-18: relay/template_seed.py (the connector-less route) calls it. See
     # docs/unreached_burndown.md, "the tab era's leftovers".
     "bridge/validity_audit.py::wait_async_idle",                 # test/shutdown drain helper
+    # DURABLE TOMBSTONE READ/CLEAR API (PR 421, relay/fleet_tombstone.py). The write+block
+    # path is wired and live -- write_tombstone, is_tombstoned, blocked_jid and
+    # worker_identities are called from fleet_runner's cancel/close/adopt/live-add doors. These
+    # three are the module's read/clear surface: tombstone_reason (the recorded reason word),
+    # tombstoned_jids (the on-disk inventory) and remove_tombstone (the operator-resubmit clear,
+    # guarded to refuse any jid that is not a NEW one). They are exercised directly by
+    # relay/test_fleet_tombstone.py but have no production caller yet; kept unwired on purpose
+    # until the cockpit surfaces a reason and the resubmit path carries a new jid. See
+    # docs/unreached_burndown.md.
+    "relay/fleet_tombstone.py::remove_tombstone",                 # 20 lines, test refs
+    "relay/fleet_tombstone.py::tombstone_reason",                 # 12 lines, test refs
+    "relay/fleet_tombstone.py::tombstoned_jids",                  # 12 lines, test refs
 }
 
 BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
@@ -384,6 +396,14 @@ REASONS: dict[str, tuple[str, str]] = {
 
     # TAB-ERA LEFTOVERS, 2026-10-14. Kept on purpose; the nine tab-only siblings were deleted.
     "bridge/validity_audit.py::wait_async_idle": ("deliberate", "docs/unreached_burndown.md"),
+
+    # DURABLE TOMBSTONE READ/CLEAR API (PR 421). The write+block half is wired; these three are
+    # the read/clear half, tested in relay/test_fleet_tombstone.py and held unwired on purpose
+    # until a cockpit reason surface and an operator-resubmit-with-new-jid path call them. The
+    # tombstone itself (stopped stays stopped) does not depend on them. See the burndown entry.
+    "relay/fleet_tombstone.py::remove_tombstone": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/fleet_tombstone.py::tombstone_reason": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/fleet_tombstone.py::tombstoned_jids": ("deliberate", "docs/unreached_burndown.md"),
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.
