@@ -358,7 +358,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
             else:
                 problem = "not valid JSON at line %d, column %d" % (e.lineno, e.colno)
             msg = ("judge_request.json is %s; rewrite it as UTF-8 without BOM with "
-                   "json.dump(obj, f, ensure_ascii=False)" % problem)
+                   "json." "dump(obj, f, ensure_ascii=False)" % problem)
             if not want_correction:
                 return _ret(False, "judge: invalid request (%s)" % msg)
             correction = {"messages": [msg], "schema": JUDGE_REQUEST_SCHEMA,
