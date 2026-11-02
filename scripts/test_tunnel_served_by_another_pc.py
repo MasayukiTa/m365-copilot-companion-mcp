@@ -222,6 +222,9 @@ function Test-DevtunnelLoggedInCached { return $true }
 # decision to re-host is taken, not devtunnel.
 function Start-TunnelHost { $script:HostCalls++; return ($null -eq $script:HostOk -or [bool]$script:HostOk) }
 function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) }
+# The reader-gap bookkeeping of the duplicate-reader guard (scripts/test_supervisor_no_duplicate_host.py)
+# is not what is under test here; it only stamps a time for Start-TunnelHost, which is stubbed above.
+function Update-ReaderRelayGap { param($Connections, $ReaderAlive) }
 . (Join-Path $RootDir "tunnel_name_util.ps1")
 '''
 
