@@ -7,7 +7,7 @@ is the standing guard: ON by default, it refuses any goal whose text asks for re
 automation unless the goal carries the explicit operator field allow_real_desktop.
 
 These tests drive the guard with the ACTUAL goal files the owner's two jobs used
-(C:/Users/M118A8586/.claude/tools/goals/g_uia_ab*.txt) -- both must be refused -- and with
+(the per-user ~/.claude/tools/goals/g_uia_ab*.txt files) -- both must be refused -- and with
 ordinary coding/data goals -- which must NOT be refused. The classifier is a deterministic
 vocabulary match (judge_gate shape): no clock, no network, no real desktop touched here.
 """
@@ -23,7 +23,7 @@ from relay import desktop_guard as dg
 #: The real goal files. When present (the operator's machine) they are the authoritative
 #: wording; when absent (a fresh CI checkout -- the goals/ tree is not in the repo) the test
 #: falls back to verbatim excerpts captured from them so the assertion still runs everywhere.
-_GOAL_DIR = r"C:/Users/M118A8586/.claude/tools/goals"
+_GOAL_DIR = os.path.join(os.path.expanduser("~"), ".claude", "tools", "goals")
 
 _FALLBACK = {
     # Verbatim phrases from g_uia_ab.txt (the real-desktop run).
