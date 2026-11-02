@@ -86,9 +86,12 @@ _NUM_RE = re.compile(
 #:   * a "top 50" screening answer was read as the number 20 (a version/id token "v20"/"_v2 0"
 #:     and list scaffolding, not a statistic).
 #: We mask citation tags, hex hashes/ids, file paths and names, dates and times, version
-#: strings, markdown list numbering and headings, and #-prefixed PR/issue numbers. Years are
-#: handled separately by range in extract_numbers. We do NOT mask bare decimals, percentages,
-#: or unit-bearing counts: those are exactly the statistics the gate must keep policing.
+#: strings, markdown list numbering and headings, and #-prefixed PR/issue numbers. A SECOND
+#: class -- standard/product/format NAMES and their units (ISO 8601, UTF-8, SHA-256, RFC <n>,
+#: HTTP 200, Python 3.10, CP932, p95, ordinals, counters, ports, timezones, code spans) -- is
+#: in _MASK_STANDARD_NAMES just below. Years are handled separately by range in extract_numbers.
+#: We do NOT mask bare decimals, percentages, or unit-bearing counts: those are exactly the
+#: statistics the gate must keep policing.
 _MASK_RES = (
     # Citation tags like [ref:511e078026f6] (any bracketed ref:/cite:/id: + token).
     re.compile(r"\[(?:ref|cite|id|cid)\s*:[^\]]*\]", re.IGNORECASE),
@@ -112,6 +115,64 @@ _MASK_RES = (
     re.compile(r"(?m)^\s*\d+[.)]\s"),
 )
 
+#: A SECOND class of false positives: digits that belong to a STANDARD / PRODUCT / FORMAT name,
+#: a unit of a format, an ordinal label, or a counter -- never a measured analysis value.
+#: Evidence: job e6541c75bcd9 (a Friday merge worker) ended VERIFY_FAILED on "8601", which was
+#: the "8601" of the standard name "ISO 8601" in the worker's explanation of the judge_request
+#: format ("fetched_at(ISO 8601 の時刻)"). It is not a statistic anyone computed. The same shape
+#: covers UTF-8/UTF-16, SHA-256/SHA1/MD5, RFC <n>, HTTP status codes ("HTTP 200"), interpreter
+#: and app version names (Python 3.10, Windows 11, Excel 2016), CP932, base64, "p95"/"p99"
+#: percentile NAMES, ordinal labels ("第1段", "step 2", "attempt 1/3", "(1/3)"), turn/job
+#: counters, port numbers, time-of-day/timezone strings, and anything inside a code span or
+#: backtick-quoted identifier. These are masked BEFORE number extraction so their digits never
+#: become claimed numbers. We still do NOT mask bare decimals, percentages, or unit-bearing
+#: counts: a planted statistic must stay policed (see the tests that keep those rejected).
+_MASK_STANDARD_NAMES = (
+    # Code spans / backtick-quoted identifiers and file names: `foo 3.10`, ``a | b``. Everything
+    # between matching backticks is an identifier/snippet, not prose, so its digits are masked.
+    re.compile(r"`[^`]*`"),
+    # ISO 8601 (and ISO <n> family), optionally with a trailing part number.
+    re.compile(r"\bISO[\s/-]?\d{3,5}(?:[-:]\d+)*\b", re.IGNORECASE),
+    # Character encodings: UTF-8, UTF-16, UTF-32, UCS-2.
+    re.compile(r"\b(?:UTF|UCS)[\s-]?\d{1,2}\b", re.IGNORECASE),
+    # Hash/digest algorithm names: SHA-256, SHA256, SHA-1, SHA1, SHA-512, MD5, CRC32.
+    re.compile(r"\b(?:SHA|MD|CRC)[\s-]?\d{1,3}\b", re.IGNORECASE),
+    # Code page / encoding ids written with digits: CP932, CP1252, Latin1, base64, UTF8 etc.
+    re.compile(r"\b(?:CP|Latin|Win|ISO-?8859-|Shift_JIS)[\s-]?\d{1,4}\b", re.IGNORECASE),
+    re.compile(r"\bbase64\b", re.IGNORECASE),
+    # RFC / PEP / errno-style standard references: RFC 3339, PEP 8.
+    re.compile(r"\b(?:RFC|PEP|ECMA|ANSI|IEEE|EN)[\s-]?\d{1,5}\b", re.IGNORECASE),
+    # HTTP status codes and protocol versions: "HTTP 200", "HTTP/1.1", "status 404".
+    re.compile(r"\bHTTP\s*/?\s*\d(?:\.\d)?\d*\b", re.IGNORECASE),
+    re.compile(r"\b(?:status|code)\s+(?:1\d\d|2\d\d|3\d\d|4\d\d|5\d\d)\b", re.IGNORECASE),
+    # Interpreter / application / OS version NAMES: Python 3.10, Windows 11, Excel 2016,
+    # Node 18, Java 21, Pandas 2.1, numpy 1.26, .NET 8, Ubuntu 22.04, macOS 14.
+    re.compile(r"\b(?:Python|Windows|Excel|Word|PowerPoint|Office|Node(?:\.js)?|Java|Pandas|"
+               r"NumPy|SciPy|Ubuntu|Debian|macOS|Linux|SQLite|PostgreSQL|MySQL|SQL\s*Server|"
+               r"\.NET|dotnet|openpyxl|pyodbc)\s*v?\d+(?:\.\d+)*\b", re.IGNORECASE),
+    # Percentile / quantile NAMES written as a label: p95, p99, P50, q90.
+    re.compile(r"(?<![A-Za-z0-9_])[pPqQ]\d{1,3}\b"),
+    # Western ordinal / step / attempt labels: "step 2", "attempt 1/3", "turn 10", "job 5",
+    # "phase 2", "round 3", "part 4", "item 7", "figure 1", "table 2".
+    re.compile(r"\b(?:step|attempt|turn|job|phase|round|part|item|figure|fig|table|tab|retry|"
+               r"iteration|iter|slice|subtask|task|worker|batch|epoch|trial)\.?\s*#?\d+"
+               r"(?:\s*(?:/|of)\s*\d+)?\b", re.IGNORECASE),
+    # Japanese ordinal labels: 第1段, 第2回, 3件目 is NOT masked (件 is a unit) -- only the
+    # 第<n><counter> form where 第 marks it as an ordinal, e.g. 第1段/第2章/第3回/第1部.
+    re.compile(r"第\s*\d+\s*(?:段|回|章|部|節|項|版|次|位|号)"),
+    # Bare "(1/3)" / "1/3" progress counters: a fraction-of-attempts, not a measured ratio.
+    re.compile(r"[(\uff08]\s*\d+\s*/\s*\d+\s*[)\uff09]"),
+    # Port numbers: "port 8080", ":50379" following a host/identifier.
+    re.compile(r"\bport\s*:?\s*\d{2,5}\b", re.IGNORECASE),
+    # A host:port or bare ":<port>" token. Clock times (12:43) are already masked by _MASK_RES
+    # above, so a surviving ":<2-5 digits>" here is a port, not a time.
+    re.compile(r":\d{2,5}\b"),
+    # Time-of-day and timezone strings not caught by the date rules: "UTC+9", "+09:00", "JST",
+    # "GMT+0900". The bare clock "12:43" is already masked by _MASK_RES.
+    re.compile(r"\b(?:UTC|GMT)\s*[+-]\s*\d{1,2}(?::?\d{2})?\b", re.IGNORECASE),
+    re.compile(r"(?<![0-9]):[+-]\d{2}:?\d{2}\b"),
+)
+
 
 def _mask_non_values(text: str) -> str:
     """Blank out identifier/metadata spans so their digits never become claimed numbers.
@@ -125,6 +186,10 @@ def _mask_non_values(text: str) -> str:
     def blank(m):
         return " " * (m.end() - m.start())
     for rx in _MASK_RES:
+        text = rx.sub(blank, text)
+    # Second class: standard/product/format names, units of a format, ordinal labels, counters,
+    # ports, timezones, and code-span contents -- their digits are never a measured value.
+    for rx in _MASK_STANDARD_NAMES:
         text = rx.sub(blank, text)
     return text
 
