@@ -315,3 +315,90 @@ def test_exploratory_mode_cannot_adopt(tmp_path):
                        out_dir=str(tmp_path), root=str(tmp_path), screened=by)
     assert "D_FAIL_EXPLORATORY" in outcomes[0].reasons
     assert outcomes[0].verdict == "HOLD"
+
+
+def test_run_workflow_confirms_true_not_confounded(tmp_path):
+    """End-to-end run_workflow with injected fakes (hermetic: no engine, no harness).
+
+    Drives split -> screen -> select -> build_claim -> lock -> write_confirm_set -> confirm
+    in one call and checks: the planted true effect is adopted, the confounded and null
+    factors are never selected, the family size is the full screen family, and the confirm
+    file is written only after the lock receipt exists.
+    """
+    from tools.screen_estimate_confirm import run_workflow, _factor_of
+
+    rows = _make_rows()
+    factors = ["A_true", "B_confound", "C_null"]
+    confirm_path = os.path.join(str(tmp_path), "confirm_rows.json")
+    lock_path = os.path.join(str(tmp_path), "lock.json")
+    out_dir = os.path.join(str(tmp_path), "engine_out")
+
+    prereg_utc = _dt.datetime.now(_dt.timezone.utc).isoformat()
+    order = {"locked": False}
+
+    def register_fn(claims):
+        order["locked"] = True
+        return {"locked_utc": prereg_utc, "n": len(claims)}
+
+    def to_record(confirm_rows):
+        assert order["locked"] is True, "confirm file written before lock"
+        assert not os.path.exists(confirm_path), "confirm file written too early"
+        return _to_json_record(confirm_rows)
+
+    import time as _time
+    _time.sleep(0.002)
+
+    def judge_fn(data_path, claim, *, lock_path=None, out_dir=None, root=None):
+        fetched = _dt.datetime.now(_dt.timezone.utc).isoformat()
+        return _make_judge(prereg_utc, fetched, _factor_of)(
+            data_path, claim, lock_path=lock_path, out_dir=out_dir, root=root)
+
+    outcomes = run_workflow(
+        rows, factors, delta_min=DELTA, k=2, dataset_id="DS1",
+        exposure_column="A_true", response_column="y", unit_column="lot",
+        confirm_path=confirm_path, lock_path=lock_path, out_dir=out_dir, root=str(tmp_path),
+        rationale="largest standardised effect clearing delta_min in screen",
+        direction="positive", group_column="machine", group_aware=True,
+        split_mode="time", screen_frac=0.5,
+        register_fn=register_fn, judge_fn=judge_fn, to_record=to_record)
+
+    assert [o.factor for o in outcomes] == ["A_true"]
+    o = outcomes[0]
+    assert o.verdict == "GO"
+    assert verdict_label(o.verdict) == "adopt"
+    assert o.claim_supported is True
+    assert o.family_m == 3
+    assert o.group_separated is True
+    assert o.confirmed_effect is not None
+    assert os.path.exists(confirm_path)
+    assert order["locked"] is True
+
+
+def test_run_workflow_writes_confirm_only_after_lock(tmp_path):
+    """If the registration path never locks (no locked_utc), run_workflow must refuse to write
+    the confirm file and never reach the judge."""
+    from tools.screen_estimate_confirm import run_workflow, RegistrationOrderError
+
+    rows = _make_rows()
+    factors = ["A_true", "B_confound", "C_null"]
+    confirm_path = os.path.join(str(tmp_path), "confirm_rows.json")
+
+    def bad_register_fn(claims):
+        return {"n": len(claims)}
+
+    def judge_fn(*a, **k):
+        raise AssertionError("judge must not run when the lock is missing")
+
+    raised = False
+    try:
+        run_workflow(
+            rows, factors, delta_min=DELTA, k=1, dataset_id="DS1",
+            exposure_column="A_true", response_column="y", unit_column="lot",
+            confirm_path=confirm_path, lock_path=os.path.join(str(tmp_path), "lock.json"),
+            out_dir=str(tmp_path), root=str(tmp_path), rationale="r",
+            group_column="machine", register_fn=bad_register_fn, judge_fn=judge_fn,
+            to_record=_to_json_record)
+    except RegistrationOrderError:
+        raised = True
+    assert raised
+    assert not os.path.exists(confirm_path)
