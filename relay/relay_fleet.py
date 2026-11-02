@@ -9570,7 +9570,28 @@ class RelayWorker:
 
     def _mcp_gate_blocked(self):
         """True (and the worker is held with a reason) while the local MCP server is not ready to
-        have a conversation created against it. Never raises: a broken probe lets the send go."""
+        have a conversation created against it. Never raises: a broken probe lets the send go.
+
+        CONNECTOR-LESS ROUTE SKIPS THE CREATION GATE. The gate exists only because Copilot Studio
+        binds the MCP connector tools when a conversation is CREATED, so a conversation created
+        while the server is unreachable loses its tools for life (relay/mcp_ready.py). On the
+        connector-less (bridged) route there is NO connector to bind: tool calls go through the
+        gateway/run_tool (relay/tool_bridge.make_run_tool), no tunnel is in the path, and
+        _check_tools_attached already skips the initialize detector for a bridged worker. Holding
+        creation here buys nothing and a slow /health under load stalls the worker for nothing.
+
+        Why is_bridge() and not worker_is_bridged(self): the conversation about to be created is
+        created under the CURRENT transport setting, which is exactly what is_bridge() reads. The
+        driver-based worker_is_bridged() reads drv._run_tool, which may not be set before the first
+        send, so it would misjudge a fresh worker. A resumed conversation keeps its own route and
+        never reaches this gate (_mcp_conv_fresh is False for a resume), so it is unaffected. If the
+        local server is truly down, the gateway tool calls fail and are reported by the existing
+        paths -- this skip hides nothing."""
+        try:
+            if tool_bridge.is_bridge():
+                return False
+        except Exception:
+            pass
         try:
             why = mcp_ready.gate().reason()
         except Exception:
