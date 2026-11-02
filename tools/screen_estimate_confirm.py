@@ -402,3 +402,61 @@ def verdict_label(verdict: str) -> str:
     """Map an engine verdict to the report's three words."""
     return {"GO": "adopt", "HOLD": "hold", "NA": "not identifiable",
             "ERROR": "not identifiable"}.get(verdict, "hold")
+
+
+# --------------------------------------------------------------------------- end-to-end entry
+
+def run_workflow(rows, factors, *, delta_min, k, dataset_id, exposure_column,
+                 response_column, unit_column, confirm_path, lock_path, out_dir, root,
+                 rationale, register_fn=None, judge_fn=None, to_record=None,
+                 direction="positive", group_column=None, group_aware=True,
+                 split_mode="time", screen_frac=0.5, seed=None, data_kind="semi_synthetic"):
+    """Run the whole screen -> select -> lock -> confirm pipeline and return the outcomes.
+
+    This is the single production entry point that chains the stage functions in the one
+    order the design permits: SPLIT the lots, SCREEN on the screen set only, SELECT at most
+    k hypotheses by the in-code rule, BUILD a confirmatory claim per selection, LOCK the
+    claims through the harness registration path, WRITE the confirm file only after the lock
+    exists, and CONFIRM on the withheld rows through the judge chain.
+
+    Dependency injection keeps the module hermetic: when register_fn / judge_fn / to_record
+    are not supplied they are resolved lazily from the real harness and engine at call time
+    (never at import), so importing this module still pulls in nothing but numpy and the
+    standard library. Tests pass their own faithful fakes.
+    """
+    if register_fn is None:
+        from tools import validity_harness as _vh
+
+        def register_fn(claims):
+            import datetime as _d
+            receipt = _vh.register_and_lock(
+                root, claim=claims[0],
+                data_fetched_at=_d.datetime.now(_d.timezone.utc).isoformat(),
+                data_location=confirm_path)
+            receipt.setdefault("locked_utc", receipt.get("registered_at")
+                               or _d.datetime.now(_d.timezone.utc).isoformat())
+            return receipt
+    if judge_fn is None:
+        from validity.engine import judge as judge_fn  # engine's judge(data_path, claim, ...)
+    if to_record is None:
+        def to_record(confirm_rows):
+            return _canon([dataclasses.asdict(r) for r in confirm_rows])
+
+    manifest = split_lots(rows, mode=split_mode, screen_frac=screen_frac, seed=seed)
+    screen_rows = rows_for_lots(rows, manifest["screen_lots"])
+    effects = screen(screen_rows, factors, delta_min=delta_min, group_aware=group_aware)
+    selected = select_hypotheses(effects, k=k)
+    screened = {e.factor: e for e in effects}
+    claims = [build_claim(e.factor, m=len(factors), delta_min=delta_min,
+                          rationale=rationale, direction=direction,
+                          exposure_column=exposure_column, response_column=response_column,
+                          unit_column=unit_column, dataset_id=dataset_id,
+                          data_kind=data_kind, group_column=group_column)
+              for e in selected]
+    if not claims:
+        return []
+    receipt = lock_claims(claims, register_fn=register_fn)
+    write_confirm_set(rows, manifest["confirm_lots"], confirm_path,
+                      lock_receipt=receipt, to_record=to_record)
+    return confirm(claims, confirm_path, judge_fn=judge_fn, lock_path=lock_path,
+                   out_dir=out_dir, root=root, screened=screened)
