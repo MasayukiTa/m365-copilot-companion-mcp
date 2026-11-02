@@ -8158,6 +8158,61 @@ class RelayWorker:
         except (AttributeError, TypeError, ValueError, OSError):
             return set()
 
+    def _judge_compute_outputs(self):
+        """The result TEXT of this worker's compute-tool calls in this job.
+
+        The provenance gate (relay/analysis_provenance.py) needs the OUTPUTS of the
+        computations this run performed on raw data, not just their names: a number in the
+        final answer is trusted only if it also appears in one of these. Same attribution as
+        _judge_tool_names -- only calls on a trusted, uniquely bound session (or named for this
+        worker) since the first turn -- then join each compute CALL to its OUTCOME by id and
+        take the bounded result text the ledger stored. Never raises: a collector that fails
+        must not fail the settle it feeds, and an empty list means 'nothing seen', which the
+        gate reads conservatively (it does not fail an answer on evidence it could not gather).
+        """
+        try:
+            from relay import analysis_provenance as _ap
+            from relay import mcp_attribution as attr
+            since = float(getattr(self, "_first_turn_sent_at", 0) or 0)
+            if not since:
+                return []
+            route = _socket_route()
+            bindings = route.mcp_bindings.snapshot() if route else {}
+            ids = self._conversation_ids_for_binding() if route else {}
+            conversation = ids.get("client") or ""
+            sessions = {s for s, b in bindings.items()
+                        if b.get("worker") == self.name and conversation
+                        and b.get("conversation") == conversation
+                        and b.get("how") in attr.TRUSTED_HOW}
+            rows = self._ledger_rows()
+            # The compute CALLS attributed to this worker, by ledger id.
+            compute_ids = {
+                str(r.get("id") or "") for r in rows
+                if r.get("event") == "call" and float(r.get("ts") or 0) >= since
+                and str(r.get("tool") or "") in _ap.COMPUTE_TOOLS
+                and (r.get("session") in sessions or r.get("worker") == self.name)}
+            if not compute_ids:
+                return []
+            outputs = []
+            for r in rows:
+                if r.get("event") != "outcome" or str(r.get("id") or "") not in compute_ids:
+                    continue
+                # A refused/unavailable/failed outcome is not a computation that produced a
+                # number; the ledger already flags it, and its text is an error report, not a
+                # result. Skip it so a failed run cannot 'support' a transcribed number.
+                if not r.get("ok", True):
+                    continue
+                res = r.get("result")
+                # The bounded shape _bounded() writes: {"text", "len", "sha16", "truncated"}.
+                # A withheld (secret-result) outcome carries no text and contributes nothing.
+                if isinstance(res, dict) and isinstance(res.get("text"), str):
+                    outputs.append(res["text"])
+                elif isinstance(res, str):
+                    outputs.append(res)
+            return outputs
+        except (AttributeError, TypeError, ValueError, OSError, ImportError):
+            return []
+
     #: Tools that read a file's CONTENT. A case reference points at a request FILE whose body
     #: is the actual task; opening it necessarily goes through one of these. (search_ops.glob /
     #: find_files only match names, so they are deliberately NOT here -- listing a folder is not
@@ -8307,6 +8362,45 @@ class RelayWorker:
         if not judge_ok:
             self.status, self.outcome, self.reason = "stuck", "VERIFY_FAILED", judge_text
             return
+        # THE PROVENANCE GATE. A data-analysis answer may only report numbers this run
+        # RECOMPUTED from the raw input; a number taken from a results file the folder already
+        # held (an earlier run's workbook, a planted "results" file) is a transcription, and
+        # accepting it is the defect job 065d8c1c4a14 exhibited -- plant a dataset's
+        # conclusions in the folder and the agent reports them. Applied HERE, at the one place
+        # a worker becomes DONE, so no settle path walks around it; and AFTER the judge's own
+        # verdict, because an answer the judge already rejected does not need a second reason.
+        # The provenance note is appended to the visible judge text so it travels into the
+        # judge input and the footer (owner rule 4). Never raises: the collector and checker
+        # are both conservative and an error in them must not fail a finished run.
+        try:
+            from relay import analysis_provenance as _ap
+            from relay.judge_gate import is_data_analysis_goal as _is_analysis
+            _is_an = _is_analysis(getattr(self, "goal", ""),
+                                  getattr(self, "_judge_request_text", ""),
+                                  RelayWorker._judge_tool_names(self))
+            _answer = getattr(self, "_candidate_done_reply", "") or self.last_response or ""
+            _prov = _ap.check_answer_provenance(
+                _answer, self._judge_compute_outputs(), is_analysis=_is_an)
+            # ONLY SPEAK WHEN THE GATE ACTUALLY LOOKED. A no-op pass -- a non-analysis answer,
+            # or an analysis answer with no numeric claim to police -- examined nothing, so it
+            # must leave the visible answer and the judge text exactly as they were. Adding a
+            # 'provenance: n/a' line there would change last_response on the ordinary M365 /
+            # prose path, which other completion contracts read byte-for-byte. The note is
+            # emitted only when a claim was checked (checked > 0) or the gate FAILED.
+            _spoke = (not _prov.get("ok")) or int(_prov.get("checked") or 0) > 0
+            if _spoke:
+                _note = _ap.provenance_note(_prov)
+                judge_text = ((judge_text + "\n") if judge_text else "") + _note
+            if not _prov.get("ok"):
+                self.last_response = (self.last_response or "") + "\n" + _note
+                self._judge_fix_job_text = _prov.get("correction", "")
+                self.status, self.outcome = "stuck", "VERIFY_FAILED"
+                self.reason = ("provenance: %s | %s"
+                               % (_prov.get("reason", ""),
+                                  _prov.get("correction", "")))[:300]
+                return
+        except Exception:
+            pass
         if judge_text:
             self.last_response = (self.last_response or "") + "\n" + judge_text
         self.status = "done"
