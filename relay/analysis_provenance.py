@@ -109,6 +109,14 @@ _MASK_RES = (
     # File paths (contain a slash or backslash) and bare file names (name.ext).
     re.compile(r"[A-Za-z0-9_./\\-]*[\\/][A-Za-z0-9_./\\-]+"),
     re.compile(r"\b[\w-]+\.(?:csv|xlsx|xlsm|xls|json|md|py|txt|png|jpg|parquet|sql|yml|yaml|log)\b", re.IGNORECASE),
+    # Source-line locus after a file/colon: ":510-511", ":304-320" (and the single ":830" the
+    # port mask already covers). The filename rule above blanks "analysis_stable.py" but leaves
+    # the trailing ":510-511"; the port mask then eats only ":510" and the "-511" survives and is
+    # read as the number -511 -- the exact FALSE positive job 8c3daa76ccf0 failed on (a docstring
+    # pointer "analysis_stable.py:510-511", not an analysis value). A colon-prefixed numeric RANGE
+    # is a code locus, never a reported statistic (an interval is written [a, b] or a\u2013b, never
+    # ":a-b"), so masking the whole ":\d-\d" span is safe and keeps real intervals policed.
+    re.compile(r":\d{1,5}-\d{1,5}\b"),
     # ISO-ish dates and date-times: 2026-11-02, 2026/11/02, optional T12:43:18(+09:00).
     re.compile(r"\b\d{4}[-/]\d{1,2}[-/]\d{1,2}(?:[T ]\d{1,2}:\d{2}(?::\d{2})?(?:[.,]\d+)?(?:[+-]\d{2}:?\d{2}|Z)?)?"),
     # Clock times on their own: 12:43, 09:20:05.
