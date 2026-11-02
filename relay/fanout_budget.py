@@ -76,6 +76,17 @@ BOUNDS = {
 #: Slots held back from the total for the merge worker that follows every split.
 MERGE_RESERVE = 1
 
+#: How long a campaign header with NO worker row yet and NO resolved merge may still be treated as
+#: "about to split" (live: its clock runs to now and its header n floors the total). This covers the
+#: brief window where a split has been written to the ledger but its children have not yet surfaced
+#: as worker rows. Past this grace the header is an ORPHAN -- a split whose workers never appeared
+#: (coordinator died mid-split, merge row never written, etc.). Such a header must NOT keep counting
+#: header-start -> now: that is the weeks-long (27000-45000 min) wall times and never-shrinking
+#: totals seen on long-abandoned roots. A healthy split surfaces workers in minutes and a healthy
+#: tree finishes well under the wall limit, so reusing DEFAULT_MAX_WALL_MIN keeps this in lockstep
+#: with the wall gate: if no worker has appeared within one full wall budget, the header is dead.
+ORPHAN_HEADER_GRACE_MIN = DEFAULT_MAX_WALL_MIN
+
 #: At most this many roots are exported in status.json.
 MAX_ROOTS_EXPORTED = 20
 
@@ -309,12 +320,23 @@ def usage_from_status(workers, campaigns, now=None):
         # time (the 27000-45000 min runaways). `fin` therefore wins over the worker-derived `live`.
         live = live and not fin
         # A tree is treated as "about to split" (header count is a floor, clock runs to now) only
-        # when it is live, or when it has no worker row yet AND its merge has not resolved. A
-        # FINISHED tree (its merge row is in the ledger) whose workers have since dropped out of
-        # status.json would otherwise fall into the ran == 0 branch and keep counting header-start
-        # -> now forever -- the stale wall times (hours to weeks) seen on long-done trees. Treating
-        # it as finished freezes its clock and stops flooring its total by every past split.
-        about_to_split = live or (ran == 0 and not fin)
+        # when it is live, or when it has no worker row yet AND its merge has not resolved AND its
+        # newest header is still within the orphan grace. A FINISHED tree (its merge row is in the
+        # ledger) whose workers have since dropped out of status.json would otherwise fall into the
+        # ran == 0 branch and keep counting header-start -> now forever -- the stale wall times
+        # (hours to weeks) seen on long-done trees. Treating it as finished freezes its clock and
+        # stops flooring its total by every past split.
+        #
+        # The grace also catches the ORPHAN header: a split whose children never surfaced as worker
+        # rows and whose merge was never written (coordinator died mid-split). It has ran == 0 and
+        # fin is False -- identical to a split still being decided -- so neither `live` nor `fin`
+        # can distinguish it. Only its AGE can: a real pending split surfaces workers in minutes,
+        # while an orphan's header is hours-to-weeks old. Past ORPHAN_HEADER_GRACE_MIN we stop
+        # treating it as about-to-split, which freezes its clock (wall_min 0.0) and drops its total
+        # to the workers that actually ran (0), instead of header-start -> now forever.
+        hdr_fresh = (hdr_last is not None
+                     and (now - hdr_last) <= ORPHAN_HEADER_GRACE_MIN * 60)
+        about_to_split = live or (ran == 0 and not fin and hdr_fresh)
         # Workers that actually ran. The header count is a FLOOR in exactly two cases: the tree is
         # still live and more children were requested than have become workers (queued children do
         # not yet show as rows), or no worker row exists yet at all (ran == 0) -- a split being

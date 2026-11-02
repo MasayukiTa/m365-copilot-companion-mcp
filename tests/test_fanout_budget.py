@@ -194,6 +194,34 @@ def test_a_live_tree_measures_to_now_and_is_floored_by_the_header():
     assert u["r"]["total"] == 5                       # header n=5 floors the one live row
 
 
+def test_a_fresh_split_with_no_workers_yet_runs_to_now_and_is_floored_by_its_header():
+    # A split has just been written to the ledger (header is seconds old) but its children have not
+    # yet surfaced as worker rows. Within ORPHAN_HEADER_GRACE_MIN it is still "about to split": its
+    # clock runs header-start -> now and its header n floors the total.
+    hdr = [_hdr("r", 4, ts=NOW - 60)]                 # 1 min old, well inside the grace
+    u = fb.usage_from_status([], hdr, now=NOW)
+    assert u["r"]["wall_min"] == 1.0                  # header-start -> now
+    assert u["r"]["total"] == 4                       # header n floors the (zero) worker rows
+    assert u["r"]["active"] == 0
+
+
+def test_an_orphan_header_whose_workers_never_appeared_freezes_and_stops_counting():
+    # The 27000-45000 min runaway on long-abandoned roots: a split whose children never became
+    # worker rows and whose merge was never written (coordinator died mid-split). It has ran == 0
+    # and is not finished -- indistinguishable from a fresh pending split EXCEPT by age. Past
+    # ORPHAN_HEADER_GRACE_MIN the header is an orphan: its clock freezes (wall_min 0.0) and its
+    # total drops to the workers that actually ran (0), instead of header-start -> now forever.
+    grace_s = fb.ORPHAN_HEADER_GRACE_MIN * 60
+    hdr = [_hdr("r", 4, ts=NOW - grace_s - 600)]      # 10 min past the grace
+    u = fb.usage_from_status([], hdr, now=NOW)
+    assert u["r"]["wall_min"] == 0.0                  # frozen, not header-start -> now
+    assert u["r"]["total"] == 0                       # no longer floored by the dead header
+    assert u["r"]["active"] == 0
+    # And the clock stays frozen no matter how much later we look.
+    far = fb.usage_from_status([], hdr, now=NOW + 10_000_000)
+    assert far["r"]["wall_min"] == 0.0
+
+
 def test_read_campaign_rows_distinguishes_absent_from_unreadable(tmp_path):
     assert fb.read_campaign_rows(str(tmp_path / "none.jsonl")) == []
     assert fb.read_campaign_rows("") == []
