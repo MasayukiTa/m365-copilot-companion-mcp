@@ -212,3 +212,93 @@ def _one(store, sql):
 
 def _one_conn(conn, sql):
     return conn.execute(sql).fetchone()[0]
+
+
+# -- unified flag-style CLI: --q/--domain/--since/--until/--verdict/--goal-id/--dump/--out ----
+
+import json as _json
+
+
+def test_parse_when_accepts_epoch_and_iso():
+    assert SC._parse_when(None) is None
+    assert SC._parse_when("") is None
+    assert SC._parse_when("1700000000") == 1700000000.0
+    assert SC._parse_when("1700000000.5") == 1700000000.5
+    # ISO date alone is midnight UTC; ISO instant with Z is parsed to the same epoch.
+    assert SC._parse_when("1970-01-01") == 0.0
+    assert SC._parse_when("1970-01-01T00:00:00Z") == 0.0
+
+
+def test_search_since_until_window(store):
+    conn = _ro(store)
+    try:
+        # Synthetic ts start at 1_700_000_000.0 and increase by i (and +0.5 for verdict rows).
+        lo, hi = 1_700_000_010.0, 1_700_000_020.0
+        _, rows = SC.search(conn, q="body", since=lo, until=hi, limit=1000)
+    finally:
+        conn.close()
+    assert rows
+    assert all(lo <= r["ts"] <= hi for r in rows)
+
+
+def test_search_by_goal_id_and_verdict(store):
+    conn = _ro(store)
+    try:
+        _, g1 = SC.search(conn, goal_id=1, limit=1000)
+        _, upheld = SC.search(conn, verdict="UPHELD", limit=1000)
+    finally:
+        conn.close()
+    assert g1 and all(r["goal_id"] == 1 for r in g1)
+    assert upheld and all(r["verdict"] == "UPHELD" for r in upheld)
+
+
+def test_search_no_q_is_pure_filter(store):
+    conn = _ro(store)
+    try:
+        engine, rows = SC.search(conn, goal_id=1, limit=5)
+    finally:
+        conn.close()
+    assert engine == "filter"
+    assert rows
+
+
+def test_dump_is_verbatim_and_jsonl(store, tmp_path, capsys):
+    # A row with punctuation/newline in the text must come back byte-identical.
+    raw = "UPHELD: line1\nline2 \u89e3\u6790 \"q\""
+    conn = sqlite3.connect(store)
+    try:
+        conn.execute("INSERT INTO fleet_turns(key,role,text,ts,goal_id,turn) "
+                     "VALUES('dvv','refuter_verdict',?,?,1,1)", (raw, 1700009999.0))
+        conn.commit()
+    finally:
+        conn.close()
+    out = str(tmp_path / "dump.jsonl")
+    # Dump by goal_id (a pure filter, no FTS) so the just-inserted row is in scope; the point
+    # under test is that --dump emits the text VERBATIM, not the search path.
+    rc = SC.main(["--db", store, "--goal-id", "1", "--dump", "--out", out])
+    assert rc == 0
+    with open(out, encoding="utf-8") as fh:
+        lines = [l for l in fh.read().splitlines() if l.strip()]
+    recs = [_json.loads(l) for l in lines]
+    assert any(r["text"] == raw for r in recs)  # text preserved exactly, no truncation/rewrite
+
+
+def test_cli_out_file_search_json(store, tmp_path):
+    out = str(tmp_path / "res.json")
+    rc = SC.main(["--db", store, "--q", "body", "--limit", "3", "--out", out])
+    assert rc == 0
+    with open(out, encoding="utf-8") as fh:
+        payload = _json.load(fh)
+    assert payload["engine"] in ("fts", "like")
+    assert payload["count"] == len(payload["rows"]) <= 3
+
+
+def test_cli_since_until_flags_parsed(store, tmp_path):
+    out = str(tmp_path / "win.json")
+    rc = SC.main(["--db", store, "--q", "body",
+                  "--since", "1700000010", "--until", "1700000020",
+                  "--limit", "1000", "--out", out])
+    assert rc == 0
+    with open(out, encoding="utf-8") as fh:
+        payload = _json.load(fh)
+    assert all(1700000010.0 <= r["ts"] <= 1700000020.0 for r in payload["rows"])

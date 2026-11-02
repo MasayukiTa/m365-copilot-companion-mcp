@@ -15,6 +15,7 @@ which is slower but correct; a query of three or more characters uses the index.
 told which path answered in `engine`, so a slow short query is explained rather than mysterious.
 """
 import argparse
+import datetime
 import json
 import os
 import sqlite3
@@ -134,40 +135,134 @@ def domains(conn):
     return [dict(r) for r in rows]
 
 
+def _parse_when(s):
+    """Accept an epoch second (int/float) or an ISO-8601 instant and return a float epoch.
+
+    A date alone ('2026-11-02') is read as that day's 00:00:00 UTC. Returns None for None/''.
+    Raised as ValueError on anything else, so a typo is reported rather than silently ignored.
+    """
+    if s is None:
+        return None
+    s = s.strip()
+    if not s:
+        return None
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    iso = s.replace("Z", "+00:00")
+    dt = datetime.datetime.fromisoformat(iso)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.timestamp()
+
+
+def search(conn, q=None, domain=None, since=None, until=None, verdict=None,
+           goal_id=None, limit=25):
+    """Unified turn search. Any subset of filters may be combined; all are ANDed.
+
+    q        -- substring of the turn text (FTS when >= 3 chars, LIKE fallback below that)
+    domain   -- restrict to goals classified into this domain
+    since/until -- inclusive ts (epoch-second) bounds, from _parse_when
+    verdict  -- restrict to turns carrying this refuter verdict
+    goal_id  -- restrict to a single goal
+    Returns (engine, rows). engine is 'fts'/'like' when q was given, else 'filter'.
+    """
+    needle = (q or "").strip()
+    where = []
+    params = []
+    if needle:
+        use_fts = _has_fts(conn) and len(needle) >= _TRIGRAM_MIN
+        if use_fts:
+            base = ("SELECT t.id, t.key, t.role, t.text, t.ts, t.goal, t.goal_id, t.verdict "
+                    "FROM fleet_turns_fts f JOIN fleet_turns t ON t.id = f.rowid "
+                    "WHERE f.text MATCH ? ")
+            params.append(_fts_query(needle))
+            engine = "fts"
+        else:
+            base = ("SELECT t.id, t.key, t.role, t.text, t.ts, t.goal, t.goal_id, t.verdict "
+                    "FROM fleet_turns t WHERE t.text LIKE ? ESCAPE '\\' ")
+            params.append("%" + _like_escape(needle) + "%")
+            engine = "like"
+    else:
+        base = ("SELECT t.id, t.key, t.role, t.text, t.ts, t.goal, t.goal_id, t.verdict "
+                "FROM fleet_turns t WHERE 1=1 ")
+        engine = "filter"
+    if domain:
+        where.append("t.goal_id IN (SELECT goal_id FROM goal_summary WHERE domain = ?)")
+        params.append(domain)
+    if since is not None:
+        where.append("t.ts >= ?")
+        params.append(float(since))
+    if until is not None:
+        where.append("t.ts <= ?")
+        params.append(float(until))
+    if verdict:
+        where.append("t.verdict = ?")
+        params.append(verdict)
+    if goal_id is not None:
+        where.append("t.goal_id = ?")
+        params.append(int(goal_id))
+    sql = base + "".join("AND " + c + " " for c in where) + "ORDER BY t.ts DESC LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    out = [{"id": r["id"], "key": r["key"], "role": r["role"], "ts": r["ts"],
+            "goal_id": r["goal_id"], "verdict": r["verdict"], "goal": _goal_of(conn, r),
+            "text": r["text"]} for r in rows]
+    return engine, out
+
+
+def dump_rows(conn, q=None, domain=None, since=None, until=None, verdict=None,
+              goal_id=None, limit=1000000):
+    """Like search() but every matching turn is emitted whole and VERBATIM -- id, key, role,
+    ts, goal_id, verdict and the full original `text` with no truncation or rewriting -- so a
+    dump can be diffed against the source. Returns a list of dicts (newest first).
+    """
+    _, rows = search(conn, q=q, domain=domain, since=since, until=until, verdict=verdict,
+                     goal_id=goal_id, limit=limit)
+    return rows
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__)
-    ap.add_argument("--db", default=None)
-    sub = ap.add_subparsers(dest="cmd", required=True)
-    t = sub.add_parser("text", help="full-text search of turns")
-    t.add_argument("needle")
-    t.add_argument("--domain")
-    t.add_argument("--limit", type=int, default=25)
-    d = sub.add_parser("domain", help="goals in a domain")
-    d.add_argument("name")
-    d.add_argument("--limit", type=int, default=50)
-    v = sub.add_parser("verdict", help="goals whose review landed on a verdict")
-    v.add_argument("name")
-    v.add_argument("--limit", type=int, default=50)
-    sub.add_parser("domains", help="domain histogram")
+    ap.add_argument("--db", default=None, help="store path (default: derived from repo root)")
+    ap.add_argument("--q", default=None, help="substring to search in turn text")
+    ap.add_argument("--domain", default=None, help="restrict to goals in this domain")
+    ap.add_argument("--since", default=None, help="ts lower bound: epoch second or ISO-8601")
+    ap.add_argument("--until", default=None, help="ts upper bound: epoch second or ISO-8601")
+    ap.add_argument("--verdict", default=None, help="restrict to turns with this verdict")
+    ap.add_argument("--goal-id", dest="goal_id", type=int, default=None,
+                    help="restrict to a single goal_id")
+    ap.add_argument("--limit", type=int, default=25, help="max rows (default 25)")
+    ap.add_argument("--dump", action="store_true",
+                    help="emit every matching turn VERBATIM as JSONL (one row per line)")
+    ap.add_argument("--out", default=None,
+                    help="write output to this file instead of stdout")
     args = ap.parse_args(argv)
 
+    since = _parse_when(args.since)
+    until = _parse_when(args.until)
     path = args.db or _default_db_path()
     conn = _connect_ro(path)
     try:
-        if args.cmd == "text":
-            engine, rows = search_text(conn, args.needle, args.limit, args.domain)
-            print(json.dumps({"engine": engine, "count": len(rows), "rows": rows},
-                             ensure_ascii=False, indent=2))
-        elif args.cmd == "domain":
-            print(json.dumps(list_by_domain(conn, args.name, args.limit),
-                             ensure_ascii=False, indent=2))
-        elif args.cmd == "verdict":
-            print(json.dumps(list_by_verdict(conn, args.name, args.limit),
-                             ensure_ascii=False, indent=2))
-        elif args.cmd == "domains":
-            print(json.dumps(domains(conn), ensure_ascii=False, indent=2))
+        if args.dump:
+            limit = args.limit if args.limit and args.limit > 0 else 1000000
+            rows = dump_rows(conn, q=args.q, domain=args.domain, since=since, until=until,
+                             verdict=args.verdict, goal_id=args.goal_id, limit=limit)
+            text = "".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rows)
+        else:
+            engine, rows = search(conn, q=args.q, domain=args.domain, since=since, until=until,
+                                  verdict=args.verdict, goal_id=args.goal_id, limit=args.limit)
+            text = json.dumps({"engine": engine, "count": len(rows), "rows": rows},
+                              ensure_ascii=False, indent=2) + "\n"
     finally:
         conn.close()
+    if args.out:
+        with open(args.out, "w", encoding="utf-8", newline="\n") as fh:
+            fh.write(text)
+        sys.stderr.write("wrote %d row(s) to %s\n" % (len(rows), args.out))
+    else:
+        sys.stdout.write(text)
     return 0
 
 
