@@ -9,7 +9,7 @@ openpyxl
 # xlsxwriter writes the native (editable) Excel charts of tools/chart_ops.py
 # (excel_chart_export). It was installed by hand on one PC and never declared; a fresh PC
 # would have lacked it. pandas, openpyxl and matplotlib are used by the same module.
-xlsxwriter>=3.2.9
+xlsxwriter>=3.3.1
 python-pptx>=1.0.2,<2.0
 python-docx>=1.2.0
 pypdf>=6.20.1
