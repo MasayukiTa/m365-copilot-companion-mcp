@@ -1,79 +1,72 @@
-# 時間切れした「動作する」ターンが STUCK になる仕組みと本修正
+# ファンアウト木の予算: total と wall_min を「実測」に直す
 
-ジョブ r6ae0d5a6_a0_w3。実測 2026-10-27 15:53 (.fleet/status.json): 再起動後のフリート
-(約 300 担当、CPU 90〜100%、物理メモリ空き 1.6〜2.5 GB)で 90 担当が
-`not re-sent: the turn may already have been delivered and this goal performs an action
-(delivery=unknown, turn timeout without a reply)` で STUCK。run_id r6ae04307_a0。turn 内訳は
-turn2 x72・turn1 x16・turn3 x2。多くはファンアウトの子で、動作を伴う目標(機能実装、PR180 確認、
-PR184 修正、PR #304)を持つ。
+ジョブ fanbudget。origin/main の worktree (fix/fanout-budget-measurement)。
+対象は relay/fanout_budget.py の usage_from_status()。実測の根拠は本番の
+resonac-mcp/.fleet(読み取りのみ。コーディネータ/コックピットは停止していない)。
 
-以下はすべて修正前の relay/relay_fleet.py (origin/main 910bb189)の行番号を根拠にする。
+## 症状(実測 .fleet/status.json の tree_budget)
 
-## 1. 「配達されたか」をどう判定していたか — 判定していなかった
+- スクリーンショットの root c234d1e0a6436: total 28(上限 24, 赤)、wall_min 525.11(上限 120, 赤)、
+  active 0・turns 0・known true。すなわち「終了済みの木」なのに wall が 525 分。
+- 終了済みなのに時計が暴走: c219044f97381 wall_min 41426.92(約28.8日)、c30fcc13deb6a 41616.77、
+  c573b542742de 21814.1、c1c6347ac010b 8697.16。いずれも active 0・turns 0。
+- c7e01b58b1956: total 128(known false)。
+- 生きている木 cd1d08b153c03: wall_min 417.13・active 6(稼働中に 120 を超過)。
 
-時間切れ経路は RelayWorker.poll の中にある。応答がまだ無く、かつ自前の時計が予算を超えたとき
-(`if not _has_new_answer and time.time() - self._t_send > _bound:`、9322 行)に入る。
+## 原因(修正前のコード)
 
-- 9355-9356 行: `_timeout_resend_decision()` を呼び、動作目標で効果を確認できないときは
-  `_timeout_resend != "resend"` となる(9357 行)。
-- 9363-9368 行: ソケットが開いていれば `_retry_socket(..., assume_landed=True)` で同じ会話の
-  「続きのターン」を試みる。
-- 続きが成立しないと 9376-9379 行へ進み、ここで
-  `self._refuse_resend("turn timeout without a reply", "unknown")` を無条件に呼ぶ。
+1. total が「過去の全 split の campaign ヘッダ n の累積和」だった。n は子が終わっても減算されない
+   ため、年を重ねた終了済みの木が total 28 や 128 と、もう存在しない worker 数を報告していた。
+2. wall_min = (now - first_header_ts)/60 に 終端(end bound)が無かった。木が終了しても now との差を
+   数え続けるので、最初のヘッダから経過した実時間(最大 28.8 日)をそのまま分で出していた。
 
-つまり delivery 引数は コード上で "unknown" にハードコードされていた(9378 行)。この経路は
-「このターンにモデルが実際に配達されたか(＝応答トークンが届いたか)」を一切見ていない。
+両者とも「木が終わってもゼロに戻らない/止まらない」ことが本質で、終了済みの木が赤く出続けて
+ネストした split を不当に拒否していた。
 
-`_refuse_resend`(8204-8215 行)は受け取った delivery をそのまま STUCK 理由と台帳に書く:
+## 実測した分布(根拠データ)
 
-```
-self.reason = ("not re-sent: the turn may already have been delivered and this goal "
-               "performs an action (delivery=%s, %s)" % (delivery, reason[:120]))   # 8207-8208
-```
+.fleet/campaigns.jsonl(24MB)をストリーム解析。campaign ヘッダ 653 件: n は min 2 / max 12 /
+mean 4.83 / median 4 / p90 8 / p95 9 / p99 12。既定 total=24・MAX_CHILDREN=12 は p99=12 の
+1 split 分 + マージ予約 + 余裕を満たし、第1 split を一切絞らない(tests が全 split サイズで証明)。
 
-これが status.json で観測された文面そのもの。delivery=unknown は判定結果ではなく、
-判定を省いた既定値だった。
+## 修正
 
-### 配達の証拠はすでに存在していた
+### total — 実際に走った worker を数える
 
-ドライバ(relay/socket_driver.py)は、このターンに届いたトークンを partial_text()
-(416-419 行)で、完了フレームの到着を _turn_answered(100 行、settled_text が 433 行で参照)で
-保持している。再接続経路はこの同じ情報を saw_output として既に読んでいる。時間切れの拒否だけが
-それを参照せず、応答が「遅かっただけ」のターン(トークンは届いていた)も unknown 扱いで STUCK に
-していた。
+ran(その木に属する worker 行の数)を基本とし、campaign ヘッダ n は FLOOR として次の 2 例だけに
+効かせる: (a) 木が live でまだ worker になっていない子がキューにある、(b) worker 行がまだ 1 件も
+無い(ran==0 — 台帳だけで split を判断する段階)。終了済みで実際に走った木(ran>0・live でない)は
+ヘッダ和で底上げしない。これで終了済みの木の total が過去 split 分だけ膨らむことが無くなる。
 
-## 2. 時間切れの秒数(_bound)がどう決まるか
+### wall_min — アクティブ期間を測り、終了で凍結
 
-比較対象の予算 _bound は poll 内 9302-9311 行で決まる。
+phase_events から各 worker の active span(started=最初に tab を持った=入場待ち以外の最初のイベント、
+ended=最後の TERMINAL)を取り、木の wall_min を「最初の worker の start → 最後の worker の end」とする。
+全 worker が終端に達したら時計は最後の end で凍結し、now に対して増え続けない(525 分 /41183 分の木)。
+いずれかが live の間は end=now。
 
-- 9302 行: 基準は `_bound = self.per_turn_timeout_s`。既定の毎ターン上限。
-- 9306-9308 行: ソケット担当で既に per_turn を超えていても、`_socket_tool_wait_alive()` が真
-  (このターンに帰属するツール実行が進行中)なら `_bound = max(_bound, SOCKET_TURN_TIMEOUT_S)` に広げる。
-- 9309-9311 行: ブリッジ中のターンはツールの往復を含むので `tool_bridge.turn_limit_s()` まで広げる。
+per-worker の時刻が無い場合のフォールバック:
+- live、または worker 行がまだ無い木(ran==0, 台帳だけで split 判断)→ header start → now。
+  これはアジアした header-only の木に wall 上限を効かせ、古い root へのネスト split を fail-safe に
+  拒否するために必要(0.0 にすると上限をすり抜ける)。
+- worker が走って終わった木(ran>0・live でない)→ 0.0(not running)。
 
-定数の根拠は relay/relay_fleet.py 冒頭:
+known は「数えた worker の turn が読めない」または「live な木の start が読めない」ときだけ False。
 
-- SOCKET_TURN_TIMEOUT_S(3078 行)= 既定 1200 秒(MCP_FLEET_SOCKET_TURN_S)。1 担当のソケットターンが
-  走ってよい長さ。3067-3077 行のコメントのとおり、既定 600 秒では 4 か月分のメール検索のような重い
-  目標が時計に殺されていたため 20 分に引き上げた。
-- 比較に使う per_turn_timeout_s 自体は 240 秒系で、9287-9301 行のコメントが「ソケットの予算を
-  1200 に広げるのは誤り(届いていた応答を 1200 秒待たせる)」と測定を根拠に述べている。
-- SOCKET_MEANINGFUL_IDLE_S(3090 行, 既定 60 秒)や SOCKET_LIVE_STREAM_IDLE_S(3096 行, 300 秒)は
-  別経路(無活動失速)の時計で、9285-9286 行の _socket_meaningful_idle_stalled が使う。
+## 実データ形状での検証
 
-したがって 90 担当は、per_turn(240 秒)の予算を超えた時点で応答がまだポーリングに見えず、続きの
-ターンも成立せず、9378 行の ハードコード unknown で拒否されて STUCK になった、という経路である。
+- 終了済みで実走した木(ヘッダ n=28、worker 2 件が各60秒で終了): 修正後 total 2 / wall_min 3.33
+  (旧: total 28 / wall_min 41417)。時計は凍結。
+- header-only の木(worker 行なし、ran==0、ヘッダ ts が 28.8 日前): total 28 / wall_min 41417 を
+  維持 — これは「これから split する木」を台帳だけで評価している状態で、wall 上限が働いて古い root の
+  ネスト split を拒否する(意図した非対称)。
 
-## 3. 本修正(既定オン、切替可)
+## テスト
 
-9376-9379 行の拒否直前に、配達の証拠を読む判定を挟んだ。設定 verify_delivery_before_giving_up
-(既定 on、relay/delivery_verify.py、tools/settings_keys.py に each_gate 登録)がオンのとき:
+tests/test_fanout_budget.py の 2 アサーションを新しい実測セマンティクスに更新:
+- rows_from_workers が started/ended を持つこと(phase_events からの span)。
+- 終了済みで実走した木(b)の wall_min は 0.0(凍結)。
 
-- self._saw_output_for_turn()(新設、partial_text()/_turn_answered を読む)が真なら
-  transport_policy.delivery_seen_from_output(True) -> "delivered"。このときは STUCK にせず
-  return False で応答を待ち続ける(同一ターンの逐語再送は動作をもう一度要求してしまうため)。
-- 出力が無ければ正直に "unknown" のままとし、従来の慣重な拒否を変えない。
-
-設定オフ時は 9378 行の旧来のハードコード unknown 拒否と完全に同一。delivery=unknown は
-ハードコードから実測値へ置き換わり、挙動が変わるのは「出力が届いていた＝delivered」の場合だけで、
-それは実トークンという根拠に裏打ちされる。
+tests/test_fanout_budget.py + test_fanout_budget_large_ledger.py は 70 passed、
+関連する relay/tests のファンアウト群は 112 passed。origin/main に対する差分は
+relay/fanout_budget.py と tests/test_fanout_budget.py の 2 ファイルのみ。

@@ -135,7 +135,7 @@ def test_usage_is_derived_per_root_from_rows_and_campaign_lines():
              {"campaign_id": "a", "task_id": "child line, not a header"}, "not json"]
     u = fb.usage_from_status(rows, lines, now=NOW)
     assert u["a"] == {"total": 6, "active": 1, "turns": 10, "wall_min": 30.0, "known": True}
-    assert u["b"]["active"] == 0 and u["b"]["turns"] == 2 and u["b"]["wall_min"] == 2.0
+    assert u["b"]["active"] == 0 and u["b"]["turns"] == 2 and u["b"]["wall_min"] == 0.0
     assert u["c"]["total"] == 2 and u["c"]["wall_min"] == 60.0       # queued, not yet workers
     assert set(u) == {"a", "b", "c"}
 
@@ -151,8 +151,47 @@ def test_rows_from_workers_reads_the_root_the_status_export_reads():
         status, turn, task_envelope = "done", 1, None
 
     rows = fb.rows_from_workers([_W(), _Solo()])
-    assert rows[0] == {"root_id": "r1", "status": "working", "turn": 4}
+    assert rows[0] == {"root_id": "r1", "status": "working", "turn": 4, "started": None, "ended": None}
     assert rows[1]["root_id"] == ""
+
+
+def test_the_active_span_starts_after_admission_not_at_the_queue_wait():
+    # phase_events: queued/pending first, then the first real work, then terminal. The span must
+    # begin at the first NON-admission event, so queue waiting is not charged as active time.
+    ev = [{"ts": NOW - 1000, "event": "pending"},
+          {"ts": NOW - 600, "event": "working"},
+          {"ts": NOW - 300, "event": "done"}]
+    started, ended = fb._span_from_phase_events(ev)
+    assert started == NOW - 600 and ended == NOW - 300
+    # end - start = 300 s = 5.0 min; the 400 s of pending before it is excluded.
+    row = {"root_id": "r", "status": "done", "turn": 1, "phase_events": ev}
+    u = fb.usage_from_status([row], [_hdr("r", 1, ts=NOW - 1000)], now=NOW)
+    assert u["r"]["wall_min"] == 5.0
+
+
+def test_a_finished_trees_wall_clock_freezes_and_does_not_grow_with_now():
+    # The 41183-min bug: a tree whose workers all finished long ago kept reporting now - start.
+    # With the active-span fix its clock FREEZES at the last worker's end, so moving `now` far
+    # into the future does not change wall_min.
+    ev = [{"ts": NOW - 10000, "event": "working"}, {"ts": NOW - 9400, "event": "done"}]
+    row = {"root_id": "r", "status": "done", "turn": 1, "phase_events": ev}
+    hdr = [_hdr("r", 1, ts=NOW - 10000)]
+    near = fb.usage_from_status([row], hdr, now=NOW)
+    far = fb.usage_from_status([row], hdr, now=NOW + 10_000_000)
+    assert near["r"]["wall_min"] == 10.0            # (9400-10000)->600 s span -> 10 min
+    assert far["r"]["wall_min"] == near["r"]["wall_min"]   # frozen: independent of now
+    assert near["r"]["active"] == 0
+
+
+def test_a_live_tree_measures_to_now_and_is_floored_by_the_header():
+    # While a worker is still live the span runs to now; a header that asked for more children than
+    # have become worker rows is a FLOOR on total (queued children are not rows yet).
+    ev = [{"ts": NOW - 120, "event": "working"}]      # no terminal event -> still live
+    row = {"root_id": "r", "status": "working", "turn": 1, "phase_events": ev}
+    u = fb.usage_from_status([row], [_hdr("r", 5, ts=NOW - 120)], now=NOW)
+    assert u["r"]["wall_min"] == 2.0                  # 120 s to now
+    assert u["r"]["active"] == 1
+    assert u["r"]["total"] == 5                       # header n=5 floors the one live row
 
 
 def test_read_campaign_rows_distinguishes_absent_from_unreadable(tmp_path):
