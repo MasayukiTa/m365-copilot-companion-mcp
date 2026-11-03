@@ -8257,6 +8257,15 @@ class RelayWorker:
         "write_file": "content", "create_small_text_file": "content",
         "createSmallTextFile": "content", "createSmallTextFileInMyOnedrive": "content",
         "replace_in_file": "new", "multi_edit": "edits", "append_file": "content",
+        # pptx deliverables: the slide text/numbers are in the CALL args, not the (binary)
+        # file the outcome names. A worker that wrote its findings into a .pptx via these
+        # tools (create_pptx/pptx_from_markdown/pptx_add_slide/pptx_add_table) was sent back
+        # because the gate never saw the slide body. The arg is a dict/list, not a bare
+        # string, so _unwrap_arg json-encodes it and every number in slides/rows/markdown
+        # becomes a produced-in-this-run source. (python-pptx-via-run_python is already
+        # covered by the compute outputs; these are the direct MCP pptx writers.)
+        "create_pptx": "slides", "pptx_from_markdown": "markdown",
+        "pptx_add_slide": "slide", "pptx_add_table": "rows",
     }
     #: Tools whose OUTCOME text is the body this run READ from a file. A number the run read from
     #: an input table or a note it actually opened this run is produced-in-this-run evidence --
@@ -8271,9 +8280,23 @@ class RelayWorker:
     def _unwrap_arg(v):
         """The ledger stores each arg as {'text': <value>, 'len', 'sha16', ...}; a few are bare.
         Return the inner text as a string, or '' when there is none."""
-        if isinstance(v, dict):
+        if isinstance(v, dict) and "text" in v and not ("slides" in v or "rows" in v):
+            # The ledger's bounded wrapper {'text', 'len', 'sha16', ...}; unwrap to the inner
+            # value. A structured pptx arg (a dict with 'slides'/'rows', or a plain spec dict)
+            # has no 'text' key and falls through to the json path below.
             v = v.get("text")
-        return v if isinstance(v, str) else ""
+        if isinstance(v, str):
+            return v
+        if isinstance(v, (dict, list)):
+            # A structured arg (pptx slides/slide/rows): json-encode so every number it carries
+            # survives as text for the gate. ensure_ascii=False keeps Japanese slide text
+            # readable; default=str tolerates any stray non-serialisable value. Never raises.
+            try:
+                import json as _json
+                return _json.dumps(v, ensure_ascii=False, default=str)
+            except Exception:
+                return str(v)
+        return ""
 
     def _judge_run_file_outputs(self):
         """Body TEXT of files THIS run created/changed/read within its own lifetime.
@@ -8324,7 +8347,9 @@ class RelayWorker:
                     # The text this run WROTE. For multi_edit the arg is a JSON array of edits;
                     # its raw text still contains any numbers, which is all the gate needs.
                     body = self._unwrap_arg(args.get(self._FILE_WRITE_ARG[tool]))
-                    path = self._unwrap_arg(args.get("path"))
+                    # pptx writers name the file 'pptx_path'; the text writers use 'path'.
+                    path = (self._unwrap_arg(args.get("path"))
+                            or self._unwrap_arg(args.get("pptx_path")))
                     if body and self._write_is_in_run(path, since):
                         outputs.append(body)
                 elif tool in self._FILE_READ_TOOLS:
