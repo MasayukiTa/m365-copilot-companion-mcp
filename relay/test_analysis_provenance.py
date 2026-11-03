@@ -341,3 +341,79 @@ def test_a_real_interval_is_not_swallowed_by_the_locus_mask():
     assert not r["ok"], r
     for planted in (0.067, 0.151, 0.208):
         assert any(abs(v - planted) < 1e-9 for v in r["unsupported"]), (planted, r["unsupported"])
+
+
+# -- small whole counts / orders are not policed as claims (owner 2026-11-03) ----------------
+
+
+def test_small_integer_counts_are_not_claims():
+    answer = "7 lots checked, 0 deviations, top 4 items registered."
+    r = ap.check_answer_provenance(answer, ["recomputed mean = 3.14"], is_analysis=True)
+    assert r["ok"], r
+    assert r["unsupported"] == [], r
+
+
+def test_boundary_small_counts_zero_and_ten_dropped_eleven_kept():
+    vals = [v for v, _ in ap.extract_numbers("0 1 10 11 ken", policing=True)]
+    assert 0.0 not in vals and 10.0 not in vals and 1.0 not in vals
+    assert 11.0 in vals
+
+
+def test_small_count_still_counts_as_support_on_the_computed_side():
+    computed_vals = ap._computed_values(["7 groups, total 47 rows"])
+    assert 47.0 in computed_vals and 7.0 in computed_vals
+
+
+def test_a_percent_or_decimal_small_value_is_still_policed():
+    answer = "defect rate 4% and metric 4.00"
+    r = ap.check_answer_provenance(answer, ["recomputed unrelated = 1.0"], is_analysis=True)
+    assert not r["ok"], r
+    # 4% and 4.00 both surface value 4.0 as a policed claim (percent flag / decimal form keep
+    # them out of the small-count drop); neither traces to the unrelated computation.
+    assert any(abs(v - 4.0) < 1e-9 for v in r["unsupported"]), r["unsupported"]
+
+
+# -- numbers produced in this run's OWN files are a valid source -----------------------------
+
+
+def test_number_in_a_file_this_run_wrote_is_supported():
+    answer = "The screened kasure correlation is 0.271 and the furukure mean is 4.77."
+    r = ap.check_answer_provenance(
+        answer, compute_outputs=[], is_analysis=True,
+        run_file_outputs=["# lab note\n kasure rho = 0.271\n furukure mean = 4.77\n"])
+    assert r["ok"], r
+    assert r["unsupported"] == [], r
+
+
+def test_number_in_a_file_this_run_read_is_supported():
+    answer = "Measured thickness deviation is 0.333 mm."
+    r = ap.check_answer_provenance(
+        answer, compute_outputs=[], is_analysis=True,
+        run_file_outputs=["col_a,thickness_dev\nx,0.333\n"])
+    assert r["ok"], r
+
+
+def test_file_and_compute_sources_are_merged():
+    answer = "rho 0.271 over 1380 rows."
+    r = ap.check_answer_provenance(
+        answer, compute_outputs=["row count = 1380"], is_analysis=True,
+        run_file_outputs=["kasure rho = 0.271"])
+    assert r["ok"], r
+
+
+# -- transcription from a stale file this run did NOT touch is still caught -------------------
+
+
+def test_transcription_not_in_any_run_source_is_still_rejected():
+    answer = "The reported yield is 0.959 and defect fraction 0.271."
+    r = ap.check_answer_provenance(
+        answer, compute_outputs=["defect fraction = 0.271"], is_analysis=True,
+        run_file_outputs=["defect fraction = 0.271"])
+    assert not r["ok"], r
+    assert any(abs(v - 0.959) < 1e-9 for v in r["unsupported"]), r["unsupported"]
+
+
+def test_empty_run_file_outputs_keeps_prior_behaviour():
+    r = ap.check_answer_provenance(
+        "correlation 0.42", compute_outputs=[], is_analysis=True, run_file_outputs=[])
+    assert not r["ok"] and r["reason"] == "analysis answer with zero executed computations", r
