@@ -34,6 +34,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 
 try:
     from relay.task_kind import task_kind, DATA_QUERY
@@ -379,6 +380,13 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
     if not path or not os.path.exists(path):
         return _ret(False, "judge: none (request required)") if strict else _ret(True, "judge: none")
     try:
+        # DEFECT 2: a corrected request must be judged again. judge_result.json is write-once
+        # (a harness-written record is never clobbered), so a stale ERROR record left by an
+        # earlier failed request would otherwise block the corrected request from ever being
+        # judged. Supersede ONLY a stale harness ERROR record that predates this (rewritten)
+        # request, archiving it as judge_result.superseded.<ts>.json. A real verdict
+        # (HOLD/NA/ADOPT) is NEVER touched.
+        _supersede_retryable_result(path)
         try:
             with open(path, encoding="utf-8-sig") as f:
                 request = json.load(f)
@@ -568,6 +576,32 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                                    registered_claim=registered_claim,
                                    judge_folder=output_folder)
         engine_available = bool(verdict.get("engine_available", False))
+        # DEFECT 1: tell the worker the engine's OWN messages, not just codes. When the engine
+        # could not produce a verdict on a worker-supplied claim, run the engine's claim loader
+        # and the data-file column check and put the engine's exact text (unknown key paths, the
+        # load_claim messages, and any claim column that is not a column of the data file, with
+        # the columns that do exist) into both the correction sent back and _record_correction,
+        # spending the existing correction budget. We only preflight a worker-supplied claim with
+        # no human-pre-registered configs/<id>.json -- the engine prefers a human config, so we
+        # must not preflight a different claim against it. A real verdict (engine produced
+        # ADOPT/HOLD/NA) never reaches here as a correction because want_correction turns are
+        # bounded and a produced verdict is reported, not corrected.
+        if (want_correction and registered_claim is not None and engine_available
+                and correction_attempt < int(correction_budget)
+                and verdict.get("verdict") not in ("ADOPT", "HOLD", "NA")
+                and not os.path.isfile(
+                    os.path.join(ENGINE_ROOT, "configs", claim_id + ".json"))):
+            preflight = _claim_preflight(path, data_location)
+            if preflight:
+                corrections.extend(preflight)
+                detail = ("judge: request invalid (attempt %d/%d)\n" %
+                          (correction_attempt + 1, int(correction_budget))
+                          + "\n".join("- " + m for m in preflight))
+                _record_correction(output_folder, claim_id=claim_id,
+                                   attempt=correction_attempt + 1, messages=preflight)
+                return _ret(True, detail, {"messages": preflight,
+                                           "schema": JUDGE_REQUEST_SCHEMA,
+                                           "attempt": correction_attempt + 1})
         # ENGINE COULD NOT FIND A CLAIM, AND THE WORKER CAN FIX THAT. When the engine did not run
         # ONLY because no claim was found (no human-pre-registered configs/<id>.json AND the
         # request carried no matching registration.claim), the worker CAN fix it by adding the
@@ -629,6 +663,57 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         return _ret(True, full_text)
     except (OSError, ValueError, TypeError, KeyError) as e:
         return _ret(False, "judge: invalid request (%s)" % e)
+
+
+def _claim_preflight(request_path, data_location):
+    """Return the engine's own claim/column messages, run in an isolated interpreter.
+
+    Shells judge_claim_preflight.py with the engine root on sys.path so importing the frozen
+    engine never perturbs the harness process. Read-only. An unavailable engine (root missing,
+    import failure, timeout, non-zero exit) is NOT a worker-fixable problem, so it returns [] --
+    never a spurious correction.
+    """
+    if not os.path.isdir(ENGINE_ROOT):
+        return []
+    from tools.childproc import headless_creationflags
+    try:
+        result = subprocess.run(
+            [sys.executable, os.path.join(os.path.dirname(__file__), "judge_claim_preflight.py"),
+             ENGINE_ROOT, request_path, data_location],
+            capture_output=True, text=True, encoding="utf-8", timeout=30,
+            creationflags=headless_creationflags())
+        return json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, ValueError, subprocess.TimeoutExpired):
+        return []
+
+
+def _supersede_retryable_result(request_path):
+    """Archive ONLY a stale harness ERROR record that predates the (rewritten) request.
+
+    judge_result.json is write-once, so a corrected request would never be judged while an older
+    ERROR record sits next to it. We move that one aside to judge_result.superseded.<ts>.json so
+    the corrected request is judged afresh. Guards, in order:
+      * the request must be strictly newer than the record (an untouched request changes nothing);
+      * a real verdict -- HOLD, NA or ADOPT -- is NEVER archived;
+      * a harness-correction record (status 'correcting', no verdict) is NEVER archived -- it
+        carries the bounded correction history that _write_judge_result folds into the eventual
+        authoritative record, so moving it would lose that history.
+    Only a 'source: harness' record whose verdict is ERROR is superseded. Never raises.
+    """
+    result = os.path.join(os.path.dirname(request_path), "judge_result.json")
+    try:
+        if os.stat(request_path).st_mtime_ns <= os.stat(result).st_mtime_ns:
+            return
+        with open(result, encoding="utf-8-sig") as f:
+            record = json.load(f)
+        verdict = record.get("verdict")
+        token = verdict.get("verdict") if isinstance(verdict, dict) else verdict
+        if record.get("source") == "harness" and token == "ERROR":
+            archive = os.path.join(os.path.dirname(result),
+                                   "judge_result.superseded.%s.json" % time.time_ns())
+            os.rename(result, archive)
+    except (OSError, ValueError, TypeError, AttributeError):
+        return
 
 
 def _record_correction(output_folder, *, claim_id, attempt, messages) -> None:
