@@ -51,4 +51,5 @@ __all__ = [
     "common",
     "bc_confirm",
     "d_reacquire",
+    "run_bc_d",
 ]
