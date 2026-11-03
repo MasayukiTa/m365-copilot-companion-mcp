@@ -48,6 +48,9 @@ __all__ = [
     "judge_result_pointer",
     "ENGINE_ROOT",
     "MISCLASSIFICATION_NOTE",
+    "confirm_overlap_fraction",
+    "apply_confirm_independence",
+    "confirm_independence_note",
 ]
 
 # The frozen engine checkout (A). Read-only. The engine lives OUTSIDE this public repo on the
@@ -198,7 +201,12 @@ JUDGE_REQUEST_SCHEMA = (
     '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
     ")}; "
     "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
-    "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}。"
+    "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}; "
+    "confirm_overlap {confirm_lots: 確認用データのロット識別子の配列 (曝露*結果の組ごとのロット"
+    "キー。文字列か [曝露, 結果, ロット] の三つ組), prior_opened: 既存解析が開封したロットの台帳 "
+    "({ロットキー: 開封時刻ISO} の辞書、または [{lot: .., opened_at: ISO}] の配列)}。confirm_overlap "
+    "を渡すと、確認用ロットのうち登録時刻より前に別解析が開封した割合を算出し、割合>0 なら判定票に"
+    "『確認用データは開封済み(独立でない)』と明記して order_ok を false にする (registration が必要)。\n"
     "入力の無いセクションは省略する(空の値で埋めない)。\n"
     "判定エンジンを走らせるには、claim_id の claim がエンジンに事前登録(configs/<claim_id>.json)"
     "されているか、さもなければ registration セクションに claim_id と同じ id を持つ claim を入れる"
@@ -264,6 +272,150 @@ def post_hoc_order_note(order_record) -> str:
         "これは入力不備(ERROR)ではなく、エンジンの規則では事後登録=D_FAIL_LOCK_AFTER_DATA で"
         "判定は最大でも HOLD(保留)に留まります。妥当にするには、データ取得より前に主張を登録・"
         "ロックすること(事後にこの順序を偽装はしない)。" % (reg, mtime))
+
+
+#: Key the harness adds to an order_record when confirmation data proves NOT independent of a
+#: prior analysis (a lot already opened before this claim's trusted registration time). The
+#: fraction and the offending lot keys are recorded so a reader of judge_result.json sees WHY
+#: order_ok was forced false, and build_judge_footer surfaces the same line on the final answer.
+_INDEPENDENCE_KEY = "confirm_independence"
+
+
+def confirm_overlap_fraction(confirm_lots, prior_opened, *, registered_at):
+    """Fraction of CONFIRMATION lots that a PRIOR analysis already opened before registration.
+
+    Fixed condition (2): when judge_gate judges a CONFIRMATION run, it must compute -- over the
+    confirmation data's lots, keyed by the (exposure, response) pair -- the share of lots the
+    ledger shows were opened by ANOTHER analysis at a time BEFORE this claim's trusted
+    registered_at. A share > 0 means the confirmation slice was not freshly fetched after
+    registration; it was already seen, so it is NOT independent.
+
+    Arguments (all data-free in the sense of carrying no measurement value -- only lot keys and
+    times):
+      * confirm_lots: iterable of the confirmation run's lot identifiers. Each identifier is the
+        (exposure, response) pair's lot key -- a string or a [exposure, response, lot] triple;
+        it is normalised to a hashable key here. Duplicates are counted once.
+      * prior_opened: mapping {lot_key: opened_at_iso} OR an iterable of {"lot": .., "opened_at":
+        ..} records distilled from the ledger (a prior analysis's manifest/lock records the lots
+        it opened and when). opened_at is an ISO 8601 time.
+      * registered_at: this claim's TRUSTED registration time (ISO 8601). A prior opening counts
+        only when it is STRICTLY BEFORE this time -- an opening at or after registration is not a
+        pre-registration leak.
+
+    Returns {"fraction": float in [0,1], "n_lots": int, "n_overlap": int, "overlap_lots":
+    sorted[str]}. An empty confirmation set yields fraction 0.0 (nothing to leak). Never raises on
+    an unparseable prior time -- that record is skipped (it cannot be shown to precede
+    registration), because this screen only STOPS on evidence, it never invents an overlap.
+    """
+    def _key(item):
+        if isinstance(item, (list, tuple)):
+            return "|".join(str(p) for p in item)
+        return str(item)
+
+    lots = []
+    seen = set()
+    for item in (confirm_lots or []):
+        k = _key(item)
+        if k not in seen:
+            seen.add(k)
+            lots.append(k)
+    n_lots = len(lots)
+    if n_lots == 0:
+        return {"fraction": 0.0, "n_lots": 0, "n_overlap": 0, "overlap_lots": []}
+    # Normalise prior_opened into {lot_key: [opened_at, ...]}.
+    opened = {}
+    if isinstance(prior_opened, dict):
+        items = prior_opened.items()
+    else:
+        items = ((rec.get("lot"), rec.get("opened_at"))
+                 for rec in (prior_opened or []) if isinstance(rec, dict))
+    for lot_key, when in items:
+        if lot_key is None:
+            continue
+        opened.setdefault(_key(lot_key), []).append(when)
+    try:
+        reg_dt = _parse_iso_gate(registered_at)
+    except (ValueError, TypeError):
+        # Without a trusted registration time we cannot say any opening PRECEDED it. Report no
+        # overlap rather than guess -- the order check elsewhere already flags a missing time.
+        return {"fraction": 0.0, "n_lots": n_lots, "n_overlap": 0, "overlap_lots": []}
+    overlap = []
+    for k in lots:
+        for when in opened.get(k, []):
+            try:
+                if _parse_iso_gate(when) < reg_dt:
+                    overlap.append(k)
+                    break
+            except (ValueError, TypeError):
+                continue  # an unparseable prior time is not evidence of a leak; skip it
+    n_overlap = len(overlap)
+    return {"fraction": n_overlap / n_lots, "n_lots": n_lots,
+            "n_overlap": n_overlap, "overlap_lots": sorted(overlap)}
+
+
+def _parse_iso_gate(s):
+    """Parse an ISO 8601 time the same way the harness registry does (assume JST when naive),
+    kept local to judge_gate so the gate does not depend on the engine or import order."""
+    import datetime as _dt
+    t = _dt.datetime.fromisoformat(str(s).replace("Z", "+00:00"))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=_dt.timezone(_dt.timedelta(hours=9)))
+    return t
+
+
+def apply_confirm_independence(order_record, overlap):
+    """Fold an overlap result into the order_record, STOPPING only (order_ok true -> false).
+
+    Fixed condition (2) + the 'stricter / add-information only' rule: when the confirmation data
+    is not independent (overlap fraction > 0), this
+      * records the independence finding ON the order_record (information added), and
+      * forces order_ok to False when it was True (stricter only -- it NEVER flips a False to
+        True and NEVER relaxes anything; an order already False stays False).
+    A fraction of 0 adds the finding as 'independent: true' and changes order_ok not at all.
+    Returns the same order_record (mutated in place) for convenience; tolerates order_record None.
+    """
+    if not isinstance(order_record, dict):
+        return order_record
+    frac = float(overlap.get("fraction", 0.0)) if isinstance(overlap, dict) else 0.0
+    record = {
+        "checked": True,
+        "independent": frac <= 0.0,
+        "opened_before_registration_fraction": frac,
+        "n_lots": overlap.get("n_lots") if isinstance(overlap, dict) else None,
+        "n_overlap": overlap.get("n_overlap") if isinstance(overlap, dict) else None,
+        "overlap_lots": overlap.get("overlap_lots") if isinstance(overlap, dict) else None,
+    }
+    order_record[_INDEPENDENCE_KEY] = record
+    if frac > 0.0 and order_record.get("order_ok") is True:
+        order_record["order_ok"] = False
+        prior = order_record.get("order_reason") or ""
+        note = ("confirmation data is NOT independent: %.1f%% of its lots (%s/%s, by "
+                "exposure*response) were opened by a prior analysis BEFORE this claim's "
+                "registration; order_ok forced false"
+                % (frac * 100.0, record["n_overlap"], record["n_lots"]))
+        order_record["order_reason"] = (prior + "; " + note) if prior else note
+    return order_record
+
+
+def confirm_independence_note(order_record):
+    """A plain line for the footer when confirmation data was shown NOT independent, else ''.
+
+    States that the confirmation slice was already opened (so it is not a post-registration fresh
+    fetch), names the fraction, and that order_ok was set false for it -- never silent, never
+    faked. Returns '' when the check did not run or found the data independent.
+    """
+    if not isinstance(order_record, dict):
+        return ""
+    rec = order_record.get(_INDEPENDENCE_KEY)
+    if not isinstance(rec, dict) or not rec.get("checked"):
+        return ""
+    if rec.get("independent"):
+        return ""
+    frac = rec.get("opened_before_registration_fraction") or 0.0
+    return ("確認用データは開封済み(独立でない): 確認用ロットの %.1f%%(%s/%s、曝露*結果の組ごと)が、"
+            "この主張の登録時刻より前に別の解析で開封されていました。登録後に初めて取得した未開封"
+            "データではないため、order_ok を false にしました(事後にこの順序を偽装はしない)。"
+            % ((frac * 100.0), rec.get("n_overlap"), rec.get("n_lots")))
 
 
 def _short_type(value) -> str:
@@ -504,6 +656,37 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                     statuses.append("lot diagnosis: " + json.dumps(diagnosis, ensure_ascii=False))
                 except (ValueError, TypeError, ImportError) as e:
                     statuses.append("lot diagnosis: not run: %s" % e)
+        # CONFIRMATION-DATA INDEPENDENCE (fixed condition 2). A CONFIRMATION run must be judged on
+        # data fetched AFTER the claim was registered. When the request carries a confirm_overlap
+        # section -- the confirmation run's lots (by exposure*response) plus the ledger of lots a
+        # prior analysis already opened and when -- compute the share of confirmation lots opened
+        # before this claim's TRUSTED registration time. A share > 0 means the slice was already
+        # seen (not independent): we FORCE order_ok false (stricter only, never relaxes) and add
+        # the finding to the order_record so the footer states it. Needs the trusted registered_at
+        # from register_and_lock, so it runs only when a registration order_record exists.
+        confirm = request.get("confirm_overlap")
+        if confirm is not None and order_record is not None:
+            if not isinstance(confirm, dict):
+                msg = "confirm_overlap must be an object, got %s" % _short_type(confirm)
+                statuses.append("confirm independence: not run: %s" % msg)
+                corrections.append(msg)
+            else:
+                try:
+                    overlap = confirm_overlap_fraction(
+                        confirm.get("confirm_lots"), confirm.get("prior_opened"),
+                        registered_at=order_record.get("registered_at"))
+                    apply_confirm_independence(order_record, overlap)
+                    statuses.append("confirm independence: "
+                                    + json.dumps(order_record.get(_INDEPENDENCE_KEY),
+                                                 ensure_ascii=False)
+                                    + " -> order_ok=%s" % order_record.get("order_ok"))
+                except (ValueError, TypeError) as e:
+                    statuses.append("confirm independence: not run: %s" % e)
+        elif confirm is not None and order_record is None:
+            # The check needs a trusted registration time; without a registration section there
+            # is none. Say so plainly rather than skip silently.
+            statuses.append("confirm independence: not run: no registration order_record "
+                            "(a trusted registered_at is required to judge independence)")
         # A BOUNDED CORRECTION TURN, BEFORE THE ENGINE RUNS. If a section was PRESENT but has a
         # field-level problem the worker can fix (wrong type/shape, or a claim id mismatch), and
         # the caller gave a budget that is not yet spent, hand the specific messages + schema back
@@ -1044,6 +1227,12 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
         _ph = post_hoc_order_note(order_record)
         if _ph:
             lines.append(_ph)
+        # Confirmation-data independence (fixed condition 2). When the confirmation slice was
+        # already opened by a prior analysis before registration, state it plainly and that
+        # order_ok was set false for it -- never silently omitted, never faked.
+        _indep = confirm_independence_note(order_record)
+        if _indep:
+            lines.append(_indep)
     if not engine_available or not verdict:
         reason = unavailable_reason or (
             verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"
