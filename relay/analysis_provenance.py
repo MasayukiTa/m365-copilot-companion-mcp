@@ -214,6 +214,27 @@ def _mask_non_values(text: str) -> str:
 #: dropped by the non-identifier lookbehind in _NUM_RE.
 _YEAR_RANGE = (1900, 2100)
 
+#: SMALL WHOLE COUNTS ARE NOT POLICED AS CLAIMS. A bare integer whose magnitude is in 0..10,
+#: written with no decimal, no thousands separator and no percent, is almost always a COUNT or
+#: an ORDER -- "7 ロットを確認", "0 件の逸脱", "上位 4 件", "2 群" -- not a measured statistic a
+#: results file could have planted. Evidence (owner, 2026-11-03): in the real rejection record
+#: (.fleet/status.json) 37.5% of the numbers this gate flagged were exactly such small integers
+#: (0,4,7,...), and the detection value on them is low while the false-rejection cost is high:
+#: an honest worker who writes "7 ロット" after counting rows in run_python output is sent back
+#: for a 7 that trivially appears everywhere. So on the CLAIM side (policing=True) a small whole
+#: number is dropped before it becomes something the answer must justify. It is NOT dropped on
+#: the COMPUTED side: a computation that legitimately emits 7 still counts as support for any
+#: larger claim, and nothing about the computed list changes. A decimal (4.0 written as "4.00"),
+#: a percent ("4%"), or a thousands-grouped value is never small-count: those keep being policed.
+_SMALL_COUNT_MAX = 10
+
+
+def _is_small_count(digits: str, had_percent: bool, val: float) -> bool:
+    """Whether this match is a small whole count/order (0..10 integer, no decimal/percent/comma)
+    that the gate should not police as a claimed statistic. Mirrors the year-drop shape."""
+    return (not had_percent and "." not in digits and "," not in digits
+            and val == int(val) and 0 <= abs(val) <= _SMALL_COUNT_MAX)
+
 
 def _to_float(digits: str, percent: bool):
     """The numeric value of one match, or None if it will not parse. Percent is NOT folded in
@@ -269,7 +290,7 @@ def _request_digit_runs(request_text) -> frozenset:
     return frozenset(r for r in re.findall(r"\d+", request_text) if len(r) >= 2)
 
 
-def extract_numbers(text, request_digits=None) -> list:
+def extract_numbers(text, request_digits=None, *, policing=False) -> list:
     """Every numeric quantity in `text`, as (value, had_percent) pairs.
 
     A LIST, NOT A SET, and the percent flag is kept: 0.12 and 12% are different faces of the
@@ -284,6 +305,13 @@ def extract_numbers(text, request_digits=None) -> list:
     is dropped. A run in a QUANTITY form ("679 件", "679%", "n = 679") is NEVER dropped this
     way: a stated quantity still has to be found in a computation output, even when the same
     digits occur in the goal.
+
+    `policing` distinguishes the two callers. On the CLAIM side (policing=True, the answer being
+    checked) a small whole count/order (0..10 integer, no decimal/percent/comma) is dropped --
+    it is a count like "7 ロット" or an order like "上位 4 件", not a statistic a results file
+    plants, and policing it costs honest answers (see _SMALL_COUNT_MAX). On the COMPUTED side
+    (policing=False, the default, the computation outputs) nothing is dropped: a computed 7 must
+    still be available to support a larger claim, so the computed list is unchanged.
     """
     if not isinstance(text, str):
         return []
@@ -294,6 +322,12 @@ def extract_numbers(text, request_digits=None) -> list:
         had_percent = bool(m.group(2))
         val = _to_float(m.group(1), had_percent)
         if val is None:
+            continue
+        # SMALL WHOLE COUNT / ORDER, claim side only. A 0..10 integer with no decimal, comma or
+        # percent is a count or a rank, not a measured statistic; dropping it on the claim side
+        # stops the dominant false rejection (37.5% of real flags) without touching the
+        # computed side, where the same value may legitimately support a larger claim.
+        if policing and _is_small_count(m.group(1), had_percent, val):
             continue
         # A bare integer in the year range with no decimal and no percent is almost always a
         # date, not a measured quantity. Dropping it is conservative in the SAFE direction:
@@ -411,13 +445,25 @@ class ProvenanceResult(dict):
 
 
 def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
-                            request_text="") -> ProvenanceResult:
-    """Does every number in the answer trace to a computation this run performed?
+                            request_text="", run_file_outputs=None) -> ProvenanceResult:
+    """Does every number in the answer trace to something this run actually produced -- a
+    computation it ran, OR a file it created/changed/read in this run?
 
     `compute_outputs` is the list of result texts from THIS run's compute-tool calls (the
     caller collects them from the attributed ledger -- see relay_fleet). `is_analysis` is the
     gate's own applicability: when False the check is a no-op pass, because a non-analysis
     answer carries numbers (dates, counts, ids) this rule has no business policing.
+
+    `run_file_outputs` (optional) is the list of BODY TEXTS of files this run touched within
+    its own lifetime: files it created or changed (the pptx/md/json/csv/txt deliverables of
+    this job -- their text, python-pptx slide text included) and files it READ (an input table
+    or a prior note it actually opened this run). The caller (relay_fleet) builds this from the
+    attributed ledger, keeping only files whose modified-time is at or after this run's start
+    (for writes) or that this run read at all, so that a stale results file the folder already
+    held and this run NEVER read is excluded -- transcribing its numbers is still caught.
+    A number that appears in one of these texts is as produced-by-this-run as a computed one;
+    both lists are legitimate sources and are checked together. When run_file_outputs is empty
+    the check degrades to its prior behaviour exactly (compute outputs only).
 
     `request_text` (optional) is the requester's own words -- the goal text and/or the resolved
     request text. Digit runs that appear THERE (a case name like "679かすれ調査", an id like
@@ -433,9 +479,21 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
     all behind them.
     """
     request_digits = _request_digit_runs(request_text)
-    claimed = extract_numbers(final_answer, request_digits) if is_analysis else []
+    claimed = (extract_numbers(final_answer, request_digits, policing=True)
+               if is_analysis else [])
     had_compute = bool([t for t in (compute_outputs or []) if str(t or "").strip()])
+    had_file = bool([t for t in (run_file_outputs or []) if str(t or "").strip()])
+    # The produced-in-this-run number pool: computation outputs AND the body text of files this
+    # run created/changed/read. Both are flattened the same way; the computed side keeps its
+    # default (policing=False) so small counts stay available as support.
     computed = _computed_values(compute_outputs) if had_compute else []
+    if had_file:
+        computed = computed + _computed_values(run_file_outputs)
+    # 'A computation ran' for RULE 3 is satisfied by EITHER an executed computation OR a file
+    # this run produced/read: both are evidence the run did real work and did not merely read a
+    # planted results file back out. (A run that only read a stale file it did not touch has
+    # neither, and still fails RULE 3.)
+    had_source = had_compute or had_file
 
     if not is_analysis:
         return ProvenanceResult(ok=True, had_compute=had_compute, unsupported=[],
@@ -446,9 +504,10 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
                                 checked=0, reason="no numeric claims in the answer",
                                 correction="")
 
-    # RULE 3: numbers but zero computation. The answer asserts quantities with nothing in this
-    # run that could have produced them -- the exact shape of reading a results file back out.
-    if not had_compute:
+    # RULE 3: numbers but zero source. The answer asserts quantities with nothing in this run
+    # that could have produced them -- neither a computation NOR a file this run made or read --
+    # the exact shape of reading a results file back out.
+    if not had_source:
         return ProvenanceResult(
             ok=False, had_compute=False, unsupported=[v for v, _ in claimed],
             checked=len({v for v, _ in claimed}),
@@ -460,7 +519,7 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
                 "テーブルから run_python 等で実際に再計算し、その出力に現れた数値だけを"
                 "報告してください。"))
 
-    # RULE 2: each claimed number must appear among the computed values.
+    # RULE 2: each claimed number must appear among the produced values (computation + files).
     seen = set()
     unsupported = []
     for val, had_percent in claimed:
@@ -473,15 +532,16 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
     if unsupported:
         shown = ", ".join(("%g" % v) for v in unsupported[:12])
         return ProvenanceResult(
-            ok=False, had_compute=True, unsupported=unsupported, checked=len(seen),
+            ok=False, had_compute=had_compute, unsupported=unsupported, checked=len(seen),
             reason="claimed numbers not found in this run's computation outputs",
             correction=(
-                "次の数値は回答に現れますが、この実行の計算出力のどこにも現れません: %s。"
-                "フォルダ内の既存の結果ファイルから転記した数値である可能性があります。"
-                "生の入力テーブルから run_python 等で再計算し、その出力に現れた数値のみを"
-                "報告してください(既存の結果ファイルは検証すべき主張として扱う)。" % shown))
+                "次の数値は回答に現れますが、この実行の計算出力にも、この実行が作成・変更・"
+                "読み取りしたファイルの本文にも現れません: %s。フォルダ内の既存の結果ファイル"
+                "(この実行が触れていないもの)から転記した数値である可能性があります。生の"
+                "入力テーブルから run_python 等で再計算し、その出力に現れた数値のみを報告して"
+                "ください(既存の結果ファイルは検証すべき主張として扱う)。" % shown))
 
-    return ProvenanceResult(ok=True, had_compute=True, unsupported=[], checked=len(seen),
+    return ProvenanceResult(ok=True, had_compute=had_compute, unsupported=[], checked=len(seen),
                             reason="every claimed number traces to a computation in this run",
                             correction="")
 

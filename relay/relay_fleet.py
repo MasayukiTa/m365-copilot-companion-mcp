@@ -8247,6 +8247,123 @@ class RelayWorker:
         except (AttributeError, TypeError, ValueError, OSError, ImportError):
             return []
 
+    #: Tools whose CALL carries the body text this run WROTE into a file (create/change), keyed
+    #: by the arg that holds that text. A number in one of these bodies was produced by this run
+    #: -- it is the text of a deliverable this job authored (pptx slide text via python-pptx is
+    #: written through run_python and so is already in the compute outputs; md/json/csv/txt go
+    #: through these writers). We read the CALL args, not an outcome, because the written content
+    #: is the argument; a short "ok, 1234 bytes" outcome would not contain the numbers.
+    _FILE_WRITE_ARG = {
+        "write_file": "content", "create_small_text_file": "content",
+        "createSmallTextFile": "content", "createSmallTextFileInMyOnedrive": "content",
+        "replace_in_file": "new", "multi_edit": "edits", "append_file": "content",
+    }
+    #: Tools whose OUTCOME text is the body this run READ from a file. A number the run read from
+    #: an input table or a note it actually opened this run is produced-in-this-run evidence --
+    #: NOT a transcription from a stale file it never touched. odbc_* are already compute tools;
+    #: these are the plain content reads.
+    _FILE_READ_TOOLS = frozenset({
+        "read_file", "read_json", "read_excel", "open_workbook",
+        "read_small_text_file", "readSmallTextFileFromMyOnedrive",
+    })
+
+    @staticmethod
+    def _unwrap_arg(v):
+        """The ledger stores each arg as {'text': <value>, 'len', 'sha16', ...}; a few are bare.
+        Return the inner text as a string, or '' when there is none."""
+        if isinstance(v, dict):
+            v = v.get("text")
+        return v if isinstance(v, str) else ""
+
+    def _judge_run_file_outputs(self):
+        """Body TEXT of files THIS run created/changed/read within its own lifetime.
+
+        The provenance gate treats a number found here as produced-by-this-run, exactly like a
+        computed number: the pptx/md/json/csv/txt deliverables this job authored, and the input
+        files it actually opened this run. This is the permanent fix for the false rejection
+        where a worker that really did the analysis wrote its findings into this run's own files
+        (slide, lab note, registration json, judge_result.json) and was sent back because the
+        gate only looked at run_python stdout.
+
+        WHAT IS EXCLUDED, SO TRANSCRIPTION IS STILL CAUGHT. A pre-existing results file the
+        folder already held and this run NEVER read contributes nothing: its body is not
+        collected (we only gather reads this run performed and writes this run made). For a WRITE
+        we additionally require the file's mtime to be at/after this run's start, so a path the
+        run merely overwrote-in-name but whose on-disk content predates the run cannot smuggle
+        old numbers in. Same attribution as _judge_compute_outputs (trusted bound session or
+        named for this worker, since the first turn). Never raises: an empty list means 'nothing
+        seen', which the gate reads conservatively.
+        """
+        try:
+            from relay import mcp_attribution as attr
+            since = float(getattr(self, "_first_turn_sent_at", 0) or 0)
+            if not since:
+                return []
+            route = _socket_route()
+            bindings = route.mcp_bindings.snapshot() if route else {}
+            ids = self._conversation_ids_for_binding() if route else {}
+            conversation = ids.get("client") or ""
+            sessions = {s for s, b in bindings.items()
+                        if b.get("worker") == self.name and conversation
+                        and b.get("conversation") == conversation
+                        and b.get("how") in attr.TRUSTED_HOW}
+
+            def _mine(r):
+                return (float(r.get("ts") or 0) >= since
+                        and (r.get("session") in sessions or r.get("worker") == self.name))
+
+            rows = self._ledger_rows()
+            outputs = []
+            read_ids = set()
+            for r in rows:
+                if r.get("event") != "call" or not _mine(r):
+                    continue
+                tool = str(r.get("tool") or "")
+                args = r.get("args") or {}
+                if tool in self._FILE_WRITE_ARG:
+                    # The text this run WROTE. For multi_edit the arg is a JSON array of edits;
+                    # its raw text still contains any numbers, which is all the gate needs.
+                    body = self._unwrap_arg(args.get(self._FILE_WRITE_ARG[tool]))
+                    path = self._unwrap_arg(args.get("path"))
+                    if body and self._write_is_in_run(path, since):
+                        outputs.append(body)
+                elif tool in self._FILE_READ_TOOLS:
+                    rid = str(r.get("id") or "")
+                    if rid:
+                        read_ids.add(rid)
+            # The OUTCOME text of this run's content reads: what the run actually saw.
+            if read_ids:
+                for r in rows:
+                    if r.get("event") != "outcome" or str(r.get("id") or "") not in read_ids:
+                        continue
+                    if not r.get("ok", True):
+                        continue
+                    res = r.get("result")
+                    if isinstance(res, dict) and isinstance(res.get("text"), str):
+                        outputs.append(res["text"])
+                    elif isinstance(res, str):
+                        outputs.append(res)
+            return outputs
+        except (AttributeError, TypeError, ValueError, OSError, ImportError):
+            return []
+
+    @staticmethod
+    def _write_is_in_run(path, since):
+        """Whether a write to `path` reflects content produced in THIS run: either the file does
+        not exist on disk to stat (we trust the just-seen write), or its mtime is at/after the
+        run start. A file whose on-disk content predates the run (mtime < since) is treated as
+        pre-existing and NOT admitted, so overwriting-in-name cannot smuggle old numbers in.
+        Never raises; on any doubt admit the write (the content was in this run's own call)."""
+        try:
+            if not path:
+                return True
+            import os as _os
+            if not _os.path.exists(path):
+                return True
+            return _os.path.getmtime(path) >= float(since or 0)
+        except Exception:
+            return True
+
     #: Tools that read a file's CONTENT. A case reference points at a request FILE whose body
     #: is the actual task; opening it necessarily goes through one of these. (search_ops.glob /
     #: find_files only match names, so they are deliberately NOT here -- listing a folder is not
@@ -8436,7 +8553,8 @@ class RelayWorker:
                              + (getattr(self, "_judge_request_text", "") or ""))
                 _prov = _ap.check_answer_provenance(
                     _answer, self._judge_compute_outputs(), is_analysis=_is_an,
-                    request_text=_req_text)
+                    request_text=_req_text,
+                    run_file_outputs=self._judge_run_file_outputs())
                 # ONLY SPEAK WHEN THE GATE ACTUALLY LOOKED. A no-op pass -- a non-analysis
                 # answer, or an analysis answer with no numeric claim to police -- examined
                 # nothing, so it must leave the visible answer and the judge text exactly as

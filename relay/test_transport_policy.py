@@ -194,3 +194,49 @@ def test_an_unread_reason_is_still_unknown():
     """Widening the route list must not turn the classifier into a catch-all: an unread reason
     has to keep accumulating visibly so it can be read and added deliberately."""
     assert classify_fallback("something nobody has seen before") == "unknown"
+
+
+# ---- a mid-flight drop ("no close frame received or sent") is honest-unknown, and a
+# ---- checkable act recovers from it; an unobservable act stays refused ----------------------
+from relay.transport_policy import (  # noqa: E402
+    delivery_status, delivery_proves_not_sent, duplicate_risk,
+    resend_decision_for_landed_act, CHECK_ABSENT, CHECK_PRESENT, CHECK_UNKNOWN,
+)
+
+_NO_CLOSE = "ConnectionClosedError: no close frame received or sent"
+
+
+def test_no_close_frame_is_unknown_delivery_not_a_proof_of_non_send():
+    # A socket that dropped with no close frame may or may not have put the turn on the wire,
+    # so delivery is the honest "unknown" -- never "not_delivered" (which would certify a
+    # re-send as safe) and never a before-the-wire proof.
+    assert delivery_status(_NO_CLOSE) == "unknown", _NO_CLOSE
+    assert delivery_proves_not_sent(_NO_CLOSE) is False, _NO_CLOSE
+    assert duplicate_risk(_NO_CLOSE) is True, _NO_CLOSE
+
+
+def test_no_close_frame_on_a_commit_recovers_when_the_commit_is_absent():
+    # The act leaves a trace, so the landed-but-unknown gamble becomes a lookup: the commit is
+    # not in the log, so the turn is genuinely lost and re-sending it is the recovery.
+    goal = "Fix the bug and commit the change."
+    assert resend_decision_for_landed_act(goal, lambda g: CHECK_ABSENT) == "resend"
+    # already present -> re-send is a harmless no-op, still recover rather than end stuck.
+    assert resend_decision_for_landed_act(goal, lambda g: CHECK_PRESENT) == "resend"
+
+
+def test_no_close_frame_on_an_unobservable_act_stays_refused():
+    # A mail send leaves no trace this process can read, so after a no-close-frame drop the
+    # careful refuse-on-landed default holds -- a blind re-send would be a second mail.
+    goal = "Send the status email to the team."
+    assert resend_decision_for_landed_act(goal, lambda g: CHECK_ABSENT) == "refuse"
+    assert resend_decision_for_landed_act(goal, None) == "refuse"
+
+
+def test_a_failing_checker_after_no_close_frame_falls_back_to_refuse():
+    # A checker that cannot tell (or raises) is read as unknown, which refuses -- a broken
+    # read is not evidence the act did not happen.
+    goal = "Build the deck and commit it."
+    def _raises(g):
+        raise RuntimeError("git unavailable")
+    assert resend_decision_for_landed_act(goal, _raises) == "refuse"
+    assert resend_decision_for_landed_act(goal, lambda g: CHECK_UNKNOWN) == "refuse"
