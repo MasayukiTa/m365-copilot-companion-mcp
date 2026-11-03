@@ -143,6 +143,7 @@ jobs:
             ui/test_planned_server_restart_expiry.py \
             ui/test_planned_server_restart_exact_poll.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
+            relay/test_data_access_ledger.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
@@ -183,6 +184,7 @@ jobs:
             relay/test_judge_verdict_not_error.py \
             relay/test_engine_claim_schema_in_initial_instruction.py \
             tests/test_validity_harness.py \
+            tests/test_open_ledger.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \
             tools/test_refused_record_and_force.py \
