@@ -98,14 +98,27 @@ def parse_judge_result(result: dict[str, Any] | str | Path) -> JudgeVerdict:
 
     判定器が出した値をそのまま写すだけ。数値の再計算・補正・順序の改変は一切しない。
     """
-    if isinstance(result, (str, Path)):
-        p = Path(result)
-        if p.exists():
-            data = json.loads(p.read_text(encoding="utf-8"))
-        else:
-            data = json.loads(str(result))
-    else:
+    if isinstance(result, dict):
         data = result
+    elif isinstance(result, Path):
+        data = json.loads(result.read_text(encoding="utf-8"))
+    else:
+        # str: JSON 本文（{ か [ で始まる）ならそのまま解析し、ファイル名として
+        # 扱わない。長い JSON 文字列を Path.exists() に渡すと OS が
+        # 'File name too long' を投げるため、先に本文判定する。
+        s = str(result).strip()
+        if s[:1] in "{[":
+            data = json.loads(s)
+        else:
+            p = Path(result)
+            try:
+                is_file = p.exists()
+            except OSError:
+                is_file = False
+            if is_file:
+                data = json.loads(p.read_text(encoding="utf-8"))
+            else:
+                data = json.loads(s)
 
     if not isinstance(data, dict):
         raise ValueError("judge result must be an object")

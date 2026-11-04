@@ -1156,7 +1156,8 @@ jobs:
             relay/test_a_stale_coordinator_restarts_only_when_idle.py \
             scripts/weekly_scan/tests/test_ledger_io.py \
             scripts/weekly_scan/tests/test_judge_wrapper.py \
-            scripts/weekly_scan/tests/test_db_lots.py
+            scripts/weekly_scan/tests/test_db_lots.py \
+            scripts/weekly_scan/tests/test_runner.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py

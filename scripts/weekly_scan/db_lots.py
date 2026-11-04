@@ -5,8 +5,10 @@
 判定するために、製造 DB（接続名 ``adams`` / db=mcl）から不良ロット数を品名で層別して数える。
 
 設計の前提:
-  - DB 接続の実体（サーバ・資格情報）は .env の ``MCP_DB_ADAMS`` にあり、
-    このモジュールは接続文字列を一切保持・出力しない。接続は既存 ``odbc_query`` ツールに委ねる。
+  - DB 接続の実体（サーバ・資格情報・接続名）は .env 側に置かれ、このモジュールは接続
+    文字列を一切保持・出力しない。実際の接続名・資格情報の参照は、呼び出し側が渡す
+    ``query_callable``（既存の ODBC 問い合わせツール相当）に委ねる。既定の接続名は
+    ``DEFAULT_CONNECTION``（下記）で与えるが、呼び出し側が ``connection`` 引数で上書きできる。
   - 生の測定行・社員 ID は読まない・返さない。返すのは層（品名）ごとの件数だけ（データ最小化）。
   - SQL の値は必ずバインド変数（?）で渡し、SQL 文字列に値を埋め込まない
     （既存 ``odbc_query(connection, query, params=...)`` の規約に合わせる）。
@@ -22,7 +24,10 @@ import re
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-DEFAULT_CONNECTION = "adams"  # .env の MCP_DB_ADAMS（server=...\ADAMS,50379 db=mcl trusted=No）
+# 既定の ODBC 接続名。製造 DB（ADAMS / db=mcl）を指す想定だが、接続の実体（サーバ名・
+# ポート・資格情報・環境変数名）は .env 側と呼び出し側の query_callable が持ち、本モジュール
+# は一切保持・出力しない。呼び出し側は count_lots_by_product(connection=...) で上書きできる。
+DEFAULT_CONNECTION = "adams"
 
 # 層別キー（品名）に許す文字。SQL はバインド変数で渡すので値自体の注入は起きないが、
 # 「品名として想定外の値を黙って数える」ことを防ぐため、識別子の形だけ軽く検証する。
