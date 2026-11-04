@@ -391,25 +391,37 @@ def pptx_export_png(
         pythoncom.CoInitialize()
         ppt = None
         pres = None
+        opened_fullname = None
         try:
             ppt = win32com.client.DispatchEx("PowerPoint.Application")
-            # PowerPoint can't be fully hidden on all builds; the dispatch-export-quit pattern is the standard.
+            # OWNERSHIP RULE (why there is no Quit here). PowerPoint is a single shared
+            # application the operator may already be using. This tool is only allowed to
+            # CLOSE THE ONE DOCUMENT IT OPENED ITSELF -- never Application.Quit, never a
+            # process-name terminate/kill, never "close all windows", never closing any other
+            # open presentation. Quitting the application (or killing the process) would tear
+            # down documents this tool never opened, including the operator's live work, so it
+            # is forbidden even on an instance we dispatched ourselves. The COM references are
+            # released instead and the dispatched, window-less instance is left for the OS to
+            # reclaim.
             pres = ppt.Presentations.Open(str(p), WithWindow=False)
+            opened_fullname = pres.FullName  # the file name of the document we opened
             scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
             pres.Export(str(out_dir), "PNG", width_px, scale_h)
             count = len(list(out_dir.glob("*.PNG"))) + len(list(out_dir.glob("*.png")))
             return f"Exported {count} PNG(s) to {out_dir}"
         finally:
+            # Close ONLY the single document this tool opened. This never touches any other
+            # document, never closes all windows, and never quits or kills PowerPoint.
             try:
-                if pres is not None:
+                if pres is not None and opened_fullname is not None:
                     pres.Close()
             except Exception:
                 pass
-            try:
-                if ppt is not None:
-                    ppt.Quit()
-            except Exception:
-                pass
+            # Drop our COM references WITHOUT quitting the application. del + the matching
+            # CoUninitialize is the whole teardown; there is deliberately no ppt.Quit(),
+            # no taskkill, and no window enumeration.
+            pres = None
+            ppt = None
             pythoncom.CoUninitialize()
     except Exception as e:
         return f"[pptx_export_png error: {type(e).__name__}: {e}]"
