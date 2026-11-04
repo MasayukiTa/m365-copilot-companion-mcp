@@ -1732,7 +1732,15 @@ function Invoke-TunnelHostingCheck {
     # guard can tell "reconnecting" (wait) from "wedged past 180s" (replace). A reader of ours is
     # alive when Test-OurTunnelHostRunning says so; this is cheap and reads only $script:TunnelHostProc
     # plus the devtunnel process table it already consults.
-    Update-ReaderRelayGap -Connections $conn -ReaderAlive (Test-OurTunnelHostRunning)
+    $readerAlive = Test-OurTunnelHostRunning
+    Update-ReaderRelayGap -Connections $conn -ReaderAlive $readerAlive
+    # J6 BLIND SPOT: a reader can be alive (so Start-TunnelHost never replaces it) while its own
+    # devtunnel child is alive-but-disconnected. If the relay has read 0 connections for longer
+    # than the measured worst-case recovery window, stop ONLY that child so the reader exits and
+    # the re-host logic below brings the tunnel back -- see Stop-StuckTunnelChild. A strike this
+    # tick means the child is gone and the reader is exiting; let this tick fall through, and the
+    # next tick re-reads the (now 0 / reader-gone) state and re-hosts normally.
+    if (Stop-StuckTunnelChild -ReaderAlive $readerAlive) { return $script:TunnelState }
     $state = Resolve-TunnelHostingState -Connections $conn -OurHostRunning $ourHost `
                                         -LocalPid $localPid -TunnelPid $tunnelPid `
                                         -ProbeOutcome $script:TunnelProbeOutcome -PreviousState $script:TunnelState
@@ -2338,6 +2346,90 @@ function Stop-TunnelReaderTree {
         Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
     }
     Stop-Process -Id $ReaderPid -Force -ErrorAction SilentlyContinue
+}
+
+function Get-OurReaderDevtunnelChildPid {
+    # The pid of the devtunnel host child of OUR reader for THIS tunnel, or 0 when none can be
+    # identified. SCOPE IS EVERYTHING HERE: a devtunnel.exe is this reader pair's child only when
+    # its ParentProcessId is one of our live readers AND its own command line hosts this tunnel
+    # (Test-IsTunnelHostCommandLine). This is the SAME parent+command-line match Stop-TunnelReaderTree
+    # uses to find what to tear down, so a child struck here is never a user's interactive
+    # `devtunnel login` nor any unrelated tunnel the user hosts by hand -- only the child of this
+    # supervisor's own reader. Returns the first such child's pid (one reader hosts one tunnel).
+    param([string]$Name)
+    foreach ($r in @(Get-ExistingTunnelReaders $Name)) {
+        $rp = [int]$r.Pid
+        if ($rp -le 0) { continue }
+        foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.ParentProcessId -eq $rp -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) })) {
+            return [int]$c.ProcessId
+        }
+    }
+    return 0
+}
+
+function Invoke-ChildStrikeDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c with the
+    # module and function both named, so tools/unreached.py credits this as the caller of
+    # supervisor_host_launch.decide_child_strike): "strike" or "wait" from (seconds with 0
+    # connections, reader alive, child pid). Any failure returns "" so the caller falls back to
+    # doing nothing rather than striking on an error.
+    param($SecondsWithZeroConnections, [bool]$ReaderAlive, $ChildPid)
+    $secArg = if ($null -eq $SecondsWithZeroConnections) { "None" } else { ([string][int]$SecondsWithZeroConnections) }
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    $pidArg = if ($null -eq $ChildPid) { "None" } else { ([string][int]$ChildPid) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_host_launch; print(supervisor_host_launch.decide_child_strike($secArg, $aliveArg, $pidArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+# AT MOST ONE CHILD STRIKE PER WINDOW. A strike that does not cure the tunnel (the replacement
+# child also fails to reach the relay) must not be repeated every tick; the next strike waits this
+# long. Matches the stale-rehost window ($script:StaleRehostMinSeconds) -- the same "do not churn
+# the relay" reasoning.
+$script:ChildStrikeAt = $null
+$script:ChildStrikeMinSeconds = 600
+
+function Test-ChildStrikeAllowed {
+    # PURE. $LastAt is $null (never struck) or the time of the last strike.
+    param($LastAt, [datetime]$Now, [int]$MinSeconds = 600)
+    if ($null -eq $LastAt) { return $true }
+    return ((($Now - [datetime]$LastAt).TotalSeconds) -ge $MinSeconds)
+}
+
+function Stop-StuckTunnelChild {
+    # THE J6 BLIND SPOT, CLOSED. A reader of ours is alive (so Start-TunnelHost's decide_host_launch
+    # keeps returning "wait" and never replaces it), but its devtunnel CHILD is alive-but-
+    # disconnected and the relay has read 0 host connections for longer than the measured worst-case
+    # recovery window (supervisor_host_launch.decide_child_strike / CHILD_RELAY_GRACE_SECONDS = 600s,
+    # which is > the 420s worst-case in-place reconnect). Stop ONLY that child so the reader exits
+    # and the existing re-host logic (the "none" branch next tick, or Start-TunnelHost's "replace")
+    # brings the tunnel back with exactly one reader. Never starts a second reader here; never
+    # touches a devtunnel process that is not the child of our reader. Called every tunnel-hosting
+    # tick, right after Update-ReaderRelayGap, so $script:ReaderNoRelaySince is current.
+    param([bool]$ReaderAlive)
+    if (-not $ReaderAlive) { return $false }
+    $waited = Get-ReaderSecondsWithoutRelay
+    $childPid = Get-OurReaderDevtunnelChildPid $TunnelName
+    $decision = Invoke-ChildStrikeDecision -SecondsWithZeroConnections $waited -ReaderAlive $true -ChildPid $childPid
+    if ($decision -ne "strike") { return $false }
+    if (-not (Test-ChildStrikeAllowed $script:ChildStrikeAt (Get-Date) $script:ChildStrikeMinSeconds)) {
+        return $false
+    }
+    $waitedStr = if ($null -eq $waited) { "an unknown time" } else { "$waited s (> ${script:ChildStrikeMinSeconds}s)" }
+    Write-Log ("tunnel host stuck: reader is alive but its devtunnel child pid $childPid has had 0 relay " +
+               "connections for $waitedStr -- stopping ONLY that child so the reader exits and re-hosts " +
+               "(never a second reader, never another PC's devtunnel)")
+    Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
+    $script:ChildStrikeAt = Get-Date
+    # The child is gone; the next Update-ReaderRelayGap with the reader still briefly alive would
+    # keep the old stamp, but the reader is expected to exit now. Clear the gap so a fresh reader
+    # starts its own window cleanly.
+    $script:ReaderNoRelaySince = $null
+    return $true
 }
 
 function Invoke-HostLaunchDecision {
