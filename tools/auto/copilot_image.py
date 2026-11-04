@@ -110,23 +110,64 @@ def copilot_generate_image(prompt: str, out_path: str, timeout_s: int = _DEFAULT
         return "[copilot_generate_image] playwright not available: %s" % exc
 
     page = None
+    _opened = False
     try:
         with sync_playwright() as pw:
             try:
-                browser = pw.chromium.connect_over_cdp(cdp_url)
+                # Edge on :9222 is shared: other sessions may have dozens of tabs open,
+                # which slows CDP target enumeration. Give the connect a generous timeout
+                # (default is 180s) so a busy browser does not spuriously fail the connect.
+                browser = pw.chromium.connect_over_cdp(cdp_url, timeout=300000)
             except Exception as exc:
                 return ("[copilot_generate_image] could not reach Edge over CDP at %s "
                         "(is Edge running with --remote-debugging-port=9222?): %s" % (cdp_url, exc))
             if not browser.contexts:
                 return "[copilot_generate_image] no browser context on the CDP endpoint"
             ctx = browser.contexts[0]
-            page = ctx.new_page()
-            page.goto(chat_url, wait_until="domcontentloaded")
+            # Reuse an already-open, authenticated Copilot chat tab if present; opening a
+            # fresh tab and navigating can time out when the surface is slow to load.
+            page = None
+            for p in ctx.pages:
+                try:
+                    if "m365.cloud.microsoft" in (p.url or "") and "/chat" in (p.url or ""):
+                        page = p
+                        break
+                except Exception:
+                    pass
+            _opened = False
+            if page is None:
+                page = ctx.new_page()
+                _opened = True
+                last_exc = None
+                for attempt in range(3):
+                    try:
+                        page.goto(chat_url, wait_until="commit", timeout=60000)
+                        last_exc = None
+                        break
+                    except Exception as exc:
+                        last_exc = exc
+                        time.sleep(3)
+                if last_exc is not None:
+                    return "[copilot_generate_image] could not open chat page %s: %s" % (
+                        chat_url, str(last_exc)[:200])
+            else:
+                try:
+                    page.bring_to_front()
+                except Exception:
+                    pass
             # Let the chat surface and composer mount.
             time.sleep(8)
             box = _find_composer(page)
             if not box:
                 return "[copilot_generate_image] composer textbox not found on %s" % page.url
+            # When reusing an existing tab, images from earlier turns are already in the DOM.
+            # Record their srcs now so we only accept a NEW large image that appears after we
+            # send this prompt.
+            try:
+                pre = page.evaluate(_IMG_SCAN_JS)
+            except Exception:
+                pre = []
+            seen = set(i["src"] for i in pre if i["w"] >= _MIN_SIDE and i["h"] >= _MIN_SIDE)
             box.click()
             page.keyboard.type(str(prompt), delay=4)
             page.keyboard.press("Enter")
@@ -139,7 +180,8 @@ def copilot_generate_image(prompt: str, out_path: str, timeout_s: int = _DEFAULT
                     imgs = page.evaluate(_IMG_SCAN_JS)
                 except Exception:
                     imgs = []
-                big = [i for i in imgs if i["w"] >= _MIN_SIDE and i["h"] >= _MIN_SIDE]
+                big = [i for i in imgs if i["w"] >= _MIN_SIDE and i["h"] >= _MIN_SIDE
+                       and i["src"] not in seen]
                 if big:
                     target = big[0]
                     break
@@ -158,7 +200,7 @@ def copilot_generate_image(prompt: str, out_path: str, timeout_s: int = _DEFAULT
         return "[copilot_generate_image] %s: %s" % (type(exc).__name__, str(exc)[:300])
     finally:
         try:
-            if page is not None:
+            if page is not None and _opened:
                 page.close()
         except Exception:
             pass
