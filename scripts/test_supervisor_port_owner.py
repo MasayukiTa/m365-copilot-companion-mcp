@@ -461,7 +461,9 @@ def test_a_server_launched_on_a_path_python_is_still_ours(driver_result):
 
 def test_the_main_loop_keeps_the_same_identity_rule_for_a_booting_server(src):
     loop = _code_only(src[src.index("\nwhile ($true) {"):])
-    booting = loop[loop.index("$booting = $false"):loop.index("if ($booting)")]
+    # The vanished-server fast path measures "is anything listening" and "is a main.py of ours
+    # alive" first ($portListening ... $booting), then branches on `if ($booting)`.
+    booting = loop[loop.index("$portListening = Test-PortListening"):loop.index("if ($booting)")]
     assert "Test-IsThisCheckoutServerCommandLine" in booting
     assert "$script:ServerProc" in booting
 
