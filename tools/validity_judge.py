@@ -67,7 +67,8 @@ CONTEXT_CODES = ("CTX_COMPARISON_INVALID_CROSS_PRODUCT", "CTX_TRIVIAL_COMPARISON
 NA_CODES = ("NA_NO_VARIATION", "NA_FIXED_LOT_BETWEEN_EXPOSURE", "NA_PURE_LOADING",
             "NA_TIME_ALIAS", "NA_OUT_OF_SUPPORT")
 A2_CODES = ("A_FAIL_SPARSE_LOTS", "A_FAIL_SINGLE_LOT_CELL", "A_FAIL_LOW_DF")
-D_CODES = ("D_FAIL_NO_LOCK", "D_FAIL_ORDER", "D_FAIL_EXPLORATORY")
+D_CODES = ("D_FAIL_NO_LOCK", "D_FAIL_ORDER", "D_FAIL_EXPLORATORY",
+          "D_FAIL_POSTHOC_FAMILY", "D_FAIL_SPLIT_INDEPENDENCE_UNKNOWN")
 C_CODES = ("C_FAIL_STRADDLE", "C_NOT_COMPUTABLE")
 OK_CODES = ("A_OK", "D_OK", "C_OK", "CTX_OK")
 FINDINGS = ("EFFECT", "EFFECT_OPPOSITE", "EFFECT_BELOW_MDES", "PRACTICAL_NULL")
@@ -193,6 +194,44 @@ def order_gate(order_ok, lock_present) -> list:
     return codes
 
 
+# ----------------------------------------------------------------- exploratory cap (C10/C11)
+def exploratory_cap(claim: dict) -> list:
+    """Claim-intrinsic HOLD caps from the canon's exploratory rules (C10, C11).
+
+    The canon is explicit that exploration is 'at most HOLD' (主張一覧.md L22, L79, L83):
+      - C10 (L77-79): a family (set + size m) fixed BEFORE the data gives Bonferroni FWER<=alpha;
+        a family decided AFTER the data does not (27 cells -> top 9 -> FWER=0.139). A scan with no
+        declared family + hash is exploratory (mode=exploratory) and caps at HOLD.
+      - C11 (L81-83): split-sample confirmation is valid only when discovery and confirmation sides
+        are INDEPENDENT (separate independent lots, no shared component). Splitting products of the
+        SAME lot is invalid (误确认率 0.38). split_unit='lot' is necessary but not sufficient; the
+        independence of the two sides must itself be asserted.
+
+    Safe-side policy (do NOT presume an unknown preregistration or split-independence to be a fact):
+      - mode == 'exploratory'                 -> D_FAIL_EXPLORATORY (always; GO is impossible).
+      - family explicitly marked post-hoc     -> D_FAIL_POSTHOC_FAMILY
+        (family['preregistered'] is False, or family['decided'] == 'posthoc').
+      - split explicitly NOT independent      -> D_FAIL_SPLIT_INDEPENDENCE_UNKNOWN
+        (claim['split_independent'] is False, or claim['split_independence'] == 'unknown').
+
+    When family['preregistered'] / split_independent are simply ABSENT, this function does not
+    fabricate either outcome: a confirmatory claim is taken at its declared word (mode), and the
+    footer records that the family-preregistration flag was not asserted and is not data-testable.
+    That reliance on the declaration is noted as a limitation, not treated as a verified fact.
+    """
+    caps = []
+    if claim.get("mode") == "exploratory":
+        caps.append("D_FAIL_EXPLORATORY")
+    fam = claim.get("family")
+    if isinstance(fam, dict) and (fam.get("preregistered") is False
+                                  or fam.get("decided") == "posthoc"):
+        caps.append("D_FAIL_POSTHOC_FAMILY")
+    if claim.get("split_independent") is False \
+            or claim.get("split_independence") == "unknown":
+        caps.append("D_FAIL_SPLIT_INDEPENDENCE_UNKNOWN")
+    return caps
+
+
 # ----------------------------------------------------------------- finding (§5 classify)
 def classify(lo: float, hi: float, d: float):
     """Map an aligned standardized interval [lo, hi] and delta_min d to a finding (None=straddle)."""
@@ -213,6 +252,19 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
     becomes a CAPPED_FINDING_* note and verdict carries no GO.
     """
     notes = ["LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE"]  # §5: data cannot verify this
+    # C10/C11: exploration is at most HOLD. Fold claim-intrinsic exploratory caps into the
+    # D cap so a scan (mode=exploratory), a post-hoc family, or a non-independent split can
+    # never reach GO. Unknown preregistration / split-independence is NOT presumed to be a fact.
+    dcap = sorted(set(list(dcap or []) + exploratory_cap(claim)))
+    if claim.get("mode") == "exploratory" or any(
+            c in dcap for c in ("D_FAIL_EXPLORATORY", "D_FAIL_POSTHOC_FAMILY",
+                                "D_FAIL_SPLIT_INDEPENDENCE_UNKNOWN")):
+        notes.append("EXPLORATORY_CAP_AT_MOST_HOLD")  # §5: C10/C11 cap recorded
+    if isinstance(claim.get("family"), dict) \
+            and claim["family"].get("preregistered") is not True \
+            and claim.get("mode") != "exploratory":
+        # family preregistration flag not asserted -> relied on the declared mode; note the limit.
+        notes.append("FAMILY_PREREGISTRATION_NOT_ASSERTED_RELIED_ON_MODE")
     errs = sorted(set(structure.get("input_errors") or []))
     if errs:
         return "ERROR", None, errs, notes
@@ -417,5 +469,5 @@ def footer(claim: dict, interval: dict, verdict: str, reasons: list, notes: list
 
 
 __all__ = ["DECL_ITEMS", "VERDICT_JA", "validate_claim", "ClaimError", "claim_sha256",
-           "context_gate", "order_gate", "classify", "decide", "two_stage_interval",
-           "footer", "_t_ppf", "_t_cdf"]
+           "context_gate", "order_gate", "exploratory_cap", "classify", "decide",
+           "two_stage_interval", "footer", "_t_ppf", "_t_cdf"]
