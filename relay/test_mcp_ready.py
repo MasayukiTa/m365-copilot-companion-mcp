@@ -48,6 +48,95 @@ def test_gate_table(cid, doc, tun, ok, frag):
     assert (g.reason() == "") is ok
 
 
+# --- gate: a SLOW server answering in 7-26 s is not "down" ----------------------------------
+def _kind_probe(script):
+    """A fake kind-aware probe_fn. `script` is a list of (kind, doc) returned in order, one per
+    probe call; the number of calls made is recorded so a test can assert the long probe ran (or
+    did not). Each call's timeout is ignored -- the clock is driven by the injected `now`."""
+    calls = []
+
+    def probe(timeout_s):
+        calls.append(timeout_s)
+        return script[min(len(calls) - 1, len(script) - 1)]
+    probe.calls = calls
+    return probe
+
+
+def test_gate_short_ok_is_the_fast_path_no_long_probe():
+    probe = _kind_probe([(mr.PROBE_OK, {"status": "ok", "server_uptime_s": 60})])
+    g = mr.ReadyGate(tunnel_fn=lambda p: (True, ""), now=Clock(), recheck_s=0, probe_fn=probe)
+    v = g.check()
+    assert v.ok and v.reason == ""
+    assert probe.calls == [mr.SHORT_TIMEOUT_S]      # one probe only
+
+
+def test_gate_slow_server_confirmed_by_the_long_probe_is_reachable():
+    # Short probe times out (the 3 s gate's false negative); the long probe gets a 200.
+    probe = _kind_probe([(mr.PROBE_TIMEOUT, None),
+                         (mr.PROBE_OK, {"status": "ok", "server_uptime_s": 60})])
+    g = mr.ReadyGate(tunnel_fn=lambda p: (True, ""), now=Clock(), recheck_s=0, probe_fn=probe)
+    v = g.check()
+    assert v.ok and v.reason == ""
+    assert probe.calls == [mr.SHORT_TIMEOUT_S, mr.LONG_TIMEOUT_S]   # confirmation ran
+
+
+def test_gate_refusal_fails_at_once_without_the_long_probe():
+    probe = _kind_probe([(mr.PROBE_REFUSED, None)])
+    g = mr.ReadyGate(tunnel_fn=lambda p: (True, ""), now=Clock(), recheck_s=0, probe_fn=probe)
+    v = g.check()
+    assert not v.ok and "not reachable" in v.reason
+    assert probe.calls == [mr.SHORT_TIMEOUT_S]      # no 60 s wait for an absent server
+
+
+def test_gate_long_probe_also_times_out_is_not_reachable():
+    probe = _kind_probe([(mr.PROBE_TIMEOUT, None), (mr.PROBE_TIMEOUT, None)])
+    g = mr.ReadyGate(tunnel_fn=lambda p: (True, ""), now=Clock(), recheck_s=0, probe_fn=probe)
+    v = g.check()
+    assert not v.ok and "not reachable" in v.reason
+    assert probe.calls == [mr.SHORT_TIMEOUT_S, mr.LONG_TIMEOUT_S]
+
+
+def test_gate_does_not_hold_the_lock_across_the_long_probe():
+    """The whole point of caching last-good: while one caller is parked in the 60 s confirmation
+    probe, another caller hitting check() must be served the cached verdict instead of blocking
+    on the lock. We prove the lock is free during the long probe by acquiring it from inside the
+    probe itself -- if check() held it across the probe, this would deadlock."""
+    import threading
+    clk = Clock()
+    holder = {"acquired": None}
+
+    def probe(timeout_s):
+        if timeout_s == mr.LONG_TIMEOUT_S:
+            # The gate must NOT be holding its lock here. A non-blocking acquire proves it.
+            holder["acquired"] = g._lock.acquire(blocking=False)
+            if holder["acquired"]:
+                g._lock.release()
+            return (mr.PROBE_OK, {"status": "ok", "server_uptime_s": 60})
+        return (mr.PROBE_TIMEOUT, None)
+    g = mr.ReadyGate(tunnel_fn=lambda p: (True, ""), now=clk, recheck_s=0, probe_fn=probe)
+    assert isinstance(g._lock, type(threading.Lock()))
+    v = g.check()
+    assert v.ok
+    assert holder["acquired"] is True       # the lock was free while the long probe ran
+
+
+def test_gate_serves_cached_verdict_while_a_slow_probe_is_in_flight():
+    """A second caller arriving during the long probe gets the cached last-good verdict rather
+    than starting its own probe or blocking."""
+    clk = Clock()
+
+    def probe(timeout_s):
+        if timeout_s == mr.SHORT_TIMEOUT_S:
+            return (mr.PROBE_OK, {"status": "ok", "server_uptime_s": 60})
+        return (mr.PROBE_TIMEOUT, None)
+    g = mr.ReadyGate(tunnel_fn=lambda p: (True, ""), now=clk, recheck_s=5, probe_fn=probe)
+    first = g.check()
+    assert first.ok
+    # Within recheck_s a second caller reuses the cached verdict (no new probe needed).
+    second = g.check()
+    assert second is first
+
+
 def test_gate_raising_probes_mean_not_ready():
     def boom():
         raise RuntimeError("x")

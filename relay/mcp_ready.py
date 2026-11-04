@@ -48,6 +48,12 @@ LOCAL_HEALTH_URL = os.environ.get("MCP_READY_HEALTH_URL", "http://127.0.0.1:8000
 MIN_UPTIME_S = float(os.environ.get("MCP_READY_MIN_UPTIME_S", "10"))
 #: A verdict is reused this long (the recheck pace of a waiting worker).
 RECHECK_S = float(os.environ.get("MCP_READY_RECHECK_S", "5"))
+#: The short health-probe timeout. A 200 inside this is "up" at once (the fast path).
+SHORT_TIMEOUT_S = float(os.environ.get("MCP_READY_SHORT_TIMEOUT_S", "3"))
+#: The confirmation timeout used ONLY after the short probe timed out (not on a refusal). The
+#: measured worst case under ~100% CPU was 26 s (2026-11-04); 60 s is that plus margin, while a
+#: wedged event loop still never answers, so a real "down" is still told from a merely "slow".
+LONG_TIMEOUT_S = float(os.environ.get("MCP_READY_LONG_TIMEOUT_S", "60"))
 #: An initialize must arrive this long after the first send.
 INIT_WINDOW_S = float(os.environ.get("MCP_READY_INIT_WINDOW_S", "45"))
 #: Fresh conversations a worker may be given for missing tools before it is STUCK.
@@ -99,6 +105,92 @@ def fetch_json(url, timeout_s=3.0):
         return None
 
 
+#: Probe result kinds. A closed set so the pure decision below cannot be handed a word nobody
+#: wrote: "ok" (200 + a dict body), "bad" (answered, but not a 200/JSON object -- the server is
+#: reachable yet not healthy), "timeout" (no answer within the deadline: could be a slow-but-live
+#: server or a wedged loop), "refused" (the connection was actively refused / reset / no route:
+#: the server is really absent).
+PROBE_OK = "ok"
+PROBE_BAD = "bad"
+PROBE_TIMEOUT = "timeout"
+PROBE_REFUSED = "refused"
+
+
+def _classify_probe_exception(exc) -> str:
+    """Map a urllib/socket exception to PROBE_TIMEOUT or PROBE_REFUSED. A timeout (the server is
+    there but slow, or a wedged loop) must be told from a refusal (nothing is listening), because
+    only the first is worth a long confirmation probe. Anything we cannot place is treated as a
+    timeout: erring toward one more probe is cheaper than calling a live server dead."""
+    import socket
+    if isinstance(exc, socket.timeout) or isinstance(exc, TimeoutError):
+        return PROBE_TIMEOUT
+    if isinstance(exc, ConnectionError):          # refused / reset / aborted
+        return PROBE_REFUSED
+    reason = getattr(exc, "reason", None)
+    if isinstance(reason, (socket.timeout, TimeoutError)):
+        return PROBE_TIMEOUT
+    if isinstance(reason, ConnectionError):
+        return PROBE_REFUSED
+    if isinstance(reason, OSError):
+        # ECONNREFUSED / EHOSTUNREACH / ENETUNREACH / ECONNRESET => really absent.
+        import errno
+        if getattr(reason, "errno", None) in (
+                errno.ECONNREFUSED, errno.EHOSTUNREACH, errno.ENETUNREACH,
+                errno.ECONNRESET, errno.ECONNABORTED):
+            return PROBE_REFUSED
+        return PROBE_TIMEOUT
+    text = str(exc).lower()
+    if "refused" in text or "reset" in text or "unreachable" in text or "no route" in text:
+        return PROBE_REFUSED
+    return PROBE_TIMEOUT
+
+
+def probe_health_kind(url, timeout_s):
+    """GET `url` once and report (kind, doc). kind is one of PROBE_OK/BAD/TIMEOUT/REFUSED; doc is
+    the parsed health dict on PROBE_OK else None. Bypasses system proxies. Never raises."""
+    try:
+        import urllib.request
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(url, timeout=timeout_s) as resp:
+            if int(getattr(resp, "status", getattr(resp, "code", 0)) or 0) != 200:
+                return PROBE_BAD, None
+            doc = json.loads(resp.read(200000).decode("utf-8", "replace"))
+        return (PROBE_OK, doc) if isinstance(doc, dict) else (PROBE_BAD, None)
+    except Exception as exc:          # noqa: BLE001 -- a probe must never raise into the gate
+        return _classify_probe_exception(exc), None
+
+
+def reachable_from_probes(first_kind, second_kind, seconds):
+    """Pure decision for the creation gate's health probe. Inputs: the SHORT probe's kind
+    (`first_kind`), the kind of the one LONG confirmation probe if it was run else None
+    (`second_kind`), and the long probe's duration in seconds (0.0 when it was not run).
+
+    Returns (reachable, confirmed_slow, tail):
+      reachable       -- True when the server answered either probe with a 200.
+      confirmed_slow  -- True only when the short probe timed out and the long probe then got a
+                         200: a live but slow server that the old 3 s gate called "not reachable".
+      tail            -- the reason fragment to put after REASON_PREFIX when NOT reachable; ""
+                         when reachable.
+
+    Rules: a short 200 is reachable at once (no long probe). A short refusal is "not reachable"
+    at once (do not wait 60 s for a server that is truly absent). A short "bad" answer (reached,
+    not healthy) is not reachable, at once. A short timeout is the only case that triggers the
+    long probe; its kind then decides."""
+    if first_kind == PROBE_OK:
+        return True, False, ""
+    if first_kind == PROBE_REFUSED:
+        return False, False, "not reachable"
+    if first_kind == PROBE_BAD:
+        return False, False, "not reachable"
+    # first_kind == PROBE_TIMEOUT (or anything unknown): the short deadline passed with no answer.
+    if second_kind == PROBE_OK:
+        return True, True, ""
+    if second_kind == PROBE_REFUSED or second_kind == PROBE_BAD:
+        return False, False, "not reachable"
+    # The long probe also timed out (or was somehow not run): a wedged/absent server.
+    return False, False, "not reachable (no answer in %ds)" % int(round(seconds or LONG_TIMEOUT_S))
+
+
 def default_health():
     return fetch_json(LOCAL_HEALTH_URL)
 
@@ -131,22 +223,60 @@ def default_tunnel(local_pid):
 
 
 # --- the gate -------------------------------------------------------------------------------
+def _default_probe_fn(timeout_s):
+    """The production health probe: a single GET of LOCAL_HEALTH_URL that reports its result kind
+    so the gate can tell a slow server from an absent one. Returns (kind, doc)."""
+    return probe_health_kind(LOCAL_HEALTH_URL, timeout_s)
+
+
 class ReadyGate:
-    """May a Copilot conversation be created now? Thread-safe; probes are cached RECHECK_S."""
+    """May a Copilot conversation be created now? Thread-safe; probes are cached RECHECK_S.
+
+    The health check tells "slow" from "down": the short probe (SHORT_TIMEOUT_S) is the fast path,
+    and a 200 inside it is ok at once. When the short probe TIMES OUT -- not when the connection
+    is refused -- one confirmation probe with LONG_TIMEOUT_S is run before declaring the server
+    unreachable, so a live server answering in 7-26 s under load is not read as down. The long
+    probe is run WITHOUT the lock held, and any caller arriving meanwhile is served the cached
+    last verdict, so holding one probe for up to 60 s never stalls the other workers' threads.
+
+    `probe_fn(timeout_s) -> (kind, doc)` is the kind-aware path (default: the production probe).
+    `health_fn` remains for tests that inject a plain doc-returning health function; when a
+    `health_fn` other than the default is supplied, the legacy single-probe behaviour is used
+    (no slow-confirmation), which keeps every existing gate test unchanged."""
 
     def __init__(self, health_fn=default_health, tunnel_fn=default_tunnel, now=time.time,
-                 min_uptime_s=None, recheck_s=None):
+                 min_uptime_s=None, recheck_s=None, probe_fn=None):
         self._health, self._tunnel, self._now = health_fn, tunnel_fn, now
         self.min_uptime_s = MIN_UPTIME_S if min_uptime_s is None else float(min_uptime_s)
         self.recheck_s = RECHECK_S if recheck_s is None else float(recheck_s)
         self._lock = threading.Lock()
         self._last = None
+        # Kind-aware probing (slow-vs-down) is used only when a probe_fn is given, OR when the
+        # gate is left on the default health function (the real server path). A test that injects
+        # its own health_fn keeps the legacy single-probe semantics it was written against.
+        self._probe_fn = probe_fn
+        self._use_kind = probe_fn is not None or health_fn is default_health
 
-    def _probe(self, now) -> Verdict:
-        try:
-            doc = self._health()
-        except Exception:
-            doc = None
+    def _health_doc_via_kind(self):
+        """Return the health doc using the kind-aware probe, running the long confirmation probe
+        WITHOUT the gate lock when the short probe times out. Returns (doc_or_None, slow_bool)."""
+        probe = self._probe_fn or _default_probe_fn
+        first_kind, doc = probe(SHORT_TIMEOUT_S)
+        if first_kind == PROBE_OK:
+            return doc, False
+        reachable, _slow, _tail = reachable_from_probes(first_kind, None, 0.0)
+        if first_kind != PROBE_TIMEOUT:
+            # Refused / bad body: absent or unhealthy, decided at once -- no long probe.
+            return None, False
+        # Short probe timed out: confirm with the long probe, holding no lock (the caller in
+        # check() releases it around this call).
+        t0 = float(self._now())
+        second_kind, doc2 = probe(LONG_TIMEOUT_S)
+        seconds = max(0.0, float(self._now()) - t0)
+        reachable, slow, _tail = reachable_from_probes(first_kind, second_kind, seconds)
+        return (doc2 if reachable else None), bool(slow)
+
+    def _verdict_from_doc(self, doc, now) -> Verdict:
         if not doc or str(doc.get("status", "")).lower() != "ok":
             return Verdict(False, REASON_PREFIX + " (not reachable)", None, None, now)
         pid = doc.get("server_pid")
@@ -168,13 +298,30 @@ class ReadyGate:
                            up, pid, now)
         return Verdict(True, "", up, pid, now)
 
+    def _probe(self, now) -> Verdict:
+        # Legacy single-probe path (used when a test injects its own health_fn).
+        try:
+            doc = self._health()
+        except Exception:
+            doc = None
+        return self._verdict_from_doc(doc, now)
+
     def check(self, force=False) -> Verdict:
         now = float(self._now())
         with self._lock:
             if (not force and self._last is not None
                     and 0 <= now - self._last.checked_at < self.recheck_s):
                 return self._last
-            self._last = self._probe(now)
+            if not self._use_kind:
+                self._last = self._probe(now)
+                return self._last
+        # Kind-aware path: do the (possibly long) probe WITHOUT the lock, so other callers hitting
+        # check() in the meantime are served the cached last verdict instead of blocking on us.
+        doc, _slow = self._health_doc_via_kind()
+        now2 = float(self._now())
+        verdict = self._verdict_from_doc(doc, now2)
+        with self._lock:
+            self._last = verdict
             return self._last
 
     def reason(self) -> str:
