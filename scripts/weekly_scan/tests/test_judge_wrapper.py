@@ -127,6 +127,32 @@ class RunJudgeTests(unittest.TestCase):
         self.assertEqual(v.verdict, "NA")
         self.assertFalse(v.is_go)
 
+    def test_run_judge_propagates_callable_error(self):
+        # judge_callable が投げた例外は握りつぶさず呼び出し元へ伝播する。
+        class JudgeError(Exception):
+            pass
+
+        def boom(config_id, engine_version=""):
+            raise JudgeError("engine fault")
+
+        with self.assertRaises(JudgeError):
+            run_judge("mcl_p1", boom)
+
+
+class OrderOkTests(unittest.TestCase):
+    def test_order_ok_none_when_order_block_missing(self):
+        # order ブロックが無ければ order_ok は None（偽の値を捏造しない）。
+        no_order = {"claim_id": "y", "verdict": {"verdict": "GO"}}
+        v = parse_judge_result(no_order)
+        self.assertIsNone(v.order_ok)
+
+    def test_order_ok_true_from_top_level_order(self):
+        # トップ階層 order の order_ok を素通しで写す。
+        d = {"claim_id": "z", "verdict": "GO", "order": {"order_ok": True}}
+        v = parse_judge_result(d)
+        self.assertTrue(v.order_ok)
+        self.assertTrue(v.is_go)
+
 
 if __name__ == "__main__":
     unittest.main()
