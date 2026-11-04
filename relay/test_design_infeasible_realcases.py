@@ -196,15 +196,16 @@ def test_single_shared_product_is_not_enough():
     assert r["seen"]["n_shared_at_kmin"] == 1
 
 
-# --- Optional cross-check against the raw files (skipped when absent) --------------------
-_LOSS_DIR = ("C:/Users/M118A8586/Documents/\u88fd\u9020\u30c7\u30fc\u30bf\u89e3\u6790_"
-             "\u751f\u8a18\u9332/\u6642\u9593\u5206\u5272\u78ba\u8a8d_20261103/"
-             "\u30ed\u30b9/mcl_loss_ftype_confirm")
-_LOSS_COUNTS = os.path.join(_LOSS_DIR, "_hin_counts.csv")
+# --- Optional cross-check against the raw files (skipped unless a local dir is provided) ---
+# The raw loss data lives outside the repo on an analyst workstation; its path is never
+# hard-coded here (CI forbids machine/user-specific absolute paths). Point the env var
+# DESIGN_INFEASIBLE_LOSS_DIR at a folder containing _hin_counts.csv to run this cross-check.
+_LOSS_DIR = os.environ.get("DESIGN_INFEASIBLE_LOSS_DIR")
+_LOSS_COUNTS = os.path.join(_LOSS_DIR, "_hin_counts.csv") if _LOSS_DIR else None
 
 
-@pytest.mark.skipif(not os.path.exists(_LOSS_COUNTS),
-                    reason="raw loss data not present on this runner")
+@pytest.mark.skipif(not (_LOSS_COUNTS and os.path.exists(_LOSS_COUNTS)),
+                    reason="raw loss data not present (set DESIGN_INFEASIBLE_LOSS_DIR to enable)")
 def test_loss_raw_counts_match_fixture():
     import csv
     treat, ref = {}, {}
