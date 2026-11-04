@@ -1088,7 +1088,25 @@ function Test-ServerUp {
             $script:LastServerCheck = "foreign: HTTP $code on /health from $who"
             return $false
         }
-        $script:LastServerCheck = [string]$_.Exception.Status   # Timeout / ConnectFailure / ...
+        $firstStatus = [string]$_.Exception.Status   # Timeout / ConnectFailure / ...
+        # A 5 s timeout is NOT proof the server is down. On this busy box /health has answered
+        # HTTP 200 in 7-16 s while the loop was perfectly alive (measured 2026-11-02); four 5 s
+        # timeouts in a row once killed a server still answering in 16 s. So when -- and only
+        # when -- the fast probe TIMED OUT, take a second, longer look before counting a strike.
+        # A connect failure (nothing listening) is not slowness and skips straight to the
+        # verdict, where decide_liveness_strike returns "strike" on confirm_ok = $null.
+        if ($firstStatus -eq "Timeout") {
+            $confirm = Confirm-ServerSlow
+            $verdict = Invoke-LivenessStrikeDecision $false $confirm.Ok $confirm.Seconds
+            if ($verdict -eq "alive") {
+                $script:LastServerCheck = ("server slow ({0:N0} s) but answering -- not restarting" -f $confirm.Seconds)
+                Write-Log $script:LastServerCheck
+                return $true
+            }
+            $script:LastServerCheck = "Timeout (confirmation also timed out after $([int]$LivenessConfirmSeconds)s)"
+            return $false
+        }
+        $script:LastServerCheck = $firstStatus
         return $false
     } catch {
         $script:LastServerCheck = "threw: " + $_.Exception.GetType().Name
@@ -1201,6 +1219,60 @@ function Get-HealthInflight {
     $age = $null
     if ($null -ne $j.resp_last_start_age_s) { $age = [double]$j.resp_last_start_age_s }
     return @{ Inflight = [int]$j.resp_inflight; Age = $age }
+}
+
+# THE SLOW-VS-DOWN CONFIRMATION TIMEOUT, read once from the Python module that owns it so the
+# number lives in exactly one place (LIVENESS_CONFIRM_SECONDS). If the read fails for any
+# reason, fall back to 60 -- the measured 16 s maximum plus margin -- rather than wedging.
+$script:LivenessConfirmSeconds = 60
+try {
+    $__lcs = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import stale_server_check; print(stale_server_check.LIVENESS_CONFIRM_SECONDS)" 2>$null)).Trim()
+    if ($__lcs -match '^\d+$') { $script:LivenessConfirmSeconds = [int]$__lcs }
+} catch { }
+$LivenessConfirmSeconds = $script:LivenessConfirmSeconds
+
+function Confirm-ServerSlow {
+    # SECOND LOOK after the fast 5 s probe timed out. One GET against /health with the longer
+    # LIVENESS_CONFIRM_SECONDS timeout. Returns @{ Ok = <bool>; Seconds = <double> }: Ok is
+    # $true only when it returns HTTP 200 AND the body is this checkout's /health answer
+    # (Get-HealthServerPid), the same identity rule the fast probe uses -- a foreign 200 is
+    # not our server answering slowly. Seconds is how long the GET took, for the log line.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $body = $null
+    try {
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
+        $req.Method = "GET"
+        $req.Timeout = $LivenessConfirmSeconds * 1000
+        $req.ReadWriteTimeout = $LivenessConfirmSeconds * 1000
+        $resp = $req.GetResponse()
+        try { $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } catch { $body = $null }
+        $resp.Close()
+    } catch {
+        $sw.Stop()
+        return @{ Ok = $false; Seconds = $sw.Elapsed.TotalSeconds }
+    }
+    $sw.Stop()
+    $ok = ($null -ne (Get-HealthServerPid $body))
+    return @{ Ok = $ok; Seconds = $sw.Elapsed.TotalSeconds }
+}
+
+# THE LIVENESS GATE, PURE AND TESTED: scripts/stale_server_check.decide_liveness_strike decides
+# "alive" vs "strike" from (first_ok, confirm_ok, seconds). Called the same way the other
+# supervisor gates reach their Python deciders (& $Py -c with the module and function both
+# named, so the cross-language caller scan in tools/unreached.py credits it). Returns "alive"
+# or "strike"; any failure returns "strike" so a broken bridge cannot make a down server look
+# alive (fail towards the safe, restart-capable verdict).
+function Invoke-LivenessStrikeDecision($firstOk, $confirmOk, $seconds) {
+    $fa = if ($firstOk) { "True" } else { "False" }
+    $ca = if ($null -eq $confirmOk) { "None" } elseif ($confirmOk) { "True" } else { "False" }
+    $sa = if ($null -eq $seconds) { "0" } else { ([string][double]$seconds) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import stale_server_check; print(stale_server_check.decide_liveness_strike($fa, $ca, $sa))" 2>$null)).Trim()
+    } catch {
+        return "strike"
+    }
+    if ($out -ne "alive") { return "strike" }
+    return "alive"
 }
 
 # THE DRAIN GATE, PURE AND TESTED: scripts/stale_server_check.decide_stale_drain decides

@@ -355,3 +355,51 @@ def test_drain_tolerates_a_broken_inflight_or_waited():
     # as zero seconds waited. Neither can wedge the gate.
     assert S.decide_stale_drain("x", 900.0, 0) == "cycle"
     assert S.decide_stale_drain(1, 900.0, "x") == "wait"
+
+
+# ----------------------------------------------------------------- decide_liveness_strike
+# The slow-vs-down gate. A fast 5s /health probe that times out is NOT proof the server is
+# down: on this busy box /health answered HTTP 200 in 7-16s while the loop was alive, and
+# four 5s timeouts in a row once killed a server still answering in 16s. The caller takes a
+# second, longer look (LIVENESS_CONFIRM_SECONDS) and asks this pure gate whether to strike.
+
+
+def test_liveness_confirm_timeout_is_sixty_seconds():
+    # 60s is the contract: the measured 16s maximum plus margin. A loop wedged for good
+    # never answers within it, so a genuinely dead server still earns its strike.
+    assert S.LIVENESS_CONFIRM_SECONDS == 60
+
+
+def test_liveness_fast_probe_passing_is_alive_whatever_else():
+    # If the fast probe answered there is nothing to confirm; never strike a server that
+    # just answered, even if a confirmation value was somehow passed as a failure.
+    assert S.decide_liveness_strike(True, None, 0) == "alive"
+    assert S.decide_liveness_strike(True, False, 3.0) == "alive"
+
+
+def test_liveness_slow_but_answering_is_alive_not_a_strike():
+    # THE BUG THIS FIXES. Fast probe timed out, but the 60s confirmation returned 200 with
+    # this checkout's /health body: the server is slow, not wedged. No strike.
+    assert S.decide_liveness_strike(False, True, 7.4) == "alive"
+    assert S.decide_liveness_strike(False, True, 16.0) == "alive"
+    # The time taken never changes the verdict -- an answer at 55s is still an answer.
+    assert S.decide_liveness_strike(False, True, 55.0) == "alive"
+
+
+def test_liveness_both_looks_silent_is_a_strike():
+    # Fast probe timed out AND the 60s confirmation also failed (timed out / connect fail):
+    # this is the wedged loop the strike exists for.
+    assert S.decide_liveness_strike(False, False, 60.0) == "strike"
+
+
+def test_liveness_no_confirmation_run_is_a_strike():
+    # confirm_ok is None when the caller ran no confirmation (e.g. a connect failure, not a
+    # timeout -- nothing slow to wait for). The original failure stands as a strike.
+    assert S.decide_liveness_strike(False, None, 0) == "strike"
+
+
+def test_liveness_seconds_is_tolerated_in_any_shape():
+    # seconds is for the log line only and must never wedge the gate, whatever it reads.
+    assert S.decide_liveness_strike(False, True, None) == "alive"
+    assert S.decide_liveness_strike(False, True, "not-a-number") == "alive"
+    assert S.decide_liveness_strike(False, False, None) == "strike"
