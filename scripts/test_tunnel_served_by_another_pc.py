@@ -225,6 +225,9 @@ function Start-Sleep { param([int]$Seconds, [int]$Milliseconds) }
 # The reader-gap bookkeeping of the duplicate-reader guard (scripts/test_supervisor_no_duplicate_host.py)
 # is not what is under test here; it only stamps a time for Start-TunnelHost, which is stubbed above.
 function Update-ReaderRelayGap { param($Connections, $ReaderAlive) }
+# The stuck-child strike (scripts/test_supervisor_dead_tunnel_host_replaced.py) is not under test here
+# either: no reader of ours exists in these cases, so nothing is ever struck.
+function Stop-StuckTunnelChild { param([bool]$ReaderAlive) return $false }
 . (Join-Path $RootDir "tunnel_name_util.ps1")
 '''
 
