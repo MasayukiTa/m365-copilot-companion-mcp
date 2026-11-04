@@ -816,7 +816,8 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
             corrections.append(claim_msg)
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
-                                    order_record=order_record)
+                                    order_record=order_record,
+                                    lot_diagnosis=(lot if isinstance(lot, dict) else None))
         full_text = "judge: requested\n" + "\n".join(statuses) + "\n" + footer
         # THE DURABLE RECORD COMES FROM HERE, NOT FROM THE WORKER. The worker used to run this
         # function itself and submit the returned text as its own reason; that made the record
@@ -1206,8 +1207,70 @@ def _fmt_n(ev: dict) -> str:
     return ", ".join(parts) if parts else "n=未返却"
 
 
+from relay.stratified_estimate import (  # noqa: E402  (production caller of the stratified estimate)
+    stratified_estimate as _stratified_estimate,
+    stratified_table as _stratified_table,
+)
+
+
+def _stratified_footer_lines(lot_diagnosis):
+    """Footer lines for the within-stratum (stratified) estimate, or [] to add nothing.
+
+    This is the ONLY production caller of relay.stratified_estimate. It fires only when
+    the caller supplies a lot_diagnosis dict carrying a non-empty `strata` column
+    alongside the engine's y/x/lot (all four equal-length and non-empty) defining exactly
+    two exposure groups. Any shortfall returns [] so the judge footer is byte-for-byte
+    unchanged -- strata are an OPTIONAL, footer-only enrichment that never alters the
+    frozen engine input (y/x/lot). k_min here only decides stratum eligibility; it is
+    never lowered and never relaxes a verdict.
+    """
+    if not isinstance(lot_diagnosis, dict):
+        return []
+    strata = lot_diagnosis.get("strata")
+    y = lot_diagnosis.get("y")
+    x = lot_diagnosis.get("x")
+    lot = lot_diagnosis.get("lot")
+    for seq in (y, x, strata, lot):
+        if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+            return []
+    n = len(y)
+    if not (len(x) == len(strata) == len(lot) == n):
+        return []
+    try:
+        est = _stratified_estimate(y, x, strata, lot)
+        rows = _stratified_table(est)
+    except (ValueError, TypeError, ZeroDivisionError):
+        return []
+    if not rows:
+        return []
+    hdr = "--- 層別推定(設計成立時の既定解析 stratified) ---"
+    out = [hdr]
+    out.append("曝露群: %s vs %s (差 = mean(%s) - mean(%s))" % (
+        est.get("group_a"), est.get("group_b"), est.get("group_b"), est.get("group_a")))
+    out.append("層数: 全%d (採用%d, k_min=%s/群・層)" % (
+        est.get("n_strata_total", 0), est.get("n_strata_pooled", 0), est.get("k_min")))
+    for r in rows:
+        tag = "採用" if r.get("eligible") else ("除外(%s)" % (r.get("reason") or ""))
+        d = r.get("diff")
+        ds = ("%.4g" % d) if isinstance(d, (int, float)) else "-"
+        ma = ("%.4g" % r["mean_a"]) if isinstance(r.get("mean_a"), (int, float)) else "-"
+        mb = ("%.4g" % r["mean_b"]) if isinstance(r.get("mean_b"), (int, float)) else "-"
+        w = r.get("weight") or 0.0
+        out.append("  層=%s: lots %s/%s, mean %s/%s, 差=%s, w=%.4g [%s]" % (
+            r.get("stratum"), r.get("lots_a"), r.get("lots_b"), ma, mb, ds, w, tag))
+    pooled = est.get("pooled_diff")
+    if pooled is None:
+        out.append("  プール推定: なし(採用可能な層がない)")
+    else:
+        se = est.get("pooled_se")
+        ses = ("%.4g" % se) if isinstance(se, (int, float)) else "-"
+        out.append("  プール差(精度加重): %.4g (SE=%s)" % (pooled, ses))
+    out.append("  ※ 層別に推定してからプール。製品・ライン等を跨いだ比較はしていません。")
+    return out
+
 def build_judge_footer(*, verdict: dict | None, engine_available: bool,
-                       unavailable_reason: str = "", order_record: dict | None = None) -> str:
+                       unavailable_reason: str = "", order_record: dict | None = None,
+                       lot_diagnosis: dict | None = None) -> str:
     """Compose the block appended to a data-analysis final answer.
 
     When the engine ran: surfaces id / verdict (+ja) / finding / claim_supported / reason codes /
@@ -1253,6 +1316,16 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
     hashes = verdict.get("hashes") or {}
     if hashes.get("input_sha256"):
         lines.append("input_sha256: %s" % hashes.get("input_sha256"))
+    # Stratified (within-stratum) estimate -- the DEFAULT analysis once the design has been
+    # judged to hold. Shown ONLY when the caller passed a lot_diagnosis carrying a `strata`
+    # column alongside y/x/lot (all equal-length, non-empty) AND a real engine verdict exists
+    # (i.e. the design-check seam did not block the comparison). When no strata are supplied the
+    # footer is byte-for-byte unchanged. This never touches the frozen engine or its thresholds;
+    # it estimates the exposure contrast WITHIN each shared stratum and pools, so an equipment
+    # effect is never read off product-confounded pooled rows. See relay/stratified_estimate.py.
+    _strat_lines = _stratified_footer_lines(lot_diagnosis)
+    if _strat_lines:
+        lines.extend(_strat_lines)
     lines.append("(事前登録した規則に従って機械的に判定。「採用=正しい」ではない。)")
     lines.append("--- ここまで ---")
     return "\n".join(lines)
