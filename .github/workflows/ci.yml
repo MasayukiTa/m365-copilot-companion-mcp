@@ -1162,7 +1162,8 @@ jobs:
             scripts/weekly_scan/tests/test_screening_confound.py \
             scripts/weekly_scan/tests/test_screening_screen_select_prereg.py \
             scripts/weekly_scan/tests/test_report_md.py \
-            scripts/weekly_scan/tests/test_report_pptx_and_ledger.py
+            scripts/weekly_scan/tests/test_report_pptx_and_ledger.py \
+            scripts/weekly_scan/tests/test_cli_screening_report.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
