@@ -2243,6 +2243,55 @@ function Invoke-HostLaunchDecision {
     return $out
 }
 
+function Get-TunnelReaderChildPid {
+    # The pid of the devtunnel host child this reader spawned, or 0 when none is found.
+    # Same match Stop-TunnelReaderTree uses: a devtunnel.exe whose ParentProcessId is this
+    # reader AND whose command line hosts THIS tunnel -- never a user's interactive
+    # `devtunnel login` or an unrelated tunnel. The reader (relay.tunnel_host_log) spawns
+    # exactly one `devtunnel -v host <name>`; if more than one matches we return the first.
+    param([int]$ReaderPid, [string]$Name)
+    if (-not $ReaderPid -or $ReaderPid -le 0) { return 0 }
+    $c = @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+           Where-Object { $_.ParentProcessId -eq $ReaderPid -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) } |
+           Select-Object -First 1)
+    if ($c -and $c.ProcessId) { return [int]$c.ProcessId }
+    return 0
+}
+
+function Invoke-ZeroConnChildKillDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c
+    # with the module and function both named, so tools/unreached.py credits this caller and
+    # the two cannot drift): "kill_child" or "wait" from (seconds at zero, reader alive, child
+    # pid). Any failure returns "" so the caller falls back to plain waiting rather than kill.
+    param($SecondsAtZero, [bool]$ReaderAlive, $ChildPid)
+    $secArg = if ($null -eq $SecondsAtZero) { "None" } else { ([string][int]$SecondsAtZero) }
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    $pidArg = if ($null -eq $ChildPid -or [int]$ChildPid -le 0) { "None" } else { ([string][int]$ChildPid) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_zero_conn_recovery; print(supervisor_zero_conn_recovery.decide_zero_conn_child_kill($secArg, $aliveArg, $pidArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Stop-TunnelHostChild {
+    # Stop ONLY the devtunnel host child of a reader -- NOT the reader itself. Ending the
+    # child makes relay.tunnel_host_log.serve_forever() see the host exit and start a new
+    # one after its backoff; the reader stays alive, so no second reader is ever started.
+    # Only a devtunnel.exe that is this reader's child AND hosts THIS tunnel is touched (the
+    # same guard Stop-TunnelReaderTree uses: never a `devtunnel login`, never another tunnel).
+    param([int]$ChildPid, [int]$ReaderPid, [string]$Name)
+    if (-not $ChildPid -or $ChildPid -le 0) { return $false }
+    $ok = $false
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.ProcessId -eq $ChildPid -and $_.ParentProcessId -eq $ReaderPid -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) })) {
+        Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
+        $ok = $true
+    }
+    return $ok
+}
+
 function Start-TunnelHost {
     # NEVER TWO READERS FOR ONE TUNNEL. Before stopping or launching anything, look for an
     # existing reader of this tunnel. If one is alive and the pure decider says "wait", log that
@@ -2250,11 +2299,32 @@ function Start-TunnelHost {
     # Update-ReaderRelayGap and scripts/supervisor_host_launch.py). Only "replace" (no reader, or
     # one wedged past the 180s reconnect window) proceeds to stop the old reader tree and launch
     # exactly one new reader.
+    #
+    # SELF-RECOVERY WHEN A LIVE READER STAYS AT ZERO CONNECTIONS. Before the "wait" above turns
+    # into another 7-minute gap (measured 2026-11-04, see scripts/supervisor_zero_conn_recovery.py),
+    # a reader that has been at zero connections past the measured grace has its HOST CHILD ended
+    # -- only the devtunnel.exe it spawned, never the reader. The reader's serve_forever() then
+    # sees the host exit and starts a new host (~8 s to re-register). Still exactly one reader.
     $existingReaders = @(Get-ExistingTunnelReaders $TunnelName)
     if ($existingReaders.Count -gt 0) {
         $waited = Get-ReaderSecondsWithoutRelay
         $decision = Invoke-HostLaunchDecision -ReaderAlive $true -SecondsWithoutRelay $waited
         if ($decision -eq "wait") {
+            # A reader is alive and inside its own 180s reconnect window. Rather than only
+            # logging "reconnecting" for up to 7 minutes, ask the zero-connection decider
+            # whether this reader's host child has been wedged at zero long enough to end it
+            # (reader stays alive; it restarts the host). This NEVER starts a second reader.
+            foreach ($r in $existingReaders) {
+                $childPid = Get-TunnelReaderChildPid -ReaderPid $r.Pid -Name $TunnelName
+                $killWord = Invoke-ZeroConnChildKillDecision -SecondsAtZero $waited -ReaderAlive $true -ChildPid $childPid
+                if ($killWord -eq "kill_child") {
+                    $waitedStr = if ($null -eq $waited) { "unknown" } else { ([string]$waited) }
+                    if (Stop-TunnelHostChild -ChildPid $childPid -ReaderPid $r.Pid -Name $TunnelName) {
+                        Write-Log ("reader pid $($r.Pid) at zero connections for $waitedStr s (> grace): " +
+                                   "ended its host child pid $childPid -- the reader will start a new host (no second reader)")
+                    }
+                }
+            }
             $waitedStr = if ($null -eq $waited) { "0" } else { ([string]$waited) }
             foreach ($r in $existingReaders) {
                 Write-Log ("reader pid $($r.Pid) still running, host reconnecting (waited $waitedStr s)")
