@@ -57,7 +57,10 @@ def good_interval(lo, hi, K=8, df=6):
 
 # (a) confirmatory normal example reaches GO ---------------------------------------
 def test_a_confirmatory_normal_reaches_go():
-    v, f, r, n = vj.decide(base_claim(), struct(), good_interval(0.6, 1.2), [], [])
+    # Numeric path only: opt OUT of the §5-5 rank gate explicitly. Canon line 4 / §5-5
+    # makes grounds-absent default to HOLD; this test isolates the exploratory-cap logic.
+    v, f, r, n = vj.decide(base_claim(), struct(), good_interval(0.6, 1.2), [], [],
+                           require_evidence=False)
     assert v == "GO" and f == "EFFECT"
 
 

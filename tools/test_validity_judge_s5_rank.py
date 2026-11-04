@@ -36,12 +36,16 @@ def _strong_interval():
             "method": "between_lot_ols_on_lot_means_t_K-2"}
 
 
-# --- baseline: strong effect, no dcap, no evidence gating -> GO (shows the input *would* GO)
+# --- baseline: strong effect, no dcap; opt OUT of rank gating -> GO (shows the input *would* GO)
 def test_baseline_strong_effect_is_go_without_rank_gate():
-    v, f, r, n = vj.decide(_claim(), _struct(), _strong_interval(), [], [])
+    # The §5-5 rank gate now defaults fail-closed (require_evidence=True): grounds-absent -> HOLD.
+    # To show the interval itself *would* GO, opt out of the gate explicitly.
+    v, f, r, n = vj.decide(_claim(), _struct(), _strong_interval(), [], [],
+                           require_evidence=False)
     assert v == "GO" and f == "EFFECT"
-    # Back-compat: evidence=None behaves exactly as the 5-arg call.
-    v2, f2, r2, n2 = vj.decide(_claim(), _struct(), _strong_interval(), [], [], evidence=None)
+    # The explicit opt-out and the bare 5-arg call must agree (both opt out of the gate).
+    v2, f2, r2, n2 = vj.decide(_claim(), _struct(), _strong_interval(), [], [],
+                               evidence=None, require_evidence=False)
     assert (v2, f2) == (v, f)
 
 
