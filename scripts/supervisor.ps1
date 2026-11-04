@@ -831,6 +831,47 @@ function Clear-ServerTransition {
     try { Remove-Item -LiteralPath $ServerTransitionPath -Force -ErrorAction SilentlyContinue } catch { }
 }
 
+# -- VANISHED SERVER: relaunch at once, do not wait out the strike debounce -------------------
+# GOAL (measured 2026-11-04 / 02:29 outages): when NOTHING listens on the port and NO main.py of
+# this checkout is alive, the server process has VANISHED. Waiting FailuresBeforeAction strikes
+# (about three minutes) buys nothing -- a refused connection is instant and certain, there is no
+# process mid-boot to protect. The strike debounce exists to avoid killing a server that is
+# still starting (see the main loop booting grace); it is pointless when there is nothing to
+# kill and nothing to wait for. So this case is relaunched on the FIRST miss.
+#
+# One guard: a PLANNED restart already in progress (Write-ServerTransition, e.g. the stale-code
+# cycle) owns the gap between the old server ending and the replacement listening. During that
+# window main.py is legitimately absent for a moment; relaunching here would start a SECOND
+# server beside the one the planned cycle is about to start. Test-ServerTransitionActive reads
+# the advisory marker and holds this fast path back until the planned transition expires.
+
+function Test-ServerTransitionActive {
+    try {
+        if (-not (Test-Path -LiteralPath $ServerTransitionPath)) { return $false }
+        $raw = [IO.File]::ReadAllText($ServerTransitionPath)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        $m = $raw | ConvertFrom-Json
+        if (-not $m) { return $false }
+        if ([string]$m.state -ne 'planned_restart') { return $false }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        return ([double]$m.expires -gt [double]$now)
+    } catch {
+        return $false
+    }
+}
+
+function Get-VanishedServerVerdict {
+    param(
+        [bool]$Listening,
+        [bool]$OwnMainPyAlive,
+        [bool]$TransitionActive
+    )
+    if ($Listening) { return 'wait' }
+    if ($OwnMainPyAlive) { return 'wait' }
+    if ($TransitionActive) { return 'wait' }
+    return 'relaunch-now'
+}
+
 # -- WHICH PYTHON: re-decided before every launch, not once at startup (new-PC analysis D2) ----
 # $Py above is resolved ONCE, when this process starts. A supervisor started before the .venv
 # existed -- start_all run before quickstart, or a logon autostart that fires while setup.bat is
@@ -3481,31 +3522,47 @@ while ($true) {
         # that died at launch is still restarted at the usual speed, and only one that is
         # visibly working towards listening is given room.
         $reason = $script:LastServerCheck
-        $booting = $false
-        if (-not (Test-PortListening)) {
-            # Same identity rule as Start-Server's (Test-IsThisCheckoutServerCommandLine), plus
-            # the process this supervisor launched, whose command line on a PATH python names
-            # no checkout.
+        # Measure both facts the vanished-server decision needs, ONCE, regardless of branch:
+        # is anything listening on the port, and is a main.py of THIS checkout alive. $alive is
+        # the same identity set Start-Server acts on (Test-IsThisCheckoutServerCommandLine), plus
+        # the process this supervisor launched, whose command line on a PATH python names no
+        # checkout.
+        $portListening = Test-PortListening
+        $alive = @()
+        if (-not $portListening) {
             $alive = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                        Where-Object { Test-IsThisCheckoutServerCommandLine ([string]$_.CommandLine) $Root })
             if ($alive.Count -eq 0 -and $script:ServerProc) {
                 try { $script:ServerProc.Refresh(); if (-not $script:ServerProc.HasExited) { $alive = @($script:ServerProc) } } catch { }
             }
-            if ($alive.Count -gt 0 -and $script:LastLaunchAt -and
-                ((Get-Date) - $script:LastLaunchAt).TotalSeconds -lt $StartupGraceSeconds) {
-                $booting = $true
-            }
         }
+        $ownMainPyAlive = ($alive.Count -gt 0)
+        $booting = ($ownMainPyAlive -and $script:LastLaunchAt -and
+                    ((Get-Date) - $script:LastLaunchAt).TotalSeconds -lt $StartupGraceSeconds)
         if ($booting) {
             Write-Log ("server not listening yet ({0}); main.py alive {1:N0}s after launch -- waiting, not restarting" -f
                        $reason, ((Get-Date) - $script:LastLaunchAt).TotalSeconds)
         } else {
-            $serverMiss++
-            Write-Log "server check failed ($serverMiss/$FailuresBeforeAction) -- $reason"
-            if ($serverMiss -ge $FailuresBeforeAction) {
+            # VANISHED FAST PATH: nothing listening AND no main.py of ours alive AND no planned
+            # restart owns this gap -> the server is gone; relaunch on the FIRST miss instead of
+            # spending FailuresBeforeAction strikes (~3 min, measured 2026-11-04) waiting for a
+            # process that does not exist. Any other non-booting failure (listening-but-wedged,
+            # a foreign owner, or a planned transition in flight) still goes through the ordinary
+            # strike debounce below.
+            $verdict = Get-VanishedServerVerdict -Listening $portListening -OwnMainPyAlive $ownMainPyAlive -TransitionActive (Test-ServerTransitionActive)
+            if ($verdict -eq 'relaunch-now') {
+                Write-Log "server has vanished (nothing on :$Port, no main.py of ours) -- relaunching at once, not after $FailuresBeforeAction strikes ($reason)"
                 Start-Server
                 $serverMiss = 0
                 Start-Sleep -Seconds 6
+            } else {
+                $serverMiss++
+                Write-Log "server check failed ($serverMiss/$FailuresBeforeAction) -- $reason"
+                if ($serverMiss -ge $FailuresBeforeAction) {
+                    Start-Server
+                    $serverMiss = 0
+                    Start-Sleep -Seconds 6
+                }
             }
         }
     }
