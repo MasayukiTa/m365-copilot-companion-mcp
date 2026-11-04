@@ -73,6 +73,95 @@ C_CODES = ("C_FAIL_STRADDLE", "C_NOT_COMPUTABLE")
 OK_CODES = ("A_OK", "D_OK", "C_OK", "CTX_OK")
 FINDINGS = ("EFFECT", "EFFECT_OPPOSITE", "EFFECT_BELOW_MDES", "PRACTICAL_NULL")
 
+# ----------------------------------------------------------------- evidence-rank gate (§5-5)
+# IMPORTANT: these R_* codes are the *evidence rank* gate of canon §5 item 5
+# ("a verdict resting only on D-group claims or ledger state B-or-below defaults to HOLD").
+# They are NOT the D_FAIL_* order/lock failure codes above (dcap). Do not conflate the two:
+#   - D_FAIL_* / dcap  = the preregistration order/lock gate (order_gate).
+#   - R_* / evidence   = the *rank* of the claims cited as grounds (diagnostic D-group /
+#                        ledger status), per 主張一覧.md §1 (C1-C16, state A) vs §2 (D1-D10).
+R_CODES = ("R_ONLY_DIAGNOSTIC_D", "R_ONLY_LEDGER_B_OR_BELOW", "R_EVIDENCE_UNKNOWN")
+
+# The diagnostic D-group (主張一覧.md §2, 106-120): usable only with a 'diagnostic' mark.
+D_GROUP_IDS = frozenset("D%d" % i for i in range(1, 11))
+# Direct-use claims (主張一覧.md §1): C1-C16. Direct use requires ledger state A (+ proof R).
+C_GROUP_IDS = frozenset("C%d" % i for i in range(1, 17))
+# Ledger states, ordered A > A-B > B > B-C > C > D (主張一覧.md line 4 basis; 1of6 record).
+# "B or below" = anything that is not pure state A (B, C, D, and B-containing mixes A-B/B-C).
+_LEDGER_A_ONLY = frozenset({"A"})
+
+
+def _ledger_is_b_or_below(state) -> bool:
+    """True if a ledger state counts as 'B or below' (not pure A). Unknown -> True (fail-safe)."""
+    if state is None:
+        return True
+    s = str(state).strip().upper()
+    if not s:
+        return True
+    return s not in _LEDGER_A_ONLY
+
+
+def evidence_rank_gate(evidence) -> list:
+    """Canon §5-5 evidence-rank cap. Returns R_* codes that force a default HOLD (empty = clear).
+
+    `evidence` describes the claims cited as grounds for the verdict:
+        {"claims": [{"id": "C3", "ledger_state": "A"}, {"id": "D4", "ledger_state": "B"}, ...]}
+    A verdict defaults to HOLD when its grounds are *only* D-group diagnostics, or *only*
+    ledger state B-or-below -- i.e. there is no single upper-rank ground (a C-group claim in
+    ledger state A). Missing / malformed / unknown-id evidence is fail-safe: R_EVIDENCE_UNKNOWN
+    (do NOT advance to GO on unknown grounds; canon: an undeclared assumption means the claim
+    is unusable -> at most HOLD).
+
+    This gate never *raises* a verdict; it can only cap a would-be GO down to HOLD.
+    """
+    if evidence is None:
+        # Caller opted out of rank gating (back-compatible). No cap.
+        return []
+    if not isinstance(evidence, dict):
+        return ["R_EVIDENCE_UNKNOWN"]
+    claims = evidence.get("claims")
+    if not isinstance(claims, list) or not claims:
+        # Grounds required but none supplied -> cannot certify an upper-rank ground.
+        return ["R_EVIDENCE_UNKNOWN"]
+    has_unknown = False
+    has_upper = False          # a C-group claim in ledger state A (a genuine upper-rank ground)
+    all_diagnostic_d = True    # every cited claim is a D-group diagnostic
+    all_b_or_below = True       # every cited claim is ledger state B-or-below
+    for item in claims:
+        if not isinstance(item, dict):
+            has_unknown = True
+            continue
+        cid = item.get("id")
+        state = item.get("ledger_state")
+        if not isinstance(cid, str) or cid not in (D_GROUP_IDS | C_GROUP_IDS):
+            has_unknown = True
+            continue
+        is_d = cid in D_GROUP_IDS
+        if not is_d:
+            all_diagnostic_d = False
+        b_below = _ledger_is_b_or_below(state)
+        if not b_below:
+            all_b_or_below = False
+        # An upper-rank ground = a direct-use C claim whose ledger state is A.
+        if (not is_d) and (not b_below):
+            has_upper = True
+    if has_unknown:
+        # Any unknown/unparseable ground -> cannot prove an upper-rank ground exists.
+        return ["R_EVIDENCE_UNKNOWN"]
+    if has_upper:
+        # At least one C-group, ledger-A ground exists -> §5-5 does not force HOLD.
+        return []
+    codes = []
+    if all_diagnostic_d:
+        codes.append("R_ONLY_DIAGNOSTIC_D")
+    if all_b_or_below:
+        codes.append("R_ONLY_LEDGER_B_OR_BELOW")
+    if not codes:
+        # No upper-rank ground, yet neither "all D" nor "all B-below" -> still cannot certify
+        # an A-ranked direct-use ground. Fail-safe to HOLD rather than GO.
+        codes.append("R_EVIDENCE_UNKNOWN")
+    return codes
+
 
 class ClaimError(Exception):
     def __init__(self, codes, messages):
@@ -244,12 +333,20 @@ def classify(lo: float, hi: float, d: float):
     return None
 
 
-def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: list):
+def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: list,
+           *, evidence=None):
     """Pure ordered decision. Returns (verdict, finding, reasons, notes).
 
-    Precedence: ERROR -> CONTEXT (stop) -> NA -> HOLD(A2) -> D cap(<=HOLD) -> C -> GO.
+    Precedence: ERROR -> CONTEXT (stop) -> NA -> HOLD(A2) -> D cap(<=HOLD) -> C
+                -> evidence-rank cap(§5-5, <=HOLD) -> GO.
     verdict/finding consistency: a finding rides out only on GO; under any cap the finding
     becomes a CAPPED_FINDING_* note and verdict carries no GO.
+
+    `evidence` (optional, keyword-only) feeds the §5-5 evidence-rank gate. When omitted
+    (None), rank gating is skipped and behaviour is identical to before (back-compatible).
+    When supplied, a would-be GO resting only on D-group diagnostics or ledger state
+    B-or-below (or on unknown grounds) is capped to HOLD with an R_* reason. The rank gate
+    is distinct from dcap (D_FAIL_* order/lock codes) and is evaluated only on the GO path.
     """
     notes = ["LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE"]  # §5: data cannot verify this
     # C10/C11: exploration is at most HOLD. Fold claim-intrinsic exploratory caps into the
@@ -327,6 +424,13 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
         return "HOLD", None, dcap + cb, notes
     if cb:
         return "HOLD", None, cb, notes
+    # §5-5 evidence-rank cap: a GO resting only on D-group / ledger-B-or-below / unknown
+    # grounds defaults to HOLD. Evaluated last, on the GO path only; never raises a verdict.
+    rcap = evidence_rank_gate(evidence)
+    if rcap:
+        if finding is not None:
+            notes.append("CAPPED_FINDING_%s" % finding)
+        return "HOLD", None, rcap, notes
     return "GO", finding, list(OK_CODES), notes
 
 
@@ -464,10 +568,13 @@ def footer(claim: dict, interval: dict, verdict: str, reasons: list, notes: list
         "K": interval.get("K"),
         "diagnostic_marks": diag,
         "empirical_threshold_marks": empirical,
+        # §5-5 declaration. Still always-True as the *policy statement* that such grounds
+        # default to HOLD; the enforcement lives in decide()'s evidence_rank_gate.
         "default_hold_if_only_D_or_B_below": True,
     }
 
 
 __all__ = ["DECL_ITEMS", "VERDICT_JA", "validate_claim", "ClaimError", "claim_sha256",
            "context_gate", "order_gate", "exploratory_cap", "classify", "decide",
-           "two_stage_interval", "footer", "_t_ppf", "_t_cdf"]
+           "two_stage_interval", "footer", "_t_ppf", "_t_cdf",
+           "evidence_rank_gate", "R_CODES", "D_GROUP_IDS", "C_GROUP_IDS"]
