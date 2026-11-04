@@ -391,29 +391,84 @@ def pptx_export_png(
         pythoncom.CoInitialize()
         ppt = None
         pres = None
-        opened_fullname = None
+        we_opened_it = False  # True only when THIS call opened the document itself
         try:
             ppt = win32com.client.DispatchEx("PowerPoint.Application")
-            # OWNERSHIP RULE (why there is no Quit here). PowerPoint is a single shared
-            # application the operator may already be using. This tool is only allowed to
-            # CLOSE THE ONE DOCUMENT IT OPENED ITSELF -- never Application.Quit, never a
-            # process-name terminate/kill, never "close all windows", never closing any other
-            # open presentation. Quitting the application (or killing the process) would tear
-            # down documents this tool never opened, including the operator's live work, so it
-            # is forbidden even on an instance we dispatched ourselves. The COM references are
-            # released instead and the dispatched, window-less instance is left for the OS to
-            # reclaim.
-            pres = ppt.Presentations.Open(str(p), WithWindow=False)
-            opened_fullname = pres.FullName  # the file name of the document we opened
+            # OWNERSHIP RULE (why there is no Quit here, and why Close is conditional).
+            # PowerPoint is a single shared application the operator may already be using.
+            # This tool is only allowed to CLOSE THE ONE DOCUMENT IT OPENED ITSELF -- never
+            # Application.Quit, never a process-name terminate/kill, never "close all windows",
+            # never closing any other open presentation. Quitting the application (or killing
+            # the process) would tear down documents this tool never opened, including the
+            # operator's live work, so it is forbidden even on an instance we dispatched
+            # ourselves. The COM references are released instead and the dispatched,
+            # window-less instance is left for the OS to reclaim.
+            #
+            # OWNED-DOCUMENT PROOF (why we check BEFORE opening). Presentations.Open does NOT
+            # always open a new document: when the requested file is ALREADY OPEN in this
+            # application instance, PowerPoint returns a reference to the EXISTING open
+            # presentation rather than opening a second copy. If the operator already had this
+            # deck open, an unconditional Close() in the teardown below would close THEIR
+            # document -- exactly the live work this tool must never touch. We therefore cannot
+            # prove ownership from the object Open hands back; we must establish, before
+            # calling Open, whether the document was already open. The requested path is
+            # normalised (case/separator-insensitive) and compared against the FullName of
+            # every presentation already open in this instance. If it is already open, we do
+            # NOT open it and we do NOT close it -- we are not its owner. Only when it was not
+            # already open do we open it, mark it as ours, and close exactly that object.
+            want = os.path.normcase(os.path.abspath(str(p)))
+
+            def _already_open():
+                """Return the open presentation whose file is `want`, or None.
+
+                Enumerating ppt.Presentations only READS the collection; it never closes any
+                member. FullName is normalised the same way as `want` so a difference in case
+                or separator does not read as a different file.
+                """
+                try:
+                    existing = ppt.Presentations
+                except Exception:
+                    return None
+                for i in range(1, int(existing.Count) + 1):
+                    try:
+                        candidate = existing.Item(i)
+                        full = candidate.FullName
+                    except Exception:
+                        continue
+                    if full and os.path.normcase(os.path.abspath(str(full))) == want:
+                        return candidate
+                return None
+
+            pres = _already_open()
+            if pres is not None:
+                # The operator (or something else) already had this deck open. Render from it
+                # but DO NOT take ownership: we_opened_it stays False, so the teardown leaves
+                # it exactly as we found it, open.
+                we_opened_it = False
+            else:
+                # Not already open: this call opens it, so this call owns it and may close it.
+                pres = ppt.Presentations.Open(str(p), WithWindow=False)
+                # Confirm the object we got back really is the file we asked for before we
+                # claim ownership. If Open somehow handed back a different document (a path
+                # mismatch), we cannot prove we own it, so we refuse to close it.
+                try:
+                    opened_full = os.path.normcase(os.path.abspath(str(pres.FullName)))
+                except Exception:
+                    opened_full = None
+                we_opened_it = (opened_full == want)
+
             scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
             pres.Export(str(out_dir), "PNG", width_px, scale_h)
             count = len(list(out_dir.glob("*.PNG"))) + len(list(out_dir.glob("*.png")))
             return f"Exported {count} PNG(s) to {out_dir}"
         finally:
-            # Close ONLY the single document this tool opened. This never touches any other
-            # document, never closes all windows, and never quits or kills PowerPoint.
+            # Close ONLY when THIS call opened the document itself (we_opened_it). If the deck
+            # was already open when we arrived, or if the opened object did not match the
+            # requested path, we_opened_it is False and we leave the document untouched. This
+            # never touches any other document, never closes all windows, and never quits or
+            # kills PowerPoint.
             try:
-                if pres is not None and opened_fullname is not None:
+                if pres is not None and we_opened_it:
                     pres.Close()
             except Exception:
                 pass

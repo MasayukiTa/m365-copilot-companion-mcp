@@ -470,6 +470,7 @@ jobs:
             tools/test_a_completion_marker_is_not_an_output_contract.py \
             tools/test_a_deck_the_agent_wrote_says_so.py \
             tools/test_pptx_export_png_does_not_quit_powerpoint.py \
+            tools/test_pptx_export_png_closes_only_its_own_document.py \
             tools/test_pptx_inherits_reference_template.py \
             tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
