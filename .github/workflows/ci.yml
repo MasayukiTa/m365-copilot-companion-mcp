@@ -211,6 +211,7 @@ jobs:
             tests/test_startup_imports_are_deferred.py \
             relay/test_stuck_cause_classifier.py \
             relay/test_mcp_ready.py \
+            relay/test_mcp_ready_slow_health.py \
             relay/test_side_socket.py \
             relay/test_fresh_conversation_retry.py \
             relay/test_platform_error_replies.py \
