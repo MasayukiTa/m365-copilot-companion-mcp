@@ -185,6 +185,7 @@ jobs:
             relay/test_judge_verdict_not_error.py \
             relay/test_engine_claim_schema_in_initial_instruction.py \
             tests/test_validity_harness.py \
+            tools/test_validity_judge.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \
             tools/test_refused_record_and_force.py \
