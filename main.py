@@ -468,6 +468,60 @@ _BOOT_PID = os.getpid()
 _BOOT_TS = time.time()
 
 
+# /HEALTH HAS ITS OWN SMALL THREAD POOL, SEPARATE FROM asyncio's DEFAULT EXECUTOR.
+#
+# The sub-probes below (_server_identity, _auth_stats_summary, ...) were each run with
+# asyncio.to_thread, which dispatches onto the loop's DEFAULT ThreadPoolExecutor -- the SAME
+# pool that runs tool bodies (pwsh_exec, find_files, run_python, ...). Measured 2026-11-04:
+# a single pwsh_exec held a pool slot for 150s+ while find_files/shell_exec/run_python piled
+# up behind it, so /health's to_thread calls could not get a worker and the liveness probe
+# itself timed out (8-12 consecutive >4s timeouts). The fleet send-gate reads /health to
+# decide readiness, so every worker fell into `token_wait` ("waiting for token") even though
+# the server, Edge CDP :9222 and port 8000 were all up -- a slow /health was misread as a
+# dead server.
+#
+# Fix: give /health a dedicated, tiny pool so a saturated tool pool can never starve the
+# liveness probe, and bound the WHOLE set of sub-probes with one short deadline. If the
+# deadline passes, return the minimal liveness answer plus whatever probes already finished
+# -- the probe stays fast and truthful instead of hanging.
+import concurrent.futures as _futures
+
+_HEALTH_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health")
+
+#: Whole-of-sub-probes budget for one /health call. Past this we answer with what we have.
+_HEALTH_PROBE_BUDGET_S = float(os.environ.get("MCP_HEALTH_PROBE_BUDGET_S", "2.0"))
+
+
+async def _gather_health_probes(probes):
+    """Run each zero-arg probe in the DEDICATED /health pool, in parallel, under one shared
+    deadline (_HEALTH_PROBE_BUDGET_S). Returns a merged dict of the results that finished in
+    time; a probe that is slow, raises, or returns a non-dict simply contributes nothing.
+    Never raises -- liveness must not become a 500 or a hang because a probe misbehaved."""
+    loop = asyncio.get_running_loop()
+    out = {}
+    futs = []
+    for fn in probes:
+        try:
+            futs.append(loop.run_in_executor(_HEALTH_POOL, fn))
+        except Exception:
+            pass
+    if not futs:
+        return out
+    try:
+        done, _pending = await asyncio.wait(futs, timeout=_HEALTH_PROBE_BUDGET_S)
+    except Exception:
+        return out
+    for f in done:
+        try:
+            r = f.result()
+            if isinstance(r, dict):
+                out.update(r)
+        except Exception:
+            pass
+    # Leave stragglers to finish on their own thread; we just don't wait on them.
+    return out
+
+
 #: Answer cached for this long. /health is polled about once a second by the cockpit and by
 #: the supervisor, and the answer can only change when a watched file is written -- so asking
 #: the filesystem every time would be work nobody reads.
@@ -653,26 +707,30 @@ async def health(request: Request) -> JSONResponse:
     #
     # The decision itself is scripts/stale_server_check.classify_staleness -- pure and
     # pytest-covered -- so this cannot drift from what those tests assert.
-    payload.update(await asyncio.to_thread(_server_identity))
-    payload.update(await asyncio.to_thread(_auth_stats_summary))
-    # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
-    payload.update(await asyncio.to_thread(_self_test_summary))
-    payload.update(await asyncio.to_thread(_tool_probe_summary))
-    # THREE FIELDS ONLY, FROM THE HOST-LOG ANALYZER (relay.tunnel_channels). Counts of
-    # forwarded channels, no_response and remote_closed_early seen in the last 10 minutes,
-    # read from .setup/logs/tunnel_channels.jsonl. -1 for each when that file is absent.
-    payload.update(await asyncio.to_thread(_tunnel_channels_summary))
-    # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
-    # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
-    # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
-    # tool_ok as "tool access" was reading one path of four. fleet_tool_ok is the other
-    # busy path, derived from the ledger of real calls rather than from a probe, and its
-    # None means "no calls lately", which is not a failure.
+    # uptime is pure arithmetic on an import-time constant: it costs nothing and lets a caller
+    # tell "answered but slow" (probes dropped) from "answered instantly" without a probe.
+    payload["server_uptime_s"] = round(time.time() - _BOOT_TS, 1)
+    # ALL heavy sub-probes run in the DEDICATED health pool under ONE short deadline, so a
+    # saturated default/tool executor can no longer starve liveness (see _gather_health_probes).
+    _probes = [_server_identity, _auth_stats_summary, _self_test_summary,
+               _tool_probe_summary, _tunnel_channels_summary]
     try:
         from tools.fleet_tool_health import get_summary as _fleet_tool_summary
-        payload.update(await asyncio.to_thread(_fleet_tool_summary))
+        _probes.append(_fleet_tool_summary)
     except Exception:
         pass
+    # Run every heavy sub-probe in the dedicated _HEALTH_POOL under the shared deadline and
+    # merge whatever finished in time. A saturated default/tool pool can no longer starve or
+    # hang this: past the budget we answer with the minimal liveness fields already set above
+    # plus the probes that returned, so a client always gets a clear answer, never a drop.
+    payload.update(await _gather_health_probes(_probes))
+    # NOTE: fleet_tool_health.get_summary (fleet_tool_ok / tool_ok) is one of the probes in
+    # the _probes list above, so it now runs in the dedicated health pool under the shared
+    # deadline like the rest. tool_ok comes from the BRIDGE's idle self-probe and says nothing
+    # about the fleet; fleet_tool_ok is the ledger-derived busy path, and its None means "no
+    # calls lately", not a failure. Both are best-effort: if the pool is saturated past the
+    # budget they are simply absent from this reply rather than hanging it.
+    #
     # Response-delivery telemetry rollup over the last 10 minutes (tools/response_telemetry.py):
     # resp_total_10m, resp_client_gone_10m, resp_short_10m. In-memory ring read, never raises,
     # so this stays a non-blocking probe. Surfaces the muse 'response cut mid-stream' signal to
