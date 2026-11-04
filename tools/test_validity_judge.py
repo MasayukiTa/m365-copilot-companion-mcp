@@ -138,7 +138,11 @@ def test_classify_opposite():
 
 # ----------------------------------------------------------------- decide precedence
 def test_decide_go_on_effect():
-    v, f, r, n = vj.decide(base_claim(), struct(), good_interval(0.6, 1.2), [], [])
+    # Pure numeric-path GO: opt OUT of the §5-5 rank gate explicitly. Canon line 4 / §5-5
+    # (line 157) makes grounds-absent default to HOLD, so a GO assertion on the 5-arg form
+    # must state the deliberate opt-out rather than rely on the (now fail-closed) default.
+    v, f, r, n = vj.decide(base_claim(), struct(), good_interval(0.6, 1.2), [], [],
+                           require_evidence=False)
     assert v == "GO" and f == "EFFECT"
 
 
@@ -262,7 +266,8 @@ def test_known_effect_reaches_go_effect():
     assert iv["computable"] and iv["lo_std"] > 0
     c = base_claim(delta_min={"value": 0.5, "source": "preregistration",
                               "rationale": "x"})
-    v, f, r, n = vj.decide(c, struct(), iv, [], [])
+    # Numeric path only: opt out of the rank gate explicitly (see test_decide_go_on_effect).
+    v, f, r, n = vj.decide(c, struct(), iv, [], [], require_evidence=False)
     assert v == "GO" and f == "EFFECT"
 
 

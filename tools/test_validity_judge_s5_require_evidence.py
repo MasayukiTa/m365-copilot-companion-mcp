@@ -40,13 +40,22 @@ def _strong():
             "method": "between_lot_ols_on_lot_means_t_K-2"}
 
 
-# --- the documented back-compat hole still exists when NOT opted in (default) ---------------
-def test_default_none_still_reaches_go_back_compat():
-    # evidence=None, require_evidence=False (default) -> gate skipped -> GO (unchanged behaviour).
+# --- grounds-absent now DEFAULTS to HOLD (fail-closed); explicit opt-out still reaches GO ------
+def test_default_grounds_absent_is_hold_and_opt_out_still_go():
+    # FIX (canon line 4 / §5-5 line 157): a GO must cite an upper-rank ground; grounds-absent is
+    # at most HOLD. require_evidence now defaults to True, so the old 5-arg call (evidence=None,
+    # no grounds) is capped to HOLD/R_EVIDENCE_UNKNOWN instead of silently reaching GO.
     v, f, r, n = vj.decide(_claim(), _struct(), _strong(), [], [])
-    assert v == "GO" and f == "EFFECT"
+    assert v == "HOLD" and f is None, "grounds-absent default must be HOLD, got %s" % v
+    assert "R_EVIDENCE_UNKNOWN" in r
+    assert "CAPPED_FINDING_EFFECT" in n
+    # explicit evidence=None with the default (fail-closed) -> same HOLD.
     v2, f2, r2, n2 = vj.decide(_claim(), _struct(), _strong(), [], [], evidence=None)
-    assert (v2, f2) == ("GO", "EFFECT")
+    assert (v2, f2) == ("HOLD", None)
+    # A caller may still EXPLICITLY opt out (visible at the call site) -> pure numeric GO.
+    v3, f3, r3, n3 = vj.decide(_claim(), _struct(), _strong(), [], [],
+                               evidence=None, require_evidence=False)
+    assert (v3, f3) == ("GO", "EFFECT")
 
 
 # --- opting in closes the hole: None grounds on the GO path -> HOLD, not GO -----------------

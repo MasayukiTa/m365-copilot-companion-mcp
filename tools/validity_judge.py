@@ -334,7 +334,7 @@ def classify(lo: float, hi: float, d: float):
 
 
 def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: list,
-           *, evidence=None, require_evidence=False):
+           *, evidence=None, require_evidence=True):
     """Pure ordered decision. Returns (verdict, finding, reasons, notes).
 
     Precedence: ERROR -> CONTEXT (stop) -> NA -> HOLD(A2) -> D cap(<=HOLD) -> C
@@ -348,11 +348,15 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
     B-or-below (or on unknown grounds) is capped to HOLD with an R_* reason. The rank gate
     is distinct from dcap (D_FAIL_* order/lock codes) and is evaluated only on the GO path.
 
-    `require_evidence` (keyword-only, default False) closes the back-compatibility gap: when
-    True, a GO path with evidence=None (no grounds cited) is NOT allowed to skip the gate --
-    it is treated as R_EVIDENCE_UNKNOWN and capped to HOLD. Canon §4/§5-5: a verdict with no
-    declared ground is at most HOLD. Operational GO paths MUST set require_evidence=True;
-    the default stays False so the pure 5-arg call is unchanged for non-opted-in callers.
+    `require_evidence` (keyword-only, default True) is now FAIL-CLOSED: by default a GO path
+    with evidence=None (no grounds cited) is NOT allowed to skip the gate -- it is treated as
+    R_EVIDENCE_UNKNOWN and capped to HOLD. Canon §4 (line 4) / §5-5 (line 157): a verdict with
+    no declared ground is at most HOLD, so grounds-absent must default to HOLD, not GO. This
+    closes the back-compatibility hole where the pure 5-arg call (evidence=None, the old
+    default) reached GO with the §5-5 gate silently disabled. A caller may still pass
+    require_evidence=False to EXPLICITLY opt out of rank gating (e.g. isolated unit tests of
+    the pure numeric path); that opt-out is deliberate and visible at the call site, never the
+    silent default.
     """
     notes = ["LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE"]  # §5: data cannot verify this
     # C10/C11: exploration is at most HOLD. Fold claim-intrinsic exploratory caps into the
@@ -435,11 +439,11 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
     #
     # Canon §4 (line 4) / §5-5 (line 157): "宣言が無ければ、その主張は使えない（判定は最大でも
     # 保留）". A GO *must* cite an upper-rank ground; it cannot rest on no grounds at all.
-    # evidence=None is a back-compatibility opt-out ONLY. On any operational GO path the caller
-    # MUST pass require_evidence=True, which turns a missing/None evidence into R_EVIDENCE_UNKNOWN
-    # (HOLD) instead of silently skipping the gate. This closes the "existing 5-arg call reaches
-    # GO with the §5-5 gate disabled" gap while keeping the pure 5-arg call behaviour unchanged
-    # for callers that have not opted in.
+    # require_evidence defaults to True (fail-closed): a missing/None evidence on the GO path
+    # becomes R_EVIDENCE_UNKNOWN (HOLD) instead of silently skipping the gate. This closes the
+    # "existing 5-arg call reaches GO with the §5-5 gate disabled" hole at the DEFAULT, per canon
+    # line 4 / §5-5. A caller must pass require_evidence=False to opt OUT explicitly (visible at
+    # the call site) -- e.g. a pure-numeric-path unit test; grounds-absent is never a silent GO.
     gate_input = evidence
     if require_evidence and evidence is None:
         gate_input = {}  # no grounds supplied -> evidence_rank_gate returns R_EVIDENCE_UNKNOWN
