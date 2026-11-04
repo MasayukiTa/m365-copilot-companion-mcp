@@ -334,7 +334,7 @@ def classify(lo: float, hi: float, d: float):
 
 
 def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: list,
-           *, evidence=None):
+           *, evidence=None, require_evidence=False):
     """Pure ordered decision. Returns (verdict, finding, reasons, notes).
 
     Precedence: ERROR -> CONTEXT (stop) -> NA -> HOLD(A2) -> D cap(<=HOLD) -> C
@@ -347,6 +347,12 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
     When supplied, a would-be GO resting only on D-group diagnostics or ledger state
     B-or-below (or on unknown grounds) is capped to HOLD with an R_* reason. The rank gate
     is distinct from dcap (D_FAIL_* order/lock codes) and is evaluated only on the GO path.
+
+    `require_evidence` (keyword-only, default False) closes the back-compatibility gap: when
+    True, a GO path with evidence=None (no grounds cited) is NOT allowed to skip the gate --
+    it is treated as R_EVIDENCE_UNKNOWN and capped to HOLD. Canon §4/§5-5: a verdict with no
+    declared ground is at most HOLD. Operational GO paths MUST set require_evidence=True;
+    the default stays False so the pure 5-arg call is unchanged for non-opted-in callers.
     """
     notes = ["LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE"]  # §5: data cannot verify this
     # C10/C11: exploration is at most HOLD. Fold claim-intrinsic exploratory caps into the
@@ -426,7 +432,18 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
         return "HOLD", None, cb, notes
     # §5-5 evidence-rank cap: a GO resting only on D-group / ledger-B-or-below / unknown
     # grounds defaults to HOLD. Evaluated last, on the GO path only; never raises a verdict.
-    rcap = evidence_rank_gate(evidence)
+    #
+    # Canon §4 (line 4) / §5-5 (line 157): "宣言が無ければ、その主張は使えない（判定は最大でも
+    # 保留）". A GO *must* cite an upper-rank ground; it cannot rest on no grounds at all.
+    # evidence=None is a back-compatibility opt-out ONLY. On any operational GO path the caller
+    # MUST pass require_evidence=True, which turns a missing/None evidence into R_EVIDENCE_UNKNOWN
+    # (HOLD) instead of silently skipping the gate. This closes the "existing 5-arg call reaches
+    # GO with the §5-5 gate disabled" gap while keeping the pure 5-arg call behaviour unchanged
+    # for callers that have not opted in.
+    gate_input = evidence
+    if require_evidence and evidence is None:
+        gate_input = {}  # no grounds supplied -> evidence_rank_gate returns R_EVIDENCE_UNKNOWN
+    rcap = evidence_rank_gate(gate_input)
     if rcap:
         if finding is not None:
             notes.append("CAPPED_FINDING_%s" % finding)

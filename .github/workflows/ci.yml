@@ -188,6 +188,7 @@ jobs:
             tools/test_validity_judge.py \
             tools/test_validity_judge_exploratory_hold.py \
             tools/test_validity_judge_s5_rank.py \
+            tools/test_validity_judge_s5_require_evidence.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \
             tools/test_refused_record_and_force.py \
