@@ -129,5 +129,60 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(leftovers, [])
 
 
+class LedgerNoIdentityTests(unittest.TestCase):
+    """台帳 I/O は状態だけを書く。社員 ID・認証情報の置き場を持たないことを固定する。"""
+
+    # 台帳スキーマに現れてよいキー。ここに社員 ID・認証情報の欄が足されていないこと。
+    _ALLOWED_ENTRY_KEYS = frozenset({
+        "analysis_id", "classification", "next_trigger", "last_scanned",
+        "reason", "config_id", "required_lots", "current_lots", "notes",
+    })
+
+    def test_entry_schema_has_no_identity_or_credential_field(self):
+        # dataclass のフィールド集合が許可集合と一致する（新たな欄の混入を検出）。
+        fields = set(LedgerEntry.__dataclass_fields__)  # type: ignore[attr-defined]
+        self.assertEqual(fields, set(self._ALLOWED_ENTRY_KEYS))
+        banned = (
+            "employee", "emp_id", "employee_id", "user_id", "userid",
+            "password", "passwd", "passphrase", "secret", "token",
+            "credential", "api_key", "apikey", "auth",
+        )
+        for name in fields:
+            low = name.lower()
+            for bad in banned:
+                self.assertNotIn(
+                    bad, low, "schema field %r looks like identity/credential" % name
+                )
+
+    def test_saved_ledger_bytes_contain_no_credential_markers(self):
+        # 通常の状態だけを入れて保存し、書き出したバイト列に認証情報の痕跡が無いこと。
+        led = Ledger()
+        led.upsert(LedgerEntry(
+            analysis_id="mcl_x1", classification="C",
+            reason="concept.md:12 K=3 < k_min", config_id="mcl_x1",
+            required_lots=8, current_lots=3,
+        ))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "daicho.json"
+            ledger_io.save_ledger(p, led)
+            raw = p.read_bytes()
+            # BOM 無し・UTF-8 でデコードできること。
+            self.assertFalse(raw.startswith(b"\xef\xbb\xbf"))
+            text = raw.decode("utf-8").lower()
+            for marker in ("password", "passphrase", "secret", "token", "api_key", "credential"):
+                self.assertNotIn(marker, text)
+
+    def test_credential_like_notes_are_not_invented_by_the_module(self):
+        # notes は自由形式だが、モジュールが勝手に認証情報を足さないこと。
+        # 既定で空 dict であり、保存→再読込で notes が空のまま保たれる。
+        led = Ledger()
+        led.upsert(LedgerEntry(analysis_id="a", classification="B"))
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "daicho.json"
+            ledger_io.save_ledger(p, led)
+            led2 = ledger_io.load_ledger(p)
+            self.assertEqual(led2.get("a").notes, {})
+
+
 if __name__ == "__main__":
     unittest.main()
