@@ -48,3 +48,11 @@
   only -- no production history was hand-edited, because the append-only ledger would undo it; the
   watermark is the only durable lever and it lands through this retention path once merged and the
   cockpit is restarted (ui/rebuild_ui.ps1 / relaunch FleetCockpit.exe).
+
+## 2026-11-05 01:0x - operational: prod rollout status (PR #455 merged as ad766de8)
+
+- main updated ff-only to ad766de8 (local main + origin/main); CI all green including a windows-install-smoke rerun that passed. The first fail was a transient hang in the Windows-only step, unrelated to this change.
+- Prod fleet_runner reads relay/fleet_retention.py from the prod working tree, which is currently on branch feat/judge-gate-confirm-overlap-order with unrelated uncommitted work. That file is WATERMARK_ABSENT (48 lines behind main for this file).
+- Not switching the prod working tree to main: it holds unrelated in-progress work; per the owner fixed condition (do not stop or relocate an in-flight worker on my own), the checkout is left to whoever owns that branch.
+- No extra restart needed: retention runs ONCE at fleet_runner startup (fleet_runner.py ~L4400). Once the prod tree is back on main, the next natural fleet_runner start reads the new history_archive and stamps the watermark. Running fleet_runner pids 11596/23680 left untouched (active_contract.active=false, still not stopped on my own).
+- Interim hand-archive from 08:48 (history.json.pre-archive-20261105-084824 + archive/history_completed_20261105-084824.jsonl.gz, 504 rows) stays in place as agreed.
