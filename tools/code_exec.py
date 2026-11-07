@@ -358,6 +358,13 @@ def shell_exec(
 ) -> str:
     """Run a shell command and return stdout, stderr, and return code.
 
+    The command runs through the OS default shell: cmd.exe on Windows, /bin/sh on POSIX.
+    It is NOT bash. On Windows a leading `NAME="value"` assignment makes cmd.exe try to START
+    the quoted value (you get a `'=C:/...'` file-not-found dialog, 0x80070002), and `$VAR` /
+    `${VAR}` are never expanded. Use cmd.exe syntax (`set NAME=value` then `%NAME%`), pass the
+    value inline, or use run_python. Bash-style assignments/expansions are rejected up front on
+    Windows.
+
     Args:
         command: Command line to execute.
         timeout: Maximum execution time in seconds.
@@ -366,6 +373,9 @@ def shell_exec(
     locked = require_unlocked()
     if locked:
         return locked
+    _bad = _cmd_shell_syntax_guard(command)
+    if _bad is not None:
+        return _bad
     from . import contract_gate as _cg
     if _cg.destructive_shell(command):
         _g = _cg.check_op("shell_destructive", _gate_detail(command))
@@ -378,6 +388,47 @@ def shell_exec(
         return _run_with_tree_timeout(command, timeout, _working_dir(working_dir))
     except Exception as e:
         return f"[shell_exec error: {type(e).__name__}: {e}]"
+
+
+def _cmd_shell_syntax_guard(command):
+    """Reject bash-only syntax that cmd.exe mis-executes into a Windows error dialog.
+
+    shell_exec runs via cmd.exe on Windows (subprocess shell=True). A worker that writes a
+    POSIX one-liner like `WT="C:/path" && git -C "$WT" ...` does NOT get a variable: cmd.exe
+    cannot parse the bare `NAME="..."` assignment, so it hands the quoted right-hand side to
+    ShellExecute as a program to start. With the surrounding quote stripping that surfaces as
+    `'=C:/path'`, and ShellExecute raises 0x80070002 (file not found) in a modal dialog -- the
+    exact symptom observed 2026-11-07 when a worktree path was opened this way. `$VAR` is left
+    literal on top of it. Catch both and tell the caller to use cmd.exe syntax or run_python.
+
+    Returns an error string to short-circuit, or None when the command is acceptable. Only
+    fires on Windows; POSIX /bin/sh handles this syntax correctly.
+    """
+    if os.name != "nt":
+        return None
+    import re as _re
+    # Mask quoted spans so a `&`, `;` or `=` INSIDE quotes (e.g. a URL query `?a=b&c=d`) is not
+    # mistaken for a command separator or assignment. Replacement keeps length/offsets intact.
+    def _mask(mm):
+        return mm.group(0)[0] + ("\x00" * (len(mm.group(0)) - 2)) + mm.group(0)[-1]
+    masked = _re.sub(r"\"[^\"]*\"|'[^']*'", _mask, command)
+    _assign = _re.compile(r"(?:^|[&|;])\s*([A-Za-z_][A-Za-z0-9_]*)=")
+    for m in _assign.finditer(masked):
+        head = masked[:m.start()].rstrip()
+        preceding = head.split()[-1].lower() if head.split() else ""
+        if preceding == "set":
+            continue
+        name = m.group(1)
+        return ("[shell_exec error: bash-style assignment '%s=...' will not work here -- "
+                "shell_exec runs under cmd.exe on Windows, where a bare NAME=value is handed "
+                "to ShellExecute and pops a '=<value>' file-not-found dialog (0x80070002). "
+                "Use cmd.exe syntax: `set %s=value` then reference it as %%%s%%, pass the value "
+                "inline, or use run_python for logic that needs variables.]" % (name, name, name))
+    if _re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", command):
+        return ("[shell_exec error: '$VAR'/'${VAR}' is bash syntax and is not expanded by "
+                "cmd.exe on Windows (it stays literal). Use %VAR% after `set VAR=value`, pass "
+                "the value inline, or use run_python.]")
+    return None
 
 
 def _run_with_tree_timeout(command, timeout, cwd):
