@@ -262,6 +262,121 @@ def blocked_jid(state_dir, goal):
     return None
 
 
+def goal_or_worker_ids(obj):
+    """Every id this goal/worker carries that could tie it to a stopped ancestor.
+
+    The union of its OWN identities (jid + fan-out task_id/parent_task_id/campaign_id/
+    root_id, via worker_identities) and the ancestor ids it inherits through
+    (_ancestor_jids). Used to match a still-running descendant against the identities of a
+    worker the operator just closed, WITHOUT touching disk -- an in-memory sibling of
+    blocked_jid for the live-cancel path. De-duplicated, order not significant.
+    """
+    out = []
+    seen = set()
+    for v in list(worker_identities(obj)) + list(_ancestor_jids(obj)):
+        if v and v not in seen:
+            seen.add(v)
+            out.append(v)
+    return out
+
+
+def descendants_to_cancel(closed_identities, candidate_workers, closed_workers=()):
+    """The still-running workers that inherit a CLOSED worker's identities, so closing a
+    parent also stops children ALREADY RUNNING (not just future starts).
+
+    THE GAP THIS CLOSES. The close site already tombstones every identity a closed worker
+    carries (worker_identities) so a fan-out child is refused at the next start/resume/
+    adopt door (blocked_jid). But a child that is ALREADY in flight has passed that door:
+    nothing re-checks the tombstone mid-run, so it keeps going -- which is exactly how w33
+    (a fan-out child carrying a closed parent's task_id/campaign_id/root_id, with no jid of
+    its own) ran on for ~46 minutes and launched `cargo test` after its parent was closed.
+    The tombstone is the durable floor; this is the live counterpart that cancels the
+    descendant now.
+
+    Pure and disk-free: it matches the closed identities against each candidate's own +
+    inherited ids (goal_or_worker_ids) in memory, so it is independent of whether the
+    tombstone write succeeded and is trivially testable.
+
+    `closed_identities` is the union of worker_identities(w) over every worker NAMED in the
+    close command; `candidate_workers` are the live workers; `closed_workers` are the
+    worker objects that were named in the close directly. The named workers are excluded by
+    IDENTITY -- not by trying to tell "own vs inherited" ids apart, because the fan-out
+    fields overlap: a PARENT's own task_id is, by name, an "ancestor field" too
+    (_ANCESTOR_FIELDS includes task_id, since that is the id a CHILD inherits through). So
+    a parent would wrongly look like its own descendant. Excluding the named worker objects
+    is unambiguous and leaves exactly the genuine descendants. Returns the de-duplicated
+    list of candidates to cancel, input order preserved.
+    """
+    closed = {str(i) for i in (closed_identities or []) if i}
+    if not closed:
+        return []
+    excluded = set()
+    for cw in closed_workers or []:
+        excluded.add(id(cw))
+    out = []
+    seen_names = set()
+    for w in candidate_workers or []:
+        if id(w) in excluded:
+            continue
+        ids = set(goal_or_worker_ids(w))
+        if not ids or ids.isdisjoint(closed):
+            continue
+        name = None
+        try:
+            name = w.get("name") if isinstance(w, dict) else getattr(w, "name", None)
+        except Exception:
+            name = None
+        key = name if name is not None else id(w)
+        if key in seen_names:
+            continue
+        seen_names.add(key)
+        out.append(w)
+    return out
+
+
+#: The ids a campaigns.jsonl child row carries that could name a stopped worker. A child has
+#: no jid of its own, so its OWN close is recorded by its task_id (worker_identities tombstones
+#: task_id / parent_task_id / campaign_id / root_id), and a stopped PARENT is recorded by the
+#: parent's task_id / campaign_id / root_id -- which the child repeats as campaign_id /
+#: parent_task_id / root_id. We check both the child's `goal` object (the normal shape) and the
+#: flat child row (the degraded shape whose `goal` object predates the ledger), plus the family
+#: campaign id we were handed, so a child is blocked whether it or any ancestor was closed.
+_CHILD_ID_FIELDS = ("jid", "task_id", "parent_task_id", "campaign_id", "root_id")
+
+
+def child_blocked(state_dir, child, cid=None, fam=None):
+    """If this campaign child must not resume, return the tombstoned id that blocks it; else None.
+
+    The ledger-resume path (fleet_resume.resume_children_goals) re-queues children straight from
+    campaigns.jsonl, never through blocked_jid, so a child whose OWN task_id was tombstoned by a
+    `close` -- or whose parent's campaign_id / root_id was tombstoned -- came back on restart.
+    This collects every id the child row carries (from its `goal` object AND the flat row, the
+    degraded shape) plus the family campaign id, and returns the first one that is tombstoned.
+    A pure disk read: it holds across a restart the instant the tombstone file exists.
+    """
+    ids = []
+    seen = set()
+    def _add(v):
+        s = _safe_jid(v)
+        if s and s not in seen:
+            seen.add(s)
+            ids.append(s)
+    get = child.get if isinstance(child, dict) else (lambda k: getattr(child, k, None))
+    g = get("goal") if get("goal") is not None else {}
+    gget = g.get if isinstance(g, dict) else (lambda k: None)
+    for k in _CHILD_ID_FIELDS:
+        _add(gget(k))
+        _add(get(k))
+    _add(cid)
+    if isinstance(fam, dict):
+        _add(fam.get("campaign_id"))
+        _add(fam.get("root_id"))
+    for i in ids:
+        if is_tombstoned(state_dir, i):
+            return i
+    return None
+
+
 def remove_tombstone(state_dir, jid, *, operator_resubmit_jid=None) -> bool:
     """Remove a tombstone -- ONLY an explicit operator re-submission with a NEW jid may do this.
 
