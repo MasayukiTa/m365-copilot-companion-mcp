@@ -1157,7 +1157,11 @@ jobs:
             relay/test_tunnel_host_log.py \
             tests/test_response_telemetry.py \
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
-            relay/test_a_stale_coordinator_restarts_only_when_idle.py
+            relay/test_a_stale_coordinator_restarts_only_when_idle.py \
+            scripts/weekly_scan/tests/test_screening_confound.py \
+            scripts/weekly_scan/tests/test_screening_screen_select_prereg.py \
+            scripts/weekly_scan/tests/test_report_md.py \
+            scripts/weekly_scan/tests/test_report_pptx_and_ledger.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
