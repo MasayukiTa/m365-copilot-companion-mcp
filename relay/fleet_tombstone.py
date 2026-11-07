@@ -334,6 +334,49 @@ def descendants_to_cancel(closed_identities, candidate_workers, closed_workers=(
     return out
 
 
+#: The ids a campaigns.jsonl child row carries that could name a stopped worker. A child has
+#: no jid of its own, so its OWN close is recorded by its task_id (worker_identities tombstones
+#: task_id / parent_task_id / campaign_id / root_id), and a stopped PARENT is recorded by the
+#: parent's task_id / campaign_id / root_id -- which the child repeats as campaign_id /
+#: parent_task_id / root_id. We check both the child's `goal` object (the normal shape) and the
+#: flat child row (the degraded shape whose `goal` object predates the ledger), plus the family
+#: campaign id we were handed, so a child is blocked whether it or any ancestor was closed.
+_CHILD_ID_FIELDS = ("jid", "task_id", "parent_task_id", "campaign_id", "root_id")
+
+
+def child_blocked(state_dir, child, cid=None, fam=None):
+    """If this campaign child must not resume, return the tombstoned id that blocks it; else None.
+
+    The ledger-resume path (fleet_resume.resume_children_goals) re-queues children straight from
+    campaigns.jsonl, never through blocked_jid, so a child whose OWN task_id was tombstoned by a
+    `close` -- or whose parent's campaign_id / root_id was tombstoned -- came back on restart.
+    This collects every id the child row carries (from its `goal` object AND the flat row, the
+    degraded shape) plus the family campaign id, and returns the first one that is tombstoned.
+    A pure disk read: it holds across a restart the instant the tombstone file exists.
+    """
+    ids = []
+    seen = set()
+    def _add(v):
+        s = _safe_jid(v)
+        if s and s not in seen:
+            seen.add(s)
+            ids.append(s)
+    get = child.get if isinstance(child, dict) else (lambda k: getattr(child, k, None))
+    g = get("goal") if get("goal") is not None else {}
+    gget = g.get if isinstance(g, dict) else (lambda k: None)
+    for k in _CHILD_ID_FIELDS:
+        _add(gget(k))
+        _add(get(k))
+    _add(cid)
+    if isinstance(fam, dict):
+        _add(fam.get("campaign_id"))
+        _add(fam.get("root_id"))
+    for i in ids:
+        if is_tombstoned(state_dir, i):
+            return i
+    return None
+
+
 def remove_tombstone(state_dir, jid, *, operator_resubmit_jid=None) -> bool:
     """Remove a tombstone -- ONLY an explicit operator re-submission with a NEW jid may do this.
 
