@@ -143,6 +143,8 @@ ui/_buildcheck/
 /docs/validation/
 # generic how-to for when a custom MCP connection cannot be created
 !/docs/custom_mcp_fallback_route.md
+# weekly scan runbook: 1-command run + scheduler registration steps for the manufacturing-data weekly scan
+!/docs/weekly_scan_runbook.md
 # scratch probes / b64 dumps / one-off data created during eval sessions
 /bench/_k*.py
 /bench/_pro_*.py
