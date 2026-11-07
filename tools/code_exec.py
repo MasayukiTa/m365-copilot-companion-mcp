@@ -362,10 +362,22 @@ def shell_exec(
         command: Command line to execute.
         timeout: Maximum execution time in seconds.
         working_dir: Optional working directory under the allowed base.
+
+    On Windows the command runs through cmd.exe, which is NOT bash. A POSIX-style
+    assignment like `WT="C:/path" && ...`, or any token whose first non-space
+    character is `=` (so the left-hand side is empty or not an identifier), is not
+    an assignment to cmd.exe: it hands the right-hand side to ShellExecute as a
+    program to start, and a `=C:/...` value raises 0x80070002 in a modal dialog.
+    `$VAR`/`${VAR}` are never expanded. Such commands are rejected up front; use
+    cmd.exe syntax (`set NAME=value` then `%NAME%`), pass the value inline, or use
+    run_python.
     """
     locked = require_unlocked()
     if locked:
         return locked
+    _bad = _cmd_shell_syntax_guard(command)
+    if _bad is not None:
+        return _bad
     from . import contract_gate as _cg
     if _cg.destructive_shell(command):
         _g = _cg.check_op("shell_destructive", _gate_detail(command))
@@ -378,6 +390,67 @@ def shell_exec(
         return _run_with_tree_timeout(command, timeout, _working_dir(working_dir))
     except Exception as e:
         return f"[shell_exec error: {type(e).__name__}: {e}]"
+
+
+def _cmd_shell_syntax_guard(command):
+    """Reject bash-only syntax that cmd.exe mis-executes into a Windows error dialog.
+
+    shell_exec runs via cmd.exe on Windows (subprocess shell=True). cmd.exe cannot
+    parse a bare `NAME="..."` assignment, so it hands the right-hand side to
+    ShellExecute as a program to start. Two shapes reach ShellExecute and pop a
+    `'=<value>'` file-not-found modal (0x80070002), the symptom observed
+    2026-11-07 when a worktree path was opened this way:
+
+      * `NAME=value` where NAME is an identifier -- e.g. `WT="C:/p" && git ...`.
+      * A token whose first non-space character is `=` (empty or non-identifier
+        left-hand side) -- e.g. `=C:/path`, `="C:/path"`, or a stray `=$WT` left
+        after a failed expansion. This is the exact `=C:/...k3cs_pr` string seen
+        in the dialog, and the identifier-only check above never catches it.
+
+    `$VAR`/`${VAR}` is left literal by cmd.exe; catch that too. Returns an error
+    string to short-circuit, or None when the command is acceptable. Only fires on
+    Windows; POSIX /bin/sh handles this syntax correctly.
+    """
+    if os.name != "nt":
+        return None
+    import re as _re
+    # Mask quoted spans so a `&`, `;` or `=` INSIDE quotes (e.g. a URL query
+    # `?a=b&c=d`) is not mistaken for a command separator or assignment.
+    # Replacement keeps length/offsets intact.
+    def _mask(mm):
+        return mm.group(0)[0] + ("\x00" * (len(mm.group(0)) - 2)) + mm.group(0)[-1]
+    masked = _re.sub(r"\"[^\"]*\"|'[^']*'", _mask, command)
+    # A token that STARTS with `=` at command start or just after a separator:
+    # cmd.exe has nothing to assign to, so the `=value` is handed to ShellExecute.
+    # This is the 2026-11-07 `=C:/...` symptom and must be caught before the
+    # identifier-assignment check below (which requires a name on the left).
+    _eqlead = _re.compile(r"(?:^|[&|;])\s*=")
+    if _eqlead.search(masked):
+        return ("[shell_exec error: a token beginning with '=' (for example "
+                "'=C:/path') is not an assignment to cmd.exe on Windows -- it is "
+                "handed to ShellExecute as a program to start and pops a "
+                "'=<value>' file-not-found dialog (0x80070002). This usually comes "
+                "from a bash-style `NAME=\"...\"` or an unexpanded `$VAR`. Use "
+                "cmd.exe syntax (`set NAME=value` then %NAME%), pass the value "
+                "inline, or use run_python.]")
+    _assign = _re.compile(r"(?:^|[&|;])\s*([A-Za-z_][A-Za-z0-9_]*)=")
+    for m in _assign.finditer(masked):
+        head = masked[:m.start()].rstrip()
+        preceding = head.split()[-1].lower() if head.split() else ""
+        if preceding == "set":
+            continue
+        name = m.group(1)
+        return ("[shell_exec error: bash-style assignment '%s=...' will not work "
+                "here -- shell_exec runs under cmd.exe on Windows, where a bare "
+                "NAME=value is handed to ShellExecute and pops a '=<value>' "
+                "file-not-found dialog (0x80070002). Use cmd.exe syntax: `set "
+                "%s=value` then reference it as %%%s%%, pass the value inline, or "
+                "use run_python for logic that needs variables.]" % (name, name, name))
+    if _re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", command):
+        return ("[shell_exec error: '$VAR'/'${VAR}' is bash syntax and is not "
+                "expanded by cmd.exe on Windows (it stays literal). Use %VAR% after "
+                "`set VAR=value`, pass the value inline, or use run_python.]")
+    return None
 
 
 def _run_with_tree_timeout(command, timeout, cwd):
