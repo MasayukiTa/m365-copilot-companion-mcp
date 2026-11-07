@@ -131,3 +131,76 @@ def test_a_close_without_an_open_still_yields_a_record():
     assert len(recs) == 1
     assert recs[0]["channel_id"] == 9 and recs[0]["open_time"] is None
     assert recs[0]["duration_s"] is None
+
+
+def test_health_counts_is_safe_under_concurrent_append_and_reads(tmp_path):
+    """Reading the jsonl while it is being appended to must never fault or raise.
+
+    This is the regression for the repeated python.exe heap-corruption crashes whose
+    faulthandler stack was always json.loads <- health_counts: /health runs several probe
+    threads that call health_counts() about once a second while the tunnel-host tailer
+    thread appends new lines via append_new_records(). With no serialisation, a reader
+    iterating the open file line by line saw it grow underneath it and fed a half-written
+    tail to the C json decoder. Here many reader threads hammer health_counts() while a
+    writer thread appends continuously; every read must return the documented dict and the
+    run must finish with no exception. The shared lock in tunnel_channels makes it so.
+    """
+    import threading
+
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    jsonl.write_text("", encoding="utf-8")
+    keys = ("tunnel_channels", "tunnel_no_response", "tunnel_remote_closed_early")
+
+    errors = []
+    stop = threading.Event()
+    N = 400
+
+    def writer():
+        # Append one well-formed record at a time, the way append_new_records() does, but
+        # without pre-formatting so each open()/write() genuinely races the readers.
+        try:
+            for i in range(N):
+                rec = {"time": time.time(), "no_response": bool(i % 2),
+                       "remote_closed_early": bool(i % 3 == 0)}
+                with tc._JSONL_LOCK:
+                    with open(jsonl, "a", encoding="utf-8") as out:
+                        out.write(json.dumps(rec) + "\n")
+        except Exception as e:  # pragma: no cover - a failure is the whole point to catch
+            errors.append(e)
+        finally:
+            stop.set()
+
+    def reader():
+        try:
+            while not stop.is_set():
+                counts = tc.health_counts(str(jsonl))
+                assert set(counts) == set(keys)
+                # Counts are always non-negative once the file exists, and never exceed the
+                # number of records the writer could have appended.
+                assert 0 <= counts["tunnel_channels"] <= N
+                assert 0 <= counts["tunnel_no_response"] <= counts["tunnel_channels"]
+                assert 0 <= counts["tunnel_remote_closed_early"] <= counts["tunnel_channels"]
+        except Exception as e:  # pragma: no cover - a failure is the whole point to catch
+            errors.append(e)
+
+    threads = [threading.Thread(target=writer)]
+    threads += [threading.Thread(target=reader) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=30)
+    assert not any(t.is_alive() for t in threads), "a reader/writer thread hung"
+    assert not errors, "concurrent read/append raised: %r" % (errors[:3],)
+
+    # After the dust settles the final snapshot reflects every appended record.
+    final = tc.health_counts(str(jsonl), now=time.time())
+    assert final["tunnel_channels"] == N
+
+
+def test_a_health_counts_read_and_an_append_share_one_lock():
+    """The read path and the write path must take the SAME lock, or they do not exclude
+    each other. Pins the wiring so a later refactor cannot split them onto two locks."""
+    import inspect
+    assert isinstance(tc._JSONL_LOCK, type(__import__("threading").Lock()))
+    assert "_JSONL_LOCK" in inspect.getsource(tc.health_counts)
+    assert "_JSONL_LOCK" in inspect.getsource(tc.append_new_records)

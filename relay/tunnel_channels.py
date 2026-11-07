@@ -32,7 +32,24 @@ from __future__ import annotations
 import json
 import os
 import re
+import threading
 import time
+
+# One shared lock serialises every access to the tunnel_channels.jsonl file.
+#
+# WHY THIS EXISTS. append_new_records() appends to this file from the tunnel-host
+# log tailer thread, while health_counts() reads it from the /health route -- and
+# /health runs each probe on its own thread in a 4-worker pool, polled about once a
+# second, so several health_counts() reads overlap each other AND the tailer append.
+# With no lock, a reader iterating the file line by line (a lazy, C-level buffered
+# read) sees the file grow underneath it; the half-written tail reaches the C json
+# decoder, and on Windows that corrupted the process heap -- repeated python.exe
+# access-violation / heap-corruption crashes whose faulthandler stack was always
+# json.loads <- health_counts. Serialising read and append closes that race, and
+# reading the whole file in one locked call (below) removes the grow-under-us window
+# entirely. The file is small (one short line per closed channel), so the lock is
+# held only briefly and /health stays fast.
+_JSONL_LOCK = threading.Lock()
 
 # A ts-stamped line written by relay.tunnel_host_log looks like:
 #   2026-10-31 21:40:12.345 <the devtunnel line>
@@ -194,10 +211,13 @@ def append_new_records(log_path, jsonl_path, offset_path=None):
         chunk = fh.readlines()
         new_offset = fh.tell()
     if chunk:
-        with open(jsonl_path, "a", encoding="utf-8") as out:
-            for rec in parse_channel_events(chunk):
-                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                appended += 1
+        # Hold the shared lock so a concurrent health_counts() read never sees this append
+        # mid-write (see _JSONL_LOCK).
+        with _JSONL_LOCK:
+            with open(jsonl_path, "a", encoding="utf-8") as out:
+                for rec in parse_channel_events(chunk):
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    appended += 1
     with open(offset_path, "w", encoding="utf-8") as fh:
         fh.write(str(new_offset))
     return appended
@@ -218,26 +238,37 @@ def health_counts(jsonl_path, now=None, window_s=600):
         now = time.time()
     cutoff = now - window_s
     total = no_resp = remote_early = 0
+    # Read the ENTIRE file in one locked call, then parse the snapshot in memory.
+    #
+    # Iterating the open file line by line instead would keep a lazy, C-level buffered read
+    # open across many json.loads calls -- and with append_new_records() appending from
+    # another thread, and several /health probe threads reading at once, that buffer saw the
+    # file grow underneath it and fed a half-written tail to the C json decoder, corrupting
+    # the process heap (the repeated access-violation crashes). Snapshotting under the shared
+    # lock removes the window: the reader never overlaps an append, and never holds a handle
+    # open while the file changes. The file is small, so this stays cheap.
     try:
-        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                t = rec.get("time")
-                if t is not None and t < cutoff:
-                    continue
-                total += 1
-                if rec.get("no_response"):
-                    no_resp += 1
-                if rec.get("remote_closed_early"):
-                    remote_early += 1
+        with _JSONL_LOCK:
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+                data = fh.read()
     except OSError:
         return {k: -1 for k in keys}
+    for line in data.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        t = rec.get("time")
+        if t is not None and t < cutoff:
+            continue
+        total += 1
+        if rec.get("no_response"):
+            no_resp += 1
+        if rec.get("remote_closed_early"):
+            remote_early += 1
     return {
         "tunnel_channels": total,
         "tunnel_no_response": no_resp,
