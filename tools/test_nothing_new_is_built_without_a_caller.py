@@ -151,6 +151,10 @@ NO_CALLER_BUT_TESTED = {
     "tools/auto/ext_helper.py::validity_list_claims",
     "tools/auto/ext_helper.py::validity_negative_control",
     "tools/auto/ext_helper.py::validity_verify_lock",
+    # Forged-tool style module in tools/auto/ (PR 445, copilot_image.py). Registered by the
+    # directory walk, so it has no static caller (see REASONS). Exercised directly by
+    # tools/auto/test_copilot_image.py.
+    "tools/auto/copilot_image.py::copilot_generate_image",
     # TAB-ERA LEFTOVERS, 2026-10-14 (owner rule: Copilot never runs in a tab). Nine siblings
     # were DELETED; the survivors stay because something real still uses them. save_template
     # left the list 2026-10-18: relay/template_seed.py (the connector-less route) calls it. See
@@ -215,6 +219,10 @@ REASONS: dict[str, tuple[str, str]] = {
     "tools/auto/ext_helper.py::validity_list_claims": ("dispatch", "tools/test_ext_helper.py"),
     "tools/auto/ext_helper.py::validity_negative_control": ("dispatch", "tools/test_ext_helper.py"),
     "tools/auto/ext_helper.py::validity_verify_lock": ("dispatch", "tools/test_ext_helper.py"),
+    # PR 445: forged tool in tools/auto/, registered by the directory walk (no static caller),
+    # exercised directly by tools/auto/test_copilot_image.py.
+    "tools/auto/copilot_image.py::copilot_generate_image":
+        ("dispatch", "tools/auto/test_copilot_image.py"),
     # A REFERENCE COUNT IS NOT A REACHABILITY ANALYSIS, closed 2026-09-14 by iterating the scan
     # to a fixed point (5 rounds, 80 -> 96). Every one of these sixteen was held off the list by
     # a caller that is itself unreached: something named it, and nothing could get there. Three
