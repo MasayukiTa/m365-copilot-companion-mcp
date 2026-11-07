@@ -1237,6 +1237,22 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
         _indep = confirm_independence_note(order_record)
         if _indep:
             lines.append(_indep)
+    # Result-blind design feasibility (PR #438 core). When the verdict carries per-group
+    # stratum lot counts (group_stratum_lots: {group: {stratum: lot_count}}), run the
+    # design_feasibility screen -- it never reads the response column and can only ADD a
+    # design HOLD note, never relax a verdict. Stated plainly in the footer so a
+    # design-infeasible contrast is visible even when the engine otherwise ran.
+    if isinstance(verdict, dict) and verdict.get("group_stratum_lots"):
+        _feas = design_feasibility(verdict.get("group_stratum_lots"))
+        if _feas.get("design_infeasible"):
+            _seen = _feas.get("seen") or {}
+            lines.append(
+                "設計の成立性: 設計不成立(保留) reason=%s "
+                "(共通層=%s, 被覆層(各群>=%s)=%s, overlap=%.3f)" % (
+                    _feas.get("reason_code"),
+                    _seen.get("n_common_strata"), _seen.get("k_min"),
+                    _seen.get("n_common_strata_covered"),
+                    float(_seen.get("overlap_coefficient") or 0.0)))
     if not engine_available or not verdict:
         reason = unavailable_reason or (
             verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"
