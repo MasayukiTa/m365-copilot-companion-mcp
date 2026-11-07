@@ -151,7 +151,7 @@ class _FakePythoncom(types.ModuleType):
 # Harness: install the fakes, run the tool, return what happened.
 # ---------------------------------------------------------------------------
 
-def _run_export(tmp_path, monkeypatch, seed_open_paths, request_path):
+def _run_export(tmp_path, monkeypatch, request, seed_open_paths, request_path):
     """Run pptx_export_png against the fake COM layer.
 
     seed_open_paths: files to mark as already open before the call.
@@ -176,10 +176,31 @@ def _run_export(tmp_path, monkeypatch, seed_open_paths, request_path):
     monkeypatch.setitem(sys.modules, "win32com.client", fake_client)
 
     # Scope the file tools to tmp_path so _validate_path accepts our paths.
-    monkeypatch.setenv("MCP_ALLOWED_BASE", str(tmp_path))
+    #
+    # LEAK GUARD (why the finalizer below is not optional). Reloading file_ops recomputes its
+    # module-global ALLOWED_BASES from MCP_ALLOWED_BASE, binding the file tools to THIS test's
+    # tmp_path. monkeypatch restores the ENVIRONMENT VARIABLE on teardown, but it does NOT undo
+    # the reload: without restoring it, file_ops.ALLOWED_BASES stays pinned to a dead tmp_path
+    # and every later test that writes under its own tmp_path reads as "outside the allowed
+    # base". We capture the original value and, AFTER monkeypatch has put the env back
+    # (addfinalizer runs LIFO and this is registered before setenv), reload both modules so
+    # their globals return to the process-wide default the rest of the suite expects.
     import tools.file_ops as file_ops
-    importlib.reload(file_ops)
     import tools.pptx_ops as pptx_ops
+    _orig_env = os.environ.get("MCP_ALLOWED_BASE")
+
+    def _restore_file_tool_scope():
+        if _orig_env is None:
+            os.environ.pop("MCP_ALLOWED_BASE", None)
+        else:
+            os.environ["MCP_ALLOWED_BASE"] = _orig_env
+        importlib.reload(file_ops)
+        importlib.reload(pptx_ops)
+
+    request.addfinalizer(_restore_file_tool_scope)
+
+    monkeypatch.setenv("MCP_ALLOWED_BASE", str(tmp_path))
+    importlib.reload(file_ops)
     importlib.reload(pptx_ops)
 
     result = pptx_ops.pptx_export_png(str(request_path), output_dir=str(tmp_path / "out"))
@@ -197,11 +218,11 @@ def _make_pptx(tmp_path, name):
 # Case 1: the operator already had this deck open -> never close it.
 # ---------------------------------------------------------------------------
 
-def test_a_document_already_open_is_rendered_but_never_closed(tmp_path, monkeypatch):
+def test_a_document_already_open_is_rendered_but_never_closed(tmp_path, monkeypatch, request):
     deck = _make_pptx(tmp_path, "operators_live_work.pptx")
 
     presentations, app, result, close_log, export_log = _run_export(
-        tmp_path, monkeypatch,
+        tmp_path, monkeypatch, request,
         seed_open_paths=[str(deck)],
         request_path=deck,
     )
@@ -226,11 +247,11 @@ def test_a_document_already_open_is_rendered_but_never_closed(tmp_path, monkeypa
 # Case 2: the tool opened the deck itself -> it owns it and must close that one.
 # ---------------------------------------------------------------------------
 
-def test_a_document_this_tool_opened_is_closed(tmp_path, monkeypatch):
+def test_a_document_this_tool_opened_is_closed(tmp_path, monkeypatch, request):
     deck = _make_pptx(tmp_path, "freshly_rendered.pptx")
 
     presentations, app, result, close_log, export_log = _run_export(
-        tmp_path, monkeypatch,
+        tmp_path, monkeypatch, request,
         seed_open_paths=[],          # nothing open to begin with
         request_path=deck,
     )
@@ -251,12 +272,12 @@ def test_a_document_this_tool_opened_is_closed(tmp_path, monkeypatch):
 # Case 3: another document is open; the tool opens a DIFFERENT one -> close only its own.
 # ---------------------------------------------------------------------------
 
-def test_another_open_document_is_left_untouched(tmp_path, monkeypatch):
+def test_another_open_document_is_left_untouched(tmp_path, monkeypatch, request):
     other = _make_pptx(tmp_path, "someone_elses_deck.pptx")
     mine = _make_pptx(tmp_path, "the_one_i_export.pptx")
 
     presentations, app, result, close_log, export_log = _run_export(
-        tmp_path, monkeypatch,
+        tmp_path, monkeypatch, request,
         seed_open_paths=[str(other)],      # a different doc is already open
         request_path=mine,                 # we export our own, not that one
     )
