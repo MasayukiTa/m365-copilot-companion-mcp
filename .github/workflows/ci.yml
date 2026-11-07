@@ -149,6 +149,7 @@ jobs:
             relay/test_auto_rephrase_continue.py \
             scripts/test_status_tool_does_not_mislead.py \
             scripts/test_health_probe_isolation.py \
+            scripts/test_health_busy_signal.py \
             tools/test_one_settings_file_for_every_context.py \
             tools/test_a_setting_declares_when_it_takes_effect.py \
             tools/test_a_search_walk_is_bounded_in_depth_and_time.py \

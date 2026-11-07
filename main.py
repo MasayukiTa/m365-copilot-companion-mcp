@@ -508,7 +508,7 @@ async def _gather_health_probes(probes):
     if not futs:
         return out
     try:
-        done, _pending = await asyncio.wait(futs, timeout=_HEALTH_PROBE_BUDGET_S)
+        done, pending = await asyncio.wait(futs, timeout=_HEALTH_PROBE_BUDGET_S)
     except Exception:
         return out
     for f in done:
@@ -518,7 +518,51 @@ async def _gather_health_probes(probes):
                 out.update(r)
         except Exception:
             pass
-    # Leave stragglers to finish on their own thread; we just don't wait on them.
+    # BUSY MUST BE A CLEAR ANSWER, NOT A SILENT PARTIAL. When the budget expires with probes
+    # still running, merging only what finished is indistinguishable, to a client, from a
+    # healthy full answer. Under the sustained CPU saturation that caused this incident that
+    # silent-partial reply is what let the fleet send-gate keep treating a starved server as
+    # fine until it finally dropped the connection. Now the reply SAYS it is degraded and HOW
+    # MANY probes did not finish, so a caller (fleet gate, cockpit, muse) sees a truthful busy
+    # signal instead of a dropped or misleading one -- while /health still answers fast because
+    # we never wait past the budget.
+    #
+    # And we CANCEL stragglers rather than leave them pinning the tiny 4-slot health pool: a
+    # future still QUEUED (never started) is cancelled outright, freeing its slot for the next
+    # /health poll a second later. One already RUNNING cannot be force-killed (a thread is not
+    # cancellable mid-call), so it is left to finish on its own, but it no longer blocks the
+    # ANSWER. This keeps the pool from staying starved poll after poll while heavy tool work
+    # saturates CPU.
+    #
+    # IMPORTANT: a probe can finish in the microsecond between the budget expiring and this
+    # loop running. future.cancel() returns False for it (already done), and we must HARVEST
+    # its result rather than drop it -- otherwise, under the exact CPU saturation this fix is
+    # for, a fast probe that lands a hair late would vanish from the reply. A probe still
+    # genuinely unfinished (queued or running) is what makes the answer DEGRADED, and we report
+    # HOW MANY did not finish so the caller (fleet gate, cockpit, muse) sees a truthful busy
+    # signal instead of a dropped or misleading one.
+    if pending:
+        unfinished = 0
+        for f in pending:
+            if f.done() and not f.cancelled():
+                # Finished just after the budget -- keep its result, it is not a straggler.
+                try:
+                    r = f.result()
+                    if isinstance(r, dict):
+                        out.update(r)
+                except Exception:
+                    pass
+                continue
+            # Truly unfinished: try to free its slot (succeeds only if never started), and
+            # count it as a probe that did not finish in time.
+            try:
+                f.cancel()
+            except Exception:
+                pass
+            unfinished += 1
+        if unfinished:
+            out["health_degraded"] = True
+            out["health_probes_pending"] = unfinished
     return out
 
 
