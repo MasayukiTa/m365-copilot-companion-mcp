@@ -296,3 +296,21 @@ def test_footer_has_required_fields():
     assert ft["claims_used"] == ["C-TEST"] and ft["ledger_rows"] == ["L-12"]
     assert ft["df"] == 6 and ft["K"] == 8
     assert ft["default_hold_if_only_D_or_B_below"] is True
+
+
+# ----------------------------------------------------------- claim identity
+def test_claim_sha256_is_deterministic_and_order_independent():
+    # Exercises claim_sha256 from outside the module: the canonical claim
+    # fingerprint used to tie a verdict back to the exact claim it judged.
+    a = base_claim()
+    b = base_claim()
+    h = vj.claim_sha256(a)
+    # 64 lowercase hex chars (sha256), and deterministic for equal input.
+    assert isinstance(h, str) and len(h) == 64
+    assert all(ch in "0123456789abcdef" for ch in h)
+    assert vj.claim_sha256(b) == h
+    # Key order must not matter: the canonical form sorts keys.
+    reordered = {k: a[k] for k in reversed(list(a.keys()))}
+    assert vj.claim_sha256(reordered) == h
+    # A different claim must produce a different fingerprint.
+    assert vj.claim_sha256(base_claim(K=9)) != h
