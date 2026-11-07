@@ -318,3 +318,12 @@ outputs/
 .relay_regression_*.txt
 relay_full_run_result.txt
 scratch_out.txt
+
+# ----------------------------------------------------------------------
+# Device-local secure-desktop helper: a SYSTEM service + its elevated
+# installer. Deliberately NOT part of the product -- this OSS targets
+# users without admin rights; the service exists only on this machine.
+# (The in-session client tools/auto/desktop_secure.py needs no elevation
+# and stays tracked; it degrades gracefully where the service is absent.)
+# ----------------------------------------------------------------------
+/secure_desktop/

@@ -1,5 +1,20 @@
 {
   "_why": "A public definition listed here is allowed to have nothing referencing it. The value is the reason. See scripts/check_integration_evidence.py.",
   "_note": "The three capabilities that motivated the check -- the approval gate that never ran, the reaper nothing invoked, the resume decision nobody consulted -- are NOT listed, because they have since been wired up and because the check reads one commit's diff rather than the whole repository. Past cases never reach it.",
-  "_precision": "A whole-repository dead-code audit was tried and produced 43 findings of which 1 was real. This file exists so the diff-scoped version stays at a precision people will read, not so anything inconvenient can be silenced: every entry needs a reason a reader can check."
+  "_precision": "A whole-repository dead-code audit was tried and produced 43 findings of which 1 was real. This file exists so the diff-scoped version stays at a precision people will read, not so anything inconvenient can be silenced: every entry needs a reason a reader can check.",
+  "_auto_registered": "The desktop_* entries below are not unreferenced in the sense this check means. Public top-level functions under tools/auto/ are collected at startup by load_auto_tools() in tools/auto_loader.py (called from main.py) via pkgutil+importlib and registered as live MCP tools after a restart. That dynamic import is a registration point the static scanner (git grep + ast) cannot see, so each of these shows as 'NOTHING REFERENCES' while in fact being wired up. Verify: run load_auto_tools() and confirm each name is in the result; see tools/auto_loader.py:41 and the _load_auto_tools call in main.py.",
+  "desktop_state": "tools/auto/desktop_snapshot.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "capture_window_by_title": "tools/auto/desktop_snapshot.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_full_desktop": "tools/auto/desktop_observe.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_state_report": "tools/auto/desktop_observe.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_lock_history": "tools/auto/desktop_observe.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_state_diff": "tools/auto/desktop_observe.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_msg_click": "tools/auto/desktop_act.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_msg_text": "tools/auto/desktop_act.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_msg_key": "tools/auto/desktop_act.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_msg_close": "tools/auto/desktop_act.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_uia_dump": "tools/auto/desktop_act.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_uia_act": "tools/auto/desktop_act.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_secure_status": "tools/auto/desktop_secure.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered).",
+  "screen_secure_capture": "tools/auto/desktop_secure.py -- registered as an MCP tool via tools/auto_loader.load_auto_tools() (see _auto_registered)."
 }
