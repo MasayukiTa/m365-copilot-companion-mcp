@@ -12,7 +12,7 @@ openpyxl
 xlsxwriter>=3.2.9
 python-pptx>=1.0.2,<2.0
 python-docx>=1.2.0
-pypdf>=6.20.1
+pypdf>=6.21.4
 send2trash>=2.1.0
 matplotlib
 pytesseract>=0.3.13
