@@ -43,3 +43,45 @@ def test_the_cap_is_a_real_number_and_not_absurd():
     assert m, "the default cap must be visible in the source"
     cap = eval(m.group(1), {"__builtins__": {}})
     assert 1024 * 1024 <= cap <= 64 * 1024 * 1024, cap
+
+
+# --- The crash dump must not be shredded by the periodic heartbeat ---------------
+#
+# faulthandler.enable() fires from whatever thread takes the fatal signal; the
+# periodic dump_traceback_later() fires from its own watchdog thread every 5 min.
+# faulthandler holds no lock between them, so when the two share one file handle and
+# a crash lands mid-heartbeat, the dumps interleave byte-for-byte and the crash trace
+# -- the only forensic record of a native death -- becomes unreadable. Observed
+# 2026-11-07: a 0xc0000374 (heap corruption) crash dump came out as lines like
+#   File "C:\\Users\\...\\ProgramsWindows fatal exception: code 0xc0000374
+# The fix is to give enable() and dump_traceback_later() DISTINCT file objects; two
+# separate OS handles never interleave each other's writes.
+
+
+def test_crash_dump_and_periodic_dump_use_distinct_files():
+    body = _install_src()
+    assert "faulthandler-crash.log" in body, (
+        "the crash dump (enable) must have its own file, separate from the periodic log"
+    )
+
+
+def test_enable_and_dump_later_do_not_share_a_handle():
+    """enable() backs the crash dump; dump_traceback_later() backs the heartbeat.
+    They must be handed two different file objects or their output can interleave."""
+    body = _install_src()
+    m_enable = re.search(r"faulthandler\.enable\(file=(\w+)\)", body)
+    m_later = re.search(r"dump_traceback_later\([^)]*file=(\w+)", body)
+    assert m_enable, "enable(file=...) must name its handle explicitly"
+    assert m_later, "dump_traceback_later(file=...) must name its handle explicitly"
+    assert m_enable.group(1) != m_later.group(1), (
+        "enable() and dump_traceback_later() share a handle -- a crash landing during "
+        "a periodic dump will interleave and shred the crash trace"
+    )
+
+
+def test_both_dump_files_are_rotated():
+    """The crash file is bounded too: a crash loop must not fill the disk either."""
+    body = _install_src()
+    assert body.count("_rotate(") >= 2, (
+        "both the periodic log and the crash log must be rotated under the cap"
+    )

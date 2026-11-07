@@ -1719,6 +1719,17 @@ def _install_faulthandler() -> None:
         dump_dir = Path(__file__).resolve().parent / ".fleet"
         dump_dir.mkdir(parents=True, exist_ok=True)
         dump_path = dump_dir / "faulthandler.log"
+        # SEPARATE FILE FOR THE CRASH DUMP. faulthandler.enable() fires from whatever thread
+        # takes the fatal signal (an access violation in a C extension, a heap corruption in
+        # ntdll), and dump_traceback_later() fires from its own watchdog thread every 5 min.
+        # faulthandler takes no lock between the two, so when a crash lands WHILE the periodic
+        # watchdog is mid-write to the same handle, the two dumps interleave byte-for-byte and
+        # the one dump that matters -- the crash -- becomes unreadable (observed 2026-11-07:
+        # the 0xc0000374 crash dump was shredded through the periodic heartbeat, e.g.
+        # 'File "C:\\Users\\...\\ProgramsWindows fatal exception: code 0xc0000374').
+        # Giving enable() its own handle keeps the crash trace whole regardless of the
+        # heartbeat; two distinct OS file objects never interleave each other's writes.
+        crash_path = dump_dir / "faulthandler-crash.log"
 
         # ROTATE. Every thread's stack, every five minutes, appended for ever: the file was
         # found at 51.8 MB, and it had no end. On a machine whose disk floor is measured in
@@ -1728,32 +1739,41 @@ def _install_faulthandler() -> None:
         #
         # One generation is kept. The value of these dumps is the recent ones: a wedge is
         # diagnosed from the last few heartbeats, not from a fortnight of healthy ones.
-        try:
-            cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
-            if dump_path.exists() and dump_path.stat().st_size > cap:
-                previous = dump_path.with_suffix(".log.1")
-                if previous.exists():
-                    previous.unlink()
-                dump_path.rename(previous)
-        except Exception:
-            pass
+        def _rotate(path: "Path", cap: int) -> None:
+            try:
+                if path.exists() and path.stat().st_size > cap:
+                    previous = path.with_suffix(".log.1")
+                    if previous.exists():
+                        previous.unlink()
+                    path.rename(previous)
+            except Exception:
+                pass
 
-        # Keep a handle open for the lifetime of the process (faulthandler writes to it).
+        cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
+        _rotate(dump_path, cap)
+        _rotate(crash_path, cap)
+
+        # Keep a handle open for each file for the lifetime of the process (faulthandler
+        # writes to them). The crash handle backs enable(); the periodic handle backs
+        # dump_traceback_later(). They are DISTINCT so the two never interleave.
+        _crash_fh = open(crash_path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_crash_fh)
         _fh = open(dump_path, "a", encoding="utf-8", buffering=1)
-        faulthandler.enable(file=_fh)
         # Every 5 min, dump all thread stacks. On a healthy server this is just a periodic
         # heartbeat; when the loop is stuck the dump shows exactly which tool is blocking.
         faulthandler.dump_traceback_later(
             300, repeat=True, file=_fh, exit=False
         )
-        # Keep a module-global ref so the file object isn't garbage-collected.
-        global _FAULTHANDLER_FILE
+        # Keep module-global refs so the file objects aren't garbage-collected.
+        global _FAULTHANDLER_FILE, _FAULTHANDLER_CRASH_FILE
         _FAULTHANDLER_FILE = _fh
+        _FAULTHANDLER_CRASH_FILE = _crash_fh
     except Exception:
         pass
 
 
 _FAULTHANDLER_FILE = None
+_FAULTHANDLER_CRASH_FILE = None
 
 
 def _start_approval_watcher(period: float = 3.0) -> None:
