@@ -130,6 +130,23 @@ def test_main_reads_only_and_prints_both_formats(tmp_path, capsys):
     assert os.path.getsize(p) == before and sorted(os.listdir(fleet)) == [R.LOG_NAME]
 
 
+def test_tool_filter_changes_verdict_and_applies_sample_thresholds(tmp_path, capsys):
+    rows = _enough(4) + [dict(r, tool="list_directory", differed=r["hit"], matched=False)
+                         for r in _enough(4)]
+    _write(str(tmp_path), rows)
+    R.main(["--fleet-dir", str(tmp_path), "--format", "json"])
+    assert json.loads(capsys.readouterr().out)["verdict"] == R.UNSAFE_TO_SERVE
+    R.main(["--fleet-dir", str(tmp_path), "--format", "json", "--tool", "read_file"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["verdict"] == R.WORTH_A_SERVING_TEST
+    assert result["summary"]["calls"] == 200 and result["selected_tools"] == ["read_file"]
+    R.main(["--fleet-dir", str(tmp_path), "--format", "json", "--tool", "unknown"])
+    assert json.loads(capsys.readouterr().out)["verdict"] == R.INSUFFICIENT
+    R.main(["--fleet-dir", str(tmp_path), "--tool", "read_file", "--tool", "list_directory"])
+    text = capsys.readouterr().out
+    assert "Selected tools: list_directory, read_file" in text and R.UNSAFE_TO_SERVE in text
+
+
 def test_the_report_and_the_recorder_agree_on_the_file_name():
     from relay import result_cache
     assert os.path.basename(result_cache.LOG) == R.LOG_NAME
