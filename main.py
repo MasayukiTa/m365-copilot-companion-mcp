@@ -491,6 +491,18 @@ _HEALTH_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="he
 #: Whole-of-sub-probes budget for one /health call. Past this we answer with what we have.
 _HEALTH_PROBE_BUDGET_S = float(os.environ.get("MCP_HEALTH_PROBE_BUDGET_S", "2.0"))
 
+#: Hard wall-clock ceiling for the WHOLE /health handler, independent of the per-probe
+#: budget above. The probe budget bounds the sub-probes; this bounds the handler itself --
+#: the coroutine resume, timer firing and JSONResponse build that all run on the single
+#: event-loop thread. Under real CPU saturation from other processes that thread is starved
+#: and a 2s probe budget was measured stretching to 7-12s wall clock (incident 2026-11-07).
+#: Past this ceiling we STOP waiting and answer immediately with a clear busy signal, so a
+#: client (fleet send-gate, cockpit, muse) sees a fast "busy" reply instead of a connection
+#: that is dropped after tens of seconds. Kept comfortably above the probe budget so a
+#: healthy call never trips it. Opt-out/tune with MCP_HEALTH_HANDLER_DEADLINE_S.
+_HEALTH_HANDLER_DEADLINE_S = float(
+    os.environ.get("MCP_HEALTH_HANDLER_DEADLINE_S", "3.0"))
+
 
 async def _gather_health_probes(probes):
     """Run each zero-arg probe in the DEDICATED /health pool, in parallel, under one shared
@@ -767,7 +779,27 @@ async def health(request: Request) -> JSONResponse:
     # merge whatever finished in time. A saturated default/tool pool can no longer starve or
     # hang this: past the budget we answer with the minimal liveness fields already set above
     # plus the probes that returned, so a client always gets a clear answer, never a drop.
-    payload.update(await _gather_health_probes(_probes))
+    # Bound the ENTIRE probe-gather by a hard wall-clock ceiling. _gather_health_probes is
+    # already budgeted internally, but that budget is an asyncio timer on the event-loop
+    # thread; when OTHER processes saturate the CPU the loop thread is starved and the timer
+    # fires late (7-12s measured 2026-11-07). asyncio.wait_for gives us a second, outer stop
+    # so the handler ALWAYS returns promptly -- and when it trips we say so explicitly rather
+    # than hang or drop the connection.
+    try:
+        payload.update(
+            await asyncio.wait_for(
+                _gather_health_probes(_probes),
+                timeout=_HEALTH_HANDLER_DEADLINE_S,
+            )
+        )
+    except asyncio.TimeoutError:
+        # The loop could not even finish the budgeted gather inside the outer ceiling: the
+        # machine is CPU-bound. Return a TRUTHFUL busy answer immediately. status stays "ok"
+        # (the process is alive and answering) but health_busy tells the fleet gate/cockpit
+        # to back off and retry rather than treat this as a dead server and drop the socket.
+        payload["health_busy"] = True
+        payload["health_degraded"] = True
+        payload["health_handler_deadline_s"] = _HEALTH_HANDLER_DEADLINE_S
     # NOTE: fleet_tool_health.get_summary (fleet_tool_ok / tool_ok) is one of the probes in
     # the _probes list above, so it now runs in the dedicated health pool under the shared
     # deadline like the rest. tool_ok comes from the BRIDGE's idle self-probe and says nothing
@@ -1707,6 +1739,47 @@ except Exception:
 # ----------------------------------------------------------------------------------------
 
 
+def _raise_process_priority() -> None:
+    """Lift THIS server process one scheduling band above normal so the event loop keeps
+    getting CPU time slices even when the machine is CPU-saturated.
+
+    ROOT CAUSE this addresses (incident 2026-11-07, measured 09:29-09:31): GET /health took
+    8.7-29.6s while total CPU was 99.5%. The dedicated /health thread pool (#461/#463) moved
+    the SUB-PROBES off the saturated tool pool, but the /health coroutine itself -- resuming
+    after the 2s deadline, building the JSONResponse, the asyncio timer that fires the
+    deadline -- all run on the single event-loop thread. Under real CPU saturation from OTHER
+    processes (heavy tool work: pwsh_exec, run_python child processes, fleet workers), the
+    Windows scheduler starves that one thread, so a 2s budget stretches to 7-12s wall clock
+    (reproduced locally). Thread-pool isolation cannot fix that -- it is the loop thread
+    itself that is not being scheduled.
+
+    Heavy child work is already launched at BELOW_NORMAL (tools/childproc.py, the preflight
+    probes). Raising the server to ABOVE_NORMAL widens that gap from the other side: the
+    liveness loop wins the scheduler against a saturated machine, so /health and the
+    fleet send-gate stay responsive instead of being misread as a dead server.
+
+    Best-effort and reversible: any failure (no psutil, denied permission, non-Windows)
+    leaves the process at its normal priority and must never stop the server from starting.
+    Opt-out with MCP_RAISE_PRIORITY=0.
+    """
+    if os.environ.get("MCP_RAISE_PRIORITY", "1") == "0":
+        return
+    try:
+        import psutil
+        proc = psutil.Process()
+        if os.name == "nt":
+            target = psutil.ABOVE_NORMAL_PRIORITY_CLASS
+        else:
+            # POSIX: a negative nice is higher priority; -5 mirrors the +band on Windows
+            # without demanding root for the full -20.
+            target = -5
+        proc.nice(target)
+        print("server priority raised: %r" % (target,), flush=True)
+    except Exception as _pri_exc:
+        print("server priority unchanged: %s: %s"
+              % (type(_pri_exc).__name__, _pri_exc), flush=True)
+
+
 def _install_faulthandler() -> None:
     """Dump every thread's stack to a file periodically so a wedged event loop leaves a
     forensic trail. dump_traceback_later(repeat=True) re-arms itself; if the loop is
@@ -2066,6 +2139,7 @@ if __name__ == "__main__":
     # _PROC_START; the matching 'about-to-listen' event is emitted just before uvicorn.run().
     _startup_trace("registration-complete")
     _install_faulthandler()
+    _raise_process_priority()
     _start_approval_watcher()
     try:
         # Jobs pending while nothing drains them (the supervisor is gone) -> restart + alarm.
