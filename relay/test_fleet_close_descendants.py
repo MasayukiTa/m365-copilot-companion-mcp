@@ -76,14 +76,55 @@ def test_running_child_of_a_closed_parent_is_selected_for_cancel():
     assert "w0" not in names              # the parent itself was already cancelled by the loop
 
 
-def test_a_grandchild_two_levels_down_is_still_caught_by_shared_root():
-    # Fan-out can nest: a grandchild carries the root_id of the top ancestor. Closing the
-    # top worker must still reach it, because inheritance runs through the shared ids.
+def test_closing_the_parent_still_cancels_child_and_grandchild():
+    # Closing the TOP of a fan-out tree must reach every live descendant, however deep. The
+    # grandchild names only its immediate parent (task-mid), so the selector has to WALK the
+    # chain: top -> child(task-mid) -> grandchild, not rely on a shared root_id (which would
+    # also sweep in siblings and the parent -- the bug this PR fixes).
     top = _FakeWorker("w0", jid="top", task_id="task-top",
                       campaign_id="camp", root_id="root-top")
-    grandchild = _FakeWorker("w41", parent_task_id="task-mid", root_id="root-top")
-    to_cancel = _select([top], [top, grandchild])
-    assert [w.name for w in to_cancel] == ["w41"]
+    child = _FakeWorker("w10", task_id="task-mid", parent_task_id="task-top",
+                        campaign_id="camp", root_id="root-top")
+    grandchild = _FakeWorker("w41", parent_task_id="task-mid",
+                             campaign_id="camp", root_id="root-top")
+    to_cancel = _select([top], [top, child, grandchild])
+    assert sorted(w.name for w in to_cancel) == ["w10", "w41"]
+
+
+def test_closing_one_child_does_not_cancel_its_sibling_or_its_parent():
+    # THE REVIEW FINDING. Siblings and the parent carry the SAME campaign_id/root_id as the
+    # closed child, so matching on a shared group id would cancel the whole tree from closing
+    # ONE child. Closing a child must cancel ONLY that child's own descendants -- here it has
+    # none -- and must leave its sibling and its parent running.
+    parent = _FakeWorker("w0", jid="parent0", task_id="task0",
+                         campaign_id="camp", root_id="root")
+    child_a = _FakeWorker("w1", task_id="task-a", parent_task_id="task0",
+                          campaign_id="camp", root_id="root")
+    child_b = _FakeWorker("w2", task_id="task-b", parent_task_id="task0",
+                          campaign_id="camp", root_id="root")
+    out = _select([child_a], [parent, child_a, child_b])
+    names = [w.name for w in out]
+    assert "w2" not in names     # the SIBLING is not cancelled
+    assert "w0" not in names     # the PARENT is not cancelled
+    assert out == []             # child_a has no descendants of its own
+
+
+def test_closing_a_child_cancels_only_its_own_grandchild_not_the_tree():
+    # Closing a MIDDLE worker cancels its own subtree (its grandchild) but still spares its
+    # sibling and its parent, even though all four share campaign/root.
+    parent = _FakeWorker("w0", jid="parent0", task_id="task0",
+                         campaign_id="camp", root_id="root")
+    child = _FakeWorker("w1", task_id="task-a", parent_task_id="task0",
+                        campaign_id="camp", root_id="root")
+    sibling = _FakeWorker("w2", task_id="task-b", parent_task_id="task0",
+                          campaign_id="camp", root_id="root")
+    grandchild = _FakeWorker("w9", parent_task_id="task-a",
+                             campaign_id="camp", root_id="root")
+    out = _select([child], [parent, child, sibling, grandchild])
+    names = [w.name for w in out]
+    assert names == ["w9"]       # only child's own descendant
+    assert "w2" not in names     # sibling spared
+    assert "w0" not in names     # parent spared
 
 
 def test_a_terminal_descendant_is_still_returned_but_the_caller_skips_it():
