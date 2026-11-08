@@ -262,24 +262,6 @@ def blocked_jid(state_dir, goal):
     return None
 
 
-def goal_or_worker_ids(obj):
-    """Every id this goal/worker carries that could tie it to a stopped ancestor.
-
-    The union of its OWN identities (jid + fan-out task_id/parent_task_id/campaign_id/
-    root_id, via worker_identities) and the ancestor ids it inherits through
-    (_ancestor_jids). Used to match a still-running descendant against the identities of a
-    worker the operator just closed, WITHOUT touching disk -- an in-memory sibling of
-    blocked_jid for the live-cancel path. De-duplicated, order not significant.
-    """
-    out = []
-    seen = set()
-    for v in list(worker_identities(obj)) + list(_ancestor_jids(obj)):
-        if v and v not in seen:
-            seen.add(v)
-            out.append(v)
-    return out
-
-
 #: A worker's OWN identity -- the ids that name THIS worker, not the group it belongs to.
 #: parent_task_id/campaign_id/root_id are GROUP ids a whole fan-out tree shares, so they are
 #: deliberately NOT here: they belong to the root, not to every member.

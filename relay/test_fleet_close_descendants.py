@@ -167,12 +167,3 @@ def test_each_descendant_is_returned_once_even_if_many_ids_overlap():
                         root_id="root")
     out = _select([parent], [parent, child, child])
     assert [w.name for w in out] == ["w33"]
-
-
-def test_goal_or_worker_ids_unions_own_and_inherited():
-    # The matching helper exposes both a worker's OWN identities and the ancestor ids it
-    # inherits through, de-duplicated -- the disk-free sibling of blocked_jid.
-    child = _FakeWorker("w33", parent_task_id="task0", campaign_id="camp-offC",
-                        root_id="root-offC")
-    ids = set(tomb.goal_or_worker_ids(child))
-    assert {"task0", "camp-offC", "root-offC"} <= ids
