@@ -2413,12 +2413,39 @@ class _MEMORYSTATUSEX(ctypes.Structure):
                 ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
 
 
+#: GlobalMemoryStatusEx is prototyped ONCE at import, not re-resolved per call. The old code
+#: reached it as ctypes.windll.kernel32.GlobalMemoryStatusEx inside a function called from
+#: several fleet worker threads at once (the admission loop, autoscale and should_recycle all
+#: poll avail_phys_mb()). Two faults rode on that:
+#:   1. ctypes.windll is a lazy attribute cache; two threads racing the FIRST attribute access
+#:      build the FFI prototype concurrently, which is not thread-safe.
+#:   2. With no argtypes, ctypes treats the byref(m) pointer as a C int and can truncate it on
+#:      Win64, so GlobalMemoryStatusEx writes nine 8-byte fields through a mangled pointer --
+#:      a heap write past our structure, i.e. the 0xc0000005 / 0xc0000374 python310.dll
+#:      corruption seen crashing python.exe on 2026-11-07.
+#: A single pre-bound WinDLL handle with explicit argtypes/restype removes both: the prototype
+#: exists before any worker runs, and the pointer is passed full-width. Guarded by os.name so
+#: the import is harmless on the Linux CI runner.
+_GlobalMemoryStatusEx = None
+if os.name == "nt":
+    try:
+        _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _GlobalMemoryStatusEx = _kernel32.GlobalMemoryStatusEx
+        _GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMORYSTATUSEX)]
+        _GlobalMemoryStatusEx.restype = ctypes.c_int  # BOOL
+    except Exception:
+        _GlobalMemoryStatusEx = None
+
+
 def avail_phys_mb() -> float:
     """Available physical memory in MB (Windows). Best-effort; ~4 GB on failure."""
+    if _GlobalMemoryStatusEx is None:
+        return 4096.0
     try:
         m = _MEMORYSTATUSEX()
         m.dwLength = ctypes.sizeof(m)
-        ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m))
+        if not _GlobalMemoryStatusEx(ctypes.byref(m)):
+            return 4096.0
         return m.ullAvailPhys / (1024.0 * 1024.0)
     except Exception:
         return 4096.0

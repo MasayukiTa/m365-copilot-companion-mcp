@@ -12,11 +12,13 @@
 #       backslash semantics that do not match pathlib on Linux.
 #
 # NOTE ON LINUX PORTABILITY:
-#   relay/relay_fleet.py uses ctypes.windll.kernel32.GlobalMemoryStatusEx, but
-#   only inside avail_phys_mb() wrapped in try/except (falls back to 4096 MB).
-#   The hermetic tests all monkeypatch that function, so the fallback is never
-#   even reached. pywin32 has a sys_platform=="win32" marker in mcp's metadata,
-#   so it is not installed on Linux.
+#   relay/relay_fleet.py calls GlobalMemoryStatusEx inside avail_phys_mb(), but the
+#   handle is pre-bound only when os.name == "nt" and is None elsewhere, so on Linux
+#   the function falls back to 4096 MB without touching the WinAPI. The hermetic tests
+#   mostly monkeypatch that function; test_memstatus_ctypes_threadsafe.py exercises the
+#   Linux fallback path directly and asserts on source shape, never the native call.
+#   pywin32 has a sys_platform=="win32" marker in mcp's metadata, so it is not installed
+#   on Linux.
 
 name: CI
 
@@ -911,6 +913,7 @@ jobs:
             relay/selfimprove/test_archive_publish_guard.py \
             relay/selfimprove/test_run_archive.py \
             relay/test_fleet_ram_floor.py \
+            relay/test_memstatus_ctypes_threadsafe.py \
             relay/selfimprove/test_pending.py \
             relay/selfimprove/test_a_card_whose_premise_is_gone_says_so.py \
             relay/selfimprove/test_memory_population.py \
