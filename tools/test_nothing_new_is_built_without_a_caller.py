@@ -58,6 +58,12 @@ NO_CALLER_NO_TEST = {
     "relay/autonomy_gate.py::constraints_text",                  # 5 lines
     "relay/review_resilience.py::looks_like_capability_failure", # 2 lines
     "relay/review_resilience.py::looks_like_output_filter",      # 2 lines
+    # DATA-OPENING LEDGER record API (PR 431, relay/data_access_ledger.py), 1/7. The whole
+    # module is defined and tested but has no production caller yet; its writer (the harness
+    # fetch-time hook) and its reader (relay/judge_gate.py's independence check) are later parts.
+    # append_row is the one function with NO TEST OF ITS OWN: the contract tests append through
+    # record_access, so nothing names append_row directly. See docs/unreached_burndown.md.
+    "relay/data_access_ledger.py::append_row",                    # 12 lines, reached only via record_access
 }
 
 #: Called by nothing outside tests. Tests referencing a function say it was worth writing; they
@@ -168,6 +174,18 @@ NO_CALLER_BUT_TESTED = {
     "relay/fleet_tombstone.py::remove_tombstone",                 # 20 lines, test refs
     "relay/fleet_tombstone.py::tombstone_reason",                 # 12 lines, test refs
     "relay/fleet_tombstone.py::tombstoned_jids",                  # 12 lines, test refs
+    # DATA-OPENING LEDGER record API (PR 431, relay/data_access_ledger.py), 1/7. Defined and
+    # exercised by relay/test_data_access_ledger.py, with no production caller yet -- the harness
+    # fetch-time hook (writer) and relay/judge_gate.py's independence check (reader) are later
+    # parts of this seven-part change. Kept unwired on purpose; see docs/unreached_burndown.md.
+    # append_row is in NO_CALLER_NO_TEST above: nothing references it directly, in test or prod.
+    "relay/data_access_ledger.py::record_access",                 # 46 lines, test refs
+    "relay/data_access_ledger.py::build_row",                     # 50 lines, test refs
+    "relay/data_access_ledger.py::read_ledger",                   # 21 lines, test refs
+    "relay/data_access_ledger.py::iter_openings",                 # 14 lines, test refs
+    "relay/data_access_ledger.py::init_ledger",                   # 15 lines, test refs
+    "relay/data_access_ledger.py::ledger_path",                   # 10 lines, test refs
+    "relay/data_access_ledger.py::lots_sha256",                   # 9 lines, test refs
 }
 
 BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
@@ -404,6 +422,21 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/fleet_tombstone.py::remove_tombstone": ("deliberate", "docs/unreached_burndown.md"),
     "relay/fleet_tombstone.py::tombstone_reason": ("deliberate", "docs/unreached_burndown.md"),
     "relay/fleet_tombstone.py::tombstoned_jids": ("deliberate", "docs/unreached_burndown.md"),
+
+    # DATA-OPENING LEDGER record API (PR 431, relay/data_access_ledger.py), 1/7. The module
+    # records data openings so a later independence check can see a confirmation that read
+    # already-opened lots; it relaxes no threshold. The API + init + contract tests land in this
+    # part; the writer (harness fetch-time hook) and the reader (relay/judge_gate.py) are later
+    # parts, so every public function is unwired on purpose. See docs/unreached_burndown.md,
+    # "PR 431 -- data-opening ledger record API", which names each one.
+    "relay/data_access_ledger.py::record_access": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::append_row": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::build_row": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::init_ledger": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::ledger_path": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::lots_sha256": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::read_ledger": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/data_access_ledger.py::iter_openings": ("deliberate", "docs/unreached_burndown.md"),
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.
