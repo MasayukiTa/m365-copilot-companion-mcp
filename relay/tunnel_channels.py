@@ -14,7 +14,7 @@ record of whether the PC end actually answered a request.
 
 This module does two things, both pure enough to test without a tunnel:
 
-* :func:`parse_channel_events` reads the ts-stamped log that
+* :func:`parse_channel_events` / :func:`analyze_log` read the ts-stamped log that
   :mod:`relay.tunnel_host_log` writes and yield one dict per *closed* channel:
   time, channel id, sent/received bytes, who closed first, open time and duration,
   plus the two flags ``no_response`` and ``remote_closed_early``.
@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
 import time
 
 # A ts-stamped line written by relay.tunnel_host_log looks like:
@@ -166,6 +167,15 @@ def parse_channel_events(lines):
         yield rec
 
 
+def analyze_log(path):
+    """Read a whole ts log file and return the list of close records. [] if absent."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as fh:
+            return list(parse_channel_events(fh))
+    except FileNotFoundError:
+        return []
+
+
 def append_new_records(log_path, jsonl_path, offset_path=None):
     """Tail ``log_path`` from a remembered byte offset, append new close records to
     ``jsonl_path`` (one JSON object per line), and persist the new offset.
@@ -243,3 +253,29 @@ def health_counts(jsonl_path, now=None, window_s=600):
         "tunnel_no_response": no_resp,
         "tunnel_remote_closed_early": remote_early,
     }
+
+
+def _main(argv=None):
+    """One-shot analysis of a ts-stamped tunnel host log, for diagnostics.
+
+    ``python -m relay.tunnel_channels <log-path>`` reads the whole log with
+    :func:`analyze_log` and prints one JSON object per closed channel -- the same records the
+    tailing path appends to tunnel_channels.jsonl. This is the off-line counterpart to the
+    live /health path: once a run has ended there is no reader to tail, and the whole file is
+    what you have. Returns 0 even on an absent log (prints nothing), so a wrapper can call it
+    unconditionally.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="relay.tunnel_channels",
+        description="Print one JSON record per closed channel from a tunnel host log.")
+    parser.add_argument("log_path", help="path to the ts-stamped tunnel host log")
+    args = parser.parse_args(argv)
+    for rec in analyze_log(args.log_path):
+        sys.stdout.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover - CLI entry
+    sys.exit(_main())
