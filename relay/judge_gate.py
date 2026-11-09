@@ -37,13 +37,15 @@ import sys
 import time
 
 try:
-    from relay.task_kind import task_kind, DATA_QUERY
+    from relay.task_kind import task_kind, DATA_QUERY, product_label
 except Exception:  # pragma: no cover - allow flat import when run as a script
-    from task_kind import task_kind, DATA_QUERY  # type: ignore
+    from task_kind import task_kind, DATA_QUERY, product_label  # type: ignore
 
 __all__ = [
     "is_data_analysis_goal",
     "build_judge_footer",
+    "design_check_result",
+    "format_design_check_footer",
     "run_engine_judge",
     "judge_result_pointer",
     "ENGINE_ROOT",
@@ -546,6 +548,146 @@ def _validate_lot(lot) -> str:
     return ""
 
 
+# --- design check: stratifier presence + per-exposure-group product skew ------
+#
+# WHY THIS EXISTS. An example confirmation returned order_ok=true / GO, but the comparison did not
+# hold the product (the deployment's product/stratum column; see .config/domain_terms.json
+# "product_label") fixed across the exposure groups, so the GO was not adoptable. order_ok only
+# checks the clock order of registration vs data fetch;
+# it says nothing about whether the design controlled for product. This block READS a
+# worker-supplied `design_check` section and reports two facts the reader needs to judge the
+# design -- it NEVER changes the engine verdict and NEVER loosens order_ok. It only ADDS
+# information to the judge footer / judge_result.json.
+#
+# FIELD NAMESPACE. Results are emitted under the single key `design_check` so this block does
+# not collide with any field the separate confound_gate owner adds; the two can be merged by key
+# without overwriting each other. (As of this change confound_gate has no implementation in the
+# repository, so there is no existing field shape to mirror; `design_check` is deliberately a
+# self-contained sub-object.)
+#
+# INPUT (all optional; the section itself is optional and omission is allowed, not an error):
+#   design_check = {
+#     "stratifier_columns": [<column name>, ...],   # columns the analysis stratified / blocked on
+#     "exposure_groups": {                          # per exposure group, a product->count map
+#       "<group label>": {"<product name>": <int count>, ...}, ...
+#     }
+#   }
+# No measurement rows, no employee ids -- only column names, product labels and counts.
+
+def _validate_design_check(dc) -> str:
+    """'' when the design_check section is usable; else a message naming the EXACT bad field.
+
+    Both sub-fields are optional individually, but when present they must have the right shape:
+    stratifier_columns a list of strings; exposure_groups an object whose every value is an
+    object mapping product label (string) to a non-negative integer count.
+    """
+    if not isinstance(dc, dict):
+        return "design_check must be an object, got %s" % _short_type(dc)
+    strat = dc.get("stratifier_columns")
+    if strat is not None:
+        if not isinstance(strat, list) or not all(isinstance(c, str) for c in strat):
+            return ("design_check.stratifier_columns must be an array of strings, got %s"
+                    % _short_type(strat))
+    groups = dc.get("exposure_groups")
+    if groups is not None:
+        if not isinstance(groups, dict):
+            return ("design_check.exposure_groups must be an object mapping each exposure group "
+                    "label to a {product: count} object, got %s" % _short_type(groups))
+        for label, counts in groups.items():
+            if not isinstance(counts, dict):
+                return ("design_check.exposure_groups[%r] must be a {product: count} object, "
+                        "got %s" % (label, _short_type(counts)))
+            for prod, n in counts.items():
+                if not isinstance(prod, str):
+                    return ("design_check.exposure_groups[%r] has a non-string product key %s"
+                            % (label, _short_type(prod)))
+                if isinstance(n, bool) or not isinstance(n, int) or n < 0:
+                    return ("design_check.exposure_groups[%r][%r] must be a non-negative "
+                            "integer count, got %s" % (label, prod, _short_type(n)))
+    return ""
+
+
+def design_check_result(dc) -> dict:
+    """Compute the design-check fields from a VALIDATED design_check section.
+
+    Returns a self-contained object under which the footer / judge_result.json carry the design
+    facts. Pure and side-effect free; it reads only the supplied section (already validated by
+    _validate_design_check) and never touches the engine verdict. Fields:
+
+      stratifier_present : bool  -- whether the analysis declared at least one stratifier column.
+      stratifier_columns : [str] -- the declared columns (empty when none).
+      exposure_groups    : [str] -- the exposure-group labels seen (sorted).
+      product_skew: per group, the dominant product and its share, plus a repo-level flag
+        `products_aligned` that is True only when every exposure group shares an identical set of
+        products (the condition a misaligned comparison violated). `skew_detected` is its negation.
+
+    This reports; it does not decide the verdict. The harness surfaces skew so a human (and the
+    separate confound_gate) can see that the groups were not matched on product.
+    """
+    strat = list(dc.get("stratifier_columns") or [])
+    groups = dc.get("exposure_groups") or {}
+    out = {
+        "stratifier_present": bool(strat),
+        "stratifier_columns": strat,
+        "exposure_groups": sorted(groups.keys()),
+    }
+    per_group = {}
+    product_sets = []
+    for label in sorted(groups.keys()):
+        counts = groups[label] or {}
+        total = sum(counts.values())
+        if total <= 0:
+            per_group[label] = {"total": 0, "dominant_product": None, "dominant_share": None}
+            product_sets.append(frozenset())
+            continue
+        dom_prod, dom_n = max(counts.items(), key=lambda kv: (kv[1], kv[0]))
+        per_group[label] = {
+            "total": total,
+            "dominant_product": dom_prod,
+            "dominant_share": round(dom_n / total, 4),
+        }
+        product_sets.append(frozenset(p for p, n in counts.items() if n > 0))
+    non_empty = [s for s in product_sets if s]
+    products_aligned = bool(non_empty) and all(s == non_empty[0] for s in non_empty)
+    out["product_skew"] = {
+        "per_group": per_group,
+        "products_aligned": products_aligned if groups else None,
+        "skew_detected": (not products_aligned) if groups else None,
+    }
+    return out
+
+
+def format_design_check_footer(dc_result) -> list:
+    """Footer lines for a computed design-check result. [] when there is nothing to report.
+
+    The shape is deliberately a labelled block so it reads next to the engine verdict and lines
+    up with whatever confound_gate later emits under the same `design_check` key.
+    """
+    if not isinstance(dc_result, dict) or not dc_result:
+        return []
+    term = product_label()
+    lines = ["設計検査(design check):"]
+    cols = dc_result.get("stratifier_columns") or []
+    lines.append("  層別列: %s" % (", ".join(cols) if cols else "なし"))
+    skew = dc_result.get("product_skew") or {}
+    per_group = skew.get("per_group") or {}
+    if per_group:
+        for label in sorted(per_group.keys()):
+            g = per_group[label]
+            if g.get("dominant_product") is None:
+                lines.append("  曝露群 %s: %sデータなし" % (label, term))
+            else:
+                lines.append("  曝露群 %s: 主要%s=%s (占有率 %.1f%%, n=%d)" % (
+                    label, term, g["dominant_product"], 100.0 * g["dominant_share"], g["total"]))
+        aligned = skew.get("products_aligned")
+        if aligned is True:
+            lines.append("  %sの偏り: 曝露群間で%s構成は一致(揃っている)" % (term, term))
+        elif aligned is False:
+            lines.append("  %sの偏り: 曝露群間で%s構成が不一致。比較が%sをそろえていない"
+                         "恐れ(採用前に要確認)" % (term, term, term))
+    return lines
+
+
 def complete_judge_request(goal, output_folder, *, strict=False, request_text="",
                            tool_names=(), correction_budget=None, correction_attempt=0):
     """Evaluate the worker's request at completion.
@@ -724,6 +866,28 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
             # is none. Say so plainly rather than skip silently.
             statuses.append("confirm independence: not run: no registration order_record "
                             "(a trusted registered_at is required to judge independence)")
+        # DESIGN CHECK (this change). Optional section. When present it is validated like the
+        # others (a bad shape is a worker-correctable field problem); when valid it is computed
+        # into `design_check_computed` and later ADDED to the footer / judge_result.json under the
+        # `design_check` key. It never changes the engine verdict and never loosens order_ok --
+        # it only surfaces whether the analysis stratified and whether the exposure groups held
+        # the product fixed, which is what a misaligned comparison fails to do.
+        design_check_computed = None
+        dc_section = request.get("design_check")
+        if dc_section is None:
+            pass  # omitted on purpose: allowed, not an error
+        else:
+            bad = _validate_design_check(dc_section)
+            if bad:
+                statuses.append("design check: not run: %s" % bad)
+                corrections.append(bad)
+            else:
+                try:
+                    design_check_computed = design_check_result(dc_section)
+                    statuses.append("design check: "
+                                    + json.dumps(design_check_computed, ensure_ascii=False))
+                except (ValueError, TypeError) as e:
+                    statuses.append("design check: not run: %s" % e)
         # A BOUNDED CORRECTION TURN, BEFORE THE ENGINE RUNS. If a section was PRESENT but has a
         # field-level problem the worker can fix (wrong type/shape, or a claim id mismatch), and
         # the caller gave a budget that is not yet spent, hand the specific messages + schema back
@@ -872,6 +1036,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
                                     order_record=order_record,
+                                    design_check=design_check_computed,
                                     design_feasibility=design)
         full_text = "judge: requested\n" + "\n".join(statuses) + "\n" + footer
         # THE DURABLE RECORD COMES FROM HERE, NOT FROM THE WORKER. The worker used to run this
@@ -885,7 +1050,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         _write_judge_result(
             output_folder, claim_id=claim_id, statuses=statuses, footer=footer,
             verdict=verdict, engine_available=engine_available, order_record=order_record,
-            design_feasibility=design)
+            design_check=design_check_computed, design_feasibility=design)
         # BUDGET EXHAUSTED WITH THE REQUEST STILL INVALID. The correction turns were spent and a
         # fixable field problem remains: the completion marker names it, and under strict the job
         # is rejected (VERIFY_FAILED). A valid request whose only issue is an unavailable engine
@@ -1002,7 +1167,8 @@ def _engine_status_line(verdict: dict, engine_available: bool) -> str:
 
 
 def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
-                        engine_available, order_record, design_feasibility=None) -> str:
+                        engine_available, order_record, design_check=None,
+                        design_feasibility=None) -> str:
     """Write the authoritative judge record next to the job output and return a short pointer.
 
     Stores judge_result.json = {status, engine_available, engine_status, verdict-or-reason,
@@ -1051,6 +1217,7 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
                                      if isinstance(verdict, dict) else None)),
         "order": order_record,
         "post_hoc": post_hoc or None,
+        "design_check": design_check,
         "design_feasibility_hold": hold,
         "final_display": final_display,
         "statuses": list(statuses),
@@ -1280,7 +1447,7 @@ def _fmt_n(ev: dict) -> str:
 # `design_check` footer section (feat/judge-footer-design-check) ADDS what it saw
 # about the comparison design but changes nothing about the verdict. The owner
 # (2026-11-04 07:45) said that is not enough: when groups being compared differ by
-# PRODUCT (the grouping column's product value) rather than by the exposure under study, the comparison is not
+# PRODUCT (the deployment's product/stratum column; see .config/domain_terms.json "product_label") rather than by the exposure under study, the comparison is not
 # a comparison at all (equipment-vs-product cannot be separated), and that must be
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
 # inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
@@ -1312,7 +1479,7 @@ def _fmt_n(ev: dict) -> str:
 #: machine code. An unknown code is still surfaced verbatim (never swallowed).
 _DESIGN_INFEASIBLE_REASONS = {
     "STRATUM_COLUMN_ABSENT":
-        "層別の候補列(製品または設備を表すグループ列、ライン、期間など)が入力に無い",
+        "層別の候補列(製品・品種、ライン、期間など)が入力に無い",
     "NO_COMMON_STRATUM":
         "両群に共通の層(grouping level)が無い(群を分ける属性の差か設備の差か分けられない)",
     "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
@@ -1390,6 +1557,7 @@ def _design_hold_lines(hold: dict) -> list:
 
 def build_judge_footer(*, verdict: dict | None, engine_available: bool,
                        unavailable_reason: str = "", order_record: dict | None = None,
+                       design_check: dict | None = None,
                        design_feasibility: dict | None = None) -> str:
     """Compose the block appended to a data-analysis final answer.
 
@@ -1398,7 +1566,13 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
     When it did NOT run: states that the judge did NOT run and WHY (never silently omitted).
     Language is bounded by the skill's (e): a verdict is 'judgeable', never 'proven'/'correct'.
 
-    DESIGN FORCE-HOLD (this slice). When `design_feasibility` reports the comparison
+    When a `design_check` result is supplied, its lines are added to BOTH branches
+    (engine ran / engine did not run) because the design facts -- whether the analysis stratified,
+    and whether the exposure groups held the product fixed -- are information the reader needs
+    regardless of the engine verdict. The design check NEVER changes the verdict and NEVER
+    loosens order_ok; it only adds information.
+
+    DESIGN FORCE-HOLD. When `design_feasibility` reports the comparison
     design is INFEASIBLE (feasible is False), the FINAL DISPLAY is forced to
     DESIGN_HOLD_DISPLAY: the footer LEADS with a hold banner naming the reason code and
     what was seen (common strata, per-group lot counts, overlap coefficient), then
@@ -1446,6 +1620,8 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
                     _seen.get("n_common_strata"), _seen.get("k_min"),
                     _seen.get("n_common_strata_covered"),
                     float(_seen.get("overlap_coefficient") or 0.0)))
+    # Design check lines go here so they appear whether or not the engine ran below.
+    lines.extend(format_design_check_footer(design_check))
     if not engine_available or not verdict:
         reason = unavailable_reason or (
             verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"

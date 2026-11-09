@@ -82,6 +82,32 @@ def _data_query_markers():
     return builtin + _load_local_data_source_terms()
 
 
+#: The generic word public code uses for the thing a comparison must hold fixed across groups.
+#: A deployment whose data names that thing specifically (e.g. a particular kind of product
+#: catalogue column) puts its own word in .config/domain_terms.json under "product_label"; the
+#: public default is this generic term, so no deployment's vocabulary ships in the repo.
+_DEFAULT_PRODUCT_LABEL = "\u88fd\u54c1"  # "製品" (product)
+
+
+def product_label():
+    """The word for the product/stratum a design must hold fixed, from .config/domain_terms.json.
+
+    Reads the optional local config's "product_label" string and returns it when it is a
+    non-empty string; otherwise returns the generic built-in default ("製品"). A missing,
+    unreadable, or malformed file yields the default rather than an error, so public code never
+    carries a deployment's own column name and never breaks on a bad local file.
+    """
+    try:
+        with open(_DOMAIN_TERMS_FILE, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+    except (OSError, ValueError):
+        return _DEFAULT_PRODUCT_LABEL
+    term = data.get("product_label") if isinstance(data, dict) else None
+    if isinstance(term, str) and term.strip():
+        return term.strip()
+    return _DEFAULT_PRODUCT_LABEL
+
+
 #: (label, markers) in priority order. Markers are matched against the casefolded goal text.
 #: Order matters: a code task that mentions a database, or a database task that names a repo
 #: path, must land on its own kind, so the narrower kinds come first.
