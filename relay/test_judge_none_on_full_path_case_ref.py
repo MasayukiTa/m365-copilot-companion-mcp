@@ -6,7 +6,7 @@ The real goal was an absolute Downloads path to the case folder followed by 「�
 things went wrong and both are pinned here:
   (1) case_reference_search did not recognise the full-path shape, so the request file was never
       read and is_data_analysis_goal classified the goal (text only) as non-analysis. After the
-      fix the resolved request text (which names DBB) classifies it as data analysis.
+      fix the resolved request text (which names database) classifies it as data analysis.
   (2) nothing stopped a DONE that never opened the resolved request file. _settle_done now
       refuses a DONE when a request_path was resolved but no content-reading tool ran.
 """
@@ -15,7 +15,7 @@ from relay.relay_fleet import RelayWorker
 from relay import judge_gate
 from tools import search_ops
 
-CASE_NAME = "枝さん_679かすれ調査"
+CASE_NAME = "sample_12_dataset"
 
 
 def _full_path_goal(tmp_path):
@@ -30,9 +30,9 @@ def _make_case(tmp_path, body):
 
 
 def test_full_path_goal_is_classified_by_the_request_file_content(tmp_path, monkeypatch):
-    # The goal text alone has no data-analysis marker; the request file names DBB. The
+    # The goal text alone has no data-analysis marker; the request file names database. The
     # resolved request must make is_data_analysis_goal true.
-    _make_case(tmp_path, "DBBデータを参照してかすれの原因を調べる")
+    _make_case(tmp_path, "query the sales database for the defect table")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
@@ -40,14 +40,14 @@ def test_full_path_goal_is_classified_by_the_request_file_content(tmp_path, monk
     worker = RelayWorker(goal, "fullpath-test")
     # Identity preserved; request file content present in the prompt and in the judge input.
     assert worker.goal == goal
-    assert "DBB" in worker._judge_request_text
+    assert "database" in worker._judge_request_text
     assert judge_gate.is_data_analysis_goal(worker.goal, worker._judge_request_text)
     # The composed goal carries the resolved request path (so the worker is told to read it).
     assert str(tmp_path / CASE_NAME / "やりたいこと.txt") in worker.job
 
 
 def test_done_is_refused_when_resolved_request_file_was_never_read(tmp_path, monkeypatch):
-    _make_case(tmp_path, "DBBデータを参照")
+    _make_case(tmp_path, "query the sales database")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
@@ -63,7 +63,7 @@ def test_done_is_refused_when_resolved_request_file_was_never_read(tmp_path, mon
 
 
 def test_done_proceeds_when_the_request_file_was_read(tmp_path, monkeypatch):
-    _make_case(tmp_path, "DBBデータを参照")
+    _make_case(tmp_path, "query the sales database")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
@@ -85,7 +85,7 @@ def test_unread_gate_does_not_fire_without_a_resolved_case(tmp_path, monkeypatch
 def test_unread_gate_is_inert_when_ledger_cannot_attribute(tmp_path, monkeypatch):
     # Empty attribution set AND no live attribution means the ledger cannot say -- a measurement
     # that cannot see must not fail the work. The gate must not fire on genuine no-evidence.
-    _make_case(tmp_path, "DBB")
+    _make_case(tmp_path, "query the database")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
@@ -101,7 +101,7 @@ def test_unread_gate_fires_on_a_true_no_op_when_attribution_is_live(tmp_path, mo
     # attributed set is empty -- but the ledger IS recording and this worker's session IS bound
     # (attribution_is_live True). An empty slice then means "this worker ran nothing", which for
     # a resolved case reference proves the request file was never read. The gate MUST fire.
-    _make_case(tmp_path, "DBB")
+    _make_case(tmp_path, "query the database")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
@@ -115,7 +115,7 @@ def test_unread_gate_fires_on_a_true_no_op_when_attribution_is_live(tmp_path, mo
 def test_no_op_done_is_refused_end_to_end_when_attribution_is_live(tmp_path, monkeypatch):
     # The same production no-op, driven through _settle_done: a DONE that ran no tool at all on a
     # resolved case reference must be refused, not reported DONE.
-    _make_case(tmp_path, "DBBデータを参照")
+    _make_case(tmp_path, "query the sales database")
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search",
                         lambda goal: real(goal, [tmp_path]))
