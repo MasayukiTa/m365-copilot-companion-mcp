@@ -41,18 +41,39 @@
 
 - PR. #461 (branch `fix/gwslow-health-pool`, off `origin/main` @ 9ff412b0).
 
-### 2026-11-07 (later, UTC) - post-deploy verification on the production PC
+### 2026-11-07 (later, UTC) - production verification, corrected
 
-- Confirmed in production. Before the deployed server picked up #461, the live process
-  (`server_head=dd5b5acb`, which does NOT contain #461) served `GET /health` in 15.7-41.1s under
-  CPU=100%, while the c2c-bridge `/health` answered in 3-6ms at the same instant -- isolating the
-  slowness to the MCP server's probe path, not the network or CPU per se. After the supervisor
-  cycled the server onto the merged code (`server_uptime_s=106`, i.e. the restart was the
-  supervisor's own, not a manual kill), live `GET /health` returned in 2.20s / 2.02s / 2.06s --
-  pinned at the 2.0s `_HEALTH_PROBE_BUDGET_S` deadline, i.e. the dedicated-pool + shared-budget
-  path is live and working.
-- Tests re-run green on `origin/main` @ 442e37d1 (includes #461):
-  `scripts/test_health_probe_isolation.py` 8 passed.
+- How the fix is actually live. The listening server on 127.0.0.1:8000 is pid 26916
+  (`python main.py`, cwd `<prod-checkout>`). That checkout is on branch
+  `feat/judge-gate-confirm-overlap-order` at HEAD `dd5b5acb`, and `git status` shows `main.py` as an
+  UNCOMMITTED working-tree modification (`M main.py`). That modified `main.py` already contains
+  `_HEALTH_POOL`, `_gather_health_probes`, `_HEALTH_PROBE_BUDGET_S`, `server_uptime_s` (plus newer
+  `resp_total_10m`/`resp_inflight` fields). So the dedicated-pool + deadline fix is live in
+  production via an un-committed working-tree edit of `main.py`, NOT via the HEAD being on the
+  merged code: `dd5b5acb` does NOT contain the #461 merge commit `eeaa1994`
+  (`git merge-base --is-ancestor eeaa1994 dd5b5acb` -> NO).
+- Measured now on the live server: `GET /health` 2038 / 2089 / 2084 / 2049 / 2104 ms, pinned at the
+  2.0s budget -- confirming the dedicated-pool + shared-budget path is what is running. c2c-bridge
+  stayed in the low-ms range. Earlier "2.20/2.02/2.06s on merged code" phrasing was imprecise: the
+  running code is the working-tree edit, and `origin/main` (which DOES contain #461 `eeaa1994`) is
+  the committed home of the same fix.
+- Tests: `scripts/test_health_probe_isolation.py` 8 passed on `origin/main` (contains #461).
 - Non-destructive: no process/tool/browser was killed; the production checkout and its running
-  process were left untouched. Verification ran in a throwaway worktree off `origin/main`.
+  process were left untouched.
 
+### The pre-existing `health-threadpool-isolate` worktree -- merged? why it did not prevent this
+
+- There is a pre-existing worktree `<prod-checkout>/.claude/worktrees/health-threadpool-isolate`
+  on branch `fix/health-liveness-own-executor`, HEAD `27a511af` (same title: "run /health sub-probes
+  in a dedicated pool under a deadline").
+- NOT merged. `git merge-base --is-ancestor 27a511af origin/main` -> NO. Its tree `b36f16b9` differs
+  from the merged #461 tree (`eeaa1994` -> `a46963f3`). #461 was landed from a separate branch
+  `fix/gwslow-health-pool` (head `11ed8ec9`, squash/rebase-merged as `eeaa1994`), so `27a511af`
+  itself never reached `origin/main`.
+- Why it did not prevent the outage. Because `fix/health-liveness-own-executor` (27a511af) stayed an
+  un-merged side worktree, the running production server kept serving the OLD `/health` that
+  dispatched heavy sub-probes onto the shared default ThreadPoolExecutor. The isolation/deadline fix
+  existed only in that worktree, so under tool-pool saturation `/health` still starved (15-41s) and
+  the fleet send-gate misread it as a dead server. The outage was only prevented once equivalent
+  code was actually applied to the running `main.py` (now live as the uncommitted working-tree edit
+  above) and landed on `origin/main` via #461.
