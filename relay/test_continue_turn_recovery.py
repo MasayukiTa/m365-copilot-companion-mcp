@@ -215,6 +215,10 @@ def test_mode_off_changes_nothing_on_the_wire_or_in_the_refusal(tmp_path, monkey
     # この PR で既定が on になったので、キー無し(None)はもう off ではない。off の挙動
     # (記録を持たず、送信文に参照番号を足さない)を検証するには、明示的に off を書く。
     _mode(tmp_path, monkeypatch, "off")                      # 明示 off
+    # この PR で resume_from_state が既定 on になった。ここは continue_recovery の socket 拒否
+    # 契約を固定するテストなので、新機能は off にして旧来の refuse-to-STUCK を確かめる。
+    from relay import resume_from_state as _RFS
+    monkeypatch.setattr(_RFS, "enabled", lambda path=None: False)
     tools = _Tools()
     A, connect, drv = _cut_after_one_call(tools)
     _run(drv, "THE-JOB")
@@ -600,6 +604,9 @@ def _executed_but_not_known_to_have_landed(tmp_path, monkeypatch, *, used):
 
 def test_executed_calls_with_a_refused_plan_are_not_resent_on_the_socket(tmp_path, monkeypatch):
     from relay import continue_recovery as CR
+    # socket 拒否契約のテスト。resume_from_state(既定 on)はここでは off にして旧挙動を固定。
+    from relay import resume_from_state as _RFS
+    monkeypatch.setattr(_RFS, "enabled", lambda path=None: False)
     tools, route, w, reason = _executed_but_not_known_to_have_landed(
         tmp_path, monkeypatch, used=CR.MAX_CONTINUES_PER_GOAL)
     assert w._retry_socket(reason) is False

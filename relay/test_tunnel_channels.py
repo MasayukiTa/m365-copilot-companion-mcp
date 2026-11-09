@@ -239,3 +239,41 @@ def test_concurrent_reads_during_appends_never_corrupt(tmp_path):
     # Final snapshot must be internally consistent: every appended channel is counted.
     final = tc.health_counts(str(jsonl), now=time.time(), window_s=10 ** 9)
     assert final["tunnel_channels"] == n_records
+
+
+def test_health_counts_large_file_reads_recent_tail_quickly(tmp_path):
+    path = tmp_path / "large.jsonl"
+    now = 2_000_000
+    old = (json.dumps({"time": now - 1000, "padding": "x" * 760}) + "\n").encode()
+    recent = (json.dumps({"time": now - 10, "no_response": True}) + "\n").encode()
+    with path.open("wb") as fh:
+        batch = old * 1000
+        for _ in range(400):
+            fh.write(batch)
+        fh.write(recent * 12)
+    start = time.perf_counter()
+    counts = tc.health_counts(str(path), now=now)
+    elapsed = time.perf_counter() - start
+    assert counts == {"tunnel_channels": 12, "tunnel_no_response": 12,
+                      "tunnel_remote_closed_early": 0}
+    assert elapsed < 1.0, f"tail read took {elapsed:.3f}s"
+
+
+def test_health_counts_null_time_and_incomplete_last_line(tmp_path):
+    path = tmp_path / "partial.jsonl"
+    path.write_text('{"time": null, "no_response": true}\n'
+                    '{"time": "unusable"}\n{"time":', encoding="utf-8")
+    assert tc.health_counts(str(path), now=1000) == {
+        "tunnel_channels": 2, "tunnel_no_response": 1,
+        "tunnel_remote_closed_early": 0}
+
+
+def test_health_counts_large_window_still_caps_tail(tmp_path):
+    path = tmp_path / "capped.jsonl"
+    row = b'{"time": 1, "padding": "' + b'x' * 1000 + b'"}\n'
+    with path.open("wb") as fh:
+        for _ in range(34):
+            fh.write(row * 1024)
+    lines = tc._recent_lines(path, cutoff=-10**10)
+    assert sum(len(line.encode()) + 1 for line in lines) <= 32 * 1024 * 1024
+    assert 0 < tc.health_counts(str(path), now=1000, window_s=10**10)["tunnel_channels"] < 34 * 1024
