@@ -39,8 +39,8 @@ from relay.relay_fleet import RelayWorker  # noqa: E402
 
 def test_unwrap_arg_unwraps_the_ledger_text_wrapper():
     # The ordinary bounded wrapper the ledger stores for a string arg.
-    assert RelayWorker._unwrap_arg({"text": "kasure rho = 0.271", "len": 18}) == \
-        "kasure rho = 0.271"
+    assert RelayWorker._unwrap_arg({"text": "defectA rho = 0.271", "len": 18}) == \
+        "defectA rho = 0.271"
 
 
 def test_unwrap_arg_leaves_a_bare_string_untouched():

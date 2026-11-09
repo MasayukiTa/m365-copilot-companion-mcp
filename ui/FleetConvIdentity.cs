@@ -116,7 +116,7 @@ static class FleetConvIdentity
 
     // ---- WHICH CONVERSATION A TRANSCRIPT BELONGS TO (2026-10-23) -------------------------------
     //
-    // MEASURED: opening the DBB conversation (sess:65c85c0a-..., worker w1) showed, after its own
+    // MEASURED: opening the WIDGETDB conversation (sess:65c85c0a-..., worker w1) showed, after its own
     // turns, two 10-14 phone-ledger transcripts (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the
     // current run's computer-use transcript (r6adac45a_a0_w1). None of them is that conversation.
     // They were joined by the WORKER NAME alone. A worker name (w0, w1, ...) is reused by every

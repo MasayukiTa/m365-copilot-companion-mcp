@@ -249,7 +249,7 @@ def _to_float(digits: str, percent: bool):
 #: The CHARACTERS that, when they sit immediately beside a digit run, make that run part of an
 #: IDENTIFIER rather than a standalone measured quantity: ASCII letters/underscore (already
 #: largely handled by _NUM_RE's own lookaround and the path/version masks), the '#' and path
-#: separators, and -- the gap those leave -- any CJK letter. "679かすれ" reads 679 with a CJK
+#: separators, and -- the gap those leave -- any CJK letter. "679defectA" reads 679 with a CJK
 #: ideograph glued to its right: that is the requester's case NAME, not a statistic. A Western
 #: digit-then-letter token like "20abc" is already refused by _NUM_RE; this set exists so the
 #: same refusal reaches digit-then-CJK, which _NUM_RE's [A-Za-z_] lookahead does not cover.
@@ -267,7 +267,7 @@ _IDENT_ADJACENT_RE = re.compile(
 #: these follows the digits ("679 件", "679%", "20倍"), the token is a measurement the gate must
 #: still police -- it is NOT exempted as an identifier, even if the same digits are in the goal.
 #: This is deliberately a quantity-form allow-list layered OVER the identifier test below, so a
-#: name like "679かすれ" (かすれ is not a counter) stays exempt while "679件" does not.
+#: name like "679defectA" (defectA is not a counter) stays exempt while "679件" does not.
 _QUANTITY_SUFFIX_RE = re.compile(
     r"\s*(?:%|\uff05|\u500d"                               # %, ％, 倍
     r"|\u4ef6|\u500b|\u672c|\u53f0|\u56de|\u540d|\u679a"   # 件 個 本 台 回 名 枚
@@ -281,7 +281,7 @@ def _request_digit_runs(request_text) -> frozenset:
     as strings, length >= 2.
 
     These are the digit sequences the gate may treat as part of an IDENTIFIER the requester
-    supplied -- the '679' of "679かすれ調査", "e679_v26", "example_analysis". Length >= 2 keeps a
+    supplied -- the '679' of "679defectA_study", "e679_v26", "example_analysis". Length >= 2 keeps a
     lone '0'/'1'/... (which occurs in almost any text) from exempting real single-digit
     statistics. Returns an empty set for non-strings so the caller degrades to the old behaviour.
     """
@@ -301,7 +301,7 @@ def extract_numbers(text, request_digits=None, *, policing=False) -> list:
     `request_digits` (optional) is the set of digit runs the REQUESTER wrote (see
     _request_digit_runs). When a matched digit run equals one of those AND sits inside an
     identifier-like token in the answer -- a CJK/letter/underscore/#/path character glued to
-    one side, as in "679かすれ" -- it is the requester's case NAME, not a computed result, so it
+    one side, as in "679defectA" -- it is the requester's case NAME, not a computed result, so it
     is dropped. A run in a QUANTITY form ("679 件", "679%", "n = 679") is NEVER dropped this
     way: a stated quantity still has to be found in a computation output, even when the same
     digits occur in the goal.
@@ -337,7 +337,7 @@ def extract_numbers(text, request_digits=None, *, policing=False) -> list:
                 and val == int(val) and _YEAR_RANGE[0] <= val <= _YEAR_RANGE[1]):
             continue
         # REQUESTER-SUPPLIED IDENTIFIER. The exact digit run the requester wrote (e.g. "679" of
-        # "679かすれ調査"), appearing in the answer glued to a CJK/letter/underscore/#/path
+        # "679defectA_study"), appearing in the answer glued to a CJK/letter/underscore/#/path
         # character, is the case NAME, not a statistic -- unless it wears a quantity form
         # (percent or a counter), which a stated measurement always has to justify.
         if req and not had_percent:
@@ -466,7 +466,7 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
     the check degrades to its prior behaviour exactly (compute outputs only).
 
     `request_text` (optional) is the requester's own words -- the goal text and/or the resolved
-    request text. Digit runs that appear THERE (a case name like "679かすれ調査", an id like
+    request text. Digit runs that appear THERE (a case name like "679defectA_study", an id like
     "e679_v26") are treated as identifiers, NOT claims, when they appear in the answer glued to
     a letter/underscore/#/path/CJK character rather than standing alone as a stated quantity.
     A quantity form ("679 件", "679%", "n = 679") is still policed even if the same digits are

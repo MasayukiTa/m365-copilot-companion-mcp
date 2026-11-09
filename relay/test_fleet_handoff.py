@@ -633,7 +633,7 @@ def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, mo
     monkeypatch.setattr(TR, "FLEET_STATE_DIR", str(state))
     TR.ensure_dirs()
 
-    out = FI.fleet_submit("check the coating DB for last week", source="phone (verification)")
+    out = FI.fleet_submit("check the widget DB for last week", source="phone (verification)")
     jid = out.split()[1]
     TR.dispatch_once()
 
@@ -645,7 +645,7 @@ def test_a_full_job_from_the_intake_door_reaches_the_runners_reader(tmp_path, mo
         "a delivered goal must not also be left waiting")
 
     assert [g["text"] for g in _commands(state)["add_goal"]] == [
-        "check the coating DB for last week"]
+        "check the widget DB for last week"]
 
 
 def test_order_survives_a_clock_that_does_not_move(tmp_path, monkeypatch):

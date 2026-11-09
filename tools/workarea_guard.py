@@ -6,7 +6,7 @@ token) were creating fresh top-level folders and files directly under the checko
 The 2026-10-26 census of ``.fleet/tool_events.jsonl`` over ten days found 114 write-tool
 calls whose path sat directly at the checkout root; the offenders were new untracked names
 like ``secure_desktop``/``audit_fixes_20261022``/``reviews``/``_pr_body.md``, alongside a
-``kasure679_out`` that a request had explicitly pointed at ``%TEMP%`` yet also appeared at the
+``defectA679_out`` that a request had explicitly pointed at ``%TEMP%`` yet also appeared at the
 root. Nothing in the server refused any of it: ``AGENTS.md`` asks for temp under
 ``%TEMP%\\m365-companion`` and ``relay/fleet_retention.sweep_temp_home`` only sweeps THAT home,
 so the checkout root had a convention and no enforcement.
