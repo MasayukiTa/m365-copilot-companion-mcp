@@ -371,7 +371,8 @@ def test_the_real_split_site_hands_the_parent_conversation_to_the_spawn():
     i = src.index("self._spawn_fn(self.goal, kids,")
     assert "**conv_saving_mod.parent_merge_kwargs(self)" in src[i:i + 400]
     assert "def _spawn_children(parent_goal, kids, parent_checks=None, parent_partial=\"\"," in src
-    assert "_agg = conv_saving_mod.apply_merge_conversation(_agg, _camp, _recs, run_id=run_id)" in src
+    assert "_merge_item = conv_saving_mod.apply_merge_conversation(" in src
+    assert "_merge_item, _camp, _recs, run_id=run_id)" in src
 
 
 # ---------------------------------------------------------------- through run_relay_fleet

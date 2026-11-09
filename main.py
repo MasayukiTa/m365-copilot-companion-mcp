@@ -4,11 +4,35 @@ import os
 import time
 from pathlib import Path
 
+# Startup timing: _PROC_START is stamped as early as the interpreter reaches this module so
+# MCP_STARTUP_TRACE can report the whole launch->listen span, not just a tail of it. The
+# supervisor log only ever saw "not listening yet" with no breakdown of where the seconds
+# went; this is the breakdown. It is import-cheap (one perf_counter read) and prints nothing
+# unless MCP_STARTUP_TRACE is set, so the default boot path is byte-for-byte unchanged.
+_PROC_START = time.perf_counter()
+
+
+def _startup_trace(event: str) -> None:
+    """Emit one 'STARTUP_TRACE <event> <elapsed_s>' line when MCP_STARTUP_TRACE is truthy.
+
+    Tool registration finishes at module import (the @mcp.tool/mcp.tool calls run while this
+    file and the tools.* packages are imported, well before __main__ binds the socket), so a
+    'registration-complete' event logged just before uvicorn.run() is the measured proof that
+    the tool list is whole before the server listens -- the ordering clients depend on.
+    """
+    if not os.environ.get("MCP_STARTUP_TRACE"):
+        return
+    try:
+        elapsed = time.perf_counter() - _PROC_START
+        print("STARTUP_TRACE %s %.3f" % (event, elapsed), flush=True)
+    except Exception:
+        pass
+
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 from starlette.requests import Request
-from starlette.responses import JSONResponse, PlainTextResponse
+from starlette.responses import JSONResponse, PlainTextResponse, Response
 
 from tools.archive_ops import zip_create, zip_extract, zip_list
 from tools.clipboard_ops import clipboard_get, clipboard_set
@@ -141,6 +165,8 @@ from tools.sqllib.mcp_tools import (
 )
 from tools.watcher_ops import watcher_events, watcher_start, watcher_stop
 from tools.auth_stats import get_summary as _auth_stats_summary
+from tools.response_telemetry import health_counters as _resp_telemetry_counters
+from tools.response_telemetry import health_inflight as _resp_telemetry_inflight
 from tools.tool_probe import get_summary as _tool_probe_summary
 from tools.fleet_intake import fleet_submit, fleet_queue
 from tools.audit_ledger_ops import validity_audit_ledger, validity_past_runs
@@ -220,10 +246,7 @@ def _u(on: str, off: str) -> str:
     return on if _UNLOCK_ON else off
 
 
-mcp = FastMCP(
-    "m365-copilot-companion-mcp",
-    auth=auth,
-    instructions=(
+FULL_INSTRUCTIONS = (
         "m365-copilot-companion-mcp toolkit. "
         # The catalogue is reachable ONLY through the call_tool gateway. Naming tools as
         # though they were directly callable made agents look for read_file/list_directory
@@ -377,7 +400,36 @@ mcp = FastMCP(
         "for a confident trusted match. Skill trust never grants extra execution rights; "
         "every mutating, shell, or outbound tool keeps its normal " +
         _u("unlock/contract gate.", "contract gate.")
-    ),
+)
+
+COMPACT_INSTRUCTIONS = (
+    "Every tool is behind the call_tool gateway. A bare tool name is not callable; "
+    "its absence from your own tool list is expected. "
+    "RULE 1: First call call_tool(name='') and read the index before saying what is "
+    "impossible. Open categories with call_tool(name='<category>'); show a tool's "
+    "parameters with call_tool(name='<tool>'). "
+    "RULE 2: Call skill_match with the user's request before domain work. Load and "
+    "follow a confident trusted match as written. No match means only that the local "
+    "catalogue has nothing for this; continue with other tools. Skill trust never grants "
+    "extra execution rights. "
+    + _u(
+        "RULE 3: Ordinary reads need no unlock; clipboard, mail, calendar, database and "
+        "registry reads are gated. Unlock before changes or execution. If locked and you "
+        "have the password, call unlock(password) once in this conversation and retry; "
+        "the session carries authorization. If you lack it, submit the whole request to "
+        "the fleet; do not search .env or abandon a read. ",
+        "RULE 3: No tool needs unlock. Never seek a password or stop because a tool "
+        "description mentions unlocking. Report actual errors. ",
+    )
+    + "For long or multi-step work, use fleet_submit directly if listed, or "
+    "call_tool(name='fleet_submit', arguments={...}). QUEUED means not started."
+)
+
+mcp = FastMCP(
+    "m365-copilot-companion-mcp",
+    auth=auth,
+    instructions=COMPACT_INSTRUCTIONS if os.environ.get("MCP_INSTRUCTIONS_COMPACT", "1") != "0"
+    else FULL_INSTRUCTIONS,
 )
 
 def _git_head_sha(repo_root=None):
@@ -414,6 +466,104 @@ def _git_head_sha(repo_root=None):
 _BOOT_HEAD = _git_head_sha()
 _BOOT_PID = os.getpid()
 _BOOT_TS = time.time()
+
+
+# /HEALTH HAS ITS OWN SMALL THREAD POOL, SEPARATE FROM asyncio's DEFAULT EXECUTOR.
+#
+# The sub-probes below (_server_identity, _auth_stats_summary, ...) were each run with
+# asyncio.to_thread, which dispatches onto the loop's DEFAULT ThreadPoolExecutor -- the SAME
+# pool that runs tool bodies (pwsh_exec, find_files, run_python, ...). Measured 2026-11-04:
+# a single pwsh_exec held a pool slot for 150s+ while find_files/shell_exec/run_python piled
+# up behind it, so /health's to_thread calls could not get a worker and the liveness probe
+# itself timed out (8-12 consecutive >4s timeouts). The fleet send-gate reads /health to
+# decide readiness, so every worker fell into `token_wait` ("waiting for token") even though
+# the server, Edge CDP :9222 and port 8000 were all up -- a slow /health was misread as a
+# dead server.
+#
+# Fix: give /health a dedicated, tiny pool so a saturated tool pool can never starve the
+# liveness probe, and bound the WHOLE set of sub-probes with one short deadline. If the
+# deadline passes, return the minimal liveness answer plus whatever probes already finished
+# -- the probe stays fast and truthful instead of hanging.
+import concurrent.futures as _futures
+
+_HEALTH_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health")
+
+#: Whole-of-sub-probes budget for one /health call. Past this we answer with what we have.
+_HEALTH_PROBE_BUDGET_S = float(os.environ.get("MCP_HEALTH_PROBE_BUDGET_S", "2.0"))
+
+
+async def _gather_health_probes(probes):
+    """Run each zero-arg probe in the DEDICATED /health pool, in parallel, under one shared
+    deadline (_HEALTH_PROBE_BUDGET_S). Returns a merged dict of the results that finished in
+    time; a probe that is slow, raises, or returns a non-dict simply contributes nothing.
+    Never raises -- liveness must not become a 500 or a hang because a probe misbehaved."""
+    loop = asyncio.get_running_loop()
+    out = {}
+    futs = []
+    for fn in probes:
+        try:
+            futs.append(loop.run_in_executor(_HEALTH_POOL, fn))
+        except Exception:
+            pass
+    if not futs:
+        return out
+    try:
+        done, pending = await asyncio.wait(futs, timeout=_HEALTH_PROBE_BUDGET_S)
+    except Exception:
+        return out
+    for f in done:
+        try:
+            r = f.result()
+            if isinstance(r, dict):
+                out.update(r)
+        except Exception:
+            pass
+    # BUSY MUST BE A CLEAR ANSWER, NOT A SILENT PARTIAL. When the budget expires with probes
+    # still running, merging only what finished is indistinguishable, to a client, from a
+    # healthy full answer. Under the sustained CPU saturation that caused this incident that
+    # silent-partial reply is what let the fleet send-gate keep treating a starved server as
+    # fine until it finally dropped the connection. Now the reply SAYS it is degraded and HOW
+    # MANY probes did not finish, so a caller (fleet gate, cockpit, muse) sees a truthful busy
+    # signal instead of a dropped or misleading one -- while /health still answers fast because
+    # we never wait past the budget.
+    #
+    # And we CANCEL stragglers rather than leave them pinning the tiny 4-slot health pool: a
+    # future still QUEUED (never started) is cancelled outright, freeing its slot for the next
+    # /health poll a second later. One already RUNNING cannot be force-killed (a thread is not
+    # cancellable mid-call), so it is left to finish on its own, but it no longer blocks the
+    # ANSWER. This keeps the pool from staying starved poll after poll while heavy tool work
+    # saturates CPU.
+    #
+    # IMPORTANT: a probe can finish in the microsecond between the budget expiring and this
+    # loop running. future.cancel() returns False for it (already done), and we must HARVEST
+    # its result rather than drop it -- otherwise, under the exact CPU saturation this fix is
+    # for, a fast probe that lands a hair late would vanish from the reply. A probe still
+    # genuinely unfinished (queued or running) is what makes the answer DEGRADED, and we report
+    # HOW MANY did not finish so the caller (fleet gate, cockpit, muse) sees a truthful busy
+    # signal instead of a dropped or misleading one.
+    if pending:
+        unfinished = 0
+        for f in pending:
+            if f.done() and not f.cancelled():
+                # Finished just after the budget -- keep its result, it is not a straggler.
+                try:
+                    r = f.result()
+                    if isinstance(r, dict):
+                        out.update(r)
+                except Exception:
+                    pass
+                continue
+            # Truly unfinished: try to free its slot (succeeds only if never started), and
+            # count it as a probe that did not finish in time.
+            try:
+                f.cancel()
+            except Exception:
+                pass
+            unfinished += 1
+        if unfinished:
+            out["health_degraded"] = True
+            out["health_probes_pending"] = unfinished
+    return out
 
 
 #: Answer cached for this long. /health is polled about once a second by the cockpit and by
@@ -510,6 +660,25 @@ def _server_identity():
     }
 
 
+def _tunnel_channels_summary() -> dict:
+    """Last-10-minute Dev Tunnel channel counts for /health, read from the jsonl file.
+
+    relay.tunnel_channels owns the thresholds and the file format; this is a thin,
+    never-raising wrapper so a missing or malformed file can never turn a /health poll
+    into a 500. When the file is absent every value is -1 (see health_counts), which is
+    how /health signals "the host-log analyzer has not written anything yet".
+    """
+    absent = {"tunnel_channels": -1, "tunnel_no_response": -1,
+              "tunnel_remote_closed_early": -1}
+    try:
+        from relay.tunnel_channels import health_counts
+        jsonl = str(Path(__file__).resolve().parent / ".setup" / "logs"
+                    / "tunnel_channels.jsonl")
+        return health_counts(jsonl)
+    except Exception:
+        return absent
+
+
 def _health_bearer_ok(request: Request) -> bool:
     """True iff the caller presented this server's own MCP_API_KEY as a bearer token.
 
@@ -582,20 +751,44 @@ async def health(request: Request) -> JSONResponse:
     #
     # The decision itself is scripts/stale_server_check.classify_staleness -- pure and
     # pytest-covered -- so this cannot drift from what those tests assert.
-    payload.update(await asyncio.to_thread(_server_identity))
-    payload.update(await asyncio.to_thread(_auth_stats_summary))
-    # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
-    payload.update(await asyncio.to_thread(_self_test_summary))
-    payload.update(await asyncio.to_thread(_tool_probe_summary))
-    # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
-    # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
-    # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
-    # tool_ok as "tool access" was reading one path of four. fleet_tool_ok is the other
-    # busy path, derived from the ledger of real calls rather than from a probe, and its
-    # None means "no calls lately", which is not a failure.
+    # uptime is pure arithmetic on an import-time constant: it costs nothing and lets a caller
+    # tell "answered but slow" (probes dropped) from "answered instantly" without a probe.
+    payload["server_uptime_s"] = round(time.time() - _BOOT_TS, 1)
+    # ALL heavy sub-probes run in the DEDICATED health pool under ONE short deadline, so a
+    # saturated default/tool executor can no longer starve liveness (see _gather_health_probes).
+    _probes = [_server_identity, _auth_stats_summary, _self_test_summary,
+               _tool_probe_summary, _tunnel_channels_summary]
     try:
         from tools.fleet_tool_health import get_summary as _fleet_tool_summary
-        payload.update(await asyncio.to_thread(_fleet_tool_summary))
+        _probes.append(_fleet_tool_summary)
+    except Exception:
+        pass
+    # Run every heavy sub-probe in the dedicated _HEALTH_POOL under the shared deadline and
+    # merge whatever finished in time. A saturated default/tool pool can no longer starve or
+    # hang this: past the budget we answer with the minimal liveness fields already set above
+    # plus the probes that returned, so a client always gets a clear answer, never a drop.
+    payload.update(await _gather_health_probes(_probes))
+    # NOTE: fleet_tool_health.get_summary (fleet_tool_ok / tool_ok) is one of the probes in
+    # the _probes list above, so it now runs in the dedicated health pool under the shared
+    # deadline like the rest. tool_ok comes from the BRIDGE's idle self-probe and says nothing
+    # about the fleet; fleet_tool_ok is the ledger-derived busy path, and its None means "no
+    # calls lately", not a failure. Both are best-effort: if the pool is saturated past the
+    # budget they are simply absent from this reply rather than hanging it.
+    #
+    # Response-delivery telemetry rollup over the last 10 minutes (tools/response_telemetry.py):
+    # resp_total_10m, resp_client_gone_10m, resp_short_10m. In-memory ring read, never raises,
+    # so this stays a non-blocking probe. Surfaces the muse 'response cut mid-stream' signal to
+    # the supervisor/cockpit without grepping the jsonl.
+    try:
+        payload.update(_resp_telemetry_counters())
+    except Exception:
+        pass
+    # Live in-flight request gauge (tools/response_telemetry.py): resp_inflight and
+    # resp_last_start_age_s. The supervisor reads these to hold off a stale-code cycle while
+    # an external client is mid-response (scripts/stale_server_check.decide_stale_drain), so
+    # a deploy never cuts a response a client is waiting for. In-memory read, never raises.
+    try:
+        payload.update(_resp_telemetry_inflight())
     except Exception:
         pass
     return JSONResponse(payload)
@@ -647,6 +840,41 @@ async def exec_status(request: Request) -> JSONResponse:
     payload = {"status": "ok"}
     payload.update(snap)
     return JSONResponse(payload)
+
+
+@mcp.custom_route("/diag/bytes", methods=["GET"])
+async def diag_bytes(request: Request) -> Response:
+    """Hand back EXACTLY n bytes of 'x' with an exact Content-Length -- a size probe for the
+    muse 'responses cut above ~2.1 KB' incident (2026-10-31). The server host completes these
+    24/24 up to 8 KB and the tunnel host log shows every byte sent; this endpoint lets the
+    REMOTE client ask for a known size over the same path, so a cut can be located by the
+    size at which it starts, independent of any tool.
+
+    OFF BY DEFAULT. The only gate is a token equal to the environment variable MCP_DIAG_TOKEN,
+    compared in constant time. When that variable is empty the route answers 404 -- so it does
+    not exist unless an operator sets the token. No other auth: a bare diagnostic that only
+    emits 'x' * n discloses nothing, and binding it to the normal bearer would make it useless
+    for a client that is debugging exactly that credential.
+
+    n is 1..65536 (inclusive); out of range or non-integer is a 400. The reply is
+    application/octet-stream with an exact Content-Length so the client can compare declared
+    against received. It is itself recorded by the response telemetry like any other request."""
+    token = os.environ.get("MCP_DIAG_TOKEN", "") or ""
+    if not token:
+        # Off by default: no token configured means the endpoint is not there.
+        return PlainTextResponse("not found", status_code=404)
+    supplied = request.query_params.get("t", "") or ""
+    if not hmac.compare_digest(supplied, token):
+        return PlainTextResponse("not found", status_code=404)
+    raw = request.query_params.get("n", "")
+    try:
+        n = int(raw)
+    except (TypeError, ValueError):
+        return PlainTextResponse("n must be an integer between 1 and 65536", status_code=400)
+    if n < 1 or n > 65536:
+        return PlainTextResponse("n must be between 1 and 65536", status_code=400)
+    body = b"x" * n
+    return Response(content=body, media_type="application/octet-stream")
 
 
 TOOLS = (
@@ -1095,6 +1323,18 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
             _cid = _ledger.record_call(name, _args, task=_task, worker=_worker)
         except Exception:
             _ledger = None
+        # BIND THE WORKER FOR ANY PROCESS THIS CALL SPAWNS. A tool that starts a child
+        # (run_python, shell_exec) records the child under this worker via tools.proc_registry,
+        # so RelayWorker.close()/cancel() -- and the coordinator-start sweep -- can kill the
+        # tree the moment the worker ends. Reset in the finally below so a later call on the
+        # same thread is not mis-attributed. Total: a failure here never stops the tool.
+        _worker_tok = None
+        if _worker:
+            try:
+                from tools import proc_registry as _pr
+                _worker_tok = _pr.set_worker(_worker)
+            except Exception:
+                _worker_tok = None
         # IN-FLIGHT VISIBILITY (issue #328 proposal 2). Registered the moment the call enters the
         # execute path and removed in the finally below, so a call that never returns stays
         # visible -- which is the whole point: the jams of 2026-10-27..28 were a call that had
@@ -1235,6 +1475,15 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
                 try:
                     from tools import exec_inflight as _inflight2
                     _inflight2.end(_inflight_token)
+                except Exception:
+                    pass
+            # UNBIND THE WORKER SET ABOVE, scoped to this call exactly like the token reset
+            # below: a worker left bound would attribute the next call's spawns to the wrong
+            # worker. reset is total -- a missing or already-reset token is ignored.
+            if _worker_tok is not None:
+                try:
+                    from tools import proc_registry as _pr2
+                    _pr2.reset_worker(_worker_tok)
                 except Exception:
                     pass
             # SCOPED TO THIS CALL. A token left behind would authorise the next one, which is
@@ -1470,6 +1719,17 @@ def _install_faulthandler() -> None:
         dump_dir = Path(__file__).resolve().parent / ".fleet"
         dump_dir.mkdir(parents=True, exist_ok=True)
         dump_path = dump_dir / "faulthandler.log"
+        # SEPARATE FILE FOR THE CRASH DUMP. faulthandler.enable() fires from whatever thread
+        # takes the fatal signal (an access violation in a C extension, a heap corruption in
+        # ntdll), and dump_traceback_later() fires from its own watchdog thread every 5 min.
+        # faulthandler takes no lock between the two, so when a crash lands WHILE the periodic
+        # watchdog is mid-write to the same handle, the two dumps interleave byte-for-byte and
+        # the one dump that matters -- the crash -- becomes unreadable (observed 2026-11-07:
+        # the 0xc0000374 crash dump was shredded through the periodic heartbeat, e.g.
+        # 'File "C:\\Users\\...\\ProgramsWindows fatal exception: code 0xc0000374').
+        # Giving enable() its own handle keeps the crash trace whole regardless of the
+        # heartbeat; two distinct OS file objects never interleave each other's writes.
+        crash_path = dump_dir / "faulthandler-crash.log"
 
         # ROTATE. Every thread's stack, every five minutes, appended for ever: the file was
         # found at 51.8 MB, and it had no end. On a machine whose disk floor is measured in
@@ -1479,32 +1739,41 @@ def _install_faulthandler() -> None:
         #
         # One generation is kept. The value of these dumps is the recent ones: a wedge is
         # diagnosed from the last few heartbeats, not from a fortnight of healthy ones.
-        try:
-            cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
-            if dump_path.exists() and dump_path.stat().st_size > cap:
-                previous = dump_path.with_suffix(".log.1")
-                if previous.exists():
-                    previous.unlink()
-                dump_path.rename(previous)
-        except Exception:
-            pass
+        def _rotate(path: "Path", cap: int) -> None:
+            try:
+                if path.exists() and path.stat().st_size > cap:
+                    previous = path.with_suffix(".log.1")
+                    if previous.exists():
+                        previous.unlink()
+                    path.rename(previous)
+            except Exception:
+                pass
 
-        # Keep a handle open for the lifetime of the process (faulthandler writes to it).
+        cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
+        _rotate(dump_path, cap)
+        _rotate(crash_path, cap)
+
+        # Keep a handle open for each file for the lifetime of the process (faulthandler
+        # writes to them). The crash handle backs enable(); the periodic handle backs
+        # dump_traceback_later(). They are DISTINCT so the two never interleave.
+        _crash_fh = open(crash_path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_crash_fh)
         _fh = open(dump_path, "a", encoding="utf-8", buffering=1)
-        faulthandler.enable(file=_fh)
         # Every 5 min, dump all thread stacks. On a healthy server this is just a periodic
         # heartbeat; when the loop is stuck the dump shows exactly which tool is blocking.
         faulthandler.dump_traceback_later(
             300, repeat=True, file=_fh, exit=False
         )
-        # Keep a module-global ref so the file object isn't garbage-collected.
-        global _FAULTHANDLER_FILE
+        # Keep module-global refs so the file objects aren't garbage-collected.
+        global _FAULTHANDLER_FILE, _FAULTHANDLER_CRASH_FILE
         _FAULTHANDLER_FILE = _fh
+        _FAULTHANDLER_CRASH_FILE = _crash_fh
     except Exception:
         pass
 
 
 _FAULTHANDLER_FILE = None
+_FAULTHANDLER_CRASH_FILE = None
 
 
 def _start_approval_watcher(period: float = 3.0) -> None:
@@ -1792,6 +2061,10 @@ class _BearerPrefix:
 
 
 if __name__ == "__main__":
+    # Reached only after every top-level import above has run, i.e. after all tools are
+    # registered on `mcp`. Logging here dates the registration-complete point relative to
+    # _PROC_START; the matching 'about-to-listen' event is emitted just before uvicorn.run().
+    _startup_trace("registration-complete")
     _install_faulthandler()
     _start_approval_watcher()
     try:
@@ -1849,6 +2122,14 @@ if __name__ == "__main__":
     # straight through, so the inner Starlette startup/shutdown still runs under uvicorn.
     app = _BearerPrefix(app)
 
+    # OUTERMOST layer, applied LAST so it observes every byte of every send and every receive --
+    # including the _BearerPrefix rewrite and FastMCP's auth. _ResponseTelemetry records one
+    # JSON line per HTTP request (what was declared, what was handed to send, whether the client
+    # vanished mid-response) and never alters a response. This is the missing eye on what happens
+    # to a response AFTER the server hands it to the transport (the muse mid-stream cut, 2026-10-31).
+    from tools.response_telemetry import ResponseTelemetry as _ResponseTelemetry
+    app = _ResponseTelemetry(app)
+
     # Durable, timestamped copy of uvicorn's access/error log (tools/access_log.py): server.log
     # is recreated on every launch and has no timestamps, so a restart erased the request record.
     try:
@@ -1863,4 +2144,21 @@ if __name__ == "__main__":
     except Exception:
         pass
     _run_kwargs = {"log_config": _log_config} if _log_config is not None else {}
+    # timeout_keep_alive: how long uvicorn holds an idle keep-alive connection open before
+    # closing it. uvicorn's default is 5 s, and a client that reused the same connection after
+    # an idle gap of >=6 s got the connection aborted (measured 2026-10-31: 3 s -> OK; 6 s, 12 s,
+    # 30 s -> RemoteDisconnected / WinError 10053), which users see as "RemoteDisconnected, not
+    # even a response" on initialize and which the access log cannot show (the connection is
+    # closed before any request is read). Raise the idle window via MCP_KEEPALIVE_S (default
+    # 120 s) so normal think-time pauses no longer drop the connection. Only this one option is
+    # added; every other uvicorn setting above is left unchanged.
+    try:
+        _keepalive_s = int(os.environ.get("MCP_KEEPALIVE_S", "120"))
+    except (TypeError, ValueError):
+        _keepalive_s = 120
+    _run_kwargs["timeout_keep_alive"] = _keepalive_s
+    # Last line before the socket is bound. The gap between 'registration-complete' and this
+    # event is pure pre-listen setup (watchers, log config); everything tool-registration had
+    # to do is already done. See _startup_trace for why this proves the ordering.
+    _startup_trace("about-to-listen")
     uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)

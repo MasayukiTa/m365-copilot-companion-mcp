@@ -1282,3 +1282,29 @@ Two rows are kept, as `deliberate`, because something real still uses them:
 | row | verdict | why it stays |
 |---|---|---|
 | `bridge/validity_audit.py::wait_async_idle` | deliberate | the synchronisation point for the async audit writer; `relay/test_sweep_hot_path.py` drains the queue through it before reading the log |
+
+## PR 421 — durable tombstone read/clear API (deliberate, unwired)
+
+`relay/fleet_tombstone.py` makes a cancelled or operator-closed job terminal across restarts
+by writing one durable tombstone file per jid. The WRITE and BLOCK half of the module is wired
+and live: `write_tombstone`, `is_tombstoned`, `blocked_jid` and `worker_identities` are called
+from `relay/fleet_runner.py` at the cancel, close, adopt and live-add doors.
+
+Three functions are the module's READ/CLEAR surface and are kept on the unreached inventory on
+purpose (reason: deliberate), tested by `relay/test_fleet_tombstone.py` but with no production
+caller yet:
+
+- `tombstone_reason` — returns the recorded reason word (cancelled / operator_close /
+  inherited) for a jid's tombstone. Intended for a cockpit refusal line, which does not yet
+  render it; wiring it alone would add a renderer with nothing deciding what to show.
+- `tombstoned_jids` — the on-disk inventory of every tombstoned jid. Intended for an operator
+  status/audit view that does not exist yet.
+- `remove_tombstone` — the ONLY sanctioned way to clear a tombstone, guarded to refuse unless
+  an explicit operator re-submission carries a NEW jid distinct from the tombstoned one. The
+  adopt/live-add refusal messages already tell the operator to "re-submit with a new jid"; the
+  path that detects that new jid and calls `remove_tombstone` is a separate change and is not
+  wired here, so a restart / resume / reaper can never clear a tombstone by accident.
+
+These stay unwired until the cockpit surfaces a reason and the resubmit path carries a new jid.
+The tombstone's safety property — stopped stays stopped across restarts — does not depend on
+any of the three.

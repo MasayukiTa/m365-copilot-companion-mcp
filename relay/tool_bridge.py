@@ -505,7 +505,7 @@ def server_instructions(client_factory=None, now=None, ttl_s=None) -> str:
         return c["text"]
 
 
-def _shadow_result_cache(payload, text, ok, duration_s, worker_name):
+def _shadow_result_cache(payload, text, ok, duration_s, worker_name, fingerprint=None):
     """Hand one completed inner tool call to the read-only result cache in shadow. Only a
     successful call is a candidate (a failed read answers nothing a cache would serve). Never
     raises: the recorder runs inside run_tool and must not break a worker's turn."""
@@ -517,7 +517,8 @@ def _shadow_result_cache(payload, text, ok, duration_s, worker_name):
         if not _rc.is_read_only(inner):
             return
         _rc.shadow_observe(inner, (payload.get("arguments") or {}), text,
-                           read_only=True, duration_s=duration_s, run_id=str(worker_name or ""))
+                           read_only=True, duration_s=duration_s, run_id=str(worker_name or ""),
+                           fingerprint=fingerprint)
     except Exception:
         return
 
@@ -550,13 +551,19 @@ def make_run_tool(worker_name="", *, client_factory=None, timeout_s=None):
                 return False, ("[call_tool: no tool or category named '%s'. "
                                "For mail and calendar use the Microsoft Work IQ tools.]"
                                % str(payload.get("name"))[:60])
+            fingerprint = None
+            try:
+                from relay import result_cache as _rc
+                fingerprint = _rc.fingerprint_before(payload.get("name"), payload.get("arguments"))
+            except Exception:
+                pass
             _t0 = time.time()
             result = _run_coroutine(_call(factory, payload, limit))
             text = _text_of(result)
             if _is_discovery(payload):
                 text = scrub_listing(text)
             ok = not _is_error(result)
-            _shadow_result_cache(payload, text, ok, time.time() - _t0, worker_name)
+            _shadow_result_cache(payload, text, ok, time.time() - _t0, worker_name, fingerprint)
             return ok, text
         except asyncio.TimeoutError:
             return False, "TimeoutError: the tool call took longer than %d s" % int(limit)

@@ -348,11 +348,17 @@ _FUNCTIONS = (
     "function Get-PortListenerPids", "function Test-IsMainPyCommandLine",
     "function Test-IsThisCheckoutServerCommandLine", "function Get-ProcessVerdict",
     "function Get-HealthServerPid", "function Write-ForeignPortHolderLog",
+    # Test-ServerUp now takes a second, longer look on a 5 s timeout (the slow-vs-down gate);
+    # the two helpers it calls there must be in the driver too, or a timed-out case (tcp)
+    # reaches an undefined function and the whole driver aborts mid-loop.
+    "function Confirm-ServerSlow", "function Invoke-LivenessStrikeDecision",
     "function Test-ServerUp", "function Get-ServerExitRecord", "function Start-Server",
 )
 _INIT_LINES = (
     "$script:PyRecheckSeconds =", "$script:PyRejectedAt = $null", "$script:PyRejectedWhy = $null",
     "$script:ForeignHolderKey =", "$script:ForeignHolderLoggedAt =", "$script:VerifiedServerPid =",
+    # the slow-vs-down confirmation timeout Confirm-ServerSlow reads ($LivenessConfirmSeconds)
+    "$script:LivenessConfirmSeconds = 60",
 )
 
 
@@ -455,7 +461,9 @@ def test_a_server_launched_on_a_path_python_is_still_ours(driver_result):
 
 def test_the_main_loop_keeps_the_same_identity_rule_for_a_booting_server(src):
     loop = _code_only(src[src.index("\nwhile ($true) {"):])
-    booting = loop[loop.index("$booting = $false"):loop.index("if ($booting)")]
+    # The vanished-server fast path measures "is anything listening" and "is a main.py of ours
+    # alive" first ($portListening ... $booting), then branches on `if ($booting)`.
+    booting = loop[loop.index("$portListening = Test-PortListening"):loop.index("if ($booting)")]
     assert "Test-IsThisCheckoutServerCommandLine" in booting
     assert "$script:ServerProc" in booting
 

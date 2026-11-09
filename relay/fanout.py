@@ -1005,6 +1005,63 @@ def aggregation_goal(parent_goal, records, *, campaign_id="", parent_task_id="",
     return item
 
 
+#: 分割元ワーカーが分割後に入る状態名。子の完了を待つ非終端の状態で、タブ (admission slot)
+#: は解放するがワーカーは生きたまま残る。TERMINAL にも PENDING にも属さない。先行例は
+#: `awaiting_execution` (レビュー済みで slot 待ち) で、計上・poll の扱いをそれに倣う。
+#:
+#: なぜ『完了 (FANOUT)』で終わらせないか: 分割元を終わらせて別担当 (aggregator) に統合させる
+#: と、画面・状態集計・反証役の対象が実際の進み方と合わない (分割元が『完了』なのに結果は
+#: まだ無い)。オーナー指摘 2026-10-30。分割元を待機させれば、統合は分割元自身の会話の続きで
+#: 行え、受け取り専用の別担当を立てずに済む。
+#:
+#: デッドロックを避ける鍵: 待機中はタブを解放するので admission slot を占有しない。
+#: aggregation_goal の docstring が警告する『親が slot を握ったまま子を待つ』状況にはならない。
+AWAITING_CHILDREN = "awaiting_children"
+
+
+def parent_waits_for_children(*, spawned, depth=0):
+    """分割元が、分割後に『待機 (子の完了待ち)』に入るべきか。
+
+    `spawned` は _spawn_children が子を queue できたか (False なら家族が成立せず、分割元は
+    通常実行に戻る)。`depth` は入れ子でも同じ (待機は深さに依らない -- #361 の既存決定どおり
+    深さ制限なしで入れ子にできる)。純粋関数: relay_fleet 側の状態遷移はこの判定に従う。
+    """
+    return bool(spawned)
+
+
+def parent_resume_goal(parent_goal, records, *, campaign_id="", resume_conv="",
+                       cwd=None, parent_checks=None, parent_partial="",
+                       parent_level=None, run_id="", depth=None, board_lines=""):
+    """子が全部終わったあと、分割元『自身の会話』で統合を続けるための goal。
+
+    aggregation_goal との違いは一点だけ: これは受け取り専用の別担当 (role=aggregator) では
+    なく、分割元自身の会話の続き (role=parent_merge) として走る。`resume_conv` に分割元の
+    会話 id を載せるので、同じ会話に子の結果が渡り、続きが書かれる -- オーナーの求める
+    『統合は分割元自身が行う。別担当を立てない』を満たす。
+
+    `resume_conv` が空のとき (分割元の会話 id が無い = 別プロセスで家族を再構築した等) は
+    その場での継続ができない。その場合 resume_conv 無しの goal を返し、呼び出し側は
+    フォールバックとして従来どおり別担当 (aggregation_goal) を立てる。統合プロンプト・checks・
+    cwd・失敗スライスの名指しは aggregation_goal と同一 (aggregation_prompt /
+    merge_acceptance_checks を共用) なので、継続でも別担当でも中身は変わらない。
+    """
+    item = aggregation_goal(parent_goal, records, campaign_id=campaign_id,
+                            limit_each=1200, cwd=cwd, parent_checks=parent_checks,
+                            parent_partial=parent_partial, parent_level=parent_level,
+                            run_id=run_id, depth=depth, board_lines=board_lines)
+    # 別担当ではなく分割元の継続であることを role で区別する。task_id も -merge とは別にして、
+    # 分割元自身のタスクの続きであることを示す (別担当の %s-merge と衝突しない)。
+    item["role"] = "parent_merge"
+    item["task_id"] = "%s-parentmerge" % (campaign_id
+                                          or campaign_id_for(parent_goal))
+    rc = str(resume_conv or "").strip()
+    if rc:
+        item["resume_conv"] = rc
+    else:
+        item.pop("resume_conv", None)
+    return item
+
+
 def aggregation_prompt(parent_goal, results, limit_each=1200, parent_partial=""):
     """What the parent is asked once its children are finished.
 
@@ -1243,6 +1300,7 @@ __all__ = ["SUBTASKS_READY", "SPLIT_JOB", "MAX_CHILDREN", "MIN_CHILDREN", "MAX_D
     "NO_SPLIT_MARKER", "declined_split", "MIDRUN_SPLIT_JOB", "midrun_split_job",
     "missing_slices", "merge_acceptance_checks", "campaigns_from_ledger",
     "collapse_retries", "ready_to_aggregate", "aggregation_goal",
+    "AWAITING_CHILDREN", "parent_waits_for_children", "parent_resume_goal",
     "fanout_family_view", "HIERARCHICAL_MERGE_READY", "configured_max_depth",
     "effective_max_depth", "may_split_at", "depth_report",
     "hierarchical_merge_setting", "hierarchical_merge_enabled",

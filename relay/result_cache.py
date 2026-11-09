@@ -2,8 +2,8 @@
 """Read-only tool result caching, SHADOW ONLY: it records the time it would have saved.
 
 WHERE IT SITS. Every tool the model calls on the connector-less route goes through one
-chokepoint (relay/tool_bridge.py:run_tool). A read-only tool called twice with the same
-arguments returns the same answer both times; the second call spends its latency for nothing.
+chokepoint (relay/tool_bridge.py:run_tool). Read-only calls with the same arguments may
+return different answers when external state changes; shadow measures that assumption.
 This module watches that chokepoint and, for a read-only call whose (tool, arguments) it has
 seen answer before, records that a cache would have returned the earlier answer -- how long
 that saved, and whether the fresh answer actually matched the one a cache would have served.
@@ -63,7 +63,7 @@ _settings_cache = {}
 
 # ------------------------------------------------------------------ what is safe to repeat
 
-#: Inner tool names a repeat is safe to serve from a cache: they read and do not change state.
+#: Inner tool names eligible for shadow measurement, not proven safe to serve from a cache.
 #: Kept as an explicit allow-list on purpose -- an unlisted or write tool is never a candidate,
 #: so a new tool is a miss until someone adds it here with that judgement in mind.
 READ_ONLY_TOOLS = frozenset({
@@ -71,10 +71,43 @@ READ_ONLY_TOOLS = frozenset({
     "get_job_status", "read_image", "memory_load", "list_my_tools",
 })
 
+# Only classifications supported by the tool implementations; unknown tools stay unknown.
+STATE_READS = frozenset({"read_file", "list_directory", "read_excel", "file_metadata", "read_image"})
+
+
+def fingerprint_before(tool, arguments):
+    """Best-effort pre-call metadata; no path or directory entries are recorded.
+
+    Relative paths may resolve differently in the server process, so do not guess. Recursive
+    listings cannot be represented by the immediate-children fingerprint and are excluded.
+    """
+    try:
+        if mode() != "shadow" or tool not in STATE_READS or not isinstance(arguments, dict):
+            return None
+        path = arguments.get("path")
+        if not isinstance(path, str) or not os.path.isabs(path):
+            return None
+        if tool == "list_directory" and arguments.get("recursive", False):
+            return None
+        from tools.file_ops import _validate_path
+        p = _validate_path(path)
+        st = p.stat()
+        if tool == "list_directory":
+            if not p.is_dir():
+                return None
+            stamps = [child.stat().st_mtime_ns for child in p.iterdir()]
+            return {"kind": "directory", "count": len(stamps),
+                    "mtime_ns": st.st_mtime_ns, "max_child_mtime_ns": max(stamps, default=None)}
+        if not p.is_file():
+            return None
+        return {"kind": "file", "mtime_ns": st.st_mtime_ns, "size": st.st_size}
+    except Exception:
+        return None
+
 
 def is_read_only(tool):
-    """True when a repeat of this inner tool with the same arguments is safe to serve from a
-    cache. Only names on the explicit allow-list qualify; everything else (writes, unknown
+    """True when this inner tool is eligible for shadow measurement. Only names on the
+    explicit allow-list qualify; everything else (writes, unknown
     tools, discovery) is treated as not cacheable."""
     return str(tool or "") in READ_ONLY_TOOLS
 
@@ -165,18 +198,18 @@ def _append(row):
         return False
 
 
-def _remember(key, digest, now):
+def _remember(key, digest, now, fingerprint):
     """Record that this key was just answered, for the next call to compare against. Drops the
     oldest entry when the table is full."""
     _TABLE.pop(key, None)
-    _TABLE[key] = {"at": now, "digest": digest}
+    _TABLE[key] = {"at": now, "digest": digest, "fingerprint": fingerprint}
     while len(_TABLE) > MAX_ENTRIES:
         oldest = next(iter(_TABLE))
         _TABLE.pop(oldest, None)
 
 
 def shadow_observe(tool, arguments, result, read_only, duration_s=None, run_id="",
-                   settings_path=None, now=None):
+                   settings_path=None, now=None, fingerprint=None):
     """Called by the tool chokepoint once per completed call, after the real result is in hand
     and before it is returned to the model. In `shadow` it compares this call against the last
     answer for the same (tool, arguments) and appends one row when the tool is read-only. In
@@ -198,6 +231,10 @@ def shadow_observe(tool, arguments, result, read_only, duration_s=None, run_id="
         row = {
             "v": SCHEMA, "ts": round(t, 1), "run_id": str(run_id or ""), "mode": "shadow",
             "tool": str(tool or ""), "arg_hash": key[1], "read_only": True,
+            "tool_class": "state_dependent_read" if tool in STATE_READS else None,
+            "result_hash": digest, "fingerprint": fingerprint,
+            "previous_result_hash": entry.get("digest") if hit else None,
+            "previous_fingerprint": entry.get("fingerprint") if hit else None,
             "hit": hit, "matched": matched, "differed": differed,
             "age_s": (round(verdict["age"], 1) if verdict["age"] is not None else None),
             "saved_s": (round(float(duration_s), 3)
@@ -209,7 +246,7 @@ def shadow_observe(tool, arguments, result, read_only, duration_s=None, run_id="
                 _STATE["hits"] += 1
                 _STATE["matched"] += 1 if matched else 0
                 _STATE["differed"] += 1 if differed else 0
-        _remember(key, digest, t)
+        _remember(key, digest, t, fingerprint)
         return None
     except Exception:
         return None

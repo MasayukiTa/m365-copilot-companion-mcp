@@ -292,3 +292,114 @@ def test_a_folder_without_git_passes_the_staleness_check_instead_of_staying_inde
     assert guard < git_call, "the no-.git pass must precede the git call"
     assert "if ($LASTEXITCODE -ne 0 -or -not $head) { return $null }" in block, \
         "a real git failure inside a checkout must stay indeterminate"
+
+
+# ------------------------------------------------------------------ decide_stale_drain
+# The drain gate the supervisor consults before cycling a stale server. It is pure: the
+# caller reads /health (resp_inflight, resp_last_start_age_s), accumulates the seconds it
+# has already waited, and acts on the one word this returns. These assert the three
+# behaviours the gate promises -- hold while a request is open, hold just after one
+# started, and never hold past the cap -- by calling the function directly, so they run
+# identically on the Linux CI runner and a developer's Windows box.
+
+def test_drain_waits_while_a_request_is_in_flight():
+    # A client is mid-response: cycling now would cut it. Hold.
+    assert S.decide_stale_drain(1, 0.3, 0) == "wait"
+    assert S.decide_stale_drain(3, 42.0, 0) == "wait"
+
+
+def test_drain_waits_right_after_a_request_started_even_with_zero_inflight():
+    # resp_inflight can read zero for the instant between the relay accepting a request and
+    # the telemetry wrapper opening it. A fresh start (age < settle) is still "busy".
+    assert S.decide_stale_drain(0, 0.0, 0) == "wait"
+    assert S.decide_stale_drain(0, 4.9, 0) == "wait"
+
+
+def test_drain_cycles_when_nothing_is_in_flight_and_nothing_just_arrived():
+    # No open request and the last one started well past the settle window: safe to cycle.
+    assert S.decide_stale_drain(0, 5.0, 0) == "cycle"
+    assert S.decide_stale_drain(0, 900.0, 0) == "cycle"
+
+
+def test_drain_cycles_when_no_request_has_started_since_startup():
+    # age is None when the ring has seen no request at all. Nothing to protect -> cycle.
+    assert S.decide_stale_drain(0, None, 0) == "cycle"
+
+
+def test_drain_cap_forces_a_cycle_even_with_a_request_still_open():
+    # THE BACKSTOP. A wedged client that never completes must not keep stale code live
+    # forever: once waited reaches the cap, cycle regardless of inflight or age.
+    assert S.decide_stale_drain(5, 1.0, 180) == "cycle"
+    assert S.decide_stale_drain(5, 1.0, 181) == "cycle"
+    # ONE TICK SHORT OF THE CAP STILL WAITS, so the cap boundary is exact, not approximate.
+    assert S.decide_stale_drain(5, 1.0, 179) == "wait"
+
+
+def test_drain_cap_is_checked_before_everything_else():
+    # Even with a request open and freshly started, the cap wins -- it is the only thing that
+    # guarantees the fix eventually goes live.
+    assert S.decide_stale_drain(2, 0.0, 180) == "cycle"
+
+
+def test_drain_tolerates_a_missing_or_broken_age():
+    # A damaged age can only ever make the gate MORE willing to cycle, never wedge it.
+    assert S.decide_stale_drain(0, None, 0) == "cycle"
+    assert S.decide_stale_drain(0, -3.0, 0) == "cycle"      # clock went backwards
+    assert S.decide_stale_drain(0, "not-a-number", 0) == "cycle"
+    # but a real open request still holds, whatever the age reads.
+    assert S.decide_stale_drain(1, None, 0) == "wait"
+
+
+def test_drain_tolerates_a_broken_inflight_or_waited():
+    # Non-numeric inflight reads as zero (nothing proven in flight); non-numeric waited reads
+    # as zero seconds waited. Neither can wedge the gate.
+    assert S.decide_stale_drain("x", 900.0, 0) == "cycle"
+    assert S.decide_stale_drain(1, 900.0, "x") == "wait"
+
+
+# ----------------------------------------------------------------- decide_liveness_strike
+# The slow-vs-down gate. A fast 5s /health probe that times out is NOT proof the server is
+# down: on this busy box /health answered HTTP 200 in 7-16s while the loop was alive, and
+# four 5s timeouts in a row once killed a server still answering in 16s. The caller takes a
+# second, longer look (LIVENESS_CONFIRM_SECONDS) and asks this pure gate whether to strike.
+
+
+def test_liveness_confirm_timeout_is_sixty_seconds():
+    # 60s is the contract: the measured 16s maximum plus margin. A loop wedged for good
+    # never answers within it, so a genuinely dead server still earns its strike.
+    assert S.LIVENESS_CONFIRM_SECONDS == 60
+
+
+def test_liveness_fast_probe_passing_is_alive_whatever_else():
+    # If the fast probe answered there is nothing to confirm; never strike a server that
+    # just answered, even if a confirmation value was somehow passed as a failure.
+    assert S.decide_liveness_strike(True, None, 0) == "alive"
+    assert S.decide_liveness_strike(True, False, 3.0) == "alive"
+
+
+def test_liveness_slow_but_answering_is_alive_not_a_strike():
+    # THE BUG THIS FIXES. Fast probe timed out, but the 60s confirmation returned 200 with
+    # this checkout's /health body: the server is slow, not wedged. No strike.
+    assert S.decide_liveness_strike(False, True, 7.4) == "alive"
+    assert S.decide_liveness_strike(False, True, 16.0) == "alive"
+    # The time taken never changes the verdict -- an answer at 55s is still an answer.
+    assert S.decide_liveness_strike(False, True, 55.0) == "alive"
+
+
+def test_liveness_both_looks_silent_is_a_strike():
+    # Fast probe timed out AND the 60s confirmation also failed (timed out / connect fail):
+    # this is the wedged loop the strike exists for.
+    assert S.decide_liveness_strike(False, False, 60.0) == "strike"
+
+
+def test_liveness_no_confirmation_run_is_a_strike():
+    # confirm_ok is None when the caller ran no confirmation (e.g. a connect failure, not a
+    # timeout -- nothing slow to wait for). The original failure stands as a strike.
+    assert S.decide_liveness_strike(False, None, 0) == "strike"
+
+
+def test_liveness_seconds_is_tolerated_in_any_shape():
+    # seconds is for the log line only and must never wedge the gate, whatever it reads.
+    assert S.decide_liveness_strike(False, True, None) == "alive"
+    assert S.decide_liveness_strike(False, True, "not-a-number") == "alive"
+    assert S.decide_liveness_strike(False, False, None) == "strike"

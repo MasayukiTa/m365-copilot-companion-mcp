@@ -47,9 +47,15 @@ def _default_store_path() -> str:
 
 def _sha_file(path: str) -> str:
     h = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(1 << 20), b""):
-            h.update(chunk)
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(1 << 20), b""):
+                h.update(chunk)
+    except PermissionError as e:
+        # The file exists but access is genuinely denied: report WHICH file by name rather than
+        # letting a bare Errno 13 surface without saying what could not be read.
+        raise PermissionError(
+            "permission denied reading data file %r: %s" % (path, e)) from e
     return h.hexdigest()
 
 
@@ -172,7 +178,18 @@ def record_manifest(manifest_path: str, *, dataset_id: str, data_path: str, resu
     entry {path, sha256, result_sha256, fetched_at} per dataset_id. Idempotent per dataset_id
     (an existing entry is replaced). Returns the entry. No raw data row is stored -- only hashes.
     """
+    # manifest_path is the JSON FILE the manifest is written into, never a directory. A caller
+    # that passes a folder (e.g. the request/output folder) would otherwise make the open() below
+    # try to write the directory itself, surfacing a bare '[Errno 13] Permission denied: <folder>'
+    # that reads as if the harness tried to open the folder as a file. Reject it by name instead.
+    if os.path.isdir(manifest_path):
+        raise IsADirectoryError(
+            "manifest_path must be a file to write the manifest JSON into, not a directory: %r"
+            % manifest_path)
     if not os.path.isfile(data_path):
+        if os.path.isdir(data_path):
+            raise IsADirectoryError(
+                "data_path must be the data FILE, not a directory: %r" % data_path)
         raise FileNotFoundError(data_path)
     fetched_at = fetched_at or _dt.datetime.now(
         _dt.timezone(_dt.timedelta(hours=9))).isoformat()
@@ -199,27 +216,91 @@ def record_manifest(manifest_path: str, *, dataset_id: str, data_path: str, resu
 
 
 # ---------------------------------------------------------------------------- (b)
+def _file_mtime_iso(path: str) -> str | None:
+    """The data file's modification time as an ISO string (JST), or None when there is no file.
+
+    This is the lower bound of when the data provably EXISTED: the engine's D gate needs the
+    registration to precede the data, and a worker-declared fetch time is not evidence of that.
+    The filesystem mtime is.
+    """
+    if not path or not os.path.isfile(path):
+        return None
+    ts = os.path.getmtime(path)
+    return _dt.datetime.fromtimestamp(
+        ts, _dt.timezone(_dt.timedelta(hours=9))).isoformat()
+
+
 def register_and_lock(root: str, *, claim: dict, data_fetched_at: str,
-                      registered_at: str | None = None) -> dict:
-    """Register a claim and record the lock, capturing the register-vs-fetch time order.
+                      registered_at: str | None = None, data_location: str | None = None,
+                      trusted: bool = True) -> dict:
+    """Register a claim and record the lock, capturing a TRUSTED register-vs-fetch time order.
 
     Writes <root>/registry/<id>.json (the claim as registered) and appends a line to
-    <root>/registry/lock_log.jsonl with both timestamps and the claim sha256. The engine's
-    D gate requires the registration (preregistration commit) to be strictly before the data
-    fetch; `order_ok` reports whether that holds. This records -- it does not fabricate -- the
-    order; a backdated fetch is reported, not silently accepted.
+    <root>/registry/lock_log.jsonl with the claim sha256 and the times.
+
+    WHY THIS NO LONGER TRUSTS THE WORKER'S CLOCK (欠け 2026-11-01). The old version used the
+    `registered_at` the worker wrote and set `order_ok` to a bare string compare of two values
+    the worker also wrote -- so a backdated registration passed with nothing checking it. Now:
+
+      * registered_at is STAMPED HERE from the system clock at the moment the registration is
+        recorded (trusted=True, the default). A worker-supplied value is kept only as
+        `declared_registered_at`, shown beside the trusted one and NEVER used for order_ok.
+      * the data's existence is checked against EVIDENCE: when data_location is a file, its
+        modification time (`data_file_mtime`) is the lower bound of when the data existed. A
+        declared data_fetched_at EARLIER than that mtime is impossible and is flagged
+        `fetched_at_inconsistent=True`.
+      * order_ok is true only when the trusted registration time is strictly BEFORE the data
+        existed -- i.e. before the file mtime (and, when consistent, before the declared fetch
+        time). If the registration happens AFTER the data file's mtime, order_ok is false and
+        `order_reason` says so.
+
+    The engine's verdict rules, thresholds and claim files are untouched; this only records a
+    trustworthy order. Set trusted=False to fall back to the declared registered_at (kept for
+    callers that have an independently trusted time source of their own).
     """
-    registered_at = registered_at or _dt.datetime.now(
-        _dt.timezone(_dt.timedelta(hours=9))).isoformat()
+    declared_registered_at = registered_at
+    now_iso = _dt.datetime.now(_dt.timezone(_dt.timedelta(hours=9))).isoformat()
+    if trusted or not registered_at:
+        registered_at = now_iso
     cid = str(claim.get("id") or "UNKNOWN")
     reg_dir = os.path.join(root, "registry")
     os.makedirs(reg_dir, exist_ok=True)
     claim_sha = hashlib.sha256(_canon_bytes(claim)).hexdigest()
     with open(os.path.join(reg_dir, f"{cid}.json"), "wb") as f:
         f.write(json.dumps(claim, sort_keys=True, indent=1, ensure_ascii=False).encode("utf-8"))
-    order_ok = _parse_iso(registered_at) < _parse_iso(data_fetched_at)
+
+    data_file_mtime = _file_mtime_iso(data_location)
+    reg_dt = _parse_iso(registered_at)
+    declared_fetch_dt = _parse_iso(data_fetched_at)
+    fetched_at_inconsistent = False
+    if data_file_mtime is not None:
+        mtime_dt = _parse_iso(data_file_mtime)
+        # A declared fetch earlier than the file's mtime is impossible: the file existed by
+        # its mtime, so it could not have been fetched before then. Report, do not accept.
+        fetched_at_inconsistent = declared_fetch_dt < mtime_dt
+        # The data provably existed by its mtime; registration must precede that.
+        order_ok = reg_dt < mtime_dt
+        if order_ok:
+            order_reason = ("trusted registration precedes the data file mtime "
+                            "(data existed no earlier than its mtime)")
+        else:
+            order_reason = ("trusted registration is NOT before the data file mtime: "
+                            "the data already existed when the claim was registered")
+        if fetched_at_inconsistent:
+            order_reason += ("; declared fetched_at is earlier than the data file mtime "
+                             "(inconsistent -- declared value not used for order_ok)")
+    else:
+        # No file evidence available: fall back to comparing trusted registration with the
+        # declared fetch time, and say plainly that this leg rests on a declared value.
+        order_ok = reg_dt < declared_fetch_dt
+        order_reason = ("no data file mtime available; order_ok rests on the declared "
+                        "data_fetched_at compared with the trusted registration time")
     rec = {"id": cid, "claim_sha256": claim_sha, "registered_at": registered_at,
-           "data_fetched_at": data_fetched_at, "order_ok": order_ok, "lock_recorded": True}
+           "declared_registered_at": declared_registered_at,
+           "registered_at_trusted": bool(trusted or not declared_registered_at),
+           "data_fetched_at": data_fetched_at, "data_file_mtime": data_file_mtime,
+           "fetched_at_inconsistent": bool(fetched_at_inconsistent),
+           "order_ok": bool(order_ok), "order_reason": order_reason, "lock_recorded": True}
     with open(os.path.join(reg_dir, "lock_log.jsonl"), "ab") as f:
         f.write((json.dumps(rec, ensure_ascii=False) + "\n").encode("utf-8"))
     return rec
