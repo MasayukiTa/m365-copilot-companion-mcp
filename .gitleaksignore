@@ -26,9 +26,10 @@ d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retriev
 6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
 #
 # Full-history (--log-opts="--all") false positives from the curl-auth-user rule.
-# Both are test fixtures asserting a quoted shell token is treated literally,
-# not real credentials. The commits live on other in-flight branches; the --all
+# Both are test fixtures / command-line examples asserting a quoted shell token is treated
+# literally, not real credentials. The commits live on other in-flight branches; the --all
 # scan reaches them, so the rule fires. Fingerprints (commit:file:rule:line) only --
 # no literal is reproduced here, so these lines add no new finding.
 d28ecd524a386c6a2765b37fa15f06e2690ca465:.gitleaksignore:curl-auth-user:25
+060b1175cc33986dbce397e91dd7d630bab52e22:.gitleaksignore:curl-auth-user:26
 5703b257606179c91365b9ef23eee4f79ad71fb8:tools/test_a_bash_assignment_does_not_reach_shellexecute.py:curl-auth-user:56

@@ -488,6 +488,23 @@ import concurrent.futures as _futures
 
 _HEALTH_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health")
 
+# INBOUND-OBSERVER POOL, SEPARATE FROM asyncio's DEFAULT EXECUTOR.
+#
+# _observe_inbound offloads its journalling (_finish -> obs_log.log_inbound, a jsonl write)
+# with asyncio.to_thread, which dispatches onto the loop's DEFAULT ThreadPoolExecutor -- the
+# SAME pool that runs tool bodies (pwsh_exec, find_files, run_python, ...). This observer runs
+# on the receive path of EVERY request, /health included. Measured 2026-11-07 09:29-09:31:
+# with CPU at 99.5% and heavy tool bodies holding every default-pool slot, the observer's
+# to_thread journalling could not get a worker, so request INTAKE stalled before the handler
+# ever ran -- which is why giving /health's sub-probes their own pool (#461/#463) did not keep
+# /health fast: the request was already stuck in the observer, upstream of the handler. GET
+# /health took 29.6s/25.3s/15.7s/8.7s/19.0s while the loopback c2c-bridge answered in 278ms.
+#
+# Fix: journal on a dedicated, tiny pool so a saturated tool pool can never starve request
+# intake, and make the journalling strictly best-effort -- if even this pool is full we DROP
+# the log line rather than block the request (a liveness probe must never wait on bookkeeping).
+_OBS_POOL = _futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="obs-inbound")
+
 #: Whole-of-sub-probes budget for one /health call. Past this we answer with what we have.
 _HEALTH_PROBE_BUDGET_S = float(os.environ.get("MCP_HEALTH_PROBE_BUDGET_S", "2.0"))
 
@@ -1896,10 +1913,54 @@ async def _observe_inbound(scope, receive):
         # Copilot conversation on this side. See obs_log.header_info / extras_from_body.
         obs_log.log_inbound(methods, sid, ip, ua, headers=scope.get("headers"), extras=extras)
 
+    def _offload(methods, extras=None):
+        # Journal on the DEDICATED observer pool, FIRE-AND-FORGET. This runs on the receive
+        # path of EVERY request (/health included). The original code did
+        # `await asyncio.to_thread(_finish, ...)`, which (a) used the loop's DEFAULT executor --
+        # the same pool heavy tool bodies run on -- and (b) AWAITED completion, so request
+        # INTAKE blocked until a journal write finished. Under the 2026-11-07 CPU saturation
+        # (99.5%) every default-pool slot was held by a tool body, so intake stalled for tens
+        # of seconds BEFORE the handler ran -- which is why /health took 29.6s while the
+        # loopback bridge answered in 278ms, and why #461/#463 (which only isolated /health's
+        # sub-probes) did not help: the request never reached the handler.
+        #
+        # Two independent changes break that: a DEDICATED pool so tool bodies cannot take the
+        # observer's slots, AND no await -- journalling is best-effort bookkeeping that must
+        # never hold up a request. If the submit itself fails or the pool is full, the line is
+        # simply dropped. A request that answers is worth far more than a journal line.
+        try:
+            return _OBS_POOL.submit(_finish, methods, extras)
+        except Exception:
+            return None
+
+    async def _offload_and_settle(methods, extras=None):
+        # Fire-and-forget onto the DEDICATED pool, then AWAIT its completion via the event loop
+        # WITHOUT holding the loop: asyncio.wrap_future yields control while the journal runs on
+        # its own thread, so a slow write suspends only this coroutine, never the loop. Request
+        # intake still never queues behind tool bodies (they run on the DEFAULT pool, this on
+        # _OBS_POOL), which is the starvation fix; awaiting the dedicated-pool future only makes
+        # the line observable to the caller once it is on disk. Best-effort: a failed submit or a
+        # journal error is swallowed.
+        fut = _offload(methods, extras)
+        if fut is None:
+            return
+        try:
+            await asyncio.wrap_future(fut)
+        except Exception:
+            pass
+
     try:
         http_method = str(scope.get("method") or "")
         if http_method != "POST":
-            await asyncio.to_thread(_finish, [("HTTP " + http_method, "")])
+            # Non-POST never wraps the body stream (we return the original receive), so settle the
+            # journal here. Block only this submit's own tiny future, briefly; the GET path reads
+            # no body, so there is nothing to stall behind.
+            fut = _offload([("HTTP " + http_method, "")])
+            if fut is not None:
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
             return receive
     except Exception:
         return receive
@@ -1919,13 +1980,13 @@ async def _observe_inbound(scope, receive):
                 if not message.get("more_body"):
                     from tools import obs_log
                     if state["over"]:
-                        await asyncio.to_thread(_finish, [("(oversize)", "")])
+                        await _offload_and_settle([("(oversize)", "")])
                     else:
                         _body = bytes(state["buf"])
-                        await asyncio.to_thread(_finish, obs_log.methods_from_body(_body),
-                                                obs_log.extras_from_body(_body))
+                        await _offload_and_settle(obs_log.methods_from_body(_body),
+                                                  obs_log.extras_from_body(_body))
             elif not state["done"] and message.get("type") == "http.disconnect":
-                await asyncio.to_thread(_finish, [("(disconnect-before-body)", "")])
+                await _offload_and_settle([("(disconnect-before-body)", "")])
         except Exception:
             pass
         return message
@@ -1934,7 +1995,7 @@ async def _observe_inbound(scope, receive):
         # A response started although the body was never read (auth rejected it first): still
         # worth one line, so "client reached us and was refused" is distinguishable from silence.
         try:
-            await asyncio.to_thread(_finish, [("(body-unread status=%s)" % status, "")])
+            await _offload_and_settle([("(body-unread status=%s)" % status, "")])
         except Exception:
             pass
 
