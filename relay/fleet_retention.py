@@ -969,6 +969,18 @@ HISTORY_KEEP = int(os.environ.get("MCP_FLEET_HISTORY_KEEP", "200"))
 HISTORY_TERMINAL = frozenset({"done", "stuck", "maxturns", "error", "cancelled",
                               "content_refused"})
 
+#: The cockpit's durable record of every history clear, which tools/rebuild_history.py reads
+#: back as a watermark: a rebuilt row whose ts is at or before the newest entry here is
+#: WITHHELD. history_archive writes one too, because moving a completed row out to the gzip
+#: archive and trimming it from history.json is not enough on its own -- .fleet/
+#: socket_route.jsonl is append-only and still holds every worker_done, so the cockpit's
+#: startup load and `python -m tools.rebuild_history` reconstruct exactly the rows this rule
+#: just archived unless the clear watermark tells them not to. Same basename, same one-JSON-
+#: object-per-line shape, same no-BOM UTF-8 as cockpit/clear_history (ui/FleetCockpit.History
+#: .cs) and tools.rebuild_history.CLEARED_LOG_NAME.
+HISTORY_CLEARED_LOG_NAME = "history_cleared.jsonl"
+HISTORY_ARCHIVE_CLEAR_BY = "relay/fleet_retention.history_archive"
+
 
 def history_archive(fleet_dir, now=None, dry_run=False, keep=None):
     """Move the OLDEST completed rows out of history.json into a gzip archive, and trim the
@@ -1070,6 +1082,42 @@ def history_archive(fleet_dir, now=None, dry_run=False, keep=None):
         except OSError:
             pass
         return 0, moved_keys
+
+    # STAMP THE CLEAR WATERMARK so the rows just archived do not come back. history.json is
+    # rebuilt from .fleet/socket_route.jsonl (append-only) by the cockpit at startup and by
+    # `python -m tools.rebuild_history`; both withhold a reconstructed row whose ts is at or
+    # before the newest history_cleared.jsonl entry (tools.rebuild_history.cleared_through).
+    # Without this line the trim frees disk for one tick and the next rebuild refills it --
+    # which is exactly what was observed. The watermark is the MAX ts among the moved rows:
+    # everything archived is at or before it (so it is withheld) and every row kept in
+    # history.json is newer (so it survives), which mirrors the "older than the clear" rule
+    # the cockpit's own clear uses. A moved row with no usable ts does not lower the mark;
+    # if no moved row has one, no watermark is written rather than a false 0.0.
+    _ts_vals = []
+    for r in moving:
+        if not isinstance(r, dict):
+            continue
+        try:
+            _ts_vals.append(float(r.get("ts") or 0.0))
+        except (TypeError, ValueError):
+            continue
+    _wm = max(_ts_vals) if _ts_vals else 0.0
+    if _wm > 0.0:
+        try:
+            _clog = os.path.join(fleet_dir, HISTORY_CLEARED_LOG_NAME)
+            _rec = {
+                "ts": _wm,
+                "iso": time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(_wm)),
+                "rows": len(moving),
+                "by": HISTORY_ARCHIVE_CLEAR_BY,
+            }
+            with io.open(_clog, "a", encoding="utf-8", newline="\n") as _fh:
+                _fh.write(json.dumps(_rec, ensure_ascii=False) + "\n")
+        except OSError:
+            # The archive and the trim already succeeded; a missing watermark only risks a
+            # later rebuild refilling these rows, which the next sweep will re-archive and
+            # re-stamp. It is not a reason to report the trim as failed.
+            pass
 
     freed = max(0, before - _size(path))
     return freed, moved_keys

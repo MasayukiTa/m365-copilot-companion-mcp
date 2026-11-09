@@ -259,6 +259,8 @@ partial class CockpitWindow
             case "ram_floor_mb":
             case "maxtabs":
                 return "live";
+            case "analysis_provenance_gate":
+            case "block_real_desktop_automation":
             case "tool_probe_idle_min":
             case "merge_conversation":
             case "tool_transport":

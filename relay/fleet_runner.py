@@ -78,6 +78,9 @@ from relay.relay_fleet import (  # noqa: E402
 from relay.copilot_autopilot_relay import default_notify  # noqa: E402
 from relay.refuter import PANEL_LENSES  # noqa: E402
 from relay.fanout import fanout_family_view  # noqa: E402
+from relay.coordinator_reload import (  # noqa: E402
+    COORDINATOR_RELOAD_EXIT_CODE, CoordinatorReloadGate,
+)
 from relay.control_markers import CLOSING_INSTRUCTION  # noqa: E402
 from relay.control_envelopes import is_local_loop_control_submission  # noqa: E402
 
@@ -2029,7 +2032,7 @@ def _submitter_of(jid):
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
-              reunlock=None, command_rejections=None):
+              reunlock=None, command_rejections=None, newest_source_mtime=0.0):
     from relay import priority_boost
     boosted_workers = priority_boost.effective_workers(workers)
     from relay.relay_fleet import (free_disk_gb, floor_source as _floor_source,
@@ -2065,6 +2068,15 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # while this is not explicitly False, so a goal that arrives during the post-run
         # cleanup window goes to autostart instead of into a channel nobody will drain.
         "accepting_goals": True,
+        # COORDINATOR STALENESS, additive and small. `coordinator_started` is this coordinator
+        # process's start epoch; `newest_source_mtime` is the newest mtime among the relay/ source
+        # files it loaded (relay.coordinator_reload.COORDINATOR_SOURCE_FILES). When the latter is
+        # greater than the former, the running coordinator is executing code the checkout has moved
+        # past -- a stale long-lived coordinator the cockpit and reports can now see (see the
+        # 2026-11-01 root cause: an 11:52 coordinator kept running pre-#388 code). 0.0 when the
+        # watch could not stat the sources; never blocks a snapshot.
+        "coordinator_started": started,
+        "newest_source_mtime": round(float(newest_source_mtime or 0.0), 3),
         "paused": bool(paused),        # fleet frozen by the cockpit (pause toggle)
         "max_concurrent": max_concurrent,
         "active_concurrent": active_worker_count(workers),
@@ -2371,6 +2383,45 @@ def _mark_not_accepting_goals(status_path):
     _write_atomic(status_path, snap)
 
 
+def _stamp_recovery_status(status_path, attempt, phase, pending_count):
+    """Keep status.json ADVANCING while the recovery loop is between legs.
+
+    THE SILENT-FREEZE FIX. During recovery the sweep (run_relay_fleet) is not running, so
+    nothing calls on_tick and status.json stops being rewritten. If a recovery step then
+    blocks, the file's mtime stays frozen: task_router.fleet_is_live() and the cockpit see
+    a run that is neither advancing nor declared dead, and the watchdog upstream cannot tell
+    a wedged recovery from a healthy pause. Observed 2026-11-07..09: ~33 h of total silence
+    inside recovery attempt 1.
+
+    So every recovery step stamps here. MERGE, DON'T REPLACE (same contract as
+    _mark_not_accepting_goals): load the existing snapshot and set only the recovery fields
+    plus a fresh `updated`, so running / workers / the rest the cockpit reads are preserved.
+    A fresh `updated` lands the stamp inside FLEET_LIVE_MAX_AGE_S, so a downstream watcher
+    can see recovery is progressing (attempt/phase changing) OR stuck (same stamp, old
+    mtime) and retry instead of waiting forever. Best-effort: a status write must never be
+    the thing that takes recovery down, so every failure is swallowed.
+    """
+    try:
+        try:
+            with open(status_path, encoding="utf-8-sig") as fh:
+                snap = json.load(fh)
+        except Exception:
+            snap = {}
+        if not isinstance(snap, dict):
+            snap = {}
+        snap["updated"] = time.time()
+        snap["recovering"] = True
+        snap["recovery"] = {
+            "attempt": int(attempt),
+            "phase": str(phase),
+            "pending": int(pending_count),
+            "stamped": time.time(),
+        }
+        _write_atomic(status_path, snap)
+    except Exception:
+        pass  # the stamp is an optimisation; never let it break recovery
+
+
 # ── RUN-RESUME ledger ──────────────────────────────────────────────────────────
 # When a fleet run dies midway (process killed, PC reboot, crash), the unfinished
 # goals would be lost from the runner's perspective. We persist two small sidecar
@@ -2399,6 +2450,13 @@ _RESUME_SUCCESS_OUTCOMES = ("DONE",)
 # in the done-map so resume can tell "split" from "never ran", but it is NOT a success outcome:
 # it counts as finished only if its campaign header is on disk (see _resume_goal_is_done).
 _RESUME_FANOUT_OUTCOME = "FANOUT"
+# A worker a human stopped (the cockpit `close`/cancel command -> RelayWorker.cancel ->
+# outcome CANCELLED). The user's intent is terminal: re-queueing it on the next --resume is
+# repetition, not recovery (relay/outcomes.py keeps CANCELLED in FINISHED for the same reason).
+# It is written to the done-map so resume can tell "user stopped it" from "never ran", and
+# treated as finished by _resume_goal_is_done. INTERRUPTED (the coordinator died mid-work) is
+# deliberately NOT here: that worker did not finish and MUST still resume.
+_RESUME_CANCELLED_OUTCOME = "CANCELLED"
 
 
 def _goal_key(text):
@@ -2556,7 +2614,8 @@ def _update_done_map(state_dir, workers):
         done = _read_done_map(state_dir)
         for w in workers:
             outcome = getattr(w, "outcome", None)
-            if outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME:
+            if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME
+                    or outcome == _RESUME_CANCELLED_OUTCOME):
                 _k = _goal_resume_key({
                     "text": getattr(w, "goal", "") or "",
                     "jid": getattr(w, "jid", None),
@@ -2564,6 +2623,25 @@ def _update_done_map(state_dir, workers):
                 # monotonic: a later FANOUT never downgrades a recorded DONE
                 if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
                     done[_k] = outcome
+            # DURABLE TOMBSTONE for a cancelled worker, in addition to the done-map entry.
+            # The done-map is keyed by goal text/jid and is the fast in-run skip; the tombstone
+            # is the jid-keyed floor that survives a restart even when no outcome file was ever
+            # written (the five uia jids had no outcome file yet still ran). Writing it each
+            # tick a worker reads CANCELLED means a close that races the coordinator's death is
+            # still recorded. Idempotent; best-effort.
+            if outcome == _RESUME_CANCELLED_OUTCOME:
+                try:
+                    from relay import fleet_tombstone as _tomb
+                    # Tombstone the worker's jid AND its fan-out identities (task_id /
+                    # parent_task_id / campaign_id / root_id), so a cancelled PARENT also stops
+                    # the children that inherit those ids but carry no jid of their own.
+                    for _id in _tomb.worker_identities(w):
+                        _tomb.write_tombstone(
+                            state_dir, _id, reason=_tomb.REASON_CANCELLED,
+                            worker=getattr(w, "name", None),
+                            goal_text=getattr(w, "goal", None))
+                except Exception:
+                    pass
         _write_atomic(os.path.join(state_dir, LAST_RUN_DONE), done)
     except Exception as e:
         # log ONCE per process (not once per tick) to avoid stderr spam every sweep.
@@ -2588,7 +2666,8 @@ def _merge_final_done_map(state_dir, results):
             goal = r.get("goal") or ""
         except Exception:
             continue
-        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME) and goal:
+        if (outcome in _RESUME_SUCCESS_OUTCOMES or outcome == _RESUME_FANOUT_OUTCOME
+                or outcome == _RESUME_CANCELLED_OUTCOME) and goal:
             _k = _goal_resume_key({"text": goal, "jid": r.get("jid")})
             if not (outcome == _RESUME_FANOUT_OUTCOME and done.get(_k) in _RESUME_SUCCESS_OUTCOMES):
                 done[_k] = outcome
@@ -2597,7 +2676,8 @@ def _merge_final_done_map(state_dir, results):
 
 
 def _resume_goal_is_done(entry, key, done_map, state_dir):
-    """Did this ledger goal finish? DONE, or FANOUT whose campaign header is on disk.
+    """Did this ledger goal finish? DONE, CANCELLED (a user stop), or FANOUT whose
+    campaign header is on disk.
 
     G1: the FANOUT parent ends `done/FANOUT` at the split and used to be re-queued on every
     resume (one wasted turn, nothing queued). It counts as finished only when the header line
@@ -2606,6 +2686,8 @@ def _resume_goal_is_done(entry, key, done_map, state_dir):
     outcome = done_map.get(key)
     if outcome in _RESUME_SUCCESS_OUTCOMES:
         return True
+    if outcome == _RESUME_CANCELLED_OUTCOME:
+        return True                        # a human stopped it; resume must not resurrect it
     if outcome == _RESUME_FANOUT_OUTCOME:
         try:
             from relay import fleet_resume
@@ -2633,9 +2715,36 @@ def _resume_goals(state_dir):
         stored = entry.get("key") or _goal_key(entry.get("text", ""))
         legacy_key_counts[stored] = legacy_key_counts.get(stored, 0) + 1
 
+    # DURABLE TOMBSTONE FLOOR, checked BEFORE the done-map. A job the operator cancelled or
+    # closed is recorded by jid under tasks/closed/ the moment it was stopped; it must never
+    # resume even if the done-map never learned its CANCELLED outcome (no outcome file, a close
+    # that raced the coordinator's death). The done-map remains the finer in-run signal; this is
+    # the floor that does not depend on a terminal hook having run. A child entry inherits its
+    # parent/family tombstone through blocked_jid.
+    try:
+        from relay import fleet_tombstone as _tomb
+    except Exception:
+        _tomb = None
+
     remainder = []
     for entry in ledger:
         primary = _goal_resume_key(entry)
+        if _tomb is not None:
+            _blocker = _tomb.blocked_jid(state_dir, entry)
+            if _blocker:
+                # A tombstoned job (or a child of one) is terminal across restarts. If it is a
+                # child inheriting an ancestor's tombstone, stamp its own jid so the next resume
+                # is O(1) and the audit trail shows the inheritance.
+                _own = _tomb.goal_jid(entry)
+                if _own and _own != _blocker and not _tomb.is_tombstoned(state_dir, _own):
+                    try:
+                        _tomb.write_tombstone(state_dir, _own,
+                                              reason=_tomb.REASON_INHERITED,
+                                              goal_text=entry.get("text"),
+                                              parent_jid=_blocker)
+                    except Exception:
+                        pass
+                continue                   # operator stopped it; resume must not resurrect it
         if _resume_goal_is_done(entry, primary, done_map, state_dir):
             continue                       # already finished successfully (or split) -- skip
         stored = entry.get("key") or _goal_key(entry.get("text", ""))
@@ -3871,6 +3980,24 @@ def claim_adopt_command(state_dir, path):
     goals = goals_from_command(cmd) if not errors else []
     if not goals and not errors:
         errors.append("adopt command contains no usable goals")
+    # DURABLE TOMBSTONE CHECK at the adopt door. A fresh runner adopting a pending add_goal
+    # command starts a NEW run that never consults the done-map, so without this a cancelled /
+    # closed jid parked in commands.d is resurrected on the next cold start -- one of the paths
+    # the uia jobs came back through. Refuse to adopt a goal whose own or inherited jid is
+    # tombstoned; an operator who really wants it re-submits with a NEW jid (which clears it).
+    if goals and not errors:
+        try:
+            from relay import fleet_tombstone as _tomb
+            for _g in goals:
+                _blk = _tomb.blocked_jid(state_dir, _g)
+                if _blk:
+                    errors.append(
+                        "adopt command carries a stopped job: jid=%s blocked by tombstone %s "
+                        "(operator cancelled/closed it; re-submit with a new jid)"
+                        % (_tomb.goal_jid(_g) or "?", _blk))
+                    break
+        except Exception:
+            pass
     if errors:
         restore_command_claim(claim)
         return None, [], errors
@@ -4569,6 +4696,15 @@ def main():
         return 5
     _start_forensics(args.state_dir)
     _sample_free_space(args.state_dir, None, force=True)   # floor not resolved yet; ticks carry it
+    # STALE-CODE SELF-RESTART (see relay/coordinator_reload.py and the 2026-11-01 root cause). This
+    # coordinator imported relay/*.py ONCE above and will keep running that in-memory code for its
+    # whole life; a merged source change does not reach it. The gate (built now, so its fingerprint
+    # is of the code THIS process actually loaded) is asked each tick in on_tick: when a watched
+    # source is newer than this start AND nothing is in flight, the coordinator exits with a
+    # distinct code and LEAVES its active marker, so the supervisor's existing fleet auto-resume
+    # relaunches a fresh coordinator on the new code. Reuses relay.code_staleness.CodeWatch (the
+    # same stale-code mechanism #387 wired for the server), never a second one.
+    _reload_gate = CoordinatorReloadGate(_repo_root(), started=started)
     if _adopt_claim is not None:
         if not commit_command_claim(args.state_dir, _adopt_claim, applied=True):
             restore_command_claim(_adopt_claim)
@@ -4869,10 +5005,66 @@ def main():
                     apply_priority_boost(cmd["set_priority_boost"], workers)
                 except (ValueError, RuntimeError) as exc:
                     return False, [str(exc)]
+            _closed_identities = []   # union of every closed worker's ids, for the live-cancel below
+            _closed_workers = []      # the worker objects named in the close, excluded below
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
+                if w is not None:
+                    _closed_workers.append(w)
                 if w is not None and w.status not in TERMINAL:
                     w.cancel()
+                # DURABLE TOMBSTONE AT THE CLOSE SITE. The operator stopped this worker; its
+                # intent is terminal across restarts. Write the tombstone here -- not only via
+                # the done-map on the next tick -- because a worker closed as the coordinator
+                # is going down may never reach _update_done_map, which is exactly how the
+                # cancelled uia jobs came back after a restart. Keyed by jid so every
+                # start/resume/adopt path (and the worker's fan-out children) can refuse it.
+                if w is not None:
+                    try:
+                        from relay import fleet_tombstone as _tomb
+                        # Tombstone every identity this worker carries (jid + fan-out
+                        # task_id/parent_task_id/campaign_id/root_id) so a closed PARENT also
+                        # blocks its children, which inherit those ids but have no jid.
+                        for _id in _tomb.worker_identities(w):
+                            _tomb.write_tombstone(
+                                args.state_dir, _id,
+                                reason=_tomb.REASON_OPERATOR_CLOSE,
+                                worker=getattr(w, "name", None),
+                                goal_text=getattr(w, "goal", None))
+                            _closed_identities.append(_id)
+                    except Exception:
+                        pass
+            # CANCEL DESCENDANTS THAT ARE ALREADY RUNNING. The tombstones above only stop a
+            # child at its NEXT start/resume/adopt door; a fan-out child already in flight has
+            # passed that door and nothing re-checks the tombstone mid-run -- which is how w33
+            # (carrying a closed parent's task_id/campaign_id/root_id, no jid of its own) kept
+            # running for ~46 min and launched `cargo test` after its parent was closed. So
+            # closing a worker must also cancel every LIVE worker that inherits its ids, not
+            # just write their tombstone. Pure id-matching (disk-free) via fleet_tombstone so
+            # it holds even if a tombstone write above failed.
+            if _closed_identities:
+                try:
+                    from relay import fleet_tombstone as _tomb
+                    for _desc in _tomb.descendants_to_cancel(
+                            _closed_identities, workers, closed_workers=_closed_workers):
+                        try:
+                            if getattr(_desc, "status", "") not in TERMINAL:
+                                _desc.cancel()
+                                # The descendant carries no jid of its own; tombstone its own
+                                # fan-out identities too so a restart/adopt cannot revive it.
+                                for _id in _tomb.worker_identities(_desc):
+                                    _tomb.write_tombstone(
+                                        args.state_dir, _id,
+                                        reason=_tomb.REASON_INHERITED,
+                                        worker=getattr(_desc, "name", None),
+                                        goal_text=getattr(_desc, "goal", None))
+                                print("[command] close cancelled a running descendant: %s "
+                                      "(inherits a closed worker's id)"
+                                      % getattr(_desc, "name", "?"), flush=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if "set_maxtabs" in cmd:
                 # under autoscale this knob is the CEILING (上限); otherwise the fixed cap.
                 try:
@@ -4930,6 +5122,20 @@ def main():
             # A recovered command whose batch was persisted before a crash is therefore a no-op;
             # --resume already reconstructed that work from the same ledger.
             for g in _new_cmd_goals:
+                # DURABLE TOMBSTONE CHECK at the live-add door. A command can re-introduce a
+                # jid the operator already cancelled/closed (a recovered commands.d file, a
+                # child carrying a tombstoned ancestor). Refuse it here so a `close` is not
+                # undone by the very next drain. Text/legacy goals with no jid are unaffected.
+                try:
+                    from relay import fleet_tombstone as _tomb
+                    _blk = _tomb.blocked_jid(args.state_dir, g)
+                    if _blk:
+                        print("[fleet] refusing a live-add of a stopped job: jid=%s blocked by "
+                              "tombstone %s (operator cancelled/closed it; re-submit with a new "
+                              "jid to run it)" % (_tomb.goal_jid(g) or "?", _blk), flush=True)
+                        continue
+                except Exception:
+                    pass
                 add_box.append(g)
                 # THE ONE PLACE A `/goal ` SUBMISSION IS STILL VISIBLE. The command file is
                 # deleted the moment it is read, and after that this goal looks like any
@@ -5127,7 +5333,8 @@ def main():
                                                  # next sweep admits them.
                                                  queued=len(add_box or []),
                                                  reunlock=reunlock_box[0],
-                                                 command_rejections=rejections_box)))
+                                                 command_rejections=rejections_box,
+                                                 newest_source_mtime=_reload_gate.newest_source_mtime())))
         except Exception as _status_exc:
             # SILENT HERE USED TO MEAN INVISIBLE, AND task_router.fleet_is_live() TRUSTED THE
             # FILE'S MTIME TO MEAN THE PROCESS. `_write_atomic`'s own docstring says a write
@@ -5165,10 +5372,39 @@ def main():
         except Exception:
             pass
 
+        # STALE-CODE SELF-RESTART, asked LAST so this tick's work (snapshot, commands, registry)
+        # has already been persisted before we may exit. in_flight reuses the SAME notion as
+        # status.json's `running`: an admitted worker is executing, or a goal is queued for
+        # admission. When the gate says restart, exit with the distinct code WITHOUT clearing the
+        # active marker -- the supervisor's existing fleet auto-resume then relaunches a fresh
+        # coordinator on the merged code. A running worker is never killed: a busy tick returns
+        # "wait" and we simply keep sweeping. Fail-safe: the gate swallows its own errors and
+        # returns "none", so a broken check can only ever decline to restart.
+        try:
+            from relay.relay_fleet import active_worker_count as _awc
+            _in_flight = _awc(workers) > 0 or len(add_box or []) > 0
+            _verdict = _reload_gate.should_restart(time.time(), _in_flight, stop_box[0])
+            if _verdict == "restart":
+                print(_reload_gate.restart_log_line(), flush=True)
+                raise SystemExit(COORDINATOR_RELOAD_EXIT_CODE)
+        except SystemExit:
+            raise
+        except Exception:
+            pass
+
     from playwright.sync_api import sync_playwright
     from relay.relay_fleet import FleetContextLost, reset_socket_route
     from relay.edge_recover import cdp_alive, companion_edge_mb, hard_reset as _edge_hard_reset
     from relay.edge_recover import other_fleet_runs, should_recycle
+    # BOUNDED health probe for the recovery loop. cdp_alive() can block forever on a wedged
+    # browser (its `_ = b.contexts` CDP round-trip has no timeout); cdp_alive_bounded() runs
+    # it under a hard wall-clock ceiling so a stuck probe becomes "not alive" -> reset,
+    # never a silent 33-hour freeze of the whole coordinator (observed 2026-11-07..09).
+    from relay.edge_recover import cdp_alive_bounded
+    #: Wall-clock ceiling for every recovery-loop health probe. Past this the browser is
+    #: treated as wedged and reset, rather than waited on indefinitely.
+    RECOVER_CDP_PROBE_DEADLINE_S = float(
+        os.environ.get("MCP_FLEET_RECOVER_CDP_DEADLINE_S", "25"))
 
     #: How many times a discretionary reset defers to a sibling before taking it anyway.
     EDGE_SUPPRESS_MAX = int(os.environ.get("MCP_FLEET_EDGE_SUPPRESS_MAX", "3"))
@@ -5371,15 +5607,26 @@ def main():
                          % (what, new_attempt,
                             len(unfinished if unfinished is not None else pending), wait_s)),
                   flush=True)
+            _unfin_n = len(unfinished if unfinished is not None else pending)
             deadline = time.time() + wait_s
+            # STAMP WHILE WE WAIT, not just before. The sweep is not running during this
+            # back-off, so nothing else advances status.json; without this the file freezes
+            # for the whole wait and a watcher cannot tell backing-off from wedged.
+            _stamp_recovery_status(status_path, new_attempt,
+                                   "backoff:%s" % what, _unfin_n)
             while time.time() < deadline and not stop_box[0]:
                 time.sleep(min(5.0, max(0.0, deadline - time.time())))
+                _stamp_recovery_status(status_path, new_attempt,
+                                       "backoff:%s" % what, _unfin_n)
         return new_attempt, give_up_flag
 
     while pending:
         _leg_size[0] = len(pending)
-        if not cdp_alive(args.cdp_url):
+        if not cdp_alive_bounded(args.cdp_url,
+                                 deadline_s=RECOVER_CDP_PROBE_DEADLINE_S):
             print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
+            _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
+                                   len(pending))
             hard_reset(port)
         try:
             with sync_playwright() as p:
@@ -5510,7 +5757,8 @@ def main():
             if _give_up:
                 print(_stamp("[recover] giving up (auto-recover is switched off)"))
                 break
-            if not cdp_alive(args.cdp_url):
+            if not cdp_alive_bounded(args.cdp_url,
+                                     deadline_s=RECOVER_CDP_PROBE_DEADLINE_S):
                 hard_reset(port)
         except MalformedCheck as e:
             # A CONFIGURATION ERROR IS NOT A CONNECTION ERROR, whatever route it arrives by.
@@ -5532,7 +5780,8 @@ def main():
             # ONLY IF THE BROWSER IS ACTUALLY GONE. A context can be lost because a SIBLING
             # run reset this shared Edge, and resetting it again from here is how one reset
             # becomes a round of them.
-            if not cdp_alive(args.cdp_url):
+            if not cdp_alive_bounded(args.cdp_url,
+                                     deadline_s=RECOVER_CDP_PROBE_DEADLINE_S):
                 hard_reset(port)
 
     stop_wd.set()

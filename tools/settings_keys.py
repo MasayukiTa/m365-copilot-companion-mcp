@@ -140,6 +140,23 @@ KEYS = OrderedDict([
        "tools/approval_policy.py:current_approval_mode (every gate check)",
        "Read fresh at every approval gate, so the panel governs jobs already queued."),
 
+    # The analysis provenance gate (relay/analysis_provenance.py), applied where a worker
+    # becomes DONE in relay/relay_fleet.py. It refuses a data-analysis answer whose numbers
+    # were not recomputed from the raw input in this run (a transcription from a results file
+    # the folder already held). ON by default. The switch lets the owner turn the gate off
+    # from the settings screen without a code change, read fresh on each completion like the
+    # other each_gate keys. Event it prevents and the measurement are recorded in the code
+    # comment at the gate call site (2026-11-02: 28 wrongful rejections of audit/review jobs,
+    # fixed by scoping the classifier to goal content -- this switch is the operator override).
+    _k("analysis_provenance_gate", EACH_GATE, "on",
+       "relay/relay_fleet.py:_settle_done (every data-analysis completion, reads settings.txt mtime-cached)",
+       "off|on. on (default): a data-analysis answer must only report numbers this run "
+       "recomputed from the raw input; a number taken from a results file the folder already "
+       "held fails completion (VERIFY_FAILED) with a correction naming what to do. off: the "
+       "provenance gate is skipped and such an answer completes unchecked. Read fresh at each "
+       "completion with no restart. A present line reads as off only when it says off; anything "
+       "else on a present line, and an absent line, reads as on (the default)."),
+
     # fleet_submit's word-overlap duplicate guard (tools/fleet_intake.py). OFF by default by
     # owner order 2026-10-26: refusing a goal at the door on word overlap turned away DIFFERENT
     # work (two short goals sharing a verb, two coding goals sharing one appended block of common
@@ -155,6 +172,21 @@ KEYS = OrderedDict([
        "ignored, short goals weigh their own identifiers). Read fresh on every submission, so a "
        "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
        "anything but on reads as off."),
+
+    # The owner's standing rule after the 2026-11-02 uia incident: the fleet REFUSES to start a
+    # job whose goal asks for UI automation / computer use on the REAL desktop (desktop_act /
+    # screen_uia_act / screen_uia_dump / Notepad+Calculator automation tests). ON by default --
+    # a safety floor, so a missing/unreadable line keeps it on; only an explicit `off` disables
+    # it. A single goal may still run there by carrying the explicit operator field
+    # allow_real_desktop (off by default on the goal dict). Read live at each worker start.
+    _k("block_real_desktop_automation", EACH_GATE, "on",
+       "relay/desktop_guard.py:mode (every worker start, mtime-cached)",
+       "on|off. on (default): a job whose goal text asks for real-desktop UI automation "
+       "(desktop_act, screen_uia_act/dump, 'Notepad and Calculator' automation, '実デスクトップ') "
+       "is REFUSED before a worker opens, with a reason shown in the cockpit, unless the goal "
+       "carries the operator field allow_real_desktop. off: the guard is disabled. The env var "
+       "MCP_BLOCK_REAL_DESKTOP_AUTOMATION beats the file. Read fresh at each start, so a change "
+       "reaches the next worker with no restart; absent or unreadable reads as on (the floor)."),
 
     # ---------------------------------------------------------------- sweep_start
     _k("autoscale", SWEEP_START, 0,

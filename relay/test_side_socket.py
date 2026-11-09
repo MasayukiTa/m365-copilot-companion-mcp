@@ -69,6 +69,11 @@ class _FakeSocketDriver:
 def _isolate(tmp_path, monkeypatch):
     monkeypatch.setattr(_SR, "DEFAULT_LOG", str(tmp_path / "isolated.jsonl"))
     monkeypatch.setattr(mcp_ready, "gate", lambda: _Gate(""))
+    # These tests exercise the CONNECTOR route by default: the creation gate (mcp_ready.gate)
+    # is only meaningful when a connector is bound. Pin is_bridge() False so the existing gate
+    # tests see the connector behaviour; the connector-less tests override it to True locally.
+    from relay import tool_bridge
+    monkeypatch.setattr(tool_bridge, "is_bridge", lambda *a, **k: False)
     import relay.socket_driver as SD
     monkeypatch.setattr(SD, "CopilotSocketDriver", _FakeSocketDriver)
     _FakeSocketDriver.instances = []
@@ -168,6 +173,44 @@ def test_an_expired_token_holds_and_requests_a_new_one():
 
 
 def test_the_mcp_gate_holds_a_new_conversation():
+    route = _route()
+    drv, why = _acquire(route, gate=_Gate("waiting for MCP server (not reachable)"))
+    assert drv is None and why.startswith("waiting for MCP server")
+
+
+def test_the_mcp_gate_holds_a_side_agent_on_the_connector_route(monkeypatch):
+    """CONNECTOR ROUTE (is_bridge() False): the creation gate still holds the side agent exactly
+    as before -- a conversation created while /health is unreachable would lose its connector
+    tools for life, so the reviewer waits."""
+    from relay import tool_bridge
+    monkeypatch.setattr(tool_bridge, "is_bridge", lambda *a, **k: False)
+    route = _route()
+    drv, why = _acquire(route, gate=_Gate("waiting for MCP server (not reachable)"))
+    assert drv is None and why.startswith("waiting for MCP server")
+
+
+def test_the_mcp_gate_is_skipped_for_a_side_agent_on_the_connector_less_route(monkeypatch):
+    """CONNECTOR-LESS ROUTE (is_bridge() True): there is no connector to bind, so a slow or
+    unreachable /health must NOT hold the side agent. The SAME gate that holds on the connector
+    route is skipped here and the socket is acquired. Regression for the 2026-11-04 stall where
+    every reviewer waited 30+ minutes on mcp_ready.gate().reason()."""
+    from relay import tool_bridge
+    monkeypatch.setattr(tool_bridge, "is_bridge", lambda *a, **k: True)
+    route = _route()
+    drv, why = _acquire(route, gate=_Gate("waiting for MCP server (not reachable)"))
+    assert drv is not None and why == "", "the bridged side agent is not held by the creation gate"
+    assert isinstance(drv, _FakeSocketDriver)
+
+
+def test_a_broken_is_bridge_probe_holds_the_side_agent_on_the_gate(monkeypatch):
+    """Defence in depth: if the route probe raises, the gate is honoured (connector behaviour) --
+    the broken probe never silently lets a side agent past an unreachable /health."""
+    from relay import tool_bridge
+
+    def _boom(*a, **k):
+        raise RuntimeError("transport read failed")
+
+    monkeypatch.setattr(tool_bridge, "is_bridge", _boom)
     route = _route()
     drv, why = _acquire(route, gate=_Gate("waiting for MCP server (not reachable)"))
     assert drv is None and why.startswith("waiting for MCP server")

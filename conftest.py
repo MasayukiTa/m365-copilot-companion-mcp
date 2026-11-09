@@ -359,6 +359,12 @@ LIVE_RECORD_REDIRECTS = {
     # consumer_watch.log and consumer_watch_start_all.log, and reads tasks/pending, all under this
     # one directory, and its default (tick(), start_watcher(), launch_start_all()) would otherwise
     # write the operator's live .fleet. Its tests pass a directory of their own as well.
+    # Per-worker process registry: .fleet/procs/<worker>.jsonl, written on the hot path of
+    # every spawning tool (run_python/shell_exec). registry_dir() is a callable, so the
+    # fixture patches it to return <tmp>/procs; _path_for() derives from it and follows
+    # (see DELIBERATELY_NOT_REDIRECTED). Without this a test that registers a pid would
+    # append to the operator's own .fleet/procs and kill_worker_tree could act on it.
+    "tools.proc_registry": {"registry_dir": "procs"},
     "relay.consumer_watch": {"FLEET_DIR": "consumer_watch_fleet"},
 }
 
@@ -366,6 +372,10 @@ LIVE_RECORD_REDIRECTS = {
 #: this list is a claim that a test writing there is harmless -- so it is short, and each line
 #: has to be defensible.
 DELIBERATELY_NOT_REDIRECTED = {
+    ("tools.proc_registry", "_path_for"):
+        "a function that joins registry_dir() with <worker>.jsonl; registry_dir is "
+        "redirected in LIVE_RECORD_REDIRECTS, so _path_for resolves under the per-run "
+        "temp directory in tests and writes nothing of its own",
     ("tools.live_write_guard", "describe"):
         "read-only status function reporting LEDGER_PATH, which is redirected for tests; "
         "it does not write a record",

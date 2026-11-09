@@ -380,6 +380,62 @@ def test_the_cockpit_draws_the_bar_from_the_view():
     assert "BuildBudgetBar(w, " in src
 
 
+# -- the honest over-limit note: what a red bar actually means (display only) ----------------------
+
+def _go(root, g, ja=True):
+    return dict(_c("group_overlimit", root=root, group=g, ja=ja))
+
+
+@pytestmark_nt
+def test_the_over_limit_note_is_silent_until_a_cap_is_reached(tmp_path):
+    g = _g(**NESTED)
+    lim = {"total": 20, "active": 10, "turns": 100, "wall_min": 100}
+    r = _run_cases(tmp_path, [_go(_tb(USE, lim), g),                      # well under
+                              _go(_tb(dict(USE, total=17), lim), g),      # 85% -- still just a warning
+                              _go(_tb(USE, lim), _g(depth=1, root_id="cmp1")),  # not a root
+                              _go({"groups": [g]}, g)])                   # no tree_budget entry
+    assert all(x["text"] is None for x in r)
+
+
+@pytestmark_nt
+def test_the_over_limit_note_says_only_a_further_split_is_refused(tmp_path):
+    g = _g(**NESTED)
+    lim = {"total": 20, "active": 10, "turns": 100, "wall_min": 100}
+    # active 1 of 10 -> the tree is still running (not finished); total 20/20 is at the cap
+    r = _run_cases(tmp_path, [_go(_tb(dict(USE, total=20), lim), g),
+                              _go(_tb(dict(USE, total=20), lim), g, False)])
+    ja, en = r[0]["text"], r[1]["text"]
+    assert ja is not None and en is not None
+    # it names the ONLY effect (new children of a further split) and the non-effects
+    assert "新しい子" in ja and "統合" in ja and "再試行" in ja and "実行中" in ja
+    assert "further split" in en and "does not stop" in en
+    assert "merge" in en and "retry" in en and "running child" in en
+    # a running tree is NOT described as finished
+    assert "完了済み" not in ja and "finished" not in en
+
+
+@pytestmark_nt
+def test_a_finished_tree_over_the_cap_is_said_to_be_frozen(tmp_path):
+    g = _g(**NESTED)
+    lim = {"total": 20, "active": 10, "turns": 100, "wall_min": 100}
+    # active 0 -> every worker is terminal: the numbers are final and the minutes stopped climbing
+    done = {"total": 20, "active": 0, "turns": 40, "wall_min": 185}
+    r = _run_cases(tmp_path, [_go(_tb(done, lim), g), _go(_tb(done, lim), g, False)])
+    assert "完了済み" in r[0]["text"] and "最終値" in r[0]["text"]
+    assert "finished" in r[1]["text"] and "final" in r[1]["text"]
+
+
+def test_the_cockpit_draws_the_over_limit_note_and_the_help_is_honest():
+    src = open(SHIPPED, encoding="utf-8").read()
+    # the note is wired through ExtraText so the existing paint path shows it
+    assert "OverLimitNote(" in src
+    m = re.search(r"string ExtraText\(.*?\n    }\n", src, re.S)
+    assert m and "OverLimitNote(" in m.group(0)
+    # the minutes help no longer claims "since a tree's first split" (an ever-growing clock)
+    assert "since a tree's first split" not in src
+    assert "active time" in src and "実働時間" in src
+
+
 # -- the same bar for the other ledger dimensions (total / active / minutes), display only --------
 
 def _gba(root, g, idx, ja=True):

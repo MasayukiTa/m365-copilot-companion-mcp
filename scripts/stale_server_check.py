@@ -221,6 +221,140 @@ def fleet_is_running(marker_states) -> bool:
     return any(present and pid_alive for present, pid_alive in marker_states)
 
 
+#: How long the supervisor may hold off a stale-code cycle while an external client is
+#: mid-response, before cycling anyway. An in-flight tool call normally ends well within
+#: this; the cap is the backstop that keeps the checkout's fixes from never going live if
+#: a request never completes (a wedged client, a hung stream). See decide_stale_drain.
+DRAIN_CAP_SECONDS = 180
+
+#: A request that started fewer than this many seconds ago is treated as "just arrived":
+#: resp_inflight can read zero for the instant between the relay accepting a request and
+#: the telemetry wrapper opening it, so a tiny settle window keeps the gate from cycling
+#: into a request that is about to show up. Matches the drain gate the GOAL specifies.
+DRAIN_SETTLE_SECONDS = 5
+
+
+def decide_stale_drain(inflight, age, waited,
+                       cap=DRAIN_CAP_SECONDS, settle=DRAIN_SETTLE_SECONDS):
+    """Whether the supervisor may cycle a stale server now, or must keep waiting.
+
+    The stale-code cycle kills the server process; a request the external client is still
+    waiting on is lost (the client sees the connection closed mid-response, and the tunnel
+    relay answers new requests 502 for ~40s while the replacement binds). The OLD rule --
+    fleet idle and the bridge not busy -- never looked at live HTTP, so it cycled straight
+    through a client mid-response. This gate adds that missing look.
+
+    Inputs are the two numbers /health now carries (tools/response_telemetry.py):
+
+      * ``inflight`` -- HTTP requests currently open through the telemetry wrapper.
+      * ``age``      -- seconds since the most recent request STARTED, or None when no
+                        request has started since the server came up.
+      * ``waited``   -- seconds this cycle decision has already deferred, accumulated by
+                        the caller across its re-checks.
+
+    Returns one of two words:
+
+      * ``"wait"``   -- a request is open, or one started within ``settle`` seconds, and
+                        the cap has not been reached: defer and re-check.
+      * ``"cycle"``  -- nothing is in flight (and nothing just arrived), OR ``waited`` has
+                        reached ``cap``: cycle now. The caller logs which of the two it was
+                        by comparing ``waited`` to ``cap``.
+
+    Pure: the caller reads /health, accumulates ``waited`` over the normal loop interval,
+    and acts on the word. The cap is checked FIRST, so a request that never finishes still
+    lets the fix go live once the backstop is hit -- the whole point of having a cap.
+
+    ``age`` is tolerant of a missing or unreadable value: ``None`` (never started) and a
+    negative number (a clock that went backwards) both read as "nothing recent", so a
+    damaged age can only ever make the gate MORE willing to cycle, never wedge it.
+    """
+    try:
+        w = float(waited)
+    except (TypeError, ValueError):
+        w = 0.0
+    if w >= cap:
+        return "cycle"
+    try:
+        n = int(inflight)
+    except (TypeError, ValueError):
+        n = 0
+    if n > 0:
+        return "wait"
+    if age is not None:
+        try:
+            a = float(age)
+        except (TypeError, ValueError):
+            a = None
+        if a is not None and 0 <= a < settle:
+            return "wait"
+    return "cycle"
+
+
+#: The longer timeout, in seconds, of the SECOND (confirmation) /health GET that
+#: Test-ServerUp issues after its fast 5s probe times out. The fast probe gives up at 5s and
+#: reports a bare "Timeout"; that is far too short a verdict to KILL a server on, because a
+#: busy box (this one runs the whole fleet at ~100% CPU with under 1 GB free) routinely makes
+#: /health take 7-16s to answer while the process is perfectly alive and mid-work (measured
+#: 2026-11-02: 7.4s, 10.7s, 15s, 16s, all HTTP 200). Killing it there throws away the
+#: in-flight response and costs ~40s of relay 502s while the replacement binds -- for a server
+#: that was never down. 60s clears the measured 16s maximum with margin; a loop wedged for
+#: good never answers within it, so a genuinely dead server still earns its strike.
+LIVENESS_CONFIRM_SECONDS = 60
+
+
+def decide_liveness_strike(first_ok, confirm_ok, seconds):
+    """Tell a slow-but-alive server from a dead one after a fast /health probe failed.
+
+    Test-ServerUp uses a 5-second timeout. On an idle machine that is plenty, but this
+    supervisor runs beside the fleet, and a /health that takes 7-16s to answer under load
+    is a server that is ALIVE and busy, not one that is down (measured 2026-11-02). The old
+    loop treated the 5s timeout as a failed tick directly, so FailuresBeforeAction slow ticks
+    in a row killed a working server, dropped whatever request was in flight, and made the
+    relay answer 502 for ~40s while the replacement bound -- an outage manufactured out of
+    mere slowness (2026-11-02 18:10: 4/4 timeouts struck a server still answering in 16s).
+
+    This gate adds the missing second look. The caller does the I/O (the fast probe, then a
+    longer confirmation GET with LIVENESS_CONFIRM_SECONDS) and hands in the two outcomes plus
+    how long the confirmation took; the verdict is pure so it can be tested without a server,
+    exactly like :func:`decide_stale_drain`.
+
+    Inputs:
+
+      * ``first_ok``   -- the fast 5s Test-ServerUp probe answered 200 this tick. When True
+                          there is nothing to decide and the caller does not run a
+                          confirmation; the gate still returns ``"alive"`` so a mistaken call
+                          cannot strike a server that just answered.
+      * ``confirm_ok`` -- the longer confirmation GET's result: ``True`` it returned 200 with
+                          this checkout's /health body, ``False`` it also timed out or the
+                          connection failed, ``None`` no confirmation was run (there was
+                          nothing slow to wait for, e.g. a non-timeout failure).
+      * ``seconds``    -- how long the confirmation GET took, for the caller's log line
+                          ("server slow (N s) but answering"). Does not change the verdict:
+                          an answer is an answer whether it took 8s or 55s. Tolerated as
+                          non-numeric so a broken timer can never wedge the gate.
+
+    Returns one of two words:
+
+      * ``"alive"``   -- the fast probe passed, OR the confirmation GET answered: the server
+                         is up (just slow). The caller resets the miss streak and does NOT
+                         restart; it logs "server slow (N s) but answering -- not restarting".
+      * ``"strike"``  -- the fast probe failed and the confirmation also failed (or was not
+                         run): count this tick toward FailuresBeforeAction.
+
+    Precedence is deliberate: a passing probe (fast or confirm) beats everything, because a
+    server that just answered is up no matter how long it took; only genuine silence on both
+    looks reaches ``"strike"``. The gate can therefore only ever be MORE reluctant to kill,
+    never less. ``seconds`` is read but never gates the result, so it is accepted in any
+    shape.
+    """
+    _ = seconds  # for the caller's log only; never changes the verdict
+    if first_ok:
+        return "alive"
+    if confirm_ok:
+        return "alive"
+    return "strike"
+
+
 # --------------------------------------------------------------------------- CLI
 # doctor invokes this file through Invoke-BoundedPythonFile (see check_unlock_usable.py
 # for the same pattern) with two arguments: the path to the server-start HEAD marker,

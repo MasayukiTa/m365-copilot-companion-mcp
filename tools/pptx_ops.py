@@ -1,16 +1,28 @@
+from __future__ import annotations
+
 import os
 import re
 import subprocess
 import sys
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
-
-from pptx import Presentation
-from pptx.util import Emu, Inches, Pt
+from typing import TYPE_CHECKING, Any, Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
+
+if TYPE_CHECKING:  # annotations only; the real import happens inside each function
+    from pptx import Presentation
+
+# python-pptx costs ~1-2s to import at startup; defer it until a pptx tool is actually
+# called. Each function that needs it calls _pptx_imports() first, so behaviour is
+# unchanged -- the cost just moves from server boot to first pptx use.
+
+
+def _pptx_imports():
+    from pptx import Presentation
+    from pptx.util import Emu, Inches, Pt
+    return Presentation, Emu, Inches, Pt
 
 
 # Layout indices in the default python-pptx blank template.
@@ -66,6 +78,7 @@ def create_pptx(path: str, slides: list[dict], title: Optional[str] = None,
     try:
         if not isinstance(slides, list) or not slides:
             return "[create_pptx error: 'slides' must be a non-empty list]"
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         out = _validate_path(path)
         if out.suffix.lower() != ".pptx":
             return "[create_pptx error: path must end with .pptx]"
@@ -134,6 +147,7 @@ def pptx_from_markdown(path: str, markdown: str, title: Optional[str] = None,
 def pptx_info(path: str) -> str:
     """Return a structural summary of an existing .pptx (slide count + titles)."""
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         p = _validate_path(path)
         if p.suffix.lower() != ".pptx":
             return "[pptx_info error: path must end with .pptx]"
@@ -175,6 +189,7 @@ def pptx_add_slide(pptx_path: str, slide: dict) -> str:
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         if not isinstance(slide, dict):
             return "[pptx_add_slide error: slide must be an object]"
         p = _validate_path(pptx_path)
@@ -213,6 +228,7 @@ def pptx_add_image(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         p = _validate_path(pptx_path)
         if not p.is_file():
             return f"[pptx_add_image error: file not found: {p}]"
@@ -259,6 +275,7 @@ def pptx_replace_image(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         p = _validate_path(pptx_path)
         if not p.is_file():
             return f"[pptx_replace_image error: file not found: {p}]"
@@ -309,6 +326,7 @@ def pptx_add_table(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         if not isinstance(rows, list) or not rows or not isinstance(rows[0], list):
             return "[pptx_add_table error: rows must be a 2D list]"
         p = _validate_path(pptx_path)
@@ -365,34 +383,101 @@ def pptx_export_png(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            import pythoncom  # type: ignore
-            import win32com.client  # type: ignore
+            import pythoncom  # type: ignore  # noqa: F401
+            import win32com.client  # type: ignore  # noqa: F401
         except ImportError:
             return "[pptx_export_png error: pywin32 not installed; cannot drive PowerPoint COM]"
 
-        pythoncom.CoInitialize()
-        ppt = None
-        pres = None
-        try:
-            ppt = win32com.client.DispatchEx("PowerPoint.Application")
-            # PowerPoint can't be fully hidden on all builds; the dispatch-export-quit pattern is the standard.
-            pres = ppt.Presentations.Open(str(p), WithWindow=False)
-            scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
-            pres.Export(str(out_dir), "PNG", width_px, scale_h)
-            count = len(list(out_dir.glob("*.PNG"))) + len(list(out_dir.glob("*.png")))
-            return f"Exported {count} PNG(s) to {out_dir}"
-        finally:
+        # ROOT CAUSE OF THE REPEATED python.exe CRASHES (faulthandler.log.1, 2026-11-07):
+        # every faulthandler "Current thread" crash frame is this function
+        # (pptx_ops.py:pptx_export_png <- main.py:call_tool), with NATIVE exceptions
+        # 0x80010108 (RPC_E_DISCONNECTED), 0x800706ba/0x800706be (RPC server
+        # unavailable / call failed) and access violations (0xc0000005). These come
+        # from the shared PowerPoint COM server disconnecting mid-call. They are SEH /
+        # native exceptions, NOT Python exceptions -- `try/except Exception` below can
+        # never catch them, so when the COM calls run directly on the anyio call_tool
+        # worker thread, the native crash takes the whole MCP server (main.py, port
+        # 8000) down and it restarts (observed 12:52:41, 13:13:57, 14:28:24).
+        #
+        # Containment: run ALL COM work on a dedicated daemon STA thread. If that
+        # thread dies to a native COM crash, the server process survives: the join
+        # below returns without a result and we report an error string instead of
+        # letting python.exe be killed. The dispatch/no-quit logic (PR #444) is kept
+        # verbatim inside the worker so its green behaviour is unchanged.
+        import threading as _threading
+        _result: dict = {}
+
+        def _com_worker():
+            import pythoncom  # type: ignore
+            import win32com.client  # type: ignore
+            pythoncom.CoInitialize()
+            ppt = None
+            pres = None
+            already_open = False
+            # PowerPoint は 1 つのインスタンスを共有する。DispatchEx は、すでに開いている
+            # 利用者の PowerPoint にそのままつながることがあり、同じ資料がすでに開かれていれば
+            # Open() は新しく開かず既存の資料オブジェクトを返す。その資料は利用者の生きた作業
+            # なので、閉じてはならない。所有ルールは狭い: このツールは「自分が開いた 1 つの資料」
+            # だけを閉じてよく、Application.Quit もプロセス kill も他の資料の Close も行わない
+            # (2026-11-06 に、開始直後に利用者の資料を閉じる不具合として確認)。
             try:
-                if pres is not None:
-                    pres.Close()
-            except Exception:
-                pass
-            try:
-                if ppt is not None:
-                    ppt.Quit()
-            except Exception:
-                pass
-            pythoncom.CoUninitialize()
+                ppt = win32com.client.DispatchEx("PowerPoint.Application")
+                # 利用者がすでに同じ資料を開いているなら、それを使い、閉じない。すでに開いて
+                # いるかは、プロセス一覧ではなく開いている資料のコレクションを走査して判定する。
+                # tasklist に頼らないので、分離ワーカースレッド上で余計な子プロセスを起こさず、
+                # 判定は常に実際の COM の状態そのものに基づく。
+                _want = os.path.normcase(os.path.abspath(str(p)))
+                try:
+                    _presentations = ppt.Presentations
+                    _item = getattr(_presentations, "Item", None)
+                    for _i in range(1, _presentations.Count + 1):
+                        _cand = _item(_i) if _item is not None else _presentations(_i)
+                        if os.path.normcase(os.path.abspath(str(_cand.FullName))) == _want:
+                            pres = _cand
+                            already_open = True
+                            break
+                except Exception:
+                    pass
+                if pres is None:
+                    # 自分で開いた資料だけを、このツールが所有する。
+                    pres = ppt.Presentations.Open(str(p), WithWindow=False)
+                scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
+                pres.Export(str(out_dir), "PNG", width_px, scale_h)
+                count = len(list(out_dir.glob("*.PNG"))) + len(list(out_dir.glob("*.png")))
+                _result["ok"] = f"Exported {count} PNG(s) to {out_dir}"
+            except Exception as e:  # pragma: no cover - exercised only with real COM
+                _result["err"] = f"[pptx_export_png error: {type(e).__name__}: {e}]"
+            finally:
+                try:
+                    # 自分が開いた資料だけを閉じる。到着時にすでに開いていた資料 (利用者の
+                    # 作業) は、このツールの所有物ではないので決して閉じない。Application.Quit
+                    # は呼ばない: アプリを終了すると開いている他の資料まで道連れに閉じてしまう。
+                    if pres is not None and not already_open:
+                        pres.Close()
+                except Exception:
+                    pass
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+        _t = _threading.Thread(target=_com_worker, name="pptx-export-com", daemon=True)
+        _t.start()
+        # Export of a large deck can legitimately take a while; cap it so a hung COM
+        # server cannot wedge the caller forever. A timeout here still leaves the
+        # server process alive -- only this one tool call fails.
+        _t.join(timeout=180)
+        if _t.is_alive():
+            return ("[pptx_export_png error: PowerPoint COM did not finish within 180s; "
+                    "the export was abandoned and the server left running]")
+        if "ok" in _result:
+            return _result["ok"]
+        if "err" in _result:
+            return _result["err"]
+        # Worker thread vanished without recording a result -- the signature of a
+        # native COM crash that this isolation is designed to survive.
+        return ("[pptx_export_png error: PowerPoint COM worker terminated without a "
+                "result (likely a native COM/RPC disconnect); server left running]")
     except Exception as e:
         return f"[pptx_export_png error: {type(e).__name__}: {e}]"
 
@@ -540,6 +625,7 @@ def pptx_from_reference(
     if locked:
         return locked
     try:
+        Presentation, Emu, Inches, Pt = _pptx_imports()
         out = _validate_path(output_path)
         if out.suffix.lower() != ".pptx":
             return "[pptx_from_reference error: output_path must end with .pptx]"
@@ -620,7 +706,8 @@ def _strip_existing_slides(prs: Presentation) -> None:
         xml_slides.remove(sld_id)
 
 
-def _add_slide(prs: Presentation, spec: dict) -> None:
+def _add_slide(prs: "Presentation", spec: dict) -> None:
+    _P, Emu, Inches, Pt = _pptx_imports()
     layout_name = spec.get("layout")
     layout_idx = _pick_layout(spec, layout_name)
     # A template deck may carry fewer layouts than the default's six; fall back to the
@@ -698,6 +785,7 @@ def _pick_layout(spec: dict, explicit: Optional[str]) -> int:
 
 
 def _style_title(title_shape: Any) -> None:
+    _P, _Emu, _Inches, Pt = _pptx_imports()
     tf = title_shape.text_frame
     for para in tf.paragraphs:
         for run in para.runs:
@@ -706,6 +794,7 @@ def _style_title(title_shape: Any) -> None:
 
 
 def _fill_bullets(placeholder: Any, bullets: list) -> None:
+    _P, _Emu, _Inches, Pt = _pptx_imports()
     tf = placeholder.text_frame
     tf.clear()
     first = True
@@ -725,6 +814,7 @@ def _fill_bullets(placeholder: Any, bullets: list) -> None:
 
 
 def _fill_body(placeholder: Any, text: str) -> None:
+    _P, _Emu, _Inches, Pt = _pptx_imports()
     tf = placeholder.text_frame
     tf.clear()
     lines = text.splitlines() or [""]

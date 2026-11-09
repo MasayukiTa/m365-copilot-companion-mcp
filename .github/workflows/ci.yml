@@ -12,11 +12,13 @@
 #       backslash semantics that do not match pathlib on Linux.
 #
 # NOTE ON LINUX PORTABILITY:
-#   relay/relay_fleet.py uses ctypes.windll.kernel32.GlobalMemoryStatusEx, but
-#   only inside avail_phys_mb() wrapped in try/except (falls back to 4096 MB).
-#   The hermetic tests all monkeypatch that function, so the fallback is never
-#   even reached. pywin32 has a sys_platform=="win32" marker in mcp's metadata,
-#   so it is not installed on Linux.
+#   relay/relay_fleet.py calls GlobalMemoryStatusEx inside avail_phys_mb(), but the
+#   handle is pre-bound only when os.name == "nt" and is None elsewhere, so on Linux
+#   the function falls back to 4096 MB without touching the WinAPI. The hermetic tests
+#   mostly monkeypatch that function; test_memstatus_ctypes_threadsafe.py exercises the
+#   Linux fallback path directly and asserts on source shape, never the native call.
+#   pywin32 has a sys_platform=="win32" marker in mcp's metadata, so it is not installed
+#   on Linux.
 
 name: CI
 
@@ -37,6 +39,13 @@ jobs:
           # vacuously, which is a green tick that means nothing.
           fetch-depth: 2
 
+      - name: Reject CRLF in tracked Python, Markdown and YAML
+        shell: bash
+        run: |
+          git ls-files --eol -- '*.py' '*.md' '*.yml' | awk '
+            /^i\/crlf[[:space:]]/ { print "CRLF in index: " substr($0, index($0, "\t") + 1); bad = 1 }
+            END { exit bad ? 1 : 0 }
+          '
       - name: Set up Python 3.10
         uses: actions/setup-python@v7
         with:
@@ -113,7 +122,11 @@ jobs:
             tests/test_unlock_oracle.py \
             tests/test_search_deadline.py \
             tests/test_env_example_states_standard_tunnel_effect.py \
+            tests/test_sessions_search_migration.py \
             tools/test_child_env_credentials.py \
+            tools/test_childproc_timeout_kills_tree_no_thread_leak.py \
+            tools/test_ocr_native_thread_leak.py \
+            tools/test_ocr_thread_leak.py \
             tools/test_web_fetch_encoding.py \
             tools/test_web_search_no_gpu_no_clone.py \
             tools/test_arg_repair.py \
@@ -137,6 +150,8 @@ jobs:
             relay/test_goal_during_cleanup_window.py \
             relay/test_auto_rephrase_continue.py \
             scripts/test_status_tool_does_not_mislead.py \
+            scripts/test_health_probe_isolation.py \
+            scripts/test_health_busy_signal.py \
             tools/test_one_settings_file_for_every_context.py \
             tools/test_a_setting_declares_when_it_takes_effect.py \
             tools/test_a_search_walk_is_bounded_in_depth_and_time.py \
@@ -157,11 +172,30 @@ jobs:
             relay/test_a_one_line_answer_is_still_an_answer.py \
             tests/test_a_question_nobody_can_fail_is_not_a_question.py \
             tools/test_fleet_intake.py \
+            tools/test_case_reference_search.py \
+            tools/test_case_reference_search_full_path.py \
+            relay/test_fleet_case_reference.py \
+            relay/test_judge_none_on_full_path_case_ref.py \
+            relay/test_judge_gate_harness.py \
+              relay/test_judge_engine_messages.py \
+            relay/test_fleet_judge_request.py \
+            relay/test_judge_correction_turn.py \
+              relay/test_judge_request_decode_correction.py \
+            relay/test_fleet_judge_empty_cwd.py \
+            relay/test_judge_worker_claim_to_engine.py \
+            relay/test_judge_engine_chain_after_395.py \
+            relay/test_judge_verdict_not_error.py \
+            relay/test_engine_claim_schema_in_initial_instruction.py \
+            relay/test_judge_footer_force_hold.py \
+            tests/test_validity_harness.py \
+            tools/test_gui_submission_reaches_fleet.py \
+            tools/test_fleet_admissions.py \
             tools/test_refused_record_and_force.py \
             ui/test_a_refused_request_is_shown_and_can_be_forced.py \
             tools/test_dismiss_refused_card.py \
             ui/test_priority_boost_persists_and_audits.py \
             ui/test_a_boosted_parent_lifts_its_children.py \
+            ui/test_clicking_a_worker_changes_spine.py \
             tools/overnight/test_overnight_input.py \
             tools/overnight/test_overnight_runner.py \
             tools/overnight/test_overnight_detect.py \
@@ -178,15 +212,17 @@ jobs:
             tests/test_unlock_token.py \
             tests/test_unlock_revocation.py \
             tests/test_unlock_switch.py \
+            tests/test_uvicorn_keepalive_timeout.py \
+            tests/test_startup_imports_are_deferred.py \
             relay/test_stuck_cause_classifier.py \
             relay/test_mcp_ready.py \
+            relay/test_mcp_ready_slow_health.py \
             relay/test_side_socket.py \
             relay/test_fresh_conversation_retry.py \
             relay/test_platform_error_replies.py \
             relay/test_route_breaker_per_conversation.py \
             relay/test_mcp_attribution.py \
             relay/test_a_running_tool_call_is_progress_not_a_stall.py \
-            relay/test_judge_gate_harness.py \
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
@@ -209,7 +245,6 @@ jobs:
             scripts/test_set_setting_via_ui_ids.py \
             tests/test_scroll_transcript.py \
             tests/test_golden.py \
-            tests/test_validity_harness.py \
             tests/test_listing_counts.py \
             tests/test_child_output_decoding.py \
             bench/test_skill_use_log.py \
@@ -232,12 +267,15 @@ jobs:
             relay/test_continue_turn_recovery.py \
             relay/test_a_cut_after_output_is_continued_not_resent.py \
             relay/test_socket_tools.py \
+            relay/test_unfenced_call_label.py \
             relay/test_first_turn_preflight.py \
             relay/test_token_prestart.py \
+            relay/ops_db/test_ops_db_stage1.py \
             relay/test_batching_rule_in_prompt.py \
             relay/test_tool_bridge.py \
             relay/test_tool_bridge_wiring.py \
             relay/test_tool_bridge_fleet_checks.py \
+            relay/test_mcp_ready_gate_skips_bridge.py \
             relay/test_bridged_reply_checks.py \
             relay/test_bridge_bench_selfcheck.py \
             relay/test_template_seed.py \
@@ -256,6 +294,10 @@ jobs:
             relay/test_priority_survives_every_delivery_route.py \
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
+            relay/test_fleet_tombstone.py \
+            relay/test_fleet_child_no_resurrect.py \
+            relay/test_fleet_close_descendants.py \
+            relay/test_desktop_guard.py \
             relay/test_every_intake_route_leaves_one_receipt.py \
             relay/test_fanout_family_view.py \
             relay/test_family_view.py \
@@ -376,6 +418,9 @@ jobs:
             scripts/test_supervisor_rotates_its_log.py \
             scripts/test_a_hard_killed_supervisor_leaves_a_last_breath.py \
             scripts/test_supervisor_death_is_explained.py \
+            scripts/test_supervisor_no_duplicate_host.py \
+            scripts/test_supervisor_dead_tunnel_host_replaced.py \
+            scripts/test_supervisor_zero_conn_recovery.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
@@ -401,6 +446,7 @@ jobs:
             relay/selfimprove/test_the_rollback_has_a_handle.py \
             tools/test_child_output_is_not_decoded_by_luck.py \
             tools/test_process_tree_ownership.py \
+            tools/test_proc_registry.py \
             tools/test_a_windowless_launch_really_has_no_window.py \
             tools/test_a_test_run_opens_no_console.py \
             tools/test_no_new_launch_inherits_its_console_by_accident.py \
@@ -428,7 +474,10 @@ jobs:
             tools/test_no_window_opens_on_the_operators_desktop_during_a_test.py \
             tools/test_a_completion_marker_is_not_an_output_contract.py \
             tools/test_a_deck_the_agent_wrote_says_so.py \
+            tools/test_pptx_export_png_does_not_quit_powerpoint.py \
+            tools/test_pptx_export_png_closes_only_its_own_document.py \
             tools/test_pptx_inherits_reference_template.py \
+            tools/test_pptx_export_png_com_isolated.py \
             tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
             tests/test_flow_map_docs_name_files_that_exist.py \
@@ -463,6 +512,7 @@ jobs:
             tools/test_security.py \
             tools/test_python_gate.py \
             tools/test_powershell_hardening.py \
+            tools/test_shell_exec_eqpath_guard.py \
             tools/test_approval_policy.py \
             tools/test_bypass_never_asks.py \
             tools/test_layer1_security.py \
@@ -647,6 +697,7 @@ jobs:
             relay/test_settle_replay.py \
             relay/test_settle_trace_collect.py \
             relay/test_settle_collect.py \
+            relay/test_shell_exec_eqpath_guard.py \
             relay/test_soak.py \
             relay/test_solve_policy.py \
             relay/test_skills.py \
@@ -775,6 +826,8 @@ jobs:
             tests/test_steer_followup.py \
             tests/test_launch_gate.py \
             relay/test_fanout_worker.py \
+            relay/test_fanout_parent_waits.py \
+            relay/test_fanout_parent_waits_sweep.py \
             relay/test_splittability.py \
             relay/test_wants_fanout.py \
             relay/test_natural_language_fanout_e2e.py \
@@ -802,6 +855,7 @@ jobs:
             tests/test_skill_requires_tools.py \
             tests/test_refuter_source_check.py \
             tests/test_refuter_subject_check.py \
+            tests/test_refuter_judge_check.py \
             tests/test_no_domain_words_in_harness.py \
             tests/test_skills_fairtest.py \
             tests/test_skills_business_draft.py \
@@ -867,6 +921,7 @@ jobs:
             relay/selfimprove/test_archive_publish_guard.py \
             relay/selfimprove/test_run_archive.py \
             relay/test_fleet_ram_floor.py \
+            relay/test_memstatus_ctypes_threadsafe.py \
             relay/selfimprove/test_pending.py \
             relay/selfimprove/test_a_card_whose_premise_is_gone_says_so.py \
             relay/selfimprove/test_memory_population.py \
@@ -924,8 +979,10 @@ jobs:
             relay/test_edge_disk_cap.py \
             relay/test_effort_expressible.py \
             relay/test_evidence_manifest.py \
+            relay/test_refuter_evidence_handoff.py \
             relay/test_fleet_retention.py \
             relay/test_completed_jobs_move_to_archive_then_leave_history.py \
+            relay/test_history_archive_stamps_the_clear_watermark.py \
             relay/test_disk_series.py \
             relay/test_conversation_registry_keeps_listable_rows.py \
             relay/test_temp_home.py \
@@ -938,6 +995,12 @@ jobs:
             relay/test_an_invariant_has_a_call_site.py \
             relay/test_a_contract_is_checked_against_its_own_hash.py \
             relay/test_a_diagnosis_is_computed_not_transcribed.py \
+            relay/test_analysis_provenance.py \
+            relay/test_provenance_pptx_source.py \
+            relay/test_provenance_standard_names.py \
+            relay/test_provenance_request_identifiers.py \
+            relay/test_a_planted_results_file_is_not_an_answer.py \
+            relay/test_a_rounded_answer_is_not_a_fake.py \
             relay/test_the_first_recovery_will_announce_itself.py \
             relay/test_an_infrastructure_stop_says_so_where_it_is_kept.py \
             relay/test_the_timeout_record_names_its_own_clock.py \
@@ -955,6 +1018,7 @@ jobs:
             relay/test_a_steer_starts_a_new_chain.py \
             relay/test_a_locked_worker_needed_a_button_not_a_prayer.py \
             relay/test_a_bad_check_costs_only_its_own_goal.py \
+            relay/test_a_wedged_edge_probe_gives_up_within_its_deadline.py \
             relay/test_acceptance_process_cleanup.py \
             relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_an_unnumbered_split_reply_is_still_a_split.py \
@@ -1034,6 +1098,10 @@ jobs:
             relay/test_a_coordinator_turn_writes_its_context.py \
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
+            scripts/test_sibling_cost_report.py \
+            scripts/test_sibling_turn_context_join.py \
+            scripts/test_comm_roi_report.py \
+            scripts/test_board_report.py \
             scripts/test_ab_compare.py \
             scripts/test_exp_public_data.py \
             scripts/test_exp_collect.py \
@@ -1101,7 +1169,13 @@ jobs:
             tools/test_reldisc.py \
             tests/test_owner_verbatim_realuse.py \
             scripts/test_stability_replay.py \
-            relay/test_a_finished_worker_need_not_be_swept_every_tick.py
+            relay/test_a_finished_worker_need_not_be_swept_every_tick.py \
+            relay/test_tunnel_channels.py \
+            relay/test_tunnel_host_log.py \
+            tests/test_response_telemetry.py \
+            tests/test_heavy_libraries_are_not_imported_at_startup.py \
+            tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
+            relay/test_a_stale_coordinator_restarts_only_when_idle.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
@@ -1240,7 +1314,7 @@ jobs:
         env:
           REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py relay/test_acceptance_process_cleanup.py tools/test_process_tree_ownership.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py ui/test_the_conversation_list_shows_every_transcript.py ui/test_both_windows_can_be_constructed.py ui/test_planned_server_restart_exact_poll.py ui/test_a_submitted_task_is_on_top_at_once.py ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py ui/test_submitted_history_reconciliation.py ui/test_stale_submitted_tasks_are_observable.py ui/test_live_add_survives_runner_shutdown.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_supervisor_stale_code.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_failed_start_says_what_and_where.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py scripts/test_start_all_prepares_a_missing_venv.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py scripts/test_tunnel_served_by_another_pc.py scripts/test_start_all_ten_clicks.py scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py scripts/test_configure_env_uses_japanese_font.py scripts/test_preflight_vbs_engine.py scripts/test_gui_submit_lock.py scripts/test_start_all_records_the_bridge_poll.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py relay/test_acceptance_process_cleanup.py tools/test_process_tree_ownership.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py ui/test_the_conversation_list_shows_every_transcript.py ui/test_both_windows_can_be_constructed.py ui/test_planned_server_restart_exact_poll.py ui/test_a_submitted_task_is_on_top_at_once.py ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py ui/test_submitted_history_reconciliation.py ui/test_stale_submitted_tasks_are_observable.py ui/test_live_add_survives_runner_shutdown.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_supervisor_stale_code.py scripts/test_supervisor_no_duplicate_host.py scripts/test_supervisor_dead_tunnel_host_replaced.py scripts/test_supervisor_zero_conn_recovery.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_failed_start_says_what_and_where.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py scripts/test_start_all_prepares_a_missing_venv.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py scripts/test_tunnel_served_by_another_pc.py scripts/test_start_all_ten_clicks.py scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py scripts/test_configure_env_uses_japanese_font.py scripts/test_preflight_vbs_engine.py scripts/test_gui_submit_lock.py scripts/test_start_all_records_the_bridge_poll.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot

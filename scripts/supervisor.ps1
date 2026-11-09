@@ -831,6 +831,47 @@ function Clear-ServerTransition {
     try { Remove-Item -LiteralPath $ServerTransitionPath -Force -ErrorAction SilentlyContinue } catch { }
 }
 
+# -- VANISHED SERVER: relaunch at once, do not wait out the strike debounce -------------------
+# GOAL (measured 2026-11-04 / 02:29 outages): when NOTHING listens on the port and NO main.py of
+# this checkout is alive, the server process has VANISHED. Waiting FailuresBeforeAction strikes
+# (about three minutes) buys nothing -- a refused connection is instant and certain, there is no
+# process mid-boot to protect. The strike debounce exists to avoid killing a server that is
+# still starting (see the main loop booting grace); it is pointless when there is nothing to
+# kill and nothing to wait for. So this case is relaunched on the FIRST miss.
+#
+# One guard: a PLANNED restart already in progress (Write-ServerTransition, e.g. the stale-code
+# cycle) owns the gap between the old server ending and the replacement listening. During that
+# window main.py is legitimately absent for a moment; relaunching here would start a SECOND
+# server beside the one the planned cycle is about to start. Test-ServerTransitionActive reads
+# the advisory marker and holds this fast path back until the planned transition expires.
+
+function Test-ServerTransitionActive {
+    try {
+        if (-not (Test-Path -LiteralPath $ServerTransitionPath)) { return $false }
+        $raw = [IO.File]::ReadAllText($ServerTransitionPath)
+        if ([string]::IsNullOrWhiteSpace($raw)) { return $false }
+        $m = $raw | ConvertFrom-Json
+        if (-not $m) { return $false }
+        if ([string]$m.state -ne 'planned_restart') { return $false }
+        $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        return ([double]$m.expires -gt [double]$now)
+    } catch {
+        return $false
+    }
+}
+
+function Get-VanishedServerVerdict {
+    param(
+        [bool]$Listening,
+        [bool]$OwnMainPyAlive,
+        [bool]$TransitionActive
+    )
+    if ($Listening) { return 'wait' }
+    if ($OwnMainPyAlive) { return 'wait' }
+    if ($TransitionActive) { return 'wait' }
+    return 'relaunch-now'
+}
+
 # -- WHICH PYTHON: re-decided before every launch, not once at startup (new-PC analysis D2) ----
 # $Py above is resolved ONCE, when this process starts. A supervisor started before the .venv
 # existed -- start_all run before quickstart, or a logon autostart that fires while setup.bat is
@@ -1088,7 +1129,25 @@ function Test-ServerUp {
             $script:LastServerCheck = "foreign: HTTP $code on /health from $who"
             return $false
         }
-        $script:LastServerCheck = [string]$_.Exception.Status   # Timeout / ConnectFailure / ...
+        $firstStatus = [string]$_.Exception.Status   # Timeout / ConnectFailure / ...
+        # A 5 s timeout is NOT proof the server is down. On this busy box /health has answered
+        # HTTP 200 in 7-16 s while the loop was perfectly alive (measured 2026-11-02); four 5 s
+        # timeouts in a row once killed a server still answering in 16 s. So when -- and only
+        # when -- the fast probe TIMED OUT, take a second, longer look before counting a strike.
+        # A connect failure (nothing listening) is not slowness and skips straight to the
+        # verdict, where decide_liveness_strike returns "strike" on confirm_ok = $null.
+        if ($firstStatus -eq "Timeout") {
+            $confirm = Confirm-ServerSlow
+            $verdict = Invoke-LivenessStrikeDecision $false $confirm.Ok $confirm.Seconds
+            if ($verdict -eq "alive") {
+                $script:LastServerCheck = ("server slow ({0:N0} s) but answering -- not restarting" -f $confirm.Seconds)
+                Write-Log $script:LastServerCheck
+                return $true
+            }
+            $script:LastServerCheck = "Timeout (confirmation also timed out after $([int]$LivenessConfirmSeconds)s)"
+            return $false
+        }
+        $script:LastServerCheck = $firstStatus
         return $false
     } catch {
         $script:LastServerCheck = "threw: " + $_.Exception.GetType().Name
@@ -1179,6 +1238,99 @@ function Get-BridgePortVerdict {
 # AND ONLY AFTER IT PERSISTS. Two consecutive checks, so a commit landing between the health
 # read and the idle read does not cycle a server that was about to be used anyway.
 $script:StaleStreak = 0
+
+# LIVE IN-FLIGHT HTTP, read from the server's own /health (tools/response_telemetry.py adds
+# resp_inflight and resp_last_start_age_s). Returns a hashtable @{ Inflight=<int>; Age=<double
+# or $null> } or $null when /health cannot be read or does not carry the keys -- the caller
+# treats $null as "fall back to the old behaviour", i.e. cycle without a drain gate. Age is
+# $null when no request has started since the server came up; the gate reads that as "nothing
+# recent".
+function Get-HealthInflight {
+    try {
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
+        $req.Method = "GET"; $req.Timeout = 5000; $req.ReadWriteTimeout = 5000
+        $resp = $req.GetResponse()
+        $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd()
+        $resp.Close()
+    } catch {
+        return $null
+    }
+    try { $j = $body | ConvertFrom-Json -ErrorAction Stop } catch { return $null }
+    if ($null -eq $j.resp_inflight) { return $null }
+    $age = $null
+    if ($null -ne $j.resp_last_start_age_s) { $age = [double]$j.resp_last_start_age_s }
+    return @{ Inflight = [int]$j.resp_inflight; Age = $age }
+}
+
+# THE SLOW-VS-DOWN CONFIRMATION TIMEOUT, read once from the Python module that owns it so the
+# number lives in exactly one place (LIVENESS_CONFIRM_SECONDS). If the read fails for any
+# reason, fall back to 60 -- the measured 16 s maximum plus margin -- rather than wedging.
+$script:LivenessConfirmSeconds = 60
+try {
+    $__lcs = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import stale_server_check; print(stale_server_check.LIVENESS_CONFIRM_SECONDS)" 2>$null)).Trim()
+    if ($__lcs -match '^\d+$') { $script:LivenessConfirmSeconds = [int]$__lcs }
+} catch { }
+$LivenessConfirmSeconds = $script:LivenessConfirmSeconds
+
+function Confirm-ServerSlow {
+    # SECOND LOOK after the fast 5 s probe timed out. One GET against /health with the longer
+    # LIVENESS_CONFIRM_SECONDS timeout. Returns @{ Ok = <bool>; Seconds = <double> }: Ok is
+    # $true only when it returns HTTP 200 AND the body is this checkout's /health answer
+    # (Get-HealthServerPid), the same identity rule the fast probe uses -- a foreign 200 is
+    # not our server answering slowly. Seconds is how long the GET took, for the log line.
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $body = $null
+    try {
+        $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
+        $req.Method = "GET"
+        $req.Timeout = $LivenessConfirmSeconds * 1000
+        $req.ReadWriteTimeout = $LivenessConfirmSeconds * 1000
+        $resp = $req.GetResponse()
+        try { $body = (New-Object System.IO.StreamReader($resp.GetResponseStream())).ReadToEnd() } catch { $body = $null }
+        $resp.Close()
+    } catch {
+        $sw.Stop()
+        return @{ Ok = $false; Seconds = $sw.Elapsed.TotalSeconds }
+    }
+    $sw.Stop()
+    $ok = ($null -ne (Get-HealthServerPid $body))
+    return @{ Ok = $ok; Seconds = $sw.Elapsed.TotalSeconds }
+}
+
+# THE LIVENESS GATE, PURE AND TESTED: scripts/stale_server_check.decide_liveness_strike decides
+# "alive" vs "strike" from (first_ok, confirm_ok, seconds). Called the same way the other
+# supervisor gates reach their Python deciders (& $Py -c with the module and function both
+# named, so the cross-language caller scan in tools/unreached.py credits it). Returns "alive"
+# or "strike"; any failure returns "strike" so a broken bridge cannot make a down server look
+# alive (fail towards the safe, restart-capable verdict).
+function Invoke-LivenessStrikeDecision($firstOk, $confirmOk, $seconds) {
+    $fa = if ($firstOk) { "True" } else { "False" }
+    $ca = if ($null -eq $confirmOk) { "None" } elseif ($confirmOk) { "True" } else { "False" }
+    $sa = if ($null -eq $seconds) { "0" } else { ([string][double]$seconds) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import stale_server_check; print(stale_server_check.decide_liveness_strike($fa, $ca, $sa))" 2>$null)).Trim()
+    } catch {
+        return "strike"
+    }
+    if ($out -ne "alive") { return "strike" }
+    return "alive"
+}
+
+# THE DRAIN GATE, PURE AND TESTED: scripts/stale_server_check.decide_stale_drain decides
+# "cycle" vs "wait" from (inflight, age, waited). Called the same way the other supervisor
+# gates reach their Python deciders (& $Py -c with the module and function both named, so the
+# cross-language caller scan in tools/unreached.py credits it). Returns "cycle" or "wait";
+# any failure returns "" so the caller can fall back to cycling rather than wedging.
+function Invoke-StaleDrainDecision($inflight, $age, $waited) {
+    $ageArg = if ($null -eq $age) { "None" } else { ([string]$age) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import stale_server_check; print(stale_server_check.decide_stale_drain($inflight, $ageArg, $waited))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
 function Invoke-StaleServerCycle {
     try {
         $req = [System.Net.WebRequest]::Create("http://127.0.0.1:$Port/health")
@@ -1231,7 +1383,44 @@ function Invoke-StaleServerCycle {
     $script:StaleStreak++
     if ($script:StaleStreak -lt 2) { return }
     $script:StaleStreak = 0
-    Write-Log "server is running stale code and nothing is in flight -- cycling it so the checkout's fixes are live"
+
+    # DRAIN GATE. The streak said fleet/bridge are idle, but neither looks at live HTTP from
+    # external clients, so a client could be mid-response right now. Killing the server here
+    # loses that response (the client sees the connection closed; the relay answers new
+    # requests 502 for ~40s while the replacement binds). So before cycling, hold off while a
+    # request is open or one just started, re-checking on the normal loop interval, capped so
+    # a request that never finishes still lets the fix go live. If /health cannot be read we
+    # fall straight through to the old, ungated cycle -- an unreadable health is not a reason
+    # to leave stale code running forever.
+    $waited = 0
+    $drainInterval = 8
+    $capHit = $false
+    $lastInflight = 0
+    for (;;) {
+        $h = Get-HealthInflight
+        if ($null -eq $h) {
+            Write-Log "stale code cycle: /health in-flight state unreadable -- falling back to the ungated cycle"
+            break
+        }
+        $lastInflight = $h.Inflight
+        $decision = Invoke-StaleDrainDecision $h.Inflight $h.Age $waited
+        if ($decision -ne "wait") {
+            # "cycle" (nothing in flight, or the cap was reached) or "" (decider failed ->
+            # do not wedge: cycle). The cap is reached inside the pure function at waited>=180.
+            if ($decision -eq "cycle" -and $waited -ge 180) { $capHit = $true }
+            break
+        }
+        $ageShown = if ($null -eq $h.Age) { "n/a" } else { ([string]$h.Age) }
+        Write-Log ("stale code cycle deferred: {0} request(s) in flight (last start {1}s ago), waited {2}s so far -- re-checking" -f $h.Inflight, $ageShown, $waited)
+        Start-Sleep -Seconds $drainInterval
+        $waited += $drainInterval
+    }
+
+    if ($capHit) {
+        Write-Log ("server is running stale code; drain cap of 180s reached with {0} request(s) still in flight after {1}s -- cycling it so the checkout's fixes are live" -f $lastInflight, $waited)
+    } else {
+        Write-Log ("server is running stale code and nothing is in flight -- cycling it so the checkout's fixes are live (waited {0}s, inflight {1})" -f $waited, $lastInflight)
+    }
     # DECLARE THE REASON BEFORE STOPPING IT. This is the specific, human-legible reason
     # Get-ServerExitRecord (see Start-Server) will show for this cycle's exit record instead of
     # the generic default Start-Server falls back to when nothing upstream has said why.
@@ -1539,6 +1728,19 @@ function Invoke-TunnelHostingCheck {
         $localPid = Get-HealthPidAt "http://127.0.0.1:$Port/health" 5000
         $tunnelPid = Get-TunnelServerPidBounded
     }
+    # TRACK HOW LONG OUR READER HAS GONE WITHOUT A RELAY, so Start-TunnelHost's duplicate-launch
+    # guard can tell "reconnecting" (wait) from "wedged past 180s" (replace). A reader of ours is
+    # alive when Test-OurTunnelHostRunning says so; this is cheap and reads only $script:TunnelHostProc
+    # plus the devtunnel process table it already consults.
+    $readerAlive = Test-OurTunnelHostRunning
+    Update-ReaderRelayGap -Connections $conn -ReaderAlive $readerAlive
+    # J6 BLIND SPOT: a reader can be alive (so Start-TunnelHost never replaces it) while its own
+    # devtunnel child is alive-but-disconnected. If the relay has read 0 connections for longer
+    # than the measured worst-case recovery window, stop ONLY that child so the reader exits and
+    # the re-host logic below brings the tunnel back -- see Stop-StuckTunnelChild. A strike this
+    # tick means the child is gone and the reader is exiting; let this tick fall through, and the
+    # next tick re-reads the (now 0 / reader-gone) state and re-hosts normally.
+    if (Stop-StuckTunnelChild -ReaderAlive $readerAlive) { return $script:TunnelState }
     $state = Resolve-TunnelHostingState -Connections $conn -OurHostRunning $ourHost `
                                         -LocalPid $localPid -TunnelPid $tunnelPid `
                                         -ProbeOutcome $script:TunnelProbeOutcome -PreviousState $script:TunnelState
@@ -2068,7 +2270,282 @@ function Ensure-DiskSeries {
     }
 }
 
+# -- NEVER TWO READERS FOR ONE TUNNEL (2026-11-02) --------------------------------------------
+# Measured 2026-11-02: a <1 min outbound network drop at 07:34 made the reader started at 21:23
+# (python -m relay.tunnel_host_log, a supervisor child) lose its relay connection; it was
+# retrying with its OWN backoff. The supervisor's "tunnel host connections = 0 (4/4)" rule then
+# fired at 07:34:52 and Start-TunnelHost launched a SECOND reader WITHOUT stopping the first.
+# Two devtunnel hosts for one tunnel took each other's relay session ("Connection lost" in a
+# loop) and the gateway answered 502/timeouts from ~07:34 to ~07:41. The fix: before launching,
+# look for an existing reader; if one is alive and still inside its own measured reconnect
+# window, DO NOT launch another -- wait for its backoff to recover the relay. Only a reader that
+# has been alive but without a relay connection for longer than RECONNECT_GRACE_SECONDS (180s,
+# justified in scripts/supervisor_host_launch.py) is treated as wedged, torn down tree-first,
+# and replaced by exactly one new reader.
+#
+# HOW LONG WITHOUT A RELAY is tracked here, not guessed: Update-ReaderRelayGap is called every
+# tunnel-hosting tick with the live "host connections" count and whether a reader of ours is
+# alive. It stamps the first moment the count hit 0 while a reader was alive, and clears it the
+# moment a connection returns or no reader is alive. Start-TunnelHost reads that stamp to tell
+# the pure decider how long the current reader has gone without a relay.
+$script:ReaderNoRelaySince = $null
+
+function Update-ReaderRelayGap {
+    # Maintain $script:ReaderNoRelaySince: the UTC time our reader first went to 0 relay
+    # connections while alive, or $null when it has a relay (or no reader of ours is alive).
+    param([Nullable[int]]$Connections, [bool]$ReaderAlive)
+    if (-not $ReaderAlive) { $script:ReaderNoRelaySince = $null; return }
+    $hasRelay = ($null -ne $Connections -and [int]$Connections -ge 1)
+    if ($hasRelay) { $script:ReaderNoRelaySince = $null; return }
+    if ($null -eq $script:ReaderNoRelaySince) { $script:ReaderNoRelaySince = [DateTime]::UtcNow }
+}
+
+function Get-ReaderSecondsWithoutRelay {
+    # Seconds the current reader has been alive without a relay connection, or $null when it
+    # cannot be told (never recorded a gap). Passed straight to the pure decider.
+    if ($null -eq $script:ReaderNoRelaySince) { return $null }
+    return [int]([DateTime]::UtcNow - [datetime]$script:ReaderNoRelaySince).TotalSeconds
+}
+
+function Get-ExistingTunnelReaders {
+    # The relay.tunnel_host_log readers for THIS tunnel that are alive right now, as
+    # @{ Pid; CommandLine } records. Command-line match: a python process whose arguments name
+    # relay.tunnel_host_log (module form or path form) AND this tunnel's bare name as a token --
+    # so "abc" does not claim "abc-2". The reader this supervisor launched ($script:TunnelHostProc)
+    # is included even if its command line cannot be read.
+    param([string]$Name)
+    $bare = Get-BareTunnelName $Name
+    $out = @()
+    $trackedPid = 0
+    if ($script:TunnelHostProc) {
+        try { $script:TunnelHostProc.Refresh(); if (-not $script:TunnelHostProc.HasExited) { $trackedPid = $script:TunnelHostProc.Id } } catch { }
+    }
+    foreach ($p in @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue)) {
+        $cl = [string]$p.CommandLine
+        if (-not $cl) { continue }
+        if ($cl -notmatch '(?i)relay[\\/.]tunnel_host_log') { continue }
+        if ($bare -and ($cl -notmatch ('(?i)\s"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))) { continue }
+        $out += @{ Pid = [int]$p.ProcessId; CommandLine = $cl }
+    }
+    if ($trackedPid -and -not (@($out | Where-Object { $_.Pid -eq $trackedPid }).Count)) {
+        $out += @{ Pid = $trackedPid; CommandLine = "(the reader this supervisor launched)" }
+    }
+    return @($out)
+}
+
+function Stop-TunnelReaderTree {
+    # Stop a reader process AND its devtunnel host child(ren). The reader (relay.tunnel_host_log)
+    # spawns `devtunnel -v host <name>`; stopping the reader alone can orphan that host, which is
+    # the very process that holds the relay session. So stop the devtunnel children first, then
+    # the reader. Only children whose own command line hosts THIS tunnel are touched -- never a
+    # user's interactive `devtunnel login` or an unrelated tunnel (see Start-TunnelHost's note).
+    param([int]$ReaderPid, [string]$Name)
+    if (-not $ReaderPid -or $ReaderPid -le 0) { return }
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.ParentProcessId -eq $ReaderPid -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) })) {
+        Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
+    }
+    Stop-Process -Id $ReaderPid -Force -ErrorAction SilentlyContinue
+}
+
+function Get-OurReaderDevtunnelChildPid {
+    # The pid of the devtunnel host child of OUR reader for THIS tunnel, or 0 when none can be
+    # identified. SCOPE IS EVERYTHING HERE: a devtunnel.exe is this reader pair's child only when
+    # its ParentProcessId is one of our live readers AND its own command line hosts this tunnel
+    # (Test-IsTunnelHostCommandLine). This is the SAME parent+command-line match Stop-TunnelReaderTree
+    # uses to find what to tear down, so a child struck here is never a user's interactive
+    # `devtunnel login` nor any unrelated tunnel the user hosts by hand -- only the child of this
+    # supervisor's own reader. Returns the first such child's pid (one reader hosts one tunnel).
+    param([string]$Name)
+    foreach ($r in @(Get-ExistingTunnelReaders $Name)) {
+        $rp = [int]$r.Pid
+        if ($rp -le 0) { continue }
+        foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                         Where-Object { $_.ParentProcessId -eq $rp -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) })) {
+            return [int]$c.ProcessId
+        }
+    }
+    return 0
+}
+
+function Invoke-ChildStrikeDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c with the
+    # module and function both named, so tools/unreached.py credits this as the caller of
+    # supervisor_host_launch.decide_child_strike): "strike" or "wait" from (seconds with 0
+    # connections, reader alive, child pid). Any failure returns "" so the caller falls back to
+    # doing nothing rather than striking on an error.
+    param($SecondsWithZeroConnections, [bool]$ReaderAlive, $ChildPid)
+    $secArg = if ($null -eq $SecondsWithZeroConnections) { "None" } else { ([string][int]$SecondsWithZeroConnections) }
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    $pidArg = if ($null -eq $ChildPid) { "None" } else { ([string][int]$ChildPid) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_host_launch; print(supervisor_host_launch.decide_child_strike($secArg, $aliveArg, $pidArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+# AT MOST ONE CHILD STRIKE PER WINDOW. A strike that does not cure the tunnel (the replacement
+# child also fails to reach the relay) must not be repeated every tick; the next strike waits this
+# long. Matches the stale-rehost window ($script:StaleRehostMinSeconds) -- the same "do not churn
+# the relay" reasoning.
+$script:ChildStrikeAt = $null
+$script:ChildStrikeMinSeconds = 600
+
+function Test-ChildStrikeAllowed {
+    # PURE. $LastAt is $null (never struck) or the time of the last strike.
+    param($LastAt, [datetime]$Now, [int]$MinSeconds = 600)
+    if ($null -eq $LastAt) { return $true }
+    return ((($Now - [datetime]$LastAt).TotalSeconds) -ge $MinSeconds)
+}
+
+function Stop-StuckTunnelChild {
+    # THE J6 BLIND SPOT, CLOSED. A reader of ours is alive (so Start-TunnelHost's decide_host_launch
+    # keeps returning "wait" and never replaces it), but its devtunnel CHILD is alive-but-
+    # disconnected and the relay has read 0 host connections for longer than the measured worst-case
+    # recovery window (supervisor_host_launch.decide_child_strike / CHILD_RELAY_GRACE_SECONDS = 600s,
+    # which is > the 420s worst-case in-place reconnect). Stop ONLY that child so the reader exits
+    # and the existing re-host logic (the "none" branch next tick, or Start-TunnelHost's "replace")
+    # brings the tunnel back with exactly one reader. Never starts a second reader here; never
+    # touches a devtunnel process that is not the child of our reader. Called every tunnel-hosting
+    # tick, right after Update-ReaderRelayGap, so $script:ReaderNoRelaySince is current.
+    param([bool]$ReaderAlive)
+    if (-not $ReaderAlive) { return $false }
+    $waited = Get-ReaderSecondsWithoutRelay
+    $childPid = Get-OurReaderDevtunnelChildPid $TunnelName
+    $decision = Invoke-ChildStrikeDecision -SecondsWithZeroConnections $waited -ReaderAlive $true -ChildPid $childPid
+    if ($decision -ne "strike") { return $false }
+    if (-not (Test-ChildStrikeAllowed $script:ChildStrikeAt (Get-Date) $script:ChildStrikeMinSeconds)) {
+        return $false
+    }
+    $waitedStr = if ($null -eq $waited) { "an unknown time" } else { "$waited s (> ${script:ChildStrikeMinSeconds}s)" }
+    Write-Log ("tunnel host stuck: reader is alive but its devtunnel child pid $childPid has had 0 relay " +
+               "connections for $waitedStr -- stopping ONLY that child so the reader exits and re-hosts " +
+               "(never a second reader, never another PC's devtunnel)")
+    Stop-Process -Id $childPid -Force -ErrorAction SilentlyContinue
+    $script:ChildStrikeAt = Get-Date
+    # The child is gone; the next Update-ReaderRelayGap with the reader still briefly alive would
+    # keep the old stamp, but the reader is expected to exit now. Clear the gap so a fresh reader
+    # starts its own window cleanly.
+    $script:ReaderNoRelaySince = $null
+    return $true
+}
+
+function Invoke-HostLaunchDecision {
+    # PURE DECIDER, reached the same way the other supervisor gates reach their Python deciders
+    # (& $Py -c with the module and function both named, so tools/unreached.py credits the
+    # cross-language caller): "wait" or "replace" from (reader alive, seconds without relay).
+    # Any failure returns "" so the caller can fall back to its old behaviour rather than wedge.
+    param([bool]$ReaderAlive, $SecondsWithoutRelay)
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    $secArg = if ($null -eq $SecondsWithoutRelay) { "None" } else { ([string][int]$SecondsWithoutRelay) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_host_launch; print(supervisor_host_launch.decide_host_launch($aliveArg, $secArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Get-TunnelReaderChildPid {
+    # The pid of the devtunnel host child this reader spawned, or 0 when none is found.
+    # Same match Stop-TunnelReaderTree uses: a devtunnel.exe whose ParentProcessId is this
+    # reader AND whose command line hosts THIS tunnel -- never a user's interactive
+    # `devtunnel login` or an unrelated tunnel. The reader (relay.tunnel_host_log) spawns
+    # exactly one `devtunnel -v host <name>`; if more than one matches we return the first.
+    param([int]$ReaderPid, [string]$Name)
+    if (-not $ReaderPid -or $ReaderPid -le 0) { return 0 }
+    $c = @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+           Where-Object { $_.ParentProcessId -eq $ReaderPid -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) } |
+           Select-Object -First 1)
+    if ($c -and $c.ProcessId) { return [int]$c.ProcessId }
+    return 0
+}
+
+function Invoke-ZeroConnChildKillDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c
+    # with the module and function both named, so tools/unreached.py credits this caller and
+    # the two cannot drift): "kill_child" or "wait" from (seconds at zero, reader alive, child
+    # pid). Any failure returns "" so the caller falls back to plain waiting rather than kill.
+    param($SecondsAtZero, [bool]$ReaderAlive, $ChildPid)
+    $secArg = if ($null -eq $SecondsAtZero) { "None" } else { ([string][int]$SecondsAtZero) }
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    $pidArg = if ($null -eq $ChildPid -or [int]$ChildPid -le 0) { "None" } else { ([string][int]$ChildPid) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_zero_conn_recovery; print(supervisor_zero_conn_recovery.decide_zero_conn_child_kill($secArg, $aliveArg, $pidArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Stop-TunnelHostChild {
+    # Stop ONLY the devtunnel host child of a reader -- NOT the reader itself. Ending the
+    # child makes relay.tunnel_host_log.serve_forever() see the host exit and start a new
+    # one after its backoff; the reader stays alive, so no second reader is ever started.
+    # Only a devtunnel.exe that is this reader's child AND hosts THIS tunnel is touched (the
+    # same guard Stop-TunnelReaderTree uses: never a `devtunnel login`, never another tunnel).
+    param([int]$ChildPid, [int]$ReaderPid, [string]$Name)
+    if (-not $ChildPid -or $ChildPid -le 0) { return $false }
+    $ok = $false
+    foreach ($c in @(Get-CimInstance Win32_Process -Filter "Name='devtunnel.exe'" -ErrorAction SilentlyContinue |
+                     Where-Object { $_.ProcessId -eq $ChildPid -and $_.ParentProcessId -eq $ReaderPid -and (Test-IsTunnelHostCommandLine ([string]$_.CommandLine) $Name) })) {
+        Stop-Process -Id $c.ProcessId -Force -ErrorAction SilentlyContinue
+        $ok = $true
+    }
+    return $ok
+}
+
 function Start-TunnelHost {
+    # NEVER TWO READERS FOR ONE TUNNEL. Before stopping or launching anything, look for an
+    # existing reader of this tunnel. If one is alive and the pure decider says "wait", log that
+    # the host is reconnecting and return WITHOUT launching a second reader (see the block above
+    # Update-ReaderRelayGap and scripts/supervisor_host_launch.py). Only "replace" (no reader, or
+    # one wedged past the 180s reconnect window) proceeds to stop the old reader tree and launch
+    # exactly one new reader.
+    #
+    # SELF-RECOVERY WHEN A LIVE READER STAYS AT ZERO CONNECTIONS. Before the "wait" above turns
+    # into another 7-minute gap (measured 2026-11-04, see scripts/supervisor_zero_conn_recovery.py),
+    # a reader that has been at zero connections past the measured grace has its HOST CHILD ended
+    # -- only the devtunnel.exe it spawned, never the reader. The reader's serve_forever() then
+    # sees the host exit and starts a new host (~8 s to re-register). Still exactly one reader.
+    $existingReaders = @(Get-ExistingTunnelReaders $TunnelName)
+    if ($existingReaders.Count -gt 0) {
+        $waited = Get-ReaderSecondsWithoutRelay
+        $decision = Invoke-HostLaunchDecision -ReaderAlive $true -SecondsWithoutRelay $waited
+        if ($decision -eq "wait") {
+            # A reader is alive and inside its own 180s reconnect window. Rather than only
+            # logging "reconnecting" for up to 7 minutes, ask the zero-connection decider
+            # whether this reader's host child has been wedged at zero long enough to end it
+            # (reader stays alive; it restarts the host). This NEVER starts a second reader.
+            foreach ($r in $existingReaders) {
+                $childPid = Get-TunnelReaderChildPid -ReaderPid $r.Pid -Name $TunnelName
+                $killWord = Invoke-ZeroConnChildKillDecision -SecondsAtZero $waited -ReaderAlive $true -ChildPid $childPid
+                if ($killWord -eq "kill_child") {
+                    $waitedStr = if ($null -eq $waited) { "unknown" } else { ([string]$waited) }
+                    if (Stop-TunnelHostChild -ChildPid $childPid -ReaderPid $r.Pid -Name $TunnelName) {
+                        Write-Log ("reader pid $($r.Pid) at zero connections for $waitedStr s (> grace): " +
+                                   "ended its host child pid $childPid -- the reader will start a new host (no second reader)")
+                    }
+                }
+            }
+            $waitedStr = if ($null -eq $waited) { "0" } else { ([string]$waited) }
+            foreach ($r in $existingReaders) {
+                Write-Log ("reader pid $($r.Pid) still running, host reconnecting (waited $waitedStr s)")
+            }
+            return $false
+        }
+        # "replace" (or "" fallback / wedged): tear down every existing reader tree first, so
+        # exactly one reader exists after this function -- the one launched below.
+        foreach ($r in $existingReaders) {
+            Write-Log ("replacing reader pid $($r.Pid): alive but no relay for " +
+                       $(if ($null -eq $waited) { "an unknown time" } else { "$waited s (> 180s)" }) +
+                       " -- stopping its tree before launching one new reader")
+            Stop-TunnelReaderTree -ReaderPid $r.Pid -Name $TunnelName
+        }
+        $script:ReaderNoRelaySince = $null
+    }
     # Stop only OUR stale host process(es) -- those whose command line is
     # `devtunnel host <TunnelName>`. NEVER `Get-Process devtunnel | Stop-Process`: that
     # reaps a user's interactive `devtunnel login` (the very command that authenticates
@@ -2083,25 +2560,38 @@ function Start-TunnelHost {
     # events that drop the cached devtunnel login answer (see Test-DevtunnelLoggedInCached).
     $script:TunnelHostProc = $null
     Reset-TunnelProbeBackoff
-    # ITS OUTPUT IS KEPT. On 2026-09-24 a host this supervisor launched exited 27 s after it
-    # "established", and the only record was that it had exited: the window was hidden and
-    # nothing was redirected, so whatever devtunnel said about why was gone. The host's output
-    # goes to .setup\logs\devtunnel-host.*.log (gitignored) and the main loop quotes its last
-    # lines when the host exits.
+    # ITS OUTPUT IS KEPT, AND NOW IT IS ALWAYS READ. On 2026-09-24 a host this supervisor
+    # launched exited 27 s after it "established" and the only record was that it had exited;
+    # on 2026-10-31 a reader-less host left no log for the minutes a user reported a
+    # disconnect, because the short-lived starter that redirected its pipes had already
+    # exited and nothing drained them. The host is now owned by a supervisor-launched,
+    # LONG-LIVED Python reader (relay.tunnel_host_log): it spawns `devtunnel -v host`, drains
+    # BOTH streams continuously, stamps every line with a millisecond local time, writes to
+    # .setup\logs\devtunnel-host-ts.log (opened shared-read, rotated at 20 MB keeping 5,
+    # appended across host restarts), restarts the host with a backoff and logs its exit code.
+    # $script:TunnelHostProc is that reader; its own exit is still the login-cache
+    # invalidation event the main loop watches. The reader is modelled on the disk-series
+    # sampler launch above (same $Py, same windowless redirect-or-fallback shape).
+    Update-PythonInterpreter "the devtunnel host log reader"
     $logDir = Join-Path $Root ".setup\logs"
-    $script:TunnelHostOut = Join-Path $logDir "devtunnel-host.out.log"
-    $script:TunnelHostErr = Join-Path $logDir "devtunnel-host.err.log"
+    $script:TunnelHostOut = Join-Path $logDir "devtunnel-host-reader.out.log"
+    $script:TunnelHostErr = Join-Path $logDir "devtunnel-host-reader.err.log"
+    $script:TunnelHostTsLog = Join-Path $logDir "devtunnel-host-ts.log"
+    $env:MCP_DEVTUNNEL_BIN = $DevTunnel
+    $readerArgs = @("-m", "relay.tunnel_host_log", $TunnelName)
     try {
         if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null }
-        $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden `
+        $script:TunnelHostProc = Start-Process -FilePath $Py -ArgumentList $readerArgs `
+            -WorkingDirectory $Root -WindowStyle Hidden `
             -RedirectStandardOutput $script:TunnelHostOut -RedirectStandardError $script:TunnelHostErr -PassThru
     } catch {
-        Write-Log "devtunnel host output could not be redirected ($($_.Exception.Message)); starting without it"
+        Write-Log "devtunnel host reader output could not be redirected ($($_.Exception.Message)); starting without it"
         $script:TunnelHostOut = $null
         $script:TunnelHostErr = $null
-        $script:TunnelHostProc = Start-Process -FilePath $DevTunnel -ArgumentList "host $TunnelName" -WindowStyle Hidden -PassThru
+        $script:TunnelHostProc = Start-Process -FilePath $Py -ArgumentList $readerArgs `
+            -WorkingDirectory $Root -WindowStyle Hidden -PassThru
     }
-    Write-Log "devtunnel host starting for $TunnelName (bin=$DevTunnel) ..."
+    Write-Log "devtunnel host reader starting for $TunnelName (python=$Py, bin=$DevTunnel; ts-log=$script:TunnelHostTsLog) ..."
     # A freshly-started host can take 15-30s to register with the relay. Block until it
     # actually shows >=1 connection (up to ~50s) so the monitor loop never kills a host
     # that is still in the middle of connecting (which would cause a restart churn loop).
@@ -2128,6 +2618,7 @@ function Start-TunnelHost {
 $script:TunnelHostProc = $null
 $script:TunnelHostOut = $null
 $script:TunnelHostErr = $null
+$script:TunnelHostTsLog = $null
 
 function Get-TunnelHostExitDetail {
     # " (code N; it said: ...)" for the host this supervisor launched, from its exit code and the
@@ -2135,7 +2626,7 @@ function Get-TunnelHostExitDetail {
     $parts = @()
     try { if ($script:TunnelHostProc) { $parts += ("code " + $script:TunnelHostProc.ExitCode) } } catch { }
     $said = @()
-    foreach ($f in @($script:TunnelHostErr, $script:TunnelHostOut)) {
+    foreach ($f in @($script:TunnelHostErr, $script:TunnelHostOut, $script:TunnelHostTsLog)) {
         if (-not $f) { continue }
         try {
             if (Test-Path -LiteralPath $f) {
@@ -3265,31 +3756,47 @@ while ($true) {
         # that died at launch is still restarted at the usual speed, and only one that is
         # visibly working towards listening is given room.
         $reason = $script:LastServerCheck
-        $booting = $false
-        if (-not (Test-PortListening)) {
-            # Same identity rule as Start-Server's (Test-IsThisCheckoutServerCommandLine), plus
-            # the process this supervisor launched, whose command line on a PATH python names
-            # no checkout.
+        # Measure both facts the vanished-server decision needs, ONCE, regardless of branch:
+        # is anything listening on the port, and is a main.py of THIS checkout alive. $alive is
+        # the same identity set Start-Server acts on (Test-IsThisCheckoutServerCommandLine), plus
+        # the process this supervisor launched, whose command line on a PATH python names no
+        # checkout.
+        $portListening = Test-PortListening
+        $alive = @()
+        if (-not $portListening) {
             $alive = @(Get-CimInstance Win32_Process -ErrorAction SilentlyContinue |
                        Where-Object { Test-IsThisCheckoutServerCommandLine ([string]$_.CommandLine) $Root })
             if ($alive.Count -eq 0 -and $script:ServerProc) {
                 try { $script:ServerProc.Refresh(); if (-not $script:ServerProc.HasExited) { $alive = @($script:ServerProc) } } catch { }
             }
-            if ($alive.Count -gt 0 -and $script:LastLaunchAt -and
-                ((Get-Date) - $script:LastLaunchAt).TotalSeconds -lt $StartupGraceSeconds) {
-                $booting = $true
-            }
         }
+        $ownMainPyAlive = ($alive.Count -gt 0)
+        $booting = ($ownMainPyAlive -and $script:LastLaunchAt -and
+                    ((Get-Date) - $script:LastLaunchAt).TotalSeconds -lt $StartupGraceSeconds)
         if ($booting) {
             Write-Log ("server not listening yet ({0}); main.py alive {1:N0}s after launch -- waiting, not restarting" -f
                        $reason, ((Get-Date) - $script:LastLaunchAt).TotalSeconds)
         } else {
-            $serverMiss++
-            Write-Log "server check failed ($serverMiss/$FailuresBeforeAction) -- $reason"
-            if ($serverMiss -ge $FailuresBeforeAction) {
+            # VANISHED FAST PATH: nothing listening AND no main.py of ours alive AND no planned
+            # restart owns this gap -> the server is gone; relaunch on the FIRST miss instead of
+            # spending FailuresBeforeAction strikes (~3 min, measured 2026-11-04) waiting for a
+            # process that does not exist. Any other non-booting failure (listening-but-wedged,
+            # a foreign owner, or a planned transition in flight) still goes through the ordinary
+            # strike debounce below.
+            $verdict = Get-VanishedServerVerdict -Listening $portListening -OwnMainPyAlive $ownMainPyAlive -TransitionActive (Test-ServerTransitionActive)
+            if ($verdict -eq 'relaunch-now') {
+                Write-Log "server has vanished (nothing on :$Port, no main.py of ours) -- relaunching at once, not after $FailuresBeforeAction strikes ($reason)"
                 Start-Server
                 $serverMiss = 0
                 Start-Sleep -Seconds 6
+            } else {
+                $serverMiss++
+                Write-Log "server check failed ($serverMiss/$FailuresBeforeAction) -- $reason"
+                if ($serverMiss -ge $FailuresBeforeAction) {
+                    Start-Server
+                    $serverMiss = 0
+                    Start-Sleep -Seconds 6
+                }
             }
         }
     }

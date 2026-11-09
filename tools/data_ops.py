@@ -1,14 +1,19 @@
+from __future__ import annotations
+
 import io
 import json
-from typing import Optional
-
-import pandas as pd
+from typing import TYPE_CHECKING, Optional
 
 from .file_ops import _validate_path
 from .security import require_unlocked
 
+if TYPE_CHECKING:  # annotations only; the real import happens inside each function
+    import pandas as pd
 
-def _read_table(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+
+def _read_table(path: str, sheet_name: Optional[str] = None) -> "pd.DataFrame":
+    import pandas as pd
+
     p = _validate_path(path)
     suffix = p.suffix.lower()
     if suffix == ".csv":
@@ -36,6 +41,8 @@ def write_excel(path: str, csv_data: str, sheet_name: str = "Sheet1") -> str:
     if locked:
         return locked
     try:
+        import pandas as pd
+
         p = _validate_path(path)
         p.parent.mkdir(parents=True, exist_ok=True)
         df = pd.read_csv(io.StringIO(csv_data))

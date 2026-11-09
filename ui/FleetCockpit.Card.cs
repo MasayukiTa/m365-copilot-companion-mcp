@@ -777,6 +777,7 @@ partial class CockpitWindow
         // when it is available.
         card.Cursor = Cursors.Hand;
         string wname = name; string url = conv;
+        card.PreviewMouseLeftButtonDown += delegate { SelectSpineWorker(name); };
         card.MouseLeftButtonUp += delegate { FlashOpen(card); OpenWorker(wname, url); };
         card.ToolTip = _lang == 0 ? "クリックでこの会話をメインに表示" : "Click to open this conversation in the chat";
         return card;
