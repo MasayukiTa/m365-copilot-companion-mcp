@@ -82,11 +82,11 @@ ENGINE_ROOT = os.environ.get("VALIDITY_ENGINE_ROOT") or _default_engine_root()
 #: non-analysis answer wastes an engine run and clutters the answer, while MISSING a real
 #: analysis is the failure the owner is fixing. When in doubt the caller may force the gate on.
 MISCLASSIFICATION_NOTE = (
-    "判別条件: task_kind(goal) == DATA_QUERY を基礎に、DBB / analysis db / odbc / sql server 等のデータ"
+    "判別条件: task_kind(goal) == DATA_QUERY を基礎に、database / sql / query / odbc / table 等のデータ"
     "取得と、その結果を表・相関・群間比較にする仕事を「データ解析」と判別する。\n"
     "誤検知の例(本当は解析なのに漏れる / 偽陰性): データ元を名指しせず「前回の表をもう一度"
     "集計して」だけの依頼は、DATA_QUERY マーカーが無ければ unknown に落ちて False になる。\n"
-    "誤判定の例(解析でないのに拾う / 偽陽性): 「DBA のコードを small fix する」のようにデータ"
+    "誤判定の例(解析でないのに拾う / 偽陽性): 「the database reader のコードを small fix する」のようにデータ"
     "語を含むが実際はコード変更の仕事。task_kind は CODE_CHANGE / M365_LOOKUP / WRITING を先に"
     "返す順位なので、それらは解析として拾わない。境界が疑わしいときは呼び出し側が強制 ON にできる。\n"
     "ツール使用だけでは解析と判別しない: run_python / odbc_query を走らせたコード監査やレビューも"
@@ -1480,7 +1480,7 @@ def needs_judge_rework(goal, final_response) -> bool:
 #: It asks for the three steps and -- per the skill -- forbids inventing a verdict: if the judge
 #: cannot run, the answer must SAY WHY, not omit it.
 REWORK_JOB = (
-    "このゴールはDB照会(DBB/DBA等)の結果を表・相関・群間比較にするデータ解析の仕事です。"
+    "このゴールはDB照会(database / sql / query / odbc / table 等)の結果を表・相関・群間比較にするデータ解析の仕事です。"
     "最終回答に、少標本評価の判定器(validity_judge)の結果が載っていません。次の工程を通し、"
     "結果を最終回答に追記してください:\n"
     "(i) 解析結果とデータのsha256・取得時刻を記録 (tools/validity_harness.record_manifest)\n"
