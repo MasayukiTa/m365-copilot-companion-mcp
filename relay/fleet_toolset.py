@@ -195,6 +195,11 @@ DELIBERATELY_EXCLUDED = {
     "validity_negative_control": "repeats the operator's validity judgement on controls, which is not part of fixing the instance -- same reason as validity_audit_ledger",
     "validity_verify_lock": "checks the operator's validity pre-registration lock, which is not part of fixing the instance -- same reason as validity_audit_ledger",
     "validity_explain_reason": "explains the operator's validity reason codes, which are not part of fixing the instance -- same reason as validity_audit_ledger",
+    # FORGED TOOL (PR 445, tools/auto/copilot_image.py). Drives the operator's own Edge over
+    # CDP to have M365 Copilot generate an image -- it reaches the operator's authenticated
+    # browser and desktop, which no benchmark instance owns; same reason as screenshot and
+    # the screen_* computer-use tools a bench run is refused.
+    "copilot_generate_image": "drives the operator's authenticated Edge/Copilot session to generate an image, which is outside every benchmark instance -- same reason as screenshot",
     "count_failures":    "helper of the edit/verify loop (edit_and_verify's family), not weighed on its own -- recorded as excluded because unlisted already meant refused",
     "failure_signal":    "helper of the edit/verify loop (edit_and_verify's family), not weighed on its own -- recorded as excluded because unlisted already meant refused",
     "trajectory":        "reads the run log of an edit/verify loop, which a worker has no loop of its own to report on -- same reason as loop_trajectory",
