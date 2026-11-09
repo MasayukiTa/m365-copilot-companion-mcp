@@ -73,7 +73,7 @@ def _make_fake_sessions_db(path: str) -> None:
             ("example_D1", "run0001", 1, "tool_result", 1001.0,
              json.dumps({"id": "example_D1", "verdict": "HOLD",
                          "reasons": ["D_FAIL_UNLOCKED"],
-                         "notes": ["LOT_INDEPENDENCE_NOT_CHECKED"],
+                         "notes": ["DIAG_NOTE_SYN"],
                          "hashes": {"input_sha256": "0" * 64}}),
              "tool_events.jsonl", "outcome:abc", json.dumps({"ok": True})),
         )
@@ -169,7 +169,7 @@ def test_register_and_lock_rejects_backdated_fetch():
         assert res["order_ok"] is False
 
 
-# ---- lot independence check (LOT_INDEPENDENCE_NOT_CHECKED) --------------------
+# ---- lot independence check (diagnostic note) --------------------------------
 
 def test_lot_independence_check_runs_and_reports():
     """The check must at least run and return a structured diagnostic (not raise,
