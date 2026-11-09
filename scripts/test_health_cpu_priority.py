@@ -120,9 +120,17 @@ def test_raise_process_priority_is_safe_and_opt_outable(monkeypatch):
 
 
 def _spin(stop):
+    # GIL-bound spinner used to saturate a core from a SEPARATE process. It must still be
+    # promptly stoppable: under full CPU saturation on Windows (spawn) a pure busy loop can
+    # starve the child long enough that it never observes `stop` before the parent's join
+    # window closes, leaving an un-reaped process that hangs interpreter shutdown. A tiny
+    # periodic yield keeps the core effectively pinned while guaranteeing the stop flag is
+    # seen quickly, so the parent can always reap the child.
     x = 0
     while not stop.is_set():
-        x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        for _ in range(200000):
+            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
+        time.sleep(0)
 
 
 def test_health_gather_stays_fast_under_real_cpu_saturation(monkeypatch):
@@ -161,8 +169,18 @@ def test_health_gather_stays_fast_under_real_cpu_saturation(monkeypatch):
         assert out.get("health_degraded") is True
         assert elapsed < 8.0, "gather ran away under CPU saturation: %.2fs" % elapsed
     finally:
+        # Reap EVERY spinner deterministically so a straggler can never hang interpreter
+        # shutdown (the failure that wedged CI). Escalate: cooperative stop -> terminate ->
+        # kill, re-joining after each step, and always join once more so no child is left
+        # un-reaped. join() with no stale timeout guarantees we wait for the final reap.
         stop.set()
         for p in procs:
             p.join(timeout=5)
+        for p in procs:
             if p.is_alive():
                 p.terminate()
+                p.join(timeout=5)
+        for p in procs:
+            if p.is_alive():
+                p.kill()
+                p.join()
