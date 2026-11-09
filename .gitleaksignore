@@ -17,3 +17,5 @@
 #   gitleaks detect --redact -v --log-opts="--all"  ->  0 leaks found, 2431 commits scanned.
 d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
 d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
+6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
+6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
