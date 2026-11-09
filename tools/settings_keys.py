@@ -173,20 +173,33 @@ KEYS = OrderedDict([
        "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
        "anything but on reads as off."),
 
-    # The owner's standing rule after the 2026-11-02 uia incident: the fleet REFUSES to start a
-    # job whose goal asks for UI automation / computer use on the REAL desktop (desktop_act /
-    # screen_uia_act / screen_uia_dump / Notepad+Calculator automation tests). ON by default --
-    # a safety floor, so a missing/unreadable line keeps it on; only an explicit `off` disables
-    # it. A single goal may still run there by carrying the explicit operator field
-    # allow_real_desktop (off by default on the goal dict). Read live at each worker start.
-    _k("block_real_desktop_automation", EACH_GATE, "on",
+    # The owner's standing rule after the 2026-11-02 uia incident classified goals asking for UI
+    # automation / computer use on the REAL desktop (desktop_act / screen_uia_act / screen_uia_dump
+    # / Notepad+Calculator automation tests). FLIPPED 2026-11-09 (owner instruction): such a goal
+    # is now ALLOWED by default. desktop_guard is the opt-out -- set it to deny to restore the old
+    # refuse-by-default behaviour. Read live at each worker start, mtime-cached.
+    _k("desktop_guard", EACH_GATE, "allow",
        "relay/desktop_guard.py:mode (every worker start, mtime-cached)",
-       "on|off. on (default): a job whose goal text asks for real-desktop UI automation "
-       "(desktop_act, screen_uia_act/dump, 'Notepad and Calculator' automation, '実デスクトップ') "
-       "is REFUSED before a worker opens, with a reason shown in the cockpit, unless the goal "
-       "carries the operator field allow_real_desktop. off: the guard is disabled. The env var "
-       "MCP_BLOCK_REAL_DESKTOP_AUTOMATION beats the file. Read fresh at each start, so a change "
-       "reaches the next worker with no restart; absent or unreadable reads as on (the floor)."),
+       "allow|deny. allow (default, owner instruction 2026-11-09): a job whose goal text asks for "
+       "real-desktop UI automation (desktop_act, screen_uia_act/dump, 'Notepad and Calculator' "
+       "automation, '実デスクトップ') is born as a normal worker. deny: "
+       "restores the old behaviour -- such a goal is REFUSED before a worker opens, with a reason "
+       "shown in the cockpit, unless the goal carries the operator field allow_real_desktop. The "
+       "env var MCP_DESKTOP_GUARD beats the file. Read fresh at each start, so a change reaches the "
+       "next worker with no restart; absent or unreadable reads as allow (the flipped default)."),
+
+    # Back-compat for the pre-2026-11-09 switch. An explicit `on` here still means deny (restore the
+    # old refuse-by-default); `off` means allow. Its ABSENCE no longer means deny -- the default is
+    # now allow via desktop_guard above. Kept declared so operators' existing lines keep working and
+    # the live-settings test still exercises the legacy path. Read live at each worker start.
+    _k("block_real_desktop_automation", EACH_GATE, "off",
+       "relay/desktop_guard.py:mode (legacy deny trigger, every worker start, mtime-cached)",
+       "on|off (legacy). on: restores the old refuse-by-default behaviour (equivalent to "
+       "desktop_guard=deny); a job whose goal text asks for real-desktop UI automation is REFUSED "
+       "unless the goal carries allow_real_desktop. off (default): the new allow default stands. "
+       "The env var MCP_BLOCK_REAL_DESKTOP_AUTOMATION beats the file. Superseded by desktop_guard; "
+       "kept only for back-compat. Read fresh at each start, so a change reaches the next worker "
+       "with no restart; absent or unreadable reads as off."),
 
     # ---------------------------------------------------------------- sweep_start
     _k("autoscale", SWEEP_START, 0,

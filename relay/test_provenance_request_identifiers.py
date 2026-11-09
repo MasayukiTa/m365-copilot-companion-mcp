@@ -135,7 +135,7 @@ def test_a_planted_percentage_679_still_fails():
 def test_a_non_request_number_next_to_cjk_stays_policed():
     # 20 is NOT in the requester's words, so "20倍" is policed as before: a fold magnitude with
     # no computation behind it still fails. The exemption is scoped to requester-supplied digits.
-    answer = "塗工機間の中央値20倍差。"
+    answer = "設備間の中央値20倍差。"
     computed = ["recomputed spearman rho = 0.208"]
     r = ap.check_answer_provenance(answer, computed, is_analysis=True,
                                    request_text=REQUEST_TEXT)
