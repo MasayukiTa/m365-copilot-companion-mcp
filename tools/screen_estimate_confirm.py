@@ -154,6 +154,7 @@ def _lot_unit_values(rows: Sequence[Row], factor: str):
         by_lot.setdefault(r.lot, {"x": [], "y": [], "g": r.group})
         by_lot[r.lot]["x"].append(float(v))
         by_lot[r.lot]["y"].append(float(r.response))
+    import numpy as np  # deferred: keep module import light (startup defers heavy libs)
     lots = sorted(by_lot)
     x = np.array([np.mean(by_lot[L]["x"]) for L in lots], dtype=float)
     y = np.array([np.mean(by_lot[L]["y"]) for L in lots], dtype=float)
@@ -168,6 +169,7 @@ def _std_slope_ci(x: np.ndarray, y: np.ndarray, alpha: float = 0.05):
     quantile is taken from a small built-in table (no scipy) so the module stays dependency
     free; values match scipy.stats.t.ppf(0.975, df) to 3 decimals for the df used in tests.
     """
+    import numpy as np  # deferred: keep module import light (startup defers heavy libs)
     n = len(x)
     if n < 3:
         return None, None, None, None
@@ -227,6 +229,7 @@ def screen(rows: Sequence[Row], factors: Sequence[str], *, delta_min: float,
         x, y, g, lots = _lot_unit_values(rows, f)
         note = ""
         if group_aware and any(gi is not None for gi in g) and len(set(g)) > 1:
+            import numpy as np  # deferred: keep module import light (startup defers heavy libs)
             # within-group centring of BOTH x and y at the lot level (confound separation)
             xg = x.copy()
             yg = y.copy()
