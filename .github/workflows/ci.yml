@@ -150,6 +150,7 @@ jobs:
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
             relay/test_auto_rephrase_continue.py \
+            scripts/test_agents_janitor.py \
             scripts/test_status_tool_does_not_mislead.py \
             scripts/test_health_probe_isolation.py \
             scripts/test_health_busy_signal.py \
