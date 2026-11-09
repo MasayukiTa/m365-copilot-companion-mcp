@@ -170,6 +170,26 @@ def has_campaign_header(state_dir, text):
     return campaign_id_for_goal(text) in read_campaigns(state_dir)
 
 
+def _child_own_tombstone_id(child):
+    """The id to stamp as a child's OWN tombstone when it is blocked by an ancestor's: its
+    task_id (a fan-out child has no jid of its own). Prefers the `goal` object's task_id, falls
+    back to the flat child row's. "" when neither is a usable id -- then no own stamp is written
+    and the inheritance is re-derived on the next resume (correct, just not O(1))."""
+    g = child.get("goal") if isinstance(child, dict) else None
+    for src in (g if isinstance(g, dict) else {}, child if isinstance(child, dict) else {}):
+        v = str(src.get("task_id") or "").strip()
+        if v and _SAFE_ID.fullmatch(v):
+            return v
+    return ""
+
+
+def _tomb_child_blocked(state_dir, child, cid, fam):
+    """fleet_tombstone.child_blocked, imported lazily so this module stays import-safe from
+    relay_fleet. Returns the blocking tombstoned id or None. Never raises on a missing module."""
+    from relay import fleet_tombstone as _tomb
+    return _tomb.child_blocked(state_dir, child, cid, fam)
+
+
 def _child_done(child, fam, done_map):
     """A child counts as finished when its resume key is DONE in the done-map, or a
     `child_result` line records its slice as DONE (the fallback for degraded old lines whose
@@ -710,6 +730,34 @@ def resume_children_goals(state_dir, done_map=None, log=print, scope=None):
         _requeue = {id(c) for c in recover_family_results(state_dir, cid, fam, done_map,
                                                           log=log)[1]}
         for child in fam.get("children") or []:
+            # DURABLE TOMBSTONE FLOOR for a fan-out child, checked BEFORE the done-map. This is
+            # the one resume path that re-queues children straight from campaigns.jsonl (not the
+            # goals ledger, so it never passes through fleet_runner._resume_goals / blocked_jid).
+            # A child closed by the operator carries no jid, so its close is recorded under its
+            # task_id, and a closed PARENT is recorded under the campaign_id / root_id the child
+            # repeats -- without this check the child came back on the next restart (w33 -> w27,
+            # 2026-11-07). Stamp the child's own task_id so the next resume is O(1) and the audit
+            # trail shows the inheritance. Best-effort; a tombstone module import must not break
+            # resume.
+            try:
+                _blk = _tomb_child_blocked(state_dir, child, cid, fam)
+            except Exception:
+                _blk = None
+            if _blk:
+                _own = _child_own_tombstone_id(child)
+                if _own and _own != _blk:
+                    try:
+                        from relay import fleet_tombstone as _tomb
+                        if not _tomb.is_tombstoned(state_dir, _own):
+                            _tomb.write_tombstone(
+                                state_dir, _own, reason=_tomb.REASON_INHERITED,
+                                goal_text=_child_goal_text(child), parent_jid=_blk)
+                    except Exception:
+                        pass
+                log("[resume] child %s of campaign %s stays stopped: blocked by tombstone %s "
+                    "(operator closed it or an ancestor)"
+                    % (child.get("subtask_index"), cid, _blk))
+                continue
             if _child_done(child, fam, done_map) and id(child) not in _requeue:
                 continue
             if _child_split_into_nested(child, cid, done_map, nested_slots):
