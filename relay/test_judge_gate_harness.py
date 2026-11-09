@@ -2,8 +2,7 @@
 """Failing-first tests for the final-step validity-judge harness (owner task 2026-10-27,
 re-scoped 2026-10-30).
 
-OWNER INSTRUCTION (2026-10-27, verbatim): 「データ解析系は、すべて最終でこの判定器を通す
-ハーネスを入れ、databricks を圧倒す。これが先週与えたタスクだ。」
+DESIGN INTENT: route every data-analysis final answer through this judge before delivery.
 
 WHAT THIS PINS. relay/judge_gate.py is the orchestration seam that makes every DATA-ANALYSIS
 goal pass through the frozen validity engine before its final answer is delivered:
@@ -18,9 +17,9 @@ goal pass through the frozen validity engine before its final answer is delivere
   (3) the refuter must additionally check "did it pass the judge, and if not why" -- pinned by
       test_refuter_has_judge_check.
 
-The verdict engine itself lives OUTSIDE this repo (Desktop/AHA資料_参照一式/証明/公開データ検証/
-engine_v1_8c2), is secret, remote-less and byte-identical-locked; this harness only ORCHESTRATES
-it and NEVER edits its rules, thresholds or registered claims. No secret data, measurement row
+The verdict engine itself lives OUTSIDE this repo (Desktop/validity_engine), is private, remote-less
+and byte-identical-locked; this harness only ORCHESTRATES
+it and NEVER edits its rules, thresholds or registered claims. No private data, measurement row
 or employee id appears here -- fixtures are synthetic.
 
 These tests are expected to FAIL until relay/judge_gate.py implements the contract.
@@ -96,7 +95,7 @@ def test_footer_surfaces_verdict_reasons_interval_n():
 def test_footer_when_engine_unavailable_states_reason_not_silent():
     footer = jg.build_judge_footer(
         verdict=None, engine_available=False,
-        unavailable_reason="engine root not found: engine_v1_8c2")
+        unavailable_reason="engine root not found: validity_engine")
     assert footer.strip(), "footer must not be empty when the judge could not run"
     assert "engine root not found" in footer
     # it must be explicit that the judge did NOT run (never silently omitted)

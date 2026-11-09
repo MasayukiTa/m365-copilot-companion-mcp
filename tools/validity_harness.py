@@ -9,9 +9,9 @@ the data was absent from the engine manifest, and that every claim carried
 LOT_INDEPENDENCE_NOT_CHECKED.
 
 WHAT THIS FILE IS, AND IS NOT. The verdict engine itself lives OUTSIDE this public repository
-(Desktop/AHA資料_参照一式/証明/公開データ検証/engine_v1_8c2), is a SECRET folder, has no git
-remote, and is byte-identical-locked by PREREGISTRATION_v1_8c2.md -- so its code must not be
-edited and its secret data must not be copied into this public repo. This module therefore
+(Desktop/validity_engine), is a private folder, has no git
+remote, and is byte-identical-locked by PREREGISTRATION.md -- so its code must not be
+edited and its private data must not be copied into this public repo. This module therefore
 holds only the parts that can live in the open:
 
   (c) past_runs()         -- read distilled past verdicts from the sessions DB (no raw rows);

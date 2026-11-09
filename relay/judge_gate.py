@@ -2,9 +2,8 @@
 """judge_gate -- the final-step seam that routes DATA-ANALYSIS answers through the frozen
 validity engine before they are delivered.
 
-OWNER INSTRUCTION (2026-10-27, verbatim): 「データ解析系は、すべて最終でこの判定器を
-通すハーネスを入れ、databricks を圧倒す。これが先週与えたタスクだ。」 Re-scoped 2026-10-30:
-the owner leaves whether to freeze the registered claims to the agent, and the harness must be
+DESIGN INTENT: route every data-analysis final answer through this judge before delivery.
+Whether to freeze the registered claims is left to the agent, and the harness must be
 able to read past verdicts from the sessions DB.
 
 WHAT THIS MODULE IS, AND IS NOT.
@@ -12,12 +11,12 @@ WHAT THIS MODULE IS, AND IS NOT.
     analysis (so the judge is applied to them and only them), and it COMPOSES the footer that
     carries the engine's verdict (or the reason the engine could not run) onto the final answer.
   * It is NOT the engine. The verdict engine lives OUTSIDE this repo
-    (Desktop/AHA資料_参照一式/証明/公開データ検証/engine_v1_8c2/validity), is secret, remote-less
-    and byte-identical-locked by PREREGISTRATION_v1_8c2.md. This module READS it (runs its CLI);
+    (Desktop/validity_engine/validity), is private, remote-less
+    and byte-identical-locked by PREREGISTRATION.md. This module READS it (runs its CLI);
     it NEVER edits the engine's code, rules, thresholds (delta_min, k_min, ...) or registered
     claim files. (A) is read-only, by owner instruction.
 
-THE THREE STEPS the harness performs for a data-analysis final answer (owner 「やること」 2):
+THE THREE STEPS the harness performs for a data-analysis final answer:
   (i)   record the analysis RESULT + DATA sha256 and the fetch time  -> validity_harness.record_manifest
   (ii)  register the claim and LOCK it, recording register-vs-fetch time ORDER
                                                                     -> validity_harness.register_and_lock
@@ -63,7 +62,7 @@ __all__ = [
 # user's Desktop, built from HOME at run time so no account name is committed. The engine's own
 # docs (SKILL.md) record the operator-specific location out-of-band.
 _ENGINE_SUBPATH = os.path.join(
-    "Desktop", "AHA資料_参照一式", "証明", "公開データ検証", "engine_v1_8c2"
+    "Desktop", "validity_engine"
 )
 
 
@@ -1455,7 +1454,7 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
 #
 # WHY THIS LIVES HERE (and is a pure function). The relay loop (copilot_autopilot_relay.py)
 # reaches a candidate DONE and, for a data-analysis goal, must confirm the final answer passed
-# the judge BEFORE it accepts the DONE -- the owner task. Measured 2026-10-30: the 679かすれ
+# the judge BEFORE it accepts the DONE -- the design requirement. Observed regression: an example
 # analysis was delivered three times with no judge block and nothing caught it. The relay code
 # is not unit-tested in isolation; this seam is, so the decision lives in a tested pure function
 # and the loop only calls it.
