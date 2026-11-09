@@ -32,12 +32,12 @@ from relay import auto_rephrase_continue as AR  # noqa: E402
 #: A stable fragment of the resume lead: the worker must verify state before acting.
 VERIFY_FRAGMENT = "git status"
 #: A stable fragment telling the worker not to redo finished work.
-NO_REDO_FRAGMENT = "やり直さない"
+NO_REDO_FRAGMENT = "\u3084\u308a\u76f4\u3055\u306a\u3044"
 
 
 def test_resume_text_carries_goal_state_check_and_no_redo_instruction():
-    goal = "依頼本文ABC: PR を作ってチェックを通せ"
-    last = "前担当の最後の返答テキストXYZ"
+    goal = "\u4f9d\u983c\u672c\u6587ABC: PR \u3092\u4f5c\u3063\u3066\u30c1\u30a7\u30c3\u30af\u3092\u901a\u305b"
+    last = "\u524d\u62c5\u5f53\u306e\u6700\u5f8c\u306e\u8fd4\u7b54\u30c6\u30ad\u30b9\u30c8XYZ"
     text = AR.build_resume_text(goal, worker_last=last, partial_text="", journal="",
                                cwd="", git_summary="", folder_listing="")
     assert isinstance(text, str)
@@ -54,7 +54,7 @@ def test_resume_text_carries_goal_state_check_and_no_redo_instruction():
 
 def test_resume_text_survives_empty_inputs_and_missing_cwd(tmp_path):
     missing = str(tmp_path / "does-not-exist")
-    goal = "空の前置きでも依頼本文は残る"
+    goal = "\u7a7a\u306e\u524d\u7f6e\u304d\u3067\u3082\u4f9d\u983c\u672c\u6587\u306f\u6b8b\u308b"
     text = AR.build_resume_text(goal, worker_last="", partial_text="", journal="",
                                cwd=missing)
     assert isinstance(text, str)
@@ -87,7 +87,7 @@ def test_git_summary_includes_the_branch_pr_when_supplied(tmp_path):
     pr = "PR #180 [OPEN] implement a call feature\nhttps://example.invalid/pr/180"
     summary = AR._git_summary(str(repo), gh_pr=pr)
     assert subject in summary
-    assert "このブランチの PR" in summary
+    assert "\u3053\u306e\u30d6\u30e9\u30f3\u30c1\u306e PR" in summary
     assert "PR #180" in summary
 
 
@@ -103,17 +103,32 @@ def test_git_summary_says_no_pr_when_none_found(tmp_path):
     _git(["commit", "-q", "-m", "c"], str(repo))
     # empty gh result (no PR / gh unavailable) must not raise and must be reported plainly.
     summary = AR._git_summary(str(repo), gh_pr="")
-    assert "このブランチの PR: なし" in summary
+    assert "\u3053\u306e\u30d6\u30e9\u30f3\u30c1\u306e PR: \u306a\u3057" in summary
 
 
 def test_resume_text_reaches_git_summary_without_a_repo(tmp_path):
     # No git repo at cwd: build_resume_text still returns, and the preamble says state unknown.
-    text = AR.build_resume_text("依頼", cwd=str(tmp_path))
-    assert "依頼" in text
+    text = AR.build_resume_text("\u4f9d\u983c", cwd=str(tmp_path))
+    assert "\u4f9d\u983c" in text
     assert isinstance(text, str)
 
 
 # ---- relay_fleet wiring (source-level; the heavy module is not imported) -----------------
+#
+# RECONCILED 2026-11-09 (merge of origin/main into fix/resume-unknown-delivery-timeout-ci):
+# the feature this test was written for landed on main independently as PR #503, which
+# implements the same “resume a delivery-unknown acting turn in a fresh conversation that
+# first reads real state” recovery under the name `_resume_from_state_after_unknown`, backed
+# by relay/resume_from_state.py (enabled()/goal_is_resumable()/RESUME_FROM_STATE_PER_GOAL/
+# build_resume_text). The merge took main’s implementation; this branch’s original
+# `_resume_unknown_act_in_fresh_conversation` no longer exists. These source-level checks are
+# updated to assert the SAME invariants against the shipping method name/wiring, so coverage
+# of the incident (workers left STUCK on turn timeout with delivery unknown) is preserved.
+#
+# NOTE: `_resume_from_state_after_unknown` is CALLED from two places -- the proven-not-sent
+# path in `_retry_socket` (earlier in the file) and the per-turn timeout path (later). Tests
+# that reason about the timeout path specifically anchor on the TIMEOUT occurrence (rfind /
+# the slice at/after the 'bounded wait expired' refusal), not merely the first call site.
 
 def _relay_fleet_src():
     with open(RELAY_FLEET, encoding="utf-8") as fh:
@@ -122,14 +137,14 @@ def _relay_fleet_src():
 
 def test_timeout_tries_fresh_resume_before_refusing_on_unknown_delivery():
     src = _relay_fleet_src()
-    # The resume is invoked via a callable lookup so the settle-test stand-in workers (which do
-    # not subclass RelayWorker) fall back to the old refuse path; the recovery call still comes
-    # BEFORE the terminal refuse-resend of a 'turn timeout without a reply'.
-    resume_call = src.find("_resume_unknown_act_in_fresh_conversation")
-    resume_invoke = src.find("and callable(_resume_fn) and _resume_fn()")
+    # In the per-turn timeout path, an acting goal cut with delivery UNKNOWN whose
+    # same-conversation continue is unavailable must be offered the fresh-state resume BEFORE
+    # the terminal refuse-resend of a 'turn timeout without a reply' that leaves it STUCK.
+    # Anchor on the TIMEOUT-path resume call (the last occurrence) so this is not satisfied by
+    # the separate proven-not-sent call site earlier in the file.
+    resume_invoke = src.rfind("self._resume_from_state_after_unknown(")
     refuse_call = src.find('self._refuse_resend("turn timeout without a reply"')
-    assert resume_call != -1, "timeout path never references the fresh-resume recovery"
-    assert resume_invoke != -1, "timeout path never invokes the fresh-resume recovery"
+    assert resume_invoke != -1, "timeout path never invokes the fresh-state resume recovery"
     assert refuse_call != -1, "timeout path lost its terminal refuse-resend"
     assert resume_invoke < refuse_call, \
         "resume must be attempted before the worker is refused and left STUCK"
@@ -137,10 +152,15 @@ def test_timeout_tries_fresh_resume_before_refusing_on_unknown_delivery():
 
 def test_delivered_delivery_is_still_refused_not_resumed():
     src = _relay_fleet_src()
+    # A turn whose delivery is proven DELIVERED gets the bounded-wait refusal and returns; it
+    # is NOT routed into the delivery-unknown fresh-state resume. Within the TIMEOUT path that
+    # refusal must stay ahead of (and separate from) the unknown-resume invocation -- so it
+    # precedes the timeout-path resume call (the one that follows it in source order).
     delivered = src.find('self._refuse_resend("bounded wait expired; continuation unavailable"')
-    resume_invoke = src.find("and callable(_resume_fn) and _resume_fn()")
     assert delivered != -1
-    assert resume_invoke != -1
+    # The timeout-path resume call is the first resume occurrence AT/AFTER the delivered refusal.
+    resume_invoke = src.find("self._resume_from_state_after_unknown(", delivered)
+    assert resume_invoke != -1, "timeout path never invokes the fresh-state resume after the delivered refusal"
     assert delivered < resume_invoke, \
         "the delivered-timeout refusal must stay ahead of (and separate from) the unknown resume"
 
@@ -148,13 +168,16 @@ def test_delivered_delivery_is_still_refused_not_resumed():
 def test_resume_method_is_bounded_and_opens_a_fresh_conversation():
     src = _relay_fleet_src()
     m = re.search(
-        r"def _resume_unknown_act_in_fresh_conversation\(self\):(.*?)\n    def ", src, re.S)
-    assert m, "_resume_unknown_act_in_fresh_conversation not found in relay_fleet.py"
+        r"def _resume_from_state_after_unknown\(self, reason, delivery\):(.*?)\n    def ", src, re.S)
+    assert m, "_resume_from_state_after_unknown not found in relay_fleet.py"
     body = m.group(1)
-    assert "_resume_unknown_used" in body
-    assert "FRESH_RETRY_MAX" in body
-    guard = re.search(r"if used >= FRESH_RETRY_MAX:\s*\n\s*return False", body)
-    assert guard, "no 'if used >= FRESH_RETRY_MAX: return False' bound"
+    # Bounded per goal: a spent counter compared against RESUME_FROM_STATE_PER_GOAL, and the
+    # bound is checked (returning False) BEFORE a fresh conversation is ever started.
+    assert "_state_resumes_used" in body
+    assert "RESUME_FROM_STATE_PER_GOAL" in body
+    guard = re.search(
+        r"if spent >= _resume_from_state\.RESUME_FROM_STATE_PER_GOAL:\s*\n\s*return False", body)
+    assert guard, "no 'if spent >= RESUME_FROM_STATE_PER_GOAL: return False' bound"
     assert "build_resume_text" in body
     start_call = body.find("self._start_fresh_conversation(")
     assert start_call != -1, "fresh conversation is never started"
@@ -164,8 +187,10 @@ def test_resume_method_is_bounded_and_opens_a_fresh_conversation():
 def test_resume_method_respects_the_auto_rephrase_setting():
     src = _relay_fleet_src()
     m = re.search(
-        r"def _resume_unknown_act_in_fresh_conversation\(self\):(.*?)\n    def ", src, re.S)
+        r"def _resume_from_state_after_unknown\(self, reason, delivery\):(.*?)\n    def ", src, re.S)
     assert m
     body = m.group(1)
-    assert "auto_rephrase_continue" in body
+    # The recovery is gated by its own settings module (relay/resume_from_state.py): when the
+    # feature is switched off, enabled() is False and the method refuses rather than resuming.
+    assert "_resume_from_state" in body
     assert ".enabled()" in body
