@@ -40,3 +40,19 @@
   helper and merges probe fields into the reply.
 
 - PR. #461 (branch `fix/gwslow-health-pool`, off `origin/main` @ 9ff412b0).
+
+### 2026-11-07 (later, UTC) - post-deploy verification on the production PC
+
+- Confirmed in production. Before the deployed server picked up #461, the live process
+  (`server_head=dd5b5acb`, which does NOT contain #461) served `GET /health` in 15.7-41.1s under
+  CPU=100%, while the c2c-bridge `/health` answered in 3-6ms at the same instant -- isolating the
+  slowness to the MCP server's probe path, not the network or CPU per se. After the supervisor
+  cycled the server onto the merged code (`server_uptime_s=106`, i.e. the restart was the
+  supervisor's own, not a manual kill), live `GET /health` returned in 2.20s / 2.02s / 2.06s --
+  pinned at the 2.0s `_HEALTH_PROBE_BUDGET_S` deadline, i.e. the dedicated-pool + shared-budget
+  path is live and working.
+- Tests re-run green on `origin/main` @ 442e37d1 (includes #461):
+  `scripts/test_health_probe_isolation.py` 8 passed.
+- Non-destructive: no process/tool/browser was killed; the production checkout and its running
+  process were left untouched. Verification ran in a throwaway worktree off `origin/main`.
+
