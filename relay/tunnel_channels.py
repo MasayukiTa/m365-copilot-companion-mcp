@@ -230,6 +230,43 @@ def append_new_records(log_path, jsonl_path, offset_path=None):
     return appended
 
 
+def _recent_lines(path, cutoff, max_bytes=32 * 1024 * 1024):
+    """Read a bounded snapshot backwards, assuming timestamped records are ordered.
+
+    Even for arbitrarily large windows, the snapshot is capped at 32 MB; counts
+    can therefore be incomplete when the requested window exceeds that tail.
+    Call with _JSONL_LOCK held so the snapshot cannot overlap an append.
+    """
+    chunk = 1024 * 1024
+    with open(path, "rb") as fh:
+        size = fh.seek(0, 2)
+        pos = size
+        blocks = []
+        while pos > 0 and size - pos < max_bytes:
+            step = min(chunk, pos, max_bytes - (size - pos))
+            pos -= step
+            fh.seek(pos)
+            block = fh.read(step)
+            blocks.append(block)
+            # The first complete line in this block bounds older ordered records.
+            start = block.find(b"\n") + 1 if pos else 0
+            end = block.find(b"\n", start)
+            if end < 0:
+                continue
+            try:
+                record = json.loads(block[start:end])
+                timestamp = record.get("time")
+                if isinstance(timestamp, (int, float)) and timestamp < cutoff:
+                    break
+            except (ValueError, AttributeError):
+                continue
+        data = b"".join(reversed(blocks))
+        if pos:
+            newline = data.find(b"\n")
+            data = data[newline + 1:] if newline >= 0 else b""
+    return data.decode("utf-8", errors="replace").splitlines()
+
+
 def health_counts(jsonl_path, now=None, window_s=600):
     """Counts for the last ``window_s`` seconds, for the /health route.
 
@@ -245,18 +282,13 @@ def health_counts(jsonl_path, now=None, window_s=600):
         now = time.time()
     cutoff = now - window_s
     total = no_resp = remote_early = 0
-    # Read the WHOLE file in one shot under the shared lock, then parse the in-memory
-    # snapshot. This never holds a file handle across json.loads calls and never overlaps an
-    # append, so the C json decoder is never handed a half-written line (the heap-corruption
-    # path the faulthandler dumps show). Each line is tiny and the jsonl stays small, so the
-    # whole read is quick and the lock is held only momentarily.
+    # Take the bounded snapshot under the shared append lock; parse it after release.
     try:
         with _JSONL_LOCK:
-            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
-                snapshot = fh.read()
+            snapshot = _recent_lines(jsonl_path, cutoff)
     except OSError:
         return {k: -1 for k in keys}
-    for line in snapshot.splitlines():
+    for line in snapshot:
         line = line.strip()
         if not line:
             continue
@@ -264,8 +296,10 @@ def health_counts(jsonl_path, now=None, window_s=600):
             rec = json.loads(line)
         except ValueError:
             continue
+        if not isinstance(rec, dict):
+            continue
         t = rec.get("time")
-        if t is not None and t < cutoff:
+        if isinstance(t, (int, float)) and t < cutoff:
             continue
         total += 1
         if rec.get("no_response"):
