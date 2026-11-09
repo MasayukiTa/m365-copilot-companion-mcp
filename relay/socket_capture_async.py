@@ -206,12 +206,20 @@ class AsyncCaptureManager:
                     tail = childproc.decode(_e).strip().replace("\r", " ").replace("\n", " ")[-200:]
                 except Exception:
                     pass
-                raise RuntimeError("capture helper exceeded %.0fs%s"
-                                   % (self.timeout_s, (" (last: %s)" % tail) if tail else ""))
+                # The worker names its in-flight stage with a STAGE= prefix (see _worker_main).
+                # Lift it to the FRONT of the timeout message and result so a 180 s timeout says
+                # the stage it hung in -- connect / page found / token read / write -- rather than
+                # only that it ran out of time.
+                stage = _stage_from_tail(tail)
+                raise RuntimeError("capture helper exceeded %.0fs in stage '%s'%s"
+                                   % (self.timeout_s, stage,
+                                      (" (last: %s)" % tail) if tail else ""))
             rc = getattr(proc, "returncode", None)
             if rc not in (0, None):
                 err = childproc.decode(raw_err).strip().replace("\r", " ").replace("\n", " ")
-                raise RuntimeError("capture helper exit %s: %s" % (rc, err[-300:]))
+                stage = _stage_from_tail(err)
+                raise RuntimeError("capture helper exit %s in stage '%s': %s"
+                                   % (rc, stage, err[-300:]))
             text = childproc.decode(raw_out).strip()
             data = json.loads(text)
             token = str(data.get("token") or "")
@@ -286,13 +294,78 @@ class AsyncCaptureManager:
                     "policy": {k: self.policy.snapshot(k) for k in self._last_attempt}}
 
 
+#: The capture stages, in the order the worker runs them. A failure names which one it was in
+#: and how long each completed stage took, so a timeout (180 s with no detail, historically) says
+#: where the time went instead of only that it ran out.
+CAPTURE_STAGES = ("connect", "page found", "token read", "write")
+
+
+def _stage_from_tail(text):
+    """Recover the worker's in-flight stage name from its stderr tail.
+
+    The worker prints ``STAGE=<name> timings[...]`` on failure; a timeout kills the worker before
+    it can, so the name may be absent. Returns one of CAPTURE_STAGES, or '(unknown)' when the tail
+    carries no stage marker (e.g. the worker was killed mid-connect before printing anything).
+    """
+    import re
+    if text:
+        m = re.search(r"STAGE=([a-z ]+?)(?: timings\[|:|$)", text)
+        if m:
+            name = m.group(1).strip()
+            if name in CAPTURE_STAGES:
+                return name
+    return "(unknown)"
+
+
+class _StageTimer:
+    """Record which capture stage is running now and how long each one took.
+
+    ``enter(name)`` closes the previous stage's timing and opens the next. ``stage`` is the name
+    of the stage in flight when a failure is raised; ``timings`` is the per-stage elapsed seconds
+    for every stage that began (the in-flight one included, measured up to the failure).
+    """
+
+    def __init__(self, now=time.perf_counter):
+        self._now = now
+        self.stage = None
+        self.timings = {}            # stage name -> elapsed seconds (completed or up-to-failure)
+        self._started = None
+
+    def enter(self, name):
+        self._close()
+        self.stage = name
+        self._started = self._now()
+
+    def _close(self):
+        if self.stage is not None and self._started is not None:
+            self.timings[self.stage] = round(self._now() - self._started, 3)
+
+    def snapshot(self):
+        """Timings including the in-flight stage measured up to now (does not close it)."""
+        out = dict(self.timings)
+        if self.stage is not None and self._started is not None:
+            out[self.stage] = round(self._now() - self._started, 3)
+        return out
+
+    def summary(self):
+        """A compact ``connect=0.4s page found=1.2s`` string for a log line."""
+        return " ".join("%s=%.3fs" % (n, s) for n, s in self.snapshot().items())
+
+
 def _worker_main() -> int:
-    """Child side: own Playwright connection, one capture, JSON result to stdout only."""
+    """Child side: own Playwright connection, one capture, JSON result to stdout only.
+
+    Each stage (connect, page found, token read, write) is timed. On failure the stage name and
+    the per-stage timing are written to stderr -- which the parent folds into its failure log and
+    result -- so a capture that times out says WHICH stage it was in and how long each one took,
+    instead of the old bare 'exceeded 180s'.
+    """
     cdp_url = os.environ.get("MCP_CAPTURE_WORKER_CDP") or "http://localhost:9222"
     agent_url = os.environ.get("MCP_CAPTURE_WORKER_AGENT") or ""
     if not agent_url:
         print("capture worker: missing agent url", file=sys.stderr, flush=True)
         return 2
+    timer = _StageTimer()
     try:
         # Redirect every incidental capture print away from stdout. stdout is a private protocol
         # carrying the credential back to the parent; mixing diagnostics into it would both break
@@ -301,22 +374,31 @@ def _worker_main() -> int:
             from playwright.sync_api import sync_playwright
             from relay.profile_token import capture_fn, capture_via_profile
             with sync_playwright() as pw:
+                timer.enter("connect")
                 browser = pw.chromium.connect_over_cdp(cdp_url, timeout=20000)
+                timer.enter("page found")
                 if not browser.contexts:
                     raise RuntimeError("CDP browser has no context")
                 context = browser.contexts[0]
+                timer.enter("token read")
                 fn = capture_fn()
                 if fn is capture_via_profile:
                     token, template = fn(context, agent_url,
                                          log=lambda m: print(m, file=sys.stderr, flush=True))
                 else:
                     token, template = fn(context, agent_url)
-        payload = {"token": token, "query": dict(template.query), "frame": template.frame}
+        timer.enter("write")
+        payload = {"token": token, "query": dict(template.query), "frame": template.frame,
+                   "stages": timer.snapshot()}
         sys.stdout.write(json.dumps(payload, ensure_ascii=False))
         sys.stdout.flush()
         return 0
     except Exception as exc:
-        print("capture worker failed: %s: %s" % (type(exc).__name__, str(exc)[:500]),
+        # STAGE= is a stable prefix the parent parses back out of the stderr tail. Keep it first
+        # so even a truncated 200-char tail still carries the stage name.
+        print("capture worker failed: STAGE=%s timings[%s]: %s: %s"
+              % (timer.stage or "(none)", timer.summary(),
+                 type(exc).__name__, str(exc)[:500]),
               file=sys.stderr, flush=True)
         return 1
 

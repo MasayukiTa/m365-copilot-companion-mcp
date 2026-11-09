@@ -51,8 +51,13 @@ __all__ = [
     "confirm_overlap_fraction",
     "apply_confirm_independence",
     "confirm_independence_note",
+    "design_feasibility",
+    "DESIGN_K_MIN",
+    "DESIGN_OVERLAP_MIN",
+    "DESIGN_MIN_COMMON_STRATA",
     "design_feasibility_hold",
     "DESIGN_HOLD_DISPLAY",
+    "load_domain_terms",
 ]
 
 # The frozen engine checkout (A). Read-only. The engine lives OUTSIDE this public repo on the
@@ -72,6 +77,36 @@ def _default_engine_root() -> str:
 
 
 ENGINE_ROOT = os.environ.get("VALIDITY_ENGINE_ROOT") or _default_engine_root()
+
+# --- optional, out-of-band domain vocabulary --------------------------------
+#
+# WHY THIS EXISTS. This module must read cleanly in a PUBLIC repo, so it carries NO
+# site-specific product names, product-name column headers, or process words. The
+# human-facing design-hold text below is therefore written in GENERIC terms
+# ("grouping column", "product or equipment"). An operator who wants the footer to
+# name their real columns/products can supply them out-of-band in
+# .config/domain_terms.json (git-ignored, so nothing site-specific is committed).
+# OPTIONAL: when absent or empty, the generic wording is used unchanged. Keys:
+#   "grouping_column_examples": [str, ...]  # example grouping/stratum column names
+#   "group_split_by": str                   # what the compared groups differ by
+#   "hold_display": str                     # the forced final-display phrase
+# Values are plain display text only; they never change any verdict.
+_DOMAIN_TERMS_RELPATH = os.path.join(".config", "domain_terms.json")
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_domain_terms() -> dict:
+    """Optional domain vocabulary as a dict, or {} when unavailable. Never raises."""
+    path = os.path.join(_repo_root(), _DOMAIN_TERMS_RELPATH)
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 #: WHY THIS NOTE EXISTS. The classifier below is a keyword screen over the goal text (reusing
 #: relay/task_kind.py's DATA_QUERY markers, which were read off the live history). A keyword
@@ -1250,7 +1285,7 @@ def _fmt_n(ev: dict) -> str:
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
 # inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
 # response/outcome column -- feat/design-feasibility-core) reports the design is
-# INFEASIBLE, the FINAL DISPLAY is forced to 設計不成立(保留) regardless of what the
+# INFEASIBLE, the FINAL DISPLAY is forced to DESIGN_HOLD_DISPLAY regardless of what the
 # engine verdict was.
 #
 # STRICTER-ONLY, AND NON-DESTRUCTIVE. This can only turn a deliverable answer INTO a
@@ -1265,7 +1300,7 @@ def _fmt_n(ev: dict) -> str:
 # not import or recompute the upstream check. The dict shape it reads:
 #   {"feasible": bool,                 # False => force a hold
 #    "reason_code": str,               # e.g. one of _DESIGN_INFEASIBLE_REASONS
-#    "common_strata": int,             # 共通層(製品)の数
+#    "common_strata": int,             # number of common strata (grouping levels)
 #    "lots_per_group": {group: int},   # 群ごとのロット数
 #    "overlap_coefficient": number,    # 群間の層構成の重なり係数
 #    ...}                              # any other keys are carried as `seen`
@@ -1279,7 +1314,7 @@ _DESIGN_INFEASIBLE_REASONS = {
     "STRATUM_COLUMN_ABSENT":
         "層別の候補列(製品または設備を表すグループ列、ライン、期間など)が入力に無い",
     "NO_COMMON_STRATUM":
-        "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
+        "両群に共通の層(grouping level)が無い(群を分ける属性の差か設備の差か分けられない)",
     "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
         "共通の層内で各群 k_min ロット以上を満たす層の数が下限未満",
     "GROUP_COMPOSITION_IMBALANCE":
@@ -1290,7 +1325,8 @@ _DESIGN_INFEASIBLE_REASONS = {
 #: tests can pin it. The engine's own verdict tokens (GO/HOLD/NA) are NOT reused for
 #: this -- a forced design hold is a HARNESS decision about the comparison's validity,
 #: distinct from the engine's statistical verdict, and must read as such.
-DESIGN_HOLD_DISPLAY = "設計不成立(保留)"
+_DEFAULT_HOLD_DISPLAY = "DESIGN INFEASIBLE / 設計上比較不能（保留）"
+DESIGN_HOLD_DISPLAY = str(load_domain_terms().get("hold_display") or _DEFAULT_HOLD_DISPLAY)
 
 
 def design_feasibility_hold(design) -> dict | None:
@@ -1345,8 +1381,10 @@ def _design_hold_lines(hold: dict) -> list:
         lots = "未返却"
     seen = ("見たもの: 共通層の数=%s, 各群のロット数{%s}, 重なり係数=%s"
             % (hold.get("common_strata"), lots, hold.get("overlap_coefficient")))
-    note = ("比較する群が曝露ではなく製品(グループ列の製品値)で分かれているため、設備の差か製品の差か"
-            "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。")
+    split_by = str(load_domain_terms().get("group_split_by")
+                   or "群を分ける属性 (product or equipment)")
+    note = ("比較する群が曝露ではなく%sで分かれているため、群を分ける属性の差か設備の差か"
+            "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。" % split_by)
     return [head, why, seen, note]
 
 
@@ -1362,7 +1400,7 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
 
     DESIGN FORCE-HOLD (this slice). When `design_feasibility` reports the comparison
     design is INFEASIBLE (feasible is False), the FINAL DISPLAY is forced to
-    設計不成立(保留): the footer LEADS with a hold banner naming the reason code and
+    DESIGN_HOLD_DISPLAY: the footer LEADS with a hold banner naming the reason code and
     what was seen (common strata, per-group lot counts, overlap coefficient), then
     prints the engine's ORIGINAL verdict block UNCHANGED below it, labelled
     参考・変更なし. Stricter-only; never edits the engine output. A feasible / missing /
@@ -1392,6 +1430,22 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
         _indep = confirm_independence_note(order_record)
         if _indep:
             lines.append(_indep)
+    # Result-blind design feasibility (PR #438 core). When the verdict carries per-group
+    # stratum lot counts (group_stratum_lots: {group: {stratum: lot_count}}), run the
+    # design_feasibility screen -- it never reads the response column and can only ADD a
+    # design HOLD note, never relax a verdict. Stated plainly in the footer so a
+    # design-infeasible contrast is visible even when the engine otherwise ran.
+    if isinstance(verdict, dict) and verdict.get("group_stratum_lots"):
+        _feas = design_feasibility(verdict.get("group_stratum_lots"))
+        if _feas.get("design_infeasible"):
+            _seen = _feas.get("seen") or {}
+            lines.append(
+                "設計の成立性: 設計不成立(保留) reason=%s "
+                "(共通層=%s, 被覆層(各群>=%s)=%s, overlap=%.3f)" % (
+                    _feas.get("reason_code"),
+                    _seen.get("n_common_strata"), _seen.get("k_min"),
+                    _seen.get("n_common_strata_covered"),
+                    float(_seen.get("overlap_coefficient") or 0.0)))
     if not engine_available or not verdict:
         reason = unavailable_reason or (
             verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"
@@ -1480,3 +1534,168 @@ def rework_job_text(goal="", final_response="") -> str:
     """The job handed back to the implementer to make it pass the judge. Constant text; the
     arguments are accepted so a caller can log what triggered it."""
     return REWORK_JOB
+
+
+# ---------------------------------------------------------------------------
+# Design-feasibility gate (result-blind).  Design rationale: the gate must judge the
+# soundness of a two-group comparison's design automatically and without reading the
+# response column, so that swapping the response cannot change the verdict.
+#
+# This is the CORE pure function for that gate.  It takes, PER EXPOSURE GROUP, the
+# breakdown of how many LOTS fall into each stratum level (product, line, period).
+# It NEVER takes the response column
+# and NEVER reads any measurement value -- the whole point is that the design is
+# judged blind to the result, so swapping the response column cannot change the
+# verdict.
+#
+# It returns design_infeasible=True with a reason code when any of the
+# three conditions holds:
+#   NO_STRATIFIER             (a) no stratifier breakdown was supplied at all
+#   NO_COMMON_STRATUM         (b) the two groups share no stratum level
+#   INSUFFICIENT_LOTS_IN_COMMON (b) too few common strata have >= k_min lots in BOTH groups
+#   HIGH_SKEW                 (c) the groups' stratum mixes barely overlap (Overlap < min)
+#
+# Overlap coefficient here = sum_level min(p_g1(level), p_g2(level)) over the union
+# of levels, where p is the within-group lot share.  Overlap is 1.0 when the two
+# groups have identical stratum mixes and 0.0 when they share no level -- it is the
+# complement, on shared mass, of the total-variation distance used by the harness
+# screen (tools/confound_check.py); kept here as its own measure so the gate reads
+# its own number.  k_min / delta_min / corrections are NOT changed by this gate and
+# it only ever makes the display STRICTER (adds a HOLD-for-design), never looser.
+#
+# HERMETIC: standard library only; pure; no file / network / OS access.
+
+#: Minimum lots a stratum must have IN EACH GROUP to count as "covered" in common.
+#: This is the design gate's own k_min for stratum coverage; it is 8 to match the
+#: engine's independent-lot floor and is NOT the engine's k_min (which is
+#: untouched).  Raising the bar is allowed; this gate never lowers any threshold.
+DESIGN_K_MIN: int = 8
+
+#: At least this many common strata must each clear DESIGN_K_MIN in BOTH groups for
+#: a stratified estimate to be possible.  One shared, well-covered product is the
+#: minimum on which a within-stratum comparison can even be formed.
+DESIGN_MIN_COMMON_STRATA: int = 1
+
+#: Overlap coefficient at or below this is reported as HIGH_SKEW (the groups' mixes
+#: barely overlap, so an unstratified contrast is product-vs-equipment confounded).
+#: 0.5 means the groups share at most half their mass; chosen as a visible, round
+#: screening line and flagged empirical so it can be tuned without pretending it is
+#: derived.  It is a STRICTER-side screen: it can only add a design HOLD.
+DESIGN_OVERLAP_MIN: float = 0.5
+DESIGN_OVERLAP_MIN_IS_EMPIRICAL: bool = True
+
+
+def _overlap_coefficient(counts_a, counts_b) -> float:
+    """Overlap = sum_level min(p_a(level), p_b(level)) over the union of levels.
+
+    Each side is normalised to sum 1 over its own total.  Returns a value in [0, 1]:
+    1.0 when the two mixes are identical, 0.0 when they share no level.  An all-zero
+    side yields 0.0 against any non-empty side (nothing shared), and 0.0 against
+    another all-zero side (no mass to overlap -- reported as no overlap, the
+    stricter reading).
+    """
+    levels = set(counts_a or {}) | set(counts_b or {})
+    ta = float(sum(max(0.0, float(v)) for v in (counts_a or {}).values()))
+    tb = float(sum(max(0.0, float(v)) for v in (counts_b or {}).values()))
+    if ta <= 0.0 or tb <= 0.0:
+        return 0.0
+    s = 0.0
+    for lv in levels:
+        pa = max(0.0, float((counts_a or {}).get(lv, 0.0))) / ta
+        pb = max(0.0, float((counts_b or {}).get(lv, 0.0))) / tb
+        s += min(pa, pb)
+    return s
+
+
+def design_feasibility(group_stratum_lots,
+                       *,
+                       k_min: int = DESIGN_K_MIN,
+                       min_common_strata: int = DESIGN_MIN_COMMON_STRATA,
+                       overlap_min: float = DESIGN_OVERLAP_MIN):
+    """Decide, WITHOUT reading the response column, whether a two-group exposure
+    comparison's design is sound enough to estimate.
+
+    Argument
+      group_stratum_lots: mapping {group_label: {stratum_level: lot_count}} for
+        EXACTLY TWO exposure groups.  Each inner map says, for that group, how many
+        LOTS fell into each stratum level (one stratifier, e.g. product, line, or
+        period).  The
+        counts are lot counts, never measurements.  An empty outer map, an outer map
+        without two groups, or two groups whose inner maps are both empty is treated
+        as having no stratifier information (NO_STRATIFIER).
+
+    Keyword (all defaulted; a caller may pass STRICTER values, never looser -- the
+    function does not enforce that, but the gate's contract is stricter-or-equal):
+      k_min: lots a stratum needs IN EACH GROUP to count as covered (default 8).
+      min_common_strata: how many such covered common strata are required (default 1).
+      overlap_min: Overlap coefficient below which the mix is HIGH_SKEW (default 0.5).
+
+    Returns a dict:
+      design_infeasible: bool
+      reason_code: one of NO_STRATIFIER / NO_COMMON_STRATUM /
+                   INSUFFICIENT_LOTS_IN_COMMON / HIGH_SKEW / None (feasible)
+      seen: {
+        groups: [label, label],
+        group_lots: {label: total lots},
+        n_common_strata: int,              # levels present in BOTH groups
+        n_common_strata_covered: int,      # common levels with >= k_min lots in BOTH
+        overlap_coefficient: float,        # Overlap = sum min(p1,p2)
+        k_min: int, min_common_strata: int, overlap_min: float,
+      }
+
+    The checks are applied in the order (a) then (b) then (c); the FIRST
+    failing one sets the reason code.  design_infeasible True means the final
+    display must be forced to "設計不成立(保留)" -- this function never relaxes a
+    verdict, it only ever adds a design HOLD.
+    """
+    gsl = group_stratum_lots or {}
+    groups = list(gsl.keys())
+
+    # (a) no stratifier information at all: not two groups, or both sides empty.
+    def _is_empty(d):
+        return not d or sum(max(0, int(v)) for v in d.values()) <= 0
+    if len(groups) != 2 or all(_is_empty(gsl.get(g) or {}) for g in groups):
+        seen = {
+            "groups": groups,
+            "group_lots": {g: int(sum(max(0, int(v)) for v in (gsl.get(g) or {}).values()))
+                           for g in groups},
+            "n_common_strata": 0,
+            "n_common_strata_covered": 0,
+            "overlap_coefficient": 0.0,
+            "k_min": int(k_min),
+            "min_common_strata": int(min_common_strata),
+            "overlap_min": float(overlap_min),
+        }
+        return {"design_infeasible": True, "reason_code": "NO_STRATIFIER", "seen": seen}
+
+    g1, g2 = groups[0], groups[1]
+    a = {k: max(0, int(v)) for k, v in (gsl.get(g1) or {}).items()}
+    b = {k: max(0, int(v)) for k, v in (gsl.get(g2) or {}).items()}
+    common = [lv for lv in (set(a) & set(b))
+              if a.get(lv, 0) > 0 and b.get(lv, 0) > 0]
+    covered = [lv for lv in common if a.get(lv, 0) >= k_min and b.get(lv, 0) >= k_min]
+    overlap = _overlap_coefficient(a, b)
+
+    seen = {
+        "groups": [g1, g2],
+        "group_lots": {g1: int(sum(a.values())), g2: int(sum(b.values()))},
+        "n_common_strata": len(common),
+        "n_common_strata_covered": len(covered),
+        "overlap_coefficient": float(overlap),
+        "k_min": int(k_min),
+        "min_common_strata": int(min_common_strata),
+        "overlap_min": float(overlap_min),
+    }
+
+    # (b) no common stratum at all, or too few covered to the required depth.
+    if len(common) == 0:
+        return {"design_infeasible": True, "reason_code": "NO_COMMON_STRATUM", "seen": seen}
+    if len(covered) < int(min_common_strata):
+        return {"design_infeasible": True,
+                "reason_code": "INSUFFICIENT_LOTS_IN_COMMON", "seen": seen}
+
+    # (c) the groups' stratum mixes barely overlap -> confounded, hold for design.
+    if overlap < float(overlap_min):
+        return {"design_infeasible": True, "reason_code": "HIGH_SKEW", "seen": seen}
+
+    return {"design_infeasible": False, "reason_code": None, "seen": seen}
