@@ -25,16 +25,18 @@ def _outside_limiter():
 
 
 def _outside_peer():
-    """Classify only the socket peer, never caller-controlled forwarding headers.
-
-    A local tunnel forwards from 127.0.0.1, indistinguishable here from fleet calls.
-    Such requests remain in the default lane until the tunnel has a distinct listener.
-    """
+    """Route tunnel and non-loopback requests to the bounded outside lane."""
+    # A forged header only puts its sender in the eight-token outside lane; it
+    # grants nothing. The tunnel adds it, so its callers cannot hide it, and
+    # fleet workers do not send it.
     if os.environ.get("MCP_OUTSIDE_LANE", "1").strip().lower() in ("0", "false", "off", "no"):
         return False
     try:
         from fastmcp.server.dependencies import get_http_request
-        peer = get_http_request().scope.get("client")
+        scope = get_http_request().scope
+        if any(name.lower() == b"x-forwarded-for" for name, _ in scope.get("headers", [])):
+            return True
+        peer = scope.get("client")
         address = ipaddress.ip_address(peer[0])
         if getattr(address, "ipv4_mapped", None):
             address = address.ipv4_mapped
