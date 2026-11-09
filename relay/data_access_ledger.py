@@ -3,7 +3,7 @@
 
 WHY THIS EXISTS (owner 「やること」(1), 2026-11-03). A confirmation analysis is only
 independent if the lots it reads were NOT already opened by an earlier analysis before the
-claim was registered. The loss analysis (mcl_loss_ftype_confirm) returned order_ok=true / GO
+claim was registered. The loss analysis (example_confirm_analysis) returned order_ok=true / GO
 yet its confirmation data fell inside a period an earlier analysis had already opened, so the
 GO was an artefact of clock order, not of independence. To let the gate SEE that, every time an
 analysis pulls lots out of the database we append one row here: which lots (the set), when they

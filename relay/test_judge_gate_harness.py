@@ -272,7 +272,7 @@ def test_footer_states_confirmation_not_independent_and_order_false():
              "data_fetched_at": "2026-11-02T21:00:00+09:00"}
     overlap = {"fraction": 0.25, "n_lots": 8, "n_overlap": 2, "overlap_lots": ["x", "y"]}
     apply_confirm_independence(order, overlap)
-    verdict = {"id": "MCL_L1", "verdict": "HOLD", "verdict_ja": "保留",
+    verdict = {"id": "EXAMPLE_L1", "verdict": "HOLD", "verdict_ja": "保留",
                "finding": None, "claim_supported": None, "reasons": [], "notes": [],
                "evidence": {"K": 3}, "hashes": {}}
     footer = build_judge_footer(verdict=verdict, engine_available=True, order_record=order)

@@ -3,11 +3,11 @@
 (branch fix/judge-engine-chain-after-395, after PR #395 engaged the final-step judge for a
 goal that was only a path to a request folder).
 
-The defects, taken from that job's judge_request.json shape (claim_id 'mcl_kasure679', a
+The defects, taken from that job's judge_request.json shape (claim_id 'example_kasure_analysis', a
 manifest whose .path was the DATA FOLDER and whose .result was a PATH STRING, and NO
 registration section at all):
 
-  1. 'registered claim not found for id mcl_kasure679' with claim_source null -- the worker
+  1. 'registered claim not found for id example_kasure_analysis' with claim_source null -- the worker
      named a claim id but the request carried no registration.claim and the engine had no
      pre-registered configs/<id>.json, so the engine could not run and the worker was never
      told, in correctable terms, what to send. A worker that DOES follow the documented path
@@ -41,7 +41,7 @@ vh = pytest.importorskip(
 
 from relay.judge_gate import complete_judge_request, run_engine_judge
 
-CLAIM_ID = "mcl_kasure679"
+CLAIM_ID = "example_kasure_analysis"
 
 # A minimal analysis-result OBJECT, the shape manifest.result must carry (defect 2). No real
 # measurements -- synthetic lot ids and numbers only.

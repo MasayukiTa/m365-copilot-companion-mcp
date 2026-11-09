@@ -281,7 +281,7 @@ def _request_digit_runs(request_text) -> frozenset:
     as strings, length >= 2.
 
     These are the digit sequences the gate may treat as part of an IDENTIFIER the requester
-    supplied -- the '679' of "679かすれ調査", "e679_v26", "mcl_kasure679". Length >= 2 keeps a
+    supplied -- the '679' of "679かすれ調査", "e679_v26", "example_kasure_analysis". Length >= 2 keeps a
     lone '0'/'1'/... (which occurs in almost any text) from exempting real single-digit
     statistics. Returns an empty set for non-strings so the caller degrades to the old behaviour.
     """

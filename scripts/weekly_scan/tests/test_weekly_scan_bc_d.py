@@ -56,7 +56,7 @@ class FakeJudge:
 
 def _request(registered_at="2026-10-01T00:00:00+09:00", dmin=0.3):
     return {
-        "claim_id": "mcl_demo",
+        "claim_id": "example_demo",
         "data_location": "/orig/data.csv",
         "registration": {
             "registered_at": registered_at,
@@ -117,8 +117,8 @@ def test_with_registered_clock_refuses_to_mint_a_clock():
 
 
 def test_ledger_key_distinguishes_duplicate_ids_across_dirs():
-    a = {"analysis_id": "mcl_kasure679", "dir": "AHA/679"}
-    b = {"analysis_id": "mcl_kasure679", "dir": "ERROR/mcl_kasure679"}
+    a = {"analysis_id": "example_kasure_analysis", "dir": "AHA/679"}
+    b = {"analysis_id": "example_kasure_analysis", "dir": "ERROR/example_kasure_analysis"}
     assert common.ledger_key(a) != common.ledger_key(b)
 
 
@@ -126,7 +126,7 @@ def test_ledger_key_distinguishes_duplicate_ids_across_dirs():
 
 
 def test_bc_not_ready_when_new_lots_below_need():
-    row = {"analysis_id": "mcl_demo", "dir": "d", "class": "C", "kshort": 8, "add80": 8}
+    row = {"analysis_id": "example_demo", "dir": "d", "class": "C", "kshort": 8, "add80": 8}
     judge = FakeJudge("GO")
     out = bc_confirm.confirm_one(
         row, request_loader=_loader(_request()), lot_counter=FakeLotCounter(3),
@@ -139,7 +139,7 @@ def test_bc_not_ready_when_new_lots_below_need():
 
 
 def test_bc_confirms_and_reuses_clock_when_ready():
-    row = {"analysis_id": "mcl_demo", "dir": "d", "class": "B", "kshort": 0, "add80": 0}
+    row = {"analysis_id": "example_demo", "dir": "d", "class": "B", "kshort": 0, "add80": 0}
     # B with need 0 is ready at 0 new lots (order-establishment only).
     judge = FakeJudge("GO", ["A_OK", "D_OK", "C_OK", "B_OK"])
     fetcher = FakeFetcher("/new/confirm.csv")
@@ -157,7 +157,7 @@ def test_bc_confirms_and_reuses_clock_when_ready():
 
 
 def test_bc_confirmed_hold_keeps_rescan_trigger():
-    row = {"analysis_id": "mcl_demo", "dir": "d", "class": "C", "kshort": 2, "add80": 0}
+    row = {"analysis_id": "example_demo", "dir": "d", "class": "C", "kshort": 2, "add80": 0}
     judge = FakeJudge("HOLD", ["D_FAIL_NO_LOCK"])
     out = bc_confirm.confirm_one(
         row, request_loader=_loader(_request()), lot_counter=FakeLotCounter(2),
@@ -197,7 +197,7 @@ def test_bc_rows_skips_non_bc():
 
 
 def test_d_reacquire_repairs_input_and_rejudges_on_recorded_clock():
-    row = {"analysis_id": "mcl_coat", "dir": "d", "class": "D"}
+    row = {"analysis_id": "example_coat", "dir": "d", "class": "D"}
     judge = FakeJudge("HOLD", ["D_FAIL_NO_LOCK"])
     fetcher = FakeFetcher("/repaired/data.csv")
     out = d_reacquire.reacquire_one(
@@ -211,9 +211,9 @@ def test_d_reacquire_repairs_input_and_rejudges_on_recorded_clock():
 
 
 def test_d_reacquire_without_clock_does_not_invent_one():
-    row = {"analysis_id": "mcl_coat", "dir": "d", "class": "D"}
+    row = {"analysis_id": "example_coat", "dir": "d", "class": "D"}
     judge = FakeJudge("ERROR", ["INPUT_NO_ROWS"])
-    req = {"claim_id": "mcl_coat", "data_location": "/orig.csv"}  # no registered_at
+    req = {"claim_id": "example_coat", "data_location": "/orig.csv"}  # no registered_at
     out = d_reacquire.reacquire_one(
         row, request_loader=lambda r: req, data_fetcher=FakeFetcher("/re.csv"),
         judge=judge, scanned_on="2026-11-04",
@@ -225,7 +225,7 @@ def test_d_reacquire_without_clock_does_not_invent_one():
 
 
 def test_d_reacquire_go_sets_follow_trigger():
-    row = {"analysis_id": "mcl_coat", "dir": "d", "class": "D"}
+    row = {"analysis_id": "example_coat", "dir": "d", "class": "D"}
     judge = FakeJudge("GO", ["A_OK", "D_OK", "C_OK", "B_OK"])
     out = d_reacquire.reacquire_one(
         row, request_loader=_loader(_request()), data_fetcher=FakeFetcher(),

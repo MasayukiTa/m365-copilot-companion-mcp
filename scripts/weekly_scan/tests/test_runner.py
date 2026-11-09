@@ -23,9 +23,9 @@ from weekly_scan.runner import (  # noqa: E402
 
 # 判定器の返値を模す（ネスト verdict を持つ judge_result.json の形）。
 _VERDICT_SAMPLE = {
-    "claim_id": "mcl_b1",
+    "claim_id": "example_b1",
     "verdict": {
-        "id": "mcl_b1",
+        "id": "example_b1",
         "verdict": "HOLD",
         "finding": "ORDER_NOT_ESTABLISHED",
         "evidence": {"K": 8},
@@ -49,7 +49,7 @@ def _fake_query_rows(rows):
 class ScanEntryTests(unittest.TestCase):
     def test_b_entry_is_judged_without_lot_count(self):
         entry = LedgerEntry(
-            analysis_id="a_b", classification="B", config_id="mcl_b1"
+            analysis_id="a_b", classification="B", config_id="example_b1"
         )
         out = scan_entry(entry, judge_callable=_fake_judge, scanned_at="2026-11-04")
         self.assertTrue(out.judged)
@@ -58,7 +58,7 @@ class ScanEntryTests(unittest.TestCase):
 
     def test_c_entry_counts_lots_and_judges_when_met(self):
         entry = LedgerEntry(
-            analysis_id="a_c", classification="C", config_id="mcl_c1",
+            analysis_id="a_c", classification="C", config_id="example_c1",
             required_lots=10,
             notes={"lot_count": {"table": "MCL.dbo.V", "unit_column": "lot",
                                  "product_column": "hinmei"}},
@@ -74,7 +74,7 @@ class ScanEntryTests(unittest.TestCase):
 
     def test_c_entry_not_judged_when_lots_short(self):
         entry = LedgerEntry(
-            analysis_id="a_c2", classification="C", config_id="mcl_c2",
+            analysis_id="a_c2", classification="C", config_id="example_c2",
             required_lots=20,
             notes={"lot_count": {"table": "MCL.dbo.V", "unit_column": "lot",
                                  "product_column": "hinmei"}},
@@ -89,7 +89,7 @@ class ScanEntryTests(unittest.TestCase):
 
     def test_c_entry_without_lotcount_spec_is_not_counted(self):
         entry = LedgerEntry(
-            analysis_id="a_c3", classification="C", config_id="mcl_c3",
+            analysis_id="a_c3", classification="C", config_id="example_c3",
             required_lots=5,
         )
         q = _fake_query_rows([("P1", 9)])
@@ -99,7 +99,7 @@ class ScanEntryTests(unittest.TestCase):
 
     def test_dry_run_entry_only_updates_last_scanned(self):
         entry = LedgerEntry(analysis_id="a_d", classification="D",
-                            config_id="mcl_d1")
+                            config_id="example_d1")
         out = scan_entry(entry, scanned_at="2026-11-04")
         self.assertFalse(out.judged)
         self.assertEqual(entry.last_scanned, "2026-11-04")
@@ -111,7 +111,7 @@ class ScanLedgerTests(unittest.TestCase):
         led.upsert(LedgerEntry(analysis_id="keep_a", classification="A"))
         led.upsert(LedgerEntry(analysis_id="keep_e", classification="E"))
         led.upsert(LedgerEntry(analysis_id="do_b", classification="B",
-                               config_id="mcl_b1"))
+                               config_id="example_b1"))
         led.upsert(LedgerEntry(analysis_id="do_d", classification="D"))
         return led
 

@@ -54,7 +54,7 @@ def test_record_access_round_trips_time_and_lots(tmp_path, monkeypatch):
     p = _ledger(tmp_path)
     monkeypatch.setenv(dal.LEDGER_PATH_ENV, p)
     row = dal.record_access(
-        "mcl_demo",
+        "example_demo",
         ["B2", "A1", "A1", "C3"],
         data_location="/tmp/x.csv",
         data_ext=".csv",
@@ -71,7 +71,7 @@ def test_record_access_round_trips_time_and_lots(tmp_path, monkeypatch):
     assert row["fetched_at"] == "2026-11-03T07:00:00+09:00"
     back = dal.read_ledger()
     assert len(back) == 1
-    assert back[0]["analysis_id"] == "mcl_demo"
+    assert back[0]["analysis_id"] == "example_demo"
     assert back[0]["lots"] == ["A1", "B2", "C3"]
     assert back[0]["fetched_at"] == "2026-11-03T07:00:00+09:00"
 

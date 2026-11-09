@@ -40,7 +40,7 @@ from typing import Any, Callable, Mapping, Optional, Protocol, Sequence
 def ledger_key(row: Mapping[str, Any]) -> tuple[str, str]:
     """The real identity of a ledger row.
 
-    analysis_id is NOT unique on its own (e.g. ``mcl_kasure679`` appears under
+    analysis_id is NOT unique on its own (e.g. ``example_kasure_analysis`` appears under
     two directories), so a scan that updated by analysis_id alone would stamp
     the wrong row.  The key is (analysis_id, dir).
     """

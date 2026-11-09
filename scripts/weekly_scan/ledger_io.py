@@ -3,7 +3,7 @@
 台帳は週次走査の中心となる状態ファイル。1 エントリ = 1 解析で、次のスキーマを持つ:
 
     {
-      "analysis_id":  str,          # 解析 ID（例 "mcl_doushiwa_v3"）。一意。
+      "analysis_id":  str,          # 解析 ID（例 "example_doushiwa_analysis"）。一意。
       "classification": "A"|"B"|"C"|"D"|"E",  # 棚卸しの5分類
       "next_trigger":  str|null,    # 次の契機（例 "確認用ロットが規定数に達する予定日: 2026-12-01",
                                     #   "再取得"、null=契機なし/対象外）

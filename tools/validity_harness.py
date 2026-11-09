@@ -2,7 +2,7 @@
 """validity_harness -- NON-SECRET orchestration around the (external, frozen) validity engine.
 
 WHY THIS EXISTS (owner decision 2026-10-30 07:40). Whether to freeze the six registered
-claims (MCL_D1/D3/D4/K1/P1/P2) is left to the agent; and if past analysis results are in the
+claims (EXAMPLE_D1/D3/D4/K1/P1/P2) is left to the agent; and if past analysis results are in the
 sessions DB, the harness should be able to read them. The 679-kasure v6 report (欠け#3) found
 the engine's D gate could not line up the lock time with the round-4 data fetch time because
 the data was absent from the engine manifest, and that every claim carried

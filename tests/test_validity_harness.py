@@ -64,14 +64,14 @@ def _make_fake_sessions_db(path: str) -> None:
         )
         conn.execute(
             "INSERT INTO validity_audit VALUES (?,?,?,?,?,?,?,?,?)",
-            ("MCL_D1", "run0001", 0, "tool_call", 1000.0,
-             'validity_judge {"config_id":"MCL_D1"}', "tool_events.jsonl",
+            ("EXAMPLE_D1", "run0001", 0, "tool_call", 1000.0,
+             'validity_judge {"config_id":"EXAMPLE_D1"}', "tool_events.jsonl",
              "call:abc", json.dumps({"tool": "validity_judge"})),
         )
         conn.execute(
             "INSERT INTO validity_audit VALUES (?,?,?,?,?,?,?,?,?)",
-            ("MCL_D1", "run0001", 1, "tool_result", 1001.0,
-             json.dumps({"id": "MCL_D1", "verdict": "HOLD",
+            ("EXAMPLE_D1", "run0001", 1, "tool_result", 1001.0,
+             json.dumps({"id": "EXAMPLE_D1", "verdict": "HOLD",
                          "reasons": ["D_FAIL_NO_LOCK"],
                          "notes": ["LOT_INDEPENDENCE_NOT_CHECKED"],
                          "hashes": {"input_sha256": "0" * 64}}),
@@ -88,10 +88,10 @@ def test_past_runs_reads_claim_from_db():
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "sessions.sqlite3")
         _make_fake_sessions_db(db)
-        runs = vh.past_runs("MCL_D1", store_path=db)
-        assert isinstance(runs, list) and runs, "MCL_D1 must be found in the DB"
+        runs = vh.past_runs("EXAMPLE_D1", store_path=db)
+        assert isinstance(runs, list) and runs, "EXAMPLE_D1 must be found in the DB"
         r = runs[0]
-        assert r["claim_id"] == "MCL_D1"
+        assert r["claim_id"] == "EXAMPLE_D1"
         assert r["verdict"] == "HOLD"
         assert "input_sha256" in r["hashes"]
 
@@ -102,7 +102,7 @@ def test_past_runs_emits_no_raw_rows():
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "sessions.sqlite3")
         _make_fake_sessions_db(db)
-        runs = vh.past_runs("MCL_D1", store_path=db)
+        runs = vh.past_runs("EXAMPLE_D1", store_path=db)
         for r in runs:
             assert set(r).issubset(
                 {"claim_id", "run_id", "verdict", "finding", "reasons",
@@ -207,14 +207,14 @@ def _make_fleet_turns_only_db(path):
         conn.execute(
             "INSERT INTO fleet_turns (key,name,goal,turn,role,text,extra,ts,goal_id) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            ("r_run_x1", "w0", "judge claim MCL_X1 superiority", 7, "verdict",
-             "GO", "{}", 2000.0, "MCL_X1"),
+            ("r_run_x1", "w0", "judge claim EXAMPLE_X1 superiority", 7, "verdict",
+             "GO", "{}", 2000.0, "EXAMPLE_X1"),
         )
         conn.execute(
             "INSERT INTO fleet_turns (key,name,goal,turn,role,text,extra,ts,goal_id) "
             "VALUES (?,?,?,?,?,?,?,?,?)",
-            ("r_run_x1", "w0", "judge claim MCL_X1 superiority", 6, "worker_reply",
-             "secret raw measurement blob 0.12345 lot=679", "{}", 1999.0, "MCL_X1"),
+            ("r_run_x1", "w0", "judge claim EXAMPLE_X1 superiority", 6, "worker_reply",
+             "secret raw measurement blob 0.12345 lot=679", "{}", 1999.0, "EXAMPLE_X1"),
         )
         conn.commit()
     finally:
@@ -225,7 +225,7 @@ def test_past_runs_falls_back_to_fleet_turns():
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "sessions.sqlite3")
         _make_fleet_turns_only_db(db)
-        runs = vh.past_runs("MCL_X1", store_path=db)
+        runs = vh.past_runs("EXAMPLE_X1", store_path=db)
         assert isinstance(runs, list) and runs, "fleet_turns-only verdict must still be found"
         assert any(r.get("verdict") == "GO" for r in runs), "fleet_turns verdict token must be read"
 
@@ -234,7 +234,7 @@ def test_past_runs_fallback_emits_no_raw_rows():
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "sessions.sqlite3")
         _make_fleet_turns_only_db(db)
-        runs = vh.past_runs("MCL_X1", store_path=db)
+        runs = vh.past_runs("EXAMPLE_X1", store_path=db)
         for r in runs:
             assert set(r).issubset(
                 {"claim_id", "run_id", "verdict", "finding", "reasons",
@@ -261,8 +261,8 @@ def _seed_validity_audit(path):
         )
         conn.execute(
             "INSERT INTO validity_audit VALUES (?,?,?,?,?,?,?,?,?)",
-            ("MCL_D1", "run1", 0, "tool_result", 1.0,
-             json.dumps({"id": "MCL_D1", "verdict": "HOLD",
+            ("EXAMPLE_D1", "run1", 0, "tool_result", 1.0,
+             json.dumps({"id": "EXAMPLE_D1", "verdict": "HOLD",
                          "reasons": ["A_FAIL_SPARSE_LOTS"],
                          "hashes": {"input_sha256": "deadbeef"}}),
              "tool_events.jsonl", "outcome:c1",
@@ -280,10 +280,10 @@ def test_validity_past_runs_public_tool_wires_past_runs_into_the_flow():
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "sessions.sqlite3")
         _seed_validity_audit(db)
-        out = validity_past_runs("MCL_D1", store_path=db)
+        out = validity_past_runs("EXAMPLE_D1", store_path=db)
         assert isinstance(out, str), "a public tool must return a JSON string"
         payload = json.loads(out)
-        assert payload.get("claim_id") == "MCL_D1"
+        assert payload.get("claim_id") == "EXAMPLE_D1"
         runs = payload.get("runs")
         assert isinstance(runs, list) and runs, "past verdicts must reach the judge flow"
         assert runs[0].get("verdict") == "HOLD"
@@ -294,7 +294,7 @@ def test_validity_past_runs_public_tool_keeps_data_minimisation():
     with tempfile.TemporaryDirectory() as td:
         db = os.path.join(td, "sessions.sqlite3")
         _seed_validity_audit(db)
-        out = validity_past_runs("MCL_D1", store_path=db)
+        out = validity_past_runs("EXAMPLE_D1", store_path=db)
         assert "raw blob" not in out and "lot=679" not in out
         for r in json.loads(out)["runs"]:
             assert set(r).issubset(

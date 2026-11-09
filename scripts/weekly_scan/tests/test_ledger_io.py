@@ -77,13 +77,13 @@ class LedgerTests(unittest.TestCase):
     def test_roundtrip_json_file(self):
         led = Ledger()
         led.upsert(LedgerEntry(
-            analysis_id="mcl_k1", classification="C",
+            analysis_id="example_k1", classification="C",
             next_trigger="2026-12-01", last_scanned=None,
-            reason="concept.md:12 K=3 < k_min", config_id="mcl_k1",
+            reason="concept.md:12 K=3 < k_min", config_id="example_k1",
             required_lots=8, current_lots=3, notes={"owner": "line56"},
         ))
         led.upsert(LedgerEntry(
-            analysis_id="mcl_d4", classification="D",
+            analysis_id="example_d4", classification="D",
             reason="re-fetch needed", next_trigger="re-fetch",
         ))
         with tempfile.TemporaryDirectory() as d:
@@ -95,9 +95,9 @@ class LedgerTests(unittest.TestCase):
             self.assertTrue(raw.endswith(b"\n"))
             # 再読込で内容が一致。
             led2 = ledger_io.load_ledger(p)
-            self.assertEqual(set(led2.entries), {"mcl_k1", "mcl_d4"})
-            self.assertEqual(led2.get("mcl_k1").required_lots, 8)
-            self.assertEqual(led2.get("mcl_k1").notes["owner"], "line56")
+            self.assertEqual(set(led2.entries), {"example_k1", "example_d4"})
+            self.assertEqual(led2.get("example_k1").required_lots, 8)
+            self.assertEqual(led2.get("example_k1").notes["owner"], "line56")
 
     def test_load_missing_file_returns_empty(self):
         with tempfile.TemporaryDirectory() as d:
@@ -158,8 +158,8 @@ class LedgerNoIdentityTests(unittest.TestCase):
         # 通常の状態だけを入れて保存し、書き出したバイト列に認証情報の痕跡が無いこと。
         led = Ledger()
         led.upsert(LedgerEntry(
-            analysis_id="mcl_x1", classification="C",
-            reason="concept.md:12 K=3 < k_min", config_id="mcl_x1",
+            analysis_id="example_x1", classification="C",
+            reason="concept.md:12 K=3 < k_min", config_id="example_x1",
             required_lots=8, current_lots=3,
         ))
         with tempfile.TemporaryDirectory() as d:

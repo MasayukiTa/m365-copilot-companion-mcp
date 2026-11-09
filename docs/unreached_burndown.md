@@ -1316,7 +1316,7 @@ any of the three.
 harness: every time an analysis pulls lots out of the database, one JSONL row is appended
 (which lots, when they were fetched, the exposure/response columns, the analysis id). Its
 purpose is to let a later independence check SEE that a "confirmation" analysis read lots an
-earlier analysis had already opened — the `mcl_loss_ftype_confirm` case that returned
+earlier analysis had already opened — the `example_confirm_analysis` case that returned
 order_ok=true / GO while its data fell inside a period already opened. The module only RECORDS;
 it relaxes no judging threshold.
 

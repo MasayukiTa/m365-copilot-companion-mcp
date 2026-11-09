@@ -33,7 +33,7 @@ def validity_past_runs(config_id: str = "", limit: int = 200, store_path: str = 
     """Past validity VERDICTS for a pre-registered claim id, as JSON, for use as judge-flow input.
 
     This is the public wiring that lets a judging agent feed the past-analysis DB into its
-    decision: call it with the claim id (e.g. 'MCL_D1') before/alongside validity_judge to see
+    decision: call it with the claim id (e.g. 'EXAMPLE_D1') before/alongside validity_judge to see
     whether that claim was already judged and what the verdict was. It reads the sessions DB
     (validity_audit, falling back to fleet_turns -- the raw past-analysis table the ledger is
     distilled from), and returns ONLY the distilled, allow-listed verdict fields

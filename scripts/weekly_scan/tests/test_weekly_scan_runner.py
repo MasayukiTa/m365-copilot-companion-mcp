@@ -50,7 +50,7 @@ class FakeJudge:
 
 def _request(registered_at="2026-10-01T00:00:00+09:00"):
     return {
-        "claim_id": "mcl_demo",
+        "claim_id": "example_demo",
         "data_location": "/orig/data.csv",
         "registration": {"registered_at": registered_at,
                          "claim": {"delta_min": {"value": 0.3}}},

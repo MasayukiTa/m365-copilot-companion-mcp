@@ -21,9 +21,9 @@ from weekly_scan.judge_wrapper import (  # noqa: E402
 
 # 実物 judge_result.json の形（トップとネスト verdict の双方に同名フィールド）を模す。
 _SAMPLE = {
-    "claim_id": "mcl_p1",
+    "claim_id": "example_p1",
     "verdict": {
-        "id": "mcl_p1",
+        "id": "example_p1",
         "verdict": "HOLD",
         "claim_supported": False,
         "finding": "ORDER_NOT_ESTABLISHED",
@@ -46,7 +46,7 @@ _SAMPLE = {
 class ParseTests(unittest.TestCase):
     def test_parses_nested_verdict(self):
         v = parse_judge_result(_SAMPLE)
-        self.assertEqual(v.claim_id, "mcl_p1")
+        self.assertEqual(v.claim_id, "example_p1")
         self.assertEqual(v.verdict, "HOLD")
         self.assertTrue(v.is_hold)
         self.assertFalse(v.is_go)
@@ -88,7 +88,7 @@ class ParseTests(unittest.TestCase):
     def test_parse_json_string(self):
         import json
         v = parse_judge_result(json.dumps(_SAMPLE))
-        self.assertEqual(v.claim_id, "mcl_p1")
+        self.assertEqual(v.claim_id, "example_p1")
 
 
 class RunJudgeTests(unittest.TestCase):
@@ -100,8 +100,8 @@ class RunJudgeTests(unittest.TestCase):
             seen["engine_version"] = engine_version
             return _SAMPLE
 
-        v = run_judge("mcl_p1", fake_judge, engine_version="v1_8c2")
-        self.assertEqual(seen["config_id"], "mcl_p1")
+        v = run_judge("example_p1", fake_judge, engine_version="v1_8c2")
+        self.assertEqual(seen["config_id"], "example_p1")
         self.assertEqual(seen["engine_version"], "v1_8c2")
         self.assertIsInstance(v, JudgeVerdict)
         self.assertEqual(v.verdict, "HOLD")
@@ -112,8 +112,8 @@ class RunJudgeTests(unittest.TestCase):
         def fake_judge(config_id, engine_version=""):
             return json.dumps(_SAMPLE)
 
-        v = run_judge("mcl_p1", fake_judge)
-        self.assertEqual(v.claim_id, "mcl_p1")
+        v = run_judge("example_p1", fake_judge)
+        self.assertEqual(v.claim_id, "example_p1")
 
     def test_run_judge_rejects_empty_config_id(self):
         with self.assertRaises(ValueError):
@@ -136,7 +136,7 @@ class RunJudgeTests(unittest.TestCase):
             raise JudgeError("engine fault")
 
         with self.assertRaises(JudgeError):
-            run_judge("mcl_p1", boom)
+            run_judge("example_p1", boom)
 
 
 class OrderOkTests(unittest.TestCase):

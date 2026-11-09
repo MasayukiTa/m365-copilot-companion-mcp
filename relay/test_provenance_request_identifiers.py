@@ -5,7 +5,7 @@ requester supplied -- the case NAME in their own words -- rather than a computed
 Evidence: job 8300333c0ab2 (the "679かすれ調査" analysis, worker w49, 2026-11-02) ended
 VERIFY_FAILED "provenance: claimed numbers not found in this run's computation outputs: 679".
 The ONLY unsupported number was 679, which is the NAME of the case: the request folder is
-"枝さん_679かすれ調査", the submitter is "e679_v26", the suggested claim_id is "mcl_kasure679".
+"枝さん_679かすれ調査", the submitter is "e679_v26", the suggested claim_id is "example_kasure_analysis".
 Every genuine statistic the answer stated (K=6, the per-lot kasure rates, the bootstrap
 correlations) was found in this run's own computation output. A name the requester wrote is not
 a computed result, so it must not be policed as a claimed number.
@@ -38,7 +38,7 @@ from relay import analysis_provenance as ap  # noqa: E402
 # (no employee ids, no credentials): the folder/case name, the submitter token, the claim_id.
 REQUEST_TEXT = (
     "C:/Users/.../Downloads/枝さん_679かすれ調査 これ調べて。"
-    "claim_id の例 mcl_kasure679。submitter e679_v26。"
+    "claim_id の例 example_kasure_analysis。submitter e679_v26。"
 )
 
 # A faithful slice of the real answer's shape (job 8300333c0ab2): it refers to the case by
@@ -79,7 +79,7 @@ def test_case_name_679_glued_to_cjk_is_not_a_claim():
 
 def test_case_name_in_identifier_tokens_is_not_a_claim():
     rd = ap._request_digit_runs(REQUEST_TEXT)
-    for answer in ("claim_id は mcl_kasure679。", "submitter e679_v26 の解析。",
+    for answer in ("claim_id は example_kasure_analysis。", "submitter e679_v26 の解析。",
                    "フォルダ 枝さん_679かすれ調査 を読む。", "e679 の入力データ。"):
         vals = [v for v, _ in ap.extract_numbers(answer, rd)]
         assert 679 not in vals, answer
