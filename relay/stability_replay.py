@@ -49,6 +49,57 @@ if _ROOT not in sys.path:
 
 
 # --------------------------------------------------------------------------------------
+# Windows memory/CPU probes, prototyped ONCE at import rather than re-resolved per call.
+# The old code reached GlobalMemoryStatusEx / GetSystemTimes through the lazy windll cache
+# the probe functions (reached per call through the lazy windll attribute cache), which the
+# resource sampler calls repeatedly during a replay. Doing
+# that with no argtypes lets ctypes treat the byref() pointers as C ints and truncate them
+# on Win64 -- the struct is then filled through a mangled pointer, a heap write past our
+# memory. That is the same class of corruption that crashed python.exe with 0xc0000005 /
+# 0xc0000374 inside python310.dll on 2026-11-07. Binding a single WinDLL handle with
+# explicit argtypes/restype passes the pointers full-width and builds the FFI prototype
+# before any thread races the lazy windll attribute cache. Guarded by os.name so the import
+# stays inert on the Linux CI runner.
+# --------------------------------------------------------------------------------------
+if sys.platform.startswith("win"):
+    import ctypes as _ctypes_win
+    ctypes = _ctypes_win
+
+    class _MEMSTAT(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong),
+                    ("dwMemoryLoad", ctypes.c_ulong),
+                    ("ullTotalPhys", ctypes.c_ulonglong),
+                    ("ullAvailPhys", ctypes.c_ulonglong),
+                    ("ullTotalPageFile", ctypes.c_ulonglong),
+                    ("ullAvailPageFile", ctypes.c_ulonglong),
+                    ("ullTotalVirtual", ctypes.c_ulonglong),
+                    ("ullAvailVirtual", ctypes.c_ulonglong),
+                    ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+
+    class _FT(ctypes.Structure):
+        _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
+
+    try:
+        _kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        _GlobalMemoryStatusEx = _kernel32.GlobalMemoryStatusEx
+        _GlobalMemoryStatusEx.argtypes = [ctypes.POINTER(_MEMSTAT)]
+        _GlobalMemoryStatusEx.restype = ctypes.c_int  # BOOL
+        _GetSystemTimes = _kernel32.GetSystemTimes
+        _GetSystemTimes.argtypes = [ctypes.POINTER(_FT), ctypes.POINTER(_FT),
+                                    ctypes.POINTER(_FT)]
+        _GetSystemTimes.restype = ctypes.c_int  # BOOL
+    except Exception:
+        _GlobalMemoryStatusEx = None
+        _GetSystemTimes = None
+else:
+    ctypes = None
+    _MEMSTAT = None
+    _FT = None
+    _GlobalMemoryStatusEx = None
+    _GetSystemTimes = None
+
+
+# --------------------------------------------------------------------------------------
 # Owner inputs. Only what the owner typed is an input (the standing rule). The verbatim
 # file is the primary, provenance-carrying source. The realuse CSV holds 494 recorded
 # submissions but has no submitter column, so it CANNOT prove a row was typed by the
@@ -389,26 +440,15 @@ def sample_resources() -> dict:
     except Exception:
         pass
     out["cpu_percent"] = read_cpu_percent()
-    try:
-        import ctypes
-
-        class _MEMSTAT(ctypes.Structure):
-            _fields_ = [("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
-        m = _MEMSTAT()
-        m.dwLength = ctypes.sizeof(_MEMSTAT)
-        if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)):  # type: ignore[attr-defined]
-            committed = (m.ullTotalPageFile - m.ullAvailPageFile)
-            out["commit_gb"] = round(committed / 1e9, 3)
-    except Exception:
-        pass
+    if _GlobalMemoryStatusEx is not None:
+        try:
+            m = _MEMSTAT()
+            m.dwLength = ctypes.sizeof(_MEMSTAT)
+            if _GlobalMemoryStatusEx(ctypes.byref(m)):
+                committed = (m.ullTotalPageFile - m.ullAvailPageFile)
+                out["commit_gb"] = round(committed / 1e9, 3)
+        except Exception:
+            pass
     return out
 
 
@@ -417,16 +457,12 @@ def read_cpu_percent() -> Optional[float]:
     import and the probe never run on the CI runner."""
     if not sys.platform.startswith("win"):
         return None
+    if _GetSystemTimes is None:
+        return None
     try:
-        import ctypes
-
-        class _FT(ctypes.Structure):
-            _fields_ = [("low", ctypes.c_uint32), ("high", ctypes.c_uint32)]
-
         def _get() -> tuple[int, int, int]:
             idle, kern, user = _FT(), _FT(), _FT()
-            ctypes.windll.kernel32.GetSystemTimes(  # type: ignore[attr-defined]
-                ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user))
+            _GetSystemTimes(ctypes.byref(idle), ctypes.byref(kern), ctypes.byref(user))
             def v(ft): return (ft.high << 32) | ft.low
             return v(idle), v(kern), v(user)
         i0, k0, u0 = _get()

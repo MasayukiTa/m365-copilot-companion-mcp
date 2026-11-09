@@ -404,6 +404,7 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/fleet_tombstone.py::remove_tombstone": ("deliberate", "docs/unreached_burndown.md"),
     "relay/fleet_tombstone.py::tombstone_reason": ("deliberate", "docs/unreached_burndown.md"),
     "relay/fleet_tombstone.py::tombstoned_jids": ("deliberate", "docs/unreached_burndown.md"),
+
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.

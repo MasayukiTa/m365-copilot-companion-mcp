@@ -468,6 +468,104 @@ _BOOT_PID = os.getpid()
 _BOOT_TS = time.time()
 
 
+# /HEALTH HAS ITS OWN SMALL THREAD POOL, SEPARATE FROM asyncio's DEFAULT EXECUTOR.
+#
+# The sub-probes below (_server_identity, _auth_stats_summary, ...) were each run with
+# asyncio.to_thread, which dispatches onto the loop's DEFAULT ThreadPoolExecutor -- the SAME
+# pool that runs tool bodies (pwsh_exec, find_files, run_python, ...). Measured 2026-11-04:
+# a single pwsh_exec held a pool slot for 150s+ while find_files/shell_exec/run_python piled
+# up behind it, so /health's to_thread calls could not get a worker and the liveness probe
+# itself timed out (8-12 consecutive >4s timeouts). The fleet send-gate reads /health to
+# decide readiness, so every worker fell into `token_wait` ("waiting for token") even though
+# the server, Edge CDP :9222 and port 8000 were all up -- a slow /health was misread as a
+# dead server.
+#
+# Fix: give /health a dedicated, tiny pool so a saturated tool pool can never starve the
+# liveness probe, and bound the WHOLE set of sub-probes with one short deadline. If the
+# deadline passes, return the minimal liveness answer plus whatever probes already finished
+# -- the probe stays fast and truthful instead of hanging.
+import concurrent.futures as _futures
+
+_HEALTH_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health")
+
+#: Whole-of-sub-probes budget for one /health call. Past this we answer with what we have.
+_HEALTH_PROBE_BUDGET_S = float(os.environ.get("MCP_HEALTH_PROBE_BUDGET_S", "2.0"))
+
+
+async def _gather_health_probes(probes):
+    """Run each zero-arg probe in the DEDICATED /health pool, in parallel, under one shared
+    deadline (_HEALTH_PROBE_BUDGET_S). Returns a merged dict of the results that finished in
+    time; a probe that is slow, raises, or returns a non-dict simply contributes nothing.
+    Never raises -- liveness must not become a 500 or a hang because a probe misbehaved."""
+    loop = asyncio.get_running_loop()
+    out = {}
+    futs = []
+    for fn in probes:
+        try:
+            futs.append(loop.run_in_executor(_HEALTH_POOL, fn))
+        except Exception:
+            pass
+    if not futs:
+        return out
+    try:
+        done, pending = await asyncio.wait(futs, timeout=_HEALTH_PROBE_BUDGET_S)
+    except Exception:
+        return out
+    for f in done:
+        try:
+            r = f.result()
+            if isinstance(r, dict):
+                out.update(r)
+        except Exception:
+            pass
+    # BUSY MUST BE A CLEAR ANSWER, NOT A SILENT PARTIAL. When the budget expires with probes
+    # still running, merging only what finished is indistinguishable, to a client, from a
+    # healthy full answer. Under the sustained CPU saturation that caused this incident that
+    # silent-partial reply is what let the fleet send-gate keep treating a starved server as
+    # fine until it finally dropped the connection. Now the reply SAYS it is degraded and HOW
+    # MANY probes did not finish, so a caller (fleet gate, cockpit, muse) sees a truthful busy
+    # signal instead of a dropped or misleading one -- while /health still answers fast because
+    # we never wait past the budget.
+    #
+    # And we CANCEL stragglers rather than leave them pinning the tiny 4-slot health pool: a
+    # future still QUEUED (never started) is cancelled outright, freeing its slot for the next
+    # /health poll a second later. One already RUNNING cannot be force-killed (a thread is not
+    # cancellable mid-call), so it is left to finish on its own, but it no longer blocks the
+    # ANSWER. This keeps the pool from staying starved poll after poll while heavy tool work
+    # saturates CPU.
+    #
+    # IMPORTANT: a probe can finish in the microsecond between the budget expiring and this
+    # loop running. future.cancel() returns False for it (already done), and we must HARVEST
+    # its result rather than drop it -- otherwise, under the exact CPU saturation this fix is
+    # for, a fast probe that lands a hair late would vanish from the reply. A probe still
+    # genuinely unfinished (queued or running) is what makes the answer DEGRADED, and we report
+    # HOW MANY did not finish so the caller (fleet gate, cockpit, muse) sees a truthful busy
+    # signal instead of a dropped or misleading one.
+    if pending:
+        unfinished = 0
+        for f in pending:
+            if f.done() and not f.cancelled():
+                # Finished just after the budget -- keep its result, it is not a straggler.
+                try:
+                    r = f.result()
+                    if isinstance(r, dict):
+                        out.update(r)
+                except Exception:
+                    pass
+                continue
+            # Truly unfinished: try to free its slot (succeeds only if never started), and
+            # count it as a probe that did not finish in time.
+            try:
+                f.cancel()
+            except Exception:
+                pass
+            unfinished += 1
+        if unfinished:
+            out["health_degraded"] = True
+            out["health_probes_pending"] = unfinished
+    return out
+
+
 #: Answer cached for this long. /health is polled about once a second by the cockpit and by
 #: the supervisor, and the answer can only change when a watched file is written -- so asking
 #: the filesystem every time would be work nobody reads.
@@ -653,26 +751,30 @@ async def health(request: Request) -> JSONResponse:
     #
     # The decision itself is scripts/stale_server_check.classify_staleness -- pure and
     # pytest-covered -- so this cannot drift from what those tests assert.
-    payload.update(await asyncio.to_thread(_server_identity))
-    payload.update(await asyncio.to_thread(_auth_stats_summary))
-    # doctor's own negative probe, counted apart from auth_fail_10m (see _SELF_TEST_TRACKER).
-    payload.update(await asyncio.to_thread(_self_test_summary))
-    payload.update(await asyncio.to_thread(_tool_probe_summary))
-    # THREE FIELDS ONLY, FROM THE HOST-LOG ANALYZER (relay.tunnel_channels). Counts of
-    # forwarded channels, no_response and remote_closed_early seen in the last 10 minutes,
-    # read from .setup/logs/tunnel_channels.jsonl. -1 for each when that file is absent.
-    payload.update(await asyncio.to_thread(_tunnel_channels_summary))
-    # TWO TOOL PATHS, TWO FIELDS. tool_ok comes from the BRIDGE's idle self-probe and says
-    # nothing about the fleet; on 2026-09-16 it was red -- truthfully -- while fleet workers
-    # made 84 successful tool calls in an hour and a goal finished DONE. Anything that read
-    # tool_ok as "tool access" was reading one path of four. fleet_tool_ok is the other
-    # busy path, derived from the ledger of real calls rather than from a probe, and its
-    # None means "no calls lately", which is not a failure.
+    # uptime is pure arithmetic on an import-time constant: it costs nothing and lets a caller
+    # tell "answered but slow" (probes dropped) from "answered instantly" without a probe.
+    payload["server_uptime_s"] = round(time.time() - _BOOT_TS, 1)
+    # ALL heavy sub-probes run in the DEDICATED health pool under ONE short deadline, so a
+    # saturated default/tool executor can no longer starve liveness (see _gather_health_probes).
+    _probes = [_server_identity, _auth_stats_summary, _self_test_summary,
+               _tool_probe_summary, _tunnel_channels_summary]
     try:
         from tools.fleet_tool_health import get_summary as _fleet_tool_summary
-        payload.update(await asyncio.to_thread(_fleet_tool_summary))
+        _probes.append(_fleet_tool_summary)
     except Exception:
         pass
+    # Run every heavy sub-probe in the dedicated _HEALTH_POOL under the shared deadline and
+    # merge whatever finished in time. A saturated default/tool pool can no longer starve or
+    # hang this: past the budget we answer with the minimal liveness fields already set above
+    # plus the probes that returned, so a client always gets a clear answer, never a drop.
+    payload.update(await _gather_health_probes(_probes))
+    # NOTE: fleet_tool_health.get_summary (fleet_tool_ok / tool_ok) is one of the probes in
+    # the _probes list above, so it now runs in the dedicated health pool under the shared
+    # deadline like the rest. tool_ok comes from the BRIDGE's idle self-probe and says nothing
+    # about the fleet; fleet_tool_ok is the ledger-derived busy path, and its None means "no
+    # calls lately", not a failure. Both are best-effort: if the pool is saturated past the
+    # budget they are simply absent from this reply rather than hanging it.
+    #
     # Response-delivery telemetry rollup over the last 10 minutes (tools/response_telemetry.py):
     # resp_total_10m, resp_client_gone_10m, resp_short_10m. In-memory ring read, never raises,
     # so this stays a non-blocking probe. Surfaces the muse 'response cut mid-stream' signal to
@@ -1617,6 +1719,17 @@ def _install_faulthandler() -> None:
         dump_dir = Path(__file__).resolve().parent / ".fleet"
         dump_dir.mkdir(parents=True, exist_ok=True)
         dump_path = dump_dir / "faulthandler.log"
+        # SEPARATE FILE FOR THE CRASH DUMP. faulthandler.enable() fires from whatever thread
+        # takes the fatal signal (an access violation in a C extension, a heap corruption in
+        # ntdll), and dump_traceback_later() fires from its own watchdog thread every 5 min.
+        # faulthandler takes no lock between the two, so when a crash lands WHILE the periodic
+        # watchdog is mid-write to the same handle, the two dumps interleave byte-for-byte and
+        # the one dump that matters -- the crash -- becomes unreadable (observed 2026-11-07:
+        # the 0xc0000374 crash dump was shredded through the periodic heartbeat, e.g.
+        # 'File "C:\\Users\\...\\ProgramsWindows fatal exception: code 0xc0000374').
+        # Giving enable() its own handle keeps the crash trace whole regardless of the
+        # heartbeat; two distinct OS file objects never interleave each other's writes.
+        crash_path = dump_dir / "faulthandler-crash.log"
 
         # ROTATE. Every thread's stack, every five minutes, appended for ever: the file was
         # found at 51.8 MB, and it had no end. On a machine whose disk floor is measured in
@@ -1626,32 +1739,41 @@ def _install_faulthandler() -> None:
         #
         # One generation is kept. The value of these dumps is the recent ones: a wedge is
         # diagnosed from the last few heartbeats, not from a fortnight of healthy ones.
-        try:
-            cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
-            if dump_path.exists() and dump_path.stat().st_size > cap:
-                previous = dump_path.with_suffix(".log.1")
-                if previous.exists():
-                    previous.unlink()
-                dump_path.rename(previous)
-        except Exception:
-            pass
+        def _rotate(path: "Path", cap: int) -> None:
+            try:
+                if path.exists() and path.stat().st_size > cap:
+                    previous = path.with_suffix(".log.1")
+                    if previous.exists():
+                        previous.unlink()
+                    path.rename(previous)
+            except Exception:
+                pass
 
-        # Keep a handle open for the lifetime of the process (faulthandler writes to it).
+        cap = int(os.environ.get("MCP_FAULTHANDLER_MAX_BYTES", str(8 * 1024 * 1024)))
+        _rotate(dump_path, cap)
+        _rotate(crash_path, cap)
+
+        # Keep a handle open for each file for the lifetime of the process (faulthandler
+        # writes to them). The crash handle backs enable(); the periodic handle backs
+        # dump_traceback_later(). They are DISTINCT so the two never interleave.
+        _crash_fh = open(crash_path, "a", encoding="utf-8", buffering=1)
+        faulthandler.enable(file=_crash_fh)
         _fh = open(dump_path, "a", encoding="utf-8", buffering=1)
-        faulthandler.enable(file=_fh)
         # Every 5 min, dump all thread stacks. On a healthy server this is just a periodic
         # heartbeat; when the loop is stuck the dump shows exactly which tool is blocking.
         faulthandler.dump_traceback_later(
             300, repeat=True, file=_fh, exit=False
         )
-        # Keep a module-global ref so the file object isn't garbage-collected.
-        global _FAULTHANDLER_FILE
+        # Keep module-global refs so the file objects aren't garbage-collected.
+        global _FAULTHANDLER_FILE, _FAULTHANDLER_CRASH_FILE
         _FAULTHANDLER_FILE = _fh
+        _FAULTHANDLER_CRASH_FILE = _crash_fh
     except Exception:
         pass
 
 
 _FAULTHANDLER_FILE = None
+_FAULTHANDLER_CRASH_FILE = None
 
 
 def _start_approval_watcher(period: float = 3.0) -> None:

@@ -77,7 +77,15 @@ def acquire_side_driver(label, agent_url, *, hold_name, turn_timeout_s, frame_ti
         # CREATION GATE: a conversation created while the MCP server is unreachable stays
         # without the connector tools for its whole life (relay/mcp_ready.py). The reviewer
         # reads files through those tools, so it waits for the same gate a worker does.
-        why = (gate or mcp_ready.gate()).reason()
+        # CONNECTOR-LESS ROUTE SKIPS THIS GATE (same reason as relay_fleet._mcp_gate_blocked): there is
+        # no connector to bind, tool calls go through the gateway, and a slow /health under load
+        # held every reviewer for 30+ minutes on 2026-11-04.
+        try:
+            from relay import tool_bridge
+            _bridged = tool_bridge.is_bridge()
+        except Exception:
+            _bridged = False
+        why = "" if _bridged else (gate or mcp_ready.gate()).reason()
         if why:
             return None, held(why)
 

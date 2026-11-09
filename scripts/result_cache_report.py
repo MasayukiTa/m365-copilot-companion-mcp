@@ -40,6 +40,7 @@ interval range; they are not a measured optimum. Anything else is INSUFFICIENT a
 requirements are listed.
 
   python scripts/result_cache_report.py [--fleet-dir .fleet] [--format text|json]
+      [--tool NAME ...]
 """
 from __future__ import annotations
 
@@ -56,6 +57,15 @@ MIN_RUNS = 3
 MIN_HITS = 20
 DIFFER_UNSAFE = 0.05
 HIT_WORTH = 0.05
+
+# K3 serving allowlist. Only tools whose repeated read-only results are reproducible when the
+# pre-call fingerprint (file mtime_ns and size) is unchanged belong here. Per the shadow data,
+# read_file and list_directory show 0 differed among fingerprint-equal hits; file_metadata does
+# not (it differs even when mtime_ns/size match), so it is excluded. Serving is still gated on an
+# equal pre-call fingerprint, never on arguments alone.
+SERVE_ALLOWLIST = ("list_directory", "read_file")
+SERVE_REQUIRE_FP = True
+
 
 INSUFFICIENT, NOTHING_TO_GAIN, UNSAFE_TO_SERVE, WORTH_A_SERVING_TEST = (
     "INSUFFICIENT", "NOTHING_TO_GAIN", "UNSAFE_TO_SERVE", "WORTH_A_SERVING_TEST")
@@ -123,6 +133,38 @@ def summarise(rows):
             "last_ts": max(ts) if ts else None}
 
 
+def allowlist_summary(rows, allowlist=SERVE_ALLOWLIST, require_fp=SERVE_REQUIRE_FP):
+    """Re-score the differed share over only the hits a cache would be ALLOWED to serve:
+    the tool is in the allowlist and (when require_fp) the pre-call fingerprint equalled the
+    earlier one. Returns overall and per-tool counts. Reads only; never serves."""
+    def _fp_equal(r):
+        fp = r.get("fingerprint")
+        return (isinstance(fp, dict) and bool(fp)
+                and fp == r.get("previous_fingerprint"))
+    by_tool = {}
+    served = differed = 0
+    for r in rows:
+        if not r.get("read_only", True) or not r.get("hit"):
+            continue
+        tool = str(r.get("tool") or "")
+        if tool not in allowlist:
+            continue
+        if require_fp and not _fp_equal(r):
+            continue
+        e = by_tool.setdefault(tool, {"served": 0, "differed": 0})
+        e["served"] += 1
+        served += 1
+        if r.get("differed"):
+            e["differed"] += 1
+            differed += 1
+    for e in by_tool.values():
+        e["differed_share"] = _share(e["differed"], e["served"])
+    return {"allowlist": list(allowlist), "require_fp": bool(require_fp),
+            "served": served, "differed": differed,
+            "differed_share": _share(differed, served),
+            "by_tool": dict(sorted(by_tool.items()))}
+
+
 def verdict(s):
     """(label, [unmet requirements]) from a summary."""
     unmet = []
@@ -188,11 +230,19 @@ def main(argv=None):
     ap.add_argument("--same-fingerprint", action="store_true",
                     help="compare only hits with two available, equal pre-call fingerprints")
     ap.add_argument("--by-tool", action="store_true", help="show per-tool comparison rates")
+    ap.add_argument("--tool", action="append", default=None, metavar="NAME",
+                    help="include only this exact tool name; repeat to include multiple tools")
+    ap.add_argument("--allowlist", action="store_true",
+                    help="differed share over only hits a cache would be allowed to serve "
+                         "(allowlisted tool and equal pre-call fingerprint)")
     args = ap.parse_args(argv)
     # Resolved here, not as a module constant: nothing in this script writes, and a module-level
     # path to the live record directory would have to be classified by the isolation guard.
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     rows, bad = read_rows(os.path.join(fleet_dir, LOG_NAME))
+    if args.tool is not None:
+        selected = set(args.tool)
+        rows = [row for row in rows if row.get("tool") in selected]
     if args.same_fingerprint:
         pairs = [r for r in rows if r.get("read_only", True) and r.get("hit")
                  and isinstance(r.get("fingerprint"), dict) and r["fingerprint"]
@@ -211,25 +261,52 @@ def main(argv=None):
                    "differed_share": _share(differed, len(pairs)), "unreadable": bad}
         if args.by_tool:
             summary["by_tool"] = dict(sorted(by_tool.items()))
+        if args.tool is not None:
+            summary["selected_tools"] = sorted(selected)
         if args.format == "json":
             text = json.dumps(summary, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
         else:
             text = ("Same pre-call fingerprint: %d pairs, %d differed (%s).\n"
                     "Metadata fingerprints are incomplete and do not prove unchanged state or safe serving.\n"
                     % (len(pairs), differed, _pct(summary["differed_share"])))
+            if args.tool is not None:
+                text = "Selected tools: %s\n\n" % ", ".join(sorted(selected)) + text
             if args.by_tool:
                 for name, item in sorted(by_tool.items()):
                     text += "- %s: %d pairs, %d differed (%s)\n" % (
                         name, item["pairs"], item["differed"], _pct(item["differed_share"]))
         sys.stdout.write(text)
         return 0
+    if args.allowlist:
+        a = allowlist_summary(rows)
+        if args.format == "json":
+            sys.stdout.write(json.dumps({"allowlist_summary": a, "unreadable": bad},
+                                        ensure_ascii=False, indent=2, sort_keys=True) + "\n")
+        else:
+            lines = ["Allowlist serving (allowlisted tool and equal pre-call fingerprint):",
+                     "- allowlist: %s; fingerprint required: %s"
+                     % (", ".join(a["allowlist"]), a["require_fp"]),
+                     "- served: %d; differed: %d (%s)"
+                     % (a["served"], a["differed"], _pct(a["differed_share"]))]
+            for name, e in a["by_tool"].items():
+                lines.append("- %s: %d served, %d differed (%s)"
+                             % (name, e["served"], e["differed"], _pct(e["differed_share"])))
+            lines.append("A fingerprint equal on mtime_ns and size does not prove unchanged "
+                         "content; this bounds, not proves, safe serving.")
+            sys.stdout.write("\n".join(lines) + "\n")
+        return 0
     s = summarise(rows)
     label, unmet = verdict(s)
     if args.format == "json":
-        text = json.dumps({"summary": s, "verdict": label, "unmet": unmet, "unreadable": bad},
+        result = {"summary": s, "verdict": label, "unmet": unmet, "unreadable": bad}
+        if args.tool is not None:
+            result["selected_tools"] = sorted(selected)
+        text = json.dumps(result,
                           ensure_ascii=False, indent=2, sort_keys=True) + "\n"
     else:
         text = render(s, label, unmet, bad)
+        if args.tool is not None:
+            text = "Selected tools: %s\n\n" % ", ".join(sorted(selected)) + text
     try:
         sys.stdout.write(text)
     except UnicodeEncodeError:

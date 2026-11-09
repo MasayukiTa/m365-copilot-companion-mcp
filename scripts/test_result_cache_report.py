@@ -13,6 +13,55 @@ if REPO not in sys.path:
 from scripts import result_cache_report as R  # noqa: E402
 
 
+def test_allowlist_serves_only_allowlisted_tools_with_equal_fingerprint():
+    fp = {"kind": "file", "mtime_ns": 1, "size": 4}
+    # read_file: equal fingerprint, result unchanged -> served, not differed
+    rf_ok = dict(_row(1, tool="read_file", hit=True), fingerprint=fp, previous_fingerprint=fp)
+    # read_file: fingerprint changed -> not served at all (excluded from denominator)
+    rf_changed = dict(_row(2, tool="read_file", hit=True, differed=True),
+                      fingerprint=dict(fp, size=5), previous_fingerprint=fp)
+    # list_directory: equal fingerprint, unchanged -> served
+    ld_ok = dict(_row(3, tool="list_directory", hit=True), fingerprint=fp, previous_fingerprint=fp)
+    # file_metadata: equal fingerprint but differs -> NOT allowlisted, excluded
+    fm = dict(_row(4, tool="file_metadata", hit=True, differed=True),
+              fingerprint=fp, previous_fingerprint=fp)
+    a = R.allowlist_summary([rf_ok, rf_changed, ld_ok, fm])
+    assert a["served"] == 2 and a["differed"] == 0 and a["differed_share"] == 0.0
+    assert set(a["by_tool"]) == {"read_file", "list_directory"}
+    assert a["by_tool"]["read_file"]["served"] == 1
+    assert "file_metadata" not in a["by_tool"]
+
+
+def test_allowlist_counts_a_differed_served_hit_when_fingerprint_equal():
+    fp = {"kind": "file", "mtime_ns": 7, "size": 9}
+    # an allowlisted tool whose fingerprint matched yet the result differed is counted differed
+    bad = dict(_row(1, tool="read_file", hit=True, differed=True),
+               fingerprint=fp, previous_fingerprint=fp)
+    a = R.allowlist_summary([bad])
+    assert a["served"] == 1 and a["differed"] == 1 and a["differed_share"] == 1.0
+
+
+def test_allowlist_requires_a_fingerprint_pair_not_arguments_alone():
+    # a hit with no fingerprint is never served, even for an allowlisted tool
+    legacy = _row(1, tool="read_file", hit=True, differed=True)
+    a = R.allowlist_summary([legacy])
+    assert a["served"] == 0 and a["differed_share"] is None
+
+
+def test_main_allowlist_branch_prints_both_formats(tmp_path, capsys):
+    import json as _json
+    fp = {"kind": "file", "mtime_ns": 1, "size": 4}
+    served = dict(_row(1, tool="read_file", hit=True), fingerprint=fp, previous_fingerprint=fp)
+    fleet = str(tmp_path / "fleet")
+    _write(fleet, [served])
+    assert R.main(["--fleet-dir", fleet, "--allowlist", "--format", "json"]) == 0
+    out = _json.loads(capsys.readouterr().out)
+    assert out["allowlist_summary"]["served"] == 1
+    assert out["allowlist_summary"]["differed"] == 0
+    assert R.main(["--fleet-dir", fleet, "--allowlist"]) == 0
+    text = capsys.readouterr().out
+    assert "Allowlist serving" in text and "read_file" in text
+
 def test_same_fingerprint_pairs_exclude_changed_and_legacy_rows(tmp_path, capsys):
     base = _row(1, hit=True)
     fp = {"kind": "file", "mtime_ns": 1, "size": 4}
@@ -128,6 +177,23 @@ def test_main_reads_only_and_prints_both_formats(tmp_path, capsys):
     out = json.loads(capsys.readouterr().out)
     assert out["verdict"] == "INSUFFICIENT" and out["summary"]["rows"] == 3
     assert os.path.getsize(p) == before and sorted(os.listdir(fleet)) == [R.LOG_NAME]
+
+
+def test_tool_filter_changes_verdict_and_applies_sample_thresholds(tmp_path, capsys):
+    rows = _enough(4) + [dict(r, tool="list_directory", differed=r["hit"], matched=False)
+                         for r in _enough(4)]
+    _write(str(tmp_path), rows)
+    R.main(["--fleet-dir", str(tmp_path), "--format", "json"])
+    assert json.loads(capsys.readouterr().out)["verdict"] == R.UNSAFE_TO_SERVE
+    R.main(["--fleet-dir", str(tmp_path), "--format", "json", "--tool", "read_file"])
+    result = json.loads(capsys.readouterr().out)
+    assert result["verdict"] == R.WORTH_A_SERVING_TEST
+    assert result["summary"]["calls"] == 200 and result["selected_tools"] == ["read_file"]
+    R.main(["--fleet-dir", str(tmp_path), "--format", "json", "--tool", "unknown"])
+    assert json.loads(capsys.readouterr().out)["verdict"] == R.INSUFFICIENT
+    R.main(["--fleet-dir", str(tmp_path), "--tool", "read_file", "--tool", "list_directory"])
+    text = capsys.readouterr().out
+    assert "Selected tools: list_directory, read_file" in text and R.UNSAFE_TO_SERVE in text
 
 
 def test_the_report_and_the_recorder_agree_on_the_file_name():

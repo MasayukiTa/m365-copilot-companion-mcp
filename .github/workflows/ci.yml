@@ -12,11 +12,13 @@
 #       backslash semantics that do not match pathlib on Linux.
 #
 # NOTE ON LINUX PORTABILITY:
-#   relay/relay_fleet.py uses ctypes.windll.kernel32.GlobalMemoryStatusEx, but
-#   only inside avail_phys_mb() wrapped in try/except (falls back to 4096 MB).
-#   The hermetic tests all monkeypatch that function, so the fallback is never
-#   even reached. pywin32 has a sys_platform=="win32" marker in mcp's metadata,
-#   so it is not installed on Linux.
+#   relay/relay_fleet.py calls GlobalMemoryStatusEx inside avail_phys_mb(), but the
+#   handle is pre-bound only when os.name == "nt" and is None elsewhere, so on Linux
+#   the function falls back to 4096 MB without touching the WinAPI. The hermetic tests
+#   mostly monkeypatch that function; test_memstatus_ctypes_threadsafe.py exercises the
+#   Linux fallback path directly and asserts on source shape, never the native call.
+#   pywin32 has a sys_platform=="win32" marker in mcp's metadata, so it is not installed
+#   on Linux.
 
 name: CI
 
@@ -148,6 +150,8 @@ jobs:
             relay/test_goal_during_cleanup_window.py \
             relay/test_auto_rephrase_continue.py \
             scripts/test_status_tool_does_not_mislead.py \
+            scripts/test_health_probe_isolation.py \
+            scripts/test_health_busy_signal.py \
             tools/test_one_settings_file_for_every_context.py \
             tools/test_a_setting_declares_when_it_takes_effect.py \
             tools/test_a_search_walk_is_bounded_in_depth_and_time.py \
@@ -264,6 +268,7 @@ jobs:
             relay/test_socket_tools.py \
             relay/test_first_turn_preflight.py \
             relay/test_token_prestart.py \
+            relay/ops_db/test_ops_db_stage1.py \
             relay/test_batching_rule_in_prompt.py \
             relay/test_tool_bridge.py \
             relay/test_tool_bridge_wiring.py \
@@ -288,6 +293,7 @@ jobs:
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
             relay/test_fleet_tombstone.py \
+            relay/test_fleet_close_descendants.py \
             relay/test_desktop_guard.py \
             relay/test_every_intake_route_leaves_one_receipt.py \
             relay/test_fanout_family_view.py \
@@ -464,6 +470,8 @@ jobs:
             tools/test_no_window_opens_on_the_operators_desktop_during_a_test.py \
             tools/test_a_completion_marker_is_not_an_output_contract.py \
             tools/test_a_deck_the_agent_wrote_says_so.py \
+            tools/test_pptx_export_png_does_not_quit_powerpoint.py \
+            tools/test_pptx_export_png_closes_only_its_own_document.py \
             tools/test_pptx_inherits_reference_template.py \
             tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
@@ -499,6 +507,7 @@ jobs:
             tools/test_security.py \
             tools/test_python_gate.py \
             tools/test_powershell_hardening.py \
+            tools/test_shell_exec_eqpath_guard.py \
             tools/test_approval_policy.py \
             tools/test_bypass_never_asks.py \
             tools/test_layer1_security.py \
@@ -683,6 +692,7 @@ jobs:
             relay/test_settle_replay.py \
             relay/test_settle_trace_collect.py \
             relay/test_settle_collect.py \
+            relay/test_shell_exec_eqpath_guard.py \
             relay/test_soak.py \
             relay/test_solve_policy.py \
             relay/test_skills.py \
@@ -906,6 +916,7 @@ jobs:
             relay/selfimprove/test_archive_publish_guard.py \
             relay/selfimprove/test_run_archive.py \
             relay/test_fleet_ram_floor.py \
+            relay/test_memstatus_ctypes_threadsafe.py \
             relay/selfimprove/test_pending.py \
             relay/selfimprove/test_a_card_whose_premise_is_gone_says_so.py \
             relay/selfimprove/test_memory_population.py \
@@ -966,6 +977,7 @@ jobs:
             relay/test_refuter_evidence_handoff.py \
             relay/test_fleet_retention.py \
             relay/test_completed_jobs_move_to_archive_then_leave_history.py \
+            relay/test_history_archive_stamps_the_clear_watermark.py \
             relay/test_disk_series.py \
             relay/test_conversation_registry_keeps_listable_rows.py \
             relay/test_temp_home.py \
