@@ -7,6 +7,13 @@ installed engine's own claim loader and compares the claim's column names agains
 header of the data_location file, and returns the engine's exact messages (unknown key paths,
 the load_claim messages, and the missing columns together with the columns that do exist).
 
+It also runs a DESIGN preflight that never reads the response column: it counts how many lots
+each exposure group has in each shared stratum (product), using build_stratum_counts, and adds
+a problem when the claim's own design cannot support a within-stratum contrast -- no stratifier
+column is present at all, or no stratum is shared by both groups with enough lots. This only
+ever ADDS problems (tightens the gate); it never clears one, and it opens only the stratifier
+and unit columns, never the response.
+
 It is deliberately a standalone script: judge_gate runs it in a separate interpreter with the
 engine root on sys.path so importing the frozen engine never perturbs the harness process. It
 reads only; it never writes to or edits anything under the engine root or the data file.
@@ -21,7 +28,8 @@ def check(claim, data_location, engine_claim):
     """Return the engine's own problem messages for ``claim`` against ``data_location``.
 
     ``engine_claim`` is the frozen engine's ``validity.claim`` module. An empty list means the
-    claim loads and every column it names exists in the data file.
+    claim loads, every column it names exists in the data file, and the design can support a
+    within-stratum contrast.
     """
     problems = []
     unknown = engine_claim.unknown_key_paths(claim)
@@ -41,6 +49,51 @@ def check(claim, data_location, engine_claim):
             if col and col not in columns:
                 problems.append("%s.%s = %r is not a column of the data file; columns are %s"
                                 % (section, key, col, columns))
+    problems.extend(_design_problems(claim, data_location))
+    return problems
+
+
+def _design_problems(claim, data_location):
+    """Design-preflight messages, or [] when the design axis cannot be evaluated.
+
+    Counts lots per exposure group per shared stratum without ever reading the response column,
+    and reports the two ways the design is empty before any analysis runs: no stratifier column
+    exists to hold the groups apart, or no stratum is shared by both groups with at least the
+    minimum number of lots. A design that cannot be read at all (adapter unavailable, file
+    unreadable) is NOT a worker-fixable problem, so this returns [] rather than a spurious
+    correction -- the same rule the engine preflight uses for an unavailable engine.
+    """
+    try:
+        repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        if repo_root not in sys.path:
+            sys.path.insert(0, repo_root)
+        from relay.design_stratum_counts import (build_stratum_counts, shared_stratum_summary,
+                                                  K_MIN_LOTS)
+    except Exception:
+        return []
+    try:
+        result = build_stratum_counts(claim, data_location)
+    except Exception:
+        return []
+    if result.get("response_column_read"):
+        # Defensive: the adapter must never read the response. If it ever reports that it did,
+        # refuse to turn that reading into a verdict.
+        return []
+    strat_cols = result.get("stratifier_columns") or []
+    if not strat_cols:
+        return ["design: no stratifier column is present, so the two exposure groups cannot be "
+                "compared within a shared stratum; add a stratifier (e.g. product) column"]
+    problems = []
+    for col in strat_cols:
+        counts = result.get("counts", {}).get(col, {})
+        summary = shared_stratum_summary(counts, k_min=K_MIN_LOTS)
+        if summary.get("shared_strata_meeting_k_min", 0) < 1:
+            problems.append(
+                "design: stratifier %r has no stratum shared by both groups with at least %d "
+                "lots each (shared strata: %d, meeting the minimum: %d), so there is no "
+                "within-stratum contrast to judge"
+                % (col, summary.get("k_min", K_MIN_LOTS), summary.get("shared_strata", 0),
+                   summary.get("shared_strata_meeting_k_min", 0)))
     return problems
 
 
