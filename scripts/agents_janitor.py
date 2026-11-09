@@ -41,7 +41,19 @@ import subprocess
 import sys
 import time
 
-from tools import childproc
+# RUN AS A SCRIPT, NOT ONLY UNDER PYTEST. The supervisor runs this file as
+# `python scripts/agents_janitor.py` (scripts/supervisor.ps1, Invoke-AgentsJanitorSweep),
+# so sys.path[0] is the scripts/ directory and the repo root is NOT on sys.path -- the
+# bare `from tools import childproc` below then raises ModuleNotFoundError and the whole
+# sweep is error output (measured 2026-11-10). pytest happens to put the repo root on
+# sys.path, which is why the unit tests never caught it. Insert the repo root (the parent
+# of this scripts/ directory) at the front of sys.path before importing tools, so the
+# import resolves the same way whether this is run as a script or imported under pytest.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+
+from tools import childproc  # noqa: E402  (sys.path is fixed up just above)
 
 
 #: Folders that are shared infrastructure, not disposable worker clones. The janitor NEVER

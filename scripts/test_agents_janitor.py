@@ -247,5 +247,37 @@ def test_apply_keeps_a_dirty_clone(tmp_path):
     assert os.path.isdir(clone), "apply must never delete uncommitted work"
 
 
+def test_runs_as_a_script_from_another_cwd(tmp_path):
+    """The supervisor runs this file as `python scripts/agents_janitor.py` with the working
+    directory and sys.path[0] = scripts/ (scripts/supervisor.ps1, Invoke-AgentsJanitorSweep).
+    In that shape the repo root is NOT on sys.path, so a bare `from tools import childproc`
+    raised ModuleNotFoundError and the whole sweep was error output (measured 2026-11-10);
+    pytest hid it because it puts the repo root on sys.path. This runs the script the way the
+    supervisor does -- a dry run, in a subprocess, with -I (ignore env/user site, so the only
+    thing that can make `tools` importable is the fix in the script itself) and -X utf8, from a
+    DIFFERENT working directory -- and asserts it exits 0 and prints the DRY-RUN line.
+
+    The agents root is pointed at an empty tmp dir via --root so the script does not walk the
+    real agents directory, keeping the test hermetic and fast. No Windows-only assumptions: the
+    script, the flags and the paths all behave the same on the Linux CI runner.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(aj.__file__)))
+    script = os.path.join(repo_root, "scripts", "agents_janitor.py")
+    empty_root = tmp_path / "agents_empty"
+    empty_root.mkdir()
+    other_cwd = tmp_path / "elsewhere"
+    other_cwd.mkdir()
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    r = childproc.run(
+        [sys.executable, "-I", "-X", "utf8", script, "--root", str(empty_root)],
+        capture_output=True, cwd=str(other_cwd), env=env, timeout=120,
+    )
+    out = (r.stdout or "") + (r.stderr or "")
+    assert r.returncode == 0, out
+    assert "[agents-janitor] DRY-RUN" in out, out
+    assert "ModuleNotFoundError" not in out, out
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-q"]))
