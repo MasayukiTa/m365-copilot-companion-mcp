@@ -3205,6 +3205,91 @@ def _recovery_step(attempt, progressed, max_recover, base_s=30.0, cap_s=600.0):
     return (attempt, min(float(cap_s), float(base_s) * (2 ** min(over, 16))), False)
 
 
+class RecoveryTimeout(Exception):
+    """A recovery step (CDP probe / hard reset / reconnect) ran past its own deadline.
+
+    The resume loop's steps are each INDIVIDUALLY bounded -- cdp_alive passes a 5s CDP
+    timeout, hard_reset shells out with subprocess timeout=120, connect_over_cdp is given
+    20s. But those ceilings cover the operation they wrap, NOT the OS-level work underneath:
+    cdp_alive spawns a node driver and opens a pipe to it, and a wedged / paging-storm
+    machine can block in that spawn with no timeout reaching it. The resume loop runs AFTER
+    sweep_active is cleared, so the stall watchdog -- which only arms while a sweep is live --
+    is blind to it; on 2026-11-07 a single such step sat for ~33 hours inside 'attempt 1/3'
+    and nothing wrote status.json or reset anything. This exception is how a step that blows
+    its wall-clock budget becomes a countable recovery failure instead of a silent wedge.
+    """
+
+
+def _run_with_deadline(fn, deadline_s, label="step"):
+    """Run ``fn()`` on a daemon thread and give it at most ``deadline_s`` seconds.
+
+    Returns fn's value if it finishes in time. Raises RecoveryTimeout if it does not, and
+    re-raises fn's own exception if it failed. The worker is a daemon, so a call that never
+    returns (the exact wedge this guards) is abandoned -- it cannot hold the process open and
+    cannot block the resume loop past the deadline. This is the ceiling that the recover path
+    lacked: every ``cdp_alive`` / ``hard_reset`` / ``connect_over_cdp`` the loop makes while
+    the watchdog is disarmed is wrapped in one of these, so no single step can freeze the loop.
+
+    Pure-ish and testable: pass a fn that sleeps to see the timeout, one that returns to see
+    the value, one that raises to see the re-raise.
+    """
+    import threading as _threading
+    box = {}
+
+    def _target():
+        try:
+            box["value"] = fn()
+        except BaseException as exc:          # noqa: BLE001 - carried out and re-raised below
+            box["error"] = exc
+
+    th = _threading.Thread(target=_target, name="recover-%s" % label, daemon=True)
+    th.start()
+    th.join(max(0.0, float(deadline_s)))
+    if th.is_alive():
+        raise RecoveryTimeout("%s exceeded its %.0fs deadline" % (label, float(deadline_s)))
+    if "error" in box:
+        raise box["error"]
+    return box.get("value")
+
+
+#: Wall-clock ceilings for the recover path's steps, each comfortably above the operation's
+#: own internal timeout so a healthy-but-slow machine is not cut off, yet finite so a wedged
+#: one cannot sit forever. cdp_alive internally passes 5s (plus a node-driver spawn); hard_reset
+#: shells out with subprocess timeout=120; connect_over_cdp is given 20s. The deadlines below are
+#: the backstop for the spawn/pipe/OS work those internal timeouts do NOT cover.
+RECOVER_CDP_DEADLINE_S = 30.0
+RECOVER_RESET_DEADLINE_S = 150.0
+RECOVER_CONNECT_DEADLINE_S = 45.0
+
+
+def _recovery_status(started, attempt, max_recover, pending_n, phase,
+                     coordinator_started=None, now=None):
+    """PURE: the status.json payload written DURING recovery, between legs.
+
+    The resume loop used to write status.json only from on_tick -- i.e. only while a sweep was
+    running. Everything between a failed leg and the next successful connect (the cdp probe,
+    the hard reset, the reconnect, any backoff) left the file frozen, so task_router.fleet_is_live
+    read a stale mtime, the cockpit showed the run as simply not advancing, and nothing could tell
+    'recovering' from 'dead'. This payload is stamped around each recover step so the file keeps
+    moving and carries WHY: running stays True (there is work), recovering is True, and the attempt
+    and phase say where in the loop we are. Kept side-effect free so it is unit-testable.
+    """
+    import time as _time
+    t = _time.time() if now is None else now
+    return {
+        "started": started,
+        "updated": t,
+        "coordinator_started": coordinator_started if coordinator_started is not None else started,
+        "running": True,                 # there are pending goals -> the run is not finished
+        "accepting_goals": True,
+        "recovering": True,              # the distinguishing flag: live, but between legs
+        "recover_attempt": int(attempt),
+        "recover_max": int(max_recover),
+        "recover_phase": str(phase),     # 'cdp-probe' | 'hard-reset' | 'reconnect' | 'backoff'
+        "pending_goals": int(pending_n),
+    }
+
+
 COMMANDS_DIR = "commands.d"
 
 #: Where landing receipts go: <state_dir>/acks/<jid>.ack. The same layout relay/task_router's
@@ -5542,6 +5627,33 @@ def main():
     attempt = 0
     _leg_size = [len(pending)]
 
+    def _mark_recovering(phase, pending_n):
+        """Stamp status.json DURING recovery so the file keeps moving between legs.
+
+        Without this the resume loop writes status only from on_tick (sweep-time), and the whole
+        recover window -- probe, reset, reconnect, backoff -- leaves the file frozen. That froze
+        task_router.fleet_is_live on a stale mtime and hid 'recovering' behind what looked like a
+        dead run (2026-11-07). Best-effort: a status write must never take the recover path down."""
+        try:
+            _write_atomic(status_path,
+                          _recovery_status(started, attempt, args.max_recover, pending_n, phase,
+                                           coordinator_started=started))
+        except Exception as _rec_exc:
+            print("[status] WARN: could not stamp recovering status (%s): %s"
+                  % (phase, _rec_exc), flush=True)
+
+    def _guarded(label, fn, deadline_s, phase, pending_n):
+        """Run a recover-path call under a wall-clock deadline, stamping status around it.
+
+        The resume loop runs after sweep_active.clear(), where the stall watchdog is disarmed, so
+        a single blocking cdp_alive / hard_reset / connect_over_cdp would freeze the loop with
+        nothing watching (the 33h wedge of 2026-11-07). Each such call goes through here: status
+        is stamped first so the file moves, then the call is bounded by _run_with_deadline. A
+        RecoveryTimeout is allowed to propagate -- the loop's generic handler counts it as a
+        recovery failure and moves to the next attempt instead of blocking forever."""
+        _mark_recovering(phase, pending_n)
+        return _run_with_deadline(fn, deadline_s, label=label)
+
     def _after_failed_leg(unfinished, what):
         """Count the failure, back off if progress has stopped, and say whether to leave.
 
@@ -5560,18 +5672,43 @@ def main():
                             len(unfinished if unfinished is not None else pending), wait_s)),
                   flush=True)
             deadline = time.time() + wait_s
+            # Stamp the backoff too: a 10-minute wait is a live, deliberate pause, not a wedge --
+            # keep status.json moving so it never looks dead while we are only waiting.
             while time.time() < deadline and not stop_box[0]:
+                _mark_recovering("backoff",
+                                 len(unfinished if unfinished is not None else pending))
                 time.sleep(min(5.0, max(0.0, deadline - time.time())))
         return new_attempt, give_up_flag
 
     while pending:
         _leg_size[0] = len(pending)
-        if not cdp_alive(args.cdp_url):
-            print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
-            hard_reset(port)
+        # EACH PROBE/RESET IS BOUNDED. We are past sweep_active.clear() here, so the stall
+        # watchdog is disarmed; a cdp_alive that blocks in its node-driver spawn, or a hard_reset
+        # whose shell-out never returns, would freeze this loop with nothing watching (the 33h
+        # 'attempt 1/3' wedge of 2026-11-07). _guarded stamps status.json and caps each call; a
+        # RecoveryTimeout falls through to the generic handler, which counts it and retries.
+        try:
+            _alive = _guarded("cdp-probe", lambda: cdp_alive(args.cdp_url),
+                              RECOVER_CDP_DEADLINE_S, "cdp-probe", len(pending))
+            if not _alive:
+                print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
+                _guarded("hard-reset", lambda: hard_reset(port),
+                         RECOVER_RESET_DEADLINE_S, "hard-reset", len(pending))
+        except RecoveryTimeout as _rt:
+            # The probe or the reset blew its wall-clock budget. Treat it exactly like any other
+            # failed recover step: count it, maybe back off, and retry -- never block here.
+            sweep_active.clear()
+            attempt, _give_up = _after_failed_leg(None, "RecoveryTimeout")
+            print(_stamp("\n[recover] %s while (re)connecting; retry (attempt %d/%d)"
+                         % (_rt, attempt, args.max_recover)))
+            if _give_up:
+                break
+            continue
         try:
             with sync_playwright() as p:
-                browser = p.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
+                browser = _guarded("reconnect",
+                                   lambda: p.chromium.connect_over_cdp(args.cdp_url, timeout=20000),
+                                   RECOVER_CONNECT_DEADLINE_S, "reconnect", len(pending))
                 context = browser.contexts[0] if browser.contexts else browser.new_context()
                 # START CLEAN, NOT JUST FINISH CLEAN. run_relay_fleet closes any Copilot page
                 # left over when it ENDS, which stops a run leaving one behind -- and does
@@ -5698,8 +5835,17 @@ def main():
             if _give_up:
                 print(_stamp("[recover] giving up (auto-recover is switched off)"))
                 break
-            if not cdp_alive(args.cdp_url):
-                hard_reset(port)
+            try:
+                if not _guarded("cdp-probe", lambda: cdp_alive(args.cdp_url),
+                                RECOVER_CDP_DEADLINE_S, "cdp-probe", len(pending)):
+                    _guarded("hard-reset", lambda: hard_reset(port),
+                             RECOVER_RESET_DEADLINE_S, "hard-reset", len(pending))
+            except RecoveryTimeout as _rt:
+                # A bounded probe/reset is better than an unbounded one even here: if it times
+                # out, leave the browser as-is and let the next loop iteration re-probe. The
+                # goals are still pending, so no work is lost.
+                print(_stamp("[recover] %s after context loss; leaving reset to next iteration"
+                             % _rt))
         except MalformedCheck as e:
             # A CONFIGURATION ERROR IS NOT A CONNECTION ERROR, whatever route it arrives by.
             # The generic handler below answers every exception with a browser hard reset and
@@ -5720,8 +5866,14 @@ def main():
             # ONLY IF THE BROWSER IS ACTUALLY GONE. A context can be lost because a SIBLING
             # run reset this shared Edge, and resetting it again from here is how one reset
             # becomes a round of them.
-            if not cdp_alive(args.cdp_url):
-                hard_reset(port)
+            try:
+                if not _guarded("cdp-probe", lambda: cdp_alive(args.cdp_url),
+                                RECOVER_CDP_DEADLINE_S, "cdp-probe", len(pending)):
+                    _guarded("hard-reset", lambda: hard_reset(port),
+                             RECOVER_RESET_DEADLINE_S, "hard-reset", len(pending))
+            except RecoveryTimeout as _rt:
+                print(_stamp("[recover] %s after failed connect; leaving reset to next iteration"
+                             % _rt))
 
     stop_wd.set()
 
