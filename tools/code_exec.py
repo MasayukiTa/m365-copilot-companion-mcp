@@ -352,54 +352,62 @@ def _record_judgement(kind, text, req, verdict, mode_name, blocks, human=None):
         pass
 
 
-# From 2026-11-09 17:13 to 17:36, 30 to 46 requests were in flight and
-# outside calls waited 9 to 80 seconds while long polling occupied workers.
-_WAIT = re.compile(
-    r"(?i)(?<![\w-])(?:ping\s+-n\s+(?P<ping>\d+)\s+(?:127\.0\.0\.1|localhost)\b"
-    r"|timeout\s+/t\s+(?P<timeout>\d+)\b|sleep\s+(?P<sleep>\d+)\b"
-    r"|start-sleep\s+(?:-seconds\s+)?(?P<start>\d+)\b)"
+# Refuse any command that kills python.exe by IMAGE NAME. The MCP server, the
+# coordinator and every fleet worker are python.exe, so an image-wide kill drops
+# the whole gateway for minutes. Measured 2026-11-09 (.fleet/tool_events.jsonl):
+# `taskkill /f /im python.exe /t` and `Get-Process python | Stop-Process -Force`
+# each froze the server for about 3 minutes. A PID-scoped kill is fine; only the
+# image-wide form is refused, and the refusal points at the PID-scoped form.
+_PY_IMG = r"python(?:w)?|py"
+_KILL_ALL_PYTHON = re.compile(
+    r"(?i)(?:"
+    # taskkill /IM python.exe  (any order of switches, optional .exe)
+    r"taskkill\b[^\r\n]*?/im\s+(?:" + _PY_IMG + r")(?:\.exe)?\b"
+    # taskkill /FI "IMAGENAME eq python.exe"
+    r"|taskkill\b[^\r\n]*?/fi\s+[\"']?\s*imagename\s+eq\s+(?:" + _PY_IMG + r")(?:\.exe)?\b"
+    # Stop-Process -Name python
+    r"|stop-process\b[^\r\n]*?-name\s+[\"']?(?:" + _PY_IMG + r")\b"
+    # wmic process where name='python.exe' delete|call terminate
+    r"|wmic\b[^\r\n]*?\bname\s*=\s*[\"'](?:" + _PY_IMG + r")(?:\.exe)?[\"'][^\r\n]*?\b(?:delete|terminate|call\s+terminate)\b"
+    r")"
 )
-_LOOP = re.compile(r"(?i)\bfor\s+/l\s+%{1,2}\w+\s+in\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s+do\b")
-_GH_WATCH = re.compile(r"(?i)\bgh\s+run\s+watch\b|\bgh\b[^&|\r\n]*?\s--watch\b")
+# Get-Process python | ... | Stop-Process  -- image-wide only when the pipeline
+# does NOT narrow by Id (e.g. Where-Object { $_.Id -eq ... }). If an Id filter is
+# present the command targets specific processes and is allowed through.
+_GET_PROCESS_PY = re.compile(
+    r"(?i)get-process\b[^\r\n|]*?\b(?:" + _PY_IMG + r")\b[^\r\n]*?\|[^\r\n]*?stop-process\b"
+)
+_GET_PROCESS_ID_FILTER = re.compile(r"(?i)\$_\.id\b|\b-id\b")
+
+_REFUSAL = (
+    "[python \u306e\u30a4\u30e1\u30fc\u30b8\u540d\u6307\u5b9a\u306e\u5168\u7d42\u4e86\u306f"
+    "\u62d2\u5426\u3057\u307e\u3059\u3002MCP \u30b5\u30fc\u30d0\u30fc\u30fb\u8abf\u6574\u5f79\u30fb"
+    "\u30d5\u30ea\u30fc\u30c8\u306e\u62c5\u5f53\u306f\u3059\u3079\u3066 python.exe \u306a\u306e\u3067\u3001"
+    "\u30a4\u30e1\u30fc\u30b8\u540d\u3067\u843d\u3068\u3059\u3068 python \u3092\u5168\u90e8\u843d\u3068\u3057"
+    "\u30b2\u30fc\u30c8\u30a6\u30a7\u30a4\u304c\u6570\u5206\u6b62\u307e\u308a\u307e\u3059\u3002"
+    "PID \u3092\u6307\u5b9a\u3057\u3066\u3053\u308c\u3060\u3051\u3092\u843d\u3068\u3057\u3066\u304f\u3060\u3055\u3044"
+    "\uff08taskkill /PID <pid> /T /F\uff09\u3002\n"
+    "Refusing to kill python.exe by image name: the MCP server, the coordinator and "
+    "every fleet worker are python.exe, so an image-wide kill takes the whole gateway "
+    "down for minutes. Target a specific PID instead (taskkill /PID <pid> /T /F).]"
+)
 
 
-def _guard_waits(command: str):
-    """Return the shortened command, whether it changed, and any refusal."""
-    if _GH_WATCH.search(command):
-        return command, False, ("[shell_exec error: watch refused; poll with "
-                                "gh run view <id> --json status,conclusion or "
-                                "gh pr checks <n> without --watch.]")
-    for loop in _LOOP.finditer(command):
-        start, step, end = map(int, loop.groups())
-        body = command[loop.end():].lstrip()
-        if body.startswith("("):
-            depth = 0
-            for index, char in enumerate(body):
-                depth += (char == "(") - (char == ")")
-                if depth == 0:
-                    body = body[:index + 1]
-                    break
-        else:
-            body = re.split(r"[&|]", body, maxsplit=1)[0]
-        waits = list(_WAIT.finditer(body))
-        if waits:
-            count = max(0, (end - start) // step + 1) if step and (end - start) * step >= 0 else 0
-            if count * sum(int(next(v for v in w.groupdict().values() if v is not None)) for w in waits) > 60:
-                return command, False, ("[shell_exec error: long wait loop refused; poll with "
-                                        "gh run view <id> --json status,conclusion or "
-                                        "gh pr checks <n> without --watch.]")
-    changed = False
-    def shorten(match):
-        nonlocal changed
-        group = next(k for k, v in match.groupdict().items() if v is not None)
-        value = match.group(group)
-        if int(value) <= 20:
-            return match.group()
-        changed = True
-        start, end = match.span(group)
-        return match.group()[:start - match.start()] + "20" + match.group()[end - match.start():]
-    result = _WAIT.sub(shorten, command)
-    return result, changed, None
+def kills_every_python(text: str) -> Optional[str]:
+    """Return a refusal string if TEXT would kill python.exe by image name, else None.
+
+    Image-wide kills (taskkill /IM python.exe, Stop-Process -Name python,
+    Get-Process python | Stop-Process, wmic ... name='python.exe' delete) take down
+    the MCP server itself. A PID-scoped kill (taskkill /PID <pid>, Stop-Process -Id,
+    Get-Process python | Where-Object { $_.Id -eq ... } | Stop-Process) is allowed.
+    """
+    if not text:
+        return None
+    if _KILL_ALL_PYTHON.search(text):
+        return _REFUSAL
+    if _GET_PROCESS_PY.search(text) and not _GET_PROCESS_ID_FILTER.search(text):
+        return _REFUSAL
+    return None
 
 
 def shell_exec(
@@ -435,7 +443,7 @@ def shell_exec(
     locked = require_unlocked()
     if locked:
         return locked
-    shortened_command, shortened, refusal = _guard_waits(command)
+    refusal = kills_every_python(command)
     if refusal:
         return refusal
     _bad = _cmd_shell_syntax_guard(command)
@@ -450,9 +458,7 @@ def shell_exec(
     if _j is not None:
         return _j
     try:
-        output = _run_with_tree_timeout(shortened_command, timeout, _working_dir(working_dir))
-        return ("[wait shortened to 20 s: poll again in a later call]\n" + output
-                if shortened else output)
+        return _run_with_tree_timeout(command, timeout, _working_dir(working_dir))
     except Exception as e:
         return f"[shell_exec error: {type(e).__name__}: {e}]"
 
