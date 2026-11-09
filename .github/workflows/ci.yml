@@ -295,6 +295,7 @@ jobs:
             relay/test_priority_survives_every_delivery_route.py \
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
+            relay/test_resume_from_state.py \
             relay/test_fleet_tombstone.py \
             relay/test_fleet_child_no_resurrect.py \
             relay/test_fleet_close_descendants.py \
@@ -739,6 +740,7 @@ jobs:
             scripts/test_goal_fidelity_report.py \
             tests/test_ownership.py \
             tests/test_watchdog_arming.py \
+            tests/test_recover_steps_have_a_deadline.py \
             tests/test_control_markers.py \
             tests/test_lean_capture.py \
             tests/test_profile_token.py \

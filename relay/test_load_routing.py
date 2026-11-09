@@ -79,10 +79,10 @@ def _rows():
 
 @pytest.mark.parametrize("text,want", [
     ("", "off"), ("fanout_load_routing=shadow\n", "shadow"), ("fanout_load_routing=SHADOW\n", "shadow"),
-    ("fanout_load_routing=off\n", "off"), ("fanout_load_routing=on\n", "off"),
-    ("fanout_load_routing=route\n", "off"), ("fanout_load_routing=\n", "off"),
-    ("﻿fanout_load_routing=shadow\n", "shadow")])
-def test_the_mode_reads_off_or_shadow_and_nothing_else(tmp_path, text, want):
+    ("fanout_load_routing=off\n", "off"), ("fanout_load_routing=on\n", "on"),
+    ("fanout_load_routing=ON\n", "on"), ("fanout_load_routing=route\n", "off"),
+    ("fanout_load_routing=\n", "off"), ("﻿fanout_load_routing=shadow\n", "shadow")])
+def test_the_mode_reads_off_shadow_or_on_and_nothing_else(tmp_path, text, want):
     p = tmp_path / "s.txt"
     p.write_text(text, encoding="utf-8")
     LR._reset_for_test()
@@ -356,7 +356,54 @@ def test_the_real_assignment_and_prompts_are_byte_identical_in_off_and_shadow(tm
     assert off["admitted"] == ["w0", "w1", "w2", "w3", "w4"]        # queue order, as before
 
 
-def test_the_admission_loop_calls_the_recorder_after_the_choice_and_ignores_its_result():
+def test_on_returns_the_index_in_on_and_none_in_shadow(tmp_path, monkeypatch):
+    # same inputs, only the mode differs: shadow records and returns None; on records AND returns
+    # the 1-based position in `remaining` of the goal it would admit instead (loose margins -> the
+    # expensive producer w1, index 1).
+    admitted, rest = _W("w0", "subtask"), [_W("w1", "producer"), _W("w2", "subtask")]
+    _settings(tmp_path, monkeypatch, "fanout_load_routing=shadow\n")
+    assert LR.shadow_assign(admitted, rest, 0, 2, 5, run_id="r") is None
+    _settings(tmp_path, monkeypatch, "fanout_load_routing=on\n")
+    out = LR.shadow_assign(admitted, rest, 0, 2, 5, run_id="r")
+    assert out == 1                                                 # admit remaining[0] (w1) instead
+    row = _rows()[-1]                                              # on writes the same shape of row
+    assert row["mode"] == "on" and row["actual"]["name"] == "w0" and row["shadow"]["name"] == "w1"
+    assert row["differs"] is True
+    # shadow wrote one row before the mode switch; on appended a second. on's own counters stand alone.
+    assert LR.status_block()["fanout_load_routing"] == {"mode": "on", "recorded": 1, "differed": 1}
+
+
+def test_on_when_the_router_agrees_returns_none(tmp_path, monkeypatch):
+    # tight margins: the cheapest goal is already at the head, so the router agrees -> no swap.
+    _settings(tmp_path, monkeypatch, "fanout_load_routing=on\n")
+    out = LR.shadow_assign(_W("w0", "subtask"), [_W("w1", "producer")], 1, 2, 2,
+                           probes={"rate_ok": lambda: (True, "")})
+    assert out is None                                             # agrees -> coordinator's goal kept
+    (row,) = _rows()
+    assert row["mode"] == "on" and row["differs"] is False
+
+
+def test_on_actually_reorders_admission_while_shadow_and_off_do_not(tmp_path, monkeypatch):
+    # off and shadow admit in queue order w0..w4 (proven above). on admits the router's choice
+    # first: under loose margins it prefers the expensive producer w1 over the cheap w0, so w1 is
+    # admitted before w0. All five still run to DONE, the recorder still writes one row per
+    # admission, and no goal is dropped or duplicated.
+    on = _drive(tmp_path, monkeypatch, "fanout_load_routing=on\n")
+    assert len(on["admitted"]) == 5
+    assert sorted(on["admitted"]) == ["w0", "w1", "w2", "w3", "w4"]      # every goal, once
+    assert on["admitted"][0] == "w1"                                     # the router's choice went first
+    assert on["admitted"] != ["w0", "w1", "w2", "w3", "w4"]              # order genuinely changed
+    assert all(r["outcome"] == "DONE" for r in on["results"])
+    rows = _rows()
+    # one row per admission that had something to compare against; reordering means the final
+    # admission(s) can face an empty queue, so it is 4-5 rows, every one in on mode.
+    assert 4 <= len(rows) <= 5 and all(r["mode"] == "on" for r in rows)
+    # the goal each worker was built with is unchanged (on reorders WHICH goal is admitted, it does
+    # not edit any prompt): the built goal for w1 is still g1, for w0 still g0.
+    assert on["built"]["w1"]["goal"] == "g1" and on["built"]["w0"]["goal"] == "g0"
+
+
+def test_the_admission_loop_calls_the_recorder_after_the_choice_and_before_attach():
     with io.open(os.path.join(REPO, "relay", "relay_fleet.py"), encoding="utf-8") as fh:
         src = fh.read()
     assert src.count("load_routing.shadow_assign(") == 1
@@ -364,6 +411,10 @@ def test_the_admission_loop_calls_the_recorder_after_the_choice_and_ignores_its_
     before, after = src[:i], src[i:]
     gate = "if w.status in TERMINAL:   # (shouldn't happen, but be safe)"
     assert gate in before and "w.attach(" not in before[before.rindex(gate):]   # after the choice ...
-    assert after.index("ok = w.attach(context, agent_url)") < 600               # ... right before attach
+    assert after.index("ok = w.attach(context, agent_url)") < 1400              # ... right before attach
+    # The result is bound and used ONLY behind the `on` guard that re-validates the index; off and
+    # shadow return None, so the swap block is skipped and admission is unchanged for them.
     line_start = before.rfind("\n") + 1
-    assert src[line_start:i].strip() == ""                          # a bare statement: no use of its value
+    assert src[line_start:i].strip() == "_lr_pick ="           # bound to a name, used only under the guard
+    assert "if isinstance(_lr_pick, int) and 1 <= _lr_pick <= len(pending):" in after
+    assert "pending.insert(0, w)" in after and "w = _chosen" in after

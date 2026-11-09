@@ -40,6 +40,11 @@ class _Driver:
 class _Worker:
     poll = RF.RelayWorker.poll
     _saw_output_for_turn = RF.RelayWorker._saw_output_for_turn
+    # The resume hook runs before the goal-eligibility check; a native-act goal ('send an email')
+    # is not resumable, so it returns False and the careful refuse-to-STUCK below is unchanged.
+    _resume_from_state_after_unknown = RF.RelayWorker._resume_from_state_after_unknown
+    _collect_progress_fields = RF.RelayWorker._collect_progress_fields
+    cwd = ""
     status = "waiting"
     per_turn_timeout_s = 240
     dwell_s = 4.0

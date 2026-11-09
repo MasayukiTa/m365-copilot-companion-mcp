@@ -17,6 +17,7 @@ class _Driver:
 
 class _Worker:
     poll = RF.RelayWorker.poll
+    _resume_from_state_after_unknown = RF.RelayWorker._resume_from_state_after_unknown
     status = 'waiting'
     per_turn_timeout_s = 240
     dwell_s = 4.0
