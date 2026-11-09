@@ -454,15 +454,16 @@ def _cmd_shell_syntax_guard(command):
 
     shell_exec runs via cmd.exe on Windows (subprocess shell=True). A worker that writes a
     POSIX one-liner like `WT="C:/path" && git -C "$WT" ...` does NOT get a variable: cmd.exe
-    cannot parse the bare `NAME="..."` assignment, so the assignment is dropped and `$WT` is
-    passed through literally -- the command runs in the wrong place or fails (measured: cmd.exe
-    on this PC runs `WT="C:/nope" && git -C "$WT" status` as git with a literal `$WT`, exit 128).
-    When such a `="C:/path"` fragment is instead handed to the Windows shell-open verb (e.g. an
-    os.startfile / ShellExecute of the right-hand side), Windows raises 0x80070002 (file not
-    found) in a MODAL dialog titled with the stray `'=C:/path'` -- the exact symptom observed
-    2026-11-07 while a worktree path was being handled this way (reproduced: os.startfile of a
-    '=C:/...' string raises WinError 2 / 0x80070002). Catch the bash assignment and `$VAR`
-    expansion up front and tell the caller to use cmd.exe syntax or run_python.
+    treats `=` as a token delimiter, so it does not parse `WT="C:/path"` as an assignment --
+    it splits on the `=` and runs the command `WT` with the argument `="C:/path"`. On this PC
+    `WT` resolves to Windows Terminal (wt.exe, on the PATH via
+    %LOCALAPPDATA%/Microsoft/WindowsApps), so cmd.exe launches Windows Terminal and asks it to
+    open `=C:/path`; wt.exe cannot open that target and raises 0x80070002 (file not found) in a
+    MODAL dialog titled with the stray `'=C:/path'` (observed 2026-11-07:
+    "'=C:/path' の起動時にエラー 2147942402 (0x80070002)"). The assignment is lost and `$WT`
+    is never expanded (measured: `WT="C:/nope" && git -C "$WT" status` reaches git with a
+    literal `$WT`, exit 128). Catch the bash assignment and `$VAR` expansion up front and tell
+    the caller to use cmd.exe syntax or run_python.
 
     Returns an error string to short-circuit, or None when the command is acceptable. Only
     fires on Windows; POSIX /bin/sh handles this syntax correctly.
@@ -487,7 +488,7 @@ def _cmd_shell_syntax_guard(command):
                 "and a stray '=<value>' can pop a '=<value>' file-not-found dialog (0x80070002). "
                 "Use cmd.exe syntax: `set %s=value` then reference it as %%%s%%, pass the value "
                 "inline, or use run_python for logic that needs variables.]" % (name, name, name))
-    if _re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", command):
+    if _re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", masked):
         return ("[shell_exec error: '$VAR'/'${VAR}' is bash syntax and is not expanded by "
                 "cmd.exe on Windows (it stays literal). Use %VAR% after `set VAR=value`, pass "
                 "the value inline, or use run_python.]")
