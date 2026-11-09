@@ -701,6 +701,14 @@ KEYS = OrderedDict([
     _k("deletemode", UI_ONLY, 1, "ui/CopilotChat.cs", "Delete-button behaviour."),
     _k("last_open_conv", UI_ONLY, "", "ui/CopilotChat.cs", "Which conversation to reopen."),
     _k("autoarchive", UI_ONLY, 0, "ui/FleetCockpit.cs", "Archive a run when it finishes."),
+
+    # The supervisor's agents-janitor sweep. Read each time the supervisor decides whether to
+    # delete (every 10 minutes while C: is below the disk threshold), not held across a run, so
+    # each_gate rather than live: it needs no Follower.watch wiring and a change lands on the
+    # next sweep. 1 = delete finished clones (default); 0 = dry-run only, log what it would do.
+    _k("agents_janitor_apply", EACH_GATE, 1,
+       "relay/fleet_runner.py:settings_agents_janitor_apply",
+       "The supervisor's finished-clone janitor deletes (1) or only logs (0); read each sweep."),
 ])
 
 
