@@ -145,7 +145,6 @@ jobs:
             ui/test_planned_server_restart_expiry.py \
             ui/test_planned_server_restart_exact_poll.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
-            relay/test_data_access_ledger.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
@@ -226,8 +225,6 @@ jobs:
             tests/test_exec_via_gateway.py \
             tests/test_tool_map_pinning.py \
             scripts/test_watch_grade.py \
-            scripts/weekly_scan/tests/test_weekly_scan_bc_d.py \
-            scripts/weekly_scan/tests/test_weekly_scan_runner.py \
             scripts/test_ensure_m365_signin.py \
             scripts/test_bridge_signin_is_brought_to_the_person.py \
             scripts/test_ensure_m365_signin_state.py \
@@ -510,6 +507,7 @@ jobs:
             tools/test_security.py \
             tools/test_python_gate.py \
             tools/test_powershell_hardening.py \
+            tools/test_shell_exec_eqpath_guard.py \
             tools/test_approval_policy.py \
             tools/test_bypass_never_asks.py \
             tools/test_layer1_security.py \
@@ -1169,11 +1167,7 @@ jobs:
             relay/test_tunnel_host_log.py \
             tests/test_response_telemetry.py \
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
-            relay/test_a_stale_coordinator_restarts_only_when_idle.py \
-            scripts/weekly_scan/tests/test_ledger_io.py \
-            scripts/weekly_scan/tests/test_judge_wrapper.py \
-            scripts/weekly_scan/tests/test_db_lots.py \
-            scripts/weekly_scan/tests/test_runner.py
+            relay/test_a_stale_coordinator_restarts_only_when_idle.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py

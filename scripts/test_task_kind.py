@@ -20,7 +20,7 @@ def test_known_wordings_get_their_kind():
     cases = {
         "IMPLEMENTATION TASK D2. Work ONLY inside the git worktree": TK.CODE_CHANGE,
         "社内電話台帳と連絡先カードの突合チェックです": TK.BULK_CHECK,
-        "analysis db(DBBサーバ)で不良データを集計する": TK.DATA_QUERY,
+        "query the sales database for the defect table": TK.DATA_QUERY,
         "最新の受信メール3件を教えてください": TK.M365_LOOKUP,
         "Harmless check, read-only. Use the run_python tool once": TK.TOOL_PROBE,
         "I need two separate handbooks, hand them to two workers": TK.WRITING,
@@ -36,16 +36,16 @@ def test_unrecognised_or_non_text_stays_unknown():
 
 
 def test_deterministic_and_closed_set():
-    text = "analysis db で IMPLEMENTATION TASK"
+    text = "query the database for IMPLEMENTATION TASK"
     assert {TK.task_kind(text) for _ in range(5)} == {TK.CODE_CHANGE}
-    assert TK.task_kind("DBB") == TK.task_kind("DBB") == TK.DATA_QUERY
+    assert TK.task_kind("sql query") == TK.task_kind("sql query") == TK.DATA_QUERY
     assert TK.KINDS[-1] == TK.UNKNOWN and len(set(TK.KINDS)) == len(TK.KINDS)
 
 
 def test_narrower_kind_wins_by_rule_order():
     # a code task that mentions the database, a database task that names a repo path
     assert TK.task_kind("IMPLEMENTATION TASK: fix the odbc reader in tools/x.py") == TK.CODE_CHANGE
-    assert TK.task_kind("C:\\work\\a.py の analysis db を調べる") == TK.DATA_QUERY
+    assert TK.task_kind("C:\\work\\a.py の database を調べる") == TK.DATA_QUERY
 
 
 def _w(role, outcome, goal, i, turn=3):
@@ -54,7 +54,7 @@ def _w(role, outcome, goal, i, turn=3):
 
 
 def test_profile_per_role_and_kind_uses_the_same_min_n_rules():
-    ws = [_w("producer", "DONE", "analysis db の不良を集計", i) for i in range(5)]
+    ws = [_w("producer", "DONE", "query the database for the defect table", i) for i in range(5)]
     ws += [_w("producer", "STUCK", "IMPLEMENTATION TASK X", 10 + i) for i in range(4)]
     rep = CP.derive([], ws, [], with_kind=True)
     k = rep["profiles_by_kind"]["producer"]
@@ -81,7 +81,7 @@ def test_child_and_aggregator_take_the_goal_of_their_family():
 
 
 def test_default_report_is_unchanged_and_never_loads_the_kind_module():
-    ws = [_w("producer", "DONE", "analysis db", i) for i in range(5)]
+    ws = [_w("producer", "DONE", "database query", i) for i in range(5)]
     rep = CP.derive([], ws, [])
     assert "profiles_by_kind" not in rep and "kind_coverage" not in rep
     assert set(rep["profiles"]["producer"]) >= {"tool_calls", "tool_mix", "n_runs"}
@@ -141,7 +141,7 @@ def test_the_report_writes_nothing(tmp_path):
     fleet = tmp_path / "fleet"
     fleet.mkdir()
     (fleet / "history.json").write_text(json.dumps(
-        [{"outcome": "DONE", "turn": 2, "run_id": "r", "name": "w0", "goal": "analysis db"}]),
+        [{"outcome": "DONE", "turn": 2, "run_id": "r", "name": "w0", "goal": "database query"}]),
         encoding="utf-8")
     (fleet / "campaigns.jsonl").write_text("", encoding="utf-8")
 
