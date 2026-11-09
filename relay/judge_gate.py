@@ -36,31 +36,6 @@ import subprocess
 import sys
 import time
 
-# --- Business-specific terms (kept OUT of the public repo) --------------------
-# The public tree carries only GENERIC placeholders. Real product / column names
-# live in the gitignored .config/domain_terms.json (empty by default); when that
-# file is present the gloss below uses the real names, otherwise a generic label.
-_DOMAIN_TERMS_CACHE = None
-
-
-def _domain_terms() -> dict:
-    global _DOMAIN_TERMS_CACHE
-    if _DOMAIN_TERMS_CACHE is None:
-        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                            ".config", "domain_terms.json")
-        try:
-            with open(path, encoding="utf-8") as fh:
-                _DOMAIN_TERMS_CACHE = json.load(fh) or {}
-        except Exception:
-            _DOMAIN_TERMS_CACHE = {}
-    return _DOMAIN_TERMS_CACHE
-
-
-def _term(key: str, default: str) -> str:
-    """Return a business term from .config/domain_terms.json, or a generic default."""
-    val = _domain_terms().get(key)
-    return val if isinstance(val, str) and val else default
-
 try:
     from relay.task_kind import task_kind, DATA_QUERY
 except Exception:  # pragma: no cover - allow flat import when run as a script
@@ -78,6 +53,7 @@ __all__ = [
     "confirm_independence_note",
     "design_feasibility_hold",
     "DESIGN_HOLD_DISPLAY",
+    "load_domain_terms",
 ]
 
 # The frozen engine checkout (A). Read-only. The engine lives OUTSIDE this public repo on the
@@ -97,6 +73,36 @@ def _default_engine_root() -> str:
 
 
 ENGINE_ROOT = os.environ.get("VALIDITY_ENGINE_ROOT") or _default_engine_root()
+
+# --- optional, out-of-band domain vocabulary --------------------------------
+#
+# WHY THIS EXISTS. This module must read cleanly in a PUBLIC repo, so it carries NO
+# site-specific product names, product-name column headers, or process words. The
+# human-facing design-hold text below is therefore written in GENERIC terms
+# ("grouping column", "product or equipment"). An operator who wants the footer to
+# name their real columns/products can supply them out-of-band in
+# .config/domain_terms.json (git-ignored, so nothing site-specific is committed).
+# OPTIONAL: when absent or empty, the generic wording is used unchanged. Keys:
+#   "grouping_column_examples": [str, ...]  # example grouping/stratum column names
+#   "group_split_by": str                   # what the compared groups differ by
+#   "hold_display": str                     # the forced final-display phrase
+# Values are plain display text only; they never change any verdict.
+_DOMAIN_TERMS_RELPATH = os.path.join(".config", "domain_terms.json")
+
+
+def _repo_root() -> str:
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+def load_domain_terms() -> dict:
+    """Optional domain vocabulary as a dict, or {} when unavailable. Never raises."""
+    path = os.path.join(_repo_root(), _DOMAIN_TERMS_RELPATH)
+    try:
+        with open(path, encoding="utf-8-sig") as fh:
+            data = json.load(fh)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 #: WHY THIS NOTE EXISTS. The classifier below is a keyword screen over the goal text (reusing
 #: relay/task_kind.py's DATA_QUERY markers, which were read off the live history). A keyword
@@ -1275,7 +1281,7 @@ def _fmt_n(ev: dict) -> str:
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
 # inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
 # response/outcome column -- feat/design-feasibility-core) reports the design is
-# INFEASIBLE, the FINAL DISPLAY is forced to 設計不成立(保留) regardless of what the
+# INFEASIBLE, the FINAL DISPLAY is forced to DESIGN_HOLD_DISPLAY regardless of what the
 # engine verdict was.
 #
 # STRICTER-ONLY, AND NON-DESTRUCTIVE. This can only turn a deliverable answer INTO a
@@ -1289,8 +1295,8 @@ def _fmt_n(ev: dict) -> str:
 # INDEPENDENCE. This consumes a plain dict (the design_feasibility RESULT), it does
 # not import or recompute the upstream check. The dict shape it reads:
 #   {"feasible": bool,                 # False => force a hold
-#    "reason_code": str,               # e.g. one of _design_infeasible_reasons()
-#    "common_strata": int,             # 共通層(製品)の数
+#    "reason_code": str,               # e.g. one of _DESIGN_INFEASIBLE_REASONS
+#    "common_strata": int,             # number of common strata (grouping levels)
 #    "lots_per_group": {group: int},   # 群ごとのロット数
 #    "overlap_coefficient": number,    # 群間の層構成の重なり係数
 #    ...}                              # any other keys are carried as `seen`
@@ -1300,26 +1306,23 @@ def _fmt_n(ev: dict) -> str:
 #: The reason codes this slice understands for an infeasible comparison design. Kept
 #: as a catalogue so the footer/record can show a human-readable gloss next to the
 #: machine code. An unknown code is still surfaced verbatim (never swallowed).
-def _design_infeasible_reasons() -> dict:
-    """Reason-code -> human gloss. Built lazily so the product/column names come
-    from .config/domain_terms.json at call time (generic defaults when absent)."""
-    return {
-        "STRATUM_COLUMN_ABSENT":
-            "層別の候補列(製品=%s・%s、ライン、期間など)が入力に無い"
-            % (_term("product_name", "製品グレード"), _term("product_name_column", "品種列")),
-        "NO_COMMON_STRATUM":
-            "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
-        "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
-            "共通の層内で各群 k_min ロット以上を満たす層の数が下限未満",
-        "GROUP_COMPOSITION_IMBALANCE":
-            "群ごとの層構成の偏りが大きい(重なり係数が閾値未満)",
-    }
+_DESIGN_INFEASIBLE_REASONS = {
+    "STRATUM_COLUMN_ABSENT":
+        "層別の候補列(製品または設備を表すグループ列、ライン、期間など)が入力に無い",
+    "NO_COMMON_STRATUM":
+        "両群に共通の層(grouping level)が無い(群を分ける属性の差か設備の差か分けられない)",
+    "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
+        "共通の層内で各群 k_min ロット以上を満たす層の数が下限未満",
+    "GROUP_COMPOSITION_IMBALANCE":
+        "群ごとの層構成の偏りが大きい(重なり係数が閾値未満)",
+}
 
 #: The single phrase the forced final display uses, matched elsewhere so the gate and
 #: tests can pin it. The engine's own verdict tokens (GO/HOLD/NA) are NOT reused for
 #: this -- a forced design hold is a HARNESS decision about the comparison's validity,
 #: distinct from the engine's statistical verdict, and must read as such.
-DESIGN_HOLD_DISPLAY = "設計不成立(保留)"
+_DEFAULT_HOLD_DISPLAY = "DESIGN INFEASIBLE / 設計上比較不能（保留）"
+DESIGN_HOLD_DISPLAY = str(load_domain_terms().get("hold_display") or _DEFAULT_HOLD_DISPLAY)
 
 
 def design_feasibility_hold(design) -> dict | None:
@@ -1342,7 +1345,7 @@ def design_feasibility_hold(design) -> dict | None:
         return None
     code = design.get("reason_code")
     code = str(code) if code is not None else "DESIGN_INFEASIBLE"
-    gloss = _design_infeasible_reasons().get(code, "")
+    gloss = _DESIGN_INFEASIBLE_REASONS.get(code, "")
     # Carry the design facts the owner asked to see named on the judge票: the number
     # of common strata, each group's lot count, and the overlap coefficient. Anything
     # else the upstream check reported is preserved under `seen` (minus the response
@@ -1374,9 +1377,10 @@ def _design_hold_lines(hold: dict) -> list:
         lots = "未返却"
     seen = ("見たもの: 共通層の数=%s, 各群のロット数{%s}, 重なり係数=%s"
             % (hold.get("common_strata"), lots, hold.get("overlap_coefficient")))
-    note = (("比較する群が曝露ではなく製品(%s)で分かれているため、設備の差か製品の差か"
-            "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。")
-            % _term("product_name", "製品グレード"))
+    split_by = str(load_domain_terms().get("group_split_by")
+                   or "群を分ける属性 (product or equipment)")
+    note = ("比較する群が曝露ではなく%sで分かれているため、群を分ける属性の差か設備の差か"
+            "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。" % split_by)
     return [head, why, seen, note]
 
 
@@ -1392,7 +1396,7 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
 
     DESIGN FORCE-HOLD (this slice). When `design_feasibility` reports the comparison
     design is INFEASIBLE (feasible is False), the FINAL DISPLAY is forced to
-    設計不成立(保留): the footer LEADS with a hold banner naming the reason code and
+    DESIGN_HOLD_DISPLAY: the footer LEADS with a hold banner naming the reason code and
     what was seen (common strata, per-group lot counts, overlap coefficient), then
     prints the engine's ORIGINAL verdict block UNCHANGED below it, labelled
     参考・変更なし. Stricter-only; never edits the engine output. A feasible / missing /
