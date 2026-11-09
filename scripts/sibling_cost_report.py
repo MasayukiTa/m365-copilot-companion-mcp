@@ -85,13 +85,19 @@ def expensive_tools(pairs):
     return costly
 
 
-def analyse(events, workers, camp_rows):
-    """Cost-weighted sibling duplication. Attribution via sibling_dup_report.Roster (shared truth)."""
-    roster = B0.Roster(workers, camp_rows)
+def analyse(events, workers, camp_rows, windows=None):
+    """Cost-weighted sibling duplication. Attribution via sibling_dup_report.Roster (shared truth).
+
+    `windows` (a relay.turn_context_join.WindowIndex) lets the shared Roster attribute calls the
+    MCP session could not label, by joining them to the coordinator's turn windows. With
+    windows=None the attribution is exactly B0's.
+    """
+    roster = B0.Roster(workers, camp_rows, windows=windows)
     pairs = B0.pair_events(events)
     costly = expensive_tools(pairs)
     buckets = {"total_calls": 0, "discovery_excluded": 0, "unknown_attribution": 0,
-               "attributed_not_fanout": 0, "sibling_calls": 0, "no_args": 0}
+               "attributed_not_fanout": 0, "sibling_calls": 0, "no_args": 0,
+               "window_attributed": 0}
     per = {}  # campaign -> {"calls": [(ts, child, key, tool, dur)]}
     for call, outcome in pairs:
         buckets["total_calls"] += 1
@@ -103,10 +109,13 @@ def analyse(events, workers, camp_rows):
                                                                or call.get("worker")):
             buckets["unknown_attribution"] += 1
             continue
+        _wh_before = roster.window_hits
         hit = roster.resolve_call(call)
         if hit is None:
             buckets["attributed_not_fanout"] += 1
             continue
+        if roster.window_hits > _wh_before:
+            buckets["window_attributed"] += 1
         cid, child = hit
         buckets["sibling_calls"] += 1
         key = B0._arg_key(call)
@@ -219,6 +228,8 @@ def render(result, summary, top=50):
               "- unknown bucket (no/ambiguous attribution): %d" % b["unknown_attribution"],
               "- attributed but not mapped to a fan-out child: %d" % b["attributed_not_fanout"],
               "- sibling calls (attributed to a campaign child): %d" % b["sibling_calls"],
+              "- of those, attributed via a coordinator turn window: %d"
+              % b.get("window_attributed", 0),
               "- sibling calls without comparable args: %d" % b["no_args"],
               "- tools treated as expensive: %s" % ", ".join(result["costly_tools"]), ""]
     lines += ["## Measures (cost = measured wall-clock seconds)", "",
@@ -258,7 +269,14 @@ def main(argv=None):
     args = ap.parse_args(argv)
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     events, workers, camps, _n_tr = B0.load_fleet(fleet_dir)
-    result = analyse(events, workers, camps)
+    # Join calls the MCP session could not label to the coordinator's turn windows (read-only;
+    # an absent turn_context.jsonl yields an empty index and the report is unchanged).
+    try:
+        from relay import turn_context_join
+        windows = turn_context_join.load_windows(fleet_dir)
+    except Exception:
+        windows = None
+    result = analyse(events, workers, camps, windows=windows)
     summary = summarise(result)
     text = render(result, summary, top=args.top)
     try:

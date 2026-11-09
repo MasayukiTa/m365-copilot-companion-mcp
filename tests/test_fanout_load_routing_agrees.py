@@ -36,7 +36,7 @@ def test_the_registry_declares_it_each_gate_default_off():
     assert SK.effect("fanout_load_routing") == SK.EACH_GATE
     assert SK.default("fanout_load_routing") == "off"
     assert LR.KEY == "fanout_load_routing"
-    assert LR.MODES == ("off", "shadow")
+    assert LR.MODES == ("off", "shadow", "on")
 
 
 def test_the_cockpit_names_the_same_key_modes_and_default():
@@ -54,10 +54,10 @@ def test_no_layer_offers_a_value_that_routes():
     src = _read("ui", "EffortPolicy.cs")
     view = src[src.index("class LoadRoutingView"):]
     view = view[:view.index("\n}\n")]
-    assert 'IsMode(string v) { return v == "off" || v == "shadow"; }' in view
-    assert "enforce" not in view.lower() and '"on"' not in view and '"route"' not in view
+    assert 'IsMode(string v) { return v == "off" || v == "shadow" || v == "on"; }' in view
+    assert "enforce" not in view.lower() and '"route"' not in view
     note = SK.KEYS["fanout_load_routing"].note
-    assert "nothing is reordered" in note and "no prompt or output changes" in note
+    assert "shadow reorders nothing" in note and "no prompt or output" in note
 
 
 def test_the_cockpit_loads_persists_paints_and_does_not_refire():

@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -488,6 +489,23 @@ import concurrent.futures as _futures
 
 _HEALTH_POOL = _futures.ThreadPoolExecutor(max_workers=4, thread_name_prefix="health")
 
+# INBOUND-OBSERVER POOL, SEPARATE FROM asyncio's DEFAULT EXECUTOR.
+#
+# _observe_inbound offloads its journalling (_finish -> obs_log.log_inbound, a jsonl write)
+# with asyncio.to_thread, which dispatches onto the loop's DEFAULT ThreadPoolExecutor -- the
+# SAME pool that runs tool bodies (pwsh_exec, find_files, run_python, ...). This observer runs
+# on the receive path of EVERY request, /health included. Measured 2026-11-07 09:29-09:31:
+# with CPU at 99.5% and heavy tool bodies holding every default-pool slot, the observer's
+# to_thread journalling could not get a worker, so request INTAKE stalled before the handler
+# ever ran -- which is why giving /health's sub-probes their own pool (#461/#463) did not keep
+# /health fast: the request was already stuck in the observer, upstream of the handler. GET
+# /health took 29.6s/25.3s/15.7s/8.7s/19.0s while the loopback c2c-bridge answered in 278ms.
+#
+# Fix: journal on a dedicated, tiny pool so a saturated tool pool can never starve request
+# intake, and make the journalling strictly best-effort -- if even this pool is full we DROP
+# the log line rather than block the request (a liveness probe must never wait on bookkeeping).
+_OBS_POOL = _futures.ThreadPoolExecutor(max_workers=2, thread_name_prefix="obs-inbound")
+
 #: Whole-of-sub-probes budget for one /health call. Past this we answer with what we have.
 _HEALTH_PROBE_BUDGET_S = float(os.environ.get("MCP_HEALTH_PROBE_BUDGET_S", "2.0"))
 
@@ -569,31 +587,77 @@ async def _gather_health_probes(probes):
 #: Answer cached for this long. /health is polled about once a second by the cockpit and by
 #: the supervisor, and the answer can only change when a watched file is written -- so asking
 #: the filesystem every time would be work nobody reads.
+#:
+#: GWSLOW: the TTL is also the throttle for the BACKGROUND refresh below. newer_than() walks
+#: the whole watched package tree and stats hundreds of files; doing that synchronously inside
+#: a /health probe is exactly what made /health slow under CPU saturation on 2026-11-07 (the
+#: probe could not finish inside the health-pool budget, so every poll came back degraded).
+#: Now the walk NEVER runs on the /health path: we serve the last known answer instantly and
+#: refresh it off-thread.
 _WATCHED_CACHE_S = 5.0
 _watched_cache = {"at": 0.0, "changed": None}
+#: One background refresh at a time. A /health poll that finds the cache stale kicks a single
+#: daemon thread to recompute newer_than() and returns the OLD value immediately; concurrent
+#: polls that arrive while it runs do not pile a second walk on top (that would re-create the
+#: saturation this fix removes). The lock guards the flag, never the walk itself.
+_watched_refresh_lock = threading.Lock()
+_watched_refreshing = {"busy": False}
 
 
-def _watched_code_changed():
-    """Has a file THIS SERVER IMPORTS changed since it started?
-
-    tools/deploy_freshness already owns the list -- WATCHED, pinned by its own test against
-    main.py's real imports -- and newer_than() answers with mtimes rather than a subprocess,
-    which is what keeps /health non-blocking (see _git_head_sha for why that matters).
-
-    UNREADABLE MEANS CHANGED. If this cannot be determined, the SHA rule should stand, and the
-    SHA rule's answer here is "stale"; reporting stale when it might be is the conservative
-    side of a question about whether a fix is live.
-    """
-    now = time.time()
-    if _watched_cache["changed"] is not None and (now - _watched_cache["at"]) < _WATCHED_CACHE_S:
-        return _watched_cache["changed"]
+def _watched_recompute():
+    """Walk the watched tree once and store the result. Runs ONLY on the background thread
+    (or synchronously on the very first, pre-traffic call), never on a /health poll under
+    load. Never raises -- an unreadable tree means 'changed' (stale), the conservative side."""
     try:
         from tools.deploy_freshness import newer_than
         changed = bool(newer_than(_BOOT_TS))
     except Exception:
         changed = True
-    _watched_cache["at"], _watched_cache["changed"] = now, changed
+    _watched_cache["at"], _watched_cache["changed"] = time.time(), changed
+    with _watched_refresh_lock:
+        _watched_refreshing["busy"] = False
     return changed
+
+
+def _watched_code_changed():
+    """Has a file THIS SERVER IMPORTS changed since it started?
+
+    tools/deploy_freshness owns the list (WATCHED, pinned by its own test against main.py's
+    real imports) and newer_than() answers with mtimes rather than a subprocess.
+
+    GWSLOW stale-while-revalidate: this is called from a /health sub-probe that runs under a
+    short shared deadline. The watched-tree walk is too slow to do on that path when the CPU
+    is saturated, so we NEVER walk here when we already have an answer: we return the cached
+    value instantly and, if it is older than the TTL, kick ONE background thread to refresh
+    it. Only the very first call (cache empty, before the server is taking traffic) walks
+    synchronously, so the dot is correct from boot.
+
+    UNREADABLE MEANS CHANGED -- if freshness cannot be determined the SHA rule's answer is
+    'stale', the conservative side of 'is the fix live'.
+    """
+    now = time.time()
+    cached = _watched_cache["changed"]
+    if cached is None:
+        # First call ever: no answer to serve, so compute once, synchronously. This happens
+        # at boot/warm-up, off the hot /health path under load.
+        return _watched_recompute()
+    if (now - _watched_cache["at"]) >= _WATCHED_CACHE_S:
+        # Stale: serve the old value NOW, refresh OFF-THREAD. Start at most one walk.
+        start = False
+        with _watched_refresh_lock:
+            if not _watched_refreshing["busy"]:
+                _watched_refreshing["busy"] = True
+                start = True
+        if start:
+            try:
+                threading.Thread(target=_watched_recompute,
+                                 name="watched-refresh", daemon=True).start()
+            except Exception:
+                # Could not spawn (e.g. interpreter shutdown): clear the flag and fall back
+                # to the cached value. Never block /health to recompute.
+                with _watched_refresh_lock:
+                    _watched_refreshing["busy"] = False
+    return _watched_cache["changed"]
 
 
 #: When this process first observed itself to be stale, or None while it is current.
@@ -1896,10 +1960,54 @@ async def _observe_inbound(scope, receive):
         # Copilot conversation on this side. See obs_log.header_info / extras_from_body.
         obs_log.log_inbound(methods, sid, ip, ua, headers=scope.get("headers"), extras=extras)
 
+    def _offload(methods, extras=None):
+        # Journal on the DEDICATED observer pool, FIRE-AND-FORGET. This runs on the receive
+        # path of EVERY request (/health included). The original code did
+        # `await asyncio.to_thread(_finish, ...)`, which (a) used the loop's DEFAULT executor --
+        # the same pool heavy tool bodies run on -- and (b) AWAITED completion, so request
+        # INTAKE blocked until a journal write finished. Under the 2026-11-07 CPU saturation
+        # (99.5%) every default-pool slot was held by a tool body, so intake stalled for tens
+        # of seconds BEFORE the handler ran -- which is why /health took 29.6s while the
+        # loopback bridge answered in 278ms, and why #461/#463 (which only isolated /health's
+        # sub-probes) did not help: the request never reached the handler.
+        #
+        # Two independent changes break that: a DEDICATED pool so tool bodies cannot take the
+        # observer's slots, AND no await -- journalling is best-effort bookkeeping that must
+        # never hold up a request. If the submit itself fails or the pool is full, the line is
+        # simply dropped. A request that answers is worth far more than a journal line.
+        try:
+            return _OBS_POOL.submit(_finish, methods, extras)
+        except Exception:
+            return None
+
+    async def _offload_and_settle(methods, extras=None):
+        # Fire-and-forget onto the DEDICATED pool, then AWAIT its completion via the event loop
+        # WITHOUT holding the loop: asyncio.wrap_future yields control while the journal runs on
+        # its own thread, so a slow write suspends only this coroutine, never the loop. Request
+        # intake still never queues behind tool bodies (they run on the DEFAULT pool, this on
+        # _OBS_POOL), which is the starvation fix; awaiting the dedicated-pool future only makes
+        # the line observable to the caller once it is on disk. Best-effort: a failed submit or a
+        # journal error is swallowed.
+        fut = _offload(methods, extras)
+        if fut is None:
+            return
+        try:
+            await asyncio.wrap_future(fut)
+        except Exception:
+            pass
+
     try:
         http_method = str(scope.get("method") or "")
         if http_method != "POST":
-            await asyncio.to_thread(_finish, [("HTTP " + http_method, "")])
+            # Non-POST never wraps the body stream (we return the original receive), so settle the
+            # journal here. Block only this submit's own tiny future, briefly; the GET path reads
+            # no body, so there is nothing to stall behind.
+            fut = _offload([("HTTP " + http_method, "")])
+            if fut is not None:
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
             return receive
     except Exception:
         return receive
@@ -1919,13 +2027,13 @@ async def _observe_inbound(scope, receive):
                 if not message.get("more_body"):
                     from tools import obs_log
                     if state["over"]:
-                        await asyncio.to_thread(_finish, [("(oversize)", "")])
+                        await _offload_and_settle([("(oversize)", "")])
                     else:
                         _body = bytes(state["buf"])
-                        await asyncio.to_thread(_finish, obs_log.methods_from_body(_body),
-                                                obs_log.extras_from_body(_body))
+                        await _offload_and_settle(obs_log.methods_from_body(_body),
+                                                  obs_log.extras_from_body(_body))
             elif not state["done"] and message.get("type") == "http.disconnect":
-                await asyncio.to_thread(_finish, [("(disconnect-before-body)", "")])
+                await _offload_and_settle([("(disconnect-before-body)", "")])
         except Exception:
             pass
         return message
@@ -1934,7 +2042,7 @@ async def _observe_inbound(scope, receive):
         # A response started although the body was never read (auth rejected it first): still
         # worth one line, so "client reached us and was refused" is distinguishable from silence.
         try:
-            await asyncio.to_thread(_finish, [("(body-unread status=%s)" % status, "")])
+            await _offload_and_settle([("(body-unread status=%s)" % status, "")])
         except Exception:
             pass
 
