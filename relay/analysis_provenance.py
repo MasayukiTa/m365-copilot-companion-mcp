@@ -281,7 +281,7 @@ def _request_digit_runs(request_text) -> frozenset:
     as strings, length >= 2.
 
     These are the digit sequences the gate may treat as part of an IDENTIFIER the requester
-    supplied -- the '679' of "679defectA_study", "e679_v26", "example_analysis". Length >= 2 keeps a
+    supplied -- the '679' of "679defectA_study", "esyn_v01", "sample_claim". Length >= 2 keeps a
     lone '0'/'1'/... (which occurs in almost any text) from exempting real single-digit
     statistics. Returns an empty set for non-strings so the caller degrades to the old behaviour.
     """
@@ -467,7 +467,7 @@ def check_answer_provenance(final_answer, compute_outputs, *, is_analysis: bool,
 
     `request_text` (optional) is the requester's own words -- the goal text and/or the resolved
     request text. Digit runs that appear THERE (a case name like "679defectA_study", an id like
-    "e679_v26") are treated as identifiers, NOT claims, when they appear in the answer glued to
+    "esyn_v01") are treated as identifiers, NOT claims, when they appear in the answer glued to
     a letter/underscore/#/path/CJK character rather than standing alone as a stated quantity.
     A quantity form ("679 件", "679%", "n = 679") is still policed even if the same digits are
     in the goal: a stated measurement must always be found in a computation output. When

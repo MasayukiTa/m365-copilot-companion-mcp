@@ -58,7 +58,7 @@ def _resolve_full_path_goal(goal):
     """Shape (B): the goal is an ABSOLUTE PATH to the case, optionally followed by words.
 
     A real user pasted the request file's full Downloads path and added "これ調べて" (job
-    bfa6b22fac93). The reference regex forbids path separators, so this shape fell through to
+    jobsyn0002). The reference regex forbids path separators, so this shape fell through to
     None, the request file was never read, and the goal classified as non-analysis. Here the
     pasted path is resolved directly: its final component must carry the case-identity shape
     (so an arbitrary file path is not swept in), and the path must exist on disk. Returns the
@@ -73,7 +73,7 @@ def _resolve_full_path_goal(goal):
         return None
     # Split the leading path from any trailing words. The path ends at the first run of
     # whitespace that is followed by a non-path word; a case folder name can itself contain a
-    # single space ("枝さん_679defectA_study"), so we locate the path by trying the longest leading
+    # single space ("sampleuser_679defectA_study"), so we locate the path by trying the longest leading
     # span that names an existing filesystem entry, then shrinking at whitespace boundaries.
     best = None
     # Candidate split points: end-of-string, then each whitespace run from the right.
@@ -127,7 +127,7 @@ def case_reference_search(goal, roots=None, timeout=5.0, max_results=30):
     # shape "<...\case_folder> <words>": a real user pasted the file's full Downloads path and
     # added "これ調べて". The reference regex below never matches shape (B) because it forbids
     # path separators, so case resolution did not run, the request file was never read, and the
-    # goal classified as non-analysis (job bfa6b22fac93, judge: none). _resolve_full_path_goal
+    # goal classified as non-analysis (job jobsyn0002, judge: none). _resolve_full_path_goal
     # handles shape (B) directly from the pasted path, before the root walk.
     direct = _resolve_full_path_goal(goal)
     if direct is not None:

@@ -4,8 +4,8 @@ when the real problem is that the worker's free-text claim was never mapped into
 structured claim shape -- and a post-hoc (late) registration must be shown HONESTLY as a HOLD-cap
 condition (D_FAIL_LOCK_AFTER_DATA), never mislabelled as an input error.
 
-WHY THIS EXISTS (measured 2026-11-02). Three real judge folders (example_analysis, example_analysis,
-example_analysis) each delivered verdict=ERROR, reason INPUT_MISSING_KEY, note
+WHY THIS EXISTS (measured 2026-11-02). Three real judge folders (sample_claim, sample_claim,
+sample_claim) each delivered verdict=ERROR, reason INPUT_MISSING_KEY, note
 LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE, loo_n=0, K=null, and order_ok=false. The engine input in
 each (engine_claim_<id>.json) carried only {id, statement, data_location}: a free-text claim. The
 engine's claim loader REQUIRES 12+ structured keys (validity/claim.py REQUIRED_KEYS plus
@@ -39,7 +39,7 @@ import pytest
 from relay import judge_gate
 
 
-GOAL = "odbc_query で WIDGETDB のロット別不良A率を集計して相関を出す"
+GOAL = "odbc_query over SYNDB: aggregate per-lot defectA rate and compute correlation"
 
 # The engine's required claim keys, as the frozen loader lists them (mirrored, engine is READ-ONLY).
 _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierarchy",
@@ -47,14 +47,14 @@ _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierar
                 "assumptions")
 
 
-def _free_text_claim(claim_id="example_analysis"):
+def _free_text_claim(claim_id="sample_claim"):
     """The real shape a worker registered: a free-text statement, no engine schema keys."""
     return {"id": claim_id,
-            "statement": "679端部不良Aは来歴データと有意な相関を示さない(全因子95%CIが0をまたぐ)。",
+            "statement": "679defectA shows no significant correlation with trace data (all 95%CIs cross 0).",
             "data_location": "C:/Users/x/Downloads/_clean.csv"}
 
 
-def _structured_claim(claim_id="example_analysis"):
+def _structured_claim(claim_id="sample_claim"):
     """A claim with every engine-required key present (values are synthetic placeholders; the
     PRESENCE is what the harness screens, the engine still owns value validation)."""
     return {
@@ -72,7 +72,7 @@ def _structured_claim(claim_id="example_analysis"):
     }
 
 
-def _request(claim, *, claim_id="example_analysis", registered_at="2026-11-02T10:34:20+09:00",
+def _request(claim, *, claim_id="sample_claim", registered_at="2026-11-02T10:34:20+09:00",
              fetched_at="2026-11-02T01:26:07+09:00"):
     """A judge_request shaped like the three real folders: free-text-or-structured claim plus the
     analysis the worker DID produce (manifest.result, lot_diagnosis y/x/lot)."""
@@ -127,7 +127,7 @@ def test_gap_is_empty_on_a_non_dict():
 
 # --- 2. completion names the missing keys BEFORE the engine runs ----------------------------
 
-@pytest.mark.parametrize("claim_id", ["example_analysis", "example_analysis", "example_analysis"])
+@pytest.mark.parametrize("claim_id", ["sample_claim", "sample_claim", "sample_claim"])
 def test_free_text_claim_is_corrected_before_engine_with_named_keys(tmp_path, monkeypatch, claim_id):
     """Reproduces the three real folders: a free-text claim + the analysis data. The harness must
     hand back a correction that NAMES the missing engine keys, and must NOT have run the engine."""
