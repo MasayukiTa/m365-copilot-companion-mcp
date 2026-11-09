@@ -7,8 +7,8 @@ the DB, the harness should be able to read them. A harness that is NOT wired to
 read them is a bad harness.
 
 The validity verdict engine itself lives OUTSIDE this public repository
-(Desktop/AHA資料_参照一式/証明/公開データ検証, a SECRET, remote-less, FROZEN
-checkout whose engine code is byte-identical-locked by PREREGISTRATION_v1_8c2.md
+(Desktop/validity_engine, a private, remote-less, FROZEN
+checkout whose engine code is byte-identical-locked by PREREGISTRATION.md
 and therefore must not be edited). This repository can only host the
 non-secret ORCHESTRATION layer that:
 
