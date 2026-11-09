@@ -112,7 +112,7 @@ def test_order_posthoc_caps():
 
 
 def test_order_no_lock_caps():
-    assert "D_FAIL_NO_LOCK" in vj.order_gate(True, False)
+    assert "D_FAIL_UNLOCKED" in vj.order_gate(True, False)
 
 
 def test_order_ok_clean():
@@ -129,7 +129,7 @@ def test_classify_straddle_none():
 
 
 def test_classify_practical_null():
-    assert vj.classify(-0.3, 0.3, 0.5) == "PRACTICAL_NULL"
+    assert vj.classify(-0.3, 0.3, 0.5) == "EFFECT_NULL"
 
 
 def test_classify_opposite():
@@ -212,7 +212,7 @@ def test_decide_na_fixed_between_c5():
 
 
 def test_decide_error_on_input():
-    v, f, r, n = vj.decide(base_claim(), struct(input_errors=["INPUT_NO_ROWS"]),
+    v, f, r, n = vj.decide(base_claim(), struct(input_errors=["INPUT_EMPTY_ROWS"]),
                            good_interval(0.6, 1.2), [], [])
     assert v == "ERROR"
 
@@ -220,7 +220,7 @@ def test_decide_error_on_input():
 def test_verdict_finding_consistency_no_go_finding_under_cap():
     # under any cap, verdict is never GO and no GO finding leaks
     v, f, r, n = vj.decide(base_claim(), struct(), good_interval(0.6, 1.2), [],
-                           ["D_FAIL_NO_LOCK"])
+                           ["D_FAIL_UNLOCKED"])
     assert v != "GO" and f is None
 
 

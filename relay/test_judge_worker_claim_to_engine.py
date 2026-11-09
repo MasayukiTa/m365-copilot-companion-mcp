@@ -52,7 +52,7 @@ def _fake_engine_root(tmp_path, *, with_configs_id=None, with_lock=False,
         (root / "lock.json").write_text(json.dumps({"files": {}}), encoding="utf-8")
     verdict = verdict or {"id": "SYN1", "verdict": "HOLD", "verdict_ja": "\u4fdd\u7559",
                           "finding": None, "claim_supported": None,
-                          "reasons": ["D_FAIL_NO_LOCK"], "notes": [], "evidence": {"K": 3},
+                          "reasons": ["D_FAIL_UNLOCKED"], "notes": [], "evidence": {"K": 3},
                           "hashes": {"input_sha256": "0" * 64}}
     script = (
         "import json, os, sys\n"

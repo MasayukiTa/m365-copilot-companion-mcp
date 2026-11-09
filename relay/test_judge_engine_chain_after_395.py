@@ -64,7 +64,7 @@ def _fake_engine_root(tmp_path, *, with_configs_id=None):
                         "dataset_id": "synthetic", "source": "human-configs"}),
             encoding="utf-8")
     verdict = {"id": CLAIM_ID, "verdict": "HOLD", "verdict_ja": "\u4fdd\u7559",
-               "finding": None, "claim_supported": None, "reasons": ["D_FAIL_NO_LOCK"],
+               "finding": None, "claim_supported": None, "reasons": ["D_FAIL_UNLOCKED"],
                "notes": [], "evidence": {"K": 2}, "hashes": {"input_sha256": "0" * 64}}
     script = (
         "import json, os, sys\n"

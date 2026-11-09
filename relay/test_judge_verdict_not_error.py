@@ -158,7 +158,7 @@ def test_structured_claim_does_not_trigger_the_schema_correction(tmp_path, monke
     def _engine(cid, **kw):
         seen["claim"] = kw.get("registered_claim")
         return {"engine_available": True, "verdict": "GO", "verdict_ja": "採用",
-                "finding": "PRACTICAL_NULL", "claim_supported": True, "reasons": ["A_OK"],
+                "finding": "EFFECT_NULL", "claim_supported": True, "reasons": ["A_OK"],
                 "notes": [], "evidence": {"K": 6}, "hashes": {"input_sha256": "a" * 64},
                 "claim_source": "worker-registered via harness registry"}
 

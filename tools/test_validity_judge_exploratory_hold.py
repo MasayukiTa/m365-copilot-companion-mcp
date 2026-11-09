@@ -114,7 +114,7 @@ def test_d_split_independence_unknown_is_hold():
 
 # (e) input missing -> ERROR -------------------------------------------------------
 def test_e_input_error_is_error():
-    v, f, r, n = vj.decide(base_claim(), struct(input_errors=["INPUT_NO_ROWS"]),
+    v, f, r, n = vj.decide(base_claim(), struct(input_errors=["INPUT_EMPTY_ROWS"]),
                            good_interval(0.6, 1.2), [], [])
     assert v == "ERROR"
 
@@ -155,6 +155,6 @@ def test_na_still_beats_exploratory_cap():
 
 def test_error_still_beats_exploratory_cap():
     c = base_claim(mode="exploratory")
-    v, f, r, n = vj.decide(c, struct(input_errors=["INPUT_NO_ROWS"]),
+    v, f, r, n = vj.decide(c, struct(input_errors=["INPUT_EMPTY_ROWS"]),
                            good_interval(0.6, 1.2), [], [])
     assert v == "ERROR"
