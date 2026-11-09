@@ -1172,7 +1172,11 @@ jobs:
             scripts/periodic_scan/tests/test_runner.py \
             scripts/periodic_scan/tests/test_ledger_io.py \
             scripts/periodic_scan/tests/test_judge_wrapper.py \
-            scripts/periodic_scan/tests/test_db_lots.py
+            scripts/periodic_scan/tests/test_db_lots.py \
+            scripts/periodic_scan/tests/test_screening_confound.py \
+            scripts/periodic_scan/tests/test_screening_screen_select_prereg.py \
+            scripts/periodic_scan/tests/test_report_md.py \
+            scripts/periodic_scan/tests/test_report_pptx_and_ledger.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
