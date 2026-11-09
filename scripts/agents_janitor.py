@@ -41,6 +41,8 @@ import subprocess
 import sys
 import time
 
+from tools import childproc
+
 
 #: Folders that are shared infrastructure, not disposable worker clones. The janitor NEVER
 #: touches these by name, independent of their git state -- e.g. `repo`/`_base` are base clones
@@ -89,9 +91,10 @@ def _git(folder: str, *args: str) -> subprocess.CompletedProcess | None:
     never as "clean".
     """
     try:
-        return subprocess.run(
+        return childproc.run(
             ["git", "-C", folder, *args],
-            capture_output=True, text=True, timeout=60,
+            capture_output=True, timeout=60,
+            creationflags=childproc.headless_creationflags(),
         )
     except (OSError, subprocess.SubprocessError):
         return None

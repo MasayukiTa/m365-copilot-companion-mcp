@@ -11,13 +11,13 @@ same on the Linux CI runner.
 from __future__ import annotations
 
 import os
-import subprocess
 import sys
 import time
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from tools import childproc  # noqa: E402
 import agents_janitor as aj  # noqa: E402
 
 
@@ -27,21 +27,21 @@ def _git(cwd, *args):
     env.setdefault("GIT_AUTHOR_EMAIL", "t@t")
     env.setdefault("GIT_COMMITTER_NAME", "t")
     env.setdefault("GIT_COMMITTER_EMAIL", "t@t")
-    r = subprocess.run(["git", "-C", cwd, *args], capture_output=True, text=True, env=env)
+    r = childproc.run(["git", "-C", cwd, *args], capture_output=True, env=env)
     assert r.returncode == 0, (args, r.stderr)
     return r
 
 
 def _make_remote(tmp_path):
     remote = tmp_path / "remote.git"
-    subprocess.run(["git", "init", "--bare", str(remote)], capture_output=True, check=True)
+    childproc.run(["git", "init", "--bare", str(remote)], capture_output=True, check=True)
     return remote
 
 
 def _make_clone(tmp_path, remote, name, *, with_commit=True, old=True):
     """A clone that is clean, fully pushed, and (by default) old -> deletable."""
     clone = tmp_path / name
-    subprocess.run(["git", "clone", str(remote), str(clone)], capture_output=True, check=True)
+    childproc.run(["git", "clone", str(remote), str(clone)], capture_output=True, check=True)
     _git(str(clone), "config", "user.email", "t@t")
     _git(str(clone), "config", "user.name", "t")
     if with_commit:
