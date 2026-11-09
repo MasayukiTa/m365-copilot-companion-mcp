@@ -294,6 +294,24 @@ KEYS = OrderedDict([
        "one with no restart. A present line reads as on only when it says on; anything else on a "
        "present line is off, while an absent line is on (the default)."),
 
+    # Resume an acting repo goal cut with delivery UNKNOWN in a NEW conversation that first reads
+    # its real state (relay/resume_from_state.py). ON by default.
+    _k("resume_from_state", EACH_GATE, "on",
+       "relay/resume_from_state.py:mode (read when an acting turn is cut with delivery unknown and "
+       "no same-conversation continue is available, mtime-cached)",
+       "on|off. on (default): when an acting repository goal (git/tests/files) has its turn cut "
+       "with delivery unknown -- a dropped socket or a turn timeout with no reply -- and the "
+       "same-conversation continue (socket_continue_recovery) cannot safely continue it, the "
+       "harness opens a NEW conversation whose first instruction is to read the real state "
+       "(git status, git log, gh pr view of the branch, the files it was writing) and continue "
+       "from there, so nothing already done is executed twice. One resume per goal "
+       "(MCP_FLEET_RESUME_FROM_STATE_MAX, default 1), like a delivered reconnect. It never fires "
+       "for a goal that names the model's own native acts (mail/calendar/chat): those cannot be "
+       "reconciled from a git/file read, so they keep the careful refuse-to-STUCK. off: such a "
+       "cut ends the worker STUCK with no resume, exactly as before. Read at that decision, so a "
+       "change reaches the next one with no restart. A present line reads as off only when it "
+       "says off; anything else is on (the default)."),
+
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
     # enforcing a write scope would go through the folder policy (frozen) and needs a separate
