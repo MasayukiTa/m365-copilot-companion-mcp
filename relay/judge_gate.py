@@ -1301,7 +1301,6 @@ def _stratified_footer_lines(lot_diagnosis):
     out.append("  ※ 層別に推定してからプール。製品・ライン等を跨いだ比較はしていません。")
     return out
 
-
 # --- DESIGN-FEASIBILITY FORCE-HOLD (this slice) ------------------------------
 #
 # WHY THIS EXISTS, AND HOW IT DIFFERS FROM design_check. A SEPARATE, info-only

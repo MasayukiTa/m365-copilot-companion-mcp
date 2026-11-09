@@ -4,7 +4,8 @@ hold (i.e. both groups share strata with enough lots each).
 
 WHY THIS MODULE EXISTS.
   The owner's standing objection (2026-11-03..04) is that comparing two exposure groups whose
-  PRODUCTS differ cannot separate an equipment effect from a product effect. The
+  PRODUCTS (the product grade; the concrete domain name is kept in gitignored .config/domain_terms.json)
+  differ cannot separate an equipment effect from a product effect. The
   design-check seam (confound_gate / judge footer, implemented elsewhere) BLOCKS such a
   comparison before it is run. This module is the other half: when the design DOES hold, the
   comparison must still be estimated WITHIN each shared stratum and then pooled, never across
