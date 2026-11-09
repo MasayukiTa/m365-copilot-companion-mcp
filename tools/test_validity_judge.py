@@ -291,3 +291,18 @@ def test_footer_has_required_fields():
     assert ft["claims_used"] == ["C-TEST"] and ft["ledger_rows"] == ["L-12"]
     assert ft["df"] == 6 and ft["K"] == 8
     assert ft["default_hold_if_only_D_or_B_below"] is True
+
+
+# -------------------------------------------------- claim_sha256 (canon §0 id)
+def test_claim_sha256_is_deterministic_and_canonical():
+    # Exercises validity_judge.claim_sha256 from outside: a stable 64-hex digest that
+    # ignores key order (canonical JSON) and changes when the claim changes.
+    c = base_claim()
+    h1 = vj.claim_sha256(c)
+    assert isinstance(h1, str) and len(h1) == 64
+    assert all(ch in "0123456789abcdef" for ch in h1)
+    # key order must not matter (canonicalised before hashing)
+    reordered = dict(reversed(list(c.items())))
+    assert vj.claim_sha256(reordered) == h1
+    # a changed claim yields a different digest
+    assert vj.claim_sha256(base_claim(product="PROD-B")) != h1
