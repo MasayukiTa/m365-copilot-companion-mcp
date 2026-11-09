@@ -200,7 +200,7 @@ JUDGE_REQUEST_SCHEMA = (
     "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
     "manifest {path: manifest を書き出す JSON ファイルのパス (フォルダ不可), dataset_id: 文字列, "
     "result: 解析結果そのものを表す JSON オブジェクト (パス文字列ではない。例 "
-    '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
+    '{"n_lots": 6, "defect_rate_by_lot": {...}, "top_correlation_vs_defect_rate": {...}}'
     ")}; "
     "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
     "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}; "
@@ -442,8 +442,8 @@ def _short_type(value) -> str:
 #: A minimal, data-free example of a valid manifest.result object, shown in a correction so the
 #: worker sees the SHAPE expected (an analysis-result object) instead of a path string.
 _MANIFEST_RESULT_EXAMPLE = (
-    '{"n_lots": 6, "kasure_rate_by_lot": {"<lot>": 0.5}, '
-    '"top_correlation_vs_kasure": {"<feature>": 0.9}}')
+    '{"n_lots": 6, "defect_rate_by_lot": {"<lot>": 0.5}, '
+    '"top_correlation_vs_defect_rate": {"<feature>": 0.9}}')
 
 
 def _validate_manifest(manifest, output_folder="") -> str:
@@ -1245,7 +1245,7 @@ def _fmt_n(ev: dict) -> str:
 # `design_check` footer section (feat/judge-footer-design-check) ADDS what it saw
 # about the comparison design but changes nothing about the verdict. The owner
 # (2026-11-04 07:45) said that is not enough: when groups being compared differ by
-# PRODUCT (塗工布品名) rather than by the exposure under study, the comparison is not
+# PRODUCT (the grouping column's product value) rather than by the exposure under study, the comparison is not
 # a comparison at all (equipment-vs-product cannot be separated), and that must be
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
 # inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
@@ -1277,7 +1277,7 @@ def _fmt_n(ev: dict) -> str:
 #: machine code. An unknown code is still surfaced verbatim (never swallowed).
 _DESIGN_INFEASIBLE_REASONS = {
     "STRATUM_COLUMN_ABSENT":
-        "層別の候補列(製品=塗工布品名・製造品名・品種、ライン、期間など)が入力に無い",
+        "層別の候補列(製品または設備を表すグループ列、ライン、期間など)が入力に無い",
     "NO_COMMON_STRATUM":
         "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
     "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
@@ -1345,7 +1345,7 @@ def _design_hold_lines(hold: dict) -> list:
         lots = "未返却"
     seen = ("見たもの: 共通層の数=%s, 各群のロット数{%s}, 重なり係数=%s"
             % (hold.get("common_strata"), lots, hold.get("overlap_coefficient")))
-    note = ("比較する群が曝露ではなく製品(塗工布品名)で分かれているため、設備の差か製品の差か"
+    note = ("比較する群が曝露ではなく製品(グループ列の製品値)で分かれているため、設備の差か製品の差か"
             "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。")
     return [head, why, seen, note]
 

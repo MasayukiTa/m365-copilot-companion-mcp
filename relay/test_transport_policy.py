@@ -240,3 +240,49 @@ def test_a_failing_checker_after_no_close_frame_falls_back_to_refuse():
         raise RuntimeError("git unavailable")
     assert resend_decision_for_landed_act(goal, _raises) == "refuse"
     assert resend_decision_for_landed_act(goal, lambda g: CHECK_UNKNOWN) == "refuse"
+
+
+# ---- a route-caused drop must also indict the connection, or the breaker never counts it ----
+#
+# 2026-11-09: ~13 workers ended STUCK at once on one upstream drop. report_route_fault() sends
+# every fault to SocketRoute.note_failure(), which only increments the breaker when
+# indicts_connection(reason) is True. The websockets ConnectionClosedError str() can arrive
+# without its class name -- bare "no close frame received or sent" or, on a keepalive timeout,
+# "sent 1011 (internal error) keepalive ping timeout; no close frame received or sent". Those
+# classified as route (or unknown) yet indicts_connection() returned False, so a real transport
+# drop counted for nothing and the route stayed open while every in-flight turn died unknown.
+# The invariant that prevents the regression: anything the classifier calls 'route' MUST also
+# indict the connection -- otherwise report_route_fault hands note_failure a fault it drops.
+
+_DROP_REASONS = [
+    "no close frame received or sent",
+    "ConnectionClosedError: no close frame received or sent",
+    "sent 1011 (internal error) keepalive ping timeout; no close frame received or sent",
+    "websocket connection closed: no close frame received or sent",
+]
+
+
+@pytest.mark.parametrize("reason", _DROP_REASONS)
+def test_no_close_frame_and_keepalive_timeout_indict_the_connection(reason):
+    from relay.transport_policy import indicts_connection
+    assert indicts_connection(reason) is True, reason
+    assert classify_fallback(reason) == "route", reason
+
+
+def test_every_route_classified_drop_also_indicts_so_the_breaker_counts_it():
+    # The asymmetry itself is the bug: a reason classified 'route' that does not indict is a
+    # fault report_route_fault() forwards and note_failure() silently drops.
+    from relay.transport_policy import indicts_connection
+    for reason in _DROP_REASONS:
+        if classify_fallback(reason) == "route":
+            assert indicts_connection(reason) is True, (
+                "route-caused but not connection-indicting -> breaker never counts it: " + reason)
+
+
+def test_a_stall_is_still_not_a_connection_fault_after_the_widening():
+    # The widening must not swallow stalls: 'no meaningful progress' is honest-unknown work, not
+    # a dropped socket, and must keep indicts=False so a stall never trips the transport breaker.
+    from relay.transport_policy import indicts_connection, is_stall
+    for benign in ("turn stalled on one conversation", "no meaningful progress"):
+        assert indicts_connection(benign) is False, benign
+        assert is_stall(benign) is True, benign
