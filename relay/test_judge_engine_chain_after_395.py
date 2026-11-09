@@ -47,8 +47,8 @@ CLAIM_ID = "example_analysis"
 # measurements -- synthetic lot ids and numbers only.
 RESULT_OBJECT = {
     "n_lots": 2,
-    "kasure_rate_by_lot": {"L-A": 0.5, "L-B": 0.0},
-    "top_correlation_vs_kasure": {"feat_x": 0.9},
+    "defect_rate_by_lot": {"L-A": 0.5, "L-B": 0.0},
+    "top_correlation_vs_defect_rate": {"feat_x": 0.9},
 }
 
 
@@ -121,7 +121,7 @@ def test_manifest_result_path_string_is_corrected_with_example(tmp_path, monkeyp
     assert "manifest.result must be an object" in joined
     assert "not a path string" in joined.lower() or "NOT a path string" in joined
     # A minimal valid example is shown so the worker sees the SHAPE.
-    assert "kasure_rate_by_lot" in joined
+    assert "defect_rate_by_lot" in joined
 
 
 # ---- defect 3: manifest.path is a directory, caught before any open() --------
