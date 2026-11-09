@@ -5714,18 +5714,27 @@ def main():
         # calls below used to run with sweep_active clear -- the watchdog's blind spot -- so a
         # hang there was never seen. Set it here, and keep status.json advancing, so a wedged
         # reconnect is detected and reset like any other wedge.
-        sweep_active.set()
-        _write_recovering_status(attempt, "cdp_alive_probe")
-        if not _with_deadline(lambda: cdp_alive(args.cdp_url),
-                              RECOVERY_STEP_DEADLINE_S, "cdp_alive"):
-            print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
-            # Keep the recovery-status trail origin/main added for this leg, so the watchdog
-            # and cockpit still see the edge-unreachable reset recorded, then take the reset
-            # under the same hard deadline every other recovery step now runs under.
-            _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
-                                   len(pending))
-            _with_deadline(lambda: hard_reset(port), RECOVERY_STEP_DEADLINE_S, "hard_reset")
+        # PUT THE PRE-CONNECT PROBE/RESET INSIDE THE try. These two bounded calls can each
+        # raise FleetRecoveryTimeout (a cdp_alive probe or a hard_reset that blows its 60s
+        # ceiling). They used to sit OUTSIDE the try below, so that timeout escaped every
+        # handler and killed main() -- status frozen, attempt never counted, no retry. The
+        # 2026-11-09 22:37 crash was exactly this: hard_reset(port) timed out at line ~5727
+        # and FleetRecoveryTimeout propagated out of the while-loop. Inside the try, the
+        # generic `except Exception` below counts the attempt and retries through the
+        # ordinary reconnect path, which is what _with_deadline/FleetRecoveryTimeout were
+        # designed for (see their docstrings).
         try:
+            sweep_active.set()
+            _write_recovering_status(attempt, "cdp_alive_probe")
+            if not _with_deadline(lambda: cdp_alive(args.cdp_url),
+                                  RECOVERY_STEP_DEADLINE_S, "cdp_alive"):
+                print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
+                # Keep the recovery-status trail origin/main added for this leg, so the watchdog
+                # and cockpit still see the edge-unreachable reset recorded, then take the reset
+                # under the same hard deadline every other recovery step now runs under.
+                _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
+                                       len(pending))
+                _with_deadline(lambda: hard_reset(port), RECOVERY_STEP_DEADLINE_S, "hard_reset")
             _write_recovering_status(attempt, "connect_over_cdp")
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
