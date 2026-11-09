@@ -173,20 +173,33 @@ KEYS = OrderedDict([
        "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
        "anything but on reads as off."),
 
-    # The owner's standing rule after the 2026-11-02 uia incident: the fleet REFUSES to start a
-    # job whose goal asks for UI automation / computer use on the REAL desktop (desktop_act /
-    # screen_uia_act / screen_uia_dump / Notepad+Calculator automation tests). ON by default --
-    # a safety floor, so a missing/unreadable line keeps it on; only an explicit `off` disables
-    # it. A single goal may still run there by carrying the explicit operator field
-    # allow_real_desktop (off by default on the goal dict). Read live at each worker start.
-    _k("block_real_desktop_automation", EACH_GATE, "on",
+    # The owner's standing rule after the 2026-11-02 uia incident classified goals asking for UI
+    # automation / computer use on the REAL desktop (desktop_act / screen_uia_act / screen_uia_dump
+    # / Notepad+Calculator automation tests). FLIPPED 2026-11-09 (owner instruction): such a goal
+    # is now ALLOWED by default. desktop_guard is the opt-out -- set it to deny to restore the old
+    # refuse-by-default behaviour. Read live at each worker start, mtime-cached.
+    _k("desktop_guard", EACH_GATE, "allow",
        "relay/desktop_guard.py:mode (every worker start, mtime-cached)",
-       "on|off. on (default): a job whose goal text asks for real-desktop UI automation "
-       "(desktop_act, screen_uia_act/dump, 'Notepad and Calculator' automation, '実デスクトップ') "
-       "is REFUSED before a worker opens, with a reason shown in the cockpit, unless the goal "
-       "carries the operator field allow_real_desktop. off: the guard is disabled. The env var "
-       "MCP_BLOCK_REAL_DESKTOP_AUTOMATION beats the file. Read fresh at each start, so a change "
-       "reaches the next worker with no restart; absent or unreadable reads as on (the floor)."),
+       "allow|deny. allow (default, owner instruction 2026-11-09): a job whose goal text asks for "
+       "real-desktop UI automation (desktop_act, screen_uia_act/dump, 'Notepad and Calculator' "
+       "automation, '実デスクトップ') is born as a normal worker. deny: "
+       "restores the old behaviour -- such a goal is REFUSED before a worker opens, with a reason "
+       "shown in the cockpit, unless the goal carries the operator field allow_real_desktop. The "
+       "env var MCP_DESKTOP_GUARD beats the file. Read fresh at each start, so a change reaches the "
+       "next worker with no restart; absent or unreadable reads as allow (the flipped default)."),
+
+    # Back-compat for the pre-2026-11-09 switch. An explicit `on` here still means deny (restore the
+    # old refuse-by-default); `off` means allow. Its ABSENCE no longer means deny -- the default is
+    # now allow via desktop_guard above. Kept declared so operators' existing lines keep working and
+    # the live-settings test still exercises the legacy path. Read live at each worker start.
+    _k("block_real_desktop_automation", EACH_GATE, "off",
+       "relay/desktop_guard.py:mode (legacy deny trigger, every worker start, mtime-cached)",
+       "on|off (legacy). on: restores the old refuse-by-default behaviour (equivalent to "
+       "desktop_guard=deny); a job whose goal text asks for real-desktop UI automation is REFUSED "
+       "unless the goal carries allow_real_desktop. off (default): the new allow default stands. "
+       "The env var MCP_BLOCK_REAL_DESKTOP_AUTOMATION beats the file. Superseded by desktop_guard; "
+       "kept only for back-compat. Read fresh at each start, so a change reaches the next worker "
+       "with no restart; absent or unreadable reads as off."),
 
     # ---------------------------------------------------------------- sweep_start
     _k("autoscale", SWEEP_START, 0,
@@ -294,6 +307,24 @@ KEYS = OrderedDict([
        "one with no restart. A present line reads as on only when it says on; anything else on a "
        "present line is off, while an absent line is on (the default)."),
 
+    # Resume an acting repo goal cut with delivery UNKNOWN in a NEW conversation that first reads
+    # its real state (relay/resume_from_state.py). ON by default.
+    _k("resume_from_state", EACH_GATE, "on",
+       "relay/resume_from_state.py:mode (read when an acting turn is cut with delivery unknown and "
+       "no same-conversation continue is available, mtime-cached)",
+       "on|off. on (default): when an acting repository goal (git/tests/files) has its turn cut "
+       "with delivery unknown -- a dropped socket or a turn timeout with no reply -- and the "
+       "same-conversation continue (socket_continue_recovery) cannot safely continue it, the "
+       "harness opens a NEW conversation whose first instruction is to read the real state "
+       "(git status, git log, gh pr view of the branch, the files it was writing) and continue "
+       "from there, so nothing already done is executed twice. One resume per goal "
+       "(MCP_FLEET_RESUME_FROM_STATE_MAX, default 1), like a delivered reconnect. It never fires "
+       "for a goal that names the model's own native acts (mail/calendar/chat): those cannot be "
+       "reconciled from a git/file read, so they keep the careful refuse-to-STUCK. off: such a "
+       "cut ends the worker STUCK with no resume, exactly as before. Read at that decision, so a "
+       "change reaches the next one with no restart. A present line reads as off only when it "
+       "says off; anything else is on (the default)."),
+
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
     # enforcing a write scope would go through the folder policy (frozen) and needs a separate
@@ -392,14 +423,17 @@ KEYS = OrderedDict([
        "tools/walk.py:search_max_depth (iter_files, at the start of every search)",
        "Deepest directory level a file search descends into, counted from the search root (0 == only the root directory). Read fresh at every search, so a change reaches the next one with no restart. Absent/empty/negative means NO limit, which is the default and the pre-#328 behaviour. A per-call max_depth overrides it."),
 
-    # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
-    # which queued goal a router using the remaining admission margins and the role profile
-    # would have admitted, beside the one that was. There is deliberately no value that routes.
+    # Load-aware routing (relay/load_routing.py). At each admission it records which queued goal
+    # a router using the remaining admission margins and the role profile would have admitted,
+    # beside the one that was. `on` additionally admits the router's choice, for an off-vs-on
+    # paired comparison; the default stays off.
     _k("fanout_load_routing", EACH_GATE, "off",
        "relay/load_routing.py:mode (every admission, mtime-cached)",
-       "off|shadow. Re-read at every admission with no restart. shadow appends one row per "
-       "admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the router "
-       "would have admitted, the margins); nothing is reordered and no prompt or output "
+       "off|shadow|on. Re-read at every admission with no restart. shadow and on each append one "
+       "row per admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the "
+       "router would have admitted, the margins). shadow reorders nothing and changes no prompt "
+       "or output. on admits the router's chosen goal in place of the coordinator's when they "
+       "differ (the displaced goal returns to the head of the queue); no prompt or output "
        "changes."),
 
     # Read-only tool result cache (relay/result_cache.py). SHADOW ONLY: at each read-only tool

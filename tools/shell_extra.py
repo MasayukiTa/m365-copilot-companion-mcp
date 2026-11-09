@@ -141,6 +141,13 @@ def pwsh_exec(
     locked = require_unlocked()
     if locked:
         return locked
+    # Refuse an image-wide python.exe kill before anything else: it would take down
+    # the MCP server (and this worker) itself. Lazy import avoids a circular import
+    # (code_exec imports this module).
+    from .code_exec import kills_every_python
+    refusal = kills_every_python(script)
+    if refusal:
+        return "[pwsh_exec error] " + refusal
     from . import contract_gate as _cg
     if _cg.destructive_shell(script):
         _g = _cg.check_op("shell_destructive", _gate_detail(script))

@@ -1391,12 +1391,12 @@ public static class LoadRoutingView
     public const string Key = "fanout_load_routing";
     public const string Default = "off";
 
-    public static readonly string[] Modes = { "off", "shadow" };
+    public static readonly string[] Modes = { "off", "shadow", "on" };
 
-    public static bool IsMode(string v) { return v == "off" || v == "shadow"; }
+    public static bool IsMode(string v) { return v == "off" || v == "shadow" || v == "on"; }
 
     /// <summary>The mode named by one fanout_load_routing= line; null when the line is not that
-    /// key or the value is not off|shadow (the caller keeps its value, off). A byte order mark
+    /// key or the value is not off|shadow|on (the caller keeps its value, off). A byte order mark
     /// is tolerated and the value is case-insensitive, as in Python.</summary>
     public static string ParseLine(string line)
     {
@@ -1413,13 +1413,14 @@ public static class LoadRoutingView
     {
         if (mode == "off") return ja ? "オフ" : "Off";
         if (mode == "shadow") return ja ? "シャドウ(記録のみ)" : "Shadow (record only)";
+        if (mode == "on") return ja ? "オン(割当を適用)" : "On (apply routing)";
         return mode ?? "";
     }
 
     public static string Help(bool ja)
     {
-        return ja ? "記録のみ: 割当は変わりません。ゴールを走らせるたびに、空き状況と役割ごとの実績から選んだ場合に走らせたはずのゴールを記録します。"
-                  : "Record only: assignment is unchanged. At each admission, records which queued goal a router using the free capacity and the per-role record would have admitted.";
+        return ja ? "シャドウは記録のみ(割当は変わりません): ゴールを走らせるたびに、空き状況と役割ごとの実績から選んだ場合に走らせたはずのゴールを記録します。オンは同じ記録に加えて、その選んだゴールを実際に先に走らせます(押しのけたゴールは待ち行列の先頭に戻ります)。オフ対オンの対比較用です。"
+                  : "Shadow records only (assignment unchanged): at each admission, records which queued goal a router using the free capacity and the per-role record would have admitted. On writes the same record AND admits that chosen goal first (the displaced goal returns to the head of the queue), for an off-vs-on paired comparison.";
     }
 
     public static string TakeEffectTip(bool ja)
@@ -1433,10 +1434,14 @@ public static class LoadRoutingView
     public static string Describe(string mode, int recorded, int differed, bool ja)
     {
         if (!IsMode(mode)) return null;
-        string head = (ja ? "稼働中: " : "In effect: ") + (mode == "shadow" ? (ja ? "シャドウ(記録のみ)" : "shadow (record only)") : (ja ? "オフ" : "off"));
-        if (mode == "shadow")
+        string word;
+        if (mode == "shadow") word = ja ? "シャドウ(記録のみ)" : "shadow (record only)";
+        else if (mode == "on") word = ja ? "オン(割当を適用)" : "on (apply routing)";
+        else word = ja ? "オフ" : "off";
+        string head = (ja ? "稼働中: " : "In effect: ") + word;
+        if (mode == "shadow" || mode == "on")
             head += ja ? " / 記録 " + recorded + " 件、うち異なる選択 " + differed + " 件"
-                       : " / " + recorded + " recorded, " + differed + " would differ";
+                       : " / " + recorded + " recorded, " + differed + (mode == "on" ? " differed" : " would differ");
         return head;
     }
 
