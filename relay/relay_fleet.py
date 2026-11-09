@@ -12511,6 +12511,26 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         _socket_cap = min(_lane_ceiling, socket_capacity.ram_safeguard_cap(
             active_worker_count(workers), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
             _lane_ceiling))
+        # PRE-WEDGE BRAKE. The ram_safeguard_cap above prices a held socket at a few MB and only
+        # gates NEW admissions; on 2026-11-09 it still let the fleet climb to 48 msedge / 778 MB
+        # free before the dedicated Edge stopped answering its DevTools port and the watchdog
+        # hard-reset it, losing 43 then 30 goals. _preemptive_tab_ceiling stops admitting new
+        # goals once free RAM is at/under the measured floor (1024 MB, above that 778 MB failure
+        # point) OR the msedge process count is at/over the measured cap (40, below the 48 seen),
+        # so pressure drains as open goals finish instead of wedging. It never returns below the
+        # current open count, so no in-flight goal is dropped. Both signals are read defensively;
+        # a failure to read either leaves the existing cap untouched.
+        try:
+            from relay.fleet_runner import _preemptive_tab_ceiling as _pre_ceiling
+            try:
+                from relay.edge_recover import _msedge_cmdlines as _edge_cmds
+                _msedge_n = len(_edge_cmds())
+            except Exception:
+                _msedge_n = None
+            _socket_cap = min(_socket_cap, _pre_ceiling(
+                active_worker_count(workers), avail_phys_mb(), _msedge_n))
+        except Exception:
+            pass
         _priority_ram_cap = socket_capacity.ram_safeguard_cap(
             active_worker_count(workers), avail_phys_mb(), ram_box[0], socket_capacity.goal_cost_mb(),
             _lane_ceiling + 100)

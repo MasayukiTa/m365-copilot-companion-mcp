@@ -3268,6 +3268,65 @@ def _recovery_step(attempt, progressed, max_recover, base_s=30.0, cap_s=600.0):
     return (attempt, min(float(cap_s), float(base_s) * (2 ** min(over, 16))), False)
 
 
+#: The free-RAM level (MB) at or below which the fleet stops opening new tabs, measured from
+#: the wedge of 2026-11-09: the coordinator log recorded free RAM 778 MB with 48 msedge
+#: processes and CPU 89% at 21:42, moments before the watchdog called the Edge wedged (status
+#: frozen, DevTools port unanswered) and hard-reset it, losing 43 then 30 goals across two
+#: recoveries. 1024 MB sits safely ABOVE the observed 778 MB failure point, so admission stops
+#: while there is still headroom to drain, instead of after the browser has already wedged.
+EDGE_WEDGE_RAM_FLOOR_MB = float(
+    os.environ.get("MCP_EDGE_WEDGE_RAM_FLOOR_MB", "1024") or 1024)
+#: The msedge process count at or above which the fleet stops opening new tabs. Chromium spawns
+#: several processes per profile (browser, gpu, network, and one renderer/utility per busy tab),
+#: so the raw count is a usable proxy for tab pressure when per-process working set is not
+#: sampled. 40 sits BELOW the 48 observed at the wedge, so the cap engages before that level is
+#: reached. 0 disables the process-count arm (RAM floor still applies).
+EDGE_WEDGE_PROC_CAP = int(os.environ.get("MCP_EDGE_WEDGE_PROC_CAP", "40") or 40)
+
+
+def _preemptive_tab_ceiling(open_tabs, free_mb, msedge_count,
+                            ram_floor_mb=EDGE_WEDGE_RAM_FLOOR_MB,
+                            proc_cap=EDGE_WEDGE_PROC_CAP):
+    """Pure decision: given the live tab count and the two pressure signals the watchdog never
+    looked at BEFORE a wedge (free physical RAM and the msedge process count), return the
+    maximum number of tabs the fleet should allow open right now. Side-effect free so it can be
+    unit-tested without a browser or a live machine.
+
+    Returns an int ceiling to clamp the autoscale target to. It NEVER closes a tab that is
+    already open (the ceiling is at least ``open_tabs``): a mid-flight goal is not thrown away,
+    which is the exact cost the hard reset imposed. What it does is STOP NEW ADMISSIONS while
+    the machine is under the pressure that preceded the 2026-11-09 wedge, so the pressure drains
+    as open tabs finish instead of climbing until the Edge stops answering its DevTools port.
+
+    Rationale for the thresholds is MEASURED, not assumed -- see EDGE_WEDGE_RAM_FLOOR_MB and
+    EDGE_WEDGE_PROC_CAP, both taken from the coordinator log at 21:42 (free RAM 778 MB, 48
+    msedge). A caller that does not have a signal passes None for it, and that arm is skipped.
+    """
+    try:
+        open_tabs = max(0, int(open_tabs))
+    except (TypeError, ValueError):
+        open_tabs = 0
+    pressured = False
+    if free_mb is not None:
+        try:
+            if float(free_mb) <= float(ram_floor_mb):
+                pressured = True
+        except (TypeError, ValueError):
+            pass
+    if msedge_count is not None and proc_cap > 0:
+        try:
+            if int(msedge_count) >= int(proc_cap):
+                pressured = True
+        except (TypeError, ValueError):
+            pass
+    if pressured:
+        # Hold at the current open count: finish what is open, admit nothing new.
+        return open_tabs
+    # No pressure -> impose no ceiling of our own (a large sentinel the caller min()s with its
+    # existing cap, so autoscale keeps governing as before).
+    return 1 << 30
+
+
 COMMANDS_DIR = "commands.d"
 
 #: Where landing receipts go: <state_dir>/acks/<jid>.ack. The same layout relay/task_router's
