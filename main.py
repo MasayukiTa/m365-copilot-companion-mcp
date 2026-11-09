@@ -1929,14 +1929,38 @@ async def _observe_inbound(scope, receive):
         # never hold up a request. If the submit itself fails or the pool is full, the line is
         # simply dropped. A request that answers is worth far more than a journal line.
         try:
-            _OBS_POOL.submit(_finish, methods, extras)
+            return _OBS_POOL.submit(_finish, methods, extras)
+        except Exception:
+            return None
+
+    async def _offload_and_settle(methods, extras=None):
+        # Fire-and-forget onto the DEDICATED pool, then AWAIT its completion via the event loop
+        # WITHOUT holding the loop: asyncio.wrap_future yields control while the journal runs on
+        # its own thread, so a slow write suspends only this coroutine, never the loop. Request
+        # intake still never queues behind tool bodies (they run on the DEFAULT pool, this on
+        # _OBS_POOL), which is the starvation fix; awaiting the dedicated-pool future only makes
+        # the line observable to the caller once it is on disk. Best-effort: a failed submit or a
+        # journal error is swallowed.
+        fut = _offload(methods, extras)
+        if fut is None:
+            return
+        try:
+            await asyncio.wrap_future(fut)
         except Exception:
             pass
 
     try:
         http_method = str(scope.get("method") or "")
         if http_method != "POST":
-            _offload([("HTTP " + http_method, "")])
+            # Non-POST never wraps the body stream (we return the original receive), so settle the
+            # journal here. Block only this submit's own tiny future, briefly; the GET path reads
+            # no body, so there is nothing to stall behind.
+            fut = _offload([("HTTP " + http_method, "")])
+            if fut is not None:
+                try:
+                    fut.result(timeout=5)
+                except Exception:
+                    pass
             return receive
     except Exception:
         return receive
@@ -1956,13 +1980,13 @@ async def _observe_inbound(scope, receive):
                 if not message.get("more_body"):
                     from tools import obs_log
                     if state["over"]:
-                        _offload([("(oversize)", "")])
+                        await _offload_and_settle([("(oversize)", "")])
                     else:
                         _body = bytes(state["buf"])
-                        _offload(obs_log.methods_from_body(_body),
-                                 obs_log.extras_from_body(_body))
+                        await _offload_and_settle(obs_log.methods_from_body(_body),
+                                                  obs_log.extras_from_body(_body))
             elif not state["done"] and message.get("type") == "http.disconnect":
-                _offload([("(disconnect-before-body)", "")])
+                await _offload_and_settle([("(disconnect-before-body)", "")])
         except Exception:
             pass
         return message
@@ -1971,7 +1995,7 @@ async def _observe_inbound(scope, receive):
         # A response started although the body was never read (auth rejected it first): still
         # worth one line, so "client reached us and was refused" is distinguishable from silence.
         try:
-            _offload([("(body-unread status=%s)" % status, "")])
+            await _offload_and_settle([("(body-unread status=%s)" % status, "")])
         except Exception:
             pass
 
