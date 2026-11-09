@@ -2383,6 +2383,45 @@ def _mark_not_accepting_goals(status_path):
     _write_atomic(status_path, snap)
 
 
+def _stamp_recovery_status(status_path, attempt, phase, pending_count):
+    """Keep status.json ADVANCING while the recovery loop is between legs.
+
+    THE SILENT-FREEZE FIX. During recovery the sweep (run_relay_fleet) is not running, so
+    nothing calls on_tick and status.json stops being rewritten. If a recovery step then
+    blocks, the file's mtime stays frozen: task_router.fleet_is_live() and the cockpit see
+    a run that is neither advancing nor declared dead, and the watchdog upstream cannot tell
+    a wedged recovery from a healthy pause. Observed 2026-11-07..09: ~33 h of total silence
+    inside recovery attempt 1.
+
+    So every recovery step stamps here. MERGE, DON'T REPLACE (same contract as
+    _mark_not_accepting_goals): load the existing snapshot and set only the recovery fields
+    plus a fresh `updated`, so running / workers / the rest the cockpit reads are preserved.
+    A fresh `updated` lands the stamp inside FLEET_LIVE_MAX_AGE_S, so a downstream watcher
+    can see recovery is progressing (attempt/phase changing) OR stuck (same stamp, old
+    mtime) and retry instead of waiting forever. Best-effort: a status write must never be
+    the thing that takes recovery down, so every failure is swallowed.
+    """
+    try:
+        try:
+            with open(status_path, encoding="utf-8-sig") as fh:
+                snap = json.load(fh)
+        except Exception:
+            snap = {}
+        if not isinstance(snap, dict):
+            snap = {}
+        snap["updated"] = time.time()
+        snap["recovering"] = True
+        snap["recovery"] = {
+            "attempt": int(attempt),
+            "phase": str(phase),
+            "pending": int(pending_count),
+            "stamped": time.time(),
+        }
+        _write_atomic(status_path, snap)
+    except Exception:
+        pass  # the stamp is an optimisation; never let it break recovery
+
+
 # ── RUN-RESUME ledger ──────────────────────────────────────────────────────────
 # When a fleet run dies midway (process killed, PC reboot, crash), the unfinished
 # goals would be lost from the runner's perspective. We persist two small sidecar
@@ -5357,6 +5396,15 @@ def main():
     from relay.relay_fleet import FleetContextLost, reset_socket_route
     from relay.edge_recover import cdp_alive, companion_edge_mb, hard_reset as _edge_hard_reset
     from relay.edge_recover import other_fleet_runs, should_recycle
+    # BOUNDED health probe for the recovery loop. cdp_alive() can block forever on a wedged
+    # browser (its `_ = b.contexts` CDP round-trip has no timeout); cdp_alive_bounded() runs
+    # it under a hard wall-clock ceiling so a stuck probe becomes "not alive" -> reset,
+    # never a silent 33-hour freeze of the whole coordinator (observed 2026-11-07..09).
+    from relay.edge_recover import cdp_alive_bounded
+    #: Wall-clock ceiling for every recovery-loop health probe. Past this the browser is
+    #: treated as wedged and reset, rather than waited on indefinitely.
+    RECOVER_CDP_PROBE_DEADLINE_S = float(
+        os.environ.get("MCP_FLEET_RECOVER_CDP_DEADLINE_S", "25"))
 
     #: How many times a discretionary reset defers to a sibling before taking it anyway.
     EDGE_SUPPRESS_MAX = int(os.environ.get("MCP_FLEET_EDGE_SUPPRESS_MAX", "3"))
@@ -5559,15 +5607,26 @@ def main():
                          % (what, new_attempt,
                             len(unfinished if unfinished is not None else pending), wait_s)),
                   flush=True)
+            _unfin_n = len(unfinished if unfinished is not None else pending)
             deadline = time.time() + wait_s
+            # STAMP WHILE WE WAIT, not just before. The sweep is not running during this
+            # back-off, so nothing else advances status.json; without this the file freezes
+            # for the whole wait and a watcher cannot tell backing-off from wedged.
+            _stamp_recovery_status(status_path, new_attempt,
+                                   "backoff:%s" % what, _unfin_n)
             while time.time() < deadline and not stop_box[0]:
                 time.sleep(min(5.0, max(0.0, deadline - time.time())))
+                _stamp_recovery_status(status_path, new_attempt,
+                                       "backoff:%s" % what, _unfin_n)
         return new_attempt, give_up_flag
 
     while pending:
         _leg_size[0] = len(pending)
-        if not cdp_alive(args.cdp_url):
+        if not cdp_alive_bounded(args.cdp_url,
+                                 deadline_s=RECOVER_CDP_PROBE_DEADLINE_S):
             print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
+            _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
+                                   len(pending))
             hard_reset(port)
         try:
             with sync_playwright() as p:
@@ -5698,7 +5757,8 @@ def main():
             if _give_up:
                 print(_stamp("[recover] giving up (auto-recover is switched off)"))
                 break
-            if not cdp_alive(args.cdp_url):
+            if not cdp_alive_bounded(args.cdp_url,
+                                     deadline_s=RECOVER_CDP_PROBE_DEADLINE_S):
                 hard_reset(port)
         except MalformedCheck as e:
             # A CONFIGURATION ERROR IS NOT A CONNECTION ERROR, whatever route it arrives by.
@@ -5720,7 +5780,8 @@ def main():
             # ONLY IF THE BROWSER IS ACTUALLY GONE. A context can be lost because a SIBLING
             # run reset this shared Edge, and resetting it again from here is how one reset
             # becomes a round of them.
-            if not cdp_alive(args.cdp_url):
+            if not cdp_alive_bounded(args.cdp_url,
+                                     deadline_s=RECOVER_CDP_PROBE_DEADLINE_S):
                 hard_reset(port)
 
     stop_wd.set()

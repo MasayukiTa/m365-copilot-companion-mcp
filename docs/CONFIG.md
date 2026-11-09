@@ -175,4 +175,29 @@ stderr へ `[tool_map] ... cut N tool(s) that were asked for: ...` と出し、�
 
 ---
 
+## データソース語彙（`.config/domain_terms.json`）
+
+`relay/task_kind.py` は「データ解析の依頼」を見分けるために、汎用的な語（`database`, `sql`, `query`, `odbc`, `table` など）を内蔵しています。これだけで一般的なDB照会は判別できます。
+
+配備先に固有のデータソース名（独自DB名・ドライバ名・データ種別）を足したい場合は、リポジトリ直下の `.config/domain_terms.json`（**git 管理外**。`.config/` は `.gitignore` 済み）に置きます。無い場合・空の場合は内蔵語だけが使われます（既定）。この公開コードはどの配備先の語彙も含みません。
+
+### 形式
+
+JSON オブジェクトで、`data_source_terms` キーに文字列の配列を置きます。各要素は大文字小文字を無視して依頼テキストに部分一致します。想定外の形（キー欠落・配列でない等）は空として扱われ、分類を壊しません。
+
+```json
+{
+  "data_source_terms": [
+    "acme_warehouse",
+    "widget_metrics_db",
+    "sample_odbc_source",
+    "\u67b6\u7a7a\u30c7\u30fc\u30bf\u6e90"
+  ]
+}
+```
+
+上の値はすべて**架空の例**です。実際の配備先の名前に置き換えてください。ファイルはUTF-8（BOM可）で保存します。
+
+---
+
 ← [README に戻る](../README.md)
