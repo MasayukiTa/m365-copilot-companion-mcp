@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """Controlled trials for the canon §5-5 evidence-rank gate (D-group / ledger-B-or-below -> HOLD).
 
-Canon: ツール依存可能な主張一覧.md §5 item 5 (line 157):
-    "根拠が D 群・台帳状態 B 以下だけの判定は、既定を保留（HOLD）にする。"
+Canon: canon_spec §5 item 5 (line 157):
+    "a verdict grounded only on D-group / ledger-state B-or-below defaults to HOLD."
     (A verdict whose grounds are only D-group / ledger state B-or-below defaults to HOLD.)
 
 These trials use a strong synthetic effect interval (would be GO+EFFECT on its own) and vary

@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """Controlled trials for the §5-5 require_evidence gap-closure (canon section 5-5 + section 4).
 
-Canon: ツール依存可能な主張一覧.md
-    §4 (line 4): "宣言が無ければ、その主張は使えない（判定は最大でも保留...）".
-    §5 item 5 (line 157): "根拠が D 群・台帳状態 B 以下だけの判定は、既定を保留（HOLD）にする。"
+Canon: canon_spec
+    §4 (line 4): "a claim with no declaration is unusable (verdict at most HOLD...)".
+    §5 item 5 (line 157): "a verdict grounded only on D-group / ledger-state B-or-below defaults to HOLD."
 
 The c59a969c gate had a back-compatibility hole: decide() with evidence=None (the existing
 5-arg call) skipped evidence_rank_gate entirely and could reach GO with NO cited ground.

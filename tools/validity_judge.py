@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """validity_judge -- small-sample validity judge rebuilt from the proof-side canon.
 
-NON-SECRET. Written independently from the canon (SPEC_v1 family + 改訂C1〜C6 +
-`ツール依存可能な主張一覧.md` §0/§1/§2/§5). No code is copied from the frozen engine
+NON-SECRET. Written independently from the canon (SPEC_v1 family + revised-C1〜C6 +
+`canon_spec` §0/§1/§2/§5). No code is copied from the frozen engine
 (engine_v1_8c2), which is read-only in the invalid folder; this is an independent
 re-implementation of the *rules*, not of that code.
 
@@ -32,7 +32,7 @@ import json
 import math
 
 # ----------------------------------------------------------------- declarations (§0)
-# The twelve items that every usable claim must declare (ツール依存可能な主張一覧.md §0).
+# The twelve items that every usable claim must declare (canon_spec §0).
 DECL_ITEMS = (
     "lot_effect_model",   # random_independent | fixed_or_correlated  (C3,C4,C5; T64 not testable)
     "exposure_level",     # between_lot | within_lot                   (C3 df, C5)
@@ -79,14 +79,14 @@ FINDINGS = ("EFFECT", "EFFECT_OPPOSITE", "EFFECT_BELOW_MDES", "EFFECT_GENERIC")
 # They are NOT the D_FAIL_* order/lock failure codes above (dcap). Do not conflate the two:
 #   - D_FAIL_* / dcap  = the preregistration order/lock gate (order_gate).
 #   - R_* / evidence   = the *rank* of the claims cited as grounds (diagnostic D-group /
-#                        ledger status), per 主張一覧.md §1 (C1-C16, state A) vs §2 (D1-D10).
+#                        ledger status), per canon_spec §1 (C1-C16, state A) vs §2 (D1-D10).
 R_CODES = ("R_ONLY_DIAGNOSTIC_D", "R_ONLY_LEDGER_B_OR_BELOW", "R_EVIDENCE_UNKNOWN")
 
-# The diagnostic D-group (主張一覧.md §2, 106-120): usable only with a 'diagnostic' mark.
+# The diagnostic D-group (canon_spec §2, 106-120): usable only with a 'diagnostic' mark.
 D_GROUP_IDS = frozenset("D%d" % i for i in range(1, 11))
-# Direct-use claims (主張一覧.md §1): C1-C16. Direct use requires ledger state A (+ proof R).
+# Direct-use claims (canon_spec §1): C1-C16. Direct use requires ledger state A (+ proof R).
 C_GROUP_IDS = frozenset("C%d" % i for i in range(1, 17))
-# Ledger states, ordered A > A-B > B > B-C > C > D (主張一覧.md line 4 basis; 1of6 record).
+# Ledger states, ordered A > A-B > B > B-C > C > D (canon_spec line 4 basis; 1of6 record).
 # "B or below" = anything that is not pure state A (B, C, D, and B-containing mixes A-B/B-C).
 _LEDGER_A_ONLY = frozenset({"A"})
 
@@ -287,13 +287,13 @@ def order_gate(order_ok, lock_present) -> list:
 def exploratory_cap(claim: dict) -> list:
     """Claim-intrinsic HOLD caps from the canon's exploratory rules (C10, C11).
 
-    The canon is explicit that exploration is 'at most HOLD' (主張一覧.md L22, L79, L83):
+    The canon is explicit that exploration is 'at most HOLD' (canon_spec L22, L79, L83):
       - C10 (L77-79): a family (set + size m) fixed BEFORE the data gives Bonferroni FWER<=alpha;
         a family decided AFTER the data does not (27 cells -> top 9 -> FWER=0.139). A scan with no
         declared family + hash is exploratory (mode=exploratory) and caps at HOLD.
       - C11 (L81-83): split-sample confirmation is valid only when discovery and confirmation sides
         are INDEPENDENT (separate independent lots, no shared component). Splitting products of the
-        SAME lot is invalid (误确认率 0.38). split_unit='lot' is necessary but not sufficient; the
+        SAME lot is invalid (false-confirmation-rate 0.38). split_unit='lot' is necessary but not sufficient; the
         independence of the two sides must itself be asserted.
 
     Safe-side policy (do NOT presume an unknown preregistration or split-independence to be a fact):
@@ -433,8 +433,8 @@ def decide(claim: dict, structure: dict, interval: dict, context: list, dcap: li
     # §5-5 evidence-rank cap: a GO resting only on D-group / ledger-B-or-below / unknown
     # grounds defaults to HOLD. Evaluated last, on the GO path only; never raises a verdict.
     #
-    # Canon §4 (line 4) / §5-5 (line 157): "宣言が無ければ、その主張は使えない（判定は最大でも
-    # 保留）". A GO *must* cite an upper-rank ground; it cannot rest on no grounds at all.
+    # Canon §4 (line 4) / §5-5 (line 157): "a claim with no declaration is unusable (verdict at most
+    # HOLD)". A GO *must* cite an upper-rank ground; it cannot rest on no grounds at all.
     # evidence=None is a back-compatibility opt-out ONLY. On any operational GO path the caller
     # MUST pass require_evidence=True, which turns a missing/None evidence into R_EVIDENCE_UNKNOWN
     # (HOLD) instead of silently skipping the gate. This closes the "existing 5-arg call reaches
@@ -456,8 +456,8 @@ def two_stage_interval(lot_means, lot_exposure, *, level, alpha, m, sd_response,
                        contrast=1.0, direction="positive", lot_slopes=None):
     """C3 two-stage lot-level t interval, standardized and direction-aligned.
 
-    between_lot: OLS of lot means on lot exposure, df = K-2 (改訂C1 命題1.1).
-    within_lot: mean of per-lot slopes, se = sd/sqrt(K), df = K-1 (改訂C1 命題1.2).
+    between_lot: OLS of lot means on lot exposure, df = K-2 (revised-C1 prop.1.1).
+    within_lot: mean of per-lot slopes, se = sd/sqrt(K), df = K-1 (revised-C1 prop.1.2).
     Bonferroni over the declared family: level 1 - alpha/m (C10). No bootstrap (C4).
     """
     from statistics import mean, fmean  # stdlib only; no numpy dependency for the core
