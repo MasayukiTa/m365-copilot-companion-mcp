@@ -19,7 +19,7 @@ import tools.validity_judge as vj
 
 def base_claim(**over):
     c = {
-        "id": "C-TEST", "product": "E-679FG(S)",
+        "id": "C-TEST", "product": "PROD-A",
         "lot_effect_model": "random_independent", "exposure_level": "between_lot",
         "distribution": "gaussian", "balance": "balanced",
         "unit_column": "lot", "K": 8, "effect_type": "A", "time_unit": "day",
@@ -81,7 +81,7 @@ def test_family_shape_required_c10():
 
 # ----------------------------------------------------------------- context gate (§7)
 def test_ctx_cross_product_stops():
-    codes = vj.context_gate(base_claim(), {"products": ["E-679FG(S)", "E-999"]})
+    codes = vj.context_gate(base_claim(), {"products": ["PROD-A", "PROD-B"]})
     assert "CTX_COMPARISON_INVALID_CROSS_PRODUCT" in codes
 
 
@@ -102,7 +102,7 @@ def test_ctx_input_invalid_shortcircuits():
 
 
 def test_ctx_clean_passes():
-    assert vj.context_gate(base_claim(), {"products": ["E-679FG(S)"],
+    assert vj.context_gate(base_claim(), {"products": ["PROD-A"],
                                           "n_confirmable_lots": 8}) == []
 
 
