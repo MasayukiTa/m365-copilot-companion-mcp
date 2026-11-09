@@ -1503,18 +1503,18 @@ def rework_job_text(goal="", final_response="") -> str:
 
 
 # ---------------------------------------------------------------------------
-# Design-feasibility gate (result-blind).  Owner instruction (2026-11-04 07:45):
-# "比較不成立を表に加えるのではなく、これが自動で判定されなければ意味がない。判定器とは、
-# 結果ありきの判定ではなく、結果を見ないで、よりあるべき方向に判定するものである。"
+# Design-feasibility gate (result-blind).  Design rationale: the gate must judge the
+# soundness of a two-group comparison's design automatically and without reading the
+# response column, so that swapping the response cannot change the verdict.
 #
 # This is the CORE pure function for that gate.  It takes, PER EXPOSURE GROUP, the
-# breakdown of how many LOTS fall into each stratum level (product = coating-cloth
-# name / product name / grade, line, period).  It NEVER takes the response column
+# breakdown of how many LOTS fall into each stratum level (product, line, period).
+# It NEVER takes the response column
 # and NEVER reads any measurement value -- the whole point is that the design is
 # judged blind to the result, so swapping the response column cannot change the
 # verdict.
 #
-# It returns design_infeasible=True with a reason code when any of the owner's
+# It returns design_infeasible=True with a reason code when any of the
 # three conditions holds:
 #   NO_STRATIFIER             (a) no stratifier breakdown was supplied at all
 #   NO_COMMON_STRATUM         (b) the two groups share no stratum level
@@ -1584,7 +1584,8 @@ def design_feasibility(group_stratum_lots,
     Argument
       group_stratum_lots: mapping {group_label: {stratum_level: lot_count}} for
         EXACTLY TWO exposure groups.  Each inner map says, for that group, how many
-        LOTS fell into each stratum level (one stratifier, e.g. product name).  The
+        LOTS fell into each stratum level (one stratifier, e.g. product, line, or
+        period).  The
         counts are lot counts, never measurements.  An empty outer map, an outer map
         without two groups, or two groups whose inner maps are both empty is treated
         as having no stratifier information (NO_STRATIFIER).
@@ -1608,7 +1609,7 @@ def design_feasibility(group_stratum_lots,
         k_min: int, min_common_strata: int, overlap_min: float,
       }
 
-    The checks are applied in the owner's order (a) then (b) then (c); the FIRST
+    The checks are applied in the order (a) then (b) then (c); the FIRST
     failing one sets the reason code.  design_infeasible True means the final
     display must be forced to "設計不成立(保留)" -- this function never relaxes a
     verdict, it only ever adds a design HOLD.

@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Unit tests for judge_gate.design_feasibility -- the result-blind design gate core.
 
-These pin the owner's three conditions (2026-11-04 07:45): the comparison design is
+These pin the three conditions of the design gate: the comparison design is
 judged WITHOUT the response column, and a two-group exposure contrast is held as
 設計不成立(保留) when (a) there is no stratifier information, (b) the groups share no
 stratum or too few common strata clear k_min lots in BOTH groups, or (c) the groups'
@@ -42,7 +42,7 @@ def test_both_sides_empty_is_no_stratifier():
 
 # --- (b) NO_COMMON_STRATUM --------------------------------------------------
 def test_groups_share_no_product_is_no_common_stratum():
-    # This is the NO1-shrink shape: the two groups share zero product.
+    # Disjoint shape: the two groups share zero stratum level.
     r = jg.design_feasibility({"F": {"P1": 10, "P2": 9}, "O": {"P3": 10, "P4": 9}})
     assert r["design_infeasible"] is True
     assert r["reason_code"] == "NO_COMMON_STRATUM"
@@ -89,11 +89,11 @@ def test_identical_well_covered_mix_is_feasible():
     assert r["seen"]["n_common_strata_covered"] >= 1
 
 
-# --- the loss case shape: 502 products, 1 common at k_min=8, overlap ~0 -----
-def test_loss_shape_many_products_one_common_is_infeasible():
-    # Reproduces the structure of the loss analysis: the F group is concentrated in
-    # a handful of products, the O group in a disjoint many, with a single product
-    # shared at depth. The overlap is tiny -> design is held.
+# --- many strata, one common at k_min, overlap ~0 ---------------------------
+def test_many_strata_one_common_is_infeasible():
+    # One group is concentrated in a handful of strata, the other in a disjoint
+    # many, with a single stratum shared at depth. The overlap is tiny -> design
+    # is held.
     F = {"COMMON": 60}
     O = {"COMMON": 60}
     for i in range(500):
