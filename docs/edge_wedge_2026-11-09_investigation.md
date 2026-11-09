@@ -58,6 +58,59 @@ then `cdp_responsive=False` + nothing explaining the silence ->
 `"stalled ...s and the browser does not answer its DevTools port -> wedged"` =
 hard reset. 30 goals were resumed across attempts 1 and 2.
 
+## Measured telemetry from the named log, approaching each loss
+
+All values below are read directly from
+`.fleet/coordinator_20261109_183127_p35696.log` (the log named in the ledger).
+
+**What the log DOES record per sweep:** lap duration and worker count. Sweep
+laps are the concrete "approaching the loss" signal.
+
+Loss 1 -- sweep laps 21:14 -> 21:19:56 (workers 132):
+
+| time | lap took | workers |
+|---|---|---|
+| 21:14:29 | 30.10s | 132 |
+| 21:16:00 | 9.70s | 132 |
+| 21:16:38 | 13.88s | 132 |
+| 21:17:17 | 12.12s | 132 |
+| 21:17:48 | 13.75s | 132 |
+| 21:18:29 | 16.15s | 132 |
+| 21:19:03 | 7.55s | 132 |
+| 21:19:37 | 5.65s | 132 |
+| 21:19:56 | **Edge context lost -- resuming 43 goals** | |
+
+Laps spiked to 20.98s (lap 1360, 21:13:39) and 30.10s (lap 1362, 21:14:29)
+against a 6-17s normal, i.e. the machine was already thrashing minutes before
+the context dropped.
+
+Loss 2 -- sweep laps 22:15 -> 22:22:08 (workers 53):
+
+| time | lap took | workers |
+|---|---|---|
+| 22:15:33 | 59.99s | 53 |
+| 22:16:28 | 54.74s | 53 |
+| 22:17:15 | 47.38s | 53 |
+| 22:18:54 | 98.55s | 53 |
+| 22:20:07 | 73.50s | 53 |
+| 22:20:44 | 36.74s | 53 |
+| 22:21:20 | 36.01s | 53 |
+| 22:22:07 | 26.74s | 53 |
+| 22:22:08 | **Edge context lost -- resuming 30 goals** | |
+
+Laps of 47-98s (vs 6-17s normal) show the fleet already saturated before the
+wedge chain began.
+
+**What the log does NOT record (limits of this evidence):**
+- No per-sweep free-RAM, msedge process count, or CPU series. The log carries
+  only a start-up reading (`autoscale ON ... free RAM now 2098 MB` at 18:35).
+  The ledger's "21:42 CPU 89%, free RAM 778MB, 48 msedge processes" is an
+  external observation, not a line in this coordinator log.
+- DevTools is logged as a two-state answer/no-answer, not a latency in ms:
+  21:38:42 / 21:48:10 / 21:51:33 "browser still answers its DevTools port"
+  (loss-1 era), and 22:32:36 "the browser does not answer its DevTools port".
+  No per-probe millisecond timing exists to quote.
+
 ## Common cause
 
 Both losses trace to the same thing: tabs kept being admitted until the machine
