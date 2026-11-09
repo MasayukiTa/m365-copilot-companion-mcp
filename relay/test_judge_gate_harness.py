@@ -9,7 +9,7 @@ WHAT THIS PINS. relay/judge_gate.py is the orchestration seam that makes every D
 goal pass through the frozen validity engine before its final answer is delivered:
 
   (1) a classifier -- is_data_analysis_goal(goal) -- decides WHICH goals are data analysis
-      (DBB/analysis db queries turned into a table / correlation / group comparison), and which
+      (generic database/SQL queries turned into a table / correlation / group comparison), and which
       are NOT (M365 lookups, code changes, prose). Misclassification examples are pinned below.
   (2) a footer builder -- build_judge_footer(...) -- that, for a data-analysis final answer,
       records the result+data hash and fetch time, registers+locks the claim (order recorded),
@@ -41,10 +41,10 @@ from relay.judge_gate import (build_judge_footer, run_engine_judge,
 # ---- (1) classifier: which goals are data analysis -------------------------
 
 @pytest.mark.parametrize("goal", [
-    "analysis dbを照会し、1月の不良率を号機ごとに群镙3較して",
-    "DBB からピール強度のデータを取って相関を出して",
+    "the database をqueryし、the metricをグループで比較して",
+    "pull the dataset from the database and compute the correlation",
     "odbc_query で検査件数を集計して表にする",
-    "ワニスごとの引きはがし強度のロット間比較",
+    "group comparison of a metric across batches via a database query",
 ])
 def test_data_analysis_goals_are_flagged(goal):
     assert jg.is_data_analysis_goal(goal) is True, goal
@@ -132,21 +132,21 @@ def test_refuter_has_judge_check():
     assert isinstance(rule, str) and "判定器" in rule
     # it is actually wired into the composed prompt
     prompt = refuter.build_refuter_prompt(
-        "analysis dbを照会して不良率を群镙3較する", "完了しました DONE")
+        "the database をqueryしてthe metricをグループ比較する", "完了しました DONE")
     assert "判定器" in prompt
 
 
 # ---- the relay-loop gate: rework when a data-analysis answer lacks the judge ----
 
 def test_needs_rework_for_analysis_answer_without_judge():
-    goal = "analysis dbを照会して不良率を号機ごとに群镙3較する"
-    answer = "号機Aの不良率は12%、Bは8%でした。DONE"  # no judge block
+    goal = "the database をqueryしてthe metricをグループで比較する"
+    answer = "groupAのthe metricは12%、Bは8%でした。DONE"  # no judge block
     assert jg.needs_judge_rework(goal, answer) is True
     assert jg.judge_block_present(answer) is False
 
 
 def test_no_rework_once_judge_block_is_present():
-    goal = "analysis dbを照会して不良率を群镙3較する"
+    goal = "the database をqueryしてthe metricをグループ比較する"
     verdict = {"id": "SYN1", "verdict": "HOLD", "verdict_ja": "保留",
                "finding": None, "claim_supported": None, "reasons": ["D_FAIL_NO_LOCK"],
                "notes": [], "evidence": {"K": 3, "n": 42, "ci_std": [-0.4, 0.9]},
@@ -158,7 +158,7 @@ def test_no_rework_once_judge_block_is_present():
 
 def test_no_rework_when_reason_for_unavailable_is_stated():
     """An honest 'the judge could not run because ...' satisfies the gate; silence does not."""
-    goal = "DBB からピール強度を取って相関を出す"
+    goal = "pull the dataset from the database and compute the correlation"
     answer = "相関係数...。DONE" + jg.build_judge_footer(
         verdict=None, engine_available=False, unavailable_reason="未登録ID")
     assert jg.needs_judge_rework(goal, answer) is False

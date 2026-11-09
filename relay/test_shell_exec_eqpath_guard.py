@@ -46,8 +46,9 @@ def test_bare_bash_assignment_is_refused(cmd):
 
 @pytest.mark.skipif(os.name != "nt", reason="guard only fires under cmd.exe on Windows")
 @pytest.mark.parametrize("cmd", [
-    'git -C "$WT" status',
+    'git -C $WT status',
     'echo ${HOME}/x',
+    'echo $HOME',
 ])
 def test_bash_variable_expansion_is_refused(cmd):
     assert _guard(cmd) is not None
@@ -74,3 +75,25 @@ def test_root_cause_shellopen_of_eq_path_raises_0x80070002():
     with pytest.raises(OSError) as ei:
         os.startfile('=C:/tmp/m365-companion/agents/__guard_probe_nonexistent__')
     assert ei.value.winerror == 2
+
+
+# A `$` that lives INSIDE a quoted span is not a cmd.exe variable reference and must not be
+# rejected: cmd.exe passes the quoted text through verbatim, so these are legitimate Windows
+# commands. The guard searches the quote-masked string, so the quoted `$` is invisible to it.
+@pytest.mark.skipif(os.name != "nt", reason="guard only fires under cmd.exe on Windows")
+@pytest.mark.parametrize("cmd", [
+    'powershell -NoProfile -Command "Get-Process | ? { $_.CPU -gt 1 }"',
+    'git log --format="%H $x"',
+])
+def test_dollar_inside_quotes_is_allowed(cmd):
+    assert _guard(cmd) is None
+
+
+# An UNQUOTED `$VAR` and a bash assignment are still bash-only syntax and stay rejected.
+@pytest.mark.skipif(os.name != "nt", reason="guard only fires under cmd.exe on Windows")
+@pytest.mark.parametrize("cmd", [
+    'WT="C:/x" && git -C "$WT" status',
+    'echo $HOME',
+])
+def test_unquoted_dollar_and_assignment_still_refused(cmd):
+    assert _guard(cmd) is not None
