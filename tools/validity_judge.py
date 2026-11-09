@@ -61,16 +61,16 @@ VERDICT_JA = {"GO": "\u63a1\u7528", "HOLD": "\u4fdd\u7559", "NA": "\u8b58\u5225\
 
 # Reason codes, grouped by stage (precedence top to bottom).
 INPUT_CODES = ("INPUT_MISSING_KEY", "INPUT_SCHEMA_ERROR", "INPUT_COLUMN_MISSING",
-               "INPUT_NO_ROWS", "INPUT_LOT_DUPLICATE", "INPUT_SHA_MISMATCH")
+               "INPUT_EMPTY_ROWS", "INPUT_LOT_DUPLICATE", "INPUT_SHA_MISMATCH")
 CONTEXT_CODES = ("CTX_COMPARISON_INVALID_CROSS_PRODUCT", "CTX_TRIVIAL_COMPARISON",
                  "CTX_N_INSUFFICIENT", "CTX_INPUT_INVALID")
 NA_CODES = ("NA_NO_VARIATION", "NA_FIXED_LOT_BETWEEN_EXPOSURE", "NA_PURE_LOADING",
             "NA_TIME_ALIAS", "NA_OUT_OF_SUPPORT")
 A2_CODES = ("A_FAIL_SPARSE_LOTS", "A_FAIL_SINGLE_LOT_CELL", "A_FAIL_LOW_DF")
-D_CODES = ("D_FAIL_NO_LOCK", "D_FAIL_ORDER", "D_FAIL_EXPLORATORY")
+D_CODES = ("D_FAIL_UNLOCKED_ORDER", "D_FAIL_ORDER", "D_FAIL_EXPLORATORY")
 C_CODES = ("C_FAIL_STRADDLE", "C_NOT_COMPUTABLE")
 OK_CODES = ("A_OK", "D_OK", "C_OK", "CTX_OK")
-FINDINGS = ("EFFECT", "EFFECT_OPPOSITE", "EFFECT_BELOW_MDES", "PRACTICAL_NULL")
+FINDINGS = ("EFFECT", "EFFECT_OPPOSITE", "EFFECT_BELOW_MDES", "NEGLIGIBLE_EFFECT")
 
 
 class ClaimError(Exception):
@@ -187,7 +187,7 @@ def order_gate(order_ok, lock_present) -> list:
     before the data existed) and a lock must be present; otherwise cap at HOLD."""
     codes = []
     if not lock_present:
-        codes.append("D_FAIL_NO_LOCK")
+        codes.append("D_FAIL_UNLOCKED_ORDER")
     if order_ok is not True:
         codes.append("D_FAIL_ORDER")
     return codes
@@ -201,7 +201,7 @@ def classify(lo: float, hi: float, d: float):
     if hi < -d:
         return "EFFECT_OPPOSITE"
     if lo >= -d and hi <= d:
-        return "PRACTICAL_NULL" if lo <= 0.0 <= hi else "EFFECT_BELOW_MDES"
+        return "NEGLIGIBLE_EFFECT" if lo <= 0.0 <= hi else "EFFECT_BELOW_MDES"
     return None
 
 
