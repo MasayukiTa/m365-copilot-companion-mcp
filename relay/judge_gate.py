@@ -202,7 +202,7 @@ JUDGE_REQUEST_SCHEMA = (
     "fetched_at (ISO 8601 の時刻文字列)。任意セクション: "
     "manifest {path: manifest を書き出す JSON ファイルのパス (フォルダ不可), dataset_id: 文字列, "
     "result: 解析結果そのものを表す JSON オブジェクト (パス文字列ではない。例 "
-    '{"n_lots": 6, "kasure_rate_by_lot": {...}, "top_correlation_vs_kasure": {...}}'
+    '{"n_lots": 6, "defect_rate_by_lot": {...}, "top_correlation_vs_defect_rate": {...}}'
     ")}; "
     "registration {root: 文字列, claim: {id: <claim_id と一致>, ...}, registered_at: ISO時刻}; "
     "lot_diagnosis {y: 数値配列, x: 数値配列, lot: 配列 (3つは同じ長さ・空でない)}; "
@@ -444,8 +444,8 @@ def _short_type(value) -> str:
 #: A minimal, data-free example of a valid manifest.result object, shown in a correction so the
 #: worker sees the SHAPE expected (an analysis-result object) instead of a path string.
 _MANIFEST_RESULT_EXAMPLE = (
-    '{"n_lots": 6, "kasure_rate_by_lot": {"<lot>": 0.5}, '
-    '"top_correlation_vs_kasure": {"<feature>": 0.9}}')
+    '{"n_lots": 6, "defect_rate_by_lot": {"<lot>": 0.5}, '
+    '"top_correlation_vs_defect_rate": {"<feature>": 0.9}}')
 
 
 def _validate_manifest(manifest, output_folder="") -> str:

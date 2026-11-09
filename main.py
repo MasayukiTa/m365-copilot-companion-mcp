@@ -1,6 +1,7 @@
 import asyncio
 import hmac
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -586,31 +587,77 @@ async def _gather_health_probes(probes):
 #: Answer cached for this long. /health is polled about once a second by the cockpit and by
 #: the supervisor, and the answer can only change when a watched file is written -- so asking
 #: the filesystem every time would be work nobody reads.
+#:
+#: GWSLOW: the TTL is also the throttle for the BACKGROUND refresh below. newer_than() walks
+#: the whole watched package tree and stats hundreds of files; doing that synchronously inside
+#: a /health probe is exactly what made /health slow under CPU saturation on 2026-11-07 (the
+#: probe could not finish inside the health-pool budget, so every poll came back degraded).
+#: Now the walk NEVER runs on the /health path: we serve the last known answer instantly and
+#: refresh it off-thread.
 _WATCHED_CACHE_S = 5.0
 _watched_cache = {"at": 0.0, "changed": None}
+#: One background refresh at a time. A /health poll that finds the cache stale kicks a single
+#: daemon thread to recompute newer_than() and returns the OLD value immediately; concurrent
+#: polls that arrive while it runs do not pile a second walk on top (that would re-create the
+#: saturation this fix removes). The lock guards the flag, never the walk itself.
+_watched_refresh_lock = threading.Lock()
+_watched_refreshing = {"busy": False}
 
 
-def _watched_code_changed():
-    """Has a file THIS SERVER IMPORTS changed since it started?
-
-    tools/deploy_freshness already owns the list -- WATCHED, pinned by its own test against
-    main.py's real imports -- and newer_than() answers with mtimes rather than a subprocess,
-    which is what keeps /health non-blocking (see _git_head_sha for why that matters).
-
-    UNREADABLE MEANS CHANGED. If this cannot be determined, the SHA rule should stand, and the
-    SHA rule's answer here is "stale"; reporting stale when it might be is the conservative
-    side of a question about whether a fix is live.
-    """
-    now = time.time()
-    if _watched_cache["changed"] is not None and (now - _watched_cache["at"]) < _WATCHED_CACHE_S:
-        return _watched_cache["changed"]
+def _watched_recompute():
+    """Walk the watched tree once and store the result. Runs ONLY on the background thread
+    (or synchronously on the very first, pre-traffic call), never on a /health poll under
+    load. Never raises -- an unreadable tree means 'changed' (stale), the conservative side."""
     try:
         from tools.deploy_freshness import newer_than
         changed = bool(newer_than(_BOOT_TS))
     except Exception:
         changed = True
-    _watched_cache["at"], _watched_cache["changed"] = now, changed
+    _watched_cache["at"], _watched_cache["changed"] = time.time(), changed
+    with _watched_refresh_lock:
+        _watched_refreshing["busy"] = False
     return changed
+
+
+def _watched_code_changed():
+    """Has a file THIS SERVER IMPORTS changed since it started?
+
+    tools/deploy_freshness owns the list (WATCHED, pinned by its own test against main.py's
+    real imports) and newer_than() answers with mtimes rather than a subprocess.
+
+    GWSLOW stale-while-revalidate: this is called from a /health sub-probe that runs under a
+    short shared deadline. The watched-tree walk is too slow to do on that path when the CPU
+    is saturated, so we NEVER walk here when we already have an answer: we return the cached
+    value instantly and, if it is older than the TTL, kick ONE background thread to refresh
+    it. Only the very first call (cache empty, before the server is taking traffic) walks
+    synchronously, so the dot is correct from boot.
+
+    UNREADABLE MEANS CHANGED -- if freshness cannot be determined the SHA rule's answer is
+    'stale', the conservative side of 'is the fix live'.
+    """
+    now = time.time()
+    cached = _watched_cache["changed"]
+    if cached is None:
+        # First call ever: no answer to serve, so compute once, synchronously. This happens
+        # at boot/warm-up, off the hot /health path under load.
+        return _watched_recompute()
+    if (now - _watched_cache["at"]) >= _WATCHED_CACHE_S:
+        # Stale: serve the old value NOW, refresh OFF-THREAD. Start at most one walk.
+        start = False
+        with _watched_refresh_lock:
+            if not _watched_refreshing["busy"]:
+                _watched_refreshing["busy"] = True
+                start = True
+        if start:
+            try:
+                threading.Thread(target=_watched_recompute,
+                                 name="watched-refresh", daemon=True).start()
+            except Exception:
+                # Could not spawn (e.g. interpreter shutdown): clear the flag and fall back
+                # to the cached value. Never block /health to recompute.
+                with _watched_refresh_lock:
+                    _watched_refreshing["busy"] = False
+    return _watched_cache["changed"]
 
 
 #: When this process first observed itself to be stale, or None while it is current.
