@@ -346,6 +346,7 @@ jobs:
             relay/test_action_timeout_resend_safety.py \
             relay/test_verify_delivery_before_giving_up.py \
             relay/test_delivered_timeout_continues.py \
+            relay/test_resume_unknown_delivery_timeout.py \
             relay/test_live_acting_turn_wait.py \
             relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py \
             tests/test_fleet_landing_ack_e2e.py \
@@ -549,6 +550,7 @@ jobs:
             tools/test_file_ops_live_checkout_wiring.py \
             tools/test_file_ops_bounded_listing.py \
             tests/test_outside_lane.py \
+            tools/test_no_image_wide_python_kill.py \
             tools/test_child_process_priority.py \
             tools/test_a_dot_on_in_the_normal_state_is_not_a_signal.py \
             tools/test_tool_probe.py \
@@ -1117,6 +1119,7 @@ jobs:
             scripts/test_capability_profile.py \
             scripts/test_task_kind.py \
             scripts/test_load_routing_report.py \
+            scripts/test_load_routing_pairwise.py \
             scripts/test_result_cache_report.py \
             scripts/test_team_formation_report.py \
             bench/test_attempt_budget.py \
