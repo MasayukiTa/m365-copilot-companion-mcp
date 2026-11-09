@@ -9,11 +9,14 @@ moment of one admission, together with the capability profile of each queued goa
 (scripts/capability_profile.py, slice C1), and says which queued goal it would have admitted
 instead. It writes that next to what the coordinator actually admitted. Nothing else.
 
-WHAT THIS MODULE IS NOT. It never reorders the queue, never picks a worker, never edits a prompt
-and never changes an output. The setting `fanout_load_routing` accepts `off` and `shadow` and
-nothing else; there is no routing value to set by mistake. A router that acts would be a later
-change with its own review, once the report (scripts/load_routing_report.py) says there is enough
-data. In `off` nothing here reads a file or records.
+WHAT `shadow` IS NOT. In `shadow` it never reorders the queue, never picks a worker, never edits a
+prompt and never changes an output; it only records. The setting `fanout_load_routing` accepts
+`off`, `shadow` and `on`. `on` is the paired-comparison counterpart of `shadow`, approved
+(2026-11-09) so the two can be run off vs on through the cockpit GUI and compared: it writes the
+SAME shadow record as `shadow` AND returns the router's choice to the coordinator, which admits
+that queued goal instead of the one it would have. `on` differs from `shadow` only in that the
+choice is used; the record written is identical in shape (the `mode` field says which was live).
+The default stays `off`. In `off` nothing here reads a file, records, or changes an admission.
 
 THE RULE IT RECORDS (kept small on purpose, and stated so a reader can disagree with it).
   * With a single queued goal there is no choice: the shadow choice is the actual one.
@@ -38,7 +41,9 @@ import time
 
 KEY = "fanout_load_routing"
 #: ONLY these. There is deliberately no value that routes (see the module docstring).
-MODES = ("off", "shadow")
+MODES = ("off", "shadow", "on")
+#: The modes that record a shadow row (and, for `on`, also act on the choice). `off` does neither.
+ACTIVE_MODES = ("shadow", "on")
 
 LOG = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                    ".fleet", "load_routing_shadow.jsonl")
@@ -60,8 +65,8 @@ _profile_cache = {"at": None, "dir": None, "profiles": {}}
 # ------------------------------------------------------------------ the setting
 
 def mode(settings_path=None):
-    """`fanout_load_routing=` from settings.txt: "shadow" or "off". Anything else reads as off.
-    Re-read when the file changes (each_gate). Never raises."""
+    """`fanout_load_routing=` from settings.txt: "off", "shadow" or "on". Anything else reads as
+    off. Re-read when the file changes (each_gate). Never raises."""
     try:
         path = settings_path
         if path is None:
@@ -181,11 +186,21 @@ def _probe(probes, name):
 def shadow_assign(admitted, remaining, active_open, cap, lane_ceiling, run_id="",
                   ram_floor_mb=None, probes=None, settings_path=None, now=None):
     """Called by the coordinator once per admission, after the goal is chosen and before it is
-    attached. In `shadow` it appends one row: the goal actually admitted, the goal this router
-    would have admitted, and the margins that decided it. In `off` it returns at once.
-    Never raises, never mutates its arguments, returns nothing."""
+    attached. In `shadow` and `on` it appends one row: the goal actually admitted (what the
+    coordinator chose), the goal this router would have admitted, and the margins that decided
+    it. In `off` it returns at once.
+
+    Return value: in `on`, the 1-based position within `remaining` of the queued goal the router
+    chose, when that differs from the goal the coordinator admitted -- i.e. an int k>=1 meaning
+    "admit remaining[k-1] instead". Returns None in every other case (off, shadow, a choice that
+    agrees with the coordinator, a single candidate, an unknown cost, or any error). The caller
+    uses the int ONLY when it is not None; shadow and off keep returning None, so their callers
+    are byte-identical to before.
+
+    Never raises, never mutates its arguments."""
     try:
-        if mode(settings_path) != "shadow":
+        m = mode(settings_path)
+        if m not in ACTIVE_MODES:
             return None
         # A goal whose attach failed goes back to the head of the queue and is admitted again on
         # a later sweep: one admission, one row.
@@ -204,7 +219,7 @@ def shadow_assign(admitted, remaining, active_open, cap, lane_ceiling, run_id=""
         differs = verdict["index"] != 0
         row = {
             "v": SCHEMA, "ts": round(time.time() if now is None else now, 1),
-            "run_id": str(run_id or ""), "mode": "shadow",
+            "run_id": str(run_id or ""), "mode": m,
             "actual": cands[0], "shadow": pick, "differs": differs,
             "comparable": verdict["comparable"], "tight": verdict["tight"],
             "reason": verdict["reason"], "queue_len": len(cands),
@@ -220,6 +235,11 @@ def shadow_assign(admitted, remaining, active_open, cap, lane_ceiling, run_id=""
             _STATE["recorded"] += 1
             _STATE["differed"] += 1 if differs else 0
             _STATE["comparable"] += 1 if verdict["comparable"] else 0
+        # `on` ACTS on the choice: hand the coordinator the position in `remaining` to admit
+        # instead (verdict["index"] is into [admitted] + remaining, so index k maps to
+        # remaining[k-1]). Only when it differs; `shadow` never returns an index.
+        if m == "on" and differs:
+            return verdict["index"]
         return None
     except Exception:
         return None
