@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """Regression tests for the exploratory-mode HOLD cap (canon C10 / C11).
 
-The canon (`ツール依存可能な主張一覧.md`) is explicit that exploration is at most HOLD:
+The canon (`ツール依存可能な主張一覧.md`) is explicit: exploration is at most HOLD:
   - L22  `mode`: confirmatory / exploratory (探索は最大でも保留)
   - C10 (L77-79): a family fixed BEFORE the data gives Bonferroni FWER<=alpha; a family decided
     AFTER the data does not (27 cells -> top 9 -> FWER=0.139). A scan with no declared family +

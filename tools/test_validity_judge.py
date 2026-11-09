@@ -295,8 +295,8 @@ def test_footer_has_required_fields():
 
 # -------------------------------------------------- claim_sha256 (canon §0 id)
 def test_claim_sha256_is_deterministic_and_canonical():
-    # Exercises validity_judge.claim_sha256 from outside: a stable 64-hex digest that
-    # ignores key order (canonical JSON) and changes when the claim changes.
+    # Exercises validity_judge.claim_sha256 from outside: a stable 64-hex digest
+    # ignoring key order (canonical JSON), changing when the claim changes.
     c = base_claim()
     h1 = vj.claim_sha256(c)
     assert isinstance(h1, str) and len(h1) == 64
