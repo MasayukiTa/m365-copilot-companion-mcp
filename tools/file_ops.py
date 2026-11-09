@@ -1,7 +1,9 @@
 import fnmatch as _fnmatch
 import hashlib
+import math
 import os
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -372,6 +374,43 @@ def append_file(path: str, content: str, encoding: str = "utf-8") -> str:
         return f"[append_file error: {type(e).__name__}: {e}]"
 
 
+def _recursive_listing_entries(base, deadline):
+    """Yield sorted directory entries depth-first without materializing the tree."""
+    stack = [base]
+    while stack:
+        if time.monotonic() >= deadline[0]:
+            deadline[1] = True
+            return
+        directory = stack.pop()
+        if isinstance(directory, os.DirEntry):
+            is_dir = directory.is_dir()
+            yield directory, Path(directory.path).relative_to(base), is_dir
+            if is_dir and not directory.is_symlink():
+                stack.append(Path(directory.path))
+            continue
+        entries = []
+        with os.scandir(directory) as scan:
+            for entry in scan:
+                if time.monotonic() >= deadline[0]:
+                    deadline[1] = True
+                    return
+                entries.append(entry)
+        entries.sort(key=lambda entry: entry.name.lower())
+        # Stack individual entries so a directory is emitted before its descendants.
+        for entry in reversed(entries):
+            stack.append(entry)
+
+
+def _listing_timeout():
+    # py-spy on 2026-11-09: recursive listing consumed 148/981 samples (15%);
+    # calls waiting behind directory scans took 9-117 s. Limit each walk to 2 s.
+    try:
+        seconds = float(os.environ.get("MCP_LIST_DIRECTORY_TIMEOUT_SECONDS", "2"))
+        return seconds if math.isfinite(seconds) and seconds > 0 else 2.0
+    except ValueError:
+        return 2.0
+
+
 def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 200,
                    pattern: str = "") -> str:
     """List files and directories. The first line gives the counts -- use it as the answer
@@ -394,13 +433,15 @@ def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 
             )
         if not p.is_dir():
             return f"[list_directory error: not a directory: {p}]"
-        entries = p.rglob("*") if recursive else p.iterdir()
+        timeout = _listing_timeout() if recursive else None
+        deadline = [time.monotonic() + timeout, False] if recursive else None
+        entries = (_recursive_listing_entries(p, deadline) if recursive else
+                   ((entry, entry.relative_to(p), entry.is_dir())
+                    for entry in sorted(p.iterdir(), key=lambda x: str(x).lower())))
         lines: list[str] = []
         n_dir = n_file = 0
         truncated = False
-        for entry in sorted(entries, key=lambda x: str(x).lower()):
-            rel = entry.relative_to(p)
-            is_dir = entry.is_dir()
+        for entry, rel, is_dir in entries:
             if pattern:
                 # 絞り込み時にディレクトリを混ぜない。混ざった一覧から目的の種類だけを
                 # 拾って数える作業を呼び出し側にさせると、そこで数を外していた。
@@ -422,7 +463,9 @@ def list_directory(path: str = ".", recursive: bool = False, max_entries: int = 
             head = f"{n_file} files matching {pattern} in {p}"
         else:
             head = f"{n_file} files, {n_dir} directories in {p}"
-        if truncated:
+        if deadline and deadline[1]:
+            head += f" (stopped after {timeout:g} s; more may exist)"
+        elif truncated:
             head += f" (truncated at {max_entries}; more exist)"
         elif not lines:
             head += " (nothing matched)" if pattern else " (empty directory)"
