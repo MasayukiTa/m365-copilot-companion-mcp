@@ -12552,11 +12552,27 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            # C3, SHADOW ONLY: records which queued goal a load-aware router would have admitted
-            # beside this one. Returns nothing and changes nothing (off = no-op, never raises).
-            load_routing.shadow_assign(w, pending, _active_open(), _socket_cap, _lane_ceiling,
-                                       run_id=run_id, ram_floor_mb=ram_box[0],
-                                       probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
+            # C3: records which queued goal a load-aware router would have admitted beside this
+            # one. off = no-op; shadow = record only (returns None, changes nothing); on = record
+            # AND act -- it returns the position in `pending` of the goal to admit instead, so the
+            # off-vs-on pair can be compared through the cockpit. Never raises.
+            _lr_pick = load_routing.shadow_assign(
+                w, pending, _active_open(), _socket_cap, _lane_ceiling,
+                run_id=run_id, ram_floor_mb=ram_box[0],
+                probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
+            # In `on`, _lr_pick is an int k>=1: the router chose pending[k-1] over the goal the
+            # coordinator picked. Swap -- put the coordinator's goal back at the head of the queue
+            # (so it is the next one considered) and admit the router's choice in its place. Every
+            # other mode/outcome returns None and this block is skipped, so off and shadow admit
+            # exactly the goal they did before. The index is re-validated here so a stale or junk
+            # value can never pop the wrong goal.
+            if isinstance(_lr_pick, int) and 1 <= _lr_pick <= len(pending):
+                _chosen = pending.pop(_lr_pick - 1)
+                if _chosen.status not in TERMINAL:
+                    pending.insert(0, w)
+                    w = _chosen
+                else:
+                    pending.insert(_lr_pick - 1, _chosen)   # untouched: admit the original goal
             ok = w.attach(context, agent_url)
             if not ok and w.status == PENDING:
                 # NO SOCKET AVAILABLE (it went away between the readiness check above and the

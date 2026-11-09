@@ -177,7 +177,7 @@ partial class CockpitWindow
                 }
                 else if (ln.StartsWith("fanout_load_routing="))
                 {
-                    string lrv = LoadRoutingView.ParseLine(ln);   // off|shadow only; junk keeps the value
+                    string lrv = LoadRoutingView.ParseLine(ln);   // off|shadow|on; junk keeps the value
                     if (lrv != null) _lrVal = lrv;
                 }
                 else if (ln.StartsWith("team_mode="))

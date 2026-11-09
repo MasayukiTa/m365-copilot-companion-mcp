@@ -881,11 +881,11 @@ partial class CockpitWindow
         _wsPending.Foreground = Theme.Br(Theme.Warning(_dark));
         _wsPending.Visibility = pend != null ? Visibility.Visible : Visibility.Collapsed;
     }
-    // Load-aware routing (off|shadow), beside the sibling write scope. Persists through SaveKey only;
-    // the coordinator re-reads the key at every admission (each_gate). SHADOW ONLY: it records the
-    // goal a router would have admitted and changes nothing, and there is no option that routes.
-    // What is IN EFFECT comes from status.json "fanout_load_routing"; the words and parsing live in
-    // LoadRoutingView.
+    // Load-aware routing (off|shadow|on), beside the sibling write scope. Persists through SaveKey
+    // only; the coordinator re-reads the key at every admission (each_gate). shadow records the goal
+    // a router would have admitted and changes nothing; on records the same AND admits that goal in
+    // place of the coordinator's choice (off-vs-on paired comparison). What is IN EFFECT comes from
+    // status.json "fanout_load_routing"; the words and parsing live in LoadRoutingView.
     UIElement LoadRoutingControl()
     {
         _lrLbl = new TextBlock(); _lrLbl.VerticalAlignment = VerticalAlignment.Center;

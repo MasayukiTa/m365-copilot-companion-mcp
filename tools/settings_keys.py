@@ -392,14 +392,17 @@ KEYS = OrderedDict([
        "tools/walk.py:search_max_depth (iter_files, at the start of every search)",
        "Deepest directory level a file search descends into, counted from the search root (0 == only the root directory). Read fresh at every search, so a change reaches the next one with no restart. Absent/empty/negative means NO limit, which is the default and the pre-#328 behaviour. A per-call max_depth overrides it."),
 
-    # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
-    # which queued goal a router using the remaining admission margins and the role profile
-    # would have admitted, beside the one that was. There is deliberately no value that routes.
+    # Load-aware routing (relay/load_routing.py). At each admission it records which queued goal
+    # a router using the remaining admission margins and the role profile would have admitted,
+    # beside the one that was. `on` additionally admits the router's choice, for an off-vs-on
+    # paired comparison; the default stays off.
     _k("fanout_load_routing", EACH_GATE, "off",
        "relay/load_routing.py:mode (every admission, mtime-cached)",
-       "off|shadow. Re-read at every admission with no restart. shadow appends one row per "
-       "admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the router "
-       "would have admitted, the margins); nothing is reordered and no prompt or output "
+       "off|shadow|on. Re-read at every admission with no restart. shadow and on each append one "
+       "row per admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the "
+       "router would have admitted, the margins). shadow reorders nothing and changes no prompt "
+       "or output. on admits the router's chosen goal in place of the coordinator's when they "
+       "differ (the displaced goal returns to the head of the queue); no prompt or output "
        "changes."),
 
     # Read-only tool result cache (relay/result_cache.py). SHADOW ONLY: at each read-only tool
