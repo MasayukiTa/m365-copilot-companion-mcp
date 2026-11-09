@@ -186,3 +186,101 @@ def decide_runner_respawn(runner_alive,
     if count_respawns_in_window(hist, n, window) >= cap:
         return "cap"
     return "respawn"
+
+
+# --------------------------------------------------------------------------------
+# Reading "is there unfinished work" from a REAL-SHAPED .fleet/status.json
+# --------------------------------------------------------------------------------
+#
+# THE BUG THIS CLOSES. scripts/supervisor.ps1's Test-FleetHasUnfinishedWork originally
+# decided a worker was done from the properties ``done`` or ``state``. The real
+# .fleet/status.json workers carry NEITHER: a worker is a string field ``status``
+# (values such as done, stuck, waiting, ready, refuting, awaiting_children, cancelled)
+# PLUS a boolean field ``closed``. So every worker read as "not done", and after a
+# legitimate idle state (all workers done or closed) with running=true the supervisor
+# would respawn an idle runner up to the cap, forever.
+#
+# A worker counts as FINISHED when ``closed`` is true OR ``status`` is one of
+# ``done``, ``cancelled``, ``stuck`` -- a closed stuck worker is finished work for
+# this purpose (nothing more will happen to it without a human). It is UNFINISHED only
+# when ``closed`` is false AND ``status`` is anything else (waiting, ready, refuting,
+# awaiting_children, ...). This is the pure core; supervisor.ps1 reads status.json and
+# calls it, so the key names live in exactly one tested place.
+
+#: Worker ``status`` values that mean the worker's work is over even if a tick still
+#: sees it in the list. ``stuck`` is included deliberately: a stuck worker is closed
+#: work for respawn purposes -- the runner cannot make it progress, so its presence is
+#: not a reason to bring an absent runner back.
+FINISHED_WORKER_STATUSES = frozenset({"done", "cancelled", "stuck"})
+
+
+def worker_is_finished(worker):
+    """True when one status.json worker counts as finished work.
+
+    Finished == ``closed`` is true OR ``status`` is one of FINISHED_WORKER_STATUSES
+    (done, cancelled, stuck). Unfinished == ``closed`` is false AND ``status`` is
+    anything else. A worker that is not a mapping, or carries neither field, is treated
+    as UNFINISHED (fail towards keeping work alive, never towards declaring idle on a
+    shape we do not understand). Pure: no I/O.
+    """
+    if not isinstance(worker, dict):
+        return False
+    if worker.get("closed") is True:
+        return True
+    status = worker.get("status")
+    if isinstance(status, str) and status.strip().lower() in FINISHED_WORKER_STATUSES:
+        return True
+    return False
+
+
+def status_json_has_unfinished_work(status):
+    """Whether a parsed .fleet/status.json shows work that is not done.
+
+    ``status`` is the already-parsed dict (or None when the file is missing/unreadable).
+    Mirrors scripts/supervisor.ps1's Test-FleetHasUnfinishedWork, so the two cannot
+    drift, and uses the REAL worker shape (``closed`` bool + ``status`` string).
+
+    Rules, first match wins:
+
+      * None / not a dict  -> False (no run to bring back; an absent runner with no
+        state is left alone).
+      * ``recovering`` is true -> True (the 18-minute stuck state in the GOAL).
+      * ``running`` is not true -> False (nothing is running).
+      * running AND ``pending`` > 0 -> True.
+      * running AND ``queued`` > 0 -> True.
+      * running AND a worker list exists -> True iff ANY worker is unfinished
+        (closed false AND status not in {done, cancelled, stuck}); all finished -> False.
+      * running, no worker list -> True iff ``total`` > ``done_count``.
+      * otherwise -> False.
+
+    Pure: no I/O, no clock.
+    """
+    if not isinstance(status, dict):
+        return False
+    if status.get("recovering") is True:
+        return True
+    if status.get("running") is not True:
+        return False
+    for key in ("pending", "queued"):
+        val = status.get(key)
+        try:
+            if val is not None and int(val) > 0:
+                return True
+        except (TypeError, ValueError):
+            pass
+    workers = status.get("workers")
+    if isinstance(workers, list) and workers:
+        for w in workers:
+            if not worker_is_finished(w):
+                return True
+        # running with workers, all of them finished -> nothing unfinished.
+        return False
+    # Running with no worker list: fall back to the done/total counters.
+    total = status.get("total")
+    done_count = status.get("done_count")
+    try:
+        if total is not None and done_count is not None and int(total) > int(done_count):
+            return True
+    except (TypeError, ValueError):
+        pass
+    return False

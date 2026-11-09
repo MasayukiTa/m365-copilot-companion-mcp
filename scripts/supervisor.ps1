@@ -3644,12 +3644,29 @@ function Test-FleetHasUnfinishedWork {
         $workers = @()
         try { if ($s.workers) { $workers = @($s.workers) } } catch { $workers = @() }
         if ($workers.Count -gt 0) {
+            # THE REAL WORKER SHAPE. A .fleet\status.json worker is a string field
+            # `status` (done, stuck, waiting, ready, refuting, awaiting_children,
+            # cancelled) plus a boolean field `closed` -- NOT `done`/`state`. A worker
+            # is FINISHED when closed is true OR status is one of done/cancelled/stuck
+            # (a closed stuck worker is finished work here); UNFINISHED only when closed
+            # is false AND status is anything else. (The old code read `done`/`state`,
+            # which no real worker carries, so every worker looked unfinished and an idle
+            # runner was respawned forever.) Same rule as the pure core
+            # scripts/supervisor_runner_respawn.worker_is_finished.
+            $finishedStatuses = @('done', 'cancelled', 'stuck')
             foreach ($w in $workers) {
-                $done = $false
-                try { $done = ($w.done -eq $true) -or ([string]$w.state -in @('done','finished','complete','completed')) } catch { $done = $false }
-                if (-not $done) { return $true }
+                $finished = $false
+                try {
+                    if ($w.closed -eq $true) {
+                        $finished = $true
+                    } else {
+                        $st = ([string]$w.status).Trim().ToLowerInvariant()
+                        if ($st -and ($finishedStatuses -contains $st)) { $finished = $true }
+                    }
+                } catch { $finished = $false }
+                if (-not $finished) { return $true }
             }
-            # running with workers, all of them done -> nothing unfinished.
+            # running with workers, all of them finished -> nothing unfinished.
             return $false
         }
         # Running with no worker list: fall back to the done/total counters.

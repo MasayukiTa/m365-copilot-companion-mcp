@@ -179,3 +179,119 @@ def test_a_future_dated_respawn_does_not_block_a_real_one():
 def test_non_numeric_history_entries_are_ignored():
     assert R.count_respawns_in_window(["x", None, 990.0], 1000.0) == 1
     assert R.seconds_since_last_respawn(["x", None, 969.0], 1000.0) == 31.0
+
+
+# ---------------------------------------------------------------------------------
+# Reading unfinished work from a REAL-SHAPED status.json (the bug this PR fixes)
+# ---------------------------------------------------------------------------------
+#
+# The samples below copy ONLY the key names from a live .fleet/status.json -- running,
+# recovering, pending, queued, total, done_count, and per-worker `status` (string) and
+# `closed` (bool). No goal/business text: worker names are w0..wN and statuses are the
+# generic fleet state words. The point is the SHAPE: workers carry `status`+`closed`,
+# NOT `done`/`state`, which is exactly what the old code got wrong.
+
+
+def _worker(name, status, closed):
+    return {"name": name, "status": status, "closed": closed}
+
+
+def test_worker_is_finished_uses_closed_or_terminal_status():
+    # closed true -> finished, whatever the status string.
+    assert R.worker_is_finished(_worker("w0", "waiting", True)) is True
+    # done / cancelled / stuck count as finished even when not closed.
+    assert R.worker_is_finished(_worker("w1", "done", False)) is True
+    assert R.worker_is_finished(_worker("w2", "cancelled", False)) is True
+    assert R.worker_is_finished(_worker("w3", "stuck", False)) is True
+    # open and in any other state -> unfinished.
+    for st in ("waiting", "ready", "refuting", "awaiting_children"):
+        assert R.worker_is_finished(_worker("wx", st, False)) is False
+    # a worker that carries only the OLD keys (done/state) is unfinished -- the shape
+    # we do not understand must not read as idle.
+    assert R.worker_is_finished({"name": "wold", "done": True, "state": "done"}) is False
+
+
+def test_all_closed_or_done_workers_means_no_unfinished_work():
+    # The legitimate idle state from the GOAL: running=true but every worker is closed
+    # or done -> NOT unfinished (so an absent runner is NOT respawned).
+    status = {
+        "running": True,
+        "recovering": False,
+        "pending": 0,
+        "queued": 0,
+        "total": 3,
+        "done_count": 3,
+        "workers": [
+            _worker("w0", "done", True),
+            _worker("w1", "stuck", True),
+            _worker("w2", "done", False),
+        ],
+    }
+    assert R.status_json_has_unfinished_work(status) is False
+    # And the decider therefore leaves the absent runner alone.
+    assert R.decide_runner_respawn(
+        runner_alive=False,
+        has_unfinished_work=R.status_json_has_unfinished_work(status),
+        respawn_history=[], now=1000.0) == "no_work"
+
+
+def test_one_open_waiting_worker_means_unfinished_work():
+    # Same run, but one worker is open and waiting -> unfinished -> respawn.
+    status = {
+        "running": True,
+        "recovering": False,
+        "pending": 0,
+        "queued": 0,
+        "total": 3,
+        "done_count": 2,
+        "workers": [
+            _worker("w0", "done", True),
+            _worker("w1", "waiting", False),
+            _worker("w2", "done", True),
+        ],
+    }
+    assert R.status_json_has_unfinished_work(status) is True
+    assert R.decide_runner_respawn(
+        runner_alive=False,
+        has_unfinished_work=R.status_json_has_unfinished_work(status),
+        respawn_history=[], now=1000.0) == "respawn"
+
+
+def test_recovering_true_is_unfinished_even_with_all_workers_closed():
+    # recovering=true is the 18-minute stuck state in the GOAL: unfinished on its own,
+    # even when every worker is closed and pending is 0.
+    status = {
+        "running": True,
+        "recovering": True,
+        "pending": 0,
+        "queued": 0,
+        "workers": [_worker("w0", "done", True)],
+    }
+    assert R.status_json_has_unfinished_work(status) is True
+    assert R.decide_runner_respawn(
+        runner_alive=False,
+        has_unfinished_work=R.status_json_has_unfinished_work(status),
+        respawn_history=[], now=1000.0) == "respawn"
+
+
+def test_pending_greater_than_zero_is_unfinished():
+    # running with pending>0 and no worker list -> unfinished.
+    status = {"running": True, "recovering": False, "pending": 33, "queued": 0}
+    assert R.status_json_has_unfinished_work(status) is True
+
+
+def test_a_missing_status_file_is_not_unfinished_work():
+    # status.json missing/unreadable -> the PowerShell side passes None -> no run to
+    # bring back -> False (an absent runner with no state is left alone).
+    assert R.status_json_has_unfinished_work(None) is False
+    assert R.decide_runner_respawn(
+        runner_alive=False,
+        has_unfinished_work=R.status_json_has_unfinished_work(None),
+        respawn_history=[], now=1000.0) == "no_work"
+
+
+def test_not_running_is_not_unfinished_work():
+    # running=false -> nothing is running, even if workers look open.
+    status = {"running": False, "recovering": False,
+              "workers": [_worker("w0", "waiting", False)]}
+    assert R.status_json_has_unfinished_work(status) is False
