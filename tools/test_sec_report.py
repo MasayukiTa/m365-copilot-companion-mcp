@@ -5,7 +5,7 @@ The generator must: (1) emit one block per factor group in the exact requested f
 (「AAA では、... のため BBB は言えない。一方で、CCC は ...」), (2) build every clause from a
 number on the outcome or a reason code mapped through REASON_PHRASES -- never free-invented,
 (3) surface an unmapped reason code verbatim rather than dropping it, (4) carry the concrete
-numbers the owner asked for: effect, interval, n(=K), delta_min, family m. Pure: no engine,
+specified numbers: effect, interval, n(=K), delta_min, family m. Pure: no engine,
 no numpy, stdlib only.
 """
 from __future__ import annotations

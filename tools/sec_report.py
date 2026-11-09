@@ -4,8 +4,7 @@
 This is a SEPARATE tool from the validity engine and from the judge harness. It does NOT
 judge anything: it takes the structured ConfirmOutcome records produced by
 `tools.screen_estimate_confirm.confirm` (whose confirmation step is the only place the judge
-is called) and turns them into one plain-language block per factor group, of the exact form
-the owner asked for:
+is called) and turns them into one plain-language block per factor group, of the exact specified form:
 
     「AAA では、<原因: 判定器の理由コードや n・交絡・区間から具体的に> のため BBB は言えない。
      一方で、CCC は <確認できた内容と数値>」
@@ -88,7 +87,7 @@ def cause_clause(outcome) -> str:
     """Build the concrete cause (the '...のため' part) from reason codes AND numbers.
 
     Order: mapped reason-code phrases first (deduplicated, OK codes dropped), then any unmapped
-    codes verbatim. Always append the numeric context the owner asked for -- n(=K), the
+    codes verbatim. Always append the specified numeric context -- n(=K), the
     interval, delta_min -- so the cause names a code and the numbers behind it. Never invents.
     """
     o = _as_outcome(outcome)
