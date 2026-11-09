@@ -1,14 +1,46 @@
 import asyncio
 import functools
 import inspect
+import ipaddress
+import os
 from typing import Callable, Optional
 
 import anyio
 import anyio.to_thread
+from anyio.lowlevel import RunVar
 
 from .trace_ops import wrap_for_trace
 
 _REGISTERED: list[dict] = []
+_OUTSIDE_LIMITER = RunVar("outside_tool_limiter")
+
+
+def _outside_limiter():
+    try:
+        return _OUTSIDE_LIMITER.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(8)
+        _OUTSIDE_LIMITER.set(limiter)
+        return limiter
+
+
+def _outside_peer():
+    """Classify only the socket peer, never caller-controlled forwarding headers.
+
+    A local tunnel forwards from 127.0.0.1, indistinguishable here from fleet calls.
+    Such requests remain in the default lane until the tunnel has a distinct listener.
+    """
+    if os.environ.get("MCP_OUTSIDE_LANE", "1").strip().lower() in ("0", "false", "off", "no"):
+        return False
+    try:
+        from fastmcp.server.dependencies import get_http_request
+        peer = get_http_request().scope.get("client")
+        address = ipaddress.ip_address(peer[0])
+        if getattr(address, "ipv4_mapped", None):
+            address = address.ipv4_mapped
+        return not address.is_loopback
+    except (RuntimeError, ValueError, TypeError, IndexError, KeyError):
+        return False
 
 
 #: A refusal begins with this. tools/security.py calls the prefix load-bearing and says it must
@@ -72,7 +104,8 @@ def _to_async(fn: Callable) -> Callable:
         call = functools.partial(fn, *args, **kwargs)
         # Default anyio thread limiter (40 tokens) lets many heavy tools run in
         # parallel; one run_python no longer makes a concurrent grep wait.
-        out = await anyio.to_thread.run_sync(call)
+        limiter = _outside_limiter() if _outside_peer() else None
+        out = await anyio.to_thread.run_sync(call, limiter=limiter)
         _refuse_as_error(out)
         return out
 

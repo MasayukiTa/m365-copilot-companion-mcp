@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -351,6 +352,23 @@ def _record_judgement(kind, text, req, verdict, mode_name, blocks, human=None):
         pass
 
 
+def _wait_only(command: str) -> bool:
+    """Recognize standalone waits conservatively, never compound shell commands."""
+    command = command.strip()
+    numeric = (
+        r"ping\s+-n\s+(\d+)\s+(?:127\.0\.0\.1|localhost)",
+        r"timeout\s+/t\s+(\d+)",
+        r"sleep\s+(\d+)",
+        r"start-sleep\s+(?:-seconds\s+)?(\d+)",
+    )
+    for pattern in numeric:
+        match = re.fullmatch(pattern, command, flags=re.IGNORECASE)
+        if match:
+            return int(match.group(1)) > 20
+    return bool(re.fullmatch(r"gh\s+run\s+watch(?:\s+\d+)?", command, re.IGNORECASE)
+                or re.fullmatch(r"gh\s+pr\s+checks(?:\s+\d+)?\s+--watch", command, re.IGNORECASE))
+
+
 def shell_exec(
     command: str,
     timeout: int = 30,
@@ -384,6 +402,11 @@ def shell_exec(
     locked = require_unlocked()
     if locked:
         return locked
+    # Measured 2026-11-09: five simultaneous ping waits contributed to 30 inflight
+    # responses and outside calls waiting 9-22 seconds. Resume via the fleet instead.
+    if _wait_only(command):
+        return ("[shell_exec error: wait-only command refused; end your turn and "
+                "be resumed later by the fleet.]")
     _bad = _cmd_shell_syntax_guard(command)
     if _bad is not None:
         return _bad

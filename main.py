@@ -2161,4 +2161,7 @@ if __name__ == "__main__":
     # event is pure pre-listen setup (watchers, log config); everything tool-registration had
     # to do is already done. See _startup_trace for why this proves the ordering.
     _startup_trace("about-to-listen")
-    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
+    # Keep scope["client"] as the socket peer for lane selection; uvicorn's default
+    # proxy-header middleware would replace it with a caller-supplied forwarded IP.
+    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30,
+                proxy_headers=False, **_run_kwargs)
