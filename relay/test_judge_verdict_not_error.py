@@ -39,7 +39,7 @@ import pytest
 from relay import judge_gate
 
 
-GOAL = "odbc_query で DBB のロット別かすれ率を集計して相関を出す"
+GOAL = "odbc_query で WIDGETDB のロット別不良A率を集計して相関を出す"
 
 # The engine's required claim keys, as the frozen loader lists them (mirrored, engine is READ-ONLY).
 _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierarchy",
@@ -50,7 +50,7 @@ _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierar
 def _free_text_claim(claim_id="example_analysis"):
     """The real shape a worker registered: a free-text statement, no engine schema keys."""
     return {"id": claim_id,
-            "statement": "679端部かすれは来歴データと有意な相関を示さない(全因子95%CIが0をまたぐ)。",
+            "statement": "679端部不良Aは来歴データと有意な相関を示さない(全因子95%CIが0をまたぐ)。",
             "data_location": "C:/Users/x/Downloads/_clean.csv"}
 
 
@@ -58,8 +58,8 @@ def _structured_claim(claim_id="example_analysis"):
     """A claim with every engine-required key present (values are synthetic placeholders; the
     PRESENCE is what the harness screens, the engine still owns value validation)."""
     return {
-        "id": claim_id, "dataset_id": "ds_kasure", "data_kind": "public",
-        "response": {"column": "kasure", "type": "binary"},
+        "id": claim_id, "dataset_id": "ds_defectA", "data_kind": "public",
+        "response": {"column": "defectA", "type": "binary"},
         "exposure": {"column": "flow_L", "kind": "numeric", "level": "between_lot",
                      "contrast": {"type": "per_unit", "value": 1.0}},
         "hierarchy": {"unit_column": "lot"},
@@ -67,7 +67,7 @@ def _structured_claim(claim_id="example_analysis"):
         "direction": "either",
         "delta_min": {"value": 0.3, "scale": "standardized", "rationale": "r",
                       "source": "preregistration"},
-        "mode": "confirmatory", "family": {"id": "kasure", "m": 1},
+        "mode": "confirmatory", "family": {"id": "defectA", "m": 1},
         "assumptions": {"distribution": "gaussian", "balance": "unbalanced"},
     }
 
@@ -78,7 +78,7 @@ def _request(claim, *, claim_id="example_analysis", registered_at="2026-11-02T10
     analysis the worker DID produce (manifest.result, lot_diagnosis y/x/lot)."""
     return {
         "claim_id": claim_id, "data_location": "data.csv", "fetched_at": fetched_at,
-        "manifest": {"path": "manifest.json", "dataset_id": "ds_kasure",
+        "manifest": {"path": "manifest.json", "dataset_id": "ds_defectA",
                      "result": {"n_products": 71, "overall_rate": 0.4085}},
         "registration": {"root": "reg", "claim": claim, "registered_at": registered_at},
         "lot_diagnosis": {"y": [0.9091, 0.0], "x": [90.0, 64.0], "lot": ["T5-07-10NA", "T5-02-03NA"]},

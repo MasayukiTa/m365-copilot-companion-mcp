@@ -2776,7 +2776,7 @@ def run_relay(
             # harness -- record the result/data hash + fetch time, register+lock the claim, run
             # the frozen engine (A, read-only), and put verdict / reason codes / interval / n on
             # the final answer; if the judge cannot run, SAY WHY on the answer (never silently
-            # omit). This fixes the 679かすれ case where the analysis was delivered 3x with no
+            # omit). This fixes the 679defectA case where the analysis was delivered 3x with no
             # judge call. Bounded by the same verify budget so it cannot loop forever.
             from .judge_gate import needs_judge_rework, rework_job_text
             if os.environ.get("MCP_JUDGE_STRICT", "").lower() in ("1", "true", "yes", "on") and needs_judge_rework(goal, resp):

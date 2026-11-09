@@ -1,10 +1,10 @@
 from tools.search_ops import case_reference_search
 
-GOAL = "枝さん_679かすれ調査　これ調べて"
+GOAL = "枝さん_679defectA_study　これ調べて"
 
 
 def test_reference_finds_folder_and_request_only(tmp_path):
-    case = tmp_path / "枝さん_679かすれ調査"
+    case = tmp_path / "枝さん_679defectA_study"
     case.mkdir()
     (case / "やりたいこと.txt").write_text("設備と材料を調べる", encoding="utf-8")
     (tmp_path / "枝さん_679ワニス調査").mkdir()

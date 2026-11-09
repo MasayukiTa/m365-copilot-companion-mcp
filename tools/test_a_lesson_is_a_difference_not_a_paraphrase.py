@@ -49,7 +49,7 @@ def _row(goal, outcome, ts=1.0):
     return {"goal": goal, "outcome": outcome, "ts": ts}
 
 
-BASE = ("collect the quarterly coating inspection figures and report them as a table "
+BASE = ("collect the quarterly widget inspection figures and report them as a table "
         "with one row per production lot and a total line at the bottom")
 
 
@@ -88,7 +88,7 @@ def test_identical_instructions_carry_no_lesson_however_the_runs_ended(tmp_path)
 
 def test_unrelated_work_that_merely_shares_a_vocabulary_is_not_the_same_work(tmp_path):
     led = _ledger(tmp_path, [
-        _row("collect the quarterly coating inspection figures for the audit binder.",
+        _row("collect the quarterly widget inspection figures for the audit binder.",
              "STUCK", 1.0),
         _row("draft the quarterly safety briefing slides for the morning meeting and "
              "circulate them to the shift leads before friday.", "DONE", 2.0),

@@ -159,11 +159,11 @@ def test_strict_missing_request_is_rejected(tmp_path, monkeypatch):
 
 def test_resolved_case_request_classifies_short_reference(tmp_path):
     from tools.search_ops import case_reference_search
-    folder = tmp_path / "枝さん_679かすれ調査"
+    folder = tmp_path / "枝さん_679defectA_study"
     folder.mkdir()
     (folder / "やりたいこと.txt").write_text(
         "検査データの不良件数とロット別の設備条件を集計し相関を調べる。", encoding="utf-8")
-    goal = "枝さん_679かすれ調査　これ調べて"
+    goal = "枝さん_679defectA_study　これ調べて"
     result = case_reference_search(goal, roots=[tmp_path])
     request = next(c for c in result["candidates"] if c["kind"] == "directory")
     text = (folder / "やりたいこと.txt").read_text(encoding="utf-8")

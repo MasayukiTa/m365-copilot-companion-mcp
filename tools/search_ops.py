@@ -73,7 +73,7 @@ def _resolve_full_path_goal(goal):
         return None
     # Split the leading path from any trailing words. The path ends at the first run of
     # whitespace that is followed by a non-path word; a case folder name can itself contain a
-    # single space ("枝さん_679かすれ調査"), so we locate the path by trying the longest leading
+    # single space ("枝さん_679defectA_study"), so we locate the path by trying the longest leading
     # span that names an existing filesystem entry, then shrinking at whitespace boundaries.
     best = None
     # Candidate split points: end-of-string, then each whitespace run from the right.
