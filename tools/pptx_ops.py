@@ -383,101 +383,114 @@ def pptx_export_png(
         out_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            import pythoncom  # type: ignore
-            import win32com.client  # type: ignore
+            import pythoncom  # type: ignore  # noqa: F401
+            import win32com.client  # type: ignore  # noqa: F401
         except ImportError:
             return "[pptx_export_png error: pywin32 not installed; cannot drive PowerPoint COM]"
 
-        pythoncom.CoInitialize()
-        ppt = None
-        pres = None
-        we_opened_it = False  # True only when THIS call opened the document itself
-        try:
-            ppt = win32com.client.DispatchEx("PowerPoint.Application")
-            # OWNERSHIP RULE (why there is no Quit here, and why Close is conditional).
-            # PowerPoint is a single shared application the operator may already be using.
-            # This tool is only allowed to CLOSE THE ONE DOCUMENT IT OPENED ITSELF -- never
-            # Application.Quit, never a process-name terminate/kill, never "close all windows",
-            # never closing any other open presentation. Quitting the application (or killing
-            # the process) would tear down documents this tool never opened, including the
-            # operator's live work, so it is forbidden even on an instance we dispatched
-            # ourselves. The COM references are released instead and the dispatched,
-            # window-less instance is left for the OS to reclaim.
-            #
-            # OWNED-DOCUMENT PROOF (why we check BEFORE opening). Presentations.Open does NOT
-            # always open a new document: when the requested file is ALREADY OPEN in this
-            # application instance, PowerPoint returns a reference to the EXISTING open
-            # presentation rather than opening a second copy. If the operator already had this
-            # deck open, an unconditional Close() in the teardown below would close THEIR
-            # document -- exactly the live work this tool must never touch. We therefore cannot
-            # prove ownership from the object Open hands back; we must establish, before
-            # calling Open, whether the document was already open. The requested path is
-            # normalised (case/separator-insensitive) and compared against the FullName of
-            # every presentation already open in this instance. If it is already open, we do
-            # NOT open it and we do NOT close it -- we are not its owner. Only when it was not
-            # already open do we open it, mark it as ours, and close exactly that object.
-            want = os.path.normcase(os.path.abspath(str(p)))
+        # ROOT CAUSE OF THE REPEATED python.exe CRASHES (faulthandler.log.1, 2026-11-07):
+        # every faulthandler "Current thread" crash frame is this function
+        # (pptx_ops.py:pptx_export_png <- main.py:call_tool), with NATIVE exceptions
+        # 0x80010108 (RPC_E_DISCONNECTED), 0x800706ba/0x800706be (RPC server
+        # unavailable / call failed) and access violations (0xc0000005). These come
+        # from the shared PowerPoint COM server disconnecting mid-call. They are SEH /
+        # native exceptions, NOT Python exceptions -- `try/except Exception` below can
+        # never catch them, so when the COM calls run directly on the anyio call_tool
+        # worker thread, the native crash takes the whole MCP server (main.py, port
+        # 8000) down and it restarts (observed 12:52:41, 13:13:57, 14:28:24).
+        #
+        # Containment: run ALL COM work on a dedicated daemon STA thread. If that
+        # thread dies to a native COM crash, the server process survives: the join
+        # below returns without a result and we report an error string instead of
+        # letting python.exe be killed. The dispatch/no-quit logic (PR #444) is kept
+        # verbatim inside the worker so its green behaviour is unchanged.
+        import threading as _threading
+        _result: dict = {}
 
-            def _already_open():
-                """Return the open presentation whose file is `want`, or None.
-
-                Enumerating ppt.Presentations only READS the collection; it never closes any
-                member. FullName is normalised the same way as `want` so a difference in case
-                or separator does not read as a different file.
-                """
-                try:
-                    existing = ppt.Presentations
-                except Exception:
-                    return None
-                for i in range(1, int(existing.Count) + 1):
-                    try:
-                        candidate = existing.Item(i)
-                        full = candidate.FullName
-                    except Exception:
-                        continue
-                    if full and os.path.normcase(os.path.abspath(str(full))) == want:
-                        return candidate
-                return None
-
-            pres = _already_open()
-            if pres is not None:
-                # The operator (or something else) already had this deck open. Render from it
-                # but DO NOT take ownership: we_opened_it stays False, so the teardown leaves
-                # it exactly as we found it, open.
-                we_opened_it = False
-            else:
-                # Not already open: this call opens it, so this call owns it and may close it.
-                pres = ppt.Presentations.Open(str(p), WithWindow=False)
-                # Confirm the object we got back really is the file we asked for before we
-                # claim ownership. If Open somehow handed back a different document (a path
-                # mismatch), we cannot prove we own it, so we refuse to close it.
-                try:
-                    opened_full = os.path.normcase(os.path.abspath(str(pres.FullName)))
-                except Exception:
-                    opened_full = None
-                we_opened_it = (opened_full == want)
-
-            scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
-            pres.Export(str(out_dir), "PNG", width_px, scale_h)
-            count = len(list(out_dir.glob("*.PNG"))) + len(list(out_dir.glob("*.png")))
-            return f"Exported {count} PNG(s) to {out_dir}"
-        finally:
-            # Close ONLY when THIS call opened the document itself (we_opened_it). If the deck
-            # was already open when we arrived, or if the opened object did not match the
-            # requested path, we_opened_it is False and we leave the document untouched. This
-            # never touches any other document, never closes all windows, and never quits or
-            # kills PowerPoint.
-            try:
-                if pres is not None and we_opened_it:
-                    pres.Close()
-            except Exception:
-                pass
-            # Drop our COM references WITHOUT quitting the application. del + the matching
-            # CoUninitialize is the whole teardown; there is deliberately no ppt.Quit(),
-            # no taskkill, and no window enumeration.
-            pres = None
+        def _com_worker():
+            import pythoncom  # type: ignore
+            import win32com.client  # type: ignore
+            import subprocess
+            from tools import childproc as _childproc
+            pythoncom.CoInitialize()
             ppt = None
-            pythoncom.CoUninitialize()
+            pres = None
+            already_open = False
+            # PowerPoint は 1 つのインスタンスを共有する。DispatchEx は、すでに開いている
+            # 利用者の PowerPoint にそのままつながるので、最後に Quit() すると利用者が開いている
+            # 資料まで閉じてしまう (2026-11-06 に、開始直後に閉じる不具合として確認)。
+            # 起動前から動いていたなら、自分が開いた資料だけ閉じ、アプリは終了しない。
+            try:
+                # creationflags: CREATE_NO_WINDOW so this unattended tasklist probe does
+                # not pop a console window on the operator's desktop. errors="replace" so a
+                # single undecodable cp932 byte cannot lose the whole output (and so this
+                # call states its decoding rather than relying on the locale code page).
+                _tl = subprocess.run(
+                    ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/NH"],
+                    capture_output=True, text=True, errors="replace", timeout=10,
+                    creationflags=_childproc.headless_creationflags(),
+                ).stdout
+                ppt_was_running = "POWERPNT.EXE" in _tl.upper()
+            except Exception:
+                ppt_was_running = True  # 判定できないときは終了させない側に倒す
+            try:
+                ppt = win32com.client.DispatchEx("PowerPoint.Application")
+                # PowerPoint can't be fully hidden on all builds; the dispatch-export-quit pattern is the standard.
+                # 利用者がすでに同じ資料を開いているなら、それを使い、閉じない。
+                already_open = False
+                if ppt_was_running:
+                    try:
+                        _want = os.path.normcase(os.path.abspath(str(p)))
+                        for _i in range(1, ppt.Presentations.Count + 1):
+                            _cand = ppt.Presentations(_i)
+                            if os.path.normcase(os.path.abspath(str(_cand.FullName))) == _want:
+                                pres = _cand
+                                already_open = True
+                                break
+                    except Exception:
+                        pass
+                if pres is None:
+                    pres = ppt.Presentations.Open(str(p), WithWindow=False)
+                scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
+                pres.Export(str(out_dir), "PNG", width_px, scale_h)
+                count = len(list(out_dir.glob("*.PNG"))) + len(list(out_dir.glob("*.png")))
+                _result["ok"] = f"Exported {count} PNG(s) to {out_dir}"
+            except Exception as e:  # pragma: no cover - exercised only with real COM
+                _result["err"] = f"[pptx_export_png error: {type(e).__name__}: {e}]"
+            finally:
+                try:
+                    if pres is not None and not already_open:
+                        pres.Close()
+                except Exception:
+                    pass
+                try:
+                    # 自分が起動したアプリで、開いている資料が 1 つも残っていないときだけ終了する。
+                    if ppt is not None and not ppt_was_running and ppt.Presentations.Count == 0:
+                        ppt.Quit()
+                except Exception:
+                    pass
+                try:
+                    pythoncom.CoUninitialize()
+                except Exception:
+                    pass
+
+        _t = _threading.Thread(target=_com_worker, name="pptx-export-com", daemon=True)
+        _t.start()
+        # Export of a large deck can legitimately take a while; cap it so a hung COM
+        # server cannot wedge the caller forever. A timeout here still leaves the
+        # server process alive -- only this one tool call fails.
+        _t.join(timeout=180)
+        if _t.is_alive():
+            return ("[pptx_export_png error: PowerPoint COM did not finish within 180s; "
+                    "the export was abandoned and the server left running]")
+        if "ok" in _result:
+            return _result["ok"]
+        if "err" in _result:
+            return _result["err"]
+        # Worker thread vanished without recording a result -- the signature of a
+        # native COM crash that this isolation is designed to survive.
+        return ("[pptx_export_png error: PowerPoint COM worker terminated without a "
+                "result (likely a native COM/RPC disconnect); server left running]")
     except Exception as e:
         return f"[pptx_export_png error: {type(e).__name__}: {e}]"
 
