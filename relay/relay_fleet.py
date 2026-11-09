@@ -56,6 +56,7 @@ from relay import fleet_resume as resume_mod
 from relay.control_markers import CLOSING_INSTRUCTION
 from relay import invariants as _invariants
 from relay import auto_rephrase_continue as _auto_rephrase
+from relay import resume_from_state as _resume_from_state
 
 #: RECORD, not RAISE -- see the check in reset_socket_route. A reset runs after a browser has
 #: already died and an exception there costs the run the reset was meant to save.
@@ -9533,6 +9534,13 @@ class RelayWorker:
                     except Exception:
                         _not_sent = False
                     if not _not_sent:
+                        # BEFORE REFUSING TO STUCK: resume an acting repo goal in a NEW
+                        # conversation that first reads its real state, rather than leaving it
+                        # stuck with no attempt. Same bounded path as the timeout branch; refuses
+                        # (returns False) for a native-act goal or when disabled/spent. The fresh
+                        # conversation replaces this driver, so return True to keep the worker.
+                        if self._resume_from_state_after_unknown(reason, delivery):
+                            return True
                         self._refuse_resend(reason, delivery)
                     return False
 
@@ -9964,67 +9972,71 @@ class RelayWorker:
                        "続きから1回だけ再投入(自動・1回のみ)")
         return True
 
-    def _resume_unknown_act_in_fresh_conversation(self):
-        """A timed-out ACTING turn whose delivery is UNKNOWN: instead of ending STUCK, open a
-        NEW conversation that FIRST reads the job's real state (git status / git log / the
-        branch's PR / the files it was writing) and continues from there -- so nothing already
-        done is executed twice blindly.
+    def _resume_from_state_after_unknown(self, reason, delivery):
+        """A delivery-UNKNOWN cut of an ACTING repo goal, with no same-conversation continue:
+        open a NEW conversation that FIRST reads the job's real state and continues from there.
 
-        This is the w41/w43 shape: both lost their reply at the same moment on a dropped socket
-        ('no close frame received or sent'), timed out with no output, and were refused a re-send
-        (delivery=unknown) -- then left STUCK with nobody resuming them. The reconnect/continue
-        path cannot help once the old turn thread is gone, so the safe move is a fresh
-        conversation that verifies state before acting.
+        This is the recovery the timeout/drop path was missing. When the same-conversation continue
+        (relay/continue_recovery.py) refuses -- the backend completed no exchange
+        (``conversation_unknown``), nothing was executed to reconcile (``no_executed_calls``), the
+        model may have acted with its own tools, etc. -- the old code went straight to
+        ``_refuse_resend`` and the worker ended STUCK. Instead, for a goal that is plain repository
+        work (git/tests/files, and NOT mail/calendar/chat), open a fresh conversation whose opening
+        message tells the model to read ``git status``/``git log``/``gh pr view``/the files it was
+        writing BEFORE doing anything, so nothing already present is executed twice.
 
-        Bounded per worker by FRESH_RETRY_MAX (`_resume_unknown_used`), the same cap the other
-        fresh-conversation recoveries use, so a persistently unknown delivery cannot loop.
-        Returns True when the resume was started (the caller returns without settling STUCK);
-        False when it is disabled, already spent, or the goal is empty -- the caller then keeps
-        its existing STUCK path. The old conversation is closed first (inside
-        _start_fresh_conversation), so no two conversations act on the goal at once.
+        Returns True when a fresh-conversation resume was started (the caller returns without
+        refusing). Returns False when it is disabled, already spent, the goal is empty, or the goal
+        is not reconcilable repository work -- the caller then refuses to STUCK exactly as before.
+        Bounded by RESUME_FROM_STATE_PER_GOAL (default 1), mirroring SOCKET_RECONNECTS_IF_DELIVERED.
         """
         try:
-            from relay import auto_rephrase_continue as _arc
-            if not _arc.enabled():
+            if not _resume_from_state.enabled():
                 return False
         except Exception:
             return False
-        used = getattr(self, "_resume_unknown_used", 0)
-        if used >= FRESH_RETRY_MAX:
-            return False
+        if not self._goal_may_act():
+            return False                       # a read-only goal never reached this refuse path
+        if not _resume_from_state.goal_is_resumable(self.goal or ""):
+            return False                       # mail/calendar/chat, or not repo work: keep STUCK
+        spent = getattr(self, "_state_resumes_used", 0)
+        if spent >= _resume_from_state.RESUME_FROM_STATE_PER_GOAL:
+            return False                       # one fresh start per goal, not a loop
         goal_body = effective_goal(self.goal)
         if not goal_body.strip():
             return False
         last, partial, journal = self._collect_progress_fields()
         try:
-            resume_goal = _arc.build_resume_text(
+            resume_goal = _resume_from_state.build_resume_text(
                 goal_body, worker_last=last, partial_text=partial,
                 journal=journal, cwd=(self.cwd or ""))
         except Exception:
             return False
-        used += 1
-        self._resume_unknown_used = used
+        self._state_resumes_used = spent + 1
         job = (conversation_start_label(self.name + "-resume")
                + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + resume_goal
                + self._compaction_note())
-        # A new conversation = a new repetition count; the old streak does not carry over.
+        # A fresh conversation = a fresh repetition count.
         self.no_progress, self.last_norm = 0, None
         self._fresh_turn_base = self.turn
-        delay = FRESH_RETRY_BACKOFF_S[min(used, len(FRESH_RETRY_BACKOFF_S)) - 1]
-        print("[relay_fleet] %s: acting turn timed out with delivery unknown; new conversation "
-              "reads real state then continues (%d/%d, backoff %.0fs)"
-              % (self.name, used, FRESH_RETRY_MAX, delay), flush=True)
+        delay = transient_backoff(2)
         try:
             _socket_route().record(
-                "resume_unknown_act", worker=self.name, turn=self.turn,
-                attempt=used, limit=FRESH_RETRY_MAX, goal=(self.goal or "")[:600])
+                "resume_from_state", worker=self.name, turn=self.turn,
+                goal=(self.goal or "")[:600], used=self._state_resumes_used,
+                delivery=delivery, reason=str(reason)[:300])
         except Exception:
             pass
+        print("[relay_fleet] %s: acting turn cut (delivery=%s); resume from real state in a fresh "
+              "conversation %d/%d (backoff %.0fs): %s"
+              % (self.name, delivery, self._state_resumes_used,
+                 _resume_from_state.RESUME_FROM_STATE_PER_GOAL, delay, str(reason)[:100]),
+              flush=True)
         self._start_fresh_conversation(job, time.time() + delay)
-        self.recovery_state = "recovering"
-        self.reason = ("配達不明のままタイムアウトした作用ターン→新しい会話で実状態(git/PR/"
-                       "書きかけファイル)を確認してから続きから再開(%d/%d)"
-                       % (used, FRESH_RETRY_MAX))
+        self.reason = ("配送不明で途切れた作用目標 → 新しい会話で実状(git/PR/ファイル)を"
+                       "読み直してから続きを行う(%d/%d)" % (
+                           self._state_resumes_used,
+                           _resume_from_state.RESUME_FROM_STATE_PER_GOAL))
         return True
 
     def _start_fresh_conversation(self, job, cooldown_until):
@@ -10518,17 +10530,15 @@ class RelayWorker:
                     if _delivery == "delivered" and self.status != "stuck":
                         self._refuse_resend("bounded wait expired; continuation unavailable", _delivery)
                         return True
-                    # DELIVERY UNKNOWN IS NOT A DEAD END. The same-conversation continue above is
-                    # gone (the old turn thread is dead), and re-sending the turn verbatim could
-                    # repeat an act that may already have run. But leaving the job STUCK with
-                    # nobody resuming it is exactly the w41/w43 incident: two workers lost their
-                    # reply at once on a dropped socket and were never picked back up. So open a
-                    # NEW conversation that FIRST reads the real state (git status / git log / the
-                    # branch's PR / the files it was writing) and continues from there -- bounded
-                    # by FRESH_RETRY_MAX, like every other fresh-conversation recovery.
-                    _resume_fn = getattr(self, "_resume_unknown_act_in_fresh_conversation", None)
-                    if self.status != "stuck" and callable(_resume_fn) and _resume_fn():
-                        self._note_timeout(_origin, _elapsed, "resume-unknown", budget_s=_bound)
+                    # BEFORE REFUSING TO STUCK: an acting REPO goal cut with delivery unknown,
+                    # whose same-conversation continue was unavailable, is resumed in a NEW
+                    # conversation that first reads its real state (git/PR/files) and continues
+                    # from there -- so nothing already done is executed twice. Bounded per goal;
+                    # returns False only to refuse (disabled, spent, or a native-act goal that
+                    # cannot be reconciled from a file read). See relay/resume_from_state.py.
+                    if self._resume_from_state_after_unknown(
+                            "turn timeout without a reply", _delivery):
+                        self._note_timeout(_origin, _elapsed, "resume-from-state", budget_s=_bound)
                         return False
                     self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
                     if self.status != "stuck":
@@ -12627,11 +12637,27 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            # C3, SHADOW ONLY: records which queued goal a load-aware router would have admitted
-            # beside this one. Returns nothing and changes nothing (off = no-op, never raises).
-            load_routing.shadow_assign(w, pending, _active_open(), _socket_cap, _lane_ceiling,
-                                       run_id=run_id, ram_floor_mb=ram_box[0],
-                                       probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
+            # C3: records which queued goal a load-aware router would have admitted beside this
+            # one. off = no-op; shadow = record only (returns None, changes nothing); on = record
+            # AND act -- it returns the position in `pending` of the goal to admit instead, so the
+            # off-vs-on pair can be compared through the cockpit. Never raises.
+            _lr_pick = load_routing.shadow_assign(
+                w, pending, _active_open(), _socket_cap, _lane_ceiling,
+                run_id=run_id, ram_floor_mb=ram_box[0],
+                probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
+            # In `on`, _lr_pick is an int k>=1: the router chose pending[k-1] over the goal the
+            # coordinator picked. Swap -- put the coordinator's goal back at the head of the queue
+            # (so it is the next one considered) and admit the router's choice in its place. Every
+            # other mode/outcome returns None and this block is skipped, so off and shadow admit
+            # exactly the goal they did before. The index is re-validated here so a stale or junk
+            # value can never pop the wrong goal.
+            if isinstance(_lr_pick, int) and 1 <= _lr_pick <= len(pending):
+                _chosen = pending.pop(_lr_pick - 1)
+                if _chosen.status not in TERMINAL:
+                    pending.insert(0, w)
+                    w = _chosen
+                else:
+                    pending.insert(_lr_pick - 1, _chosen)   # untouched: admit the original goal
             ok = w.attach(context, agent_url)
             if not ok and w.status == PENDING:
                 # NO SOCKET AVAILABLE (it went away between the readiness check above and the

@@ -47,6 +47,8 @@ import os
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if REPO not in sys.path:
+    sys.path.insert(0, REPO)
 
 #: Attribution kinds under which tool_events carry a trustworthy task/worker. `ambiguous` and
 #: missing attribution are deliberately absent: they go to the unknown bucket.
@@ -144,9 +146,19 @@ def _arg_key(call):
 
 
 class Roster:
-    """Maps a ledger row's (task, worker) to (campaign_id, child_id), or None."""
+    """Maps a ledger row's (task, worker) to (campaign_id, child_id), or None.
 
-    def __init__(self, workers, camp_rows):
+    When `windows` (a relay.turn_context_join.WindowIndex) is given, a row that the task/worker
+    join cannot place is retried against the coordinator's turn windows: the worker whose turn was
+    in flight at the call's wall-clock `ts`, and the fan-out child that worker was running. This
+    only ADDS attributions a report would otherwise drop into the unknown bucket; a row the
+    existing join already resolves is never re-decided, and with windows=None behaviour is
+    unchanged.
+    """
+
+    def __init__(self, workers, camp_rows, windows=None):
+        self.windows = windows      # relay.turn_context_join.WindowIndex or None
+        self.window_hits = 0        # calls attributed via a turn window (honesty count)
         self.child_of = {}          # task string -> (campaign, child_id)
         self.by_run_name = {}       # (run_id, name) -> (campaign, child_id)
         self.by_run = {}            # run_id -> set of (campaign, child_id)
@@ -201,12 +213,34 @@ class Roster:
     def resolve_call(self, call):
         """(campaign, child) for a ledger row. The identity the coordinator wrote on the row
         (campaign_id + subtask_id, role) wins; a row without it (older ledgers) falls back to the
-        task/worker join through status.json. A merge worker's calls are not sibling calls."""
+        task/worker join through status.json, and then to the coordinator's turn windows. A merge
+        worker's calls are not sibling calls."""
         cid, sub = call.get("campaign_id"), call.get("subtask_id")
         if cid and sub:
             role = str(call.get("role") or CHILD_ROLE).lower()
             return (str(cid), str(sub)) if role == CHILD_ROLE else None
-        return self.resolve(call.get("task"), call.get("worker"))
+        hit = self.resolve(call.get("task"), call.get("worker"))
+        if hit is not None:
+            return hit
+        return self.resolve_by_window(call.get("worker"), call.get("ts"))
+
+    def resolve_by_window(self, worker, ts):
+        """(campaign, child) from the coordinator's turn window containing the call, or None.
+
+        The window carries the fan-out identity the MCP session could not: campaign_id, the
+        campaign child task_id, and role. Only a subtask-role window with both ids is a sibling
+        call; an aggregator (merge) window, or a window missing either id, is not. Pure.
+        """
+        if self.windows is None or not worker:
+            return None
+        ident = self.windows.identity_of(str(worker), ts)
+        cid = ident.get("campaign_id")
+        child = ident.get("task_id")
+        role = str(ident.get("role") or "").lower()
+        if cid and child and role == CHILD_ROLE:
+            self.window_hits += 1
+            return (str(cid), str(child))
+        return None
 
     def resolve(self, task, worker):
         if task:
@@ -222,11 +256,11 @@ class Roster:
         return None
 
 
-def analyse(events, workers, camp_rows):
-    roster = Roster(workers, camp_rows)
+def analyse(events, workers, camp_rows, windows=None):
+    roster = Roster(workers, camp_rows, windows=windows)
     buckets = {"total_calls": 0, "discovery_excluded": 0, "unknown_attribution": 0,
                "attributed_not_fanout": 0, "sibling_calls": 0, "no_args": 0,
-               "campaign_level_calls": 0}
+               "campaign_level_calls": 0, "window_attributed": 0}
     per = {}        # campaign -> dict
     for call, outcome in pair_events(events):
         buckets["total_calls"] += 1
@@ -249,10 +283,13 @@ def analyse(events, workers, camp_rows):
                 continue
             buckets["unknown_attribution"] += 1
             continue
+        _wh_before = roster.window_hits
         hit = roster.resolve_call(call)
         if hit is None:
             buckets["attributed_not_fanout"] += 1
             continue
+        if roster.window_hits > _wh_before:
+            buckets["window_attributed"] += 1
         cid, child = hit
         buckets["sibling_calls"] += 1
         p = per.setdefault(cid, {"calls": [], "t0": None, "t1": None})
@@ -397,6 +434,8 @@ def render(result, summary, top=50, n_transcripts=0):
               "- unknown bucket (no or ambiguous attribution): %d" % b["unknown_attribution"],
               "- attributed but not mapped to a fan-out child: %d" % b["attributed_not_fanout"],
               "- sibling calls (attributed to a campaign child): %d" % b["sibling_calls"],
+              "- of those, attributed via a coordinator turn window: %d"
+              % b.get("window_attributed", 0),
               "- worker-unknown calls with a known campaign (upper bound only): %d"
               % b.get("campaign_level_calls", 0),
               "- sibling calls without comparable args (excluded from M1): %d" % b["no_args"],
@@ -448,7 +487,15 @@ def main(argv=None):
     # path to the live record directory would have to be classified by the isolation guard.
     fleet_dir = args.fleet_dir or os.path.join(REPO, ".fleet")
     events, workers, camps, n_tr = load_fleet(fleet_dir)
-    result = analyse(events, workers, camps)
+    # Attribute calls the MCP session could not label by joining them to the coordinator's turn
+    # windows (relay/turn_context_join.py). Read-only; an absent turn_context.jsonl yields an
+    # empty index and leaves the report exactly as it was.
+    try:
+        from relay import turn_context_join
+        windows = turn_context_join.load_windows(fleet_dir)
+    except Exception:
+        windows = None
+    result = analyse(events, workers, camps, windows=windows)
     summary = summarise(result)
     text = render(result, summary, top=args.top, n_transcripts=n_tr)
     try:
