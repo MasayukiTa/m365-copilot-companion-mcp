@@ -1,4 +1,5 @@
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -351,6 +352,56 @@ def _record_judgement(kind, text, req, verdict, mode_name, blocks, human=None):
         pass
 
 
+# From 2026-11-09 17:13 to 17:36, 30 to 46 requests were in flight and
+# outside calls waited 9 to 80 seconds while long polling occupied workers.
+_WAIT = re.compile(
+    r"(?i)(?<![\w-])(?:ping\s+-n\s+(?P<ping>\d+)\s+(?:127\.0\.0\.1|localhost)\b"
+    r"|timeout\s+/t\s+(?P<timeout>\d+)\b|sleep\s+(?P<sleep>\d+)\b"
+    r"|start-sleep\s+(?:-seconds\s+)?(?P<start>\d+)\b)"
+)
+_LOOP = re.compile(r"(?i)\bfor\s+/l\s+%{1,2}\w+\s+in\s*\(\s*(-?\d+)\s*,\s*(-?\d+)\s*,\s*(-?\d+)\s*\)\s+do\b")
+_GH_WATCH = re.compile(r"(?i)\bgh\s+run\s+watch\b|\bgh\b[^&|\r\n]*?\s--watch\b")
+
+
+def _guard_waits(command: str):
+    """Return the shortened command, whether it changed, and any refusal."""
+    if _GH_WATCH.search(command):
+        return command, False, ("[shell_exec error: watch refused; poll with "
+                                "gh run view <id> --json status,conclusion or "
+                                "gh pr checks <n> without --watch.]")
+    for loop in _LOOP.finditer(command):
+        start, step, end = map(int, loop.groups())
+        body = command[loop.end():].lstrip()
+        if body.startswith("("):
+            depth = 0
+            for index, char in enumerate(body):
+                depth += (char == "(") - (char == ")")
+                if depth == 0:
+                    body = body[:index + 1]
+                    break
+        else:
+            body = re.split(r"[&|]", body, maxsplit=1)[0]
+        waits = list(_WAIT.finditer(body))
+        if waits:
+            count = max(0, (end - start) // step + 1) if step and (end - start) * step >= 0 else 0
+            if count * sum(int(next(v for v in w.groupdict().values() if v is not None)) for w in waits) > 60:
+                return command, False, ("[shell_exec error: long wait loop refused; poll with "
+                                        "gh run view <id> --json status,conclusion or "
+                                        "gh pr checks <n> without --watch.]")
+    changed = False
+    def shorten(match):
+        nonlocal changed
+        group = next(k for k, v in match.groupdict().items() if v is not None)
+        value = match.group(group)
+        if int(value) <= 20:
+            return match.group()
+        changed = True
+        start, end = match.span(group)
+        return match.group()[:start - match.start()] + "20" + match.group()[end - match.start():]
+    result = _WAIT.sub(shorten, command)
+    return result, changed, None
+
+
 def shell_exec(
     command: str,
     timeout: int = 30,
@@ -384,6 +435,9 @@ def shell_exec(
     locked = require_unlocked()
     if locked:
         return locked
+    shortened_command, shortened, refusal = _guard_waits(command)
+    if refusal:
+        return refusal
     _bad = _cmd_shell_syntax_guard(command)
     if _bad is not None:
         return _bad
@@ -396,7 +450,9 @@ def shell_exec(
     if _j is not None:
         return _j
     try:
-        return _run_with_tree_timeout(command, timeout, _working_dir(working_dir))
+        output = _run_with_tree_timeout(shortened_command, timeout, _working_dir(working_dir))
+        return ("[wait shortened to 20 s: poll again in a later call]\n" + output
+                if shortened else output)
     except Exception as e:
         return f"[shell_exec error: {type(e).__name__}: {e}]"
 

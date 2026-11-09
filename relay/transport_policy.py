@@ -198,6 +198,13 @@ ROUTE_CAUSED = (
     # measured -- so it stays unread, which is the whole point of leaving `unknown` alone.
     # Only the decline that WAS measured is listed.
     r"backend declined the request:\s*internalerror",
+    # ADDED 2026-11-09. The websockets ConnectionClosedError str() can arrive without its class
+    # name -- bare "no close frame received or sent", or "...keepalive ping timeout; no close
+    # frame received or sent". Neither matched here, so a real transport drop classified as
+    # `unknown` and was never retried as a route fault (it opened a tab or, worse, counted for
+    # nothing in the breaker). It is the connection dropping, so it is route-caused; listed so
+    # the classifier and indicts_connection agree on the reason that put ~13 workers STUCK.
+    r"no close frame", r"keepalive ping timeout",
 )
 
 #: A fallback reason matching one of THESE is about the goal: the socket could carry the
@@ -221,6 +228,17 @@ CONNECTION_INDICTING = (
     r"went silent", r"handshake", r"websocket",
     r"getaddrinfo", r"name or service not known", r"name resolution", r"\bdns\b",
     r"nodename nor servname",
+    # ADDED 2026-11-09 after ~13 workers ended STUCK at once on a single upstream drop. The
+    # websockets library raises ConnectionClosedError whose str() is bare "no close frame
+    # received or sent" -- and on a keepalive timeout "sent 1011 (internal error) keepalive
+    # ping timeout; no close frame received or sent", which carries no class name. classify_
+    # fallback already called both 'route' (via the "no close frame"/"went silent" route list),
+    # but indicts_connection did NOT, so report_route_fault handed the fault to note_failure and
+    # note_failure dropped it as failure_not_counted -- a route-caused drop that never reached
+    # the breaker. The connection list now matches the route classifier for this reason, so a
+    # simultaneous drop counts toward max_consecutive and closes the route instead of leaving
+    # every in-flight turn to end stuck with delivery=unknown.
+    r"no close frame", r"keepalive ping timeout", r"\b101[16]\b",
 )
 
 
