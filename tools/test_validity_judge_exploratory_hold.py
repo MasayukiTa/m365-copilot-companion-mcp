@@ -28,7 +28,7 @@ import tools.validity_judge as vj
 
 def base_claim(**over):
     c = {
-        "id": "C-TEST", "product": "E-679FG(S)",
+        "id": "C-TEST", "product": "PROD-A",
         "lot_effect_model": "random_independent", "exposure_level": "between_lot",
         "distribution": "gaussian", "balance": "balanced",
         "unit_column": "lot", "K": 8, "effect_type": "A", "time_unit": "day",
