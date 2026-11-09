@@ -207,6 +207,11 @@ def _reader_verify_delivery():
     return mode()
 
 
+def _reader_resume_from_state():
+    from relay.resume_from_state import mode
+    return mode()
+
+
 def _reader_consent_auto_approve():
     from relay.consent_approve import mode
     return mode()
@@ -334,6 +339,7 @@ _LIVE_READERS = {
     "socket_continue_recovery": (_reader_continue_recovery, "on", "off"),
     "auto_rephrase_continue": (_reader_auto_rephrase_continue, "on", "off"),
     "verify_delivery_before_giving_up": (_reader_verify_delivery, "on", "off"),
+    "resume_from_state": (_reader_resume_from_state, "on", "off"),
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
