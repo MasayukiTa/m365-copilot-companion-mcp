@@ -150,6 +150,7 @@ jobs:
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
             relay/test_auto_rephrase_continue.py \
+            scripts/test_agents_janitor.py \
             scripts/test_status_tool_does_not_mislead.py \
             scripts/test_health_probe_isolation.py \
             scripts/test_health_busy_signal.py \
@@ -179,6 +180,7 @@ jobs:
             relay/test_fleet_case_reference.py \
             relay/test_judge_none_on_full_path_case_ref.py \
             relay/test_judge_gate_harness.py \
+            relay/test_design_feasibility_core.py \
               relay/test_judge_engine_messages.py \
             relay/test_fleet_judge_request.py \
             relay/test_judge_correction_turn.py \
@@ -1187,7 +1189,8 @@ jobs:
             tests/test_response_telemetry.py \
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
             tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
-            relay/test_a_stale_coordinator_restarts_only_when_idle.py
+            relay/test_a_stale_coordinator_restarts_only_when_idle.py \
+            relay/test_a_wedged_hard_reset_in_recovery_is_caught_not_fatal.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
