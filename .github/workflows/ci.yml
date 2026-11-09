@@ -187,6 +187,7 @@ jobs:
             relay/test_judge_engine_chain_after_395.py \
             relay/test_judge_verdict_not_error.py \
             relay/test_engine_claim_schema_in_initial_instruction.py \
+            relay/test_judge_footer_force_hold.py \
             tests/test_validity_harness.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \
@@ -267,6 +268,7 @@ jobs:
             relay/test_continue_turn_recovery.py \
             relay/test_a_cut_after_output_is_continued_not_resent.py \
             relay/test_socket_tools.py \
+            relay/test_unfenced_call_label.py \
             relay/test_first_turn_preflight.py \
             relay/test_token_prestart.py \
             relay/ops_db/test_ops_db_stage1.py \
@@ -294,6 +296,7 @@ jobs:
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
             relay/test_fleet_tombstone.py \
+            relay/test_fleet_child_no_resurrect.py \
             relay/test_fleet_close_descendants.py \
             relay/test_desktop_guard.py \
             relay/test_every_intake_route_leaves_one_receipt.py \
@@ -418,6 +421,7 @@ jobs:
             scripts/test_supervisor_death_is_explained.py \
             scripts/test_supervisor_no_duplicate_host.py \
             scripts/test_supervisor_dead_tunnel_host_replaced.py \
+            scripts/test_supervisor_zero_conn_recovery.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
@@ -474,6 +478,7 @@ jobs:
             tools/test_pptx_export_png_does_not_quit_powerpoint.py \
             tools/test_pptx_export_png_closes_only_its_own_document.py \
             tools/test_pptx_inherits_reference_template.py \
+            tools/test_pptx_export_png_com_isolated.py \
             tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
             tests/test_flow_map_docs_name_files_that_exist.py \
@@ -1014,6 +1019,7 @@ jobs:
             relay/test_a_steer_starts_a_new_chain.py \
             relay/test_a_locked_worker_needed_a_button_not_a_prayer.py \
             relay/test_a_bad_check_costs_only_its_own_goal.py \
+            relay/test_a_wedged_edge_probe_gives_up_within_its_deadline.py \
             relay/test_acceptance_process_cleanup.py \
             relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_an_unnumbered_split_reply_is_still_a_split.py \
@@ -1094,6 +1100,7 @@ jobs:
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
             scripts/test_sibling_cost_report.py \
+            scripts/test_sibling_turn_context_join.py \
             scripts/test_comm_roi_report.py \
             scripts/test_board_report.py \
             scripts/test_ab_compare.py \
@@ -1168,6 +1175,7 @@ jobs:
             relay/test_tunnel_host_log.py \
             tests/test_response_telemetry.py \
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
+            tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
             relay/test_a_stale_coordinator_restarts_only_when_idle.py
 
       - name: Run script-style tracer tests
@@ -1307,7 +1315,7 @@ jobs:
         env:
           REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py relay/test_acceptance_process_cleanup.py tools/test_process_tree_ownership.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py ui/test_the_conversation_list_shows_every_transcript.py ui/test_both_windows_can_be_constructed.py ui/test_planned_server_restart_exact_poll.py ui/test_a_submitted_task_is_on_top_at_once.py ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py ui/test_submitted_history_reconciliation.py ui/test_stale_submitted_tasks_are_observable.py ui/test_live_add_survives_runner_shutdown.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_supervisor_stale_code.py scripts/test_supervisor_no_duplicate_host.py scripts/test_supervisor_dead_tunnel_host_replaced.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_failed_start_says_what_and_where.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py scripts/test_start_all_prepares_a_missing_venv.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py scripts/test_tunnel_served_by_another_pc.py scripts/test_start_all_ten_clicks.py scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py scripts/test_configure_env_uses_japanese_font.py scripts/test_preflight_vbs_engine.py scripts/test_gui_submit_lock.py scripts/test_start_all_records_the_bridge_poll.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py relay/test_acceptance_process_cleanup.py tools/test_process_tree_ownership.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py ui/test_the_conversation_list_shows_every_transcript.py ui/test_both_windows_can_be_constructed.py ui/test_planned_server_restart_exact_poll.py ui/test_a_submitted_task_is_on_top_at_once.py ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py ui/test_submitted_history_reconciliation.py ui/test_stale_submitted_tasks_are_observable.py ui/test_live_add_survives_runner_shutdown.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_supervisor_stale_code.py scripts/test_supervisor_no_duplicate_host.py scripts/test_supervisor_dead_tunnel_host_replaced.py scripts/test_supervisor_zero_conn_recovery.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_failed_start_says_what_and_where.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py scripts/test_start_all_prepares_a_missing_venv.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py scripts/test_tunnel_served_by_another_pc.py scripts/test_start_all_ten_clicks.py scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py scripts/test_configure_env_uses_japanese_font.py scripts/test_preflight_vbs_engine.py scripts/test_gui_submit_lock.py scripts/test_start_all_records_the_bridge_poll.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot

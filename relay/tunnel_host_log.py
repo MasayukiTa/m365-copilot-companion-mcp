@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -196,11 +197,127 @@ def pump_stream(stream, sink, on_line=None):
                 pass
 
 
-def run_once(cmd, sink, on_exit=None, hook=None):
+# THE RECONNECT LIMIT, SHARED WITH THE SUPERVISOR. scripts/supervisor_zero_conn_recovery.py
+# ends this reader's host child from the outside once the relay has shown zero Host connections
+# for longer than this; the reader does the SAME from the inside here, so recovery does not
+# depend on the supervisor being the one to notice. The two numbers are kept equal on purpose
+# (measured 2026-11-04: 157 s longest reconnect, ~149 s four-tick debounce, ~7 min gap this
+# closes). The reader only ever ends ITS OWN host child -- it never starts a second reader.
+ZERO_CONN_GRACE_SECONDS = 240
+
+#: How often the reader asks the relay for its Host connections count while a host runs. One
+#: `devtunnel show` was measured at a few seconds, so polling every 15 s is cheap next to a
+#: host that normally runs for hours, and is frequent enough that a grace of 240 s is crossed
+#: within one poll of the limit.
+ZERO_CONN_POLL_SECONDS = 15
+
+# "Host connections : N" in `devtunnel show <name>`, the exact line Get-TunnelHostConnections
+# in scripts/supervisor.ps1 reads, so the reader and the supervisor count the same thing.
+_HOST_CONNECTIONS = re.compile(r"Host connections\s*:\s*(\d+)", re.IGNORECASE)
+
+
+def decide_zero_conn_host_recycle(seconds_at_zero, grace=ZERO_CONN_GRACE_SECONDS):
+    """"recycle" when the relay has shown zero connections past ``grace``, else "wait".
+
+    PURE: no clock, no process, no devtunnel. ``seconds_at_zero`` is how long the relay's
+    Host connections count has been read as zero WITHOUT interruption (the caller resets it
+    to None the moment a poll sees >= 1, or a poll cannot be read). ``None`` (never zero, or
+    the count could not be read) -> "wait": an unreadable or not-yet-zero count must never be
+    the reason a working host is recycled. Only a count that has been a clear zero for longer
+    than ``grace`` yields "recycle".
+    """
+    if seconds_at_zero is None:
+        return "wait"
+    try:
+        secs = float(seconds_at_zero)
+    except (TypeError, ValueError):
+        return "wait"
+    try:
+        g = float(grace)
+    except (TypeError, ValueError):
+        g = float(ZERO_CONN_GRACE_SECONDS)
+    return "recycle" if secs > g else "wait"
+
+
+def read_host_connections(devtunnel, tunnel_name, timeout=20):
+    """The relay's Host connections count for ``tunnel_name``, or None when unreadable.
+
+    Runs ``devtunnel show <name>`` and reads the same "Host connections : N" line the
+    supervisor reads. None on any failure (CLI missing, offline, no such line, timeout):
+    an unreadable count is "cannot tell", which decide_zero_conn_host_recycle treats as wait.
+    """
+    try:
+        proc = subprocess.run(
+            [devtunnel, "show", tunnel_name],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            timeout=timeout,
+            **childproc.tree_popen_kwargs(headless=True, priority=False),
+        )
+    except Exception:
+        return None
+    try:
+        out = (proc.stdout or b"").decode("utf-8", errors="replace")
+    except Exception:
+        return None
+    m = _HOST_CONNECTIONS.search(out)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
+def _watch_zero_connections(proc, sink, read_conn, stop_event,
+                            grace=ZERO_CONN_GRACE_SECONDS, poll=ZERO_CONN_POLL_SECONDS,
+                            now=time.time, sleep=time.sleep):
+    """While ``proc`` runs, poll the connection count; end ONLY ``proc`` if zero past grace.
+
+    ``read_conn()`` returns the current Host connections count or None. The reader is NOT
+    stopped here -- only the host child (``proc``). serve_forever's loop then sees the host
+    exit and starts a fresh host; no second reader is ever started. Returns True if it ended
+    the host for a zero-connection recycle, False otherwise (host exited on its own, or the
+    watcher was asked to stop). Pure of real time only through ``now``/``sleep`` so the test
+    drives it with a fake clock.
+    """
+    zero_since = None
+    while not stop_event.is_set():
+        if proc.poll() is not None:
+            return False  # the host exited on its own; the main wait() handles it.
+        count = read_conn()
+        if count is None or count >= 1:
+            # Unreadable or a real connection -> not a zero streak; reset.
+            zero_since = None
+        else:
+            if zero_since is None:
+                zero_since = now()
+            seconds_at_zero = now() - zero_since
+            if decide_zero_conn_host_recycle(seconds_at_zero, grace) == "recycle":
+                sink.write_line(
+                    "[tunnel_host_log] Host connections stayed at 0 for %.0fs (> %ds): "
+                    "ending this reader's host child pid %s to start a fresh host "
+                    "(no second reader)" % (seconds_at_zero, int(grace), proc.pid))
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+                return True
+        # Wake promptly when asked to stop; otherwise sleep the poll interval.
+        if stop_event.wait(poll):
+            return False
+    return False
+
+
+def run_once(cmd, sink, on_exit=None, hook=None, read_conn=None,
+             grace=ZERO_CONN_GRACE_SECONDS, poll=ZERO_CONN_POLL_SECONDS):
     """Spawn ``cmd``, pump its stdout and stderr into ``sink`` until it exits.
 
-    Returns the process exit code. Used by :func:`serve_forever` and, with a fake command,
-    by the tests that prove the reader keeps consuming while nobody calls anything.
+    Returns ``(exit_code, recycled)``. ``recycled`` is True only when the host was ended by
+    the zero-connection watcher (relay showed no Host connections past ``grace``); False when
+    the host exited on its own. When ``read_conn`` is None no watcher runs and ``recycled`` is
+    always False (the hermetic pipe tests use this form). Used by :func:`serve_forever` and,
+    with a fake command, by the tests that prove the reader keeps consuming while nobody calls
+    anything.
     """
     # bufsize=-1 (system default): the pipes are binary here and line buffering is invalid
     # for binary mode (it warns and is ignored). pump_stream wraps each pipe in a
@@ -219,7 +336,19 @@ def run_once(cmd, sink, on_exit=None, hook=None):
         t = threading.Thread(target=pump_stream, args=(stream, sink, hook), daemon=True)
         t.start()
         threads.append(t)
+    recycled = {"value": False}
+    stop_event = threading.Event()
+    watcher = None
+    if read_conn is not None:
+        def _watch():
+            recycled["value"] = _watch_zero_connections(
+                proc, sink, read_conn, stop_event, grace=grace, poll=poll)
+        watcher = threading.Thread(target=_watch, daemon=True)
+        watcher.start()
     rc = proc.wait()
+    stop_event.set()
+    if watcher is not None:
+        watcher.join(timeout=5)
     for t in threads:
         t.join(timeout=5)
     if on_exit is not None:
@@ -227,7 +356,7 @@ def run_once(cmd, sink, on_exit=None, hook=None):
             on_exit(rc)
         except Exception:
             pass
-    return rc
+    return rc, recycled["value"]
 
 
 def _analyzer_hook(root):
@@ -248,12 +377,21 @@ def _analyzer_hook(root):
 
 def serve_forever(tunnel_name, root=None, devtunnel="devtunnel",
                   max_bytes=DEFAULT_MAX_BYTES, backups=DEFAULT_BACKUPS,
-                  max_restarts=None):
+                  max_restarts=None, watch_connections=True,
+                  grace=ZERO_CONN_GRACE_SECONDS, poll=ZERO_CONN_POLL_SECONDS):
     """Host the tunnel, logging verbosely, restarting on exit with a backoff.
 
     ``max_restarts`` bounds the loop for tests (None = forever). A host that stayed up at
     least 30 s resets the failure counter so a long-lived host that finally drops is not
     treated as a fast-failing one.
+
+    SELF-RECOVERY AT ZERO CONNECTIONS. When ``watch_connections`` is set (the default in
+    production), a watcher polls ``devtunnel show`` while each host runs and, if the relay's
+    Host connections count stays at zero for longer than ``grace``, ends ONLY that host child
+    so this loop starts a fresh one -- it never starts a second reader. A host recycled that
+    way is NOT a failure: the backoff and failure counter are skipped so the fresh host comes
+    up at once (~8 s to re-register, measured 2026-11-04), closing the ~7-minute gap where a
+    live host sat at zero connections and nothing replaced it.
     """
     if root is None:
         root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -262,13 +400,18 @@ def serve_forever(tunnel_name, root=None, devtunnel="devtunnel",
     hook = _analyzer_hook(root)
     cmd = [devtunnel, "-v", "host", tunnel_name]
     sink.write_line("[tunnel_host_log] starting: %s (pid=%d)" % (" ".join(cmd), os.getpid()))
+    read_conn = None
+    if watch_connections:
+        read_conn = lambda: read_host_connections(devtunnel, tunnel_name)  # noqa: E731
     failures = 0
     count = 0
     try:
         while True:
             started = time.time()
+            recycled = False
             try:
-                rc = run_once(cmd, sink, hook=hook)
+                rc, recycled = run_once(cmd, sink, hook=hook, read_conn=read_conn,
+                                        grace=grace, poll=poll)
             except FileNotFoundError as e:
                 sink.write_line("[tunnel_host_log] cannot start host: %s" % e)
                 rc = 127
@@ -277,6 +420,12 @@ def serve_forever(tunnel_name, root=None, devtunnel="devtunnel",
             count += 1
             if max_restarts is not None and count >= max_restarts:
                 break
+            if recycled:
+                # A deliberate zero-connection recycle, not a crash: do not back off and do
+                # not count it as a failure. Start a fresh host at once.
+                failures = 0
+                sink.write_line("[tunnel_host_log] restarting now (recycled at zero connections)")
+                continue
             if ran_for >= 30:
                 failures = 0
             failures += 1

@@ -55,6 +55,8 @@ __all__ = [
     "DESIGN_K_MIN",
     "DESIGN_OVERLAP_MIN",
     "DESIGN_MIN_COMMON_STRATA",
+    "design_feasibility_hold",
+    "DESIGN_HOLD_DISPLAY",
 ]
 
 # The frozen engine checkout (A). Read-only. The engine lives OUTSIDE this public repo on the
@@ -818,9 +820,28 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                                            "schema": JUDGE_REQUEST_SCHEMA,
                                            "attempt": correction_attempt + 1})
             corrections.append(claim_msg)
+        # DESIGN FORCE-HOLD (this slice). Task 1's design-feasibility check (which reads
+        # NO response/outcome column) writes its RESULT into the optional
+        # request["design_feasibility"] section. When it reports the comparison design is
+        # infeasible, the footer and the durable record force the final display to
+        # 設計不成立(保留) regardless of the engine verdict, naming the reason code and
+        # what was seen (common strata, per-group lot counts, overlap coefficient). This
+        # is stricter-only and leaves the engine's own output untouched. A missing or
+        # feasible section changes nothing. We only read the section if it is a dict; the
+        # normaliser (design_feasibility_hold) ignores anything else.
+        design = request.get("design_feasibility")
+        if not isinstance(design, dict):
+            design = None
+        elif design.get("feasible") is False:
+            statuses.append("design feasibility: infeasible -> final display forced to "
+                            + DESIGN_HOLD_DISPLAY
+                            + " (reason_code=%s)" % design.get("reason_code"))
+        else:
+            statuses.append("design feasibility: feasible (no hold forced)")
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
-                                    order_record=order_record)
+                                    order_record=order_record,
+                                    design_feasibility=design)
         full_text = "judge: requested\n" + "\n".join(statuses) + "\n" + footer
         # THE DURABLE RECORD COMES FROM HERE, NOT FROM THE WORKER. The worker used to run this
         # function itself and submit the returned text as its own reason; that made the record
@@ -832,7 +853,8 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         # text -- see RelayWorker._settle_done, which reads judge_result.json for the reason.
         _write_judge_result(
             output_folder, claim_id=claim_id, statuses=statuses, footer=footer,
-            verdict=verdict, engine_available=engine_available, order_record=order_record)
+            verdict=verdict, engine_available=engine_available, order_record=order_record,
+            design_feasibility=design)
         # BUDGET EXHAUSTED WITH THE REQUEST STILL INVALID. The correction turns were spent and a
         # fixable field problem remains: the completion marker names it, and under strict the job
         # is rejected (VERIFY_FAILED). A valid request whose only issue is an unavailable engine
@@ -949,7 +971,7 @@ def _engine_status_line(verdict: dict, engine_available: bool) -> str:
 
 
 def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
-                        engine_available, order_record) -> str:
+                        engine_available, order_record, design_feasibility=None) -> str:
     """Write the authoritative judge record next to the job output and return a short pointer.
 
     Stores judge_result.json = {status, engine_available, engine_status, verdict-or-reason,
@@ -977,6 +999,15 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
     # post-hoc claim (engine rule: D_FAIL_LOCK_AFTER_DATA, HOLD cap) rather than mistaking it for
     # the ERROR the engine returned for a separate reason (an unmapped claim). Never faked.
     post_hoc = post_hoc_order_note(order_record)
+    # DESIGN FORCE-HOLD (this slice). When the upstream design-feasibility check says
+    # the comparison design is infeasible, record the forced hold under a SEPARATE key
+    # and set a top-level `final_display`, WITHOUT touching the engine's own `verdict`.
+    # A reader of judge_result.json thus sees both the forced final display and the
+    # untouched engine output. Stricter-only: a feasible/missing design leaves
+    # final_display as the engine's verdict token and adds no hold record.
+    hold = design_feasibility_hold(design_feasibility)
+    engine_token = verdict.get("verdict") if (engine_available and isinstance(verdict, dict)) else None
+    final_display = DESIGN_HOLD_DISPLAY if hold is not None else engine_token
     record = {
         "status": "requested",
         "claim_id": claim_id,
@@ -989,6 +1020,8 @@ def _write_judge_result(output_folder, *, claim_id, statuses, footer, verdict,
                                      if isinstance(verdict, dict) else None)),
         "order": order_record,
         "post_hoc": post_hoc or None,
+        "design_feasibility_hold": hold,
+        "final_display": final_display,
         "statuses": list(statuses),
         "footer": footer,
         "source": "harness",
@@ -1210,16 +1243,142 @@ def _fmt_n(ev: dict) -> str:
     return ", ".join(parts) if parts else "n=未返却"
 
 
+# --- DESIGN-FEASIBILITY FORCE-HOLD (this slice) ------------------------------
+#
+# WHY THIS EXISTS, AND HOW IT DIFFERS FROM design_check. A SEPARATE, info-only
+# `design_check` footer section (feat/judge-footer-design-check) ADDS what it saw
+# about the comparison design but changes nothing about the verdict. The owner
+# (2026-11-04 07:45) said that is not enough: when groups being compared differ by
+# PRODUCT (塗工布品名) rather than by the exposure under study, the comparison is not
+# a comparison at all (equipment-vs-product cannot be separated), and that must be
+# judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
+# inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
+# response/outcome column -- feat/design-feasibility-core) reports the design is
+# INFEASIBLE, the FINAL DISPLAY is forced to 設計不成立(保留) regardless of what the
+# engine verdict was.
+#
+# STRICTER-ONLY, AND NON-DESTRUCTIVE. This can only turn a deliverable answer INTO a
+# hold; it never turns a hold into GO and never relaxes anything. The engine's own
+# output is PRESERVED UNCHANGED -- the footer still prints the original verdict block
+# below the hold banner (labelled 参考・変更なし), and _write_judge_result keeps the
+# original `verdict` key intact while recording the hold under the SEPARATE key
+# `design_feasibility_hold` plus a top-level `final_display`. So a reader always sees
+# both the forced final display and the untouched engine verdict.
+#
+# INDEPENDENCE. This consumes a plain dict (the design_feasibility RESULT), it does
+# not import or recompute the upstream check. The dict shape it reads:
+#   {"feasible": bool,                 # False => force a hold
+#    "reason_code": str,               # e.g. one of _DESIGN_INFEASIBLE_REASONS
+#    "common_strata": int,             # 共通層(製品)の数
+#    "lots_per_group": {group: int},   # 群ごとのロット数
+#    "overlap_coefficient": number,    # 群間の層構成の重なり係数
+#    ...}                              # any other keys are carried as `seen`
+# Only `feasible is False` forces the hold; a missing/True/None design never does,
+# so wiring this in cannot flip an otherwise-deliverable answer by accident.
+
+#: The reason codes this slice understands for an infeasible comparison design. Kept
+#: as a catalogue so the footer/record can show a human-readable gloss next to the
+#: machine code. An unknown code is still surfaced verbatim (never swallowed).
+_DESIGN_INFEASIBLE_REASONS = {
+    "STRATUM_COLUMN_ABSENT":
+        "層別の候補列(製品=塗工布品名・製造品名・品種、ライン、期間など)が入力に無い",
+    "NO_COMMON_STRATUM":
+        "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
+    "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
+        "共通の層内で各群 k_min ロット以上を満たす層の数が下限未満",
+    "GROUP_COMPOSITION_IMBALANCE":
+        "群ごとの層構成の偏りが大きい(重なり係数が閾値未満)",
+}
+
+#: The single phrase the forced final display uses, matched elsewhere so the gate and
+#: tests can pin it. The engine's own verdict tokens (GO/HOLD/NA) are NOT reused for
+#: this -- a forced design hold is a HARNESS decision about the comparison's validity,
+#: distinct from the engine's statistical verdict, and must read as such.
+DESIGN_HOLD_DISPLAY = "設計不成立(保留)"
+
+
+def design_feasibility_hold(design) -> dict | None:
+    """Normalise a design_feasibility RESULT into a force-hold record, or None.
+
+    Returns None (no forcing) unless `design` is a dict whose `feasible` is EXACTLY
+    False -- a missing design, design is None, or feasible True/None never forces a
+    hold (stricter-only: this can only add a hold, never remove one). When it does
+    force, returns a data-free record naming WHAT WAS SEEN so the footer and the
+    durable judge record can show it:
+      {"forced": True, "reason_code": str, "reason_gloss": str,
+       "common_strata": int|None, "lots_per_group": dict|None,
+       "overlap_coefficient": number|None, "seen": {..other keys..}}
+    Carries no measurement value -- only stratum counts, per-group lot counts and the
+    overlap coefficient, which are design facts, not outcomes. Never raises.
+    """
+    if not isinstance(design, dict):
+        return None
+    if design.get("feasible") is not False:
+        return None
+    code = design.get("reason_code")
+    code = str(code) if code is not None else "DESIGN_INFEASIBLE"
+    gloss = _DESIGN_INFEASIBLE_REASONS.get(code, "")
+    # Carry the design facts the owner asked to see named on the judge票: the number
+    # of common strata, each group's lot count, and the overlap coefficient. Anything
+    # else the upstream check reported is preserved under `seen` (minus the response
+    # column, which the upstream check does not read and does not emit).
+    known = {"feasible", "reason_code", "common_strata", "lots_per_group",
+             "overlap_coefficient"}
+    seen = {k: v for k, v in design.items() if k not in known}
+    return {
+        "forced": True,
+        "reason_code": code,
+        "reason_gloss": gloss,
+        "common_strata": design.get("common_strata"),
+        "lots_per_group": design.get("lots_per_group"),
+        "overlap_coefficient": design.get("overlap_coefficient"),
+        "seen": seen or None,
+    }
+
+
+def _design_hold_lines(hold: dict) -> list:
+    """The footer lines for a forced design hold (banner + what was seen). Data-free."""
+    code = hold.get("reason_code")
+    gloss = hold.get("reason_gloss")
+    head = "最終表示: %s" % DESIGN_HOLD_DISPLAY
+    why = "理由コード: %s" % code + (("(%s)" % gloss) if gloss else "")
+    lpg = hold.get("lots_per_group")
+    if isinstance(lpg, dict) and lpg:
+        lots = ", ".join("%s=%s" % (g, n) for g, n in sorted(lpg.items(), key=lambda kv: str(kv[0])))
+    else:
+        lots = "未返却"
+    seen = ("見たもの: 共通層の数=%s, 各群のロット数{%s}, 重なり係数=%s"
+            % (hold.get("common_strata"), lots, hold.get("overlap_coefficient")))
+    note = ("比較する群が曝露ではなく製品(塗工布品名)で分かれているため、設備の差か製品の差か"
+            "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。")
+    return [head, why, seen, note]
+
+
 def build_judge_footer(*, verdict: dict | None, engine_available: bool,
-                       unavailable_reason: str = "", order_record: dict | None = None) -> str:
+                       unavailable_reason: str = "", order_record: dict | None = None,
+                       design_feasibility: dict | None = None) -> str:
     """Compose the block appended to a data-analysis final answer.
 
     When the engine ran: surfaces id / verdict (+ja) / finding / claim_supported / reason codes /
     notes / interval / n / input hash -- the fields the skill requires, verbatim from the engine.
     When it did NOT run: states that the judge did NOT run and WHY (never silently omitted).
     Language is bounded by the skill's (e): a verdict is 'judgeable', never 'proven'/'correct'.
+
+    DESIGN FORCE-HOLD (this slice). When `design_feasibility` reports the comparison
+    design is INFEASIBLE (feasible is False), the FINAL DISPLAY is forced to
+    設計不成立(保留): the footer LEADS with a hold banner naming the reason code and
+    what was seen (common strata, per-group lot counts, overlap coefficient), then
+    prints the engine's ORIGINAL verdict block UNCHANGED below it, labelled
+    参考・変更なし. Stricter-only; never edits the engine output. A feasible / missing /
+    None design changes nothing.
     """
+    hold = design_feasibility_hold(design_feasibility)
     lines = ["", "--- 判定器(少標本評価 validity_judge)の結果 ---"]
+    if hold is not None:
+        # Force the final display to a design hold BEFORE the engine block, so a reader
+        # sees the forced verdict first. The engine's own block still follows, unchanged.
+        lines.extend(_design_hold_lines(hold))
+        lines.append("--- 判定器の元の出力(参考・変更なし) ---")
     if order_record is not None:
         lines.append(
             "登録→ロックの順序: order_ok=%s (registered_at=%s, data_fetched_at=%s)" % (
