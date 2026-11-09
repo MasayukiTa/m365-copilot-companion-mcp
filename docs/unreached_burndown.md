@@ -1308,3 +1308,35 @@ caller yet:
 These stay unwired until the cockpit surfaces a reason and the resubmit path carries a new jid.
 The tombstone's safety property — stopped stays stopped across restarts — does not depend on
 any of the three.
+
+## relay/opening_record.py — append-only data-opening record
+
+A generic, append-only JSONL record of *data openings*. One opening is one event: an analysis
+tool opened a set of data items. Each row carries the `analysis_id`, the opened item ids, an
+`items_digest` taken over the sorted, de-duplicated ids, a caller-supplied `fetched_at` string,
+and the `columns` read. The point of the digest is that two openings that touched the same set
+of items hash the same regardless of order, so a later independence check can see whether a
+confirmation reused items an earlier analysis had already opened. The module records facts; it
+relaxes no threshold and makes no judgement of its own.
+
+Every public function is exercised by `relay/test_opening_record.py` (synthetic ids only, e.g.
+`a1`, `item-001`) and has no production caller yet, so each is filed in `NO_CALLER_BUT_TESTED`
+with reason `deliberate`:
+
+- `items_digest` — sha256 over the sorted, de-duplicated item ids; order- and duplicate-insensitive,
+  so a confirmation that reopened the same set shares the earlier opening's digest.
+- `build_row` — assembles one opening row dict (normalised items plus digest) without touching any
+  file, so a caller can inspect a row before deciding to persist it. Called by `record_opening`.
+- `init_record` — ensures an empty record file (and its parents) exists; idempotent, never
+  truncates an existing file.
+- `record_opening` — appends one opening to the record and returns the row written; creates the
+  file if absent, so a caller may skip `init_record`.
+- `read_records` — reads every row back in file order, skipping blank lines; a missing file reads
+  as no rows.
+- `iter_openings` — streams rows back in file order, optionally narrowed to one `analysis_id` — the
+  grain a later overlap check reads at.
+
+These stay unwired on purpose until the fetch-time writer (which calls `record_opening` as items
+are fetched) and the independence-check reader (which reads through `read_records` / `iter_openings`)
+land as later parts. Recording-only means the record can be present and truthful before the
+stricter check that reads it exists.

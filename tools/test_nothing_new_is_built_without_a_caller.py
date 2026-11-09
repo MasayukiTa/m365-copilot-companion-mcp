@@ -172,6 +172,20 @@ NO_CALLER_BUT_TESTED = {
     "relay/fleet_tombstone.py::remove_tombstone",                 # 20 lines, test refs
     "relay/fleet_tombstone.py::tombstone_reason",                 # 12 lines, test refs
     "relay/fleet_tombstone.py::tombstoned_jids",                  # 12 lines, test refs
+    # APPEND-ONLY DATA-OPENING RECORD (relay/opening_record.py). A generic JSONL record of
+    # data openings: each row carries an analysis id, the opened item ids, a digest over the
+    # sorted-unique ids, a fetched-at string and the columns read. It lets a later independence
+    # check see whether a confirmation reused items an earlier analysis had already opened; it
+    # stores facts and makes no judgement. Every public function is exercised by
+    # relay/test_opening_record.py but has no production caller yet -- the fetch-time writer and
+    # the independence-check reader are not part of this change. Kept unwired on purpose; see
+    # docs/unreached_burndown.md, which names each one.
+    "relay/opening_record.py::items_digest",                      # test refs
+    "relay/opening_record.py::build_row",                         # test refs
+    "relay/opening_record.py::init_record",                       # test refs
+    "relay/opening_record.py::record_opening",                    # test refs
+    "relay/opening_record.py::read_records",                      # test refs
+    "relay/opening_record.py::iter_openings",                     # test refs
 }
 
 BASELINE = NO_CALLER_NO_TEST | NO_CALLER_BUT_TESTED
@@ -413,6 +427,17 @@ REASONS: dict[str, tuple[str, str]] = {
     "relay/fleet_tombstone.py::tombstone_reason": ("deliberate", "docs/unreached_burndown.md"),
     "relay/fleet_tombstone.py::tombstoned_jids": ("deliberate", "docs/unreached_burndown.md"),
 
+    # APPEND-ONLY DATA-OPENING RECORD (relay/opening_record.py). Generic JSONL record of data
+    # openings; every public function is tested in relay/test_opening_record.py and unwired on
+    # purpose until the fetch-time writer and the independence-check reader land. See
+    # docs/unreached_burndown.md, "relay/opening_record.py -- append-only data-opening record",
+    # which names each one.
+    "relay/opening_record.py::items_digest": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/opening_record.py::build_row": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/opening_record.py::init_record": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/opening_record.py::record_opening": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/opening_record.py::read_records": ("deliberate", "docs/unreached_burndown.md"),
+    "relay/opening_record.py::iter_openings": ("deliberate", "docs/unreached_burndown.md"),
 }
 
 #: The inventory as it stood when the reason requirement went in. See the file's own header.
