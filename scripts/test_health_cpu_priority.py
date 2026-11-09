@@ -119,15 +119,17 @@ def test_raise_process_priority_is_safe_and_opt_outable(monkeypatch):
     main._raise_process_priority()  # swallows the ImportError, no raise
 
 
-def _spin(stop):
-    # GIL-bound spinner used to saturate a core from a SEPARATE process. It must still be
-    # promptly stoppable: under full CPU saturation on Windows (spawn) a pure busy loop can
-    # starve the child long enough that it never observes `stop` before the parent's join
-    # window closes, leaving an un-reaped process that hangs interpreter shutdown. A tiny
-    # periodic yield keeps the core effectively pinned while guaranteeing the stop flag is
-    # seen quickly, so the parent can always reap the child.
+def _spin(stop, deadline):
+    # GIL-bound spinner used to saturate a core from a SEPARATE process. Two independent
+    # stop conditions make it impossible for this child to outlive the test and wedge CI:
+    #   (1) cooperative: the parent sets `stop` in its finally block;
+    #   (2) self-expiry: the child exits on its own once `deadline` (an absolute wall-clock
+    #       time passed in by the parent) passes, so even if the parent is itself starved or
+    #       dies before it can reap, the spinner terminates by itself within a bounded window.
+    # The inner batch keeps a core effectively pinned; between batches we re-check both the
+    # stop flag and the clock so the child reacts promptly instead of spinning forever.
     x = 0
-    while not stop.is_set():
+    while not stop.is_set() and time.time() < deadline:
         for _ in range(200000):
             x = (x * 1103515245 + 12345) & 0x7FFFFFFF
         time.sleep(0)
@@ -146,7 +148,14 @@ def test_health_gather_stays_fast_under_real_cpu_saturation(monkeypatch):
     ncpu = os.cpu_count() or 4
     ctx = multiprocessing.get_context()
     stop = ctx.Event()
-    procs = [ctx.Process(target=_spin, args=(stop,)) for _ in range(ncpu + 2)]
+    # Absolute self-expiry for every spinner: generous enough to cover the measurement
+    # window below, short enough that a leaked child cannot linger. The parent still reaps
+    # them cooperatively first; this is the backstop, not the primary path.
+    spin_deadline = time.time() + 30.0
+    procs = [
+        ctx.Process(target=_spin, args=(stop, spin_deadline), daemon=True)
+        for _ in range(ncpu)
+    ]
     for p in procs:
         p.start()
     try:
