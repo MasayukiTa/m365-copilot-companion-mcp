@@ -158,4 +158,46 @@ JSON オブジェクトで、`data_source_terms` キーに文字列の配列を�
 
 ---
 
+## 定期スキャン（`scripts/periodic_scan`）のローカル設定
+
+`scripts/periodic_scan` パッケージは汎用です。接続名・テーブル・カラム・クエリ・分析 ID を一切ハードコードせず、サイト固有の値はすべて実行時に**ローカルの gitignore されたプロファイル**から読むか、呼び出し側が注入します。これにより公開リポジトリに社内システム名が入りません。
+
+### プロファイルの場所
+
+```
+<リポジトリルート>/.config/scan_profile.json
+```
+
+`.config/` は `.gitignore` に登録済みなので、プロファイルは公開リポジトリに出ません。環境変数 `PERIODIC_SCAN_PROFILE=/path/to/scan_profile.json` で別の場所を指せます。
+
+### プロファイルの形
+
+キーはすべて任意です。実際に必要なキーが欠けているときだけ、値を捏造せずに明示的なエラーで失敗します。
+
+```json
+{
+  "connection":     "conn1",
+  "lot_table":      "PROD.dbo.V_metric",
+  "unit_column":    "lot",
+  "product_column": "product",
+  "ledger_path":    "C:\\path\\to\\ledger.json"
+}
+```
+
+> 上の値は**ドキュメント用の偽のプレースホルダ**です。ローカルの追跡外 `scan_profile.json` で実際の論理名に置き換えてください。
+
+| キー | 意味 |
+|---|---|
+| `connection` | 論理 ODBC 接続**名**（接続文字列ではない） |
+| `lot_table` | ロット数を数える schema 修飾のテーブル/ビュー |
+| `unit_column` | 1 ロットとして `DISTINCT` で数えるカラム |
+| `product_column` | ロット数を層別するカラム |
+| `ledger_path` | バックログ台帳 JSON のパス |
+
+### ここに決して入れないもの
+
+接続**文字列**・サーバアドレス・資格情報・環境変数名はこのプロファイルに入れません。これらは注入されるクエリ callable が持つ ODBC/`.env` 層に残ります（`.env` キーは本ドキュメント上部を参照）。このファイルは論理名だけを持ち、台帳自体は状態のみ（識別子なし・資格情報なし）を保存します。
+
+---
+
 ← [README に戻る](../README.md)
