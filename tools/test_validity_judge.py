@@ -291,3 +291,19 @@ def test_footer_has_required_fields():
     assert ft["claims_used"] == ["C-TEST"] and ft["ledger_rows"] == ["L-12"]
     assert ft["df"] == 6 and ft["K"] == 8
     assert ft["default_hold_if_only_D_or_B_below"] is True
+
+
+# ----------------------------------------------------------------- claim_sha256 (canonical id)
+def test_claim_sha256_is_deterministic_and_hex():
+    c = base_claim()
+    h1 = vj.claim_sha256(c)
+    h2 = vj.claim_sha256(base_claim())
+    assert h1 == h2
+    assert isinstance(h1, str) and len(h1) == 64
+    assert all(ch in "0123456789abcdef" for ch in h1)
+
+
+def test_claim_sha256_changes_when_a_declared_field_changes():
+    a = vj.claim_sha256(base_claim(K=8))
+    b = vj.claim_sha256(base_claim(K=12))
+    assert a != b
