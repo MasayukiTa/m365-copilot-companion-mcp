@@ -9964,6 +9964,69 @@ class RelayWorker:
                        "続きから1回だけ再投入(自動・1回のみ)")
         return True
 
+    def _resume_unknown_act_in_fresh_conversation(self):
+        """A timed-out ACTING turn whose delivery is UNKNOWN: instead of ending STUCK, open a
+        NEW conversation that FIRST reads the job's real state (git status / git log / the
+        branch's PR / the files it was writing) and continues from there -- so nothing already
+        done is executed twice blindly.
+
+        This is the w41/w43 shape: both lost their reply at the same moment on a dropped socket
+        ('no close frame received or sent'), timed out with no output, and were refused a re-send
+        (delivery=unknown) -- then left STUCK with nobody resuming them. The reconnect/continue
+        path cannot help once the old turn thread is gone, so the safe move is a fresh
+        conversation that verifies state before acting.
+
+        Bounded per worker by FRESH_RETRY_MAX (`_resume_unknown_used`), the same cap the other
+        fresh-conversation recoveries use, so a persistently unknown delivery cannot loop.
+        Returns True when the resume was started (the caller returns without settling STUCK);
+        False when it is disabled, already spent, or the goal is empty -- the caller then keeps
+        its existing STUCK path. The old conversation is closed first (inside
+        _start_fresh_conversation), so no two conversations act on the goal at once.
+        """
+        try:
+            from relay import auto_rephrase_continue as _arc
+            if not _arc.enabled():
+                return False
+        except Exception:
+            return False
+        used = getattr(self, "_resume_unknown_used", 0)
+        if used >= FRESH_RETRY_MAX:
+            return False
+        goal_body = effective_goal(self.goal)
+        if not goal_body.strip():
+            return False
+        last, partial, journal = self._collect_progress_fields()
+        try:
+            resume_goal = _arc.build_resume_text(
+                goal_body, worker_last=last, partial_text=partial,
+                journal=journal, cwd=(self.cwd or ""))
+        except Exception:
+            return False
+        used += 1
+        self._resume_unknown_used = used
+        job = (conversation_start_label(self.name + "-resume")
+               + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + resume_goal
+               + self._compaction_note())
+        # A new conversation = a new repetition count; the old streak does not carry over.
+        self.no_progress, self.last_norm = 0, None
+        self._fresh_turn_base = self.turn
+        delay = FRESH_RETRY_BACKOFF_S[min(used, len(FRESH_RETRY_BACKOFF_S)) - 1]
+        print("[relay_fleet] %s: acting turn timed out with delivery unknown; new conversation "
+              "reads real state then continues (%d/%d, backoff %.0fs)"
+              % (self.name, used, FRESH_RETRY_MAX, delay), flush=True)
+        try:
+            _socket_route().record(
+                "resume_unknown_act", worker=self.name, turn=self.turn,
+                attempt=used, limit=FRESH_RETRY_MAX, goal=(self.goal or "")[:600])
+        except Exception:
+            pass
+        self._start_fresh_conversation(job, time.time() + delay)
+        self.recovery_state = "recovering"
+        self.reason = ("配達不明のままタイムアウトした作用ターン→新しい会話で実状態(git/PR/"
+                       "書きかけファイル)を確認してから続きから再開(%d/%d)"
+                       % (used, FRESH_RETRY_MAX))
+        return True
+
     def _start_fresh_conversation(self, job, cooldown_until):
         """Drop this worker's conversation and queue `job` for a NEW one (never a tab)."""
         try:
@@ -10455,6 +10518,18 @@ class RelayWorker:
                     if _delivery == "delivered" and self.status != "stuck":
                         self._refuse_resend("bounded wait expired; continuation unavailable", _delivery)
                         return True
+                    # DELIVERY UNKNOWN IS NOT A DEAD END. The same-conversation continue above is
+                    # gone (the old turn thread is dead), and re-sending the turn verbatim could
+                    # repeat an act that may already have run. But leaving the job STUCK with
+                    # nobody resuming it is exactly the w41/w43 incident: two workers lost their
+                    # reply at once on a dropped socket and were never picked back up. So open a
+                    # NEW conversation that FIRST reads the real state (git status / git log / the
+                    # branch's PR / the files it was writing) and continues from there -- bounded
+                    # by FRESH_RETRY_MAX, like every other fresh-conversation recovery.
+                    _resume_fn = getattr(self, "_resume_unknown_act_in_fresh_conversation", None)
+                    if self.status != "stuck" and callable(_resume_fn) and _resume_fn():
+                        self._note_timeout(_origin, _elapsed, "resume-unknown", budget_s=_bound)
+                        return False
                     self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
                     if self.status != "stuck":
                         self._refuse_resend("turn timeout without a reply", _delivery)
