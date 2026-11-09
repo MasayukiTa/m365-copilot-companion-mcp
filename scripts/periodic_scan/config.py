@@ -82,30 +82,10 @@ def get(profile: Mapping[str, Any], key: str, default: Any = None) -> Any:
     return profile.get(key, default)
 
 
-def require(profile: Mapping[str, Any], key: str) -> Any:
-    """Read a required key, raising a clear error if the profile omits it.
-
-    This is how the package refuses to invent a connection/table name: if the
-    local profile does not provide it, the caller is told exactly what to add to
-    ``.config/scan_profile.json`` rather than falling back to a real system name.
-    """
-    if not profile:
-        raise ProfileNotFound(
-            "no scan profile found; create %s (see docs/CONFIG.md) and set %r"
-            % (_DEFAULT_PROFILE, key)
-        )
-    if key not in profile:
-        raise ProfileKeyMissing(
-            "scan profile is missing required key %r (see docs/CONFIG.md)" % key
-        )
-    return profile[key]
-
-
 __all__ = [
     "ProfileNotFound",
     "ProfileKeyMissing",
     "profile_path",
     "load_profile",
     "get",
-    "require",
 ]

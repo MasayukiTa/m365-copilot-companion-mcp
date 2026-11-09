@@ -17,8 +17,6 @@ Modules:
                     verbatim; the registration-order trust clock is never forged)
   - db_lots       : count NEW lots, stratified by a product column
   - runner        : wire ledger + lot counting + judge into one scan pass
-  - bc_confirm    : processing (a) B/C confirmation
-  - d_reacquire   : processing (b) D re-acquisition
 
 The judge, its criteria, effect-size floor and any standardisation/correction are
 NEVER changed here, and the registration-order trust clock is NEVER forged: a
