@@ -3242,6 +3242,67 @@ def _watchdog_should_reset(status, stalled_s, now=None, declared_blocks=None,
     return (True, "stalled %ds with no eval in flight -> wedged" % stalled_s)
 
 
+#: PRE-WEDGE RECYCLE THRESHOLDS (measured from coordinator_20261109_183127_p35696.log).
+#: The two Edge losses that day (21:19:56 and 22:30-22:37) were NOT sudden deaths: for minutes
+#: beforehand the companion Edge thrashed -- sweep laps ran 47-166s against a 6-17s baseline,
+#: free RAM fell to 778 MB at 21:42, ~48 msedge processes resident -- while the browser kept
+#: answering its DevTools port. _watchdog_should_reset() reads that responsive port and WAITS
+#: (up to CDP_RESPONSIVE_STALL_CEILING_S) with no view of memory, so the thrash deepened into a
+#: wedge every time. We reuse the already-measured pre-run recycle floors
+#: (edge_recover.RECYCLE_*: cap 1500 MB, floor 1000 MB): 778 MB sits below the 1000 MB floor,
+#: while the healthy 22:38 restart had 2506 MB free (above it). Env-overridable.
+WATCHDOG_RECYCLE_EDGE_CAP_MB = float(
+    os.environ.get("MCP_WATCHDOG_RECYCLE_CAP_MB", "") or 0.0)
+WATCHDOG_RECYCLE_FREE_FLOOR_MB = float(
+    os.environ.get("MCP_WATCHDOG_RECYCLE_FLOOR_MB", "") or 0.0)
+
+
+def _watchdog_should_preempt_recycle(edge_mb, free_mb, cdp_responsive, recovering,
+                                     edge_cap_mb=None, free_floor_mb=None):
+    """Pure decision: should the watchdog PRE-EMPTIVELY recycle the companion Edge, BEFORE it
+    wedges, while it is still answering its DevTools port.
+
+    Returns (recycle: bool, why: str). Side-effect free, so it is unit-tested.
+
+    This fills the gap _watchdog_should_reset() leaves. That function only ever decides a RESET
+    for an Edge that is ALREADY wedged (DevTools dead, or a recovery past its deadline); for a
+    browser that still answers it WAITS, with no view of memory. But the 2026-11-09 losses were
+    preceded by minutes of memory thrash under a still-responsive port. Here we convert that
+    silent wait into a lean restart the moment the companion Edge has bloated past `edge_cap_mb`
+    or free RAM has dropped below `free_floor_mb` -- the SAME measured thresholds the pre-run
+    recycle already uses (edge_recover.should_recycle), applied CONTINUOUSLY from the watchdog
+    instead of only once at start-up.
+
+    Guards (each a reason NOT to pre-empt):
+      * the browser is not currently answering its DevTools port -> a real wedge, not a
+        pre-wedge; leave it to _watchdog_should_reset()'s reset path, do not double-handle it.
+      * a recovery is already in flight (recovering=True) -> a reset is already being driven.
+      * no memory signal over threshold -> nothing to pre-empt (unknown/0 edge size with
+        healthy free RAM is NOT a reason to recycle -- mirrors should_recycle's no-signal rule).
+
+    The over/under test is delegated to should_recycle so there is ONE definition of
+    "bloated/low", not two that can drift.
+    """
+    if cdp_responsive is False:
+        return (False, "browser not answering its DevTools port -> a wedge, not a pre-wedge")
+    if recovering:
+        return (False, "a recovery is already in flight")
+    try:
+        from relay.edge_recover import (should_recycle as _should_recycle,
+                                         RECYCLE_EDGE_CAP_MB as _CAP,
+                                         RECYCLE_FREE_FLOOR_MB as _FLOOR)
+    except Exception as exc:          # pragma: no cover - import guard
+        return (False, "recycle thresholds unavailable: %s" % exc)
+    cap = (edge_cap_mb if edge_cap_mb is not None
+           else (WATCHDOG_RECYCLE_EDGE_CAP_MB or _CAP))
+    floor = (free_floor_mb if free_floor_mb is not None
+             else (WATCHDOG_RECYCLE_FREE_FLOOR_MB or _FLOOR))
+    recycle, why = _should_recycle(edge_mb, free_mb, edge_cap_mb=cap, free_floor_mb=floor)
+    if recycle:
+        return (True, "pre-wedge: %s" % why)
+    return (False, "companion Edge within memory limits")
+
+
 def _recovery_step(attempt, progressed, max_recover, base_s=30.0, cap_s=600.0):
     """Pure decision for the resume loop after a lost context or a failed connect.
 
@@ -5581,6 +5642,31 @@ def main():
                     _wd_last_note[0] = time.time()
                     print(_stamp("[watchdog] status frozen %ds but not resetting: %s"
                                  % (stalled, why)), flush=True)
+                # PRE-WEDGE RECYCLE. The branch above is the blind spot the 2026-11-09 losses
+                # fell through: a browser that still answers its DevTools port makes
+                # _watchdog_should_reset return (False, ...) and the watchdog WAITS to the CDP
+                # ceiling -- for minutes, while memory thrashes, until it wedges for real. When
+                # we are NOT resetting, ask whether the companion Edge has already crossed the
+                # measured memory thresholds; if so, recycle now (discretionary = the lean-
+                # restart path, same as the pre-run recycle) so the wedge never forms. Only when
+                # the browser is still responsive and no recovery is running -- both enforced
+                # inside the pure decision.
+                if not should:
+                    try:
+                        _recyc, _ry = _watchdog_should_preempt_recycle(
+                            companion_edge_mb(), avail_phys_mb(),
+                            cdp_responsive=_cdp_ping(args.cdp_url),
+                            recovering=bool(d.get("recovering")))
+                    except Exception:
+                        _recyc, _ry = False, ""
+                    if _recyc:
+                        print(_stamp("\n[watchdog] %s -> recycling the companion Edge before "
+                                     "it wedges" % _ry), flush=True)
+                        try:
+                            hard_reset(port, discretionary=True)
+                        except Exception:
+                            pass
+                        last_change = time.time()
                 # PROVE WHAT THE SWEEP THREAD IS BLOCKED IN, BEFORE ANYTHING IS RESET. Nobody
                 # had shown what the main thread was doing for >150 s; the stack taken now is
                 # the evidence. Written once per freeze (keyed on the frozen `updated`), whether
@@ -5715,17 +5801,29 @@ def main():
         # hang there was never seen. Set it here, and keep status.json advancing, so a wedged
         # reconnect is detected and reset like any other wedge.
         sweep_active.set()
-        _write_recovering_status(attempt, "cdp_alive_probe")
-        if not _with_deadline(lambda: cdp_alive(args.cdp_url),
-                              RECOVERY_STEP_DEADLINE_S, "cdp_alive"):
-            print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
-            # Keep the recovery-status trail origin/main added for this leg, so the watchdog
-            # and cockpit still see the edge-unreachable reset recorded, then take the reset
-            # under the same hard deadline every other recovery step now runs under.
-            _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
-                                   len(pending))
-            _with_deadline(lambda: hard_reset(port), RECOVERY_STEP_DEADLINE_S, "hard_reset")
+        # THE UNREACHABLE->HARD-RESET STEP RUNS INSIDE THE try, NOT BEFORE IT (2026-11-09
+        # incident). This block's _with_deadline(hard_reset, ...) can raise FleetRecoveryTimeout
+        # when a wedged browser makes the hard reset itself blow its 60s ceiling. While this
+        # block sat ABOVE the try, that exception was caught by NOTHING in the recover loop and
+        # tore straight through main() to SystemExit -- the fleet process died mid-recovery
+        # (observed 22:37:17: 'FleetRecoveryTimeout: recovery step hard_reset did not return
+        # within 60s', attempt 2/3, 30 goals abandoned). FleetRecoveryTimeout's own docstring
+        # already promises it is "counted as a failed attempt and RETRIED through the ordinary
+        # reconnect path"; that promise only holds if it is raised where the generic handler
+        # below can see it. Moving it inside the try makes the promise true: a blown hard-reset
+        # deadline now counts a leg, backs off, and retries -- so recovery survives past the
+        # attempt that previously killed the process.
         try:
+            _write_recovering_status(attempt, "cdp_alive_probe")
+            if not _with_deadline(lambda: cdp_alive(args.cdp_url),
+                                  RECOVERY_STEP_DEADLINE_S, "cdp_alive"):
+                print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
+                # Keep the recovery-status trail origin/main added for this leg, so the watchdog
+                # and cockpit still see the edge-unreachable reset recorded, then take the reset
+                # under the same hard deadline every other recovery step now runs under.
+                _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
+                                       len(pending))
+                _with_deadline(lambda: hard_reset(port), RECOVERY_STEP_DEADLINE_S, "hard_reset")
             _write_recovering_status(attempt, "connect_over_cdp")
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
