@@ -36,6 +36,31 @@ import subprocess
 import sys
 import time
 
+# --- Business-specific terms (kept OUT of the public repo) --------------------
+# The public tree carries only GENERIC placeholders. Real product / column names
+# live in the gitignored .config/domain_terms.json (empty by default); when that
+# file is present the gloss below uses the real names, otherwise a generic label.
+_DOMAIN_TERMS_CACHE = None
+
+
+def _domain_terms() -> dict:
+    global _DOMAIN_TERMS_CACHE
+    if _DOMAIN_TERMS_CACHE is None:
+        path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                            ".config", "domain_terms.json")
+        try:
+            with open(path, encoding="utf-8") as fh:
+                _DOMAIN_TERMS_CACHE = json.load(fh) or {}
+        except Exception:
+            _DOMAIN_TERMS_CACHE = {}
+    return _DOMAIN_TERMS_CACHE
+
+
+def _term(key: str, default: str) -> str:
+    """Return a business term from .config/domain_terms.json, or a generic default."""
+    val = _domain_terms().get(key)
+    return val if isinstance(val, str) and val else default
+
 try:
     from relay.task_kind import task_kind, DATA_QUERY
 except Exception:  # pragma: no cover - allow flat import when run as a script
@@ -1245,7 +1270,7 @@ def _fmt_n(ev: dict) -> str:
 # `design_check` footer section (feat/judge-footer-design-check) ADDS what it saw
 # about the comparison design but changes nothing about the verdict. The owner
 # (2026-11-04 07:45) said that is not enough: when groups being compared differ by
-# PRODUCT (塗工布品名) rather than by the exposure under study, the comparison is not
+# PRODUCT (a product grade) rather than by the exposure under study, the comparison is not
 # a comparison at all (equipment-vs-product cannot be separated), and that must be
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
 # inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
@@ -1264,7 +1289,7 @@ def _fmt_n(ev: dict) -> str:
 # INDEPENDENCE. This consumes a plain dict (the design_feasibility RESULT), it does
 # not import or recompute the upstream check. The dict shape it reads:
 #   {"feasible": bool,                 # False => force a hold
-#    "reason_code": str,               # e.g. one of _DESIGN_INFEASIBLE_REASONS
+#    "reason_code": str,               # e.g. one of _design_infeasible_reasons()
 #    "common_strata": int,             # 共通層(製品)の数
 #    "lots_per_group": {group: int},   # 群ごとのロット数
 #    "overlap_coefficient": number,    # 群間の層構成の重なり係数
@@ -1275,16 +1300,20 @@ def _fmt_n(ev: dict) -> str:
 #: The reason codes this slice understands for an infeasible comparison design. Kept
 #: as a catalogue so the footer/record can show a human-readable gloss next to the
 #: machine code. An unknown code is still surfaced verbatim (never swallowed).
-_DESIGN_INFEASIBLE_REASONS = {
-    "STRATUM_COLUMN_ABSENT":
-        "層別の候補列(製品=塗工布品名・製造品名・品種、ライン、期間など)が入力に無い",
-    "NO_COMMON_STRATUM":
-        "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
-    "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
-        "共通の層内で各群 k_min ロット以上を満たす層の数が下限未満",
-    "GROUP_COMPOSITION_IMBALANCE":
-        "群ごとの層構成の偏りが大きい(重なり係数が閾値未満)",
-}
+def _design_infeasible_reasons() -> dict:
+    """Reason-code -> human gloss. Built lazily so the product/column names come
+    from .config/domain_terms.json at call time (generic defaults when absent)."""
+    return {
+        "STRATUM_COLUMN_ABSENT":
+            "層別の候補列(製品=%s・%s・品種、ライン、期間など)が入力に無い"
+            % (_term("product_name", "製品グレード"), _term("product_name_column", "品種列")),
+        "NO_COMMON_STRATUM":
+            "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
+        "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
+            "共通の層内で各群 k_min ロット以上を満たす層の数が下限未満",
+        "GROUP_COMPOSITION_IMBALANCE":
+            "群ごとの層構成の偏りが大きい(重なり係数が閾値未満)",
+    }
 
 #: The single phrase the forced final display uses, matched elsewhere so the gate and
 #: tests can pin it. The engine's own verdict tokens (GO/HOLD/NA) are NOT reused for
@@ -1313,7 +1342,7 @@ def design_feasibility_hold(design) -> dict | None:
         return None
     code = design.get("reason_code")
     code = str(code) if code is not None else "DESIGN_INFEASIBLE"
-    gloss = _DESIGN_INFEASIBLE_REASONS.get(code, "")
+    gloss = _design_infeasible_reasons().get(code, "")
     # Carry the design facts the owner asked to see named on the judge票: the number
     # of common strata, each group's lot count, and the overlap coefficient. Anything
     # else the upstream check reported is preserved under `seen` (minus the response
@@ -1345,8 +1374,9 @@ def _design_hold_lines(hold: dict) -> list:
         lots = "未返却"
     seen = ("見たもの: 共通層の数=%s, 各群のロット数{%s}, 重なり係数=%s"
             % (hold.get("common_strata"), lots, hold.get("overlap_coefficient")))
-    note = ("比較する群が曝露ではなく製品(塗工布品名)で分かれているため、設備の差か製品の差か"
+    note = (("比較する群が曝露ではなく製品(%s)で分かれているため、設備の差か製品の差か"
             "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。")
+            % _term("product_name", "製品グレード"))
     return [head, why, seen, note]
 
 
