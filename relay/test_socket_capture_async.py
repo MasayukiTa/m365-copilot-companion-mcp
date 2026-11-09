@@ -235,3 +235,76 @@ def test_a_token_with_ample_life_is_not_renewed():
     assert r.needs_refresh("A") is False
     assert mgr.consider(r, "A", "http://localhost:9222") is False
     assert fac.calls == [], "余命が十分あるのに更新を起動している"
+
+
+# ---- per-stage timing and a stage name on failure (connect / page found / token read / write) --
+#
+# A worker capture that times out at 180 s historically logged only 'exceeded 180s' -- no stage,
+# no timing -- so an operator could not tell whether the CDP connect hung, the page was never
+# found, the token read stalled, or the write failed. The worker now times each stage and names
+# the in-flight one; the parent lifts that stage onto its failure message and result. These tests
+# pin all four behaviours and do not open a browser.
+
+
+def test_stage_timer_records_each_stage_and_names_the_inflight_one():
+    from relay.socket_capture_async import _StageTimer, CAPTURE_STAGES
+    clock = [0.0]
+    t = _StageTimer(now=lambda: clock[0])
+    t.enter("connect"); clock[0] = 0.4
+    t.enter("page found"); clock[0] = 1.6
+    t.enter("token read"); clock[0] = 1.9     # still in flight here
+    # The in-flight stage is named, and every stage that began has a timing.
+    assert t.stage == "token read"
+    snap = t.snapshot()
+    assert set(snap) == {"connect", "page found", "token read"}
+    assert abs(snap["connect"] - 0.4) < 1e-6
+    assert abs(snap["page found"] - 1.2) < 1e-6
+    assert abs(snap["token read"] - 0.3) < 1e-6       # measured up to now, not closed
+    # The summary string carries every stage name.
+    assert "connect=" in t.summary() and "token read=" in t.summary()
+    # The declared stage order is exactly the four the task names.
+    assert CAPTURE_STAGES == ("connect", "page found", "token read", "write")
+
+
+def test_stage_name_is_recovered_from_a_worker_stderr_tail():
+    from relay.socket_capture_async import _stage_from_tail
+    tail = "capture worker failed: STAGE=token read timings[connect=0.400s page found=1.200s " \
+           "token read=0.300s]: TimeoutError: waiting for selector"
+    assert _stage_from_tail(tail) == "token read"
+    # A connect-stage failure, and the first (shortest) prefix form.
+    assert _stage_from_tail("x STAGE=connect timings[connect=0.100s]: RuntimeError: no context") \
+        == "connect"
+    # No marker at all (worker killed before it could print) -> a named unknown, never a crash.
+    assert _stage_from_tail("") == "(unknown)"
+    assert _stage_from_tail("some unrelated stderr noise") == "(unknown)"
+
+
+class _StagedTailProc:
+    """A proc whose stderr carries a STAGE= marker, like the real worker on failure."""
+    def __init__(self, *, rc=1, stage="page found"):
+        self.returncode = rc
+        self.pid = 7777
+        self._err = ("capture worker failed: STAGE=%s timings[connect=0.400s %s=5.000s]: "
+                     "RuntimeError: boom" % (stage, stage)).encode("utf-8")
+    def communicate(self, timeout=None):
+        return b"", self._err
+    def poll(self):
+        return self.returncode
+
+
+def test_parent_failure_result_names_the_stage_from_a_nonzero_exit(monkeypatch):
+    from relay.socket_capture_async import AsyncCaptureManager
+    captured = {}
+
+    def _fac(argv, **kw):
+        return _StagedTailProc(rc=1, stage="page found")
+
+    mgr = AsyncCaptureManager(popen=_fac, interval_s=120, timeout_s=2, log=lambda _m: None)
+    r = _route()
+    # Record what the route is told the failure was.
+    monkeypatch.setattr(r, "note_capture_failure", lambda msg: captured.setdefault("why", msg))
+    assert mgr.consider(r, "A", "http://localhost:9222")
+    _wait_done(mgr)
+    assert mgr.stats()["failed"] == 1
+    # The stage name reached the failure log/result, not just a bare exit code.
+    assert "page found" in captured["why"], captured["why"]
