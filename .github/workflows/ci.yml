@@ -549,6 +549,7 @@ jobs:
             tools/test_a_cap_below_the_guard_silences_the_guard.py \
             tools/test_live_checkout_write_guard.py \
             tools/test_file_ops_live_checkout_wiring.py \
+            tests/test_outside_lane.py \
             tools/test_child_process_priority.py \
             tools/test_a_dot_on_in_the_normal_state_is_not_a_signal.py \
             tools/test_tool_probe.py \
