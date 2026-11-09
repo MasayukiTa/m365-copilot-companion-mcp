@@ -28,18 +28,19 @@ if REPO not in sys.path:
     sys.path.insert(0, REPO)
 
 from relay import auto_rephrase_continue as AR  # noqa: E402
+from relay import resume_from_state as RFS  # noqa: E402
 
 #: A stable fragment of the resume lead: the worker must verify state before acting.
 VERIFY_FRAGMENT = "git status"
 #: A stable fragment telling the worker not to redo finished work.
-NO_REDO_FRAGMENT = "\u3084\u308a\u76f4\u3055\u306a\u3044"
+NO_REDO_FRAGMENT = "\u4f5c\u308a\u76f4\u3055\u305a"
 
 
 def test_resume_text_carries_goal_state_check_and_no_redo_instruction():
     goal = "\u4f9d\u983c\u672c\u6587ABC: PR \u3092\u4f5c\u3063\u3066\u30c1\u30a7\u30c3\u30af\u3092\u901a\u305b"
     last = "\u524d\u62c5\u5f53\u306e\u6700\u5f8c\u306e\u8fd4\u7b54\u30c6\u30ad\u30b9\u30c8XYZ"
-    text = AR.build_resume_text(goal, worker_last=last, partial_text="", journal="",
-                               cwd="", git_summary="", folder_listing="")
+    text = RFS.build_resume_text(goal, worker_last=last, partial_text="", journal="",
+                                cwd="", git_summary="", folder_listing="", pr_summary="")
     assert isinstance(text, str)
     assert goal in text
     assert last in text
@@ -55,8 +56,8 @@ def test_resume_text_carries_goal_state_check_and_no_redo_instruction():
 def test_resume_text_survives_empty_inputs_and_missing_cwd(tmp_path):
     missing = str(tmp_path / "does-not-exist")
     goal = "\u7a7a\u306e\u524d\u7f6e\u304d\u3067\u3082\u4f9d\u983c\u672c\u6587\u306f\u6b8b\u308b"
-    text = AR.build_resume_text(goal, worker_last="", partial_text="", journal="",
-                               cwd=missing)
+    text = RFS.build_resume_text(goal, worker_last="", partial_text="", journal="",
+                                cwd=missing, pr_summary="")
     assert isinstance(text, str)
     assert goal in text
     assert VERIFY_FRAGMENT in text
@@ -108,7 +109,7 @@ def test_git_summary_says_no_pr_when_none_found(tmp_path):
 
 def test_resume_text_reaches_git_summary_without_a_repo(tmp_path):
     # No git repo at cwd: build_resume_text still returns, and the preamble says state unknown.
-    text = AR.build_resume_text("\u4f9d\u983c", cwd=str(tmp_path))
+    text = RFS.build_resume_text("\u4f9d\u983c", cwd=str(tmp_path), pr_summary="")
     assert "\u4f9d\u983c" in text
     assert isinstance(text, str)
 

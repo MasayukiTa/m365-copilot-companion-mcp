@@ -219,37 +219,6 @@ def build_resend_text(goal_body, worker_last="", partial_text="", journal="", cw
     return REPHRASE_LEAD + "\n" + preamble + "\n\n--- 元の依頼 ---\n" + (goal_body or "")
 
 
-#: 配達不明(delivery=unknown)でタイムアウトした作用目標を、新しい会話で安全に続けるための
-#: 前置き。前の会話は応答が返らずに途切れており、作用が済んだかどうかは分からない。だから
-#: 同じターンを盲目的に送り直す(=二重実行の恐れ)のではなく、まず実状態を自分で確認し、
-#: 済んでいる作業はやり直さない、と明示する。本文(元のゴール)は後ろに続く。
-RESUME_UNKNOWN_LEAD = (
-    "前回この作業は、応答が返らないままターンがタイムアウトしました。作用を伴う目標のため、"
-    "同じターンをそのまま送り直すと二重に実行される恐れがあり、送り直していません。"
-    "この会話は続きです。まず下記とあなた自身の確認で「どこまで済んでいるか」を把握してから、"
-    "残りだけを進めてください。\n"
-    "最初に必ず、次を自分で 1 回確認する: (1) git status と git log(直近の自分のコミットが入って"
-    "いるか)、(2) 作業ブランチの PR の有無と状態(gh pr view / gh pr checks)、(3) 書きかけだった"
-    "ファイルの実物。すでに済んでいる手順(コミット済み・PR 作成済み・ファイル出力済み)は"
-    "やり直さない。未了の手順だけを続ける。\n")
-
-
-def build_resume_text(goal_body, worker_last="", partial_text="", journal="", cwd="",
-                      git_summary=None, folder_listing=None):
-    """配達不明でタイムアウトした作用目標を、新会話で続けるための 1 通の本文。
-
-    RESUME_UNKNOWN_LEAD(状態確認を先にさせ、二重実行を防ぐ指示)+ 進捗の前置き + 元のゴール。
-    進捗前置き(git status/log・PR・フォルダ一覧)は build_resend_text と同じものを使う。
-    """
-    preamble = progress_preamble(
-        worker_last=worker_last, partial_text=partial_text, journal=journal,
-        cwd=cwd, git_summary=git_summary, folder_listing=folder_listing)
-    return RESUME_UNKNOWN_LEAD + "\n" + preamble + "\n\n--- 元の依頼 ---\n" + (goal_body or "")
-
-
-#: 設定キー名。既定オン。tools/settings_keys.py に宣言、コックピットがミラーする。
-#: 読み方は relay/continue_recovery.py の socket_continue_recovery と同じ(each_gate: 変更が
-#: 次の判断に restart なしで届く)。
 KEY = "auto_rephrase_continue"
 DEFAULT = "on"
 SETTING_KEY = KEY            # 後方互換の別名
