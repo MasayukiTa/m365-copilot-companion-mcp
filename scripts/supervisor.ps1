@@ -3651,8 +3651,10 @@ function Test-FleetHasUnfinishedWork {
             # (a closed stuck worker is finished work here); UNFINISHED only when closed
             # is false AND status is anything else. (The old code read `done`/`state`,
             # which no real worker carries, so every worker looked unfinished and an idle
-            # runner was respawned forever.) Same rule as the pure core
-            # scripts/supervisor_runner_respawn.worker_is_finished.
+            # runner was respawned forever.) This mirrors the pure core in
+            # scripts/supervisor_runner_respawn.py, whose worker_is_finished and
+            # status_json_has_unfinished_work encode exactly this rule and are the one
+            # tested place the key names live, so this reader and that module cannot drift.
             $finishedStatuses = @('done', 'cancelled', 'stuck')
             foreach ($w in $workers) {
                 $finished = $false
