@@ -3545,6 +3545,12 @@ def _goal_item_error(it):
     for key in ("priority", "new_task", "retry"):
         if it.get(key) is not None and not _is_flag(it[key]):
             return "%s must be true/false" % key
+    o = it.get("origin")
+    if o is not None:
+        if not isinstance(o, dict) or set(o) - {"via", "source"}:
+            return "origin must be an object with only via/source"
+        if not all(isinstance(v, str) and _text_ok(v, MAX_REF) for v in o.values()):
+            return "origin via/source must be strings of at most %d chars" % MAX_REF
     if it.get("jid") is not None and not _is_safe_id(it["jid"]):
         return "jid must be a plain id"
     if it.get("origin") is not None:

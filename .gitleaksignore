@@ -22,6 +22,10 @@
 # Same two fixture literals; neither is a real credential.
 d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
 d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
+# History rewritten 2026-11-09 10:45 re-hashed the commit that first introduced the two
+# fixture literals (was d4d2c33ef1f6..., now 6fa5f0032bb5...). The full-history scan now
+# reports them under the new commit SHA, so add the equivalent fingerprints. Same two fixture
+# passwords in scripts/test_unlock_password_is_retrievable.py (lines 66 and 130); not real creds.
 6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
 6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
 #
