@@ -47,6 +47,15 @@ $Boxes = @{
     'tool_probe_idle_min'       = 'toolProbeBox'
 }
 
+# setting key -> AutomationIds of its -/+ stepper in the settings popup. These settings are not
+# combo boxes: the cockpit saves them from a numeric stepper (a value label with a minus and a
+# plus button). The driver below sets them the way a person does -- it clicks + or - until the
+# value label shows the wanted number -- so they need no ComboBox and are kept out of $Boxes.
+$Steppers = @{
+    'maxtabs'       = @{ Value = 'maxtabsValue';       Dec = 'maxtabsDec';       Inc = 'maxtabsInc' }
+    'autoscale_max' = @{ Value = 'autoscaleMaxValue'; Dec = 'autoscaleMaxDec'; Inc = 'autoscaleMaxInc' }
+}
+
 $AE = [System.Windows.Automation.AutomationElement]
 $TS = [System.Windows.Automation.TreeScope]
 
@@ -115,6 +124,41 @@ function Read-SettingsFile([string]$key) {
     return $hit
 }
 
+# Read the number a stepper's value label currently shows. A WPF TextBlock exposes its text as
+# the AutomationElement Name, so the value label is read through NameProperty, not a pattern.
+function Read-StepperValue($el) {
+    if ($null -eq $el) { return $null }
+    $n = $el.Current.Name
+    $parsed = 0
+    if ([int]::TryParse($n, [ref]$parsed)) { return $parsed }
+    return $null
+}
+
+function Invoke-Button($btn) {
+    $btn.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern).Invoke()
+}
+
+# Drive one numeric stepper to $target by clicking + or - until its value label matches, the way
+# a person would. Re-finds the elements each pass because the panel rebuilds on a save/repaint.
+function Set-Stepper([hashtable]$ids, [int]$target) {
+    $deadline = (Get-Date).AddSeconds($TimeoutSeconds)
+    $last = $null
+    while ((Get-Date) -lt $deadline) {
+        $valEl = Find-Anywhere $ids.Value
+        if ($null -eq $valEl) { Open-Settings; Start-Sleep -Milliseconds 200; continue }
+        $cur = Read-StepperValue $valEl
+        if ($null -eq $cur) { return $null }
+        $last = $cur
+        if ($cur -eq $target) { return $cur }
+        $id = if ($cur -lt $target) { $ids.Inc } else { $ids.Dec }
+        $btn = Find-Anywhere $id
+        if ($null -eq $btn) { return $last }
+        Invoke-Button $btn
+        Start-Sleep -Milliseconds 120
+    }
+    return $last
+}
+
 function Invoke-Main {
     Open-Settings
 
@@ -124,6 +168,28 @@ function Invoke-Main {
             if ($null -eq $c) { Write-Output ("{0}: combo {1} not found" -f $k, $Boxes[$k]); continue }
             Write-Output ("{0}: current={1}" -f $k, (Read-Combo $c))
         }
+        foreach ($k in $Steppers.Keys) {
+            $v = Read-StepperValue (Find-Anywhere $Steppers[$k].Value)
+            if ($null -eq $v) { Write-Output ("{0}: stepper {1} not found" -f $k, $Steppers[$k].Value); continue }
+            Write-Output ("{0}: current={1}" -f $k, $v)
+        }
+        return
+    }
+
+    if ($Steppers.ContainsKey($Setting)) {
+        $tgt = 0
+        if (-not [int]::TryParse($Value, [ref]$tgt)) { throw ("{0} takes a number, got '{1}'" -f $Setting, $Value) }
+        $ids = $Steppers[$Setting]
+        $reached = Set-Stepper $ids $tgt
+        if ($null -eq $reached) { throw ("stepper {0} not found in the settings popup" -f $ids.Value) }
+        $fileVal = Read-SettingsFile $Setting
+        if ($null -ne $fileVal -and $fileVal -ne $Value) {
+            throw ("{0}: wanted {1} but settings.txt has {2}" -f $Setting, $Value, $fileVal)
+        }
+        if ($reached -ne $tgt) {
+            throw ("{0}: wanted {1} but the stepper stopped at {2}" -f $Setting, $Value, $reached)
+        }
+        Write-Output ("{0} set to {1} via the settings stepper (read back)" -f $Setting, $Value)
         return
     }
 
