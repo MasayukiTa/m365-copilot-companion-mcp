@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """A goal that is a FULL PATH to the case (not the short reference shape) must still resolve.
 
-Job bfa6b22fac93 ran one turn and finished "judge: none". Its goal was exactly a Downloads
+Job jobsyn0002 ran one turn and finished "judge: none". Its goal was exactly a Downloads
 full path to the request folder followed by 「これ調べて」. The reference regex forbids path
 separators, so case_reference_search returned None, the request file was never read, and the
 goal classified as non-analysis. These tests pin the full-path shape to the same resolved
@@ -10,8 +10,8 @@ candidate the short reference produces.
 from tools.search_ops import case_reference_search
 
 # The EXACT shape of the real goal: an absolute path whose final component is the case folder,
-# then a full-width space, then the words. (job bfa6b22fac93)
-CASE_NAME = "枝さん_679defectA_study"
+# then a full-width space, then the words. (job jobsyn0002)
+CASE_NAME = "sampleuser_679defectA_study"
 
 
 def _full_path_goal(tmp_path):
@@ -22,7 +22,7 @@ def test_full_path_goal_resolves_the_request_file(tmp_path):
     case = tmp_path / CASE_NAME
     case.mkdir()
     (case / "やりたいこと.txt").write_text(
-        "WIDGETDBデータと実データを参照して不良Aの原因を調べる", encoding="utf-8")
+        "query SYNDB and measurement data to investigate the cause of defectA", encoding="utf-8")
     result = case_reference_search(_full_path_goal(tmp_path), [tmp_path])
     assert result is not None
     assert not result["errors"] and not result["truncated"]
@@ -30,7 +30,7 @@ def test_full_path_goal_resolves_the_request_file(tmp_path):
     cand = result["candidates"][0]
     assert cand["kind"] == "directory"
     assert cand["request"] == str(case / "やりたいこと.txt")
-    assert "WIDGETDB" in cand["excerpt"]
+    assert "SYNDB" in cand["excerpt"]
     assert cand["case_id"] == "679"
 
 
@@ -39,7 +39,7 @@ def test_full_path_goal_resolves_even_without_configured_roots(tmp_path):
     # under one of the configured M365_CASE_ROOTS -- the pasted path IS the location.
     case = tmp_path / CASE_NAME
     case.mkdir()
-    (case / "やりたいこと.txt").write_text("WIDGETDB", encoding="utf-8")
+    (case / "やりたいこと.txt").write_text("SYNDB", encoding="utf-8")
     # roots=[] -> the walk would find nothing; only the full-path resolver can succeed.
     result = case_reference_search(_full_path_goal(tmp_path), [])
     assert result is not None
@@ -52,7 +52,7 @@ def test_full_path_directly_to_the_request_file_resolves_its_folder(tmp_path):
     case = tmp_path / CASE_NAME
     case.mkdir()
     req = case / "やりたいこと.txt"
-    req.write_text("WIDGETDB", encoding="utf-8")
+    req.write_text("SYNDB", encoding="utf-8")
     goal = str(req) + " これ調べて"
     result = case_reference_search(goal, [])
     assert result is not None

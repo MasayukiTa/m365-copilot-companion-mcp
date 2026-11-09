@@ -102,7 +102,7 @@ def test_ordinal_and_counter_labels_are_not_claimed_numbers():
 
 
 def test_ports_and_timezones_are_not_claimed_numbers():
-    answer = "Connected to WIDGETDB on port 50379 at :1433, time 2026-11-02T12:43:18+09:00 UTC+9."
+    answer = "Connected to SYNDB on port 50379 at :1433, time 2026-11-02T12:43:18+09:00 UTC+9."
     vals = [v for v, _ in ap.extract_numbers(answer)]
     for planted in (50379, 1433, 9):
         assert planted not in vals, (planted, vals)

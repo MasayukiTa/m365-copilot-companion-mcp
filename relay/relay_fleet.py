@@ -8431,7 +8431,7 @@ class RelayWorker:
     def _case_file_unread(self) -> bool:
         """A resolved case-reference request file exists, but no content-reading tool ran.
 
-        The root cause behind job bfa6b22fac93 was that the goal only POINTED at a request file
+        The root cause behind job jobsyn0002 was that the goal only POINTED at a request file
         (a Downloads path + "これ調べて"); the file's body is the task. A one-turn DONE that never
         opened it answered a question it never read. This is the completion-side backstop to the
         classifier fix: when the harness resolved a request_path, the worker must have used at
@@ -8599,7 +8599,7 @@ class RelayWorker:
                 _answer = getattr(self, "_candidate_done_reply", "") or self.last_response or ""
                 # The requester's own words (goal + resolved request text) name the case: a
                 # digit run that is part of an identifier there ("679" of "679defectA_study",
-                # "e679_v26") is not a computed result, so the gate must not police it when it
+                # "esyn_v01") is not a computed result, so the gate must not police it when it
                 # appears glued to a letter/CJK/path character in the answer. A quantity form
                 # ("679 件", "679%") is still policed. See analysis_provenance.extract_numbers.
                 _req_text = ((getattr(self, "goal", "") or "") + "\n"
