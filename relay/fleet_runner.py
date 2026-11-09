@@ -3125,6 +3125,16 @@ def _main_thread_in_playwright():
     return False
 
 
+class FleetRecoveryTimeout(Exception):
+    """A single step of recovery (a CDP connect/attach, an idle-page close, a liveness probe,
+    a hard reset) ran past its ceiling. Raised by the recover loop's bounded-call helper so a
+    wedged recovery step is counted as a failed attempt and RETRIED through the ordinary
+    reconnect path, instead of blocking the whole fleet forever with status.json frozen. This
+    is a subclass of Exception on purpose: the recover loop's generic handler already answers
+    any exception with attempt-counting + a conditional hard reset, which is exactly what a
+    blown recovery deadline needs."""
+
+
 def _watchdog_should_reset(status, stalled_s, now=None, declared_blocks=None,
                            capture_inflight=0, edge_age_s=None, cdp_responsive=None,
                            main_in_playwright=False):
@@ -3210,6 +3220,20 @@ def _watchdog_should_reset(status, stalled_s, now=None, declared_blocks=None,
     if cdp_responsive is False:
         return (True, "stalled %ds and the browser does not answer its DevTools port "
                       "-> wedged" % stalled_s)
+    # A RECOVERY THAT BLEW ITS OWN DEADLINE IS A WEDGE, even if the browser still answers its
+    # DevTools port. The recover loop stamps status.json with recovering=True and the deadline
+    # the current phase must meet; a CDP socket wedged mid-recovery keeps /json/version
+    # answering (cdp_responsive True) while the next CDP command never returns, which is
+    # exactly the case the responsive-wait below would sit on forever. If the recovery deadline
+    # has passed, do not wait on a responsive port -- reset.
+    if status.get("recovering"):
+        try:
+            _rdl = float(status.get("recovery_deadline") or 0.0)
+        except (TypeError, ValueError):
+            _rdl = 0.0
+        if _rdl and now > _rdl:
+            return (True, "recovery phase %r blew its deadline by %ds -> wedged" % (
+                status.get("recovery_phase"), int(now - _rdl)))
     if (cdp_responsive is True or main_in_playwright) \
             and stalled_s <= CDP_RESPONSIVE_STALL_CEILING_S:
         return (False, "%s (within %ds ceiling)" % (
@@ -3633,6 +3657,12 @@ def _goal_item_error(it):
     for key in ("priority", "new_task", "retry"):
         if it.get(key) is not None and not _is_flag(it[key]):
             return "%s must be true/false" % key
+    o = it.get("origin")
+    if o is not None:
+        if not isinstance(o, dict) or set(o) - {"via", "source"}:
+            return "origin must be an object with only via/source"
+        if not all(isinstance(v, str) and _text_ok(v, MAX_REF) for v in o.values()):
+            return "origin via/source must be strings of at most %d chars" % MAX_REF
     if it.get("jid") is not None and not _is_safe_id(it["jid"]):
         return "jid must be a plain id"
     if it.get("origin") is not None:
@@ -5734,13 +5764,76 @@ def main():
                 time.sleep(min(5.0, max(0.0, deadline - time.time())))
         return new_attempt, give_up_flag
 
+    # EVERY RECOVERY STEP HAS A DEADLINE (2026-11-07 incident). The reconnect steps below --
+    # browser.contexts[0] and _close_idle_copilot_pages -- are synchronous CDP round-trips with
+    # no timeout, and they run BEFORE sweep_active is set, which is the watchdog's blind spot
+    # (it resets its stall clock whenever sweep_active is clear). A CDP socket that is wedged
+    # but still answers its DevTools HTTP port (/json/version) makes connect_over_cdp return,
+    # then the next CDP command never comes back: the sweep never starts, on_tick never fires,
+    # status.json freezes, and the watchdog -- blind here and seeing a 'responsive' browser --
+    # waits forever. Measured once: 33 h silent inside recovery attempt 1. The fix is that
+    # NOTHING in recovery blocks without a ceiling, and status.json keeps advancing while we
+    # recover, so a stuck recovery is visible and retried rather than silent.
+    #: Per-step ceiling for a single synchronous recovery CDP call. Env-overridable; finite.
+    RECOVERY_STEP_DEADLINE_S = float(
+        os.environ.get("MCP_FLEET_RECOVERY_STEP_DEADLINE_S", "60") or 60)
+
+    def _with_deadline(fn, seconds, label):
+        """Run a blocking call with a hard ceiling. Returns fn()'s value, or raises
+        FleetRecoveryTimeout if it has not returned within `seconds`.
+
+        The call runs in a daemon thread; on timeout we STOP WAITING (we do not, and cannot,
+        kill a thread stuck in a C extension) and raise, so the recover loop counts an attempt
+        and retries through its ordinary path (hard reset if the browser is actually gone)
+        instead of standing still. The abandoned thread dies with the next hard reset that
+        tears the wedged browser down."""
+        box = {}
+        def _run():
+            try:
+                box["v"] = fn()
+            except BaseException as _e:          # carry the real error back to the caller
+                box["e"] = _e
+        th = threading.Thread(target=_run, name="recover-%s" % label, daemon=True)
+        th.start()
+        th.join(max(0.1, float(seconds)))
+        if th.is_alive():
+            raise FleetRecoveryTimeout(
+                "recovery step %r did not return within %.0fs" % (label, seconds))
+        if "e" in box:
+            raise box["e"]
+        return box.get("v")
+
+    def _write_recovering_status(attempt_no, phase, deadline_s=RECOVERY_STEP_DEADLINE_S):
+        """Keep status.json ADVANCING during recovery so a stuck recovery is visible, not
+        silent. on_tick only writes while the sweep runs; between legs there is no writer, so
+        the watchdog (and the cockpit) would see a frozen file with no explanation. Stamp a
+        fresh `updated` plus a `recovering` marker and the deadline this phase must meet, so
+        the watchdog can tell a recovery that is making its deadlines from one that has blown
+        them. Best-effort: a failed status write must never abort recovery."""
+        try:
+            snap = {
+                "started": started, "updated": time.time(), "running": True,
+                "idle": False, "recovering": True, "recovery_phase": str(phase),
+                "recovery_attempt": int(attempt_no),
+                "recovery_deadline": time.time() + float(deadline_s),
+                "total": len(goals), "pending": len(pending),
+            }
+            _write_atomic(status_path, snap)
+        except Exception:
+            pass
+
     while pending:
         _leg_size[0] = len(pending)
-        # EACH PROBE/RESET IS BOUNDED. We are past sweep_active.clear() here, so the stall
-        # watchdog is disarmed; a cdp_alive that blocks in its node-driver spawn, or a hard_reset
-        # whose shell-out never returns, would freeze this loop with nothing watching (the 33h
-        # 'attempt 1/3' wedge of 2026-11-07). _guarded stamps status.json and caps each call; a
-        # RecoveryTimeout falls through to the generic handler, which counts it and retries.
+        # EACH PROBE/RESET IS BOUNDED, AND THE WATCHDOG IS ARMED ACROSS THE WHOLE RECONNECT.
+        # origin/main set sweep_active across the reconnect (the watchdog used to be blind here)
+        # and kept status.json advancing; this branch bounds every probe/reset with _guarded so a
+        # cdp_alive that blocks in its node-driver spawn, or a hard_reset whose shell-out never
+        # returns, cannot freeze this loop (the 33h 'attempt 1/3' wedge of 2026-11-07). We keep
+        # both: arm the watchdog and advance the recovering-status trail, then run each call under
+        # its own hard deadline; a RecoveryTimeout falls through to the generic handler, which
+        # counts it and retries.
+        sweep_active.set()
+        _write_recovering_status(attempt, "cdp_alive_probe")
         try:
             _alive = _guarded("cdp-probe", lambda: cdp_alive(args.cdp_url),
                               RECOVER_CDP_DEADLINE_S, "cdp-probe", len(pending))
@@ -5761,11 +5854,19 @@ def main():
                 break
             continue
         try:
+            _write_recovering_status(attempt, "connect_over_cdp")
             with sync_playwright() as p:
+                # Bound the reconnect under its own deadline (this branch), and bound the
+                # context attach too (origin/main added attach_context under a deadline) -- keep
+                # both so neither the connect nor the context fetch can wedge the loop.
                 browser = _guarded("reconnect",
                                    lambda: p.chromium.connect_over_cdp(args.cdp_url, timeout=20000),
                                    RECOVER_CONNECT_DEADLINE_S, "reconnect", len(pending))
-                context = browser.contexts[0] if browser.contexts else browser.new_context()
+                context = _guarded(
+                    "attach-context",
+                    lambda: (browser.contexts[0] if browser.contexts
+                             else browser.new_context()),
+                    RECOVER_CONNECT_DEADLINE_S, "attach-context", len(pending))
                 # START CLEAN, NOT JUST FINISH CLEAN. run_relay_fleet closes any Copilot page
                 # left over when it ENDS, which stops a run leaving one behind -- and does
                 # nothing about one that is already there when it begins.
@@ -5776,7 +5877,10 @@ def main():
                 # no Copilot page open, 697 MB with one. 61.6% of nearly five thousand samples
                 # had one. A monitor caught it and was not read before launching -- so the
                 # check belongs where a launch happens, not in whoever remembers to look.
-                _closed = _close_idle_copilot_pages(context)
+                _write_recovering_status(attempt, "close_idle_pages")
+                _closed = _with_deadline(
+                    lambda: _close_idle_copilot_pages(context),
+                    RECOVERY_STEP_DEADLINE_S, "close_idle_pages")
                 if _closed:
                     print("       start: closed %d Copilot page(s) left by an earlier run "
                           "(they cost ~350 MB each and would have sat in this run's "
