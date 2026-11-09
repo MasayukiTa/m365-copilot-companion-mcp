@@ -582,12 +582,21 @@ partial class CockpitWindow
         var startPlus = MiniButton("+"); startPlus.Click += delegate { SetMaxTabs(_maxtabs + 1); };
         _maxMinus = startMinus; _maxPlus = startPlus;   // keep refs so PaintChrome re-themes them (mirrors ceiling)
         _maxValue = new TextBlock(); _maxValue.Text = _maxtabs.ToString();
+        // AutomationIds so scripts/win/set_setting_via_ui.ps1 can drive the start-tabs (maxtabs)
+        // stepper the way a person does: click -/+ until the value shows the target.
+        System.Windows.Automation.AutomationProperties.SetAutomationId(startMinus, "maxtabsDec");
+        System.Windows.Automation.AutomationProperties.SetAutomationId(startPlus, "maxtabsInc");
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_maxValue, "maxtabsValue");
         col.Children.Add(SettingsStepperRow(T("def_tabs"), _maxValue, startMinus, startPlus, "maxtabs"));
         // ceiling stepper -- reuses _autoLbl/_autoMinus/_autoValue/_autoPlus via CeilingStepper fields
         var ceilMinus = MiniButton("−"); ceilMinus.Click += delegate { SetAutoMax(_autoMax - 1); };
         var ceilPlus = MiniButton("+"); ceilPlus.Click += delegate { SetAutoMax(_autoMax + 1); };
         _autoValue = new TextBlock(); _autoValue.Text = _autoMax.ToString();
         _autoMinus = ceilMinus; _autoPlus = ceilPlus;   // keep refs so UpdateAutoEnabled can grey them
+        // AutomationIds for the ceiling (autoscale_max) stepper, same purpose as the start stepper above.
+        System.Windows.Automation.AutomationProperties.SetAutomationId(ceilMinus, "autoscaleMaxDec");
+        System.Windows.Automation.AutomationProperties.SetAutomationId(ceilPlus, "autoscaleMaxInc");
+        System.Windows.Automation.AutomationProperties.SetAutomationId(_autoValue, "autoscaleMaxValue");
         col.Children.Add(SettingsStepperRow(T("max_tabs2"), _autoValue, ceilMinus, ceilPlus, "autoscale_max"));
 
         // ── Conversation retention: days (default 90, since 2026-09-24) + size cap (default: no cap) ──
