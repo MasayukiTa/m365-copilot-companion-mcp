@@ -15,7 +15,11 @@
 # Neither is a real credential; both are 8-hex-digit-shaped strings the generic-api-key rule
 # cannot distinguish from a key. Confirmed clean with gitleaks v8.30.1:
 #   gitleaks detect --redact -v --log-opts="--all"  ->  0 leaks found, 2431 commits scanned.
-d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
-d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
+# The 2026-11-09 history rewrite moved this blob to 6fa5f003 on origin/main, while an
+# unrelated in-flight branch still carries the pre-rewrite blob at d4d2c33e. The
+# full-history scan (--log-opts="--all") reaches both, so both fingerprints are listed.
+# Same two fixture literals; neither is a real credential.
 6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
 6fa5f0032bb5222059991b227b879cd986d8a331:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
+d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:66
+d4d2c33ef1f6ac580d4bb6fd9968573a20ec2ea9:scripts/test_unlock_password_is_retrievable.py:generic-api-key:130
