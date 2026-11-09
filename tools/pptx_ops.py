@@ -410,46 +410,36 @@ def pptx_export_png(
         def _com_worker():
             import pythoncom  # type: ignore
             import win32com.client  # type: ignore
-            import subprocess
-            from tools import childproc as _childproc
             pythoncom.CoInitialize()
             ppt = None
             pres = None
             already_open = False
             # PowerPoint は 1 つのインスタンスを共有する。DispatchEx は、すでに開いている
-            # 利用者の PowerPoint にそのままつながるので、最後に Quit() すると利用者が開いている
-            # 資料まで閉じてしまう (2026-11-06 に、開始直後に閉じる不具合として確認)。
-            # 起動前から動いていたなら、自分が開いた資料だけ閉じ、アプリは終了しない。
-            try:
-                # creationflags: CREATE_NO_WINDOW so this unattended tasklist probe does
-                # not pop a console window on the operator's desktop. errors="replace" so a
-                # single undecodable cp932 byte cannot lose the whole output (and so this
-                # call states its decoding rather than relying on the locale code page).
-                _tl = subprocess.run(
-                    ["tasklist", "/FI", "IMAGENAME eq POWERPNT.EXE", "/NH"],
-                    capture_output=True, text=True, errors="replace", timeout=10,
-                    creationflags=_childproc.headless_creationflags(),
-                ).stdout
-                ppt_was_running = "POWERPNT.EXE" in _tl.upper()
-            except Exception:
-                ppt_was_running = True  # 判定できないときは終了させない側に倒す
+            # 利用者の PowerPoint にそのままつながることがあり、同じ資料がすでに開かれていれば
+            # Open() は新しく開かず既存の資料オブジェクトを返す。その資料は利用者の生きた作業
+            # なので、閉じてはならない。所有ルールは狭い: このツールは「自分が開いた 1 つの資料」
+            # だけを閉じてよく、Application.Quit もプロセス kill も他の資料の Close も行わない
+            # (2026-11-06 に、開始直後に利用者の資料を閉じる不具合として確認)。
             try:
                 ppt = win32com.client.DispatchEx("PowerPoint.Application")
-                # PowerPoint can't be fully hidden on all builds; the dispatch-export-quit pattern is the standard.
-                # 利用者がすでに同じ資料を開いているなら、それを使い、閉じない。
-                already_open = False
-                if ppt_was_running:
-                    try:
-                        _want = os.path.normcase(os.path.abspath(str(p)))
-                        for _i in range(1, ppt.Presentations.Count + 1):
-                            _cand = ppt.Presentations(_i)
-                            if os.path.normcase(os.path.abspath(str(_cand.FullName))) == _want:
-                                pres = _cand
-                                already_open = True
-                                break
-                    except Exception:
-                        pass
+                # 利用者がすでに同じ資料を開いているなら、それを使い、閉じない。すでに開いて
+                # いるかは、プロセス一覧ではなく開いている資料のコレクションを走査して判定する。
+                # tasklist に頼らないので、分離ワーカースレッド上で余計な子プロセスを起こさず、
+                # 判定は常に実際の COM の状態そのものに基づく。
+                _want = os.path.normcase(os.path.abspath(str(p)))
+                try:
+                    _presentations = ppt.Presentations
+                    _item = getattr(_presentations, "Item", None)
+                    for _i in range(1, _presentations.Count + 1):
+                        _cand = _item(_i) if _item is not None else _presentations(_i)
+                        if os.path.normcase(os.path.abspath(str(_cand.FullName))) == _want:
+                            pres = _cand
+                            already_open = True
+                            break
+                except Exception:
+                    pass
                 if pres is None:
+                    # 自分で開いた資料だけを、このツールが所有する。
                     pres = ppt.Presentations.Open(str(p), WithWindow=False)
                 scale_h = int(width_px * (pres.PageSetup.SlideHeight / pres.PageSetup.SlideWidth))
                 pres.Export(str(out_dir), "PNG", width_px, scale_h)
@@ -459,14 +449,11 @@ def pptx_export_png(
                 _result["err"] = f"[pptx_export_png error: {type(e).__name__}: {e}]"
             finally:
                 try:
+                    # 自分が開いた資料だけを閉じる。到着時にすでに開いていた資料 (利用者の
+                    # 作業) は、このツールの所有物ではないので決して閉じない。Application.Quit
+                    # は呼ばない: アプリを終了すると開いている他の資料まで道連れに閉じてしまう。
                     if pres is not None and not already_open:
                         pres.Close()
-                except Exception:
-                    pass
-                try:
-                    # 自分が起動したアプリで、開いている資料が 1 つも残っていないときだけ終了する。
-                    if ppt is not None and not ppt_was_running and ppt.Presentations.Count == 0:
-                        ppt.Quit()
                 except Exception:
                     pass
                 try:
