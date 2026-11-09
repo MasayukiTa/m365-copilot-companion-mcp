@@ -371,6 +371,15 @@ def shell_exec(
         command: Command line to execute.
         timeout: Maximum execution time in seconds.
         working_dir: Optional working directory under the allowed base.
+
+    On Windows the command runs through cmd.exe, which is NOT bash. A POSIX-style
+    assignment like `WT="C:/path" && ...`, or any token whose first non-space
+    character is `=` (so the left-hand side is empty or not an identifier), is not
+    an assignment to cmd.exe: it hands the right-hand side to ShellExecute as a
+    program to start, and a `=C:/...` value raises 0x80070002 in a modal dialog.
+    `$VAR`/`${VAR}` are never expanded. Such commands are rejected up front; use
+    cmd.exe syntax (`set NAME=value` then `%NAME%`), pass the value inline, or use
+    run_python.
     """
     locked = require_unlocked()
     if locked:
@@ -476,6 +485,20 @@ def _cmd_shell_syntax_guard(command):
     def _mask(mm):
         return mm.group(0)[0] + ("\x00" * (len(mm.group(0)) - 2)) + mm.group(0)[-1]
     masked = _re.sub(r'"[^"]*"|\'[^\']*\'', _mask, command)
+    # A token that STARTS with `=` at command start or just after a separator:
+    # cmd.exe has nothing to assign to, so the `=value` is handed to ShellExecute
+    # (or to wt.exe on this PC) and pops a `'=<value>'` 0x80070002 dialog. This is
+    # the exact `=C:/...` string from 2026-11-07 and must be caught before the
+    # identifier-assignment check below, which requires a name on the left.
+    _eqlead = _re.compile(r"(?:^|[&|;])\s*=")
+    if _eqlead.search(masked):
+        return ("[shell_exec error: a token beginning with '=' (for example "
+                "'=C:/path') is not an assignment to cmd.exe on Windows -- it is "
+                "handed to ShellExecute as a program to start and pops a "
+                "'=<value>' file-not-found dialog (0x80070002). This usually comes "
+                "from a bash-style `NAME=\"...\"` or an unexpanded `$VAR`. Use "
+                "cmd.exe syntax (`set NAME=value` then %NAME%), pass the value "
+                "inline, or use run_python.]")
     _assign = _re.compile(r"(?:^|[&|;])\s*([A-Za-z_][A-Za-z0-9_]*)=")
     for m in _assign.finditer(masked):
         head = masked[:m.start()].rstrip()
