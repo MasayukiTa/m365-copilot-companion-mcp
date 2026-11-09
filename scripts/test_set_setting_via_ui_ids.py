@@ -78,3 +78,60 @@ def test_success_line_only_after_a_read_back_and_failures_exit_nonzero():
     assert 'Write-Output ("FAILED:' in text and "exit 1" in text
     # nothing prints a success line outside the final read-back
     assert text.count("through the cockpit") == 1
+
+
+def _steppers() -> dict:
+    """key -> {Value,Dec,Inc} AutomationIds from the $Steppers map in the driver.
+
+    These settings are numeric steppers, not combo boxes; the driver clicks -/+ until the value
+    label shows the target, so they are kept out of $Boxes and have their own map."""
+    text = SCRIPT.read_text(encoding="utf-8")
+    block = text.split("$Steppers = @{", 1)[1].split("\n}\n", 1)[0]
+    out = {}
+    for key, inner in re.findall(r"'([a-z_]+)'\s*=\s*@\{([^}]*)\}", block):
+        ids = dict(re.findall(r"(Value|Dec|Inc)\s*=\s*'(\w+)'", inner))
+        out[key] = ids
+    return out
+
+
+def test_every_driven_stepper_has_its_three_automation_ids_in_the_cockpit():
+    cs = cockpit_source.read(encoding="utf-8")
+    steppers = _steppers()
+    assert steppers, "no steppers are listed in the script"
+    for key, ids in steppers.items():
+        assert set(ids) == {"Value", "Dec", "Inc"}, (key, ids)
+        for role, aid in ids.items():
+            assert 'SetAutomationId(' in cs and '"%s"' % aid in cs, (key, role, aid)
+
+
+def test_autoscale_max_and_maxtabs_are_driven_as_steppers():
+    steppers = _steppers()
+    assert "autoscale_max" in steppers, "autoscale_max must be drivable"
+    assert "maxtabs" in steppers, "maxtabs must be drivable"
+
+
+def test_every_driven_stepper_key_is_a_declared_setting():
+    from tools.settings_keys import KEYS
+    names = set(KEYS)
+    for key in _steppers():
+        assert key in names, key
+
+
+def test_steppers_and_combos_are_disjoint_and_ids_are_unique():
+    boxes = _boxes()
+    steppers = _steppers()
+    assert not (set(boxes) & set(steppers)), set(boxes) & set(steppers)
+    all_ids = list(boxes.values())
+    for ids in steppers.values():
+        all_ids += list(ids.values())
+    assert len(all_ids) == len(set(all_ids)), "an AutomationId is used twice"
+
+
+def test_a_stepper_is_set_through_a_read_back_and_failures_exit_nonzero():
+    text = SCRIPT.read_text(encoding="ascii")
+    ok = text.index("via the settings stepper (read back)")
+    # the success line is reached only after settings.txt was consulted for the same key
+    assert text.rindex("Read-SettingsFile", 0, ok) < ok
+    # the stepper value label is re-read (the stopped-at check) before success is printed
+    assert "the stepper stopped at" in text
+    assert text.count("via the settings stepper") == 1
