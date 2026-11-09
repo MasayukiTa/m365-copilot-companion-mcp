@@ -145,6 +145,7 @@ jobs:
             ui/test_planned_server_restart_expiry.py \
             ui/test_planned_server_restart_exact_poll.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
+            relay/test_opening_record.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
@@ -152,6 +153,7 @@ jobs:
             scripts/test_status_tool_does_not_mislead.py \
             scripts/test_health_probe_isolation.py \
             scripts/test_health_busy_signal.py \
+            scripts/test_inbound_observer_pool_isolation.py \
             tools/test_one_settings_file_for_every_context.py \
             tools/test_a_setting_declares_when_it_takes_effect.py \
             tools/test_a_search_walk_is_bounded_in_depth_and_time.py \
@@ -186,6 +188,7 @@ jobs:
             relay/test_judge_engine_chain_after_395.py \
             relay/test_judge_verdict_not_error.py \
             relay/test_engine_claim_schema_in_initial_instruction.py \
+            relay/test_judge_footer_force_hold.py \
             tests/test_validity_harness.py \
             tools/test_gui_submission_reaches_fleet.py \
             tools/test_fleet_admissions.py \
@@ -266,6 +269,7 @@ jobs:
             relay/test_continue_turn_recovery.py \
             relay/test_a_cut_after_output_is_continued_not_resent.py \
             relay/test_socket_tools.py \
+            relay/test_unfenced_call_label.py \
             relay/test_first_turn_preflight.py \
             relay/test_token_prestart.py \
             relay/ops_db/test_ops_db_stage1.py \
@@ -292,7 +296,9 @@ jobs:
             relay/test_priority_survives_every_delivery_route.py \
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
+            relay/test_resume_from_state.py \
             relay/test_fleet_tombstone.py \
+            relay/test_fleet_child_no_resurrect.py \
             relay/test_fleet_close_descendants.py \
             relay/test_desktop_guard.py \
             relay/test_every_intake_route_leaves_one_receipt.py \
@@ -417,6 +423,7 @@ jobs:
             scripts/test_supervisor_death_is_explained.py \
             scripts/test_supervisor_no_duplicate_host.py \
             scripts/test_supervisor_dead_tunnel_host_replaced.py \
+            scripts/test_supervisor_zero_conn_recovery.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
@@ -473,6 +480,7 @@ jobs:
             tools/test_pptx_export_png_does_not_quit_powerpoint.py \
             tools/test_pptx_export_png_closes_only_its_own_document.py \
             tools/test_pptx_inherits_reference_template.py \
+            tools/test_pptx_export_png_com_isolated.py \
             tools/test_a_deck_from_a_reference_keeps_the_reference.py \
             tools/test_an_archive_does_not_contain_itself.py \
             tests/test_flow_map_docs_name_files_that_exist.py \
@@ -538,6 +546,8 @@ jobs:
             tools/test_a_cap_below_the_guard_silences_the_guard.py \
             tools/test_live_checkout_write_guard.py \
             tools/test_file_ops_live_checkout_wiring.py \
+            tools/test_file_ops_bounded_listing.py \
+            tests/test_outside_lane.py \
             tools/test_child_process_priority.py \
             tools/test_a_dot_on_in_the_normal_state_is_not_a_signal.py \
             tools/test_tool_probe.py \
@@ -733,6 +743,7 @@ jobs:
             scripts/test_goal_fidelity_report.py \
             tests/test_ownership.py \
             tests/test_watchdog_arming.py \
+            tests/test_recover_steps_have_a_deadline.py \
             tests/test_control_markers.py \
             tests/test_lean_capture.py \
             tests/test_profile_token.py \
@@ -1013,6 +1024,7 @@ jobs:
             relay/test_a_steer_starts_a_new_chain.py \
             relay/test_a_locked_worker_needed_a_button_not_a_prayer.py \
             relay/test_a_bad_check_costs_only_its_own_goal.py \
+            relay/test_a_wedged_edge_probe_gives_up_within_its_deadline.py \
             relay/test_acceptance_process_cleanup.py \
             relay/test_a_preamble_is_not_a_subtask.py \
             relay/test_an_unnumbered_split_reply_is_still_a_split.py \
@@ -1057,6 +1069,7 @@ jobs:
             relay/test_git_push_safety.py \
             tools/auto/test_autoloop.py \
             tools/auto/test_loop_runner.py \
+            tools/auto/test_copilot_image.py \
             tools/test_auto_ops.py \
             tools/test_recurrent_ops.py \
             tools/test_recurrent_keep_best.py \
@@ -1093,6 +1106,7 @@ jobs:
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
             scripts/test_sibling_cost_report.py \
+            scripts/test_sibling_turn_context_join.py \
             scripts/test_comm_roi_report.py \
             scripts/test_board_report.py \
             scripts/test_ab_compare.py \
@@ -1102,6 +1116,7 @@ jobs:
             scripts/test_capability_profile.py \
             scripts/test_task_kind.py \
             scripts/test_load_routing_report.py \
+            scripts/test_load_routing_pairwise.py \
             scripts/test_result_cache_report.py \
             scripts/test_team_formation_report.py \
             bench/test_attempt_budget.py \
@@ -1120,6 +1135,7 @@ jobs:
             relay/test_task_router_exact_approval.py \
             scripts/test_update_from_release.py \
             tests/test_health_route.py \
+            tests/test_health_fast_under_cpu_load.py \
             tests/test_durable_access_log.py \
             tests/test_mcp_inbound_log.py \
             tests/test_fleet_submit_refusal_log.py \
@@ -1167,6 +1183,7 @@ jobs:
             relay/test_tunnel_host_log.py \
             tests/test_response_telemetry.py \
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
+            tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
             relay/test_a_stale_coordinator_restarts_only_when_idle.py
 
       - name: Run script-style tracer tests
@@ -1306,7 +1323,7 @@ jobs:
         env:
           REQUIRE_CSC: "1"
         run: |
-          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py relay/test_acceptance_process_cleanup.py tools/test_process_tree_ownership.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py ui/test_the_conversation_list_shows_every_transcript.py ui/test_both_windows_can_be_constructed.py ui/test_planned_server_restart_exact_poll.py ui/test_a_submitted_task_is_on_top_at_once.py ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py ui/test_submitted_history_reconciliation.py ui/test_stale_submitted_tasks_are_observable.py ui/test_live_add_survives_runner_shutdown.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_supervisor_stale_code.py scripts/test_supervisor_no_duplicate_host.py scripts/test_supervisor_dead_tunnel_host_replaced.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_failed_start_says_what_and_where.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py scripts/test_start_all_prepares_a_missing_venv.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py scripts/test_tunnel_served_by_another_pc.py scripts/test_start_all_ten_clicks.py scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py scripts/test_configure_env_uses_japanese_font.py scripts/test_preflight_vbs_engine.py scripts/test_gui_submit_lock.py scripts/test_start_all_records_the_bridge_poll.py
+          python -m pytest -rsx tools/test_a_windowless_launch_really_has_no_window.py relay/test_acceptance_process_cleanup.py tools/test_process_tree_ownership.py ui/test_the_ui_and_the_fleet_agree_on_the_command_channel.py ui/test_the_chat_window_sends_what_was_typed.py ui/test_a_fleet_interrupt_survives_a_supervisor_restart.py ui/test_a_fleet_conversation_never_shows_another_conversations_transcripts.py ui/test_the_conversation_list_shows_every_transcript.py ui/test_both_windows_can_be_constructed.py ui/test_planned_server_restart_exact_poll.py ui/test_a_submitted_task_is_on_top_at_once.py ui/test_a_wrapped_goal_is_confirmed_by_its_worker.py ui/test_submitted_history_reconciliation.py ui/test_stale_submitted_tasks_are_observable.py ui/test_live_add_survives_runner_shutdown.py scripts/test_a_silent_death_leaves_its_exit_code.py scripts/test_a_runner_that_dies_before_argparse_is_recorded.py scripts/test_supervisor_reresolves_python.py scripts/test_supervisor_port_owner.py scripts/test_supervisor_fleet_resume_guard.py scripts/test_supervisor_stale_code.py scripts/test_supervisor_no_duplicate_host.py scripts/test_supervisor_dead_tunnel_host_replaced.py scripts/test_supervisor_zero_conn_recovery.py scripts/test_a_submitted_job_is_picked_up_at_once.py scripts/test_setup_devtunnel_access_and_identity.py scripts/test_doctor_reports_the_last_start.py scripts/test_unlock_password_is_retrievable.py scripts/test_start_all_install_path.py scripts/test_a_failed_start_says_what_and_where.py scripts/test_a_bridge_restart_respects_a_live_turn.py scripts/test_install_path_powershell.py scripts/test_install_path_batch.py scripts/test_heal_tunnel_notice_survives_an_apostrophe_path.py scripts/test_a_failing_entry_point_says_why.py scripts/test_generated_tunnel_name_matches_across_languages.py scripts/test_start_all_dependency_drift_check.py scripts/test_start_all_prepares_a_missing_venv.py ui/test_the_bridge_client_sends_the_token.py ui/test_the_startup_loop_has_a_backstop.py scripts/test_preflight_wsh_and_start_all_fallback.py scripts/test_quickstart_exit_code.py scripts/test_quickstart_lock.py scripts/test_setup_devtunnel_signature.py scripts/test_setup_uv_installer_policy.py scripts/test_shortcuts_without_wsh.py scripts/test_start_all_splash_can_be_minimized.py scripts/test_tunnel_served_by_another_pc.py scripts/test_start_all_ten_clicks.py scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py scripts/test_configure_env_uses_japanese_font.py scripts/test_preflight_vbs_engine.py scripts/test_gui_submit_lock.py scripts/test_start_all_records_the_bridge_poll.py
 
       # The keyboard table lives here rather than on the ubuntu job because
       # tools/desktop_input.py binds ctypes.windll.user32 at import, so the module cannot
@@ -1348,6 +1365,37 @@ jobs:
           # here with a clear reason instead of silently running the wrong engine again.
           Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
           $result = Invoke-Pester .\scripts\heal_tunnel.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
+
+      # Every main.py (re)launch by the supervisor must leave a durable reason record in
+      # .fleet\main_launch_log.jsonl. These Pester 3.4.0 tests cover the PURE classification
+      # and record-assembly functions (Get-LaunchReason, Test-AncestryManualScript,
+      # Build-MainLaunchLogRecord) plus Get-ServerExitRecord against real child processes
+      # that exit 3 and that are killed with Stop-Process. Same engine pin as heal_tunnel.
+      - name: Run main launch-log unit tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
+          $result = Invoke-Pester .\scripts\test_main_launch_log.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
+
+      # ADDED 2026-11-09: every main.py (re)launch the supervisor makes must leave a durable
+      # reason record in .fleet\main_launch_log.jsonl, so an unexplained gateway restart can be
+      # attributed. The reason classifier (Get-LaunchReason), the manual-script ancestry test
+      # (Test-AncestryManualScript) and the record builder (Build-MainLaunchLogRecord) are pure
+      # and are asserted here; the two real-process cases (a child that exits 3, and one killed
+      # with Stop-Process) self-skip when no python is on PATH, so this step stays green on the
+      # Linux image while still exercising the real exit-code read on Windows. Pester pinned to
+      # 3.4.0 for the same reason as heal_tunnel above (Should Be vs Should -Be).
+      - name: Run supervisor main.py launch-reason record tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
+          $result = Invoke-Pester .\scripts\test_main_launch_log.Tests.ps1 -PassThru
           if ($result.FailedCount -gt 0) {
             exit 1
           }

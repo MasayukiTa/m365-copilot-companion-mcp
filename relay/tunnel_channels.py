@@ -33,7 +33,22 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+
+# One process-wide lock serialises every read of and append to the tunnel_channels.jsonl
+# file. The /health route runs _tunnel_channels_summary -> health_counts on a dedicated
+# ThreadPoolExecutor and is polled about once a second, so several health_counts reads can
+# run at once while the tunnel-host-log tailer calls append_new_records to grow the same
+# file. health_counts used to iterate the open file line by line, holding a buffered read
+# across many json.loads calls, so an append that extended the file mid-read fed a partial
+# byte sequence to the C json decoder and corrupted the process heap -- the faulthandler
+# dumps show every faulting thread in json.loads under health_counts, and the crashes were
+# access violations at varying offsets in python310.dll plus a 0xc0000374 heap corruption
+# in ntdll. Serialising read against append, and reading the whole file in one shot under
+# the lock (never holding a changing file handle across decodes), removes the data race.
+# Each record is one short line, so the lock is held only briefly and /health stays fast.
+_JSONL_LOCK = threading.Lock()
 
 # A ts-stamped line written by relay.tunnel_host_log looks like:
 #   2026-10-31 21:40:12.345 <the devtunnel line>
@@ -204,13 +219,52 @@ def append_new_records(log_path, jsonl_path, offset_path=None):
         chunk = fh.readlines()
         new_offset = fh.tell()
     if chunk:
-        with open(jsonl_path, "a", encoding="utf-8") as out:
-            for rec in parse_channel_events(chunk):
-                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                appended += 1
+        # Serialise the append against every concurrent health_counts read of the same file.
+        with _JSONL_LOCK:
+            with open(jsonl_path, "a", encoding="utf-8") as out:
+                for rec in parse_channel_events(chunk):
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    appended += 1
     with open(offset_path, "w", encoding="utf-8") as fh:
         fh.write(str(new_offset))
     return appended
+
+
+def _recent_lines(path, cutoff, max_bytes=32 * 1024 * 1024):
+    """Read a bounded snapshot backwards, assuming timestamped records are ordered.
+
+    Even for arbitrarily large windows, the snapshot is capped at 32 MB; counts
+    can therefore be incomplete when the requested window exceeds that tail.
+    Call with _JSONL_LOCK held so the snapshot cannot overlap an append.
+    """
+    chunk = 1024 * 1024
+    with open(path, "rb") as fh:
+        size = fh.seek(0, 2)
+        pos = size
+        blocks = []
+        while pos > 0 and size - pos < max_bytes:
+            step = min(chunk, pos, max_bytes - (size - pos))
+            pos -= step
+            fh.seek(pos)
+            block = fh.read(step)
+            blocks.append(block)
+            # The first complete line in this block bounds older ordered records.
+            start = block.find(b"\n") + 1 if pos else 0
+            end = block.find(b"\n", start)
+            if end < 0:
+                continue
+            try:
+                record = json.loads(block[start:end])
+                timestamp = record.get("time")
+                if isinstance(timestamp, (int, float)) and timestamp < cutoff:
+                    break
+            except (ValueError, AttributeError):
+                continue
+        data = b"".join(reversed(blocks))
+        if pos:
+            newline = data.find(b"\n")
+            data = data[newline + 1:] if newline >= 0 else b""
+    return data.decode("utf-8", errors="replace").splitlines()
 
 
 def health_counts(jsonl_path, now=None, window_s=600):
@@ -228,26 +282,30 @@ def health_counts(jsonl_path, now=None, window_s=600):
         now = time.time()
     cutoff = now - window_s
     total = no_resp = remote_early = 0
+    # Take the bounded snapshot under the shared append lock; parse it after release.
     try:
-        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                t = rec.get("time")
-                if t is not None and t < cutoff:
-                    continue
-                total += 1
-                if rec.get("no_response"):
-                    no_resp += 1
-                if rec.get("remote_closed_early"):
-                    remote_early += 1
+        with _JSONL_LOCK:
+            snapshot = _recent_lines(jsonl_path, cutoff)
     except OSError:
         return {k: -1 for k in keys}
+    for line in snapshot:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(rec, dict):
+            continue
+        t = rec.get("time")
+        if isinstance(t, (int, float)) and t < cutoff:
+            continue
+        total += 1
+        if rec.get("no_response"):
+            no_resp += 1
+        if rec.get("remote_closed_early"):
+            remote_early += 1
     return {
         "tunnel_channels": total,
         "tunnel_no_response": no_resp,
