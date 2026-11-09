@@ -50,7 +50,10 @@ import json
 import math
 import os
 import random
-from typing import Callable, Iterable, Sequence
+from typing import TYPE_CHECKING, Callable, Iterable, Sequence
+
+if TYPE_CHECKING:  # import heavy libs only for type checkers; runtime stays light
+    import numpy as np
 
 
 # --------------------------------------------------------------------------- data model
