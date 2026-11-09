@@ -5715,17 +5715,29 @@ def main():
         # hang there was never seen. Set it here, and keep status.json advancing, so a wedged
         # reconnect is detected and reset like any other wedge.
         sweep_active.set()
-        _write_recovering_status(attempt, "cdp_alive_probe")
-        if not _with_deadline(lambda: cdp_alive(args.cdp_url),
-                              RECOVERY_STEP_DEADLINE_S, "cdp_alive"):
-            print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
-            # Keep the recovery-status trail origin/main added for this leg, so the watchdog
-            # and cockpit still see the edge-unreachable reset recorded, then take the reset
-            # under the same hard deadline every other recovery step now runs under.
-            _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
-                                   len(pending))
-            _with_deadline(lambda: hard_reset(port), RECOVERY_STEP_DEADLINE_S, "hard_reset")
+        # THE UNREACHABLE->HARD-RESET STEP RUNS INSIDE THE try, NOT BEFORE IT (2026-11-09
+        # incident). This block's _with_deadline(hard_reset, ...) can raise FleetRecoveryTimeout
+        # when a wedged browser makes the hard reset itself blow its 60s ceiling. While this
+        # block sat ABOVE the try, that exception was caught by NOTHING in the recover loop and
+        # tore straight through main() to SystemExit -- the fleet process died mid-recovery
+        # (observed 22:37:17: 'FleetRecoveryTimeout: recovery step hard_reset did not return
+        # within 60s', attempt 2/3, 30 goals abandoned). FleetRecoveryTimeout's own docstring
+        # already promises it is "counted as a failed attempt and RETRIED through the ordinary
+        # reconnect path"; that promise only holds if it is raised where the generic handler
+        # below can see it. Moving it inside the try makes the promise true: a blown hard-reset
+        # deadline now counts a leg, backs off, and retries -- so recovery survives past the
+        # attempt that previously killed the process.
         try:
+            _write_recovering_status(attempt, "cdp_alive_probe")
+            if not _with_deadline(lambda: cdp_alive(args.cdp_url),
+                                  RECOVERY_STEP_DEADLINE_S, "cdp_alive"):
+                print(_stamp("[recover] Edge unreachable -> hard reset before (re)connecting"))
+                # Keep the recovery-status trail origin/main added for this leg, so the watchdog
+                # and cockpit still see the edge-unreachable reset recorded, then take the reset
+                # under the same hard deadline every other recovery step now runs under.
+                _stamp_recovery_status(status_path, attempt, "edge-unreachable-hard-reset",
+                                       len(pending))
+                _with_deadline(lambda: hard_reset(port), RECOVERY_STEP_DEADLINE_S, "hard_reset")
             _write_recovering_status(attempt, "connect_over_cdp")
             with sync_playwright() as p:
                 browser = p.chromium.connect_over_cdp(args.cdp_url, timeout=20000)
