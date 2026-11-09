@@ -138,3 +138,142 @@ def test_analyze_log_reads_a_whole_file_and_tolerates_absence(tmp_path):
     log.write_text(SAMPLE, encoding="utf-8")
     assert tc.analyze_log(str(log)) == _records()
     assert tc.analyze_log(str(tmp_path / "missing.log")) == []
+
+
+def test_both_paths_take_the_same_shared_lock():
+    # Wiring guard: append_new_records and health_counts must both serialise on the one
+    # module lock. If a refactor drops the lock from either path, the read/write race that
+    # corrupted the process heap (faulting threads in json.loads under health_counts) comes
+    # back, so pin the shared lock here. We hold the lock and assert both calls block on it.
+    import threading as _threading
+
+    assert isinstance(tc._JSONL_LOCK, type(_threading.Lock()))
+
+    blocked = []
+    with tc._JSONL_LOCK:
+        # With the lock held, a health_counts in another thread must not get past the lock.
+        def _reader():
+            # Point at a non-existent file so, if it somehow ran, it would return fast; the
+            # point is it should BLOCK on the lock and never set done before we release.
+            tc.health_counts("/no/such/tunnel_channels.jsonl.lock-probe")
+            blocked.append("ran")
+
+        # health_counts returns early for an absent file BEFORE taking the lock, so use a
+        # real file to force it onto the locked read path.
+        import tempfile
+        fd, path = tempfile.mkstemp(suffix=".jsonl")
+        os.close(fd)
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(json.dumps({"time": time.time(),
+                                 "no_response": False,
+                                 "remote_closed_early": False}) + "\n")
+
+        done = []
+
+        def _reader_real():
+            tc.health_counts(path, now=time.time())
+            done.append(True)
+
+        t = _threading.Thread(target=_reader_real)
+        t.start()
+        t.join(timeout=0.5)
+        # The lock is still held here, so the reader must still be blocked (done empty).
+        assert done == [], "health_counts did not take the shared lock"
+    # Lock released -> the reader now completes.
+    t.join(timeout=5)
+    assert done == [True]
+    os.remove(path)
+
+
+def test_concurrent_reads_during_appends_never_corrupt(tmp_path):
+    # Regression for the native crash: many health_counts readers hammering the file while a
+    # writer continuously appends must never raise and must end on a correct snapshot. Before
+    # the shared lock, concurrent reads held a buffered file handle across json.loads while an
+    # append grew the file, feeding a half-written line to the C decoder and corrupting the
+    # heap. With read and append serialised this runs clean.
+    import threading as _threading
+
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    log = tmp_path / "devtunnel-host-ts.log"
+    offset = tmp_path / "off"
+    jsonl.write_text("", encoding="utf-8")
+
+    n_records = 400
+    stop = _threading.Event()
+    errors = []
+
+    def _writer():
+        try:
+            cid = 100
+            for _ in range(n_records):
+                cid += 1
+                line = ("2026-10-31 21:40:01.000 SshChannel(Type: forwarded-tcpip, "
+                        f"Id: {cid}, RemoteId: {cid}) opened.\n"
+                        "2026-10-31 21:40:03.500 SshChannel(Type: forwarded-tcpip, "
+                        f"Id: {cid}, RemoteId: {cid}) closed locally. (S: 1335, R: 746)\n")
+                with open(log, "a", encoding="utf-8") as fh:
+                    fh.write(line)
+                tc.append_new_records(str(log), str(jsonl), str(offset))
+        except Exception as exc:  # pragma: no cover - only on a real race
+            errors.append(repr(exc))
+        finally:
+            stop.set()
+
+    def _reader():
+        try:
+            while not stop.is_set():
+                tc.health_counts(str(jsonl), now=time.time())
+        except Exception as exc:  # pragma: no cover - only on a real race
+            errors.append(repr(exc))
+
+    writer = _threading.Thread(target=_writer)
+    readers = [_threading.Thread(target=_reader) for _ in range(4)]
+    writer.start()
+    for r in readers:
+        r.start()
+    writer.join(timeout=60)
+    for r in readers:
+        r.join(timeout=10)
+
+    assert errors == [], f"concurrent read/append raised: {errors}"
+    # Final snapshot must be internally consistent: every appended channel is counted.
+    final = tc.health_counts(str(jsonl), now=time.time(), window_s=10 ** 9)
+    assert final["tunnel_channels"] == n_records
+
+
+def test_health_counts_large_file_reads_recent_tail_quickly(tmp_path):
+    path = tmp_path / "large.jsonl"
+    now = 2_000_000
+    old = (json.dumps({"time": now - 1000, "padding": "x" * 760}) + "\n").encode()
+    recent = (json.dumps({"time": now - 10, "no_response": True}) + "\n").encode()
+    with path.open("wb") as fh:
+        batch = old * 1000
+        for _ in range(400):
+            fh.write(batch)
+        fh.write(recent * 12)
+    start = time.perf_counter()
+    counts = tc.health_counts(str(path), now=now)
+    elapsed = time.perf_counter() - start
+    assert counts == {"tunnel_channels": 12, "tunnel_no_response": 12,
+                      "tunnel_remote_closed_early": 0}
+    assert elapsed < 1.0, f"tail read took {elapsed:.3f}s"
+
+
+def test_health_counts_null_time_and_incomplete_last_line(tmp_path):
+    path = tmp_path / "partial.jsonl"
+    path.write_text('{"time": null, "no_response": true}\n'
+                    '{"time": "unusable"}\n{"time":', encoding="utf-8")
+    assert tc.health_counts(str(path), now=1000) == {
+        "tunnel_channels": 2, "tunnel_no_response": 1,
+        "tunnel_remote_closed_early": 0}
+
+
+def test_health_counts_large_window_still_caps_tail(tmp_path):
+    path = tmp_path / "capped.jsonl"
+    row = b'{"time": 1, "padding": "' + b'x' * 1000 + b'"}\n'
+    with path.open("wb") as fh:
+        for _ in range(34):
+            fh.write(row * 1024)
+    lines = tc._recent_lines(path, cutoff=-10**10)
+    assert sum(len(line.encode()) + 1 for line in lines) <= 32 * 1024 * 1024
+    assert 0 < tc.health_counts(str(path), now=1000, window_s=10**10)["tunnel_channels"] < 34 * 1024

@@ -83,6 +83,10 @@ def test_a_turn_cut_after_output_is_continued_without_resending_the_goal(tmp_pat
 def test_the_same_cut_stays_stuck_when_recovery_is_off(tmp_path, monkeypatch):
     """設定 off: 同じ切断・出力受信済みでも、従来どおり STUCK。再送も新会話もしない。"""
     H._mode(tmp_path, monkeypatch, "off")             # 明示 off（既定が on になったため）
+    # この PR で resume_from_state が既定 on になった。ここは continue_recovery の
+    # socket 拒否契約(off=従来どおり STUCK)を固定するテストなので、新機能も off にする。
+    from relay import resume_from_state as _RFS
+    monkeypatch.setattr(_RFS, "enabled", lambda path=None: False)
     tools = H._Tools()
     A, connect1, drv1 = _cut_after_output(tools)
     H._run(drv1, "THE-JOB")
