@@ -63,10 +63,58 @@ def _run_git(args, cwd, timeout=15):
     return (proc.stdout or "").strip()
 
 
-def _git_summary(cwd):
-    """cwd が git 作業ツリーなら、ブランチ・直近コミット・変更ファイルの要約を返す。
+def _run_gh(args, cwd, timeout=15):
+    """gh をヘッドレスで 1 回走らせ、stdout を UTF-8(errors=replace)で読む。
+
+    gh が入っていない/未認証/この HEAD に PR が無い、はいずれも通常の事象なので、
+    失敗・タイムアウト・非ゼロ終了はすべて空文字で返して呼び出し側を止めない。
+    _run_git と同じく Windows ではコンソール窓を出さない。
+    """
+    creationflags = 0
+    if sys.platform == "win32":
+        creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    try:
+        proc = subprocess.run(
+            ["gh"] + list(args),
+            cwd=cwd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=timeout,
+            creationflags=creationflags,
+        )
+    except Exception:
+        return ""
+    if proc.returncode != 0:
+        return ""
+    return (proc.stdout or "").strip()
+
+
+def _gh_pr_summary(cwd):
+    """この HEAD ブランチに結び付く PR の状態(番号・題・state・url)を返す。
+
+    要件どおり「ジョブのブランチの gh pr view」を状況に含める。副作用は無い(読み取りのみ)。
+    gh が無い/未認証/PR が無い/読めない場合は空文字。I/O はここに閉じる(試験で差し替え可)。
+    """
+    if not cwd or not os.path.isdir(cwd):
+        return ""
+    # state / number / title のみを安定した書式で取り出す(ロケール非依存)。
+    view = _run_gh(
+        ["pr", "view", "--json", "number,title,state,url",
+         "--template",
+         "PR #{{.number}} [{{.state}}] {{.title}}{{\"\\n\"}}{{.url}}"],
+        cwd)
+    if not view:
+        return ""
+    return view
+
+
+def _git_summary(cwd, gh_pr=None):
+    """cwd が git 作業ツリーなら、ブランチ・直近コミット・変更ファイル・PR の要約を返す。
 
     cwd が無い/git でない/読めない場合は空文字。I/O はここに閉じる(試験で差し替え可)。
+    gh_pr を渡せば PR 取得の I/O を差し替えられる(試験用)。省略時は cwd から gh で集める。
     """
     if not cwd or not os.path.isdir(cwd):
         return ""
@@ -76,6 +124,7 @@ def _git_summary(cwd):
     branch = _run_git(["rev-parse", "--abbrev-ref", "HEAD"], cwd)
     log = _run_git(["log", "--oneline", "-5"], cwd)
     status = _run_git(["status", "--short"], cwd)
+    pr = _gh_pr_summary(cwd) if gh_pr is None else (gh_pr or "")
     parts = []
     if branch:
         parts.append("ブランチ: %s" % branch)
@@ -85,6 +134,10 @@ def _git_summary(cwd):
         parts.append("未コミットの変更:\n%s" % status)
     else:
         parts.append("未コミットの変更: なし")
+    if pr:
+        parts.append("このブランチの PR:\n%s" % pr)
+    else:
+        parts.append("このブランチの PR: なし(または取得できず)")
     return _clip("\n".join(parts), _MAX_GIT_CHARS)
 
 
@@ -166,9 +219,6 @@ def build_resend_text(goal_body, worker_last="", partial_text="", journal="", cw
     return REPHRASE_LEAD + "\n" + preamble + "\n\n--- 元の依頼 ---\n" + (goal_body or "")
 
 
-#: 設定キー名。既定オン。tools/settings_keys.py に宣言、コックピットがミラーする。
-#: 読み方は relay/continue_recovery.py の socket_continue_recovery と同じ(each_gate: 変更が
-#: 次の判断に restart なしで届く)。
 KEY = "auto_rephrase_continue"
 DEFAULT = "on"
 SETTING_KEY = KEY            # 後方互換の別名
