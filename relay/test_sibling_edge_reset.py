@@ -224,7 +224,10 @@ def test_a_lost_context_no_longer_resets_a_healthy_browser():
     src = _runner_source()
     i = src.index("if _give_up:")
     seg = src[i:i + 400]
-    assert seg.index("cdp_alive(args.cdp_url)") < seg.index("hard_reset(port)")
+    # The recovery loop now probes with the BOUNDED wrapper (cdp_alive_bounded) so a wedged
+    # browser cannot freeze it; the ordering contract is unchanged -- liveness check first,
+    # hard_reset(port) after. Track the bounded call so this guard matches the real source.
+    assert seg.index("cdp_alive_bounded(args.cdp_url") < seg.index("hard_reset(port)")
 
 
 def test_suppression_reports_which_runs_held_it():

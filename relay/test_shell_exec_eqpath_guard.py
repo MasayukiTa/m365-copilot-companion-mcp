@@ -97,3 +97,15 @@ def test_dollar_inside_quotes_is_allowed(cmd):
 ])
 def test_unquoted_dollar_and_assignment_still_refused(cmd):
     assert _guard(cmd) is not None
+
+
+# A `$` inside a SINGLE-quoted span is masked exactly like a double-quoted one, so these
+# legitimate commands must also pass. cmd.exe does not special-case single quotes, but the
+# guard masks both `"..."` and `'...'` spans so a literal `$` within either is invisible to it.
+@pytest.mark.skipif(os.name != "nt", reason="guard only fires under cmd.exe on Windows")
+@pytest.mark.parametrize("cmd", [
+    "git log --format='%H $x'",
+    "findstr '$PATH' notes.txt",
+])
+def test_dollar_inside_single_quotes_is_allowed(cmd):
+    assert _guard(cmd) is None
