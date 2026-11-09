@@ -6,11 +6,11 @@ judge request and ADDS two facts to the judge footer and to judge_result.json, u
 `design_check` key:
 
   (A) stratifier presence -- whether the analysis declared at least one stratifier / blocking
-      column (層別列の有無);
-  (B) per-exposure-group product skew -- for each exposure group, the dominant 品名 and its
+      column (stratifier/blocking column presence);
+  (B) per-exposure-group product skew -- for each exposure group, the dominant product and its
       share, plus a flag that is true only when every exposure group drew from the IDENTICAL set
-      of products. The loss confirmation (時間分割確認_20261103) failed exactly this: it returned
-      GO without holding the 塗工布品名 fixed across the exposure groups.
+      of products. A past loss-confirmation analysis failed exactly this: it returned
+      GO without holding the product name fixed across the exposure groups.
 
 These fields only ADD INFORMATION. They never change the engine verdict and never loosen
 order_ok -- those belong to other parts of the harness. All fixtures here are synthetic: no
