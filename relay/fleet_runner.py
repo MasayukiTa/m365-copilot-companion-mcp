@@ -4966,8 +4966,12 @@ def main():
                     apply_priority_boost(cmd["set_priority_boost"], workers)
                 except (ValueError, RuntimeError) as exc:
                     return False, [str(exc)]
+            _closed_identities = []   # union of every closed worker's ids, for the live-cancel below
+            _closed_workers = []      # the worker objects named in the close, excluded below
             for nm in cmd.get("close", []):
                 w = by_name.get(nm)
+                if w is not None:
+                    _closed_workers.append(w)
                 if w is not None and w.status not in TERMINAL:
                     w.cancel()
                 # DURABLE TOMBSTONE AT THE CLOSE SITE. The operator stopped this worker; its
@@ -4988,8 +4992,40 @@ def main():
                                 reason=_tomb.REASON_OPERATOR_CLOSE,
                                 worker=getattr(w, "name", None),
                                 goal_text=getattr(w, "goal", None))
+                            _closed_identities.append(_id)
                     except Exception:
                         pass
+            # CANCEL DESCENDANTS THAT ARE ALREADY RUNNING. The tombstones above only stop a
+            # child at its NEXT start/resume/adopt door; a fan-out child already in flight has
+            # passed that door and nothing re-checks the tombstone mid-run -- which is how w33
+            # (carrying a closed parent's task_id/campaign_id/root_id, no jid of its own) kept
+            # running for ~46 min and launched `cargo test` after its parent was closed. So
+            # closing a worker must also cancel every LIVE worker that inherits its ids, not
+            # just write their tombstone. Pure id-matching (disk-free) via fleet_tombstone so
+            # it holds even if a tombstone write above failed.
+            if _closed_identities:
+                try:
+                    from relay import fleet_tombstone as _tomb
+                    for _desc in _tomb.descendants_to_cancel(
+                            _closed_identities, workers, closed_workers=_closed_workers):
+                        try:
+                            if getattr(_desc, "status", "") not in TERMINAL:
+                                _desc.cancel()
+                                # The descendant carries no jid of its own; tombstone its own
+                                # fan-out identities too so a restart/adopt cannot revive it.
+                                for _id in _tomb.worker_identities(_desc):
+                                    _tomb.write_tombstone(
+                                        args.state_dir, _id,
+                                        reason=_tomb.REASON_INHERITED,
+                                        worker=getattr(_desc, "name", None),
+                                        goal_text=getattr(_desc, "goal", None))
+                                print("[command] close cancelled a running descendant: %s "
+                                      "(inherits a closed worker's id)"
+                                      % getattr(_desc, "name", "?"), flush=True)
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
             if "set_maxtabs" in cmd:
                 # under autoscale this knob is the CEILING (上限); otherwise the fixed cap.
                 try:

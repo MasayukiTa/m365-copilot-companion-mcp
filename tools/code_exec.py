@@ -371,6 +371,15 @@ def shell_exec(
         command: Command line to execute.
         timeout: Maximum execution time in seconds.
         working_dir: Optional working directory under the allowed base.
+
+    On Windows the command runs through cmd.exe, which is NOT bash. A POSIX-style
+    assignment like `WT="C:/path" && ...`, or any token whose first non-space
+    character is `=` (so the left-hand side is empty or not an identifier), is not
+    an assignment to cmd.exe: it hands the right-hand side to ShellExecute as a
+    program to start, and a `=C:/...` value raises 0x80070002 in a modal dialog.
+    `$VAR`/`${VAR}` are never expanded. Such commands are rejected up front; use
+    cmd.exe syntax (`set NAME=value` then `%NAME%`), pass the value inline, or use
+    run_python.
     """
     locked = require_unlocked()
     if locked:
@@ -454,15 +463,16 @@ def _cmd_shell_syntax_guard(command):
 
     shell_exec runs via cmd.exe on Windows (subprocess shell=True). A worker that writes a
     POSIX one-liner like `WT="C:/path" && git -C "$WT" ...` does NOT get a variable: cmd.exe
-    cannot parse the bare `NAME="..."` assignment, so the assignment is dropped and `$WT` is
-    passed through literally -- the command runs in the wrong place or fails (measured: cmd.exe
-    on this PC runs `WT="C:/nope" && git -C "$WT" status` as git with a literal `$WT`, exit 128).
-    When such a `="C:/path"` fragment is instead handed to the Windows shell-open verb (e.g. an
-    os.startfile / ShellExecute of the right-hand side), Windows raises 0x80070002 (file not
-    found) in a MODAL dialog titled with the stray `'=C:/path'` -- the exact symptom observed
-    2026-11-07 while a worktree path was being handled this way (reproduced: os.startfile of a
-    '=C:/...' string raises WinError 2 / 0x80070002). Catch the bash assignment and `$VAR`
-    expansion up front and tell the caller to use cmd.exe syntax or run_python.
+    treats `=` as a token delimiter, so it does not parse `WT="C:/path"` as an assignment --
+    it splits on the `=` and runs the command `WT` with the argument `="C:/path"`. On this PC
+    `WT` resolves to Windows Terminal (wt.exe, on the PATH via
+    %LOCALAPPDATA%/Microsoft/WindowsApps), so cmd.exe launches Windows Terminal and asks it to
+    open `=C:/path`; wt.exe cannot open that target and raises 0x80070002 (file not found) in a
+    MODAL dialog titled with the stray `'=C:/path'` (observed 2026-11-07:
+    "'=C:/path' の起動時にエラー 2147942402 (0x80070002)"). The assignment is lost and `$WT`
+    is never expanded (measured: `WT="C:/nope" && git -C "$WT" status` reaches git with a
+    literal `$WT`, exit 128). Catch the bash assignment and `$VAR` expansion up front and tell
+    the caller to use cmd.exe syntax or run_python.
 
     Returns an error string to short-circuit, or None when the command is acceptable. Only
     fires on Windows; POSIX /bin/sh handles this syntax correctly.
@@ -475,6 +485,20 @@ def _cmd_shell_syntax_guard(command):
     def _mask(mm):
         return mm.group(0)[0] + ("\x00" * (len(mm.group(0)) - 2)) + mm.group(0)[-1]
     masked = _re.sub(r'"[^"]*"|\'[^\']*\'', _mask, command)
+    # A token that STARTS with `=` at command start or just after a separator:
+    # cmd.exe has nothing to assign to, so the `=value` is handed to ShellExecute
+    # (or to wt.exe on this PC) and pops a `'=<value>'` 0x80070002 dialog. This is
+    # the exact `=C:/...` string from 2026-11-07 and must be caught before the
+    # identifier-assignment check below, which requires a name on the left.
+    _eqlead = _re.compile(r"(?:^|[&|;])\s*=")
+    if _eqlead.search(masked):
+        return ("[shell_exec error: a token beginning with '=' (for example "
+                "'=C:/path') is not an assignment to cmd.exe on Windows -- it is "
+                "handed to ShellExecute as a program to start and pops a "
+                "'=<value>' file-not-found dialog (0x80070002). This usually comes "
+                "from a bash-style `NAME=\"...\"` or an unexpanded `$VAR`. Use "
+                "cmd.exe syntax (`set NAME=value` then %NAME%), pass the value "
+                "inline, or use run_python.]")
     _assign = _re.compile(r"(?:^|[&|;])\s*([A-Za-z_][A-Za-z0-9_]*)=")
     for m in _assign.finditer(masked):
         head = masked[:m.start()].rstrip()
@@ -487,7 +511,7 @@ def _cmd_shell_syntax_guard(command):
                 "and a stray '=<value>' can pop a '=<value>' file-not-found dialog (0x80070002). "
                 "Use cmd.exe syntax: `set %s=value` then reference it as %%%s%%, pass the value "
                 "inline, or use run_python for logic that needs variables.]" % (name, name, name))
-    if _re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", command):
+    if _re.search(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?", masked):
         return ("[shell_exec error: '$VAR'/'${VAR}' is bash syntax and is not expanded by "
                 "cmd.exe on Windows (it stays literal). Use %VAR% after `set VAR=value`, pass "
                 "the value inline, or use run_python.]")

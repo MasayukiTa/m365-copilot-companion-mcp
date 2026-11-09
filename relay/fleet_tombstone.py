@@ -262,6 +262,140 @@ def blocked_jid(state_dir, goal):
     return None
 
 
+#: A worker's OWN identity -- the ids that name THIS worker, not the group it belongs to.
+#: parent_task_id/campaign_id/root_id are GROUP ids a whole fan-out tree shares, so they are
+#: deliberately NOT here: they belong to the root, not to every member.
+_OWN_IDENTITY_FIELDS = ("jid", "task_id")
+
+#: The group-root ids. A worker owns one of these ONLY when it is the root of that tree,
+#: i.e. the value equals the worker's own jid/task_id. Otherwise the value merely says which
+#: tree the worker is in -- shared by every sibling and the parent alike.
+_GROUP_ROOT_FIELDS = ("campaign_id", "root_id")
+
+
+def _get(obj, k):
+    if isinstance(obj, dict):
+        return obj.get(k)
+    return getattr(obj, k, None)
+
+
+def closing_anchor_ids(worker):
+    """The ids that make a live worker a TRUE DESCENDANT of this closed worker.
+
+    An anchor is an id such that any live worker whose ANCESTOR CHAIN contains it is a genuine
+    descendant of `worker`. That is exactly `worker`'s OWN identity: its jid and its task_id --
+    the ids a child names as its parent_task_id / inherited jid. A group-root id (campaign_id /
+    root_id) is an anchor ONLY when `worker` is itself the root of that tree, i.e. the group id
+    equals `worker`'s own jid/task_id; otherwise the group id is shared by `worker`'s siblings
+    and parent too, and anchoring on it would cancel the whole tree -- the very over-cancel this
+    fixes. Returns a set of safe-id strings.
+    """
+    own = set()
+    env = None if isinstance(worker, dict) else getattr(worker, "task_envelope", None)
+    for k in _OWN_IDENTITY_FIELDS:
+        v = _safe_jid(_get(worker, k))
+        if v:
+            own.add(v)
+        if env is not None:
+            ev = _safe_jid(getattr(env, k, None))
+            if ev:
+                own.add(ev)
+    anchors = set(own)
+    for k in _GROUP_ROOT_FIELDS:
+        v = _safe_jid(_get(worker, k))
+        if v and v in own:          # worker IS the root of this tree -> the root id is an anchor
+            anchors.add(v)
+        if env is not None:
+            ev = _safe_jid(getattr(env, k, None))
+            if ev and ev in own:
+                anchors.add(ev)
+    return anchors
+
+
+def _inherited_ancestor_ids(worker):
+    """The ids by which `worker` points at an ANCESTOR -- its inherited chain, NOT its own name.
+
+    This is _ancestor_jids minus the worker's own identity (task_id / jid): a child names its
+    parent through parent_task_id and the inherited campaign_id/root_id, and through the older
+    *_jid fields. We drop the worker's OWN task_id/jid so a worker is never its own ancestor.
+    """
+    own = set()
+    for k in _OWN_IDENTITY_FIELDS:
+        v = _safe_jid(_get(worker, k))
+        if v:
+            own.add(v)
+    return [a for a in _ancestor_jids(worker) if a not in own]
+
+
+def descendants_to_cancel(closed_identities, candidate_workers, closed_workers=()):
+    """The still-running workers that are TRUE DESCENDANTS of a closed worker, so closing a
+    parent also stops children ALREADY RUNNING (not just future starts) -- WITHOUT cancelling
+    the closed worker's siblings or its parent.
+
+    THE GAP THIS CLOSES. The close site tombstones every identity a closed worker carries so a
+    fan-out child is refused at the next start/resume/adopt door (blocked_jid). But a child
+    ALREADY in flight has passed that door and nothing re-checks the tombstone mid-run -- which
+    is how w33 (a fan-out child carrying a closed parent's task_id/campaign_id/root_id, no jid
+    of its own) ran on ~46 min and launched `cargo test` after its parent was closed.
+
+    THE OVER-CANCEL THIS AVOIDS. Descendant-hood is NOT "shares any id". Siblings and the parent
+    of a closed child carry the SAME campaign_id/root_id, so matching on a shared group id would
+    cancel the whole fan-out tree from closing ONE child. A worker is a descendant of closed X
+    only when its ANCESTOR CHAIN (parent_task_id, then that parent's parent, ..., or an inherited
+    jid) reaches X's OWN task_id/jid. A shared campaign_id/root_id selects a worker ONLY when X
+    is itself the root of that tree (X's own task_id/jid equals that root_id/campaign_id) -- see
+    closing_anchor_ids.
+
+    Multi-level: the chain is walked iteratively. Starting from the anchors of the closed
+    workers, any candidate whose inherited ancestor ids reach the current frontier is a
+    descendant, and ITS own task_id/jid joins the frontier so a grandchild two levels down is
+    still caught even though it names only its immediate parent.
+
+    Pure and disk-free. `closed_identities` is kept for call-site compatibility but anchoring is
+    derived from `closed_workers` (the actual worker objects named in the close), because only a
+    worker object can tell its OWN ids from the GROUP ids it merely shares. When `closed_workers`
+    is empty, nothing is anchored (we will not guess descendant-hood from a flat id union, which
+    is what caused the over-cancel). Named workers are excluded from the result by object
+    identity. Returns the de-duplicated candidates to cancel, input order preserved.
+    """
+    excluded = {id(cw) for cw in (closed_workers or [])}
+    frontier = set()
+    for cw in closed_workers or []:
+        frontier |= closing_anchor_ids(cw)
+    if not frontier:
+        return []
+    cands = [w for w in (candidate_workers or []) if id(w) not in excluded]
+    out = []
+    seen_keys = set()
+    # Iterate to a fixed point so multi-level descendants (grandchild, great-grandchild) are
+    # reached: each pass may add new frontier ids (a caught worker's OWN identity), which can
+    # in turn catch workers one level deeper on the next pass.
+    changed = True
+    while changed:
+        changed = False
+        for w in cands:
+            anc = set(_inherited_ancestor_ids(w))
+            if not anc or anc.isdisjoint(frontier):
+                continue
+            name = None
+            try:
+                name = w.get("name") if isinstance(w, dict) else getattr(w, "name", None)
+            except Exception:
+                name = None
+            key = name if name is not None else id(w)
+            if key in seen_keys:
+                continue
+            seen_keys.add(key)
+            out.append(w)
+            # this worker's OWN identity now anchors ITS children on a later pass
+            own_ids = {_safe_jid(_get(w, k)) for k in _OWN_IDENTITY_FIELDS}
+            own_ids = {i for i in own_ids if i}
+            if own_ids - frontier:
+                frontier |= own_ids
+                changed = True
+    return out
+
+
 def remove_tombstone(state_dir, jid, *, operator_resubmit_jid=None) -> bool:
     """Remove a tombstone -- ONLY an explicit operator re-submission with a NEW jid may do this.
 
