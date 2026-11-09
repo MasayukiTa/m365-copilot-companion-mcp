@@ -56,6 +56,7 @@ from relay import fleet_resume as resume_mod
 from relay.control_markers import CLOSING_INSTRUCTION
 from relay import invariants as _invariants
 from relay import auto_rephrase_continue as _auto_rephrase
+from relay import resume_from_state as _resume_from_state
 
 #: RECORD, not RAISE -- see the check in reset_socket_route. A reset runs after a browser has
 #: already died and an exception there costs the run the reset was meant to save.
@@ -9533,6 +9534,13 @@ class RelayWorker:
                     except Exception:
                         _not_sent = False
                     if not _not_sent:
+                        # BEFORE REFUSING TO STUCK: resume an acting repo goal in a NEW
+                        # conversation that first reads its real state, rather than leaving it
+                        # stuck with no attempt. Same bounded path as the timeout branch; refuses
+                        # (returns False) for a native-act goal or when disabled/spent. The fresh
+                        # conversation replaces this driver, so return True to keep the worker.
+                        if self._resume_from_state_after_unknown(reason, delivery):
+                            return True
                         self._refuse_resend(reason, delivery)
                     return False
 
@@ -9962,6 +9970,73 @@ class RelayWorker:
         self._start_fresh_conversation(job, time.time() + delay)
         self.reason = ("定型の無回答(作用を伴う目標)→ 進捗を前置きして言い換え、新しい会話で"
                        "続きから1回だけ再投入(自動・1回のみ)")
+        return True
+
+    def _resume_from_state_after_unknown(self, reason, delivery):
+        """A delivery-UNKNOWN cut of an ACTING repo goal, with no same-conversation continue:
+        open a NEW conversation that FIRST reads the job's real state and continues from there.
+
+        This is the recovery the timeout/drop path was missing. When the same-conversation continue
+        (relay/continue_recovery.py) refuses -- the backend completed no exchange
+        (``conversation_unknown``), nothing was executed to reconcile (``no_executed_calls``), the
+        model may have acted with its own tools, etc. -- the old code went straight to
+        ``_refuse_resend`` and the worker ended STUCK. Instead, for a goal that is plain repository
+        work (git/tests/files, and NOT mail/calendar/chat), open a fresh conversation whose opening
+        message tells the model to read ``git status``/``git log``/``gh pr view``/the files it was
+        writing BEFORE doing anything, so nothing already present is executed twice.
+
+        Returns True when a fresh-conversation resume was started (the caller returns without
+        refusing). Returns False when it is disabled, already spent, the goal is empty, or the goal
+        is not reconcilable repository work -- the caller then refuses to STUCK exactly as before.
+        Bounded by RESUME_FROM_STATE_PER_GOAL (default 1), mirroring SOCKET_RECONNECTS_IF_DELIVERED.
+        """
+        try:
+            if not _resume_from_state.enabled():
+                return False
+        except Exception:
+            return False
+        if not self._goal_may_act():
+            return False                       # a read-only goal never reached this refuse path
+        if not _resume_from_state.goal_is_resumable(self.goal or ""):
+            return False                       # mail/calendar/chat, or not repo work: keep STUCK
+        spent = getattr(self, "_state_resumes_used", 0)
+        if spent >= _resume_from_state.RESUME_FROM_STATE_PER_GOAL:
+            return False                       # one fresh start per goal, not a loop
+        goal_body = effective_goal(self.goal)
+        if not goal_body.strip():
+            return False
+        last, partial, journal = self._collect_progress_fields()
+        try:
+            resume_goal = _resume_from_state.build_resume_text(
+                goal_body, worker_last=last, partial_text=partial,
+                journal=journal, cwd=(self.cwd or ""))
+        except Exception:
+            return False
+        self._state_resumes_used = spent + 1
+        job = (conversation_start_label(self.name + "-resume")
+               + PROTOCOL + self._composed_prefix + RECYCLE_PREFIX + resume_goal
+               + self._compaction_note())
+        # A fresh conversation = a fresh repetition count.
+        self.no_progress, self.last_norm = 0, None
+        self._fresh_turn_base = self.turn
+        delay = transient_backoff(2)
+        try:
+            _socket_route().record(
+                "resume_from_state", worker=self.name, turn=self.turn,
+                goal=(self.goal or "")[:600], used=self._state_resumes_used,
+                delivery=delivery, reason=str(reason)[:300])
+        except Exception:
+            pass
+        print("[relay_fleet] %s: acting turn cut (delivery=%s); resume from real state in a fresh "
+              "conversation %d/%d (backoff %.0fs): %s"
+              % (self.name, delivery, self._state_resumes_used,
+                 _resume_from_state.RESUME_FROM_STATE_PER_GOAL, delay, str(reason)[:100]),
+              flush=True)
+        self._start_fresh_conversation(job, time.time() + delay)
+        self.reason = ("配送不明で途切れた作用目標 → 新しい会話で実状(git/PR/ファイル)を"
+                       "読み直してから続きを行う(%d/%d)" % (
+                           self._state_resumes_used,
+                           _resume_from_state.RESUME_FROM_STATE_PER_GOAL))
         return True
 
     def _start_fresh_conversation(self, job, cooldown_until):
@@ -10455,6 +10530,16 @@ class RelayWorker:
                     if _delivery == "delivered" and self.status != "stuck":
                         self._refuse_resend("bounded wait expired; continuation unavailable", _delivery)
                         return True
+                    # BEFORE REFUSING TO STUCK: an acting REPO goal cut with delivery unknown,
+                    # whose same-conversation continue was unavailable, is resumed in a NEW
+                    # conversation that first reads its real state (git/PR/files) and continues
+                    # from there -- so nothing already done is executed twice. Bounded per goal;
+                    # returns False only to refuse (disabled, spent, or a native-act goal that
+                    # cannot be reconciled from a file read). See relay/resume_from_state.py.
+                    if self._resume_from_state_after_unknown(
+                            "turn timeout without a reply", _delivery):
+                        self._note_timeout(_origin, _elapsed, "resume-from-state", budget_s=_bound)
+                        return False
                     self._note_timeout(_origin, _elapsed, "resend-refused", budget_s=_bound)
                     if self.status != "stuck":
                         self._refuse_resend("turn timeout without a reply", _delivery)
@@ -12552,11 +12637,27 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                 w = pending.pop(0)
             if w.status in TERMINAL:   # (shouldn't happen, but be safe)
                 continue
-            # C3, SHADOW ONLY: records which queued goal a load-aware router would have admitted
-            # beside this one. Returns nothing and changes nothing (off = no-op, never raises).
-            load_routing.shadow_assign(w, pending, _active_open(), _socket_cap, _lane_ceiling,
-                                       run_id=run_id, ram_floor_mb=ram_box[0],
-                                       probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
+            # C3: records which queued goal a load-aware router would have admitted beside this
+            # one. off = no-op; shadow = record only (returns None, changes nothing); on = record
+            # AND act -- it returns the position in `pending` of the goal to admit instead, so the
+            # off-vs-on pair can be compared through the cockpit. Never raises.
+            _lr_pick = load_routing.shadow_assign(
+                w, pending, _active_open(), _socket_cap, _lane_ceiling,
+                run_id=run_id, ram_floor_mb=ram_box[0],
+                probes={"rate_ok": rate_headroom_ok, "avail_mb": avail_phys_mb})
+            # In `on`, _lr_pick is an int k>=1: the router chose pending[k-1] over the goal the
+            # coordinator picked. Swap -- put the coordinator's goal back at the head of the queue
+            # (so it is the next one considered) and admit the router's choice in its place. Every
+            # other mode/outcome returns None and this block is skipped, so off and shadow admit
+            # exactly the goal they did before. The index is re-validated here so a stale or junk
+            # value can never pop the wrong goal.
+            if isinstance(_lr_pick, int) and 1 <= _lr_pick <= len(pending):
+                _chosen = pending.pop(_lr_pick - 1)
+                if _chosen.status not in TERMINAL:
+                    pending.insert(0, w)
+                    w = _chosen
+                else:
+                    pending.insert(_lr_pick - 1, _chosen)   # untouched: admit the original goal
             ok = w.attach(context, agent_url)
             if not ok and w.status == PENDING:
                 # NO SOCKET AVAILABLE (it went away between the readiness check above and the
