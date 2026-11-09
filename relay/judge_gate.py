@@ -1412,7 +1412,7 @@ def _fmt_n(ev: dict) -> str:
 # `design_check` footer section (feat/judge-footer-design-check) ADDS what it saw
 # about the comparison design but changes nothing about the verdict. The owner
 # (2026-11-04 07:45) said that is not enough: when groups being compared differ by
-# PRODUCT (塗工布品名) rather than by the exposure under study, the comparison is not
+# PRODUCT (the deployment's product/stratum column; see .config/domain_terms.json "product_label") rather than by the exposure under study, the comparison is not
 # a comparison at all (equipment-vs-product cannot be separated), and that must be
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
 # inform: when an UPSTREAM design-feasibility check (produced WITHOUT reading the
@@ -1444,7 +1444,7 @@ def _fmt_n(ev: dict) -> str:
 #: machine code. An unknown code is still surfaced verbatim (never swallowed).
 _DESIGN_INFEASIBLE_REASONS = {
     "STRATUM_COLUMN_ABSENT":
-        "層別の候補列(製品=塗工布品名・製造品名・品種、ライン、期間など)が入力に無い",
+        "層別の候補列(製品・品種、ライン、期間など)が入力に無い",
     "NO_COMMON_STRATUM":
         "両群に共通の層(製品)が無い(設備の差か製品の差か分けられない)",
     "INSUFFICIENT_LOTS_IN_COMMON_STRATA":
@@ -1512,8 +1512,8 @@ def _design_hold_lines(hold: dict) -> list:
         lots = "未返却"
     seen = ("見たもの: 共通層の数=%s, 各群のロット数{%s}, 重なり係数=%s"
             % (hold.get("common_strata"), lots, hold.get("overlap_coefficient")))
-    note = ("比較する群が曝露ではなく製品(塗工布品名)で分かれているため、設備の差か製品の差か"
-            "分けられません。結果(応答列)を読まずに設計だけで自動判定しています。")
+    note = ("比較する群が曝露ではなく製品(%s)で分かれているため、設備の差か製品の差か"
+            "分かれません。結果(応答列)を読まずに設計だけで自動判定しています。") % product_label()
     return [head, why, seen, note]
 
 
