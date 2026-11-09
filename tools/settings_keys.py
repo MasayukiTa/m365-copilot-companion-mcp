@@ -294,6 +294,24 @@ KEYS = OrderedDict([
        "one with no restart. A present line reads as on only when it says on; anything else on a "
        "present line is off, while an absent line is on (the default)."),
 
+    # Resume an acting repo goal cut with delivery UNKNOWN in a NEW conversation that first reads
+    # its real state (relay/resume_from_state.py). ON by default.
+    _k("resume_from_state", EACH_GATE, "on",
+       "relay/resume_from_state.py:mode (read when an acting turn is cut with delivery unknown and "
+       "no same-conversation continue is available, mtime-cached)",
+       "on|off. on (default): when an acting repository goal (git/tests/files) has its turn cut "
+       "with delivery unknown -- a dropped socket or a turn timeout with no reply -- and the "
+       "same-conversation continue (socket_continue_recovery) cannot safely continue it, the "
+       "harness opens a NEW conversation whose first instruction is to read the real state "
+       "(git status, git log, gh pr view of the branch, the files it was writing) and continue "
+       "from there, so nothing already done is executed twice. One resume per goal "
+       "(MCP_FLEET_RESUME_FROM_STATE_MAX, default 1), like a delivered reconnect. It never fires "
+       "for a goal that names the model's own native acts (mail/calendar/chat): those cannot be "
+       "reconciled from a git/file read, so they keep the careful refuse-to-STUCK. off: such a "
+       "cut ends the worker STUCK with no resume, exactly as before. Read at that decision, so a "
+       "change reaches the next one with no restart. A present line reads as off only when it "
+       "says off; anything else is on (the default)."),
+
     # Sibling write scope (relay/write_scope.py). SHADOW ONLY: it records overlapping writes
     # among siblings of one campaign and changes nothing. There is deliberately no `on` value;
     # enforcing a write scope would go through the folder policy (frozen) and needs a separate
@@ -392,14 +410,17 @@ KEYS = OrderedDict([
        "tools/walk.py:search_max_depth (iter_files, at the start of every search)",
        "Deepest directory level a file search descends into, counted from the search root (0 == only the root directory). Read fresh at every search, so a change reaches the next one with no restart. Absent/empty/negative means NO limit, which is the default and the pre-#328 behaviour. A per-call max_depth overrides it."),
 
-    # Load-aware routing (relay/load_routing.py). SHADOW ONLY: at each admission it records
-    # which queued goal a router using the remaining admission margins and the role profile
-    # would have admitted, beside the one that was. There is deliberately no value that routes.
+    # Load-aware routing (relay/load_routing.py). At each admission it records which queued goal
+    # a router using the remaining admission margins and the role profile would have admitted,
+    # beside the one that was. `on` additionally admits the router's choice, for an off-vs-on
+    # paired comparison; the default stays off.
     _k("fanout_load_routing", EACH_GATE, "off",
        "relay/load_routing.py:mode (every admission, mtime-cached)",
-       "off|shadow. Re-read at every admission with no restart. shadow appends one row per "
-       "admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the router "
-       "would have admitted, the margins); nothing is reordered and no prompt or output "
+       "off|shadow|on. Re-read at every admission with no restart. shadow and on each append one "
+       "row per admission to .fleet/load_routing_shadow.jsonl (the goal admitted, the goal the "
+       "router would have admitted, the margins). shadow reorders nothing and changes no prompt "
+       "or output. on admits the router's chosen goal in place of the coordinator's when they "
+       "differ (the displaced goal returns to the head of the queue); no prompt or output "
        "changes."),
 
     # Read-only tool result cache (relay/result_cache.py). SHADOW ONLY: at each read-only tool
