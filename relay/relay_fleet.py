@@ -11993,13 +11993,13 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # Durable at the moment of settling: see RelayWorker._settle_done.
         _nw.priority = bool(goal_item.get("priority")) if isinstance(goal_item, dict) else False
         _nw.on_settled_done = _note_one_finished
-        # OWNER'S REAL-DESKTOP SETTING, consulted at the one place a goal becomes a worker (each
-        # use, so an operator flipping desktop_guard reaches the next worker start). The default
-        # is ALLOW (owner instruction 2026-11-09): a goal that asks for real-desktop UI automation
-        # is born as a normal worker. It is only REFUSED here when the operator has opted back in
-        # with desktop_guard=deny (settings.txt or env MCP_DESKTOP_GUARD), and even then a goal
-        # carrying the explicit operator field allow_real_desktop is let through. refuse_reason
-        # returns None in the default case, so this branch is a no-op unless the opt-out is set.
+        # OWNER'S REAL-DESKTOP RULE, enforced at the one place a goal becomes a worker (each use,
+        # so an operator flipping block_real_desktop_automation reaches the next worker start).
+        # A goal that asks for UI automation / computer use on the real desktop is REFUSED here --
+        # born terminal (cancelled) with the refusal as its reason, so it never opens a tab on the
+        # real screen -- unless it carries the explicit operator field allow_real_desktop. This is
+        # the standing guard that complements the per-jid tombstone: the tombstone stops a known
+        # cancelled job resurrecting; this stops a NEW submission of the same forbidden kind.
         try:
             from relay import desktop_guard as _dg
             _refusal = _dg.refuse_reason(goal_item)
@@ -12009,10 +12009,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
             _nw.status = "cancelled"
             _nw.outcome = "CANCELLED"
             _nw.reason = _refusal
-            print("[fleet] %s: desktop_guard=deny のため実デスクトップUI自動化を拒否 / refused "
-                  "real-desktop automation because desktop_guard=deny is set (set "
-                  "allow_real_desktop on the goal, or remove the opt-out, to allow)" % _nw.name,
-                  flush=True)
+            print("[fleet] %s: 実デスクトップUI自動化のため開始を拒否 / refused real-desktop "
+                  "automation (set allow_real_desktop to override)" % _nw.name, flush=True)
         return _nw
 
     workers = [_worker_for(i, g) for i, g in enumerate(goals)]
