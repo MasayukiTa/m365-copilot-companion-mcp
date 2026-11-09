@@ -227,13 +227,25 @@ def _reader_relay_findings():
     return mode()
 
 
-def _reader_block_real_desktop():
+def _reader_desktop_guard():
     # desktop_guard.mode() follows settings.txt (mtime-cached) at every worker start; the env
-    # var MCP_BLOCK_REAL_DESKTOP_AUTOMATION would beat the file, so the parametrized test clears
-    # it below. _reset_for_test drops the mtime cache so the test's second write is seen.
+    # var MCP_DESKTOP_GUARD would beat the file, so the parametrized test clears it below.
+    # _reset_for_test drops the mtime cache so the test's second write is seen. Returns the
+    # setting's own vocabulary (allow|deny) -- the flipped default is allow (owner 2026-11-09).
     from relay import desktop_guard
     desktop_guard._reset_for_test()
     return desktop_guard.mode()
+
+
+def _reader_block_real_desktop():
+    # The LEGACY switch, still honoured as a deny trigger. Here we read its RAW file value (on|off)
+    # rather than mode(), because mode() normalises the legacy key into the new allow|deny
+    # vocabulary; the liveness claim this exercises is that the legacy line itself is re-read with
+    # no restart. _reset_for_test drops the mtime cache so the test's second write is seen; the
+    # parametrized test clears MCP_BLOCK_REAL_DESKTOP_AUTOMATION below so the file wins.
+    from relay import desktop_guard
+    desktop_guard._reset_for_test()
+    return desktop_guard._settings_value(desktop_guard.LEGACY_MODE_KEY)
 
 
 def _reader_workarea_guard():
@@ -343,6 +355,7 @@ _LIVE_READERS = {
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
+    "desktop_guard": (_reader_desktop_guard, "allow", "deny"),
     "block_real_desktop_automation": (_reader_block_real_desktop, "on", "off"),
     "workarea_guard": (_reader_workarea_guard, "warn", "enforce"),
     "workarea_allow": (_reader_workarea_allow, "audit_alpha", "audit_beta"),
@@ -368,7 +381,12 @@ def _norm(v):
 
 #: job_approval_mode follows the file too, but its reader short-circuits under pytest and is
 #: checked in a subprocess below; it is not a gap, it is a different harness.
-_CHECKED_ELSEWHERE = {"job_approval_mode"}
+#: agents_janitor_apply follows the file too, but the deciding read is in supervisor.ps1 (the
+#: supervisor's 10-minute janitor sweep), which calls the Python accessor
+#: relay/fleet_runner.py:settings_agents_janitor_apply fresh each sweep. This Python test
+#: harness does not run that PowerShell loop, so the behavioural read is exercised there, not
+#: here -- a different harness, not a missing reader.
+_CHECKED_ELSEWHERE = {"job_approval_mode", "agents_janitor_apply"}
 
 
 def test_every_following_key_has_a_reader_this_file_exercises():

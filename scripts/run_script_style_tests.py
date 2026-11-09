@@ -85,6 +85,7 @@ SUITES = {
     "relay/test_unlock_inject.py": None,
     "relay/test_unlock_redelivery_framing.py": None,
     "relay/test_watchdog.py": None,
+    "relay/test_watchdog_preemptive_recycle.py": None,
 }
 
 #: Per-suite budget. relay/test_fleet_refute.py is the slowest at a few seconds; the

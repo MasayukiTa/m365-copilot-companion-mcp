@@ -2035,6 +2035,207 @@ function Get-ServerExitRecord {
     }
 }
 
+function Get-LaunchAncestry {
+    # I/O. Walk up the ParentProcessId chain from a starting PID (default: this supervisor) up to
+    # -MaxDepth levels, returning an ordered array of @{ pid; name; commandline } for each ancestor.
+    # Used only to attribute a 'manual_script' launch (someone ran start_all.ps1 / quickstart by
+    # hand) to the process that drove it. Best-effort: Win32_Process may deny a field or the chain
+    # may end early; whatever was readable is returned. NO secrets: command lines of start scripts
+    # carry no credentials, but the caller still length-caps every string before it is written.
+    param([int]$StartPid = $PID, [int]$MaxDepth = 3)
+    $chain = @()
+    $cur = $StartPid
+    for ($i = 0; $i -lt $MaxDepth; $i++) {
+        if (-not $cur -or $cur -le 0) { break }
+        $p = $null
+        try { $p = Get-CimInstance Win32_Process -Filter ("ProcessId=" + $cur) -ErrorAction Stop } catch { $p = $null }
+        if (-not $p) { break }
+        $chain += ,([PSCustomObject][ordered]@{
+            pid         = [int]$p.ProcessId
+            name        = [string]$p.Name
+            commandline = [string]$p.CommandLine
+        })
+        $next = $null
+        try { $next = [int]$p.ParentProcessId } catch { $next = $null }
+        if ($next -eq $cur) { break }
+        $cur = $next
+    }
+    return ,$chain
+}
+
+function Test-AncestryManualScript {
+    # PURE. True when any ancestor's name or command line names a hand-run start script
+    # (start_all / quickstart). Takes the array Get-LaunchAncestry returns, so it can be unit-
+    # tested with fabricated ancestries and no live processes.
+    param($Ancestry)
+    if (-not $Ancestry) { return $false }
+    foreach ($a in @($Ancestry)) {
+        $hay = (([string]$a.name) + ' ' + ([string]$a.commandline)).ToLowerInvariant()
+        if ($hay -match 'start_all' -or $hay -match 'quickstart') { return $true }
+    }
+    return $false
+}
+
+function Get-LaunchReason {
+    # PURE. Decide the single reason label for a main.py (re)launch from facts already gathered
+    # elsewhere, so the classification can be unit-tested without launching anything. Inputs:
+    #   -Cause        what the supervisor path that called Start-Server knows about WHY it is
+    #                 launching: 'initial' (no previous process), 'vanished' (vanished fast path),
+    #                 'health_strike' (FailuresBeforeAction consecutive health misses), or
+    #                 'manual_script' (a start_all/quickstart ancestor drove this launch).
+    #   -PrevHasExited  $true/$false/$null from Get-ServerExitRecord.HasExited ($null = no previous
+    #                 process this supervisor launched).
+    #   -PrevExitCode   the previous process's exit code, or $null when it could not be read
+    #                 (killed externally with no code, or never launched by us).
+    #   -StrikeCount    how many consecutive health failures preceded a health_strike launch.
+    # The order matters: an explicit non-restart cause (initial / manual_script) wins over the
+    # exit-code reading, because those describe WHY we launched rather than how the old one ended.
+    param(
+        [string]$Cause,
+        $PrevHasExited,
+        $PrevExitCode,
+        [int]$StrikeCount = 0
+    )
+    if ($Cause -eq 'initial') { return 'never_started' }
+    if ($Cause -eq 'manual_script') { return 'manual_script' }
+    if ($Cause -eq 'health_strike') { return ("health_failed_{0}_times" -f $StrikeCount) }
+    # vanished or an unlabelled restart: classify by how the previous process ended.
+    if ($PrevHasExited -eq $true) {
+        if ($null -eq $PrevExitCode) { return 'killed_externally_no_exit_code' }
+        if ([int]$PrevExitCode -eq 0) { return 'exit_code_zero' }
+        return 'exit_code_nonzero'
+    }
+    if ($Cause -eq 'vanished') { return 'vanished' }
+    # The previous process was still alive when we replaced it and no stronger cause was given:
+    # this is the ordinary planned replace. Report it as a replace with no exit reading.
+    return 'killed_externally_no_exit_code'
+}
+
+function Get-FileTailText {
+    # Read the last N lines of a text file, best-effort. Returns '' when the file is absent or
+    # unreadable -- a launch log that throws because a server.log was mid-write would be worse
+    # than one missing field. The result is length-capped by the caller (Build-MainLaunchLogRecord).
+    param([string]$Path, [int]$Lines = 5)
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return '' }
+        $tail = Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction Stop
+        return ($tail -join "`n")
+    } catch {
+        return ''
+    }
+}
+
+function Build-MainLaunchLogRecord {
+    # PURE. Assemble the ordered object written as one JSONL line per (re)launch. No I/O, no
+    # secrets: callers pass only process facts and already-read log tails. Every string field is
+    # truncated so a single pathological value (a megabyte of traceback on one line) cannot blow
+    # the 2 KB/line cap the writer enforces; the writer re-checks the whole line too.
+    param(
+        [string]$LocalTime,
+        $OldPid,
+        $ExitCode,
+        [string]$ExitCodeHex,
+        [bool]$OldProcWasRunning,
+        $SupervisorPid,
+        [string]$StdoutTail,
+        [string]$StderrTail,
+        [string]$LastHealth,
+        [string]$Reason,
+        [string]$StdoutPath,
+        [string]$StderrPath,
+        $Ancestry
+    )
+    $cap = [ScriptBlock]::Create('param($s,$n) if ($null -eq $s) { return "" } $t = [string]$s; if ($t.Length -gt $n) { return $t.Substring(0, $n) } return $t')
+    # Ancestry is only present for a manual_script launch; cap each entry and keep at most 3.
+    $anc = @()
+    if ($Ancestry) {
+        foreach ($a in @($Ancestry)) {
+            $anc += ,([PSCustomObject][ordered]@{
+                pid         = $a.pid
+                name        = (& $cap $a.name 64)
+                commandline = (& $cap $a.commandline 300)
+            })
+            if ($anc.Count -ge 3) { break }
+        }
+    }
+    [PSCustomObject][ordered]@{
+        time              = $LocalTime
+        old_pid           = $OldPid
+        old_proc_running  = $OldProcWasRunning
+        exit_code         = $ExitCode
+        exit_code_hex     = (& $cap $ExitCodeHex 32)
+        supervisor_pid    = $SupervisorPid
+        last_health       = (& $cap $LastHealth 300)
+        reason            = (& $cap $Reason 64)
+        stdout_log        = (& $cap $StdoutPath 260)
+        stderr_log        = (& $cap $StderrPath 260)
+        stdout_tail       = (& $cap $StdoutTail 700)
+        stderr_tail       = (& $cap $StderrTail 700)
+        ancestry          = $anc
+    }
+}
+
+function Write-MainLaunchLog {
+    # I/O wrapper: build the record (pure), serialise it to one compact JSON line, and append it
+    # to .fleet\main_launch_log.jsonl. Best-effort and fully self-contained in try/catch: recording
+    # a launch must NEVER be able to stop the launch. Enforces a 2 KB/line cap (a line over the cap
+    # is replaced by a compact marker that still parses) and rotates the file at ~5 MB, keeping the
+    # newest tail, so an unattended machine cannot fill its disk with launch records.
+    param(
+        $OldProc,
+        $ExitRecord,
+        [string]$Cause,
+        [int]$StrikeCount = 0,
+        [string]$StdoutPath,
+        [string]$StderrPath
+    )
+    try {
+        $fleetDir = Join-Path $Root ".fleet"
+        if (-not (Test-Path -LiteralPath $fleetDir)) { New-Item -ItemType Directory -Force $fleetDir | Out-Null }
+        $logPath = Join-Path $fleetDir "main_launch_log.jsonl"
+        $oldPid = $null
+        $oldRunning = $false
+        $exitCode = $null
+        $exitHex = $null
+        $prevHasExited = $null
+        if ($ExitRecord) {
+            $oldPid = $ExitRecord.ServerPid
+            $exitCode = $ExitRecord.ExitCode
+            $exitHex = $ExitRecord.ExitCodeHex
+            $prevHasExited = $ExitRecord.HasExited
+            if ($ExitRecord.HasExited -eq $false) { $oldRunning = $true }
+        }
+        # MANUAL-SCRIPT ATTRIBUTION. Only an 'initial' launch can be a hand-run start_all/quickstart
+        # (a vanished/health/replace relaunch is the supervisor's own doing). When the supervisor's
+        # ancestry names such a script, report the launch as manual_script and carry the ancestor
+        # chain (name + command line, 3 levels) so the next unexplained restart can be told apart
+        # from one a person triggered.
+        $ancestry = $null
+        $effectiveCause = $Cause
+        if ($Cause -eq 'initial') {
+            try {
+                $ancestry = Get-LaunchAncestry -StartPid $PID -MaxDepth 3
+                if (Test-AncestryManualScript $ancestry) { $effectiveCause = 'manual_script' }
+            } catch { $ancestry = $null }
+        }
+        $reason = Get-LaunchReason -Cause $effectiveCause -PrevHasExited $prevHasExited -PrevExitCode $exitCode -StrikeCount $StrikeCount
+        $outTail = Get-FileTailText -Path $StdoutPath -Lines 5
+        $errTail = Get-FileTailText -Path $StderrPath -Lines 5
+        $rec = Build-MainLaunchLogRecord -LocalTime (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -OldPid $oldPid -ExitCode $exitCode -ExitCodeHex $exitHex -OldProcWasRunning $oldRunning -SupervisorPid $PID -StdoutTail $outTail -StderrTail $errTail -LastHealth ([string]$script:LastServerCheck) -Reason $reason -StdoutPath $StdoutPath -StderrPath $StderrPath -Ancestry $ancestry
+        $line = $rec | ConvertTo-Json -Compress
+        if ($line.Length -gt 2048) {
+            $line = (([PSCustomObject][ordered]@{ time = $rec.time; supervisor_pid = $rec.supervisor_pid; reason = $rec.reason; note = 'record exceeded 2KB cap; tails dropped' }) | ConvertTo-Json -Compress)
+        }
+        Add-Content -Path $logPath -Value $line -Encoding UTF8
+        try {
+            if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 5242880)) {
+                $keep = Get-Content -LiteralPath $logPath -Tail 500 -ErrorAction Stop
+                Set-Content -Path $logPath -Value $keep -Encoding UTF8
+            }
+        } catch { }
+    } catch { }
+}
+
 function Invoke-ApiKeyRepair {
     # The server ends with code 78 (tools/secret_store.EXIT_NO_API_KEY) when its bearer token cannot
     # be read on this account -- the case of an .env copied from another PC (the DPAPI blob is bound
@@ -2057,6 +2258,12 @@ function Invoke-ApiKeyRepair {
 }
 
 function Start-Server {
+    # -Cause / -StrikeCount feed the per-launch record (.fleet\main_launch_log.jsonl). They are
+    # advisory labels from the caller about WHY this (re)launch is happening: 'initial' (first
+    # launch, no previous process), 'vanished' (vanished fast path), 'health_strike' (N health
+    # misses; -StrikeCount is that N), 'manual_script', or '' (ordinary planned replace). They never
+    # change what Start-Server DOES -- only how the launch is explained in the log.
+    param([string]$Cause = '', [int]$StrikeCount = 0)
     # CAPTURE THE PREVIOUS LAUNCH'S STATE BEFORE TOUCHING ANYTHING BELOW. Everything past this
     # point can end the previous process -- deliberately, via the kill-by-port/kill-stale-
     # instances cleanup a few lines down, or incidentally if it had already died on its own --
@@ -2199,6 +2406,16 @@ function Start-Server {
     }
     $script:ServerProc = $newProc
     Pop-Location
+    # DURABLE REASON RECORD for this (re)launch (.fleet\main_launch_log.jsonl, one JSON line).
+    # Best-effort inside its own try/catch: this is the whole point of the change -- every launch
+    # the supervisor makes must leave a record saying why -- but it must never be able to stop the
+    # launch it is recording. $exitRecord/$prevWasAlive were captured above before any kill ran, so
+    # the record truthfully distinguishes "we stopped a live one" from "it was already gone".
+    try {
+        $launchCause = $Cause
+        if (-not $launchCause) { if ($prevWasAlive) { $launchCause = 'replace' } else { $launchCause = 'initial' } }
+        Write-MainLaunchLog -OldProc $prevProc -ExitRecord $exitRecord -Cause $launchCause -StrikeCount $StrikeCount -StdoutPath $srvOut -StderrPath $srvErr
+    } catch { }
     # RECORD THE SHA THIS SERVER STARTED ON, so doctor can later tell a running server
     # apart from a checkout that has since moved past it (a `git pull` lands new
     # relay/tools/main.py on disk, but THIS long-lived process keeps executing the code
@@ -3561,7 +3778,7 @@ if ($startupListeners.Queried) {
 }
 if ($portQueried -and -not $portOwner) {
     Write-Log "nothing is listening on :$Port at startup -> launching the server now, without the debounce"
-    Start-Server
+    Start-Server -Cause 'initial'
 }
 $tunnelMiss = 0
 $loggedIn = $null   # tri-state ($null unknown / $true / $false) -- log only on transition
@@ -3621,6 +3838,45 @@ if (-not (Test-TunnelRouteWanted)) {
     $loggedIn = $false
 }
 # -- TUNNEL STARTUP FAST PATH (end) ----------------------------------------------------------
+
+# -- AGENTS JANITOR: reclaim C: by deleting FINISHED worker clones (owner, 2026-11-09) --------
+# ROOT CAUSE of the fleet running C: out of space (measured 2026-11-09, see
+# scripts/agents_janitor.py and .fleet/disk_series.jsonl): workers `git clone` GitHub repos into
+# %TEMP%\m365-companion\agents, do their work, exit, and their full checkouts are NEVER removed.
+# This runs the janitor at most once per 10 minutes, and only while C: is below the 3 GB
+# threshold, so a healthy disk is never walked. A DRY-RUN log line is emitted first every time;
+# whether it then DELETES is the agents_janitor_apply setting (default ON). The janitor itself
+# refuses to touch anything that is not a clean, fully-pushed, unowned, quiet clone -- the apply
+# switch only gates whether its decisions are carried out.
+$script:AgentsJanitorLastRun = [datetime]::MinValue
+$script:AgentsJanitorMinSeconds = 600          # 10 minutes, same rate-limit shape as the rest
+$script:AgentsJanitorThresholdBytes = 3221225472   # 3 GB: only sweep when C: is under pressure
+function Invoke-AgentsJanitorSweep {
+    # Rate-limit: at most once per 10 minutes.
+    if (((Get-Date) - $script:AgentsJanitorLastRun).TotalSeconds -lt $script:AgentsJanitorMinSeconds) { return }
+    # Only when free space is below the threshold -- a healthy disk is left alone.
+    $free = $null
+    try { $free = [int64](New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot($FleetDir))).AvailableFreeSpace } catch { $free = $null }
+    if ($null -eq $free -or $free -ge $script:AgentsJanitorThresholdBytes) { return }
+    $script:AgentsJanitorLastRun = Get-Date
+    Write-Log ("disk below 3 GB (free {0:N2} GB) -> agents-janitor sweep" -f ($free / 1GB))
+    # DRY RUN FIRST, ALWAYS: report what would be deleted, every sweep, regardless of the setting.
+    try {
+        $dry = & $Py -u "$Root\scripts\agents_janitor.py" 2>&1
+        foreach ($line in $dry) { if ("$line".Trim()) { Write-Log "[janitor:dry] $line" } }
+    } catch { Write-Log "[janitor:dry] sweep failed: $($_.Exception.Message)" }
+    # THEN APPLY, behind the setting (default ON). Read fresh each sweep (each_gate).
+    $apply = $true
+    try {
+        $a = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_runner import settings_agents_janitor_apply; print('1' if settings_agents_janitor_apply() else '0')" 2>$null
+        if ("$a".Trim() -eq '0') { $apply = $false }
+    } catch { $apply = $true }   # unreadable setting -> default ON
+    if (-not $apply) { Write-Log "[janitor] agents_janitor_apply=0 -> dry-run only this sweep, nothing deleted"; return }
+    try {
+        $out = & $Py -u "$Root\scripts\agents_janitor.py" --apply 2>&1
+        foreach ($line in $out) { if ("$line".Trim()) { Write-Log "[janitor] $line" } }
+    } catch { Write-Log "[janitor] apply failed: $($_.Exception.Message)" }
+}
 
 # AN EXIT RECORD. 2026-10-17 the supervisor's log simply stopped at 08:44:58 and the next line, 13 h
 # later, was a fresh "supervisor up": nothing said whether it exited, was closed with its session or
@@ -3786,14 +4042,14 @@ while ($true) {
             $verdict = Get-VanishedServerVerdict -Listening $portListening -OwnMainPyAlive $ownMainPyAlive -TransitionActive (Test-ServerTransitionActive)
             if ($verdict -eq 'relaunch-now') {
                 Write-Log "server has vanished (nothing on :$Port, no main.py of ours) -- relaunching at once, not after $FailuresBeforeAction strikes ($reason)"
-                Start-Server
+                Start-Server -Cause 'vanished'
                 $serverMiss = 0
                 Start-Sleep -Seconds 6
             } else {
                 $serverMiss++
                 Write-Log "server check failed ($serverMiss/$FailuresBeforeAction) -- $reason"
                 if ($serverMiss -ge $FailuresBeforeAction) {
-                    Start-Server
+                    Start-Server -Cause 'health_strike' -StrikeCount $serverMiss
                     $serverMiss = 0
                     Start-Sleep -Seconds 6
                 }
@@ -3833,6 +4089,11 @@ while ($true) {
         # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
         Invoke-TunnelHostingCheck | Out-Null
     }
+
+    # RECLAIM C: FROM FINISHED WORKER CLONES. Before the code cycle (which may replace this
+    # process and exit): at most once per 10 minutes, and only while C: is under 3 GB. Best-effort
+    # and fully self-contained -- a janitor failure must never take down the supervisor tick.
+    try { Invoke-AgentsJanitorSweep } catch { Write-Log "agents-janitor sweep raised: $($_.Exception.Message)" }
 
     # LAST STEP OF THE TICK: is this process still the code on disk? Stat-only unless a file
     # changed; replaces this supervisor (and exits) only when Get-SupervisorRestartVerdict says ok.
