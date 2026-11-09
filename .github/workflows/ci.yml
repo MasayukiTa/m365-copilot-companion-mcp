@@ -145,6 +145,7 @@ jobs:
             ui/test_planned_server_restart_expiry.py \
             ui/test_planned_server_restart_exact_poll.py \
             tools/test_a_new_way_to_say_failed_must_be_classified.py \
+            relay/test_opening_record.py \
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
@@ -549,6 +550,7 @@ jobs:
             tools/test_a_cap_below_the_guard_silences_the_guard.py \
             tools/test_live_checkout_write_guard.py \
             tools/test_file_ops_live_checkout_wiring.py \
+            tools/test_file_ops_bounded_listing.py \
             tests/test_outside_lane.py \
             tools/test_child_process_priority.py \
             tools/test_a_dot_on_in_the_normal_state_is_not_a_signal.py \
@@ -1071,6 +1073,7 @@ jobs:
             relay/test_git_push_safety.py \
             tools/auto/test_autoloop.py \
             tools/auto/test_loop_runner.py \
+            tools/auto/test_copilot_image.py \
             tools/test_auto_ops.py \
             tools/test_recurrent_ops.py \
             tools/test_recurrent_keep_best.py \
@@ -1117,6 +1120,7 @@ jobs:
             scripts/test_capability_profile.py \
             scripts/test_task_kind.py \
             scripts/test_load_routing_report.py \
+            scripts/test_load_routing_pairwise.py \
             scripts/test_result_cache_report.py \
             scripts/test_team_formation_report.py \
             bench/test_attempt_budget.py \
@@ -1135,6 +1139,7 @@ jobs:
             relay/test_task_router_exact_approval.py \
             scripts/test_update_from_release.py \
             tests/test_health_route.py \
+            tests/test_health_fast_under_cpu_load.py \
             tests/test_durable_access_log.py \
             tests/test_mcp_inbound_log.py \
             tests/test_fleet_submit_refusal_log.py \
@@ -1364,6 +1369,37 @@ jobs:
           # here with a clear reason instead of silently running the wrong engine again.
           Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
           $result = Invoke-Pester .\scripts\heal_tunnel.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
+
+      # Every main.py (re)launch by the supervisor must leave a durable reason record in
+      # .fleet\main_launch_log.jsonl. These Pester 3.4.0 tests cover the PURE classification
+      # and record-assembly functions (Get-LaunchReason, Test-AncestryManualScript,
+      # Build-MainLaunchLogRecord) plus Get-ServerExitRecord against real child processes
+      # that exit 3 and that are killed with Stop-Process. Same engine pin as heal_tunnel.
+      - name: Run main launch-log unit tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
+          $result = Invoke-Pester .\scripts\test_main_launch_log.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
+
+      # ADDED 2026-11-09: every main.py (re)launch the supervisor makes must leave a durable
+      # reason record in .fleet\main_launch_log.jsonl, so an unexplained gateway restart can be
+      # attributed. The reason classifier (Get-LaunchReason), the manual-script ancestry test
+      # (Test-AncestryManualScript) and the record builder (Build-MainLaunchLogRecord) are pure
+      # and are asserted here; the two real-process cases (a child that exits 3, and one killed
+      # with Stop-Process) self-skip when no python is on PATH, so this step stays green on the
+      # Linux image while still exercising the real exit-code read on Windows. Pester pinned to
+      # 3.4.0 for the same reason as heal_tunnel above (Should Be vs Should -Be).
+      - name: Run supervisor main.py launch-reason record tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
+          $result = Invoke-Pester .\scripts\test_main_launch_log.Tests.ps1 -PassThru
           if ($result.FailedCount -gt 0) {
             exit 1
           }
