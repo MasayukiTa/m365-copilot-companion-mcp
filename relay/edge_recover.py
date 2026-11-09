@@ -63,6 +63,48 @@ def cdp_alive(cdp_url="http://localhost:9222", timeout_ms=5000):
         return False
 
 
+def cdp_alive_bounded(cdp_url="http://localhost:9222", timeout_ms=5000,
+                      deadline_s=25.0):
+    """cdp_alive() with a HARD WALL-CLOCK CEILING, for the recovery loop.
+
+    WHY THIS EXISTS. cdp_alive() passes `timeout_ms` only to connect_over_cdp -- that bounds
+    the CONNECT. The very next line, ``_ = b.contexts``, is a synchronous CDP round-trip with
+    NO timeout, and a browser that is wedged-but-still-listening (TCP accepts, /json/version
+    answers, but the CDP command never returns) blocks it forever. The fleet recovery loop
+    calls cdp_alive() on its MAIN thread, so that one line can freeze the whole coordinator:
+    status.json stops advancing and the stall is silent. Observed 2026-11-07..09: recovery
+    attempt 1 stood still for ~33 h inside exactly this call while /json/version still
+    answered in 1.7 s.
+
+    This wrapper runs cdp_alive() in a daemon thread and waits at most `deadline_s`. If the
+    probe has not returned by then the browser is treated as NOT alive (return False), which
+    routes the caller straight to a hard reset -- the correct action for a wedged browser --
+    instead of waiting on it indefinitely. The orphaned thread is left to die when the reset
+    tears the browser down; it holds no lock the main thread needs.
+
+    Returns True only if cdp_alive() returned True within the deadline; False on a False
+    result, an exception, OR a timeout. A timeout and a dead browser are deliberately the
+    same answer here: both mean "do not keep trusting this browser".
+    """
+    import threading
+    result = [None]
+
+    def _probe():
+        try:
+            result[0] = bool(cdp_alive(cdp_url, timeout_ms=timeout_ms))
+        except Exception:
+            result[0] = False
+
+    t = threading.Thread(target=_probe, name="cdp-alive-probe", daemon=True)
+    t.start()
+    t.join(max(0.1, float(deadline_s)))
+    if t.is_alive():
+        # The probe is still blocked (almost certainly in b.contexts against a wedged
+        # browser). Do not wait on it: answer "not alive" so the caller resets.
+        return False
+    return bool(result[0])
+
+
 def cdp_ping(cdp_url="http://localhost:9222", timeout_s=3.0):
     """Does the browser PROCESS answer on its DevTools port right now? True/False.
 

@@ -35,3 +35,15 @@ regexes = [
   '''2a0341296bb96dc7d205036f9f693427809772f6136a46f58b04a1c492de9e04''',
   '''5ba174b8e87faf4e8106e36a7cf5a901bbec3435d01fbd56914c2b0346858261''',
 ]
+
+# --- Test-fixture unlock/bearer strings (history scan) ---
+# scripts/test_unlock_password_is_retrievable.py asserts on DELIBERATELY FAKE values
+# ('visible-pw-5678', 'visible-bearer-1234', 'known-pw-1234') to prove the repair tool can
+# print a stored secret. The working tree marks each line with an inline `# gitleaks:allow`,
+# but --full-history re-scans older commits (e.g. 6fa5f003) written before that annotation
+# existed. The generic-api-key rule reads the fixture strings as keys. This path holds a TEST
+# with no real secret, so it is allowlisted for the history scan -- scoped to this one file,
+# exactly as the inline annotations scope the working-tree scan.
+paths = [
+  '''scripts/test_unlock_password_is_retrievable\.py''',
+]

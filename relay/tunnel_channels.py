@@ -33,7 +33,22 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+
+# One process-wide lock serialises every read of and append to the tunnel_channels.jsonl
+# file. The /health route runs _tunnel_channels_summary -> health_counts on a dedicated
+# ThreadPoolExecutor and is polled about once a second, so several health_counts reads can
+# run at once while the tunnel-host-log tailer calls append_new_records to grow the same
+# file. health_counts used to iterate the open file line by line, holding a buffered read
+# across many json.loads calls, so an append that extended the file mid-read fed a partial
+# byte sequence to the C json decoder and corrupted the process heap -- the faulthandler
+# dumps show every faulting thread in json.loads under health_counts, and the crashes were
+# access violations at varying offsets in python310.dll plus a 0xc0000374 heap corruption
+# in ntdll. Serialising read against append, and reading the whole file in one shot under
+# the lock (never holding a changing file handle across decodes), removes the data race.
+# Each record is one short line, so the lock is held only briefly and /health stays fast.
+_JSONL_LOCK = threading.Lock()
 
 # A ts-stamped line written by relay.tunnel_host_log looks like:
 #   2026-10-31 21:40:12.345 <the devtunnel line>
@@ -204,10 +219,12 @@ def append_new_records(log_path, jsonl_path, offset_path=None):
         chunk = fh.readlines()
         new_offset = fh.tell()
     if chunk:
-        with open(jsonl_path, "a", encoding="utf-8") as out:
-            for rec in parse_channel_events(chunk):
-                out.write(json.dumps(rec, ensure_ascii=False) + "\n")
-                appended += 1
+        # Serialise the append against every concurrent health_counts read of the same file.
+        with _JSONL_LOCK:
+            with open(jsonl_path, "a", encoding="utf-8") as out:
+                for rec in parse_channel_events(chunk):
+                    out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+                    appended += 1
     with open(offset_path, "w", encoding="utf-8") as fh:
         fh.write(str(new_offset))
     return appended
@@ -228,26 +245,33 @@ def health_counts(jsonl_path, now=None, window_s=600):
         now = time.time()
     cutoff = now - window_s
     total = no_resp = remote_early = 0
+    # Read the WHOLE file in one shot under the shared lock, then parse the in-memory
+    # snapshot. This never holds a file handle across json.loads calls and never overlaps an
+    # append, so the C json decoder is never handed a half-written line (the heap-corruption
+    # path the faulthandler dumps show). Each line is tiny and the jsonl stays small, so the
+    # whole read is quick and the lock is held only momentarily.
     try:
-        with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                t = rec.get("time")
-                if t is not None and t < cutoff:
-                    continue
-                total += 1
-                if rec.get("no_response"):
-                    no_resp += 1
-                if rec.get("remote_closed_early"):
-                    remote_early += 1
+        with _JSONL_LOCK:
+            with open(jsonl_path, "r", encoding="utf-8", errors="replace") as fh:
+                snapshot = fh.read()
     except OSError:
         return {k: -1 for k in keys}
+    for line in snapshot.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            continue
+        t = rec.get("time")
+        if t is not None and t < cutoff:
+            continue
+        total += 1
+        if rec.get("no_response"):
+            no_resp += 1
+        if rec.get("remote_closed_early"):
+            remote_early += 1
     return {
         "tunnel_channels": total,
         "tunnel_no_response": no_resp,
