@@ -1,4 +1,4 @@
-"""単体試験: 交絡検出 (confound) と品名層別推定 (stratify)。合成データのみ。"""
+"""単体試験: 交絡検出 (confound) と層別推定 (stratify)。合成データのみ。"""
 
 from scripts.periodic_scan.screening.confound import (
     detect_confounding,
@@ -19,7 +19,7 @@ def _row(lot, product, line, date, exposure, value):
 
 
 def test_no_confounding_when_groups_balanced_across_axes():
-    # 2品名・2ライン・同一時期で、各セルに treated/control が均等。
+    # 2つの層別キー値・2ライン・同一時期で、各セルに treated/control が均等。
     rows = []
     for product in ("A", "B"):
         for line in ("L1", "L2"):
@@ -58,7 +58,7 @@ def test_period_confounding_detected():
 
 
 def test_stratified_pooled_delta_is_weighted_by_product():
-    # 品名Aは delta=+1.0 (n各5), 品名Bは delta=+0.2 (n各5)。重みは等しいので pooled≈0.6。
+    # 層Aは delta=+1.0 (n各5), 層Bは delta=+0.2 (n各5)。重みは等しいので pooled≈0.6。
     rows = []
     for i in range(5):
         rows.append(_row(str(i), "A", "L1", "2026-08-01", "treated", 2.0))

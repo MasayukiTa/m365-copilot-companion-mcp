@@ -18,9 +18,9 @@ from scripts.periodic_scan.report.ledger_append import (
 
 def _rec():
     return {
-        "analysis_id": "screen-ピール値-20261104",
+        "analysis_id": "screen-指標値-20261104",
         "kind": "strong_candidate",
-        "result_item": "ピール値",
+        "result_item": "指標値",
         "what_we_saw": ["treated が一貫して高い"],
         "whats_missing": ["各群5に未達"],
         "numbers": {"pooled_delta": 0.18, "n_total": 36},
@@ -62,7 +62,7 @@ def test_write_pptx_generates_file_if_available(tmp_path):
 def test_detection_to_entry_maps_tracking():
     entry = detection_to_entry(_rec(), scanned_on="2026-11-04")
     assert entry == {
-        "analysis_id": "screen-ピール値-20261104",
+        "analysis_id": "screen-指標値-20261104",
         "class": "C",
         "next_trigger": "各群5到達",
         "last_scanned": "2026-11-04",

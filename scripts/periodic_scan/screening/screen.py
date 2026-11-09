@@ -1,4 +1,4 @@
-"""新規スクリーニング本体 — 交絡検出 + 品名層別推定 を束ね、Candidate を出す。
+"""新規スクリーニング本体 — 交絡検出 + 層別推定 を束ね、Candidate を出す。
 
 入力は SCHEMA.md の ScreenInput。出力は Candidate（SCHEMA 5）。
 
@@ -73,7 +73,7 @@ def screen_result_item(
     missing: List[str] = []
     if est["usable_strata"] < TARGET_USABLE_STRATA:
         missing.append(
-            "品名層別で各群 min_lots を満たす層が %d（目標 %d）"
+            "層別キーで各群 min_lots を満たす層が %d（目標 %d）"
             % (est["usable_strata"], TARGET_USABLE_STRATA)
         )
     if conf["confounded"]:

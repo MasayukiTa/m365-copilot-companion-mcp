@@ -1,10 +1,10 @@
-"""交絡検出 — 曝露の群ごとの品名・時期・ラインの偏りを数値化する。
+"""交絡検出 — 曝露の群ごとの層別キー・時期・ラインの偏りを数値化する。
 
 入力は SCHEMA.md の LotRow 配列。出力は ConfoundReport。
 判定器・基準・Δmin・補正は一切参照・変更しない（これは記述統計のみ）。
 
 偏り(imbalance) の定義:
-  あるカテゴリ軸（品名/ライン/時期）について、各カテゴリ値での treated 比率
+  あるカテゴリ軸（層別キー/ライン/時期）について、各カテゴリ値での treated 比率
   p_k = treated_k / (treated_k + control_k) を、全体の treated 比率 p0 からの
   ロット重み付き絶対偏差で測る。完全に群が分離していれば 1、全カテゴリで群比率が
   全体と同じなら 0。
@@ -67,7 +67,7 @@ def _imbalance(counts: Dict[str, Dict[str, int]]) -> float:
 def detect_confounding(screen_input: Dict[str, Any]) -> Dict[str, Any]:
     """ScreenInput -> ConfoundReport。
 
-    曝露の群ごとの品名・時期・ラインの偏りを見る。
+    曝露の群ごとの層別キー・時期・ラインの偏りを見る。
     """
     result_item = screen_input.get("result_item", "")
     rows = screen_input.get("rows", []) or []

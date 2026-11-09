@@ -23,7 +23,7 @@ def build_prereg_record(
     ri = candidate.get("result_item", "")
     pooled = candidate.get("pooled_delta", 0.0)
     claim = (
-        "treated 群は control 群より %s が pooled_delta=%s だけ高い（品名層別）"
+        "treated 群は control 群より %s が pooled_delta=%s だけ高い（層別）"
         % (ri, pooled)
     )
     return {

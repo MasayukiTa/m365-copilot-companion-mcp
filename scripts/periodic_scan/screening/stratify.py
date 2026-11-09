@@ -1,8 +1,8 @@
-"""品名で層別した効果量の推定。
+"""層別キーで層別した効果量の推定。
 
 入力は SCHEMA.md の ScreenInput（LotRow 配列を含む）。出力は StrataEstimate。
-交絡（品名の偏り）に対処するため、品名(product)ごとに treated-control の差を取り、
-ロット数で重み付けして統合する（品名で揃えた比較）。
+交絡（層別キーの偏り）に対処するため、層別キー(product)ごとに treated-control の差を取り、
+ロット数で重み付けして統合する（層別キーで揃えた比較）。
 
 判定器・基準・Δmin・補正は変更しない。ここは効果量（平均差）の記述的推定のみで、
 採否は判定器が別途行う。pooled_delta は「候補の強さ」を測るための材料であって
@@ -22,12 +22,12 @@ def _mean(xs: List[float]) -> float:
 
 
 def estimate_stratified(screen_input: Dict[str, Any]) -> Dict[str, Any]:
-    """ScreenInput -> StrataEstimate。品名で層別して pooled_delta を出す。"""
+    """ScreenInput -> StrataEstimate。層別キーで層別して pooled_delta を出す。"""
     result_item = screen_input.get("result_item", "")
     rows = screen_input.get("rows", []) or []
     min_lots = int(screen_input.get("min_lots_per_group", DEFAULT_MIN_LOTS_PER_GROUP))
 
-    # 品名 -> 群 -> 値リスト
+    # 層別キー -> 群 -> 値リスト
     buckets: Dict[str, Dict[str, List[float]]] = defaultdict(
         lambda: {"treated": [], "control": []}
     )

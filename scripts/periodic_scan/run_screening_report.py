@@ -8,7 +8,7 @@ run_bc_d.py が処理(a)(b)を結線するのと同じ役割を、処理(c)(d)�
 パイプライン:
   (c) スクリーニング
       1. select_targets       -- 未使用/記録が増えた結果項目のみを対象化（取り逃し防止）
-      2. screen_result_item   -- 各対象を交絡検出 + 品名層別推定で Candidate 化
+      2. screen_result_item   -- 各対象を交絡検出 + 層別推定で Candidate 化
                                  （内部で detect_confounding / estimate_stratified を呼ぶ）
       3. preregister_strong   -- strong な候補を JSONL に事前登録
                                  （内部で build_prereg_record を呼ぶ）
@@ -62,7 +62,7 @@ def _candidate_to_detection(candidate: Dict[str, Any], kind: str) -> Dict[str, A
         "usable_strata": observed.get("usable_strata", 0),
     }
     what_we_saw = [
-        "品名で層別した pooled_delta=%s（使える層 %s）"
+        "層別キーで層別した pooled_delta=%s（使える層 %s）"
         % (candidate.get("pooled_delta", 0.0), observed.get("usable_strata", 0)),
     ]
     if candidate.get("confounded"):
@@ -80,7 +80,7 @@ def _candidate_to_detection(candidate: Dict[str, Any], kind: str) -> Dict[str, A
         "whats_missing": candidate.get("missing", []),
         "proposal": {
             "change": "交絡軸をそろえた条件で再取得する",
-            "experiment": "品名・ライン・時期をそろえた対照群で追試する",
+            "experiment": "層別キー・ライン・時期をそろえた対照群で追試する",
             "confirm_design": "事前登録した主張を登録済みの順序の信頼時計で確認する",
         },
         "tracking": {

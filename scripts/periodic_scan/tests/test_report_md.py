@@ -7,10 +7,10 @@ from scripts.periodic_scan.report.report_md import render_md, write_md
 
 def _rec():
     return {
-        "analysis_id": "screen-ピール値-20261104",
+        "analysis_id": "screen-指標値-20261104",
         "kind": "strong_candidate",
-        "result_item": "ピール値",
-        "what_we_saw": ["品名A/B/Cで一貫して treated が高い"],
+        "result_item": "指標値",
+        "what_we_saw": ["層A/B/Cで一貫して treated が高い"],
         "whats_missing": ["確認用ロットが各群5に未達の層あり"],
         "numbers": {"pooled_delta": 0.18, "n_total": 36, "strength": 0.73},
         "strata": [
@@ -18,14 +18,14 @@ def _rec():
              "mean_treated": 1.2, "mean_control": 1.0, "delta": 0.2},
         ],
         "proposal": {"change": "ラインL1に揃える", "experiment": "前向きに20ロット",
-                     "confirm_design": "品名層別で判定器に通す"},
+                     "confirm_design": "層別キーで判定器に通す"},
         "tracking": {"next_trigger": "各群5到達", "class": "C"},
     }
 
 
 def test_render_md_contains_sections_and_numbers():
     md = render_md(_rec())
-    assert "# 週次走査 検出報告: ピール値" in md
+    assert "# 週次走査 検出報告: 指標値" in md
     assert "## 何を見てそう判断したか" in md
     assert "## 何が足りないか" in md
     assert "## 改善の提案" in md
@@ -48,4 +48,4 @@ def test_write_md_creates_file(tmp_path):
     path = write_md(_rec(), str(tmp_path))
     assert os.path.isfile(path)
     body = open(path, encoding="utf-8").read()
-    assert "ピール値" in body
+    assert "指標値" in body

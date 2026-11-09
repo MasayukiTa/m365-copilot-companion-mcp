@@ -65,11 +65,11 @@ def render_md(rec: Dict[str, Any]) -> str:
     out += _lines_section("何を見てそう判断したか", rec.get("what_we_saw", []) or [])
     out += _lines_section("何が足りないか", rec.get("whats_missing", []) or [])
 
-    # 品名層別の内訳（strata の生値のみ）
+    # 層別の内訳（strata の生値のみ）
     if strata:
-        out.append("## 品名層別の内訳")
+        out.append("## 層別の内訳")
         out.append("")
-        out.append("| 品名 | n(treated) | n(control) | mean(treated) | mean(control) | delta |")
+        out.append("| 層別キー | n(treated) | n(control) | mean(treated) | mean(control) | delta |")
         out.append("|---|---|---|---|---|---|")
         for s in strata:
             out.append(

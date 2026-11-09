@@ -15,7 +15,7 @@ from scripts.periodic_scan.screening.preregister import (
 
 
 def _rows_strong():
-    # 3品名すべてで大きく一貫した効果、交絡なし → strong になりやすい。
+    # 3つの層別キー値すべてで大きく一貫した効果、交絡なし → strong になりやすい。
     rows = []
     for product in ("A", "B", "C"):
         for i in range(6):
@@ -30,11 +30,11 @@ def _rows_strong():
 
 def test_screen_emits_candidate_schema():
     cand = screen_result_item(
-        {"result_item": "ピール値", "rows": _rows_strong(), "min_lots_per_group": 5},
+        {"result_item": "指標値", "rows": _rows_strong(), "min_lots_per_group": 5},
         today="2026-11-04",
     )
-    assert cand["candidate_id"] == "screen-ピール値-20261104"
-    assert cand["result_item"] == "ピール値"
+    assert cand["candidate_id"] == "screen-指標値-20261104"
+    assert cand["result_item"] == "指標値"
     assert cand["pooled_delta"] > 0
     assert 0.0 <= cand["strength"] <= 1.0
     assert isinstance(cand["strong"], bool)

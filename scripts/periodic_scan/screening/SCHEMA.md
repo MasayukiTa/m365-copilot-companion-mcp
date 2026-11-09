@@ -11,7 +11,7 @@
 ```json
 {
   "lot": "74265",          // ロットID（文字列）
-  "product": "679FG",       // 品名（層別キー）
+  "product": "P001",       // 層別キー
   "line": "L1",            // 製造ライン
   "date": "2026-08-01",     // 取得日（ISO, 時期の偏り評価に使う）
   "exposure": "treated",    // 曝露群: "treated" | "control"
@@ -22,7 +22,7 @@
 ## 2. ScreenInput — (c) `screen_result_item` の入力
 ```json
 {
-  "result_item": "ピール値",      // 結果項目名
+  "result_item": "指標値",      // 結果項目名
   "rows": [ LotRow, ... ],         // 上記 LotRow の配列
   "delta_min": 0.0,                // 既存基準の Δmin（呼び元が登録済み値を渡す。本モジュールは解釈のみ）
   "min_lots_per_group": 5          // 群ごと最小ロット数（既定5。基準は変更しない）
@@ -32,8 +32,8 @@
 ## 3. ConfoundReport — 交絡検出の出力
 ```json
 {
-  "result_item": "ピール値",
-  "by_product": { "679FG": {"treated": 10, "control": 8}, ... },  // 品名×群のロット数
+  "result_item": "指標値",
+  "by_product": { "P001": {"treated": 10, "control": 8}, ... },  // 層別キー×群のロット数
   "by_line":    { "L1": {"treated": 6, "control": 2}, ... },
   "by_period":  { "2026-08": {"treated": 7, "control": 1}, ... },
   "imbalance": {                 // 偏りの強さ 0..1（1=完全に偏る）
@@ -44,15 +44,15 @@
 }
 ```
 
-## 4. StrataEstimate — 品名で層別した推定の出力
+## 4. StrataEstimate — 層別キーで層別した推定の出力
 ```json
 {
-  "result_item": "ピール値",
-  "strata": [                    // 品名ごと
-    {"product": "679FG", "n_treated": 10, "n_control": 8,
+  "result_item": "指標値",
+  "strata": [                    // 層別キーごと
+    {"product": "P001", "n_treated": 10, "n_control": 8,
      "mean_treated": 1.20, "mean_control": 1.00, "delta": 0.20, "weight": 18}
   ],
-  "pooled_delta": 0.18,          // 層別重み付き統合効果量（品名で揃えた比較）
+  "pooled_delta": 0.18,          // 層別重み付き統合効果量（層別キーで揃えた比較）
   "n_total": 36,
   "usable_strata": 3             // 群ごと min_lots を満たした層の数
 }
@@ -61,8 +61,8 @@
 ## 5. Candidate — (c) スクリーニングが返す候補、(preregister 入力)
 ```json
 {
-  "candidate_id": "screen-ピール値-20261104",
-  "result_item": "ピール値",
+  "candidate_id": "screen-指標値-20261104",
+  "result_item": "指標値",
   "pooled_delta": 0.18,
   "strength": 0.73,             // 強度スコア 0..1
   "strong": true,               // strength が閾値以上
@@ -79,9 +79,9 @@
 ## 6. PreregRecord — 事前登録レコード（preregister 出力・JSON Lines 追記）
 ```json
 {
-  "candidate_id": "screen-ピール値-20261104",
-  "result_item": "ピール値",
-  "claim": "treated 群は control 群より ピール値 が pooled_delta だけ高い（品名層別）",
+  "candidate_id": "screen-指標値-20261104",
+  "result_item": "指標値",
+  "claim": "treated 群は control 群より 指標値 が pooled_delta だけ高い（層別）",
   "pooled_delta": 0.18,
   "preregistered_at": "2026-11-04T00:00:00Z",
   "order_clock": {"source": "registered", "state": "initial"}  // 順序の信頼時計は登録済みを使う。新規は initial のみ。
@@ -91,9 +91,9 @@
 ## 7. DetectionRecord — (d) 報告生成の入力（採用 or 強い候補）
 ```json
 {
-  "analysis_id": "screen-ピール値-20261104",
+  "analysis_id": "screen-指標値-20261104",
   "kind": "strong_candidate",     // "adopted"（順序成立の効果あり採用） | "strong_candidate"
-  "result_item": "ピール値",
+  "result_item": "指標値",
   "what_we_saw": [ "..." ],        // 何を見てそう判断したか（文字列配列。数値は本実行の計算/読み取り値のみ）
   "whats_missing": [ "..." ],      // 何が足りないか
   "numbers": { "pooled_delta": 0.18, "n_total": 36, "strength": 0.73 },  // 本実行で算出した数値のみ
@@ -113,7 +113,7 @@
 ## 8. LedgerEntry — 台帳.json の1エントリ（ledger_append 出力）
 ```json
 {
-  "analysis_id": "screen-ピール値-20261104",
+  "analysis_id": "screen-指標値-20261104",
   "class": "C",
   "next_trigger": "確認用ロットが各群 5 に達したら判定器に通す",
   "last_scanned": "2026-11-04"
