@@ -32,7 +32,7 @@ that matches what the engine already accepts, WITHOUT weakening or faking the or
     (e) REPORT per factor: screened effect, confirmed effect, verdict (adopt / hold /
         not identifiable) with the engine's reason codes, and what stayed unconfirmed.
 
-HERMETIC. This module imports only numpy and the standard library. The engine is never
+HERMETIC. This module imports only the standard library. The engine is never
 imported here; the confirm step calls an injected `judge_fn` with the engine's `judge`
 contract (data_path, claim_dict, lock_path, out_dir, root -> output dict). Production code
 passes the real engine; the tests pass a faithful local judge that reproduces the engine's
@@ -51,8 +51,6 @@ import math
 import os
 import random
 from typing import Callable, Iterable, Sequence
-
-import numpy as np
 
 
 # --------------------------------------------------------------------------- data model
