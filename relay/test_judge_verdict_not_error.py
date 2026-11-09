@@ -39,7 +39,7 @@ import pytest
 from relay import judge_gate
 
 
-GOAL = "odbc_query で DBX のロット別メトリックを集計して相関を出す"
+GOAL = "odbc_query で the analysis DB のロット別メトリックを集計して相関を出す"
 
 # The engine's required claim keys, as the frozen loader lists them (mirrored, engine is READ-ONLY).
 _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierarchy",
