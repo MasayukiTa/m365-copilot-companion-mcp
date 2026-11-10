@@ -1725,6 +1725,20 @@ _AUTO_RESUME_LOCK = _threading_mod.Lock()
 _AUTO_RESUME_CACHE = {"value": {}, "at": 0.0, "running": False}
 
 
+def _orphan_readd_block():
+    """`orphan_readd`: {count, jids, at}, additive -- how many acknowledged-but-dropped goals
+    this run's start re-queued (relay/orphan_readd.resubmit_orphans_on_start records it at
+    startup). {} when there is no record or it cannot be read. A cheap single-file read, off the
+    hot path: the record changes only once per start."""
+    try:
+        from relay import orphan_readd as _orphan_readd
+        state_dir = _ACTIVE_STATE_DIR or os.path.join(_repo_root(), ".fleet")
+        rec = _orphan_readd.read_record(state_dir)
+        return {"orphan_readd": rec} if rec else {}
+    except Exception:
+        return {}
+
+
 def _conversation_saving_block():
     """`conversation_saving`: {merge_conversation, aggregators_saved, unsent_created}, additive.
     The production caller of relay.conversation_saving.status_block. {} on any failure."""
@@ -2281,6 +2295,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_agent_board_block())
     _snap.update(_roster_block(_snap["workers"]))
     _snap.update(_auto_resume_block())
+    _snap.update(_orphan_readd_block())
     _snap.update(_conversation_saving_block())
     return _snap
 
@@ -4565,6 +4580,26 @@ def main():
             print("fleet retention: freed %.1f MB" % _ret["freed_mb"], flush=True)
     except Exception as _exc:                     # never let housekeeping stop a run
         print("fleet retention skipped: %s" % _exc, flush=True)
+
+    # ORPHANED-AFTER-ACK RE-ADD. Measured 2026-11-10: each cold start (05:10 and 14:08 that day)
+    # silently dropped every goal that had been acknowledged ('landed': acks/<jid>.ack and
+    # tasks/done/<jid>.landed.json both present) but had no outcome file -- status.json read
+    # workers=1 total=1 while five ShuttleScope goals and several orchestrator goals waited for
+    # hours with no worker and no outcome. The admission survived on disk (intake_journal.jsonl /
+    # for_fleet/<jid>.txt); nothing re-queued it. This re-adds each such jid to the for_fleet
+    # queue exactly once, carrying a resubmitted_after_restart marker, and NEVER re-adds a jid
+    # that already has an outcome, a live worker, or a refused record. It sits here, on the same
+    # startup path as the resume/reconcile housekeeping above and before the goals are finalised,
+    # and -- like retention -- never lets a failure stop the run. The count lands in status.json
+    # via _orphan_readd_block (snapshot build). See relay/orphan_readd.py.
+    try:
+        from relay import orphan_readd as _orphan_readd
+        _readded = _orphan_readd.resubmit_orphans_on_start(args.state_dir)
+        if _readded:
+            print("orphan re-add: %d acknowledged goal(s) dropped by a restart re-queued"
+                  % len(_readded), flush=True)
+    except Exception as _exc:                     # housekeeping must never stop a run
+        print("orphan re-add skipped: %s" % _exc, flush=True)
 
     # KeyboardInterrupt already knows this state_dir from the early single-instance gate above.
 
