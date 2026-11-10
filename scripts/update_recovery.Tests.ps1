@@ -169,6 +169,67 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
         Assert-Equal $result.StashCreated $true
         Assert-Equal ((& git -C $client rev-parse $result.StashRef).Trim()) $result.StashRef
     }
+
+    It "recovers a checkout stranded in an unfinished merge with an unmerged index" {
+        # Reproduce the real incident shape: a prior merge was left unfinished,
+        # so MERGE_HEAD and unmerged paths are present when recovery runs. The
+        # merge is built from two commits that SHARE an ancestor (so git really
+        # starts a merge and records a conflict, rather than refusing unrelated
+        # histories). The rewritten upstream that recovery resets to is still the
+        # force-pushed origin/main prepared by BeforeEach.
+        $sharedBase = (& git -C $client rev-parse HEAD).Trim()
+
+        # A sibling commit off the shared base that touches the same file.
+        & git -C $client checkout --quiet -b conflicting-side $sharedBase
+        Set-TestFile (Join-Path $client "version.txt") "conflicting side edit"
+        & git -C $client commit --quiet -am "conflicting side work"
+
+        # Back on main, a different edit to the same file, then start the merge.
+        & git -C $client checkout --quiet main
+        Set-TestFile (Join-Path $client "version.txt") "main side edit"
+        & git -C $client commit --quiet -am "main side work"
+        $conflictedHead = (& git -C $client rev-parse HEAD).Trim()
+        & git -C $client -c core.editor=true merge --no-edit conflicting-side 2>&1 | Out-Null
+
+        Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $true
+        Assert-Equal (@(& git -C $client ls-files -u).Count -gt 0) $true
+
+        $result = Invoke-RewrittenUpstreamRecovery `
+            -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120002"
+
+        Assert-Equal $result.Success $true
+        Assert-Equal $result.Error ""
+        # The reset landed on the rewritten upstream tip.
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        # The in-progress merge is gone and the worktree is clean.
+        Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $false
+        Assert-Equal @(& git -C $client status --porcelain).Count 0
+        # The backup branch still points at the pre-recovery HEAD (the tip that
+        # was being merged into), so the original checkout is never lost.
+        Assert-Equal ((& git -C $client rev-parse $result.BackupBranch).Trim()) $conflictedHead
+    }
+
+    It "leaves a clean, non-conflicted checkout untouched except for the reset (no spurious abort)" {
+        # The guard must only act when an operation is actually in progress. A
+        # plain diverged checkout with no local edits has no merge/rebase state
+        # and no unmerged paths, and must recover exactly as before.
+        Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $false
+        Assert-Equal @(& git -C $client ls-files -u).Count 0
+
+        $result = Invoke-RewrittenUpstreamRecovery `
+            -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120003"
+
+        Assert-Equal $result.Success $true
+        Assert-Equal $result.Error ""
+        Assert-Equal $result.HadLocalChanges $false
+        Assert-Equal $result.StashCreated $false
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        Assert-Equal ((& git -C $client rev-parse $result.BackupBranch).Trim()) $oldClientSha
+    }
 }
 
 Describe "quickstart_update.ps1 wrapper integration" {
