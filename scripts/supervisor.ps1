@@ -1084,6 +1084,12 @@ $script:LastHealthOkAt = $null
 # 200 again -- the window used to measure and log stop->recovery time. $null = no restart in flight.
 $script:HangRestartStartedAt = $null
 
+# Set true on the tick a hang restart is DEFERRED because a fleet coordinator of this checkout is
+# running, cleared on any tick it is not deferred (the server answered, or there is no coordinator,
+# or the 10-minute override fired). It makes the "deferring hang restart" line log ONCE per
+# deferral episode instead of every 15s tick for up to 10 minutes.
+$script:HangRestartDeferredLogged = $false
+
 # THE HANG WINDOW, read once from the same Python module that owns the pure gate so the number
 # lives in one place (HANG_THRESHOLD_SECONDS). Falls back to 120 (= the operator's 2-minute
 # ceiling) if the read fails for any reason, rather than wedging.
@@ -1098,13 +1104,18 @@ try {
 # same way the other supervisor gates reach their Python deciders (& $Py -c with the module and
 # function both named, so tools/unreached.py credits the cross-language call). Returns "restart"
 # or "wait"; any failure returns "wait" so a broken bridge can never manufacture a kill.
-function Invoke-HangRestartDecision($lastOkAgeSeconds, $listening, $ownMainPyAlive, $booting) {
+function Invoke-HangRestartDecision($lastOkAgeSeconds, $listening, $ownMainPyAlive, $booting, $coordinatorRunning = $false) {
     $aa = if ($null -eq $lastOkAgeSeconds) { "None" } else { ([string][double]$lastOkAgeSeconds) }
     $la = if ($listening) { "True" } else { "False" }
     $oa = if ($ownMainPyAlive) { "True" } else { "False" }
     $ba = if ($booting) { "True" } else { "False" }
+    # A fleet coordinator of THIS checkout being alive defers the hang restart in the pure gate
+    # until the silence reaches COORDINATOR_HANG_OVERRIDE_SECONDS, so a restart never drops the
+    # gateway out from under a live run short of a 10-minute outage. The override constant lives
+    # in the module (one home for the number); the gate's default is used, not restated here.
+    $cr = if ($coordinatorRunning) { "True" } else { "False" }
     try {
-        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_hang_detect; print(supervisor_hang_detect.decide_hang_restart($aa, $la, $oa, $ba, $($script:HangThresholdSeconds)))" 2>$null)).Trim()
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_hang_detect; print(supervisor_hang_detect.decide_hang_restart($aa, $la, $oa, $ba, $($script:HangThresholdSeconds), coordinator_running=$cr))" 2>$null)).Trim()
     } catch {
         return "wait"
     }
@@ -4202,6 +4213,8 @@ while ($true) {
         $serverMiss = 0
         # HANG CLOCK: /health answered 200 this tick -> the loop is alive; reset the silence clock.
         $script:LastHealthOkAt = Get-Date
+        # The server answered, so any hang-restart deferral episode is over; re-arm the one-line log.
+        $script:HangRestartDeferredLogged = $false
         # RESTART-TIME MEASUREMENT: if a hang (or any) restart is in flight, this is the first
         # tick /health came back. Report how long stop->/health-200 took, then clear the mark.
         if ($script:HangRestartStartedAt) {
@@ -4260,13 +4273,36 @@ while ($true) {
             # hung" so a never-up/booting server is left to the vanished/boot paths below.
             $lastOkAge = $null
             if ($script:LastHealthOkAt) { $lastOkAge = ((Get-Date) - $script:LastHealthOkAt).TotalSeconds }
-            $hangVerdict = Invoke-HangRestartDecision $lastOkAge $portListening $ownMainPyAlive $false
+            # IS A FLEET COORDINATOR OF THIS CHECKOUT RUNNING? A hang restart kills the server by
+            # PID and drops the public gateway ~100s; doing that mid-run kills the coordinator too.
+            # Same helper the fleet-resume gate uses (Get-ThisCheckoutFleetCoordinatorPids).
+            $coordLive = (@(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count -gt 0)
+            # The coordinator-aware verdict: the pure gate downgrades 'restart' to 'wait' while a
+            # coordinator is live until the silence reaches COORDINATOR_HANG_OVERRIDE_SECONDS.
+            $hangVerdict = Invoke-HangRestartDecision $lastOkAge $portListening $ownMainPyAlive $false $coordLive
+            # DID THE COORDINATOR GUARD ACTUALLY DEFER A RESTART THIS TICK? Only when the
+            # coordinator-blind verdict would have restarted but the coordinator-aware one did not.
+            # Logged ONCE per deferral episode (not every 15s tick) via the dedup flag below.
+            if ($coordLive -and $hangVerdict -ne 'restart') {
+                $rawVerdict = Invoke-HangRestartDecision $lastOkAge $portListening $ownMainPyAlive $false $false
+                if ($rawVerdict -eq 'restart') {
+                    if (-not $script:HangRestartDeferredLogged) {
+                        Write-Log ("server /health silent {0:N0}s (>= {1}s) but a fleet coordinator of this checkout is running -- DEFERRING the hang restart (will not restart mid-run until the silence reaches the coordinator override) ($reason)" -f $lastOkAge, $script:HangThresholdSeconds)
+                        $script:HangRestartDeferredLogged = $true
+                    }
+                } else {
+                    $script:HangRestartDeferredLogged = $false
+                }
+            } else {
+                $script:HangRestartDeferredLogged = $false
+            }
             if ($hangVerdict -eq 'restart') {
                 Write-Log ("server WEDGED: /health silent {0:N0}s (>= {1}s) while :$Port still held by our main.py -- restarting by PID now, not after the {2}-strike debounce ($reason)" -f $lastOkAge, $script:HangThresholdSeconds, $FailuresBeforeAction)
                 $script:HangRestartStartedAt = Get-Date
                 Start-Server -Cause 'hang' -StrikeCount ([int]$script:HangThresholdSeconds)
                 $serverMiss = 0
                 $script:LastHealthOkAt = $null
+                $script:HangRestartDeferredLogged = $false
                 Start-Sleep -Seconds 6
             } else {
             # VANISHED FAST PATH: nothing listening AND no main.py of ours alive AND no planned

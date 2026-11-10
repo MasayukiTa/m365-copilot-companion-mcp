@@ -43,6 +43,18 @@ from __future__ import annotations
 #: ~0 on the tick it lands.
 HANG_THRESHOLD_SECONDS = 120
 
+#: A MUCH LONGER bound that a live fleet coordinator of this checkout cannot defer past. While
+#: a coordinator of this checkout is running, a hang restart would drop the public gateway
+#: (~100s) out from under a live fleet run and kill the coordinator, so the ordinary 120s hang
+#: restart is HELD OFF for the duration of the run -- UNLESS the silence has lasted this far
+#: longer bound. 600s = 10 minutes: a coordinator process that is still alive while the server
+#: it depends on has not answered /health for a full 10 minutes is no longer "a run in
+#: progress we must not interrupt" but a real outage -- the coordinator is wedged or orphaned
+#: too -- and restarting the server is the right move even though a coordinator PID still
+#: exists. It clears the 120s hang window with a 5x margin so a genuine mid-run hang gets the
+#: benefit of the doubt, while a decade-long silence is never sat on forever.
+COORDINATOR_HANG_OVERRIDE_SECONDS = 600
+
 
 def decide_hang_restart(
     last_ok_age_s,
@@ -50,6 +62,8 @@ def decide_hang_restart(
     own_main_py_alive,
     booting,
     hang_threshold_s=HANG_THRESHOLD_SECONDS,
+    coordinator_running=False,
+    coordinator_override_s=COORDINATOR_HANG_OVERRIDE_SECONDS,
 ):
     """Decide whether a non-answering /health is a HANG that warrants an immediate restart.
 
@@ -87,6 +101,18 @@ def decide_hang_restart(
       * ``hang_threshold_s``  -- the hang window in seconds (default 120). Tolerated as
                                  non-numeric / non-positive by failing SAFE (no restart) so a
                                  broken caller cannot manufacture a kill.
+      * ``coordinator_running`` -- is a fleet coordinator of THIS checkout alive right now.
+                                 True means a fleet run is in progress and a restart would
+                                 drop the gateway out from under it (and kill the coordinator),
+                                 so a hang restart is DEFERRED until the silence reaches
+                                 ``coordinator_override_s``. The caller reads this from
+                                 Get-ThisCheckoutFleetCoordinatorPids (the same helper the
+                                 fleet-resume gate uses).
+      * ``coordinator_override_s`` -- the much longer silence (default 600s = 10 min) past
+                                 which a hang restart proceeds EVEN WITH a coordinator alive:
+                                 a coordinator beside a server silent that long is a real
+                                 outage. Non-numeric / non-positive fails SAFE (keep
+                                 deferring).
 
     Returns one of two words:
 
@@ -126,5 +152,22 @@ def decide_hang_restart(
         return "wait"
     # Silent long enough, still held by our live process, not booting: a wedge.
     if age >= window:
+        # DEFER THE RESTART WHILE A FLEET COORDINATOR OF THIS CHECKOUT IS RUNNING. A hang
+        # restart kills the server by PID and relaunches it, dropping the public gateway for
+        # ~100s; doing that in the middle of a fleet run kills the coordinator too. So when a
+        # coordinator of this checkout is live, hold the restart off -- UNLESS the silence has
+        # lasted coordinator_override_s (default 600s = 10 min), at which point a coordinator
+        # that is still alive beside a server silent that long is a real outage, not a run we
+        # must not interrupt, and the restart proceeds. A non-numeric / non-positive override
+        # fails SAFE (defer) so a broken caller cannot manufacture a mid-run kill.
+        if coordinator_running:
+            try:
+                override = float(coordinator_override_s)
+            except (TypeError, ValueError):
+                return "wait"
+            if override <= 0:
+                return "wait"
+            if age < override:
+                return "wait"
         return "restart"
     return "wait"

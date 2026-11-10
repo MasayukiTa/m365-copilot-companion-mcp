@@ -13,6 +13,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from supervisor_hang_detect import (  # noqa: E402
     decide_hang_restart,
     HANG_THRESHOLD_SECONDS,
+    COORDINATOR_HANG_OVERRIDE_SECONDS,
 )
 
 
@@ -36,6 +37,72 @@ def test_default_window_is_two_minutes():
     assert decide_hang_restart(120, True, True, False) == "restart"
     # one second short does not
     assert decide_hang_restart(119, True, True, False) == "wait"
+
+
+# ---- the coordinator guard: do not restart mid-fleet-run, but do if it is a real outage -----
+
+def test_restart_when_no_coordinator_and_age_at_least_120s():
+    # No fleet coordinator of this checkout is running, /health silent past the 120s window:
+    # a wedged server with no run to protect -> restart at once (the ordinary hang path).
+    assert decide_hang_restart(
+        last_ok_age_s=120, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=False,
+    ) == "restart"
+    assert decide_hang_restart(
+        last_ok_age_s=300, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=False,
+    ) == "restart"
+
+
+def test_deferred_when_coordinator_runs_and_age_under_10_minutes():
+    # A fleet coordinator of this checkout is running and the silence is past 120s but under the
+    # 10-minute override -> DEFER: restarting now would drop the gateway out from under a live
+    # run and kill the coordinator. The gate returns "wait", so the caller does not restart.
+    assert COORDINATOR_HANG_OVERRIDE_SECONDS == 600
+    assert decide_hang_restart(
+        last_ok_age_s=120, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=True,
+    ) == "wait"
+    assert decide_hang_restart(
+        last_ok_age_s=300, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=True,
+    ) == "wait"
+    # one second short of the override is still deferred
+    assert decide_hang_restart(
+        last_ok_age_s=599, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=True,
+    ) == "wait"
+
+
+def test_restart_when_coordinator_runs_and_age_at_least_10_minutes():
+    # A coordinator still alive beside a server whose /health has been silent for a full 10
+    # minutes is a real outage, not a run to protect -> restart even though a coordinator PID
+    # exists. The boundary is >=, so exactly 600s restarts.
+    assert decide_hang_restart(
+        last_ok_age_s=600, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=True,
+    ) == "restart"
+    assert decide_hang_restart(
+        last_ok_age_s=900, listening=True, own_main_py_alive=True, booting=False,
+        coordinator_running=True,
+    ) == "restart"
+
+
+def test_coordinator_guard_never_restarts_a_booting_or_vanished_server():
+    # the coordinator flag does not override the booting / not-listening / foreign guards
+    assert decide_hang_restart(900, True, True, True, coordinator_running=True) == "wait"   # booting
+    assert decide_hang_restart(900, False, True, False, coordinator_running=True) == "wait"  # vanished
+    assert decide_hang_restart(900, True, False, False, coordinator_running=True) == "wait"  # foreign
+
+
+def test_coordinator_override_non_positive_or_unreadable_keeps_deferring():
+    # a broken override must fail SAFE (keep deferring), never manufacture a mid-run kill
+    assert decide_hang_restart(900, True, True, False, coordinator_running=True,
+                               coordinator_override_s="nope") == "wait"
+    assert decide_hang_restart(900, True, True, False, coordinator_running=True,
+                               coordinator_override_s=0) == "wait"
+    assert decide_hang_restart(900, True, True, False, coordinator_running=True,
+                               coordinator_override_s=-5) == "wait"
 
 
 # ---- a merely slow or recently-answered server is never killed -----------------------------
