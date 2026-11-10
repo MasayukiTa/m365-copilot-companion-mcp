@@ -316,6 +316,7 @@ jobs:
             relay/test_result_cache.py \
             relay/test_team_formation.py \
             relay/test_agent_board.py \
+            relay/test_peer_requests.py \
             relay/test_roster.py \
             relay/test_org_versions.py \
             relay/test_org_genotype.py \
@@ -1123,6 +1124,7 @@ jobs:
             scripts/test_load_routing_pairwise.py \
             scripts/test_result_cache_report.py \
             scripts/test_team_formation_report.py \
+            scripts/test_peer_requests_report.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \

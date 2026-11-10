@@ -467,6 +467,19 @@ KEYS = OrderedDict([
        "goal text); nothing is queued and no prompt or output changes. on is reserved (no "
        "second-stage builder yet) and behaves as off."),
 
+    # Peer work requests (relay/peer_requests.py), roadmap slice C2. SHADOW ONLY: once per
+    # coordinator tick it records which peer REQUEST/OFFER/CLAIM a peer-request protocol would
+    # have produced from the live worker set, beside nothing being posted. The three kinds live
+    # as data in relay/peer_requests.py and are deliberately NOT on relay/board_kinds.REGISTRY,
+    # so the RF hot serialized board path is unchanged. There is deliberately no value that
+    # posts a request or grants a claim.
+    _k("peer_requests", EACH_GATE, "off",
+       "relay/peer_requests.py:mode (every coordinator tick, mtime-cached)",
+       "off|shadow. Re-read every tick with no restart. shadow appends one row per tick that has "
+       "any peer REQUEST/OFFER to .fleet/peer_requests_shadow.jsonl (campaign ids, role names and "
+       "counts, never goal or step text); the board, its kinds, delivery order, budget and the "
+       "coordinator are all unchanged."),
+
     # Campaign board (relay/agent_board.py). The coordinator reads it once when it starts.
     # p1 (workers write) is declared and NOT implemented: it behaves as p0.
     _k("agent_board_mode", SWEEP_START, "off",
