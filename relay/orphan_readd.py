@@ -9,18 +9,25 @@ ShuttleScope goals and several orchestrator goals waited for hours with no worke
 outcome. The admission survived on disk (the intake journal .fleet/intake_journal.jsonl and
 for_fleet/<jid>.txt still held what was submitted); nothing re-queued it.
 
-WHAT THIS DOES. On runner start, compute the set of ACKNOWLEDGED jids that have NO outcome file
-and NO live worker, and re-add each to the queue exactly once, carrying a marker field
-``resubmitted_after_restart``. A jid that already has an outcome, a live worker, or a refused
-record is NEVER re-added. One log line is emitted per re-added jid and the count is recorded so
+WHAT THIS DOES. On runner start, compute the set of ACKNOWLEDGED jids that have NO outcome file,
+NO delivered record, NO live worker, NO refused record, and whose ack is not older than the age
+limit, and re-add each to the queue exactly once, carrying a marker field
+``resubmitted_after_restart``. A jid that already has an outcome, a delivered record, a live
+worker, a refused record, or an ack older than the age limit is NEVER re-added. ONE summary line
+is emitted per start carrying the counts (re-added / skipped delivered / skipped too old /
+skipped no text) -- never one line per stale jid -- and the re-added count is recorded so
 status.json can surface it.
 
 WHERE EACH SIGNAL LIVES (the same layout the rest of the fleet already joins on by jid):
-  * acknowledged      .fleet/acks/<jid>.ack                     (landing receipt)
+  * acknowledged      .fleet/acks/<jid>.ack                     (landing receipt; mtime ages it)
   * outcome           .fleet/tasks/done/<jid>.outcome.json      (the job finished; terminal)
+  * delivered         .fleet/tasks/done/<jid>.delivered.json    (the result was delivered; terminal
+                      exactly like an outcome, even when no outcome.json was written)
   * refused           .fleet/tasks/done/<jid>.landed.json with status == "refused"
                       (the fleet READ the add_goal and refused it -- a real decision, not a drop)
   * live worker       status.json workers[].jid                 (a worker already carries it)
+  * too old           ack mtime older than ORPHAN_MAX_AGE_SECONDS (its done-dir record may have
+                      been pruned by retention, leaving no trace to judge it)
   * goal text         for_fleet/<jid>.txt, else the intake journal's preview
 
 The re-add writes the goal back into for_fleet/<jid>.txt -- the same parked-goal channel the
@@ -47,6 +54,14 @@ import time
 #: witness. A reader can tell a restart re-add from an ordinary parked goal by this key alone.
 RESUBMIT_MARKER = "resubmitted_after_restart"
 
+#: An ack older than this (by the ack file's mtime) is never re-added. Two cold starts dropped
+#: goals acked within a few hours of the restart, so a window of a couple of days keeps those
+#: recoverable; but acks older than the done-dir retention have had their landing records pruned,
+#: leaving no trace to judge landed-vs-refused-vs-finished -- re-adding them blind would flood
+#: the queue with goals that may already be done. 48h sits above the recent-incident window and
+#: below that retention. Overridable via the FLEET_ORPHAN_MAX_AGE_SECONDS environment variable.
+ORPHAN_MAX_AGE_SECONDS = 48 * 60 * 60
+
 #: Where the count/jids of the last start's re-adds are recorded, so the status snapshot can
 #: surface them without re-walking acks/ on the sweep thread. Shape:
 #:   {"count": int, "jids": [str, ...], "at": float}
@@ -71,10 +86,53 @@ def _acked_jids(state_dir):
     return out
 
 
+def _max_age_seconds():
+    """The age limit in effect: FLEET_ORPHAN_MAX_AGE_SECONDS if set to a positive number, else the
+    ORPHAN_MAX_AGE_SECONDS default. A malformed or non-positive override falls back to the default
+    rather than disabling the guard."""
+    raw = os.environ.get("FLEET_ORPHAN_MAX_AGE_SECONDS", "").strip()
+    if raw:
+        try:
+            val = float(raw)
+        except ValueError:
+            return ORPHAN_MAX_AGE_SECONDS
+        if val > 0:
+            return val
+    return ORPHAN_MAX_AGE_SECONDS
+
+
+def _ack_mtime(state_dir, jid):
+    """The mtime of this jid's ack file, or None when it cannot be read."""
+    try:
+        return os.path.getmtime(os.path.join(state_dir, ACKS_DIR, "%s.ack" % jid))
+    except OSError:
+        return None
+
+
+def _is_too_old(state_dir, jid, now=None, max_age=None):
+    """True when the ack is older than the age limit. An unreadable mtime is treated as NOT too old
+    (fail open to the other terminal gates), so a jid is only aged out on positive evidence."""
+    mtime = _ack_mtime(state_dir, jid)
+    if mtime is None:
+        return False
+    if now is None:
+        now = time.time()
+    if max_age is None:
+        max_age = _max_age_seconds()
+    return (now - mtime) > max_age
+
+
 def _has_outcome(state_dir, jid):
     """True when <state_dir>/tasks/done/<jid>.outcome.json exists -- the job reached a terminal
     outcome and must never be re-added."""
     return os.path.isfile(os.path.join(state_dir, "tasks", "done", "%s.outcome.json" % jid))
+
+
+def _is_delivered(state_dir, jid):
+    """True when <state_dir>/tasks/done/<jid>.delivered.json exists -- the goal finished and its
+    result was delivered. Terminal exactly like an outcome file: a delivered goal must never be
+    re-added, even if no outcome.json was written."""
+    return os.path.isfile(os.path.join(state_dir, "tasks", "done", "%s.delivered.json" % jid))
 
 
 def _is_refused(state_dir, jid):
@@ -164,22 +222,46 @@ def _goal_text_for(state_dir, jid):
 
 
 def orphan_jids(state_dir):
-    """The acknowledged jids that were dropped: ack present, but NO outcome, NO live worker, and
-    NO refused record. Deterministic order (sorted) so the log and the status record are stable.
+    """The acknowledged jids that were dropped: ack present, but NO outcome, NOT delivered, NO live
+    worker, NO refused record, and NOT older than the age limit. Deterministic order (sorted) so
+    the log and the status record are stable.
 
     This is the pure decision -- it writes nothing. `resubmit_orphans_on_start` acts on it.
     """
+    return sorted(set(_classify(state_dir)["orphans"]))
+
+
+def _classify(state_dir):
+    """Walk every acked jid once and bucket it. Returns a dict with the orphan jids and the counts
+    of each terminal/excluded reason, so a start can emit a single summary line instead of one
+    line per stale jid. 'delivered' and 'too_old' are the two new guards; a jid is counted under
+    the first reason that excludes it (live/outcome/delivered/refused/too_old), so the buckets do
+    not double-count."""
     live = _live_worker_jids(state_dir)
-    out = []
+    now = time.time()
+    max_age = _max_age_seconds()
+    orphans = []
+    skipped_delivered = 0
+    skipped_too_old = 0
     for jid in _acked_jids(state_dir):
         if jid in live:
             continue
         if _has_outcome(state_dir, jid):
             continue
+        if _is_delivered(state_dir, jid):
+            skipped_delivered += 1
+            continue
         if _is_refused(state_dir, jid):
             continue
-        out.append(jid)
-    return sorted(set(out))
+        if _is_too_old(state_dir, jid, now=now, max_age=max_age):
+            skipped_too_old += 1
+            continue
+        orphans.append(jid)
+    return {
+        "orphans": orphans,
+        "skipped_delivered": skipped_delivered,
+        "skipped_too_old": skipped_too_old,
+    }
 
 
 def _record(state_dir, jids):
@@ -225,31 +307,36 @@ def resubmit_orphans_on_start(state_dir, log=None, park=None):
 
     readded = []
     try:
-        candidates = orphan_jids(state_dir)
+        buckets = _classify(state_dir)
+        candidates = sorted(set(buckets["orphans"]))
     except Exception as exc:                       # housekeeping must not fail a start
         log("orphan re-add skipped: %s: %s" % (type(exc).__name__, exc))
         return readded
 
+    skipped_delivered = buckets["skipped_delivered"]
+    skipped_too_old = buckets["skipped_too_old"]
+    skipped_no_text = 0
     for jid in candidates:
         try:
             if _already_resubmitted_in_for_fleet(state_dir, jid):
                 continue                           # still parked from a prior start; not twice
             text = _goal_text_for(state_dir, jid)
             if not text:
-                log("orphan re-add: %s has no recoverable goal text; left for an operator" % jid)
+                skipped_no_text += 1
                 continue
             marker = {RESUBMIT_MARKER: True, "jid": jid}
             if park(jid, text, marker):
                 readded.append(jid)
-                log("orphan re-add: %s re-queued after restart (%s)" % (jid, RESUBMIT_MARKER))
             else:
-                log("orphan re-add: %s could not be parked; left for an operator" % jid)
+                skipped_no_text += 1
         except Exception as exc:
             log("orphan re-add: %s skipped: %s: %s" % (jid, type(exc).__name__, exc))
 
     _record(state_dir, readded)
-    if readded:
-        log("orphan re-add: %d goal(s) re-queued after restart" % len(readded))
+    # One summary line per start, never one line per stale jid: the 1000+ long-pruned acks that
+    # age out would otherwise flood the log on every start.
+    log("orphan re-add summary: re-added=%d skipped_delivered=%d skipped_too_old=%d "
+        "skipped_no_text=%d" % (len(readded), skipped_delivered, skipped_too_old, skipped_no_text))
     return readded
 
 
