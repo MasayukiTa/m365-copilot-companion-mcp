@@ -181,11 +181,11 @@ if errorlevel 1 (
 )
 
 if defined DO_PULL (
-    REM REUSE THE FORCE-PUSH RECOVERY start_all.ps1 USES. A plain `git pull --ff-only` fails
+    REM REUSE THE FORCE-PUSH RECOVERY start_all USES. A plain `git pull --ff-only` fails
     REM forever on a REWRITTEN UPSTREAM (the project's main was once force-pushed, so an old
     REM clone is behind AND ahead and cannot fast-forward) -- and the run then kept executing
     REM the OLD code, failing later in scripts\bootstrap.py STEP 1/7. The wrapper dot-sources
-    REM scripts\update_recovery.ps1, classifies the checkout exactly as start_all.ps1 does, and
+    REM scripts\update_recovery.ps1, classifies the checkout exactly as start_all does, and
     REM runs Invoke-RewrittenUpstreamRecovery for a rewritten/diverged upstream, else ff-only.
     REM Its exit codes: 0 = an update was applied (this file may have just been rewritten --
     REM STOP), 3 = already up to date (continue), anything else = could not update (continue on
