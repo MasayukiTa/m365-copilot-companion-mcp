@@ -80,14 +80,14 @@ def test_footer_surfaces_verdict_reasons_interval_n():
     verdict = {
         "id": "SYN1", "verdict": "HOLD", "verdict_ja": "保留",
         "finding": None, "claim_supported": None,
-        "reasons": ["D_FAIL_NO_LOCK"], "notes": ["LOT_INDEPENDENCE_NOT_CHECKED"],
+        "reasons": ["R_HOLD_PRECONDITION"], "notes": ["PRECONDITION_NOT_CHECKED"],
         "evidence": {"K": 3, "df": 2, "ci_std": [-0.4, 0.9], "n": 42},
         "hashes": {"input_sha256": "0" * 64},
     }
     footer = build_judge_footer(verdict=verdict, engine_available=True)
     assert "HOLD" in footer
-    assert "D_FAIL_NO_LOCK" in footer           # reason code surfaced
-    assert "LOT_INDEPENDENCE_NOT_CHECKED" in footer
+    assert "R_HOLD_PRECONDITION" in footer           # reason code surfaced
+    assert "PRECONDITION_NOT_CHECKED" in footer
     assert "K" in footer and "3" in footer       # n / K surfaced
     assert "ci_std" in footer or "区間" in footer   # interval surfaced
 
@@ -147,7 +147,7 @@ def test_needs_rework_for_analysis_answer_without_judge():
 def test_no_rework_once_judge_block_is_present():
     goal = "the database をqueryしてthe metricをグループ比較する"
     verdict = {"id": "SYN1", "verdict": "HOLD", "verdict_ja": "保留",
-               "finding": None, "claim_supported": None, "reasons": ["D_FAIL_NO_LOCK"],
+               "finding": None, "claim_supported": None, "reasons": ["R_HOLD_PRECONDITION"],
                "notes": [], "evidence": {"K": 3, "n": 42, "ci_std": [-0.4, 0.9]},
                "hashes": {"input_sha256": "0" * 64}}
     answer = "結果...。DONE" + jg.build_judge_footer(verdict=verdict, engine_available=True)
