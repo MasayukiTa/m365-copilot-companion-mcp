@@ -2268,5 +2268,17 @@ if __name__ == "__main__":
     # Last line before the socket is bound. The gap between 'registration-complete' and this
     # event is pure pre-listen setup (watchers, log config); everything tool-registration had
     # to do is already done. See _startup_trace for why this proves the ordering.
+    # Port is 8000 in production and is left at 8000 when MCP_PORT is unset, so this
+    # changes nothing for the primary. The cold-standby watcher (scripts/standby_watch.ps1)
+    # starts a SECOND copy of this same main.py on :8002 only when the primary stops
+    # answering /health, and the standby test harness runs throwaway copies on 18000/18002;
+    # both need a way to pick the listen port without editing this file. An out-of-range or
+    # non-integer MCP_PORT falls back to 8000 rather than crashing the server at boot.
+    try:
+        _listen_port = int(os.environ.get("MCP_PORT", "8000"))
+        if not (1 <= _listen_port <= 65535):
+            _listen_port = 8000
+    except (TypeError, ValueError):
+        _listen_port = 8000
     _startup_trace("about-to-listen")
-    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
+    uvicorn.run(app, host="127.0.0.1", port=_listen_port, timeout_graceful_shutdown=30, **_run_kwargs)
