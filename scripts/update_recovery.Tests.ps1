@@ -169,4 +169,191 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
         Assert-Equal $result.StashCreated $true
         Assert-Equal ((& git -C $client rev-parse $result.StashRef).Trim()) $result.StashRef
     }
+
+    It "recovers a checkout stranded in an unfinished merge with an unmerged index" {
+        # Reproduce the real incident shape: a prior merge was left unfinished,
+        # so MERGE_HEAD and unmerged paths are present when recovery runs. The
+        # merge is built from two commits that SHARE an ancestor (so git really
+        # starts a merge and records a conflict, rather than refusing unrelated
+        # histories). The rewritten upstream that recovery resets to is still the
+        # force-pushed origin/main prepared by BeforeEach.
+        $sharedBase = (& git -C $client rev-parse HEAD).Trim()
+
+        # A sibling commit off the shared base that touches the same file.
+        & git -C $client checkout --quiet -b conflicting-side $sharedBase
+        Set-TestFile (Join-Path $client "version.txt") "conflicting side edit"
+        & git -C $client commit --quiet -am "conflicting side work"
+
+        # Back on main, a different edit to the same file, then start the merge.
+        & git -C $client checkout --quiet main
+        Set-TestFile (Join-Path $client "version.txt") "main side edit"
+        & git -C $client commit --quiet -am "main side work"
+        $conflictedHead = (& git -C $client rev-parse HEAD).Trim()
+        & git -C $client -c core.editor=true merge --no-edit conflicting-side 2>&1 | Out-Null
+
+        Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $true
+        Assert-Equal (@(& git -C $client ls-files -u).Count -gt 0) $true
+
+        $result = Invoke-RewrittenUpstreamRecovery `
+            -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120002"
+
+        Assert-Equal $result.Success $true
+        Assert-Equal $result.Error ""
+        # The reset landed on the rewritten upstream tip.
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        # The in-progress merge is gone and the worktree is clean.
+        Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $false
+        Assert-Equal @(& git -C $client status --porcelain).Count 0
+        # The backup branch still points at the pre-recovery HEAD (the tip that
+        # was being merged into), so the original checkout is never lost.
+        Assert-Equal ((& git -C $client rev-parse $result.BackupBranch).Trim()) $conflictedHead
+    }
+
+    It "leaves a clean, non-conflicted checkout untouched except for the reset (no spurious abort)" {
+        # The guard must only act when an operation is actually in progress. A
+        # plain diverged checkout with no local edits has no merge/rebase state
+        # and no unmerged paths, and must recover exactly as before.
+        Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $false
+        Assert-Equal @(& git -C $client ls-files -u).Count 0
+
+        $result = Invoke-RewrittenUpstreamRecovery `
+            -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120003"
+
+        Assert-Equal $result.Success $true
+        Assert-Equal $result.Error ""
+        Assert-Equal $result.HadLocalChanges $false
+        Assert-Equal $result.StashCreated $false
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        Assert-Equal ((& git -C $client rev-parse $result.BackupBranch).Trim()) $oldClientSha
+    }
+}
+
+Describe "quickstart_update.ps1 wrapper integration" {
+    BeforeAll {
+        $script:WrapperPath = Join-Path $PSScriptRoot "quickstart_update.ps1"
+
+        function Assert-Equal($Actual, $Expected) {
+            if ($Actual -ne $Expected) {
+                throw "Expected <$Expected>, got <$Actual>"
+            }
+        }
+
+        function Set-TestFile([string]$Path, [string]$Text) {
+            $parent = Split-Path -Parent $Path
+            if ($parent -and -not (Test-Path $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+            [System.IO.File]::WriteAllText(
+                $Path,
+                $Text,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+
+        function Initialize-TestRepo([string]$Path) {
+            New-Item -ItemType Directory -Force -Path $Path | Out-Null
+            & git init --quiet $Path
+            & git -C $Path config user.name "Quickstart Update Test"
+            & git -C $Path config user.email "quickstart-update@example.invalid"
+        }
+
+        function Invoke-Wrapper([string]$RepoRoot) {
+            & $script:WrapperPath -RepoRoot $RepoRoot | Out-Null
+            return $LASTEXITCODE
+        }
+    }
+
+    It "recovers a rewritten (force-pushed) upstream and stops with exit 0" {
+        $caseRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
+        $remote = Join-Path $caseRoot "remote.git"
+        $oldSource = Join-Path $caseRoot "old-source"
+        $rewriteSource = Join-Path $caseRoot "rewrite-source"
+        $client = Join-Path $caseRoot "client"
+
+        & git init --quiet --bare $remote
+
+        Initialize-TestRepo $oldSource
+        Set-TestFile (Join-Path $oldSource "version.txt") "old-base"
+        & git -C $oldSource add version.txt
+        & git -C $oldSource commit --quiet -m "old base"
+        Set-TestFile (Join-Path $oldSource "version.txt") "old-tip"
+        & git -C $oldSource commit --quiet -am "old tip"
+        & git -C $oldSource branch -M main
+        & git -C $oldSource remote add origin $remote
+        & git -C $oldSource push --quiet -u origin main
+        & git --git-dir=$remote symbolic-ref HEAD refs/heads/main
+
+        & git clone --quiet $remote $client
+        & git -C $client config user.name "Quickstart Update Client"
+        & git -C $client config user.email "quickstart-client@example.invalid"
+        $oldClientSha = (& git -C $client rev-parse HEAD).Trim()
+
+        Initialize-TestRepo $rewriteSource
+        Set-TestFile (Join-Path $rewriteSource "version.txt") "clean-base"
+        & git -C $rewriteSource add version.txt
+        & git -C $rewriteSource commit --quiet -m "clean rewritten base"
+        Set-TestFile (Join-Path $rewriteSource "version.txt") "clean-latest"
+        & git -C $rewriteSource commit --quiet -am "clean latest"
+        & git -C $rewriteSource branch -M main
+        & git -C $rewriteSource remote add origin $remote
+        & git -C $rewriteSource push --quiet --force origin main
+
+        & git -C $client fetch --quiet origin
+
+        Set-TestFile (Join-Path $client "version.txt") "local tracked edit"
+
+        $exit = Invoke-Wrapper $client
+
+        Assert-Equal $exit 0
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        Assert-Equal (Get-Content (Join-Path $client "version.txt") -Raw).Trim() "clean-latest"
+        $backup = @(& git -C $client branch --list "backup/pre-reset-*")
+        Assert-Equal ($backup.Count -ge 1) $true
+        $stashes = @(& git -C $client stash list)
+        Assert-Equal ($stashes.Count -ge 1) $true
+    }
+
+    It "fast-forwards a plainly-behind clone and stops with exit 0, with no backup branch" {
+        $caseRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
+        $remote = Join-Path $caseRoot "remote.git"
+        $source = Join-Path $caseRoot "source"
+        $client = Join-Path $caseRoot "client"
+
+        & git init --quiet --bare $remote
+
+        Initialize-TestRepo $source
+        Set-TestFile (Join-Path $source "version.txt") "base"
+        & git -C $source add version.txt
+        & git -C $source commit --quiet -m "base"
+        & git -C $source branch -M main
+        & git -C $source remote add origin $remote
+        & git -C $source push --quiet -u origin main
+        & git --git-dir=$remote symbolic-ref HEAD refs/heads/main
+
+        & git clone --quiet $remote $client
+        & git -C $client config user.name "Quickstart Update Client"
+        & git -C $client config user.email "quickstart-client@example.invalid"
+
+        Set-TestFile (Join-Path $source "version.txt") "advanced"
+        & git -C $source commit --quiet -am "advance"
+        & git -C $source push --quiet origin main
+
+        & git -C $client fetch --quiet origin
+
+        $exit = Invoke-Wrapper $client
+
+        Assert-Equal $exit 0
+        Assert-Equal `
+            ((& git -C $client rev-parse HEAD).Trim()) `
+            ((& git -C $client rev-parse "@{u}").Trim())
+        Assert-Equal (Get-Content (Join-Path $client "version.txt") -Raw).Trim() "advanced"
+        $backup = @(& git -C $client branch --list "backup/pre-reset-*")
+        Assert-Equal $backup.Count 0
+    }
 }

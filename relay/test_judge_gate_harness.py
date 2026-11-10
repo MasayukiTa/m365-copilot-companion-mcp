@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Failing-first tests for the final-step validity-judge harness (owner task 2026-10-27,
-re-scoped 2026-10-30).
+"""Failing-first tests for the final-step validity-judge harness.
 
-OWNER INSTRUCTION (2026-10-27, verbatim): 「データ解析系は、すべて最終でこの判定器を通す
-ハーネスを入れ、databricks を圧倒す。これが先週与えたタスクだ。」
+PURPOSE: every data-analysis final answer is routed through the frozen validity engine before
+delivery, so a quantitative claim is not shipped without a recorded verdict.
 
 WHAT THIS PINS. relay/judge_gate.py is the orchestration seam that makes every DATA-ANALYSIS
 goal pass through the frozen validity engine before its final answer is delivered:
@@ -18,8 +17,8 @@ goal pass through the frozen validity engine before its final answer is delivere
   (3) the refuter must additionally check "did it pass the judge, and if not why" -- pinned by
       test_refuter_has_judge_check.
 
-The verdict engine itself lives OUTSIDE this repo (Desktop/AHA資料_参照一式/証明/公開データ検証/
-engine_v1_8c2), is secret, remote-less and byte-identical-locked; this harness only ORCHESTRATES
+The verdict engine itself lives OUTSIDE this repo at an operator-specific location supplied at
+run time, is secret, remote-less and byte-identical-locked; this harness only ORCHESTRATES
 it and NEVER edits its rules, thresholds or registered claims. No secret data, measurement row
 or employee id appears here -- fixtures are synthetic.
 
@@ -62,7 +61,7 @@ def test_non_analysis_goals_are_not_flagged(goal):
 
 def test_misclassification_examples_are_documented():
     """The module must spell out borderline MISCLASSIFICATION cases so the boundary is a
-    decision, not an accident (owner: write the rule and its failure examples)."""
+    decision, not an accident: the rule and its failure examples are written out explicitly."""
     text = (jg.MISCLASSIFICATION_NOTE or "")
     assert isinstance(text, str) and len(text) >= 80
     # names at least one false-positive and one false-negative shape
@@ -173,7 +172,7 @@ def test_rework_job_names_the_three_steps_and_forbids_fabrication():
     assert "validity_harness.record_manifest" in job
     assert "validity_harness.register_and_lock" in job
     assert "判定エンジン" in job
-    assert "自作・捏造" in job   # 「自作・捏造しないこと」
+    assert "自作・捏造" in job   # must warn against self-authoring or fabricating a verdict
 
 
 # ---- the gate is actually wired into the relay loop (regression guard) --------

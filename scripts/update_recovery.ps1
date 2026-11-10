@@ -124,6 +124,32 @@ function Invoke-RewrittenUpstreamRecovery {
     }
     $result.BackupBranch = $backupBranch
 
+    # A checkout can be stranded mid-operation by an earlier pull that began a
+    # merge (or rebase/cherry-pick) against a since-rewritten upstream and left
+    # an unmerged index behind. In that state `git stash push -u` refuses to run,
+    # so the stash step below would fail before the reset ever happens. The
+    # original HEAD is already safe on the backup branch created above, so abort
+    # any in-progress operation first and clear the index. We never touch the
+    # backup branch or any stash here.
+    $inProgress = $false
+    foreach ($marker in @("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD")) {
+        & git -C $RepoRoot rev-parse --verify --quiet $marker > $null 2>&1
+        if ($LASTEXITCODE -eq 0) { $inProgress = $true; break }
+    }
+    if (-not $inProgress) {
+        $unmerged = @(& git -C $RepoRoot ls-files -u 2>$null)
+        if ($unmerged.Count -gt 0) { $inProgress = $true }
+    }
+    if ($inProgress) {
+        & git -C $RepoRoot merge --abort 2>$null | Out-Null
+        if ($LASTEXITCODE -ne 0) {
+            # Not a merge (or merge --abort unavailable for this operation):
+            # fall back to discarding the index/worktree state back to HEAD. The
+            # original commit is preserved on the backup branch regardless.
+            [void](Invoke-GitResetQuiet -RepoRoot $RepoRoot -Target "HEAD")
+        }
+    }
+
     $statusOut = @(& git -C $RepoRoot status --porcelain 2>$null)
     $result.HadLocalChanges = ($statusOut.Count -gt 0)
     if ($result.HadLocalChanges) {
