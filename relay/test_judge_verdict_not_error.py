@@ -4,7 +4,7 @@ when the real problem is that the worker's free-text claim was never mapped into
 structured claim shape -- and a post-hoc (late) registration must be shown HONESTLY as a HOLD-cap
 condition (D_FAIL_LOCK_AFTER_DATA), never mislabelled as an input error.
 
-WHY THIS EXISTS (measured 2026-11-02). Three real judge folders (sample_claim, sample_claim,
+WHY THIS EXISTS (observed in a prior fleet run). Three sample judge folders (sample_claim, sample_claim,
 sample_claim) each delivered verdict=ERROR, reason INPUT_MISSING_KEY, note
 LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE, loo_n=0, K=null, and order_ok=false. The engine input in
 each (engine_claim_<id>.json) carried only {id, statement, data_location}: a free-text claim. The
@@ -18,7 +18,7 @@ WHAT THESE TESTS PIN.
     is empty for a structured claim; it never fabricates values.
   - At completion, a worker claim that lacks engine keys produces a correction that NAMES the
     missing keys and the expected shape -- BEFORE the engine is run -- instead of an opaque
-    INPUT_MISSING_KEY. The three real folder shapes are reproduced as hermetic fixtures.
+    INPUT_MISSING_KEY. The three sample folder shapes are reproduced as hermetic fixtures.
   - post_hoc_order_note states a late registration plainly: it is NOT an input error, the engine
     rule caps it at HOLD (D_FAIL_LOCK_AFTER_DATA), and it names what would make it valid. It is
     empty when the order is fine.
@@ -48,7 +48,7 @@ _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierar
 
 
 def _free_text_claim(claim_id="sample_claim"):
-    """The real shape a worker registered: a free-text statement, no engine schema keys."""
+    """The sample shape a worker registered: a free-text statement, no engine schema keys."""
     return {"id": claim_id,
             "statement": "679group_a shows no significant correlation with trace data (all 95%CIs cross 0).",
             "data_location": "C:/Users/x/Downloads/_clean.csv"}
@@ -72,16 +72,16 @@ def _structured_claim(claim_id="sample_claim"):
     }
 
 
-def _request(claim, *, claim_id="sample_claim", registered_at="2026-11-02T10:34:20+09:00",
-             fetched_at="2026-11-02T01:26:07+09:00"):
-    """A judge_request shaped like the three real folders: free-text-or-structured claim plus the
+def _request(claim, *, claim_id="sample_claim", registered_at="2020-01-02T10:00:00+09:00",
+             fetched_at="2020-01-02T01:00:00+09:00"):
+    """A judge_request shaped like the three sample folders: free-text-or-structured claim plus the
     analysis the worker DID produce (manifest.result, lot_diagnosis y/x/lot)."""
     return {
         "claim_id": claim_id, "data_location": "data.csv", "fetched_at": fetched_at,
         "manifest": {"path": "manifest.json", "dataset_id": "ds_group_a",
-                     "result": {"n_products": 71, "overall_rate": 0.4085}},
+                     "result": {"n_products": 12, "overall_rate": 0.4}},
         "registration": {"root": "reg", "claim": claim, "registered_at": registered_at},
-        "lot_diagnosis": {"y": [0.9091, 0.0], "x": [90.0, 64.0], "lot": ["T5-07-10NA", "T5-02-03NA"]},
+        "lot_diagnosis": {"y": [0.5, 0.0], "x": [1.0, 2.0], "lot": ["P1", "P2"]},
     }
 
 
@@ -129,7 +129,7 @@ def test_gap_is_empty_on_a_non_dict():
 
 @pytest.mark.parametrize("claim_id", ["sample_claim", "sample_claim", "sample_claim"])
 def test_free_text_claim_is_corrected_before_engine_with_named_keys(tmp_path, monkeypatch, claim_id):
-    """Reproduces the three real folders: a free-text claim + the analysis data. The harness must
+    """Reproduces the three sample folders: a free-text claim + the analysis data. The harness must
     hand back a correction that NAMES the missing engine keys, and must NOT have run the engine."""
     ran = {"engine": False}
 
@@ -164,8 +164,8 @@ def test_structured_claim_does_not_trigger_the_schema_correction(tmp_path, monke
 
     monkeypatch.setattr(judge_gate, "run_engine_judge", _engine)
     # registered_at BEFORE fetched_at so order_ok can be True (not the subject of this test)
-    _write(tmp_path, _request(_structured_claim(), registered_at="2026-10-01T00:00:00+09:00",
-                              fetched_at="2026-10-30T00:00:00+09:00"))
+    _write(tmp_path, _request(_structured_claim(), registered_at="2020-01-01T00:00:00+09:00",
+                              fetched_at="2020-01-05T00:00:00+09:00"))
     accept, detail, correction = judge_gate.complete_judge_request(
         GOAL, str(tmp_path), correction_budget=2, correction_attempt=0)
     # no schema-gap correction; the engine ran with the structured claim
@@ -176,8 +176,8 @@ def test_structured_claim_does_not_trigger_the_schema_correction(tmp_path, monke
 # --- 3. post_hoc_order_note is honest, not an input error ------------------------------------
 
 def test_post_hoc_note_names_hold_cap_and_not_error():
-    order = {"order_ok": False, "registered_at": "2026-11-02T10:34:20+09:00",
-             "data_file_mtime": "2026-10-30T13:58:58+09:00"}
+    order = {"order_ok": False, "registered_at": "2020-01-02T10:00:00+09:00",
+             "data_file_mtime": "2020-01-01T00:00:00+09:00"}
     note = judge_gate.post_hoc_order_note(order)
     assert note
     assert "post-hoc" in note or "事後登録" in note
@@ -194,9 +194,9 @@ def test_post_hoc_note_is_empty_when_order_is_ok():
 
 
 def test_footer_shows_post_hoc_and_never_calls_it_error():
-    order = {"order_ok": False, "registered_at": "2026-11-02T10:34:20+09:00",
-             "data_fetched_at": "2026-11-02T01:26:07+09:00",
-             "data_file_mtime": "2026-10-30T13:58:58+09:00"}
+    order = {"order_ok": False, "registered_at": "2020-01-02T10:00:00+09:00",
+             "data_fetched_at": "2020-01-02T01:00:00+09:00",
+             "data_file_mtime": "2020-01-01T00:00:00+09:00"}
     # engine unavailable here: the footer still must carry the honest post-hoc explanation
     footer = judge_gate.build_judge_footer(
         verdict={"unavailable_reason": "x"}, engine_available=False, order_record=order)
@@ -218,8 +218,8 @@ def test_engine_error_for_a_late_structured_claim_is_surfaced_not_hidden(tmp_pat
 
     monkeypatch.setattr(judge_gate, "run_engine_judge", _engine)
     # structured claim, but registered AFTER the data (post-hoc)
-    _write(tmp_path, _request(_structured_claim(), registered_at="2026-11-02T10:34:20+09:00",
-                              fetched_at="2026-11-02T01:26:07+09:00"))
+    _write(tmp_path, _request(_structured_claim(), registered_at="2020-01-02T10:00:00+09:00",
+                              fetched_at="2020-01-02T01:00:00+09:00"))
     accept, detail, correction = judge_gate.complete_judge_request(
         GOAL, str(tmp_path), correction_budget=2, correction_attempt=0)
     # the engine's own HOLD + reason is surfaced, and the post-hoc note is present, not hidden

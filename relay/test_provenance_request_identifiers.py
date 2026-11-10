@@ -2,7 +2,7 @@
 """The THIRD class of provenance false positives: digits that are part of an IDENTIFIER the
 requester supplied -- the case NAME in their own words -- rather than a computed result.
 
-Evidence: job jobsyn0001 (the "679#study" analysis, worker wNN, 2026-11-02) ended
+Evidence: job jobsyn0001 (the "679#study" analysis, worker wNN) ended
 VERIFY_FAILED "provenance: claimed numbers not found in this run's computation outputs: 679".
 The ONLY unsupported number was 679, which is the NAME of the case: the request folder is
 "sampleuser_679study", the submitter is "esyn_v01", the suggested claim_id is "sample_claim".
@@ -41,7 +41,7 @@ REQUEST_TEXT = (
     "claim_id example sample_claim. submitter esyn_v01."
 )
 
-# A faithful slice of the real answer's shape (job jobsyn0001): it refers to the case by
+# A faithful slice of the sample answer's shape (job jobsyn0001): it refers to the case by
 # name ("679#study") and states statistics that WERE recomputed this run. Only the text needed
 # for the assertion is reproduced; no employee ids or credentials.
 REAL_ANSWER = (
