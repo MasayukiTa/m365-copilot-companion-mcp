@@ -1022,18 +1022,6 @@ def settings_autoscale():
     return on, ceiling
 
 
-def settings_agents_janitor_apply(default=1):
-    """Whether the supervisor's agents-janitor sweep DELETES (1) or only dry-runs (0).
-
-    ON by default: the janitor's whole purpose is to reclaim C: during fleet runs, and its four
-    conjoined safety checks (clean tree, nothing unpushed, no live worker, quiet 60 min) already
-    refuse to touch anything that is not a finished, fully-saved clone. An operator who wants to
-    watch it decide without deleting sets agents_janitor_apply=0 and reads the dry-run log lines.
-    Cockpit-settable; adopted on the next supervisor tick that falls below the disk threshold.
-    """
-    return _settings_int("agents_janitor_apply", default) == 1
-
-
 def settings_effort(default="auto"):
     """The cockpit's chosen effort mode (`effort=min|max|ultra|auto` in settings.txt). This is the
     UI selector the user picks for BOTH fleet and single runs; the CLI --effort overrides it when

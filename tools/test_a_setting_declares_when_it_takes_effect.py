@@ -391,12 +391,7 @@ def _norm(v):
 
 #: job_approval_mode follows the file too, but its reader short-circuits under pytest and is
 #: checked in a subprocess below; it is not a gap, it is a different harness.
-#: agents_janitor_apply follows the file too, but the deciding read is in supervisor.ps1 (the
-#: supervisor's 10-minute janitor sweep), which calls the Python accessor
-#: relay/fleet_runner.py:settings_agents_janitor_apply fresh each sweep. This Python test
-#: harness does not run that PowerShell loop, so the behavioural read is exercised there, not
-#: here -- a different harness, not a missing reader.
-_CHECKED_ELSEWHERE = {"job_approval_mode", "agents_janitor_apply"}
+_CHECKED_ELSEWHERE = {"job_approval_mode"}
 
 
 def test_every_following_key_has_a_reader_this_file_exercises():
