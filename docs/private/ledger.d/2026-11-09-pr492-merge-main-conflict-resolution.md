@@ -1,6 +1,6 @@
 ## 2026-11-09 - PR #492 merge origin/main, resolve conflicts keeping both sides' intent (dirty-PR batch, slice 5/12)
 
-- Scope. One slice of the dirty-PR batch for MasayukiTa/m365-copilot-companion-mcp: PR #492 only (feat/periodic-scan-generic, base main, was CONFLICTING). Fresh clone under a temporary isolated working directory. Other PRs in the batch handled by sibling conversations; not touched here.
+- Scope. One slice of the dirty-PR batch for this repository: PR #492 only (feat/periodic-scan-generic, base main, was CONFLICTING). Fresh clone under a temporary isolated working directory. Other PRs in the batch handled by sibling conversations; not touched here.
 
 - Merge. git merge origin/main (origin/main at 17833480) into feat/periodic-scan-generic (was 7db62a22). Two content conflicts, both resolved keeping BOTH sides' intent:
   - .github/workflows/ci.yml: the hermetic pytest list tail. HEAD added scripts/periodic_scan/tests/test_runner.py; origin/main added tools/test_a_bash_assignment_does_not_reach_shellexecute.py. Both kept, plus the shared relay/test_a_stale_coordinator_restarts_only_when_idle.py line. Final tail (ci.yml 1177-1179): test_a_bash_assignment... \ , test_a_stale_coordinator... \ , periodic_scan/tests/test_runner.py (no trailing backslash, ends the arg list).
