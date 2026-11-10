@@ -73,6 +73,7 @@ def test_raw_import_from_scripts_cwd_without_root_fails() -> None:
         env=env,
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=120,
     )
     assert proc.returncode != 0, (
@@ -93,6 +94,7 @@ def test_bootstrap_status_resolves_tools_import_from_scripts_cwd() -> None:
         env=_child_env(),
         capture_output=True,
         text=True,
+        errors="replace",
         timeout=180,
     )
     combined = (proc.stdout or "") + (proc.stderr or "")
