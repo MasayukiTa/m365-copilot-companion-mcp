@@ -167,7 +167,7 @@ def test_opening_adams_does_not_take_a_transcript_that_carries_another_id(run_ca
 
 @needs_csc
 def test_the_adams_shape_from_2026_10_23(run_cases):
-    """The real case: SYNDS (id, w1) against the url-less 10-14 w1 rows and today's w1 row."""
+    """The synthetic scenario: SYNDS (id, w1) against the url-less 10-14 w1 rows and today's w1 row."""
     SYNDS = dict(row_url=ADAMS_URL, row_transcript=ADAMS_T[-1], row_transcripts=ADAMS_T)
     phone = dict(row_url="", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0])
     cur = dict(row_url="", row_transcript=NOW_W1, row_transcripts=[NOW_W1])
