@@ -1414,3 +1414,20 @@ jobs:
           if ($result.FailedCount -gt 0) {
             exit 1
           }
+
+      # ADDED 2026-11-11: ghost-safe tunnel re-host establish order. When a stale (ghost) tunnel
+      # re-host leaves the relay still counting the dead host's connection(s), the old establish
+      # test (connection count >= 1) was satisfied by the ghost alone, so Start-TunnelHost could
+      # log 'established' before the new host ever registered. The pure decider Test-RehostEstablished
+      # treats the re-host as established only once the count RISES ABOVE the ghost baseline AND a
+      # host process of ours is running. These Pester 3.4.0 tests extract that pure function from
+      # supervisor.ps1 (no dot-source, no side effects) and pin all 11 cases. Engine pinned to 3.4.0
+      # for the same Should Be vs Should -Be reason as heal_tunnel above.
+      - name: Run tunnel re-host ghost-establish unit tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
+          $result = Invoke-Pester .\scripts\test_rehost_ghost_establish.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
