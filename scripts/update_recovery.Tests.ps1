@@ -474,7 +474,7 @@ Describe "Uncovered checkout shapes end in a safe state" {
         $headBefore = Get-HeadSha $client
 
         # Confirm the shape: @{u} cannot be resolved for this branch.
-        & git -C $client rev-parse --abbrev-ref --symbolic-full-name "@{u}" > $null 2>&1
+        & { $ErrorActionPreference = 'SilentlyContinue'; & git -C $client rev-parse --abbrev-ref --symbolic-full-name "@{u}" 2>&1 | Out-Null }
         Assert-Equal ($LASTEXITCODE -ne 0) $true
 
         $exit = Invoke-Wrapper $client
@@ -503,7 +503,7 @@ Describe "Uncovered checkout shapes end in a safe state" {
         $headBefore = Get-HeadSha $client
         $env:GIT_TERMINAL_PROMPT = '0'
 
-        & git -C $client fetch --quiet 2>$null | Out-Null
+        & { $ErrorActionPreference = 'SilentlyContinue'; & git -C $client fetch --quiet 2>&1 | Out-Null }
         $fetchExit = $LASTEXITCODE
 
         # The guard's contract: fetch failed, so no behind-count, no strategy, no reset.
