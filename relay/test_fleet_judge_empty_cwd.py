@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """The empty-output-folder precondition that silently skipped the final-step judge.
 
-Job 81cac23dfc28 was a data-analysis goal (SYNDB request behind a short case reference) whose
+Job 81cac23dfc28 was a data-analysis goal (SYNDS request behind a short case reference) whose
 worker cwd was empty. The injected "write judge_request.json in the output folder ..."
 instruction was gated on ``self.cwd`` being truthy, so with an empty cwd nothing was injected
 and completion passed an empty folder to the judge gate -- the quiet marker "judge: none".
@@ -20,7 +20,7 @@ from relay.relay_fleet import RelayWorker
 from tools import search_ops
 
 GOAL = "\u679d\u3055\u3093_679\u304b\u3059\u308c\u8abf\u67fb\u3000\u3053\u308c\u8abf\u3079\u3066"
-# A SYNDB data request -- short reference resolves to this file; its text is what classifies.
+# A SYNDS data request -- short reference resolves to this file; its text is what classifies.
 ADAMS_REQUEST = ("\u3053\u306e679\u304b\u3059\u308c\u306b\u95a2\u3057\u3066\u3001"
                  "\u3042\u3089\u3086\u308b\u8a2d\u5099\u3001\u6750\u6599\u30c7\u30fc\u30bf\u3092"
                  "\u53d6\u5f97\u3057\u3001ADAMS\u30c7\u30fc\u30bf\u3068\u5b9f\u30c7\u30fc\u30bf\u3092"

@@ -113,8 +113,8 @@ def test_manifest_result_path_string_is_corrected_with_example(tmp_path, monkeyp
                      "result": str(out / "report.xlsx")},
     })
     accept, detail, correction = complete_judge_request(
-        "query SYNDB/analysis db and compute correlation", str(out),
-        request_text="query SYNDB/analysis db and compute correlation",
+        "query SYNDS/analysis db and compute correlation", str(out),
+        request_text="query SYNDS/analysis db and compute correlation",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -139,8 +139,8 @@ def test_manifest_path_directory_is_rejected_by_name_not_errno13(tmp_path, monke
         "manifest": {"path": str(folder), "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
     })
     accept, detail, correction = complete_judge_request(
-        "query SYNDB/analysis db and compute correlation", str(out),
-        request_text="query SYNDB/analysis db and compute correlation",
+        "query SYNDS/analysis db and compute correlation", str(out),
+        request_text="query SYNDS/analysis db and compute correlation",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -175,8 +175,8 @@ def test_missing_claim_is_a_named_correction_naming_registration_claim(tmp_path,
         "manifest": {"path": "manifest.json", "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
     })
     accept, detail, correction = complete_judge_request(
-        "query SYNDB/analysis db and compute correlation", str(out),
-        request_text="query SYNDB/analysis db and compute correlation",
+        "query SYNDS/analysis db and compute correlation", str(out),
+        request_text="query SYNDS/analysis db and compute correlation",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -205,8 +205,8 @@ def test_worker_following_the_documented_path_makes_the_engine_run(tmp_path, mon
         },
     })
     accept, detail, correction = complete_judge_request(
-        "query SYNDB/analysis db and compute correlation", str(out),
-        request_text="query SYNDB/analysis db and compute correlation",
+        "query SYNDS/analysis db and compute correlation", str(out),
+        request_text="query SYNDS/analysis db and compute correlation",
         correction_budget=2, correction_attempt=0)
     # With a matching registration.claim and no field problems, the engine runs: no correction.
     assert correction is None, detail

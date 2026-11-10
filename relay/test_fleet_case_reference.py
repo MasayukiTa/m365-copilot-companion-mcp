@@ -2,12 +2,12 @@ import pytest
 from relay.relay_fleet import RelayWorker
 from tools import search_ops
 
-GOAL = "sampleuser_679defectA_study　study this"
+GOAL = "sampleuser_679group_a_study　study this"
 
 
 @pytest.mark.parametrize("scenario", ["duplicate", "missing", "timeout", "conflict"])
 def test_unresolved_cases_raise_gate(tmp_path, monkeypatch, scenario):
-    case = tmp_path / "sampleuser_679defectA_study"
+    case = tmp_path / "sampleuser_679group_a_study"
     case.mkdir()
     if scenario != "missing":
         (case / "やりたいこと.txt").write_text("依頼", encoding="utf-8")
@@ -30,7 +30,7 @@ def test_unresolved_cases_raise_gate(tmp_path, monkeypatch, scenario):
 
 
 def test_resolved_reference_is_in_prompt_with_raw_goal(tmp_path, monkeypatch):
-    case = tmp_path / "sampleuser_679defectA_study"
+    case = tmp_path / "sampleuser_679group_a_study"
     case.mkdir()
     (case / "やりたいこと.txt").write_text("依頼の内容", encoding="utf-8")
     real = search_ops.case_reference_search
@@ -42,7 +42,7 @@ def test_resolved_reference_is_in_prompt_with_raw_goal(tmp_path, monkeypatch):
 
 
 def test_incomplete_single_request_proceeds_with_notice(tmp_path, monkeypatch):
-    case = tmp_path / "sampleuser_679defectA_study"
+    case = tmp_path / "sampleuser_679group_a_study"
     case.mkdir()
     request = case / "やりたいこと.txt"
     request.write_text("依頼", encoding="utf-8")
@@ -71,7 +71,7 @@ def test_timeout_without_candidates_remains_error_and_fallback_has_guidance(tmp_
 
 
 def test_gate_failure_lists_folder_without_excerpt(tmp_path, monkeypatch):
-    case = tmp_path / "sampleuser_679defectA_study"
+    case = tmp_path / "sampleuser_679group_a_study"
     case.mkdir()
     real = search_ops.case_reference_search
     monkeypatch.setattr(search_ops, "case_reference_search", lambda goal: real(goal, [tmp_path]))

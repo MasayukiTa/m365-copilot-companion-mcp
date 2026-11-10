@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """A fleet conversation opened in the main chat shows its OWN transcripts, never another one's.
 
-MEASURED 2026-10-23: the SYNDB conversation (sess:65c85c0a-..., worker w1) was opened from the
+MEASURED 2026-10-23: the SYNDS conversation (sess:65c85c0a-..., worker w1) was opened from the
 cockpit and the chat showed, after its own turns, two 10-14 phone-ledger transcripts
 (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the current run's computer-use transcript
-(r6adac45a_a0_w1). Nothing connected them to SYNDB except the worker name "w1", which every run
+(r6adac45a_a0_w1). Nothing connected them to SYNDS except the worker name "w1", which every run
 reuses. Three places compared that name:
 
   * OpenFromFleet took "the newest transcript of worker w1" as the conversation's latest
@@ -139,7 +139,7 @@ def test_a_stem_is_the_identity_of_a_conversation_with_no_id(run_cases):
 
 @needs_csc
 def test_opening_adams_does_not_take_a_transcript_that_carries_another_id(run_cases):
-    """OpenFromFleet(url=sess:SYNDB, worker=w1): a transcript with another Copilot id never joins."""
+    """OpenFromFleet(url=sess:SYNDS, worker=w1): a transcript with another Copilot id never joins."""
     d = run_cases.dir
     mine = _write_transcript(d / "r6adab543_a0_w1.jsonl", ADAMS_URL[5:])
     other = _write_transcript(d / "r6adac45a_a0_w1.jsonl", "00000002-aaaa-bbbb-cccc-000000000002")
@@ -156,7 +156,7 @@ def test_opening_adams_does_not_take_a_transcript_that_carries_another_id(run_ca
         {"id": "guid_gz_by_plain_name", "op": "transcript_guid", "path": str(d / "r6adac45a_a1_w1.jsonl")},
     ])
     assert got["own_hint"] is True
-    assert got["foreign_hint"] is False, "another conversation's transcript joined SYNDB' lineage"
+    assert got["foreign_hint"] is False, "another conversation's transcript joined SYNDS' lineage"
     assert got["foreign_hint_gz"] is False
     assert got["unknown_guid_hint"] is True, "a live run whose guid is not written yet must stay openable"
     assert got["missing_hint"] is True
@@ -167,13 +167,13 @@ def test_opening_adams_does_not_take_a_transcript_that_carries_another_id(run_ca
 
 @needs_csc
 def test_the_adams_shape_from_2026_10_23(run_cases):
-    """The real case: SYNDB (id, w1) against the url-less 10-14 w1 rows and today's w1 row."""
-    SYNDB = dict(row_url=ADAMS_URL, row_transcript=ADAMS_T[-1], row_transcripts=ADAMS_T)
+    """The real case: SYNDS (id, w1) against the url-less 10-14 w1 rows and today's w1 row."""
+    SYNDS = dict(row_url=ADAMS_URL, row_transcript=ADAMS_T[-1], row_transcripts=ADAMS_T)
     phone = dict(row_url="", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0])
     cur = dict(row_url="", row_transcript=NOW_W1, row_transcripts=[NOW_W1])
     adams_c = dict(c_url=ADAMS_URL, c_transcript=ADAMS_T[-1], c_transcripts=ADAMS_T)
     got = run_cases([
-        _reg(id="open_adams_finds_its_row", url=ADAMS_URL, anchor="", **SYNDB),
+        _reg(id="open_adams_finds_its_row", url=ADAMS_URL, anchor="", **SYNDS),
         _reg(id="open_adams_not_phone_row", url=ADAMS_URL, anchor="", **phone),
         _reg(id="open_adams_not_todays_row", url=ADAMS_URL, anchor="", **cur),
         _reg(id="live_no_id_finds_own_row", url="", anchor=NOW_W1, **cur),
@@ -194,7 +194,7 @@ def test_the_adams_shape_from_2026_10_23(run_cases):
     assert got["live_no_id_not_old_row"] is False
     assert got["no_id_no_anchor_matches_nothing"] is False
     assert got["same_file_gz"] is True
-    assert got["sync_phone_vs_adams"] is False, "the 10-14 phone-ledger row was merged into SYNDB"
+    assert got["sync_phone_vs_adams"] is False, "the 10-14 phone-ledger row was merged into SYNDS"
     assert got["sync_phone_gz_vs_adams"] is False
     assert got["sync_own_file_row"] is True
     assert got["sync_id_row_by_id"] is True
