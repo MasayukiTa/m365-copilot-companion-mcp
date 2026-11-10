@@ -346,6 +346,9 @@ def _venv_runs() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         res = _run_child([str(VENV_PYTHON), "-c", "import sys"],
                          timeout=_venv_probe_timeout())
@@ -364,6 +367,9 @@ def _venv_version() -> tuple | None:
     if not VENV_PYTHON.exists():
         return None
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         res = _run_child([str(VENV_PYTHON), "-c",
                           "import sys; print('%d.%d' % sys.version_info[:2])"],
@@ -386,6 +392,9 @@ def _venv_has_pip() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"],
                          timeout=_venv_probe_timeout())
@@ -829,6 +838,9 @@ def distributions_missing_files(paths=None) -> list:
 def _broken_distributions(py: str) -> list:
     """distributions_missing_files() as seen by the interpreter `py` (the venv pip just wrote
     into). A check that cannot run reports nothing: the import sentinel after it still runs."""
+    import sys as _sys
+    if str(ROOT) not in _sys.path:
+        _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
     from tools.childproc import run as _run_child
     try:
         r = _run_child([py, str(Path(__file__).resolve()), "--list-broken-dists"], timeout=300)
@@ -859,6 +871,9 @@ def venv_unsatisfied(req: Path = None) -> list:
     nothing about the venv's."""
     if _running_in_project_venv() or not VENV_PYTHON.exists():
         return unsatisfied_requirements(req)
+    import sys as _sys
+    if str(ROOT) not in _sys.path:
+        _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
     from tools.childproc import run as _run_child
     args = [str(VENV_PYTHON), str(Path(__file__).resolve()), "--list-unsatisfied"]
     if req is not None:
@@ -1960,6 +1975,9 @@ def _dt_run(dt: str, *args: str) -> subprocess.CompletedProcess:
     """Run a devtunnel subcommand, capturing output, never raising. Returns the
     CompletedProcess (rc 124-style sentinel on timeout/spawn failure)."""
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         return _run_child([dt, *args], timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -2124,6 +2142,9 @@ def _devtunnel_logged_in(dt: str) -> bool:
     """Best-effort: returns True only if 'devtunnel user show' clearly reports a
     logged-in account. Any error / 'not logged in' text -> False (we pause)."""
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         out = _run_child([dt, "user", "show"], timeout=20)
     except (OSError, subprocess.SubprocessError):
@@ -2453,6 +2474,9 @@ def _import_main_in_venv(for_install: bool = False):
         if not (env.get("MCP_API_KEY") or "").strip():
             env["MCP_API_KEY"] = "install-verify-placeholder"
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         res = _run_child([py, "-c", code], cwd=str(ROOT), env=env,
                          timeout=VERIFY_IMPORT_TIMEOUT_S)
