@@ -65,7 +65,7 @@ import os
 import unicodedata
 import time
 
-SCHEMA_VERSION = 1
+SCHEMA_REV = 1
 
 #: Beside the frozen anchor rather than in the repository: a tracked ledger would publish
 #: whatever the system has learned, an untracked one inside the tree is lost to any clean
@@ -159,7 +159,7 @@ def tail(path=None):
 
 def _genesis(path: str) -> dict:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_REV,
         "seq": 0,
         "ts": time.time(),
         "event": GENESIS,
@@ -202,7 +202,7 @@ def append(event: str, *, reason: str, actor_claimed: str, authorization: str = 
 
     prev = rows[-1]
     record = {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": SCHEMA_REV,
         "seq": int(prev.get("seq", 0)) + 1,
         "ts": float(now if now is not None else time.time()),
         "event": event,

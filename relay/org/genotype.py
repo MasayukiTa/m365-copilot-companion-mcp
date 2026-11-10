@@ -32,7 +32,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-SCHEMA_VERSION = 1
+SCHEMA_REV = 1
 HASH_LEN = 16
 
 
@@ -170,7 +170,7 @@ def genotype_hash(genes, base=None):
     """Hash of the materialised values. Independent of key order, line endings and of whether a
     base-valued gene was written out."""
     full = materialize(genes, base)
-    return hashlib.sha256(_canonical({"v": SCHEMA_VERSION, "genes": _norm(full)}
+    return hashlib.sha256(_canonical({"v": SCHEMA_REV, "genes": _norm(full)}
                                      ).encode("utf-8")).hexdigest()[:HASH_LEN]
 
 
@@ -194,5 +194,5 @@ def base_org_id():
 def genotype(genes, parent="", base=None):
     """The record for one candidate: schema_version, materialised genes, base org id, parent, id."""
     full = materialize(genes, base)
-    return {"schema_version": SCHEMA_VERSION, "genes": full, "base": base_org_id(),
+    return {"schema_version": SCHEMA_REV, "genes": full, "base": base_org_id(),
             "parent": str(parent or ""), "id": genotype_hash(full)}
