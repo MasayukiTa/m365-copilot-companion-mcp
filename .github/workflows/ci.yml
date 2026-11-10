@@ -125,6 +125,7 @@ jobs:
             tests/test_sessions_search_migration.py \
             tools/test_child_env_credentials.py \
             tools/test_childproc_timeout_kills_tree_no_thread_leak.py \
+            tools/test_childproc_imports_without_root_on_path.py \
             tools/test_childproc_output_via_tempfile_no_reader_thread.py \
             tools/test_ocr_native_thread_leak.py \
             tools/test_ocr_thread_leak.py \

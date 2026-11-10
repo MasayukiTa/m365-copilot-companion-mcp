@@ -35,6 +35,17 @@ import tempfile
 import threading
 from typing import Optional
 
+# BRAND-NEW-PC IMPORT SELF-HEAL. childproc is imported as ``tools.childproc`` from
+# bootstrap STEP 1/7, -c subprocess spawns, and ZIP-download runs on a foreign Python.
+# Any of those can import it before the repo ROOT (parent of the ``tools`` package) is
+# on sys.path, dying with ``ModuleNotFoundError: No module named 'tools'``. Resolve
+# ROOT from THIS file and prepend once so ``tools`` resolves regardless of launcher/cwd.
+import sys as _sys
+from pathlib import Path as _Path
+_ROOT = str(_Path(__file__).resolve().parent.parent)
+if _ROOT not in _sys.path:
+    _sys.path.insert(0, _ROOT)
+
 __all__ = ["decode", "run", "headless_creationflags", "tree_popen_kwargs", "kill_tree"]
 
 # CONCURRENT CHILD CAP. The timeout path of run() drives Popen itself, so without a bound a
