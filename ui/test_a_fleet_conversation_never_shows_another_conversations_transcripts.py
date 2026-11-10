@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """A fleet conversation opened in the main chat shows its OWN transcripts, never another one's.
 
-MEASURED 2026-10-23: the SYNDS conversation (sess:65c85c0a-..., worker w1) was opened from the
-cockpit and the chat showed, after its own turns, two 10-14 phone-ledger transcripts
+EXAMPLE: the SYNDS conversation (sess:<guid>, worker w1) was opened from the
+cockpit and the chat showed, after its own turns, two prior phone-ledger transcripts
 (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the current run's computer-use transcript
 (r6adac45a_a0_w1). Nothing connected them to SYNDS except the worker name "w1", which every run
 reuses. Three places compared that name:
@@ -45,11 +45,11 @@ SOURCES = [
 needs_csc = pytest.mark.skipif(
     os.name != "nt", reason="the code under test is C# compiled by the .NET Framework csc (Windows only)")
 
-# The shape of the real data of 2026-10-23, with the ids made up.
+# The shape of the sample data, with the ids made up.
 TD = r"C:\repo\.fleet\transcripts"
 ADAMS_URL = "sess:00000001-aaaa-bbbb-cccc-000000000001"
 ADAMS_T = [TD + r"\r6adab187_a0_w0.jsonl", TD + r"\r6adab543_a0_w0.jsonl", TD + r"\r6adab543_a0_w1.jsonl"]
-PHONE_A0 = TD + r"\r6acf1938_a0_w1.jsonl"          # 10-14, url-less registry row, name w1
+PHONE_A0 = TD + r"\r6acf1938_a0_w1.jsonl"          # prior, url-less registry row, name w1
 PHONE_A1 = TD + r"\r6acf1938_a1_w1.jsonl.gz"       # same, compressed
 NOW_W1 = TD + r"\r6adac45a_a0_w1.jsonl"            # the current run's w1 (another conversation)
 
@@ -167,7 +167,7 @@ def test_opening_adams_does_not_take_a_transcript_that_carries_another_id(run_ca
 
 @needs_csc
 def test_the_adams_shape_from_2026_10_23(run_cases):
-    """The synthetic scenario: SYNDS (id, w1) against the url-less 10-14 w1 rows and today's w1 row."""
+    """The synthetic scenario: SYNDS (id, w1) against the url-less prior w1 rows and today's w1 row."""
     SYNDS = dict(row_url=ADAMS_URL, row_transcript=ADAMS_T[-1], row_transcripts=ADAMS_T)
     phone = dict(row_url="", row_transcript=PHONE_A0, row_transcripts=[PHONE_A0])
     cur = dict(row_url="", row_transcript=NOW_W1, row_transcripts=[NOW_W1])
@@ -194,7 +194,7 @@ def test_the_adams_shape_from_2026_10_23(run_cases):
     assert got["live_no_id_not_old_row"] is False
     assert got["no_id_no_anchor_matches_nothing"] is False
     assert got["same_file_gz"] is True
-    assert got["sync_phone_vs_adams"] is False, "the 10-14 phone-ledger row was merged into SYNDS"
+    assert got["sync_phone_vs_adams"] is False, "the prior phone-ledger row was merged into SYNDS"
     assert got["sync_phone_gz_vs_adams"] is False
     assert got["sync_own_file_row"] is True
     assert got["sync_id_row_by_id"] is True

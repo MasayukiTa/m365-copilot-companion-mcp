@@ -114,10 +114,10 @@ static class FleetConvIdentity
         return transcriptMetaGoal ?? "";
     }
 
-    // ---- WHICH CONVERSATION A TRANSCRIPT BELONGS TO (2026-10-23) -------------------------------
+    // ---- WHICH CONVERSATION A TRANSCRIPT BELONGS TO (sample scenario) ---------------------------
     //
-    // MEASURED: opening the SYNDS conversation (sess:65c85c0a-..., worker w1) showed, after its own
-    // turns, two 10-14 phone-ledger transcripts (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the
+    // EXAMPLE: opening the SYNDS conversation (sess:<guid>, worker w1) showed, after its own
+    // turns, two prior phone-ledger transcripts (r6acf1938_a0_w1, r6acf1938_a1_w1) and then the
     // current run's computer-use transcript (r6adac45a_a0_w1). None of them is that conversation.
     // They were joined by the WORKER NAME alone. A worker name (w0, w1, ...) is reused by every
     // run, so it says nothing about which conversation a transcript is. The conversation's
@@ -204,7 +204,7 @@ static class FleetConvIdentity
 /// FleetConvIdentity is -- that class is WPF and cannot run in a test; this one can
 /// (ui/harness/ConvListingHarness.cs).
 ///
-/// WHY IT EXISTS (2026-10-05, "old conversations often cannot be opened from the main chat").
+/// WHY IT EXISTS ("old conversations often cannot be opened from the main chat").
 /// Three separate limits, each silent, together hid every conversation older than a day or so:
 ///   1. The sidebar kept the NEWEST 80 transcripts, scanned once at startup. 3,309 were on disk.
 ///   2. The registry (.fleet/conversations.json) grew past 2,097,152 characters, which is the
