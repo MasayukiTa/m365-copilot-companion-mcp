@@ -2766,6 +2766,22 @@ function Stop-TunnelHostChild {
     return $ok
 }
 
+function Test-RehostEstablished {
+    # PURE. Did our freshly-launched re-host actually establish, as opposed to the relay merely
+    # still showing a lingering ghost connection? TWO conditions must hold together:
+    #   * the relay's current connection count is ABOVE the ghost baseline recorded before launch
+    #     (our new host's connection added on top of whatever ghost was there), and
+    #   * a host process of ours is running.
+    # $NowConn may be $null (devtunnel show gave no count) -- that is NOT established. When
+    # $BaselineConn is 0 (a plain "none" re-host, no ghost) this reduces to "any count>=1 with our
+    # host running", the behaviour before the ghost fix.
+    param($NowConn, $BaselineConn, [bool]$OurHostRunning)
+    if (-not $OurHostRunning) { return $false }
+    if ($null -eq $NowConn) { return $false }
+    $base = if ($null -eq $BaselineConn) { 0 } else { [int]$BaselineConn }
+    return ([int]$NowConn -gt $base)
+}
+
 function Start-TunnelHost {
     # NEVER TWO READERS FOR ONE TUNNEL. Before stopping or launching anything, look for an
     # existing reader of this tunnel. If one is alive and the pure decider says "wait", log that
@@ -2815,6 +2831,16 @@ function Start-TunnelHost {
         }
         $script:ReaderNoRelaySince = $null
     }
+    # GHOST BASELINE (2026-11-10). When this re-host is for a "stale" (ghost) tunnel, the relay
+    # still counts the dead host's connection(s) -- a count this machine has NO host process for,
+    # and which devtunnel offers no command to drop (there is no `unhost`; `delete` would destroy
+    # the tunnel). The ghost simply lingers until the relay times it out. So the only safe order is:
+    # record the ghost's connection count NOW, launch our new host, and treat the host as
+    # "established" only once the relay count RISES ABOVE this baseline (our new host's connection
+    # added on top of the ghost) AND a host process of ours is actually running. A bare count>=1 is
+    # exactly what a ghost shows on its own, so it cannot be the establish signal here.
+    $ghostBaselineConn = Get-TunnelHostConnections
+    if ($null -eq $ghostBaselineConn) { $ghostBaselineConn = 0 }
     # Stop only OUR stale host process(es) -- those whose command line is
     # `devtunnel host <TunnelName>`. NEVER `Get-Process devtunnel | Stop-Process`: that
     # reaps a user's interactive `devtunnel login` (the very command that authenticates
@@ -2868,6 +2894,15 @@ function Start-TunnelHost {
     # AND THE CONNECTION MUST BE OURS: a count of 1 while another PC hosts this tunnel said
     # "established" on 2026-09-24 for a host that exited seconds later. So the host we launched
     # must still be alive when the count is read, and if it exits first that is the answer.
+    #
+    # GHOST-SAFE ESTABLISH (2026-11-10). "established" now needs TWO things together, not just
+    # count>=1: (a) a host process of OURS is actually running (Test-OurTunnelHostRunning -- the
+    # new reader's `devtunnel host` child is up), and (b) the relay count has RISEN ABOVE the ghost
+    # baseline recorded before we launched. Either alone is a ghost false-positive: a lingering
+    # ghost keeps count at the baseline with no host of ours, so count>=1 by itself (the old test)
+    # would declare "established (after ~2s)" before our new host ever registered. When the baseline
+    # was 0 (the plain "none" re-host, no ghost) this reduces to the old behaviour: any count>=1
+    # with our host running is above 0.
     for ($i = 0; $i -lt 25; $i++) {
         Start-Sleep -Seconds 2
         $exited = $false
@@ -2876,12 +2911,13 @@ function Start-TunnelHost {
             Write-Log ("devtunnel host exited while starting" + (Get-TunnelHostExitDetail) + " (will retry next cycle)")
             return $false
         }
-        if (Test-TunnelHosting) {
-            Write-Log "devtunnel host established (after ~$([int](($i + 1) * 2))s)"
+        $nowConn = Get-TunnelHostConnections
+        if (Test-RehostEstablished -NowConn $nowConn -BaselineConn $ghostBaselineConn -OurHostRunning (Test-OurTunnelHostRunning)) {
+            Write-Log ("devtunnel host established (after ~$([int](($i + 1) * 2))s; connections $ghostBaselineConn -> $nowConn, our host running)")
             return $true
         }
     }
-    Write-Log "devtunnel host did not establish within ~50s (will retry next cycle)"
+    Write-Log ("devtunnel host did not establish within ~50s (connections still at/below the ghost baseline $ghostBaselineConn, or no host of ours running; will retry next cycle)")
     return $false
 }
 $script:TunnelHostProc = $null
