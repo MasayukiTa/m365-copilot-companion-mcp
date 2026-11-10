@@ -221,14 +221,18 @@ def _goal_text_for(state_dir, jid):
     return None
 
 
-def orphan_jids(state_dir):
+def orphan_jids(state_dir, buckets=None):
     """The acknowledged jids that were dropped: ack present, but NO outcome, NOT delivered, NO live
     worker, NO refused record, and NOT older than the age limit. Deterministic order (sorted) so
     the log and the status record are stable.
 
-    This is the pure decision -- it writes nothing. `resubmit_orphans_on_start` acts on it.
+    This is the pure decision -- it writes nothing. `resubmit_orphans_on_start` calls it to pick
+    the goals it re-adds, passing the `_classify` result it already computed so the acks/ tree is
+    walked once per start, not twice.
     """
-    return sorted(set(_classify(state_dir)["orphans"]))
+    if buckets is None:
+        buckets = _classify(state_dir)
+    return sorted(set(buckets["orphans"]))
 
 
 def _classify(state_dir):
@@ -308,7 +312,7 @@ def resubmit_orphans_on_start(state_dir, log=None, park=None):
     readded = []
     try:
         buckets = _classify(state_dir)
-        candidates = sorted(set(buckets["orphans"]))
+        candidates = orphan_jids(state_dir, buckets)
     except Exception as exc:                       # housekeeping must not fail a start
         log("orphan re-add skipped: %s: %s" % (type(exc).__name__, exc))
         return readded
