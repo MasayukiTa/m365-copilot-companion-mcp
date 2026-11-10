@@ -3839,45 +3839,6 @@ if (-not (Test-TunnelRouteWanted)) {
 }
 # -- TUNNEL STARTUP FAST PATH (end) ----------------------------------------------------------
 
-# -- AGENTS JANITOR: reclaim C: by deleting FINISHED worker clones (owner, 2026-11-09) --------
-# ROOT CAUSE of the fleet running C: out of space (measured 2026-11-09, see
-# scripts/agents_janitor.py and .fleet/disk_series.jsonl): workers `git clone` GitHub repos into
-# %TEMP%\m365-companion\agents, do their work, exit, and their full checkouts are NEVER removed.
-# This runs the janitor at most once per 10 minutes, and only while C: is below the 3 GB
-# threshold, so a healthy disk is never walked. A DRY-RUN log line is emitted first every time;
-# whether it then DELETES is the agents_janitor_apply setting (default ON). The janitor itself
-# refuses to touch anything that is not a clean, fully-pushed, unowned, quiet clone -- the apply
-# switch only gates whether its decisions are carried out.
-$script:AgentsJanitorLastRun = [datetime]::MinValue
-$script:AgentsJanitorMinSeconds = 600          # 10 minutes, same rate-limit shape as the rest
-$script:AgentsJanitorThresholdBytes = 3221225472   # 3 GB: only sweep when C: is under pressure
-function Invoke-AgentsJanitorSweep {
-    # Rate-limit: at most once per 10 minutes.
-    if (((Get-Date) - $script:AgentsJanitorLastRun).TotalSeconds -lt $script:AgentsJanitorMinSeconds) { return }
-    # Only when free space is below the threshold -- a healthy disk is left alone.
-    $free = $null
-    try { $free = [int64](New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot($FleetDir))).AvailableFreeSpace } catch { $free = $null }
-    if ($null -eq $free -or $free -ge $script:AgentsJanitorThresholdBytes) { return }
-    $script:AgentsJanitorLastRun = Get-Date
-    Write-Log ("disk below 3 GB (free {0:N2} GB) -> agents-janitor sweep" -f ($free / 1GB))
-    # DRY RUN FIRST, ALWAYS: report what would be deleted, every sweep, regardless of the setting.
-    try {
-        $dry = & $Py -u "$Root\scripts\agents_janitor.py" 2>&1
-        foreach ($line in $dry) { if ("$line".Trim()) { Write-Log "[janitor:dry] $line" } }
-    } catch { Write-Log "[janitor:dry] sweep failed: $($_.Exception.Message)" }
-    # THEN APPLY, behind the setting (default ON). Read fresh each sweep (each_gate).
-    $apply = $true
-    try {
-        $a = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_runner import settings_agents_janitor_apply; print('1' if settings_agents_janitor_apply() else '0')" 2>$null
-        if ("$a".Trim() -eq '0') { $apply = $false }
-    } catch { $apply = $true }   # unreadable setting -> default ON
-    if (-not $apply) { Write-Log "[janitor] agents_janitor_apply=0 -> dry-run only this sweep, nothing deleted"; return }
-    try {
-        $out = & $Py -u "$Root\scripts\agents_janitor.py" --apply 2>&1
-        foreach ($line in $out) { if ("$line".Trim()) { Write-Log "[janitor] $line" } }
-    } catch { Write-Log "[janitor] apply failed: $($_.Exception.Message)" }
-}
-
 # AN EXIT RECORD. 2026-10-17 the supervisor's log simply stopped at 08:44:58 and the next line, 13 h
 # later, was a fresh "supervisor up": nothing said whether it exited, was closed with its session or
 # was killed, so the cause could not be told. This try/finally writes a line on every way out that
@@ -4089,11 +4050,6 @@ while ($true) {
         # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
         Invoke-TunnelHostingCheck | Out-Null
     }
-
-    # RECLAIM C: FROM FINISHED WORKER CLONES. Before the code cycle (which may replace this
-    # process and exit): at most once per 10 minutes, and only while C: is under 3 GB. Best-effort
-    # and fully self-contained -- a janitor failure must never take down the supervisor tick.
-    try { Invoke-AgentsJanitorSweep } catch { Write-Log "agents-janitor sweep raised: $($_.Exception.Message)" }
 
     # LAST STEP OF THE TICK: is this process still the code on disk? Stat-only unless a file
     # changed; replaces this supervisor (and exits) only when Get-SupervisorRestartVerdict says ok.
