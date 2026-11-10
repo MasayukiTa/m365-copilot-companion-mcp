@@ -86,6 +86,34 @@ STATE_FILE = STATE_DIR / "state.json"
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"  # Windows layout
 GENERATED_DIR = ROOT / "generated"
 
+# HOW LONG A VENV-PROBE CHILD MAY TAKE BEFORE WE CALL THE VENV BROKEN.
+#
+# _venv_runs/_venv_version/_venv_has_pip each spawn the venv's python and wait for it. The
+# wait was a hard-coded 60s. On a BRAND-NEW machine that is not always enough: measured on a
+# fresh PC, a bare `python -c "import sys"` took ~8-9s and `python -m venv` (which re-spawns
+# python for ensurepip) ran well past 60s, because real-time AV scanning and a cold file
+# cache tax every interpreter start. A healthy venv was then mis-judged "cannot run", STEP
+# 1/7 looped on rebuilding a venv that was fine, and the install never advanced. The fix is
+# to give the probe a generous default and let a slow box raise it further via one env var,
+# rather than bake a number that is right only on a warm developer machine.
+_VENV_PROBE_TIMEOUT_DEFAULT = 180.0
+_VENV_PROBE_TIMEOUT_ENV = "MCP_VENV_PROBE_TIMEOUT"
+
+
+def _venv_probe_timeout() -> float:
+    """Seconds a single venv-probe child may take. Default 180, override with
+    ``MCP_VENV_PROBE_TIMEOUT`` (seconds). An unset/blank/invalid/non-positive value falls back
+    to the default, so a bad env var can never make the timeout zero and flap the probe."""
+    raw = (os.environ.get(_VENV_PROBE_TIMEOUT_ENV) or "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _VENV_PROBE_TIMEOUT_DEFAULT
+
 DEFAULT_TUNNEL_NAME = "m365-copilot-companion"
 
 # Privacy guard: some tunnel names leak an identifying (organization/user) token to the
@@ -319,7 +347,8 @@ def _venv_runs() -> bool:
         return False
     try:
         from tools.childproc import run as _run_child
-        res = _run_child([str(VENV_PYTHON), "-c", "import sys"], timeout=60)
+        res = _run_child([str(VENV_PYTHON), "-c", "import sys"],
+                         timeout=_venv_probe_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
@@ -337,7 +366,8 @@ def _venv_version() -> tuple | None:
     try:
         from tools.childproc import run as _run_child
         res = _run_child([str(VENV_PYTHON), "-c",
-                          "import sys; print('%d.%d' % sys.version_info[:2])"], timeout=60)
+                          "import sys; print('%d.%d' % sys.version_info[:2])"],
+                         timeout=_venv_probe_timeout())
     except (OSError, subprocess.SubprocessError):
         return None
     if res.returncode != 0:
@@ -357,7 +387,8 @@ def _venv_has_pip() -> bool:
         return False
     try:
         from tools.childproc import run as _run_child
-        res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"], timeout=60)
+        res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"],
+                         timeout=_venv_probe_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
