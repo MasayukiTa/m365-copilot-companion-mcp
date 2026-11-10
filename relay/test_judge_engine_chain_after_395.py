@@ -18,7 +18,7 @@ registration section at all):
      DIRECTORY, so record_manifest opened the folder for writing. The contract must reject a
      directory by name BEFORE the harness opens it, and record_manifest must not open a folder.
 
-HERMETIC: no real folders of the owner. A FAKE engine root (a tiny `python -m validity` that
+HERMETIC: no real user folders. A FAKE engine root (a tiny `python -m validity` that
 echoes a JSON verdict) and a FAKE case folder built under tmp_path stand in for everything.
 No secret data, measurement row or employee id appears here.
 """
@@ -86,7 +86,7 @@ def _fake_engine_root(tmp_path, *, with_configs_id=None):
 
 
 def _case_folder(tmp_path):
-    """A fake case/output folder with a data FILE inside it (stands in for the owner's request
+    """A fake case/output folder with a data FILE inside it (stands in for the caller's request
     folder, which must never be touched)."""
     out = tmp_path / "job_out"
     out.mkdir()

@@ -5,7 +5,7 @@ before any analysis, WITHOUT ever reading the response column.
 WHY THIS MODULE EXISTS.
   relay.judge_claim_preflight runs a design preflight that must answer one question: can the
   two exposure groups even be compared WITHIN a shared stratum (the product / line / period
-  that an owner's confound objection says must be held fixed)? Answering it requires counting
+  that a confounding variable requires to be held fixed)? Answering it requires counting
   how many distinct lots each exposure group contributes in each stratum. It does NOT require
   -- and must never touch -- the response column: the design verdict has to be provably
   independent of the outcome, so this module reads only the stratifier column(s), the exposure
@@ -38,7 +38,7 @@ import os
 
 #: Minimum distinct lots PER GROUP within a stratum for that stratum to count as a usable
 #: within-stratum contrast. Mirrors the engine's k_min (8) and relay.stratified_estimate's
-#: DEFAULT_K_MIN by owner instruction; it is NOT the engine's threshold and does not change it.
+#: DEFAULT_K_MIN to stay consistent with it; it is NOT the engine's threshold and does not change it.
 K_MIN_LOTS = 8
 
 __all__ = [
