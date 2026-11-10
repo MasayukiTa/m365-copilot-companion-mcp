@@ -227,6 +227,15 @@ def _reader_relay_findings():
     return mode()
 
 
+def _reader_peer_requests():
+    # peer_requests follows the file at every coordinator tick (relay/peer_requests.py:mode,
+    # mtime-cached). mode() calls tools.settings_path.settings_file() fresh, so with SP.NEW_PATH
+    # pointed at the test's file an operator's change is seen on the next tick with no restart.
+    # Returned as off|shadow, the setting's own vocabulary (SHADOW ONLY: no value posts a request).
+    from relay.peer_requests import mode
+    return mode()
+
+
 def _reader_desktop_guard():
     # desktop_guard.mode() follows settings.txt (mtime-cached) at every worker start; the env
     # var MCP_DESKTOP_GUARD would beat the file, so the parametrized test clears it below.
@@ -355,6 +364,7 @@ _LIVE_READERS = {
     "consent_auto_approve": (_reader_consent_auto_approve, "off", "on"),
     "resident_tools": (_reader_resident_tools, "on", "off"),
     "relay_findings": (_reader_relay_findings, "shadow", "off"),
+    "peer_requests": (_reader_peer_requests, "off", "shadow"),
     "desktop_guard": (_reader_desktop_guard, "allow", "deny"),
     "block_real_desktop_automation": (_reader_block_real_desktop, "on", "off"),
     "workarea_guard": (_reader_workarea_guard, "warn", "enforce"),
