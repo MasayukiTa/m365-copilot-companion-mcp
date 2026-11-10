@@ -23,7 +23,7 @@ from periodic_scan.runner import (  # noqa: E402
 )
 
 _LOT_SPEC = {
-    "table": "PROD.dbo.V_metric",
+    "table": "demo_schema.lot_counts",
     "unit_column": "lot",
     "product_column": "product",
     "connection": "conn1",

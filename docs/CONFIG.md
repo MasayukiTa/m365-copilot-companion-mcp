@@ -152,7 +152,7 @@ stderr へ `[tool_map] ... cut N tool(s) that were asked for: ...` と出し、�
 ```json
 {
   "connection":     "conn1",
-  "lot_table":      "PROD.dbo.V_metric",
+  "lot_table":      "demo_schema.lot_counts",
   "unit_column":    "lot",
   "product_column": "product",
   "ledger_path":    "C:\\path\\to\\ledger.json"
