@@ -225,8 +225,8 @@ def test_engine_error_for_a_late_structured_claim_is_surfaced_not_hidden(tmp_pat
     # the engine's own HOLD + reason is surfaced, and the post-hoc note is present, not hidden
     assert "D_FAIL_LOCK_AFTER_DATA" in detail
     assert ("事後登録" in detail) or ("post-hoc" in detail)
-    # a HOLD is not an ERROR: the engine's verdict line reports 保留 (HOLD), not 入力不備 (ERROR).
-    # (The post-hoc explanation itself mentions '入力不備(ERROR)ではなく' to say it is NOT an input
+    # a HOLD is not an ERROR: the engine's verdict line reports a HOLD, not an input-missing ERROR.
+    # (The post-hoc explanation itself states it is NOT an input-missing ERROR, to say it is NOT an input
     # error, so we check the verdict LINE, not the whole text, for the ERROR label.)
     verdict_line = [ln for ln in detail.splitlines() if ln.startswith("判定:")]
     assert verdict_line and "HOLD" in verdict_line[0] and "保留" in verdict_line[0]

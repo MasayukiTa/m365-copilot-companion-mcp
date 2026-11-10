@@ -17,8 +17,8 @@ goal pass through the frozen validity engine before its final answer is delivere
   (3) the refuter must additionally check "did it pass the judge, and if not why" -- pinned by
       test_refuter_has_judge_check.
 
-The verdict engine itself lives OUTSIDE this repo (Desktop/AHA資料_参照一式/証明/公開データ検証/
-engine_v1_8c2), is secret, remote-less and byte-identical-locked; this harness only ORCHESTRATES
+The verdict engine itself lives OUTSIDE this repo at an operator-specific location supplied at
+run time, is secret, remote-less and byte-identical-locked; this harness only ORCHESTRATES
 it and NEVER edits its rules, thresholds or registered claims. No secret data, measurement row
 or employee id appears here -- fixtures are synthetic.
 
@@ -172,7 +172,7 @@ def test_rework_job_names_the_three_steps_and_forbids_fabrication():
     assert "validity_harness.record_manifest" in job
     assert "validity_harness.register_and_lock" in job
     assert "判定エンジン" in job
-    assert "自作・捏造" in job   # 「自作・捏造しないこと」
+    assert "自作・捏造" in job   # must warn against self-authoring or fabricating a verdict
 
 
 # ---- the gate is actually wired into the relay loop (regression guard) --------

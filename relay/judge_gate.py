@@ -295,8 +295,8 @@ def post_hoc_order_note(order_record) -> str:
     A worker analyses data that already exists, so a registration recorded AFTER the data file's
     mtime can never satisfy a pre-registration order check (order_ok=False). That is NOT an input
     error: the engine's own rule classes a late registration as D_FAIL_LOCK_AFTER_DATA, which
-    CAPS the verdict at HOLD (it never makes it ERROR -- see README_engine '判定の順序'). We state
-    that plainly so the worker reads 'post-hoc (HOLD上限)' rather than mistaking it for a bug, and
+    CAPS the verdict at HOLD (it never makes it ERROR -- see the engine's verdict-ordering rules). We state
+    that plainly so the worker reads it as 'post-hoc (capped at HOLD)' rather than mistaking it for a bug, and
     we name what would make it valid without faking the order or weakening the engine.
     """
     if not isinstance(order_record, dict) or order_record.get("order_ok") is not False:
@@ -855,7 +855,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         # NO response/outcome column) writes its RESULT into the optional
         # request["design_feasibility"] section. When it reports the comparison design is
         # infeasible, the footer and the durable record force the final display to
-        # 設計不成立(保留) regardless of the engine verdict, naming the reason code and
+        # a design-infeasible HOLD regardless of the engine verdict, naming the reason code and
         # what was seen (common strata, per-group lot counts, overlap coefficient). This
         # is stricter-only and leaves the engine's own output untouched. A missing or
         # feasible section changes nothing. We only read the section if it is a dict; the
@@ -1353,7 +1353,7 @@ def _stratified_footer_lines(lot_diagnosis):
 # STRICTER-ONLY, AND NON-DESTRUCTIVE. This can only turn a deliverable answer INTO a
 # hold; it never turns a hold into GO and never relaxes anything. The engine's own
 # output is PRESERVED UNCHANGED -- the footer still prints the original verdict block
-# below the hold banner (labelled 参考・変更なし), and _write_judge_result keeps the
+# below the hold banner (labelled as the original engine output, unchanged), and _write_judge_result keeps the
 # original `verdict` key intact while recording the hold under the SEPARATE key
 # `design_feasibility_hold` plus a top-level `final_display`. So a reader always sees
 # both the forced final display and the untouched engine verdict.
@@ -1363,8 +1363,8 @@ def _stratified_footer_lines(lot_diagnosis):
 #   {"feasible": bool,                 # False => force a hold
 #    "reason_code": str,               # e.g. one of _DESIGN_INFEASIBLE_REASONS
 #    "common_strata": int,             # number of common strata (grouping levels)
-#    "lots_per_group": {group: int},   # 群ごとのロット数
-#    "overlap_coefficient": number,    # 群間の層構成の重なり係数
+#    "lots_per_group": {group: int},   # lot count per group
+#    "overlap_coefficient": number,    # overlap coefficient of the stratum mix between groups
 #    ...}                              # any other keys are carried as `seen`
 # Only `feasible is False` forces the hold; a missing/True/None design never does,
 # so wiring this in cannot flip an otherwise-deliverable answer by accident.
@@ -1466,7 +1466,7 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
     DESIGN_HOLD_DISPLAY: the footer LEADS with a hold banner naming the reason code and
     what was seen (common strata, per-group lot counts, overlap coefficient), then
     prints the engine's ORIGINAL verdict block UNCHANGED below it, labelled
-    参考・変更なし. Stricter-only; never edits the engine output. A feasible / missing /
+    as the original engine output, unchanged. Stricter-only; never edits the engine output. A feasible / missing /
     None design changes nothing.
     """
     hold = design_feasibility_hold(design_feasibility)
@@ -1718,7 +1718,7 @@ def design_feasibility(group_stratum_lots,
 
     The checks are applied in the order (a) then (b) then (c); the FIRST
     failing one sets the reason code.  design_infeasible True means the final
-    display must be forced to "設計不成立(保留)" -- this function never relaxes a
+    display must be forced to a design-infeasible HOLD -- this function never relaxes a
     verdict, it only ever adds a design HOLD.
     """
     gsl = group_stratum_lots or {}
