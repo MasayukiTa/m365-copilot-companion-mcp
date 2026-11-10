@@ -3633,6 +3633,20 @@ function Test-FleetHasUnfinishedWork {
         if (-not (Test-Path -LiteralPath $statusPath)) { return $false }
         $s = Read-JsonFileUtf8 -Path $statusPath
         if (-not $s) { return $false }
+        # SINGLE SOURCE OF TRUTH: ask the pure core supervisor_runner_respawn.status_json_has_unfinished_work
+        # the same cross-language way the other supervisor gates reach their deciders (& $Py -c with
+        # the module AND the function named, so tools/unreached.py credits this caller and the Python
+        # rule and this PowerShell cannot drift). The core reads the REAL worker shape (status string
+        # + closed bool). Only if that call cannot answer (python/venv not ready, parse error) does the
+        # native fallback below run, so a tick is never blind.
+        try {
+            $py = $script:Py
+            if (-not $py) { $py = $Py }
+            $coreOut = ([string](& $py -c "import sys, json; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.status_json_has_unfinished_work(json.load(open(r'$statusPath', encoding='utf-8'))))" 2>$null)).Trim()
+            if ($coreOut -eq 'True') { return $true }
+            if ($coreOut -eq 'False') { return $false }
+        } catch { }
+        # --- Native fallback (kept byte-for-byte equivalent to the core) ---
         # recovering=true is unfinished work on its own (the 18-minute stuck state in the GOAL).
         if ($s.recovering -eq $true) { return $true }
         $running = ($s.running -eq $true)
