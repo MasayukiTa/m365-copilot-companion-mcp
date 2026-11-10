@@ -17,7 +17,7 @@ import sqlite3
 import time
 from typing import Callable
 
-from . import SCHEMA_VERSION
+from . import SCHEMA_REVISION
 from . import schema as _schema
 from . import views as _views
 
@@ -64,7 +64,7 @@ MIGRATIONS: dict[int, tuple[str, Callable[[sqlite3.Connection], None]]] = {
 }
 
 
-def apply_migrations(con: sqlite3.Connection, target: int = SCHEMA_VERSION) -> int:
+def apply_migrations(con: sqlite3.Connection, target: int = SCHEMA_REVISION) -> int:
     """Bring ``con`` up to ``target`` version, returning the final version.
 
     Runs each pending migration in order inside a transaction and records it
