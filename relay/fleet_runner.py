@@ -1594,6 +1594,16 @@ def _write_scope_tick(workers):
         pass
 
 
+def _peer_requests_tick(workers, queued=0, run_id=""):
+    """Once per tick: in shadow, record the peer REQUEST/OFFER/CLAIM a peer-request protocol
+    would have produced (relay/peer_requests.py). Never raises, never blocks, posts nothing."""
+    try:
+        from relay import peer_requests as _pr
+        _pr.shadow_tick(workers, queued=queued, run_id=run_id)
+    except Exception:
+        pass
+
+
 def _resident_tools_block():
     """`resident_tools`: "off"|"on", additive. The production caller of
     relay.resident_guard.status_block (and so of its mode reader). Nothing acts on the value
@@ -1661,6 +1671,16 @@ def _relay_findings_block():
     try:
         from relay import relay_findings as _rf
         return _rf.status_block()
+    except Exception:
+        return {}
+
+
+def _peer_requests_block():
+    """`peer_requests`: {mode, recorded, requests, offers, claims}, additive. The production
+    caller of relay.peer_requests.status_block (and so of its mode reader). {} on any failure."""
+    try:
+        from relay import peer_requests as _pr
+        return _pr.status_block()
     except Exception:
         return {}
 
@@ -2257,6 +2277,7 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_result_cache_block())
     _snap.update(_team_formation_block())
     _snap.update(_relay_findings_block())
+    _snap.update(_peer_requests_block())
     _snap.update(_agent_board_block())
     _snap.update(_roster_block(_snap["workers"]))
     _snap.update(_auto_resume_block())
@@ -5413,7 +5434,8 @@ def main():
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
         _timed("update_done_map", lambda: _update_done_map(args.state_dir, workers))
         _sample_free_space(args.state_dir, disk_box[0])
-        _timed("write_scope_tick", lambda: _write_scope_tick(workers))      # shadow: record overlapping sibling writes (off = no-op)
+        _timed("write_scope_tick", lambda: _write_scope_tick(workers))
+        _timed("peer_requests_tick", lambda: _peer_requests_tick(workers, len(add_box or []), run_label))      # shadow: record peer REQUEST/OFFER/CLAIM (off = no-op)      # shadow: record overlapping sibling writes (off = no-op)
         try:
             _timed("snapshot", lambda: _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
