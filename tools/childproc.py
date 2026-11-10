@@ -88,154 +88,166 @@ def run(cmd, **kw):
     caller reaching for this wants the output; pass `capture_output=False` when it should go to
     the console.
 
+    NO READER THREADS, EVER. Captured output is routed to on-disk temp files, not pipes, so the
+    OS writes the child's stdout/stderr straight to a file and Python never starts a
+    `_readerthread` to drain a pipe. This is the fix for the crash whose signature was 12-26
+    `_readerthread` objects alive at once inside the server: `subprocess.run(capture_output=True)`
+    and `Popen.communicate()` BOTH spawn one drain thread per captured stream, and under load a
+    burst of tool calls multiplied those into the thread count that preceded the faulthandler
+    access violations. A temp file has no pipe buffer to deadlock on and no EOF for a thread to
+    wait for, so the grandchild-holds-the-pipe leak and the per-call reader threads are removed
+    by construction rather than cleaned up after the fact.
+
     Refuses `text`, `universal_newlines` and `encoding`: each of them re-introduces the locale
     decode this exists to avoid, and accepting one silently would make the guarantee a lie.
     """
+    import tempfile
+
     for bad in ("text", "universal_newlines", "encoding", "errors"):
         if bad in kw:
             raise TypeError(
                 "childproc.run decodes for you; %r would put the locale codec back in the "
                 "path this exists to keep it out of" % bad)
     kw.setdefault("capture_output", True)
-    # BINARY IN, BINARY OUT -- BUT NOT AT THE CALLER'S EXPENSE. Running without text=True is
-    # what keeps the locale codec out of the OUTPUT path, and it also makes stdin binary, so a
-    # caller that passed a str to subprocess.run and switched to this got
-    # "TypeError: a bytes-like object is required, not 'str'" from inside Popen._stdin_write.
-    # Measured 2026-09-12 while converting scripts/test_stale_server_check.py. Encoding it here
-    # in UTF-8 -- the same direction `decode` takes on the way back -- is the whole fix.
-    # Making every call site remember instead is the version of this that keeps biting.
+    # BINARY IN, BINARY OUT. A str passed as input is encoded UTF-8 here -- the same direction
+    # decode() takes on the way back -- so a caller that switched from subprocess.run(input=str)
+    # does not get "a bytes-like object is required" from the stdin writer.
     if isinstance(kw.get("input"), str):
         kw["input"] = kw["input"].encode("utf-8")
-    # TIMEOUT MUST KILL THE WHOLE TREE, OR THE READER THREADS LEAK.
-    #
-    # subprocess.run(timeout=) kills only the DIRECT child on expiry and then calls
-    # communicate() to join its pipe-reader threads. If that child spawned a grandchild
-    # that inherited the stdout/stderr pipe write handles, those handles stay open, the
-    # reader threads never see EOF, communicate() blocks, and the threads park in Wait
-    # forever -- invisible to py-spy (no Python frame) but counted by the OS. 22h of this,
-    # a few per timed-out notify/chart/pip call, is the 500-thread leak this function was
-    # the common path for. The fix is the proven autoloop._run / ext_helper._call shape:
-    # run through Popen, and on TimeoutExpired kill the tree (taskkill /T) BEFORE the
-    # second communicate(), so the write ends close and the readers reach EOF and exit.
+
     timeout = kw.get("timeout")
-    # A caller may substitute subprocess.run (for example to simulate a command). Keep
-    # that public seam even for timed calls; only the real stdlib runner needs the
-    # Popen implementation below. Checking its provenance also handles imports made
-    # while subprocess.run is already patched.
+    # A caller may substitute subprocess.run (for example to simulate a command). Keep that
+    # public seam: only the real stdlib runner is replaced by the temp-file Popen path below.
+    # Checking provenance also handles imports made while subprocess.run is already patched.
     runner = subprocess.run
     is_stdlib_runner = (getattr(runner, "__module__", None) == "subprocess"
                         and getattr(runner, "__name__", None) == "run")
-    if timeout is None or not is_stdlib_runner:
-        proc = subprocess.run(cmd, **kw)
+    if not is_stdlib_runner:
+        # Defer entirely to the (stubbed) runner, decoding whatever it returns. No temp files,
+        # no threads of our own -- the stub decides everything.
+        proc = runner(cmd, **kw)
         try:
             proc.stdout = decode(proc.stdout)
             proc.stderr = decode(proc.stderr)
-        except AttributeError:      # capture_output=False -> both are None already
+        except AttributeError:
             pass
         return proc
-    # timeout given: drive Popen ourselves so a timeout can kill the whole tree.
-    kw.pop("timeout")
+
+    # --- real runner: drive Popen with temp-file capture so no reader thread is ever started ---
+    kw.pop("timeout", None)
     capture = kw.pop("capture_output", True)
     stdin_input = kw.pop("input", None)
     check = kw.pop("check", False)
-    if capture:
-        kw.setdefault("stdout", subprocess.PIPE)
-        kw.setdefault("stderr", subprocess.PIPE)
-    if stdin_input is not None:
-        kw.setdefault("stdin", subprocess.PIPE)
-    # Make the child the root of a killable tree. Without this, taskkill /T has no
-    # descendant group to walk on Windows and killpg has no dedicated session on POSIX --
-    # i.e. the tree kill degrades to a direct kill and the leak is not actually closed.
-    #
-    # The policy comes from tree_popen_kwargs(), expanded INLINE at the Popen call on
-    # purpose: tools/launch_sites.py recognises `**childproc.tree_popen_kwargs(...)` as a
-    # stated console/process-ownership policy, so this new spawn site counts as DECIDED and
-    # does not read as a window-allocating launch that inherits whatever console it is given.
-    # headless=False: this is the general-purpose runner, so it must keep inheriting the
-    # parent's console (ssh/git credential prompts depend on it); only the kill-ability of
-    # the tree is being added here. priority=False: a timeout path must not quietly change
-    # the child's scheduling priority relative to the no-timeout path above.
-    #
-    # For the timeout path specifically the tree policy OWNS process/console ownership, so a
-    # caller-supplied spawn kwarg for the same concern is dropped rather than collided with
-    # (Popen would raise on a duplicate **-key); every current caller leaves these unset.
+
+    # Owned by the tree policy on every spawn here; a caller-supplied value for the same concern
+    # is dropped rather than collided with (Popen raises on a duplicate **-key).
     for _owned in ("creationflags", "start_new_session", "preexec_fn"):
         kw.pop(_owned, None)
-    # Attribute form `childproc.tree_popen_kwargs(...)` is required: launch_sites keys its
-    # policy-factory allowlist on the module-qualified name (("childproc","tree_popen_kwargs")),
-    # so a bare import or an alias would not read as a stated policy. Importing this module by
-    # its own name is cheap and non-circular -- it is already in sys.modules by the time run()
-    # executes.
+
     from tools import childproc
 
-    # WINDOWS: place the child in a Job Object BEFORE it runs so a timeout can terminate the
-    # whole job (child + every descendant it later spawns) in one atomic call, with no taskkill
-    # timing race. The child is created suspended, assigned to the job, then resumed; a
-    # grandchild it spawns is in the job by kernel rule. On a build without the needed kernel32
-    # calls (_WIN_JOB_OK False) or on POSIX, fall through to the tree_popen_kwargs + kill_tree
-    # path below, which is correct for the common case and only loses the race fix.
+    out_f = err_f = in_f = None
     job = None
-    if os.name == "nt" and _WIN_JOB_OK:
-        popen_kw = dict(kw)
-        popen_kw["creationflags"] = (
-            popen_kw.get("creationflags", 0)
-            | CREATE_SUSPENDED
-            | childproc.tree_popen_kwargs(headless=False, priority=False).get("creationflags", 0)
-        )
-        job = _win_create_job()
-        proc = subprocess.Popen(cmd, **popen_kw)
-        if job is not None and _win_assign_job(job, proc.pid):
-            _win_resume_process(proc.pid)
-        else:
-            # Could not create/assign the job: resume anyway so the child is not left frozen,
-            # and drop back to kill_tree on timeout.
-            _win_close_handle(job)
-            job = None
-            _win_resume_process(proc.pid)
-    else:
-        proc = subprocess.Popen(
-            cmd, **kw, **childproc.tree_popen_kwargs(headless=False, priority=False))
-    # RECORD THE SPAWN AT ITS SOURCE. This is the one process-spawning choke point the timed
-    # tool calls (run_python/shell_exec/run_powershell) share, so registering proc.pid here
-    # attributes the whole tree to the worker whose turn is running -- read from the ContextVar
-    # the gateway set, so no caller has to thread a name through. register() is total and
-    # no-ops when there is no current worker (a CLI/test spawn), so this never changes behaviour
-    # for a non-fleet call and never raises into the tool. It is what lets a worker closed
-    # mid-call, or a coordinator-start sweep, kill this tree instead of orphaning it.
     try:
-        from tools import proc_registry as _proc_registry
-        _proc_registry.register(proc.pid, tool="childproc.run")
+        if capture:
+            out_f = tempfile.TemporaryFile()
+            err_f = tempfile.TemporaryFile()
+            kw["stdout"] = out_f
+            kw["stderr"] = err_f
+        if stdin_input is not None:
+            # Feed stdin from a temp file too, so there is no stdin writer thread and no pipe to
+            # block on if the child never reads it all.
+            in_f = tempfile.TemporaryFile()
+            in_f.write(stdin_input)
+            in_f.seek(0)
+            kw["stdin"] = in_f
+
+        # WINDOWS: put the child in a Job Object BEFORE it runs so a timeout terminates the whole
+        # job (child + every descendant) atomically. Created suspended, assigned, resumed. On a
+        # build without the needed kernel32 calls, or on POSIX, fall through to tree_popen_kwargs
+        # + kill_tree, which is correct for the common case and only loses the race fix.
+        if os.name == "nt" and _WIN_JOB_OK:
+            popen_kw = dict(kw)
+            popen_kw["creationflags"] = (
+                popen_kw.get("creationflags", 0)
+                | CREATE_SUSPENDED
+                | childproc.tree_popen_kwargs(headless=False, priority=False).get("creationflags", 0)
+            )
+            job = _win_create_job()
+            proc = subprocess.Popen(cmd, **popen_kw)
+            if job is not None and _win_assign_job(job, proc.pid):
+                _win_resume_process(proc.pid)
+            else:
+                _win_close_handle(job)
+                job = None
+                _win_resume_process(proc.pid)
+        else:
+            proc = subprocess.Popen(
+                cmd, **kw, **childproc.tree_popen_kwargs(headless=False, priority=False))
+
+        # RECORD THE SPAWN AT ITS SOURCE so a worker closed mid-call can kill this tree instead
+        # of orphaning it. Total and no-ops when there is no current worker; never raises.
+        try:
+            from tools import proc_registry as _proc_registry
+            _proc_registry.register(proc.pid, tool="childproc.run")
+        except Exception:
+            pass
+
+        timed_out = False
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            # Kill the whole tree (job terminate, or taskkill /T / killpg) so every descendant
+            # stops; there are no reader threads to join because output went to files.
+            if job is not None:
+                _win_terminate_job(job)
+            else:
+                kill_tree(proc, wait_s=5)
+            try:
+                proc.wait(timeout=5)
+            except Exception:
+                pass
+
+        out = _read_temp(out_f) if capture else None
+        err = _read_temp(err_f) if capture else None
+
+        if timed_out:
+            raise subprocess.TimeoutExpired(
+                cmd, timeout, output=decode(out), stderr=decode(err))
+
+        retcode = proc.poll()
+        completed = subprocess.CompletedProcess(cmd, retcode, decode(out), decode(err))
+        if check and retcode:
+            raise subprocess.CalledProcessError(retcode, cmd, completed.stdout, completed.stderr)
+        return completed
+    finally:
+        _win_close_handle(job)
+        for _f in (out_f, err_f, in_f):
+            try:
+                if _f is not None:
+                    _f.close()
+            except Exception:
+                pass
+
+
+def _read_temp(f):
+    """Rewind a capture temp file and return its bytes; None if there is no file.
+
+    Never raises: a capture file that cannot be read back becomes b"" rather than taking down
+    the call, which matches the module's 'a garbled byte beats losing the whole output' floor.
+    """
+    if f is None:
+        return None
+    try:
+        f.flush()
     except Exception:
         pass
     try:
-        out, err = proc.communicate(input=stdin_input, timeout=timeout)
-    except subprocess.TimeoutExpired:
-        # Kill the whole tree so the grandchildren release the pipe write ends; THEN
-        # communicate() again so the reader threads reach EOF and are joined -- not left
-        # parked. Bounded so a wedged kill cannot itself hang the server.
-        if job is not None:
-            _win_terminate_job(job)
-        else:
-            kill_tree(proc, wait_s=5)
-        try:
-            out, err = proc.communicate(timeout=5)
-        except Exception:
-            # Last resort: detach the pipes so the readers are not waited on forever here.
-            out, err = None, None
-            for stream in (proc.stdout, proc.stderr):
-                try:
-                    if stream is not None:
-                        stream.close()
-                except Exception:
-                    pass
-        _win_close_handle(job)
-        raise subprocess.TimeoutExpired(cmd, timeout, output=out, stderr=err)
-    _win_close_handle(job)
-    retcode = proc.poll()
-    completed = subprocess.CompletedProcess(cmd, retcode, decode(out), decode(err))
-    if check and retcode:
-        raise subprocess.CalledProcessError(retcode, cmd, completed.stdout, completed.stderr)
-    return completed
+        f.seek(0)
+        return f.read()
+    except Exception:
+        return b""
 
 
 def headless_creationflags() -> int:
