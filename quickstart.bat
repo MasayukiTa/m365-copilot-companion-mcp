@@ -181,7 +181,18 @@ if errorlevel 1 (
 )
 
 if defined DO_PULL (
-    git !QS_GIT_PROXY! pull --ff-only
+    REM REUSE THE RECOVERY (gap 2026-11-10). Plain `git pull --ff-only` fails
+    REM FOREVER on a clone whose upstream main was force-pushed -- and then the
+    REM run kept going on the OLD code. start_all.ps1 (Check-ForUpdates) already
+    REM recovers that exact shape via scripts/update_recovery.ps1; this wrapper
+    REM runs the SAME code: it computes behind/ahead/canFF, and on a rewritten or
+    REM diverged upstream it does the guided reset (backs HEAD up to a
+    REM backup/pre-reset-* branch and stashes local work first), else it falls
+    REM back to the same `git pull --ff-only` as before. QS_GIT_PROXY is forwarded
+    REM as one string so the wrapper's own git calls reach the network the same way.
+    REM Contract: exit 0 = updated (or already current) -> stop after this; any
+    REM other exit = update did not complete -> keep running the current code.
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\quickstart_update.ps1" -RepoRoot "%~dp0." -GitProxyArg "!QS_GIT_PROXY!"
     REM READ THE RESULT. A pull that fails -- dirty tree, diverged branch, no network -- printed
     REM its error among everything else and the run carried on, so the operator believed they
     REM were current while running the old code.
