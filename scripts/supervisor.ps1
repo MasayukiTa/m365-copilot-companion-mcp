@@ -3601,6 +3601,203 @@ function Invoke-FleetReap {
     } catch { }
 }
 
+# -- DEAD RUNNER WITH UNFINISHED WORK: respawn it (design gap measured 2026-11-10) -----------
+# relay/fleet_runner.py exited at ~04:52 with an uncaught FleetRecoveryTimeout (a hard_reset
+# that did not return within 60s). PR 528 fixes THAT crash, but any other uncaught exception in
+# the runner has the same consequence: the process is gone. The supervisor kept main.py alive
+# (it restarts the server) but NOTHING restarted the runner, and .fleet/status.json went on
+# saying running=true / recovering=true / pending=33 for 18 minutes until an unrelated new goal
+# happened to start fleet_runner and resume the old workers.
+#
+# Invoke-FleetAutoResume (above) is NOT enough on its own: it resumes from a run MARKER whose
+# pid is dead (a reboot that left a marker behind). It does not fire when the runner process is
+# simply ABSENT while the run STATE still shows unfinished work -- the marker may already have
+# been reaped, or status.json / the task state is the only thing that still says "not done".
+# So this is a SECOND, independent trigger, placed right AFTER Invoke-FleetReap (which turns a
+# dead coordinator's marker into a pending snapshot) and running every tick.
+#
+# The decision is the pure module scripts/supervisor_runner_respawn.py, reached the same
+# cross-language way the other supervisor gates reach their Python deciders (& $Py -c with the
+# module and function both named, so tools/unreached.py credits the caller). The backoff (>= 30s
+# between respawns) and the cap (<= 5 per 10 minutes) live in that module and stop a crash loop
+# from thrashing; this supervisor keeps the timestamps of its own respawns and passes them in.
+$script:RunnerRespawnHistory = New-Object System.Collections.Generic.List[double]
+
+function Test-FleetHasUnfinishedWork {
+    # Does .fleet\status.json show work that is not done? True when the run is running and the
+    # workers are not all done, OR it is recovering, OR there is pending/queued work. A missing
+    # or unreadable status.json is NOT unfinished work (there is no run to bring back) -> false,
+    # so an absent runner with no state is left alone. Never throws.
+    try {
+        $statusPath = Join-Path $Root ".fleet\status.json"
+        if (-not (Test-Path -LiteralPath $statusPath)) { return $false }
+        $s = Read-JsonFileUtf8 -Path $statusPath
+        if (-not $s) { return $false }
+        # SINGLE SOURCE OF TRUTH: ask the pure core supervisor_runner_respawn.status_json_has_unfinished_work
+        # the same cross-language way the other supervisor gates reach their deciders (& $Py -c with
+        # the module AND the function named, so tools/unreached.py credits this caller and the Python
+        # rule and this PowerShell cannot drift). The core reads the REAL worker shape (status string
+        # + closed bool). Only if that call cannot answer (python/venv not ready, parse error) does the
+        # native fallback below run, so a tick is never blind.
+        try {
+            $py = $script:Py
+            if (-not $py) { $py = $Py }
+            $coreOut = ([string](& $py -c "import sys, json; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.status_json_has_unfinished_work(json.load(open(r'$statusPath', encoding='utf-8'))))" 2>$null)).Trim()
+            if ($coreOut -eq 'True') { return $true }
+            if ($coreOut -eq 'False') { return $false }
+        } catch { }
+        # --- Native fallback (kept byte-for-byte equivalent to the core) ---
+        # recovering=true is unfinished work on its own (the 18-minute stuck state in the GOAL).
+        if ($s.recovering -eq $true) { return $true }
+        $running = ($s.running -eq $true)
+        if (-not $running) { return $false }
+        # Running AND something still to do. pending/queued when present; else workers not all
+        # done; else total greater than done_count. Any one is enough.
+        try { if ($null -ne $s.pending -and [int]$s.pending -gt 0) { return $true } } catch { }
+        try { if ($null -ne $s.queued -and [int]$s.queued -gt 0) { return $true } } catch { }
+        $workers = @()
+        try { if ($s.workers) { $workers = @($s.workers) } } catch { $workers = @() }
+        if ($workers.Count -gt 0) {
+            # THE REAL WORKER SHAPE. A .fleet\status.json worker is a string field
+            # `status` (done, stuck, waiting, ready, refuting, awaiting_children,
+            # cancelled) plus a boolean field `closed` -- NOT `done`/`state`. A worker
+            # is FINISHED when closed is true OR status is one of done/cancelled/stuck
+            # (a closed stuck worker is finished work here); UNFINISHED only when closed
+            # is false AND status is anything else. (The old code read `done`/`state`,
+            # which no real worker carries, so every worker looked unfinished and an idle
+            # runner was respawned forever.) This mirrors the pure core in
+            # scripts/supervisor_runner_respawn.py, whose worker_is_finished and
+            # status_json_has_unfinished_work encode exactly this rule and are the one
+            # tested place the key names live, so this reader and that module cannot drift.
+            $finishedStatuses = @('done', 'cancelled', 'stuck')
+            foreach ($w in $workers) {
+                $finished = $false
+                try {
+                    if ($w.closed -eq $true) {
+                        $finished = $true
+                    } else {
+                        $st = ([string]$w.status).Trim().ToLowerInvariant()
+                        if ($st -and ($finishedStatuses -contains $st)) { $finished = $true }
+                    }
+                } catch { $finished = $false }
+                if (-not $finished) { return $true }
+            }
+            # running with workers, all of them finished -> nothing unfinished.
+            return $false
+        }
+        # Running with no worker list: fall back to the done/total counters.
+        try {
+            if ($null -ne $s.total -and $null -ne $s.done_count -and [int]$s.total -gt [int]$s.done_count) { return $true }
+        } catch { }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+function Write-RunnerRespawnLog {
+    # One JSONL line per respawn in the SAME place and style as Write-MainLaunchLog
+    # (.fleet\main_launch_log.jsonl). Best-effort inside try/catch: recording a respawn must
+    # never be able to stop it. reason names this trigger so an unexplained runner relaunch can
+    # be attributed and told apart from the server's own (re)launches.
+    param([string]$Reason, $NewPid)
+    try {
+        $fleetDir = Join-Path $Root ".fleet"
+        if (-not (Test-Path -LiteralPath $fleetDir)) { New-Item -ItemType Directory -Force $fleetDir | Out-Null }
+        $logPath = Join-Path $fleetDir "main_launch_log.jsonl"
+        $rec = [PSCustomObject][ordered]@{
+            time           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            supervisor_pid = $PID
+            kind           = 'fleet_runner_respawn'
+            new_pid        = $NewPid
+            reason         = $Reason
+        }
+        $line = $rec | ConvertTo-Json -Compress
+        if ($line.Length -gt 2048) { $line = $line.Substring(0, 2048) }
+        Add-Content -Path $logPath -Value $line -Encoding UTF8
+        try {
+            if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 5242880)) {
+                $keep = Get-Content -LiteralPath $logPath -Tail 500 -ErrorAction Stop
+                Set-Content -Path $logPath -Value $keep -Encoding UTF8
+            }
+        } catch { }
+    } catch { }
+}
+
+function Get-RunnerRespawnDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c with
+    # the module and function both named, so tools/unreached.py credits this caller and the two
+    # cannot drift): one word from (runner alive, unfinished work, respawn history, now). Any
+    # failure returns "" so the caller falls back to doing nothing rather than respawning on an
+    # error.
+    param([bool]$RunnerAlive, [bool]$HasWork, [double[]]$History, [double]$Now)
+    $aliveArg = if ($RunnerAlive) { "True" } else { "False" }
+    $workArg = if ($HasWork) { "True" } else { "False" }
+    $histArg = "[" + (($History | ForEach-Object { [string][double]$_ }) -join ",") + "]"
+    $nowArg = [string][double]$Now
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.decide_runner_respawn($aliveArg, $workArg, respawn_history=$histArg, now=$nowArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Invoke-FleetRunnerRespawnCheck {
+    # Once per tick, AFTER Invoke-FleetReap. If a fleet_runner of this checkout is ABSENT and the
+    # run state shows unfinished work, ask the pure decider (backoff + cap) and, on "respawn",
+    # start exactly one fresh runner with --resume, register it for exit reporting, and log the
+    # reason in .fleet\main_launch_log.jsonl style. Never throws.
+    try {
+        $runnerAlive = (@(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count -gt 0)
+        # A resume this supervisor already launched but whose marker is not yet written also
+        # counts as a live runner: do not start a second one on top of it.
+        if (-not $runnerAlive -and $script:ResumedFleet) {
+            try { $script:ResumedFleet.Proc.Refresh(); if (-not $script:ResumedFleet.Proc.HasExited) { $runnerAlive = $true } } catch { }
+        }
+        $hasWork = Test-FleetHasUnfinishedWork
+        # Quick exit WITHOUT spawning python for the decider on the common tick (runner alive, or
+        # nothing to do).
+        if ($runnerAlive -or -not $hasWork) { return }
+        $now = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $decision = Get-RunnerRespawnDecision -RunnerAlive $false -HasWork $true `
+            -History ($script:RunnerRespawnHistory.ToArray()) -Now $now
+        if ($decision -ne "respawn") {
+            if ($decision -eq "backoff" -or $decision -eq "cap") {
+                Write-FleetResumeLog -Once -Key "runner_respawn:$decision" -Msg ("fleet runner is absent with unfinished work, but a respawn is held off ($decision): " +
+                    "min interval " + [int](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.MIN_RESPAWN_INTERVAL_SECONDS)" 2>$null) + "s, cap 5 per 10 min")
+            }
+            return
+        }
+        # Prefer resuming an interrupted run if the existing auto-resume can (it carries the
+        # loop-guard and the resume lineage). If it did, it already started a runner -- done.
+        if (Invoke-FleetAutoResume -FromCycle -ForceEnabled:$FleetCycleResumeLive) {
+            $script:RunnerRespawnHistory.Add($now)
+            Write-RunnerRespawnLog -Reason "runner absent with unfinished work; resumed interrupted run" -NewPid $null
+            return
+        }
+        # No marker/snapshot to resume from, but status.json still shows unfinished work and no
+        # runner is alive: start a fresh coordinator with --resume so it adopts the live workers
+        # and the existing .fleet state rather than beginning a new run.
+        Update-PythonInterpreter "the fleet runner respawn"
+        try {
+            $respawnAt = Get-Date
+            $proc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner", "--resume")) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+            $script:RunnerRespawnHistory.Add($now)
+            if ($proc) { $script:ResumedFleet = @{ Proc = $proc; OldPid = 0 } }
+            Register-AutoResumeRunner -Proc $proc -LaunchTime $respawnAt -Kind "fleet-respawn" `
+                -CommandLine ('"' + $Py + '" -m relay.fleet_runner --resume')
+            Write-Log "fleet runner was absent with unfinished work (status.json running/pending) -- respawned with --resume"
+            Write-RunnerRespawnLog -Reason "runner absent with unfinished work; no marker -- started fresh --resume runner" -NewPid $(if ($proc) { $proc.Id } else { $null })
+        } catch {
+            Write-Log "fleet runner respawn FAILED to relaunch: $($_.Exception.Message)"
+        }
+    } catch {
+        Write-Log "fleet runner respawn check failed: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-QueueDrain {
     # Drain the typed-job queue. An agent reaching the MCP server can hand this machine a goal
     # (tools/fleet_intake.fleet_submit), and until something calls the router that goal just
@@ -3942,6 +4139,13 @@ while ($true) {
     Invoke-ReviewAutoResume | Out-Null
     Invoke-LocalLoopCampaignDrain | Out-Null
     Invoke-LocalLoopAutoResume | Out-Null
+
+    # A fleet runner that is ABSENT while the run state still shows unfinished work is respawned
+    # here -- the design gap measured 2026-11-10, where the runner crashed and nothing brought it
+    # back for 18 minutes. Runs AFTER Invoke-FleetReap (which turns a dead coordinator's marker
+    # into a pending snapshot) and cheap on the common tick (no python unless the runner is gone
+    # and there is unfinished work). Backoff and cap live in scripts/supervisor_runner_respawn.py.
+    Invoke-FleetRunnerRespawnCheck
 
     # Keep the disk-series sampler alive: relaunch it if it has exited since the last tick. Cheap
     # when it is already running (one HasExited read).
