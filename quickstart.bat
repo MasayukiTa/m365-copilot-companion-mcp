@@ -183,7 +183,7 @@ if errorlevel 1 (
 if defined DO_PULL (
     REM REUSE THE RECOVERY (gap 2026-11-10). Plain `git pull --ff-only` fails
     REM FOREVER on a clone whose upstream main was force-pushed -- and then the
-    REM run kept going on the OLD code. start_all.ps1 (Check-ForUpdates) already
+    REM run kept going on the OLD code. The updater (Check-ForUpdates) already
     REM recovers that exact shape via scripts/update_recovery.ps1; this wrapper
     REM runs the SAME code: it computes behind/ahead/canFF, and on a rewritten or
     REM diverged upstream it does the guided reset (backs HEAD up to a
