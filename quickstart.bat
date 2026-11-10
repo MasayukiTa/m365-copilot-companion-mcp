@@ -181,16 +181,20 @@ if errorlevel 1 (
 )
 
 if defined DO_PULL (
-    git !QS_GIT_PROXY! pull --ff-only
-    REM READ THE RESULT. A pull that fails -- dirty tree, diverged branch, no network -- printed
-    REM its error among everything else and the run carried on, so the operator believed they
-    REM were current while running the old code.
-    if errorlevel 1 (
-        echo.
-        echo   UPDATE FAILED -- this checkout is still on the older version. The error is just
-        echo   above. Everything below continues to run from the code you have now.
-    ) else (
-        REM AND A SUCCESSFUL PULL REWRITES THIS FILE WHILE CMD IS EXECUTING IT. cmd resumes a
+    REM REUSE THE FORCE-PUSH RECOVERY start_all.ps1 USES. A plain `git pull --ff-only` fails
+    REM forever on a REWRITTEN UPSTREAM (the project's main was once force-pushed, so an old
+    REM clone is behind AND ahead and cannot fast-forward) -- and the run then kept executing
+    REM the OLD code, failing later in scripts\bootstrap.py STEP 1/7. The wrapper dot-sources
+    REM scripts\update_recovery.ps1, classifies the checkout exactly as start_all.ps1 does, and
+    REM runs Invoke-RewrittenUpstreamRecovery for a rewritten/diverged upstream, else ff-only.
+    REM Its exit codes: 0 = an update was applied (this file may have just been rewritten --
+    REM STOP), 3 = already up to date (continue), anything else = could not update (continue on
+    REM the current code and say so). The proxy git uses (QS_GIT_PROXY, built above) is passed
+    REM through so the same proxy reaches the wrapper's fetch/pull.
+    powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\quickstart_update.ps1" -RepoRoot "%~dp0." -GitProxyArg "!QS_GIT_PROXY!"
+    set "QS_UPD_RC=!ERRORLEVEL!"
+    if "!QS_UPD_RC!"=="0" (
+        REM A SUCCESSFUL UPDATE REWRITES THIS FILE WHILE CMD IS EXECUTING IT. cmd resumes a
         REM batch file from a byte offset after every line, so replacing it underneath a running
         REM instance continues at whatever now occupies that offset -- a partial line, the middle
         REM of another block, or nothing. Undefined, and silent. Stopping is the only safe move
@@ -203,11 +207,19 @@ if defined DO_PULL (
         echo   continue in this window. Nothing is lost -- it resumes where it left off.
         echo.
         REM INLINE, NOT `call :release_lock`: a call looks its label up in the file on disk,
-        REM which is now the NEW file. This whole block was parsed before the pull, so a command
-        REM written here is safe; a jump is not.
+        REM which is now the NEW file. This whole block was parsed before the update, so a
+        REM command written here is safe; a jump is not.
         powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0scripts\quickstart_lock.ps1" release >nul 2>nul
         pause
         exit /b 0
+    )
+    if not "!QS_UPD_RC!"=="3" (
+        REM READ THE RESULT. An update that could not be applied -- dirty tree a recovery could
+        REM not stash, no network, recovery reset failed -- must not be mistaken for "up to
+        REM date": the run carries on from the code it has now, and says so plainly.
+        echo.
+        echo   UPDATE FAILED -- this checkout is still on the older version. The reason is just
+        echo   above. Everything below continues to run from the code you have now.
     )
 )
 

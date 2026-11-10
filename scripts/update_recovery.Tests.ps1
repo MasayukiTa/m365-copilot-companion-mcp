@@ -170,3 +170,127 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
         Assert-Equal ((& git -C $client rev-parse $result.StashRef).Trim()) $result.StashRef
     }
 }
+
+Describe "quickstart_update.ps1 wrapper" {
+    # These exercise the actual wrapper quickstart.bat calls, as a real child process, so the
+    # exit-code contract quickstart.bat depends on (0 = applied/stop, 3 = up to date/continue,
+    # 1 = could not update) is verified end to end -- not just the library functions it reuses.
+    BeforeAll {
+        $script:WrapperPath = Join-Path $PSScriptRoot "quickstart_update.ps1"
+
+        function Assert-Equal($Actual, $Expected) {
+            if ($Actual -ne $Expected) {
+                throw "Expected <$Expected>, got <$Actual>"
+            }
+        }
+
+        function Set-TestFile([string]$Path, [string]$Text) {
+            $parent = Split-Path -Parent $Path
+            if ($parent -and -not (Test-Path $parent)) {
+                New-Item -ItemType Directory -Force -Path $parent | Out-Null
+            }
+            [System.IO.File]::WriteAllText(
+                $Path,
+                $Text,
+                (New-Object System.Text.UTF8Encoding($false))
+            )
+        }
+
+        function Initialize-TestRepo([string]$Path) {
+            New-Item -ItemType Directory -Force -Path $Path | Out-Null
+            & git init --quiet $Path
+            & git -C $Path config user.name "Update Recovery Test"
+            & git -C $Path config user.email "update-recovery@example.invalid"
+        }
+
+        # Run the wrapper as a genuine separate powershell process against $Client and return its
+        # integer exit code. A child process is used deliberately: the wrapper's whole contract
+        # with quickstart.bat is its PROCESS exit code, which an in-process dot-source cannot test.
+        function Invoke-Wrapper([string]$Client) {
+            $exe = (Get-Process -Id $PID).Path
+            if (-not $exe) { $exe = "powershell.exe" }
+            & $exe -NoProfile -ExecutionPolicy Bypass -File $script:WrapperPath -RepoRoot $Client | Out-Null
+            return $LASTEXITCODE
+        }
+    }
+
+    BeforeEach {
+        $caseRoot = Join-Path $TestDrive ([guid]::NewGuid().ToString("N"))
+        $remote = Join-Path $caseRoot "remote.git"
+        $oldSource = Join-Path $caseRoot "old-source"
+        $client = Join-Path $caseRoot "client"
+
+        & git init --quiet --bare $remote
+
+        Initialize-TestRepo $oldSource
+        Set-TestFile (Join-Path $oldSource "version.txt") "old-base"
+        & git -C $oldSource add version.txt
+        & git -C $oldSource commit --quiet -m "old base"
+        Set-TestFile (Join-Path $oldSource "version.txt") "old-tip"
+        & git -C $oldSource commit --quiet -am "old tip"
+        & git -C $oldSource branch -M main
+        & git -C $oldSource remote add origin $remote
+        & git -C $oldSource push --quiet -u origin main
+        & git --git-dir=$remote symbolic-ref HEAD refs/heads/main
+
+        & git clone --quiet $remote $client
+        & git -C $client config user.name "Update Recovery Client"
+        & git -C $client config user.email "update-client@example.invalid"
+        $script:oldClientSha = (& git -C $client rev-parse HEAD).Trim()
+        $script:client = $client
+        $script:remote = $remote
+        $script:oldSource = $oldSource
+    }
+
+    It "recovers a rewritten upstream and lands HEAD on origin/main (exit 0)" {
+        # Replace remote main with an unrelated clean history, then add a newer commit, so the
+        # client is behind AND ahead and cannot fast-forward -- the real force-push shape.
+        $rewriteSource = Join-Path (Split-Path -Parent $script:client) "rewrite-source"
+        Initialize-TestRepo $rewriteSource
+        Set-TestFile (Join-Path $rewriteSource "version.txt") "clean-base"
+        & git -C $rewriteSource add version.txt
+        & git -C $rewriteSource commit --quiet -m "clean rewritten base"
+        Set-TestFile (Join-Path $rewriteSource "version.txt") "clean-latest"
+        & git -C $rewriteSource commit --quiet -am "clean latest"
+        & git -C $rewriteSource branch -M main
+        & git -C $rewriteSource remote add origin $script:remote
+        & git -C $rewriteSource push --quiet --force origin main
+
+        $rc = Invoke-Wrapper $script:client
+
+        Assert-Equal $rc 0
+        Assert-Equal `
+            ((& git -C $script:client rev-parse HEAD).Trim()) `
+            ((& git -C $script:client rev-parse "@{u}").Trim())
+        Assert-Equal (Get-Content (Join-Path $script:client "version.txt") -Raw).Trim() "clean-latest"
+        # The pre-reset HEAD is preserved on a backup branch -- nothing is lost.
+        $backups = @(& git -C $script:client branch --list "backup/pre-reset-*")
+        Assert-Equal ($backups.Count -ge 1) $true
+    }
+
+    It "fast-forwards a plain behind checkout and lands HEAD on origin/main (exit 0)" {
+        # Add one ordinary commit to remote main on the SAME history, so the client is purely
+        # behind and a fast-forward is possible.
+        Set-TestFile (Join-Path $script:oldSource "version.txt") "old-newer"
+        & git -C $script:oldSource commit --quiet -am "newer on same history"
+        & git -C $script:oldSource push --quiet origin main
+
+        $rc = Invoke-Wrapper $script:client
+
+        Assert-Equal $rc 0
+        Assert-Equal `
+            ((& git -C $script:client rev-parse HEAD).Trim()) `
+            ((& git -C $script:client rev-parse "@{u}").Trim())
+        Assert-Equal (Get-Content (Join-Path $script:client "version.txt") -Raw).Trim() "old-newer"
+        # A plain fast-forward takes no recovery path, so it leaves no backup branch.
+        $backups = @(& git -C $script:client branch --list "backup/pre-reset-*")
+        Assert-Equal $backups.Count 0
+    }
+
+    It "reports up to date without changing anything (exit 3)" {
+        $rc = Invoke-Wrapper $script:client
+
+        Assert-Equal $rc 3
+        Assert-Equal ((& git -C $script:client rev-parse HEAD).Trim()) $script:oldClientSha
+    }
+}
