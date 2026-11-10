@@ -6,7 +6,7 @@ claims (example_D1/D3/D4/K1/P1/P2) is left to the agent; and if past analysis re
 sessions DB, the harness should be able to read them. The 679-group_a v6 report (defect#3) found
 the engine's D gate could not line up the lock time with the round-4 data fetch time because
 the data was absent from the engine manifest, and that every claim carried
-LOT_INDEPENDENCE_NOT_CHECKED.
+GROUP_INDEPENDENCE_NOT_CHECKED.
 
 WHAT THIS FILE IS, AND IS NOT. The verdict engine itself lives OUTSIDE this public repository
 (Desktop/AHA資料_参照一式/証明/公開データ検証/engine_v1_8c2), is a SECRET folder, has no git
@@ -18,7 +18,7 @@ holds only the parts that can live in the open:
   (a) record_manifest()   -- write the data + result sha256 into a manifest at analysis time;
   (b) register_and_lock()  -- register a claim and lock it, recording the register-vs-fetch
                              time order so the D gate can check it;
-      lot_independence_check() -- a DIAGNOSTIC for LOT_INDEPENDENCE_NOT_CHECKED. It NEVER
+      lot_independence_check() -- a DIAGNOSTIC for GROUP_INDEPENDENCE_NOT_CHECKED. It NEVER
                              changes a verdict or a threshold; it only reports.
 
 Data minimisation: no raw measurement row and no employee id is ever read or returned. The
@@ -308,7 +308,7 @@ def register_and_lock(root: str, *, claim: dict, data_fetched_at: str,
 
 # ---------------------------------------------------------------------------- diagnostic
 def lot_independence_check(*, y, x, lot) -> dict:
-    """DIAGNOSTIC for LOT_INDEPENDENCE_NOT_CHECKED. Reports whether the exposure can be told
+    """DIAGNOSTIC for GROUP_INDEPENDENCE_NOT_CHECKED. Reports whether the exposure can be told
     apart from the lot; it NEVER changes a verdict or a threshold.
 
     Reports:
