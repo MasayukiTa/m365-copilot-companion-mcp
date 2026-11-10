@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
-"""Failing-first tests for the final-step validity-judge harness (owner task 2026-10-27,
-re-scoped 2026-10-30).
+"""Failing-first tests for the final-step validity-judge harness.
 
-OWNER INSTRUCTION (2026-10-27, verbatim): 「データ解析系は、すべて最終でこの判定器を通す
-ハーネスを入れ、databricks を圧倒す。これが先週与えたタスクだ。」
+PURPOSE: every data-analysis final answer is routed through the frozen validity engine before
+delivery, so a quantitative claim is not shipped without a recorded verdict.
 
 WHAT THIS PINS. relay/judge_gate.py is the orchestration seam that makes every DATA-ANALYSIS
 goal pass through the frozen validity engine before its final answer is delivered:
@@ -62,7 +61,7 @@ def test_non_analysis_goals_are_not_flagged(goal):
 
 def test_misclassification_examples_are_documented():
     """The module must spell out borderline MISCLASSIFICATION cases so the boundary is a
-    decision, not an accident (owner: write the rule and its failure examples)."""
+    decision, not an accident: the rule and its failure examples are written out explicitly."""
     text = (jg.MISCLASSIFICATION_NOTE or "")
     assert isinstance(text, str) and len(text) >= 80
     # names at least one false-positive and one false-negative shape

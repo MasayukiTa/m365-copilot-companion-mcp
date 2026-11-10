@@ -2,7 +2,7 @@
 """Tests for relay.stratified_estimate -- the default WITHIN-stratum analysis used once a
 comparison's design has been judged to hold.
 
-These tests assert the three things the owner's objection makes load-bearing:
+These tests assert the three things the confounding concern makes load-bearing:
   * a shared stratum with enough lots in BOTH groups is pooled, and the pooled contrast lies
     between the per-stratum contrasts (it is a weighted average, not a pooled-confounded number);
   * a stratum with fewer than k_min lots in either group is reported with reason='below_k_min'

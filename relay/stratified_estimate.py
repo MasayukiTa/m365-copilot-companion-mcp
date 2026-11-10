@@ -3,7 +3,7 @@
 hold (i.e. both groups share strata with enough lots each).
 
 WHY THIS MODULE EXISTS.
-  The owner's standing objection (2026-11-03..04) is that comparing two exposure groups whose
+  The confounding concern this addresses is that comparing two exposure groups whose
   PRODUCTS (the product grade; the concrete domain name is kept in gitignored .config/domain_terms.json)
   differ cannot separate an equipment effect from a product effect. The
   design-check seam (confound_gate / judge footer, implemented elsewhere) BLOCKS such a
@@ -37,7 +37,7 @@ from __future__ import annotations
 from collections import defaultdict
 
 #: Default minimum lots PER GROUP WITHIN A STRATUM for that stratum to be pooled. This mirrors
-#: the engine's k_min (8) by owner instruction -- it is NOT the engine's threshold and does not
+#: the engine's k_min (8) to stay consistent with it -- it is NOT the engine's threshold and does not
 #: change it; it only decides stratum eligibility here. Do not lower it.
 DEFAULT_K_MIN = 8
 
