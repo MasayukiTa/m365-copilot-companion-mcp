@@ -11,6 +11,6 @@ never modified or copied. See README.md for the full design.
 
 from __future__ import annotations
 
-SCHEMA_VERSION = 1
+SCHEMA_REVISION = 1
 
-__all__ = ["SCHEMA_VERSION"]
+__all__ = ["SCHEMA_REVISION"]
