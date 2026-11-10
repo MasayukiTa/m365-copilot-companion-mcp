@@ -104,7 +104,7 @@ partial class ChatWindow
                 // A socket-driven fleet worker never gets a conv_url: relay_fleet.py's
                 // _capture_url only ever fires when the worker holds a browser `page`, and a
                 // socket worker's page is None by construction (MCP_FLEET_SOCKET has defaulted
-                // on since 2026-08-21). Requiring url here silently dropped every such worker
+                // on by default). Requiring url here silently dropped every such worker
                 // from the ONLY live-update path -- DiscoverTranscripts only runs once, at
                 // startup, capped at 80 -- so the fleet section froze at whatever that one scan
                 // found and never grew again. transcript alone is already a valid identity for
