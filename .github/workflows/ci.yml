@@ -573,6 +573,7 @@ jobs:
             scripts/test_install_path_python_version.py \
             scripts/test_install_path_powershell.py \
             scripts/test_install_path_batch.py \
+            scripts/test_venv_probe_timeout.py \
             tools/test_file_scope_fails_closed.py \
             scripts/test_repair_unlock_output.py \
             scripts/test_repair_children_are_windowless.py \
