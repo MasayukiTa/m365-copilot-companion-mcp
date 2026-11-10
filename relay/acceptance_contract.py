@@ -59,7 +59,7 @@ except Exception:                                  # pragma: no cover - import-o
     _invariants = None
     _INV_CONTRACT_INTACT = ""
 
-SCHEMA_VERSION = 1
+CONTRACT_VERSION = 1
 
 
 def _canonical(payload: dict) -> str:
@@ -93,7 +93,7 @@ def build(task: str, goal: str = "", checks=None, cwd: str = "",
             "expect": str(c.get("expect") or "exit_zero"),
         })
     payload = {
-        "schema": SCHEMA_VERSION,
+        "schema": CONTRACT_VERSION,
         "task": str(task or ""),
         "goal_sha16": hashlib.sha256((goal or "").encode("utf-8")).hexdigest()[:16],
         "cwd": str(cwd or ""),
