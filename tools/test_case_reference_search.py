@@ -1,13 +1,13 @@
 from tools.search_ops import case_reference_search
 
-GOAL = "sampleuser_679defectA_study　study this"
+GOAL = "sampleuser_679group_a_study　study this"
 
 
 def test_reference_finds_folder_and_request_only(tmp_path):
-    case = tmp_path / "sampleuser_679defectA_study"
+    case = tmp_path / "sampleuser_679group_a_study"
     case.mkdir()
     (case / "やりたいこと.txt").write_text("設備と材料を調べる", encoding="utf-8")
-    (tmp_path / "sampleuser_679defectB_study").mkdir()
+    (tmp_path / "sampleuser_679group_b_study").mkdir()
     (tmp_path / "795Gプロジェクト.txt").write_text("679", encoding="utf-8")
     result = case_reference_search(GOAL, [tmp_path])
     assert not result["errors"] and not result["truncated"]

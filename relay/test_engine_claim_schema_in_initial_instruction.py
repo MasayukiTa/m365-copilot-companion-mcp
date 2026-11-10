@@ -60,7 +60,7 @@ def test_composed_goal_in_relay_fleet_embeds_the_same_single_source():
 def _free_text_claim():
     """A worker's FREE-TEXT registration claim: it has a marker (statement) and none of the
     engine's structured keys beyond id, so the schema screen fires."""
-    return {"id": "SYN1", "statement": "defectA rate differs between lots", "data_location": "data.csv"}
+    return {"id": "SYN1", "statement": "group_a rate differs between lots", "data_location": "data.csv"}
 
 
 def test_first_correction_carries_full_shapes_second_names_only_missing(tmp_path, monkeypatch):

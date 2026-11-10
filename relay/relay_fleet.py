@@ -8598,7 +8598,7 @@ class RelayWorker:
                                       RelayWorker._judge_tool_names(self))
                 _answer = getattr(self, "_candidate_done_reply", "") or self.last_response or ""
                 # The requester's own words (goal + resolved request text) name the case: a
-                # digit run that is part of an identifier there ("679" of "679defectA_study",
+                # digit run that is part of an identifier there ("679" of "679group_a_study",
                 # "esyn_v01") is not a computed result, so the gate must not police it when it
                 # appears glued to a letter/CJK/path character in the answer. A quantity form
                 # ("679 件", "679%") is still policed. See analysis_provenance.extract_numbers.
