@@ -1072,6 +1072,46 @@ function Write-ForeignPortHolderLog {
 }
 $script:VerifiedServerPid = 0
 
+# HANG DETECTION CLOCK. Wall-clock time /health last answered 200 with this checkout's body.
+# $null = it has not answered since this supervisor (re)started tracking. The main loop stamps
+# it on every tick Test-ServerUp returns $true, and reads its age to decide a HANG restart
+# (scripts/supervisor_hang_detect.decide_hang_restart) -- a wedged loop that keeps the port
+# LISTENING but never answers /health again, which the slowness-tolerant strike debounce is
+# too patient about. See the 2-minute hang gate in the health-check loop below.
+$script:LastHealthOkAt = $null
+
+# Set when a hang restart begins (the stop/relaunch), cleared on the first tick /health answers
+# 200 again -- the window used to measure and log stop->recovery time. $null = no restart in flight.
+$script:HangRestartStartedAt = $null
+
+# THE HANG WINDOW, read once from the same Python module that owns the pure gate so the number
+# lives in one place (HANG_THRESHOLD_SECONDS). Falls back to 120 (= the operator's 2-minute
+# ceiling) if the read fails for any reason, rather than wedging.
+$script:HangThresholdSeconds = 120
+try {
+    $__hts = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_hang_detect; print(supervisor_hang_detect.HANG_THRESHOLD_SECONDS)" 2>$null)).Trim()
+    if ($__hts -match '^\d+$') { $script:HangThresholdSeconds = [int]$__hts }
+} catch { }
+
+# THE HANG GATE, PURE AND TESTED: scripts/supervisor_hang_detect.decide_hang_restart decides
+# "restart" vs "wait" from (last_ok_age_s, listening, own_main_py_alive, booting). Called the
+# same way the other supervisor gates reach their Python deciders (& $Py -c with the module and
+# function both named, so tools/unreached.py credits the cross-language call). Returns "restart"
+# or "wait"; any failure returns "wait" so a broken bridge can never manufacture a kill.
+function Invoke-HangRestartDecision($lastOkAgeSeconds, $listening, $ownMainPyAlive, $booting) {
+    $aa = if ($null -eq $lastOkAgeSeconds) { "None" } else { ([string][double]$lastOkAgeSeconds) }
+    $la = if ($listening) { "True" } else { "False" }
+    $oa = if ($ownMainPyAlive) { "True" } else { "False" }
+    $ba = if ($booting) { "True" } else { "False" }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_hang_detect; print(supervisor_hang_detect.decide_hang_restart($aa, $la, $oa, $ba, $($script:HangThresholdSeconds)))" 2>$null)).Trim()
+    } catch {
+        return "wait"
+    }
+    if ($out -ne "restart") { return "wait" }
+    return "restart"
+}
+
 function Test-ServerUp {
     # A TCP-only connect check cannot detect the failure mode where the port stays
     # LISTENING but the asyncio event loop is dead (every request times out, CLOSE_WAIT
@@ -2099,6 +2139,7 @@ function Get-LaunchReason {
     if ($Cause -eq 'initial') { return 'never_started' }
     if ($Cause -eq 'manual_script') { return 'manual_script' }
     if ($Cause -eq 'health_strike') { return ("health_failed_{0}_times" -f $StrikeCount) }
+    if ($Cause -eq 'hang') { return ("hang_no_health_{0}s" -f $StrikeCount) }
     # vanished or an unlabelled restart: classify by how the previous process ended.
     if ($PrevHasExited -eq $true) {
         if ($null -eq $PrevExitCode) { return 'killed_externally_no_exit_code' }
@@ -3955,6 +3996,15 @@ while ($true) {
 
     if (Test-ServerUp) {
         $serverMiss = 0
+        # HANG CLOCK: /health answered 200 this tick -> the loop is alive; reset the silence clock.
+        $script:LastHealthOkAt = Get-Date
+        # RESTART-TIME MEASUREMENT: if a hang (or any) restart is in flight, this is the first
+        # tick /health came back. Report how long stop->/health-200 took, then clear the mark.
+        if ($script:HangRestartStartedAt) {
+            $recovered = ((Get-Date) - $script:HangRestartStartedAt).TotalSeconds
+            Write-Log ("hang restart complete: /health answered 200 {0:N1}s after the stop/relaunch began" -f $recovered)
+            $script:HangRestartStartedAt = $null
+        }
         # The planned-transition marker is useful only while the replacement server is absent.
         # Clear any old marker first; Invoke-StaleServerCycle may immediately publish a fresh one.
         Clear-ServerTransition
@@ -3994,6 +4044,27 @@ while ($true) {
             Write-Log ("server not listening yet ({0}); main.py alive {1:N0}s after launch -- waiting, not restarting" -f
                        $reason, ((Get-Date) - $script:LastLaunchAt).TotalSeconds)
         } else {
+            # HANG FAST PATH (2-minute gate): the process is NOT booting and /health has not
+            # answered 200 for HangThresholdSeconds (120s) while the port is still LISTENING and a
+            # main.py of OURS still holds it -- a wedged event loop, exactly the shape the
+            # slowness-tolerant strike debounce (fast 5s + confirm 60s, x4) is too patient about:
+            # measured 2026-11-10 08:45:45, that path took ~7 min to fire health_failed_4_times on
+            # a server whose /health had already stopped answering. When the hang gate says so,
+            # restart by PID AT ONCE (Start-Server kills the port's wedged owner first, then
+            # relaunches) instead of waiting out the debounce. $lastOkAge is $null until /health
+            # has answered once since tracking began, which the gate reads as "not yet proven
+            # hung" so a never-up/booting server is left to the vanished/boot paths below.
+            $lastOkAge = $null
+            if ($script:LastHealthOkAt) { $lastOkAge = ((Get-Date) - $script:LastHealthOkAt).TotalSeconds }
+            $hangVerdict = Invoke-HangRestartDecision $lastOkAge $portListening $ownMainPyAlive $false
+            if ($hangVerdict -eq 'restart') {
+                Write-Log ("server WEDGED: /health silent {0:N0}s (>= {1}s) while :$Port still held by our main.py -- restarting by PID now, not after the {2}-strike debounce ($reason)" -f $lastOkAge, $script:HangThresholdSeconds, $FailuresBeforeAction)
+                $script:HangRestartStartedAt = Get-Date
+                Start-Server -Cause 'hang' -StrikeCount ([int]$script:HangThresholdSeconds)
+                $serverMiss = 0
+                $script:LastHealthOkAt = $null
+                Start-Sleep -Seconds 6
+            } else {
             # VANISHED FAST PATH: nothing listening AND no main.py of ours alive AND no planned
             # restart owns this gap -> the server is gone; relaunch on the FIRST miss instead of
             # spending FailuresBeforeAction strikes (~3 min, measured 2026-11-04) waiting for a
@@ -4014,6 +4085,7 @@ while ($true) {
                     $serverMiss = 0
                     Start-Sleep -Seconds 6
                 }
+            }
             }
         }
     }
