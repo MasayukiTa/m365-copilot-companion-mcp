@@ -23,7 +23,7 @@ $ErrorActionPreference = "Stop"
 trap {
     Write-Host ""
     Write-Host "configure_env.ps1 could not run: $($_.Exception.Message)"
-    Write-Host "Edit .env by hand and set the agent URL, then start again."
+    Write-Host "Edit .env by hand and set the agent URL, then start again. That address has no agent id, so there is nothing to connect to: open the agent in Microsoft 365 Copilot, then copy the address of the page whose path contains /agent/ followed by two ids joined by a dot."
     exit 4
 }
 # This script lives in <repo>\scripts, so $PSScriptRoot is the scripts dir. The .env it
