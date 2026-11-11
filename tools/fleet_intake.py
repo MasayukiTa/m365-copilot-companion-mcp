@@ -273,14 +273,8 @@ _WORKER_TERMINAL = frozenset(("done", "stuck", "maxturns", "error", "cancelled",
                                "content_refused"))
 
 
-#: OWNER RULE 2026-09-12 (jsonl L6695): "複数のゴールは投げるべきではない。人間はそこまで詳細に
-#: プロンプトを書くはずがない。" A real person types ONE instruction; a prompt that is a numbered
-#: battery of independent goals is the AGENT over-specifying, not the person. This is NOT a refusal
-#: -- the same owner instruction that governs similarity (2026-10-26/27) is that a submission is
-#: never stopped for its shape, only RECORDED -- so the goal is queued whole and the count is noted
-#: in the background (fleet_submit_multigoal.jsonl). Below this many detected independent goals the
-#: prompt is a single instruction and nothing is recorded; a two-goal floor is the smallest thing
-#: that is a "battery" at all, matching MIN_CHILDREN's reasoning in relay/fanout.py.
+#: A submission is never stopped for its shape: multiple goals are queued together and the
+#: detected count is recorded in fleet_submit_multigoal.jsonl. The minimum is two goals.
 MULTI_GOAL_MIN = 2
 
 #: A detected goal item must have at least this many content words of its OWN to count. A bare
@@ -1490,8 +1484,7 @@ def _mark_refused_forced(refused_id, forced_jid):
 def force_submit_refused(refused_id, source=""):
     """OPERATOR ONLY. Queue the goal of a refused record, SKIPPING every admission check.
 
-    This is the override the owner asked for: a refusal is a proposal the system makes, not a
-    verdict it enforces silently, and the person must be able to overrule it. It reads
+    An operator can override a refusal. This reads
     .fleet/tasks/refused/<refused_id>.json, writes the same goal straight into tasks/pending/
     with no duplicate/length/capacity/loop check, stamps the job as forced by a user and carries
     the originating refusal id on it, and marks the refused record forced. Returns the new job
@@ -1556,7 +1549,7 @@ def force_submit_refused(refused_id, source=""):
 # The cockpit's "force" button and an operator at a shell reach force_submit_refused THROUGH
 # HERE, by running this module as a script -- never through call_tool, because the function is
 # deliberately absent from main.py's TOOLS. A person launching `python -m tools.fleet_intake
-# --force-refused <id>` is exactly the human override the owner asked for; an agent over the
+# --force-refused <id>` provides a human override; an agent over the
 # tunnel has no catalogue entry to invoke and no code path that reaches this branch. Kept out of
 # the module import surface (guarded by __main__) so importing tools.fleet_intake never parses a
 # command line or touches argv.
