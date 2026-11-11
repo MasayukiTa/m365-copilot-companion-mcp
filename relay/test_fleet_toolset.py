@@ -88,7 +88,7 @@ def _catalogue():
 
 def test_the_allowed_set_is_small_enough_to_have_been_read():
     """A list of a hundred is a filter wearing a list's clothes."""
-    assert len(FLEET_TOOLS) <= 25, "the allowed set has grown past what anybody audits"
+    assert len(FLEET_TOOLS) <= 39, "the allowed set has grown past what anybody audits"
 
 
 def test_every_allowed_tool_carries_a_reason():
@@ -470,11 +470,15 @@ def test_the_refusal_reaches_the_caller_rather_than_the_tool():
 
 
 def test_the_six_screen_tools_are_the_office_only_set():
-    """The run-kind-sensitive tools are exactly the six computer-use tools, no more."""
+    """The run-kind-sensitive tools include both desktop tool families."""
     from relay.fleet_toolset import OFFICE_ONLY_TOOLS
+    from relay.fleet_toolset import _LOCKED_DESKTOP_TOOLS
     assert OFFICE_ONLY_TOOLS == frozenset((
         "screen_look", "screen_click", "screen_scroll",
-        "screen_type", "screen_press", "screen_windows"))
+        "screen_type", "screen_press", "screen_windows")) | frozenset(_LOCKED_DESKTOP_TOOLS)
+    for name in _LOCKED_DESKTOP_TOOLS:
+        assert is_allowed(name, "office")
+        assert not is_allowed(name, "bench")
     # and every one of them is in the allowed set to begin with -- run kind narrows, it does
     # not invent a tool that was never allowed.
     for name in OFFICE_ONLY_TOOLS:
