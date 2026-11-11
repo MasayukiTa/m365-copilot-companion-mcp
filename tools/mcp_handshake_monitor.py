@@ -31,7 +31,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 import urllib.error
@@ -44,6 +43,7 @@ if _REPO_ROOT not in sys.path:
     sys.path.insert(0, _REPO_ROOT)
 
 from tools.mcp_handshake_probe import handshake, resolve_api_key  # noqa: E402
+from tools import childproc  # noqa: E402
 
 # -- constants ------------------------------------------------------------------
 LOCAL_URL = "http://127.0.0.1:8000/mcp"
@@ -190,9 +190,9 @@ def read_host_connections(devtunnel_exe: str = "devtunnel",
                           tunnel_name: str = TUNNEL_NAME) -> Optional[int]:
     """Run ``devtunnel show`` and parse the host-connection count. None on any error."""
     try:
-        out = subprocess.run(
+        out = childproc.run(
             [devtunnel_exe, "show", tunnel_name],
-            capture_output=True, text=True, timeout=25,
+            timeout=25,
         ).stdout
     except Exception:
         return None
@@ -217,10 +217,10 @@ def probe_c2c(url: str, timeout: float = 20.0) -> dict:
     """
     # curl with the revocation check disabled (the documented workaround on this PC).
     try:
-        p = subprocess.run(
+        p = childproc.run(
             ["curl", "-s", "-m", str(int(timeout)), "--ssl-no-revoke",
              "-o", os.devnull, "-w", "%{http_code}", url],
-            capture_output=True, text=True, timeout=timeout + 5,
+            timeout=timeout + 5,
         )
         code = (p.stdout or "").strip()
         if code and code != "000":
