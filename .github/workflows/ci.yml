@@ -158,6 +158,7 @@ jobs:
             relay/test_design_stratum_counts.py \
             relay/test_auto_rephrase_continue.py \
             scripts/test_status_tool_does_not_mislead.py \
+            scripts/test_setup_devtunnel_no_device_code.py \
             scripts/test_health_probe_isolation.py \
             scripts/test_health_busy_signal.py \
             scripts/test_inbound_observer_pool_isolation.py \
