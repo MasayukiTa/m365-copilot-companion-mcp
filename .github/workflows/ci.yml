@@ -116,6 +116,7 @@ jobs:
           pytest -q \
             tests/test_security_xff.py \
             tests/test_session_store_fleet_async.py \
+            tests/test_session_store_spool_drain.py \
             tests/test_live_intake_workers.py \
             tests/test_integration_evidence.py \
             tests/test_outcome_enum_closed.py \
