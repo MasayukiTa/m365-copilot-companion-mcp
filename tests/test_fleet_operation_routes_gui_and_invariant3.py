@@ -1,10 +1,8 @@
-"""docs/research/fleet_operation_routes.md must carry two things the owner asked for in
-row #120 of the batch-08 ledger ("GUI に見える形での投入方法と、不変則 3 の修正をよろしく。
-実態に合っていないので"):
+"""The fleet operation routes document must describe two properties:
 
   1. A described, human-visible (GUI) submission route -- i.e. the cockpit UI path through
      scripts/win/submit_via_ui.ps1, with the mandatory -ReadOnly dry run first and the
-     InvokePattern (not keystroke) mechanism that replaced Ctrl+Enter on 2026-08-30.
+     InvokePattern (not keystroke) mechanism.
 
   2. Invariant #3 reconciled with reality. The old text asserted a flat "anything submitted
      while running becomes a steer" (必ず steer になる). That was wrong: what a mid-run
