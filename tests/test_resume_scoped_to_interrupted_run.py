@@ -191,10 +191,12 @@ def test_a_synthetic_copy_of_the_real_ledger_shape_queues_nothing_for_a_two_goal
 
 # ---- the cap ---------------------------------------------------------------------------
 
-def test_the_cap_is_the_larger_of_twenty_and_four_times_the_runs_goals():
-    assert fr.resume_queue_cap(0) == 20 and fr.resume_queue_cap(2) == 20
-    assert fr.resume_queue_cap(5) == 20 and fr.resume_queue_cap(6) == 24
-    assert fr.resume_queue_cap(None) == 20
+def test_the_cap_is_the_larger_of_the_floor_and_four_times_the_runs_goals():
+    threshold = fr.RESUME_CAP_FLOOR // fr.RESUME_CAP_FACTOR
+    assert fr.resume_queue_cap(0) == fr.RESUME_CAP_FLOOR
+    assert fr.resume_queue_cap(None) == fr.RESUME_CAP_FLOOR
+    assert fr.resume_queue_cap(threshold) == fr.RESUME_CAP_FLOOR
+    assert fr.resume_queue_cap(threshold + 1) == fr.RESUME_CAP_FACTOR * (threshold + 1)
 
 
 def _run_main(tmp_path, monkeypatch, capsys, env_lineage=RUN):
@@ -220,7 +222,7 @@ def test_a_resume_that_would_queue_too_many_goals_is_refused_and_stays_pending(
                         lambda *a, **k: (set(fr.read_campaigns(str(tmp_path))), "forced"))
     rc = fleet_runner.main()
     out = capsys.readouterr().out
-    assert rc == 6 and "REFUSING TO RESUME" in out and "cap is 20" in out
+    assert rc == 6 and "REFUSING TO RESUME" in out and f"cap is {fr.resume_queue_cap(len(ledger_goals))}" in out
     snap = json.load(open(tmp_path / "interrupted" / (RUN + ".json")))
     assert snap["state"] == "pending"
     assert snap["resume"]["blocked"]["reason"] == fr.RESUME_CAP_REASON
