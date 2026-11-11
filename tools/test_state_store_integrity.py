@@ -240,6 +240,11 @@ AUDITED = {
     "bridge/copilot_bridge.py": "see OPEN (fleet conversations list)",
     "tools/auth_stats.py": "derived counters snapshot, atomic tmp+replace",
     "tools/contract_gate.py": "gate files, atomic, regenerated per decision",
+    "tools/mcp_handshake_probe.py": "monitor status/alert snapshots: the status file is the "
+                                   "latest tick overwritten whole each time and the alert file is a "
+                                   "single current-alert document (raised when failing, removed when "
+                                   "clear); neither accumulates data -- the accumulated series lives "
+                                   "in the append-only mcp_synthetic_monitor.jsonl next to them",
     "tools/data_ops.py": "write_json tool: the caller supplies the whole document",
     "tools/evalbench/fairness.py": "report output",
     "tools/fleet_intake.py": "one job file per submission",
