@@ -61,6 +61,7 @@ class RecordingWorld : IChatSendEffects
     public void RestoreInput(string text) { Rec("RestoreInput|" + text); Input = text; }
     public void AddUser(string text) { Rec("AddUser|" + text); }
     public void AddAssistant(string text) { Rec("AddAssistant|" + text); }
+    public void OfferNewChat(Conversation target, string text, string message) { Rec("OfferNewChat|" + target.Id + "|" + text + "|" + message); }
     public void NewChat()
     {
         // The data half of ChatWindow.NewChat: a new conversation, current and first in the

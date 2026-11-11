@@ -450,6 +450,10 @@ def _EXPECTED_DIVERGENCE(case):
 #: extracted code cannot be made to agree by adjusting a field. Each is asserted by its own
 #: test instead; the value says which test and why.
 _DECLARED_BEHAVIOUR_CHANGES = {
+    "door_unknown": "failed send retains text for explicit recovery",
+    "door_unknown_source_empty_with_name": "failed send retains text for explicit recovery",
+    "door_resume_fails": "failed send retains text for explicit recovery",
+    "door_new_fails": "failed send retains text for explicit recovery",
     "status_maxturns":
         "the conversation's transcript now matches a terminal (maxturns) worker; the oracle "
         "still steers it, the extracted code falls through to the follow-up instead -- see "
@@ -558,13 +562,19 @@ def test_a_conversation_with_no_identity_is_refused_and_nothing_is_sent(results)
     for cid in ("door_unknown", "door_unknown_source_empty_with_name"):
         out = _x(results, cid)
         assert _said(out) == ["T:send_unknown_conv"], out["trace"]
+        assert "RestoreInput|hello" in out["trace"]
+        assert "OfferNewChat|c1|hello|T:send_unknown_conv" in out["trace"]
+        assert "NewChat" not in out["trace"]
         assert not _gets(out) and not any(ln.startswith("BeginStream") for ln in out["trace"])
 
 
 def test_a_door_that_fails_says_so_and_does_not_send(results):
     for cid in ("door_resume_fails", "door_new_fails"):
         out = _x(results, cid)
-        assert out["trace"][-1] == "AddAssistant|T:send_wrong_page", out["trace"]
+        assert "AddAssistant|T:send_wrong_page" in out["trace"]
+        assert "RestoreInput|hello" in out["trace"]
+        assert ("OfferNewChat|c1|hello|T:send_wrong_page" in out["trace"]) == (cid == "door_resume_fails")
+        assert "NewChat" not in out["trace"]
         assert not any(ln.startswith(("BeginStream", "SetPageConv", "SendInFlight"))
                        for ln in out["trace"]), out["trace"]
         assert out["state"]["convs"]["c1"]["messages"] == [], "a failed send left a message"

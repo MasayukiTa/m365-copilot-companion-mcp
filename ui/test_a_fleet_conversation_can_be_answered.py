@@ -218,3 +218,19 @@ def test_the_running_binary_carries_this_change():
     assert needle in blob, (
         "CopilotChat.exe predates this change -- rebuild it with ui/build_and_run.bat, or the "
         "fleet conversation in the running window still cannot be answered")
+
+def test_unreachable_conversation_offers_an_explicit_new_chat_with_the_same_text():
+    from pathlib import Path
+    ui = Path(__file__).resolve().parent
+    send = (ui / 'ChatSend.cs').read_text(encoding='utf-8')
+    window = (ui / 'CopilotChat.Send.cs').read_text(encoding='utf-8')
+    unknown = send[send.index('if (door == DOOR_UNKNOWN)'):send.index('if (door != DOOR_ON_PAGE)')]
+    assert 'RestoreInput(text)' in unknown and 'OfferNewChat(target, text' in unknown
+    assert 'NewChat()' not in unknown and 'SendText(' not in unknown
+    failure = send[send.index('catch\n            {\n                fx.AddAssistant(fx.T("send_wrong_page"))'):]
+    assert 'OfferNewChat(target, text' in failure
+    offer = window[window.index('void IChatSendEffects.OfferNewChat'):window.index('// The interface keeps its historical name')]
+    assert 'ShowRecoveryBanner' in offer and 'delegate' in offer
+    assert '_conv != target || _input.Text != text' in offer
+    assert 'NewChat();' in offer and '_input.Text = text;' in offer
+    assert 'SendText(' not in offer
