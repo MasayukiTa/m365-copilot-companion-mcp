@@ -58,7 +58,7 @@ def _manifest(tag):
     """A VALID manifest with one component changed.
 
     Built from `base_manifest()` rather than written by hand: `write_active` validates the
-    schema, and a hand-made dict without `schema_version` is refused -- which the first version
+    schema, and a hand-made dict without the required version field is refused -- which the first version
     of this file discovered by failing seven tests at once. A fixture that cannot be stored is
     not a fixture for a test about storing things.
     """
