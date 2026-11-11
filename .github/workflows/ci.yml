@@ -116,6 +116,7 @@ jobs:
           pytest -q \
             scripts/test_tunnel_login_state.py \
             scripts/test_probe_never_shells_out_to_devtunnel.py \
+            tests/test_deploy_main_to_live.py \
             tests/test_security_xff.py \
             tests/test_session_store_fleet_async.py \
             tests/test_session_store_spool_drain.py \
