@@ -7,8 +7,8 @@ when an urgent request is stuck behind a crowd of other work. A long goal, thoug
 often not one task: `relay.fanout` splits it into independent children that each run in
 their own conversation (task_id / parent_task_id / campaign_id / depth carried on every
 worker row). Boosting only the parent row would leave the real work -- the children --
-queued behind everyone else. The owner asked that boosting a parent reach its children
-(requirement 4). This module is the decision half of that: given the directly-boosted
+queued behind everyone else. Boosting a parent also reaches its children.
+This module is the decision half of that: given the directly-boosted
 task ids and the worker rows, it returns the FULL set of task ids that should be treated
 as boosted, the parent's own id plus every descendant in its split/campaign subtree.
 
