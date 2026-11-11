@@ -1,8 +1,7 @@
 # -*- coding: utf-8 -*-
 """The template must state what a STANDARD (default) setup gets for the Dev Tunnel.
 
-WHY THIS EXISTS. The owner asked, of the env/tunnel work, "standard no kankyou settei wo shita
-hito wa dou naru?" -- what happens to someone who left this template unchanged. The answer was
+The standard setup hosts a Dev Tunnel for external clients. This behavior is
 implemented (PR #295: host_tunnel_for_external_clients, ON by default, hosts a tunnel for an
 external client even on the connector-less default route) and declared in tools/settings_keys.py,
 but a person reading .env.example to decide what their machine does could not find it: the Dev
