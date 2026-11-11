@@ -1214,7 +1214,8 @@ jobs:
             tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
             relay/test_a_stale_coordinator_restarts_only_when_idle.py \
             relay/test_a_wedged_hard_reset_in_recovery_is_caught_not_fatal.py \
-            scripts/test_supervisor_watchdog_gate.py
+            scripts/test_supervisor_watchdog_gate.py \
+            tools/test_tunnel_probe_classifies_the_cause.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
