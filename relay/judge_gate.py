@@ -2,22 +2,22 @@
 """judge_gate -- the final-step seam that routes DATA-ANALYSIS answers through the frozen
 validity engine before they are delivered.
 
-OWNER INSTRUCTION (2026-10-27, verbatim): 「データ解析系は、すべて最終でこの判定器を
-通すハーネスを入れ、databricks を圧倒す。これが先週与えたタスクだ。」 Re-scoped 2026-10-30:
-the owner leaves whether to freeze the registered claims to the agent, and the harness must be
-able to read past verdicts from the sessions DB.
+PURPOSE: every data-analysis final answer is routed through the frozen validity engine before
+delivery, so a quantitative claim is not shipped without a recorded verdict. Whether the
+registered claims are frozen to the agent is configurable, and the harness can read past
+verdicts from the sessions DB.
 
 WHAT THIS MODULE IS, AND IS NOT.
   * It is the NON-SECRET orchestration seam in the public repo. It DECIDES which goals are data
     analysis (so the judge is applied to them and only them), and it COMPOSES the footer that
     carries the engine's verdict (or the reason the engine could not run) onto the final answer.
-  * It is NOT the engine. The verdict engine lives OUTSIDE this repo
-    (Desktop/AHA資料_参照一式/証明/公開データ検証/engine_v1_8c2/validity), is secret, remote-less
+  * It is NOT the engine. The verdict engine lives OUTSIDE this repo at an operator-specific
+    location supplied at run time (VALIDITY_ENGINE_ROOT), is secret, remote-less
     and byte-identical-locked by PREREGISTRATION_v1_8c2.md. This module READS it (runs its CLI);
     it NEVER edits the engine's code, rules, thresholds (delta_min, k_min, ...) or registered
-    claim files. (A) is read-only, by owner instruction.
+    claim files. (A) is read-only, so the engine's locked definitions cannot drift.
 
-THE THREE STEPS the harness performs for a data-analysis final answer (owner 「やること」 2):
+THE THREE STEPS the harness performs for a data-analysis final answer:
   (i)   record the analysis RESULT + DATA sha256 and the fetch time  -> validity_harness.record_manifest
   (ii)  register the claim and LOCK it, recording register-vs-fetch time ORDER
                                                                     -> validity_harness.register_and_lock
@@ -115,7 +115,7 @@ def load_domain_terms() -> dict:
 #: data analysis only when a DATA_QUERY marker is present AND no stronger non-analysis kind
 #: (code change / M365 lookup / prose) claims it first -- because applying the judge to a
 #: non-analysis answer wastes an engine run and clutters the answer, while MISSING a real
-#: analysis is the failure the owner is fixing. When in doubt the caller may force the gate on.
+#: analysis is the failure this gate prevents. When in doubt the caller may force the gate on.
 MISCLASSIFICATION_NOTE = (
     "判別条件: task_kind(goal) == DATA_QUERY を基礎に、database / sql / query / odbc / table 等のデータ"
     "取得と、その結果を表・相関・群間比較にする仕事を「データ解析」と判別する。\n"
@@ -295,8 +295,8 @@ def post_hoc_order_note(order_record) -> str:
     A worker analyses data that already exists, so a registration recorded AFTER the data file's
     mtime can never satisfy a pre-registration order check (order_ok=False). That is NOT an input
     error: the engine's own rule classes a late registration as D_FAIL_LOCK_AFTER_DATA, which
-    CAPS the verdict at HOLD (it never makes it ERROR -- see README_engine '判定の順序'). We state
-    that plainly so the worker reads 'post-hoc (HOLD上限)' rather than mistaking it for a bug, and
+    CAPS the verdict at HOLD (it never makes it ERROR -- see the engine's verdict-ordering rules). We state
+    that plainly so the worker reads it as 'post-hoc (capped at HOLD)' rather than mistaking it for a bug, and
     we name what would make it valid without faking the order or weakening the engine.
     """
     if not isinstance(order_record, dict) or order_record.get("order_ok") is not False:
@@ -740,7 +740,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
                                        "schema": JUDGE_REQUEST_SCHEMA,
                                        "attempt": correction_attempt + 1})
         # Pass the worker's registered claim (if the request carried a valid one) so the engine
-        # can judge it when the engine owner has not pre-registered configs/<id>.json. A human
+        # can judge it when configs/<id>.json has not been pre-registered in the engine. A human
         # pre-registered configs claim still wins inside run_engine_judge. The claim is written to
         # a temp file UNDER output_folder (outside the engine root), never into the engine's
         # configs/.
@@ -855,7 +855,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         # NO response/outcome column) writes its RESULT into the optional
         # request["design_feasibility"] section. When it reports the comparison design is
         # infeasible, the footer and the durable record force the final display to
-        # 設計不成立(保留) regardless of the engine verdict, naming the reason code and
+        # a design-infeasible HOLD regardless of the engine verdict, naming the reason code and
         # what was seen (common strata, per-group lot counts, overlap coefficient). This
         # is stricter-only and leaves the engine's own output untouched. A missing or
         # feasible section changes nothing. We only read the section if it is a dict; the
@@ -872,6 +872,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         footer = build_judge_footer(verdict=verdict,
                                     engine_available=engine_available,
                                     order_record=order_record,
+                                    lot_diagnosis=(lot if isinstance(lot, dict) else None),
                                     design_feasibility=design)
         full_text = "judge: requested\n" + "\n".join(statuses) + "\n" + footer
         # THE DURABLE RECORD COMES FROM HERE, NOT FROM THE WORKER. The worker used to run this
@@ -879,7 +880,7 @@ def complete_judge_request(goal, output_folder, *, strict=False, request_text=""
         # forgeable. Write the full footer + structured result to judge_result.json next to the
         # job output so the authoritative record is harness-authored. A harness-written file
         # already present is never overwritten (a re-run must not clobber the record). The full
-        # text is still returned for the VISIBLE answer (the footer the owner reads and the gate
+        # text is still returned for the VISIBLE answer (the footer the reader sees and the gate
         # checks); only the outcome.json pointer is taken from the harness record, never worker
         # text -- see RelayWorker._settle_done, which reads judge_result.json for the reason.
         _write_judge_result(
@@ -994,7 +995,7 @@ def _record_correction(output_folder, *, claim_id, attempt, messages) -> None:
 
 def _engine_status_line(verdict: dict, engine_available: bool) -> str:
     """One-line engine status for the record. When the engine did not run, it names WHY in the
-    'judge: not run (engine unavailable: <reason>)' form the owner asks for (never silent)."""
+    'judge: not run (engine unavailable: <reason>)' form, so the absence of a verdict is never silent."""
     if engine_available and isinstance(verdict, dict):
         return "judge: ran (verdict=%s)" % verdict.get("verdict")
     reason = (verdict.get("unavailable_reason") if isinstance(verdict, dict) else "") or "理由不明"
@@ -1126,7 +1127,7 @@ def run_engine_judge(config_id: str, *, data_location: str | None = None,
 
     CLAIM SOURCE (two registries that used to never meet). The claim can come from either place:
       * engine configs (human pre-registered): ENGINE_ROOT/configs/<id>.json, placed and locked
-        by the engine owner per PREREGISTRATION. If it exists it WINS -- a human-registered,
+        in the engine per PREREGISTRATION. If it exists it WINS -- a human-registered,
         locked claim is always preferred and used exactly as before.
       * worker-registered via the harness registry: when configs/<id>.json is ABSENT but the
         judge request carried the registered claim (`registered_claim`), we write that claim to a
@@ -1169,7 +1170,7 @@ def run_engine_judge(config_id: str, *, data_location: str | None = None,
                     "unavailable_reason":
                         f"registered claim not found for id {config_id}. "
                         f"Tried the engine configs path ({cfg}) and the harness registry "
-                        f"({registry_hint}). To fix: have the engine owner pre-register and lock "
+                        f"({registry_hint}). To fix: pre-register and lock "
                         f"configs/{config_id}.json in the engine root, or include the registered "
                         f"claim in the judge request so the harness can pass it to the engine."}
         if not judge_folder or not os.path.isdir(judge_folder):
@@ -1274,12 +1275,73 @@ def _fmt_n(ev: dict) -> str:
     return ", ".join(parts) if parts else "n=未返却"
 
 
+from relay.stratified_estimate import (  # noqa: E402  (production caller of the stratified estimate)
+    stratified_estimate as _stratified_estimate,
+    stratified_table as _stratified_table,
+)
+
+
+def _stratified_footer_lines(lot_diagnosis):
+    """Footer lines for the within-stratum (stratified) estimate, or [] to add nothing.
+
+    This is the ONLY production caller of relay.stratified_estimate. It fires only when
+    the caller supplies a lot_diagnosis dict carrying a non-empty `strata` column
+    alongside the engine's y/x/lot (all four equal-length and non-empty) defining exactly
+    two exposure groups. Any shortfall returns [] so the judge footer is byte-for-byte
+    unchanged -- strata are an OPTIONAL, footer-only enrichment that never alters the
+    frozen engine input (y/x/lot). k_min here only decides stratum eligibility; it is
+    never lowered and never relaxes a verdict.
+    """
+    if not isinstance(lot_diagnosis, dict):
+        return []
+    strata = lot_diagnosis.get("strata")
+    y = lot_diagnosis.get("y")
+    x = lot_diagnosis.get("x")
+    lot = lot_diagnosis.get("lot")
+    for seq in (y, x, strata, lot):
+        if not isinstance(seq, (list, tuple)) or len(seq) == 0:
+            return []
+    n = len(y)
+    if not (len(x) == len(strata) == len(lot) == n):
+        return []
+    try:
+        est = _stratified_estimate(y, x, strata, lot)
+        rows = _stratified_table(est)
+    except (ValueError, TypeError, ZeroDivisionError):
+        return []
+    if not rows:
+        return []
+    hdr = "--- 層別推定(設計成立時の既定解析 stratified) ---"
+    out = [hdr]
+    out.append("曝露群: %s vs %s (差 = mean(%s) - mean(%s))" % (
+        est.get("group_a"), est.get("group_b"), est.get("group_b"), est.get("group_a")))
+    out.append("層数: 全%d (採用%d, k_min=%s/群・層)" % (
+        est.get("n_strata_total", 0), est.get("n_strata_pooled", 0), est.get("k_min")))
+    for r in rows:
+        tag = "採用" if r.get("eligible") else ("除外(%s)" % (r.get("reason") or ""))
+        d = r.get("diff")
+        ds = ("%.4g" % d) if isinstance(d, (int, float)) else "-"
+        ma = ("%.4g" % r["mean_a"]) if isinstance(r.get("mean_a"), (int, float)) else "-"
+        mb = ("%.4g" % r["mean_b"]) if isinstance(r.get("mean_b"), (int, float)) else "-"
+        w = r.get("weight") or 0.0
+        out.append("  層=%s: lots %s/%s, mean %s/%s, 差=%s, w=%.4g [%s]" % (
+            r.get("stratum"), r.get("lots_a"), r.get("lots_b"), ma, mb, ds, w, tag))
+    pooled = est.get("pooled_diff")
+    if pooled is None:
+        out.append("  プール推定: なし(採用可能な層がない)")
+    else:
+        se = est.get("pooled_se")
+        ses = ("%.4g" % se) if isinstance(se, (int, float)) else "-"
+        out.append("  プール差(精度加重): %.4g (SE=%s)" % (pooled, ses))
+    out.append("  ※ 層別に推定してからプール。製品・ライン等を跨いだ比較はしていません。")
+    return out
+
 # --- DESIGN-FEASIBILITY FORCE-HOLD (this slice) ------------------------------
 #
 # WHY THIS EXISTS, AND HOW IT DIFFERS FROM design_check. A SEPARATE, info-only
 # `design_check` footer section (feat/judge-footer-design-check) ADDS what it saw
-# about the comparison design but changes nothing about the verdict. The owner
-# (2026-11-04 07:45) said that is not enough: when groups being compared differ by
+# about the comparison design but changes nothing about the verdict. That is not
+# sufficient: when groups being compared differ by
 # PRODUCT (the grouping column's product value) rather than by the exposure under study, the comparison is not
 # a comparison at all (equipment-vs-product cannot be separated), and that must be
 # judged AUTOMATICALLY -- not noticed by a human later. So this path does more than
@@ -1291,7 +1353,7 @@ def _fmt_n(ev: dict) -> str:
 # STRICTER-ONLY, AND NON-DESTRUCTIVE. This can only turn a deliverable answer INTO a
 # hold; it never turns a hold into GO and never relaxes anything. The engine's own
 # output is PRESERVED UNCHANGED -- the footer still prints the original verdict block
-# below the hold banner (labelled 参考・変更なし), and _write_judge_result keeps the
+# below the hold banner (labelled as the original engine output, unchanged), and _write_judge_result keeps the
 # original `verdict` key intact while recording the hold under the SEPARATE key
 # `design_feasibility_hold` plus a top-level `final_display`. So a reader always sees
 # both the forced final display and the untouched engine verdict.
@@ -1301,8 +1363,8 @@ def _fmt_n(ev: dict) -> str:
 #   {"feasible": bool,                 # False => force a hold
 #    "reason_code": str,               # e.g. one of _DESIGN_INFEASIBLE_REASONS
 #    "common_strata": int,             # number of common strata (grouping levels)
-#    "lots_per_group": {group: int},   # 群ごとのロット数
-#    "overlap_coefficient": number,    # 群間の層構成の重なり係数
+#    "lots_per_group": {group: int},   # lot count per group
+#    "overlap_coefficient": number,    # overlap coefficient of the stratum mix between groups
 #    ...}                              # any other keys are carried as `seen`
 # Only `feasible is False` forces the hold; a missing/True/None design never does,
 # so wiring this in cannot flip an otherwise-deliverable answer by accident.
@@ -1350,7 +1412,7 @@ def design_feasibility_hold(design) -> dict | None:
     code = design.get("reason_code")
     code = str(code) if code is not None else "DESIGN_INFEASIBLE"
     gloss = _DESIGN_INFEASIBLE_REASONS.get(code, "")
-    # Carry the design facts the owner asked to see named on the judge票: the number
+    # Carry the design facts that must be named on the judge footer: the number
     # of common strata, each group's lot count, and the overlap coefficient. Anything
     # else the upstream check reported is preserved under `seen` (minus the response
     # column, which the upstream check does not read and does not emit).
@@ -1390,6 +1452,7 @@ def _design_hold_lines(hold: dict) -> list:
 
 def build_judge_footer(*, verdict: dict | None, engine_available: bool,
                        unavailable_reason: str = "", order_record: dict | None = None,
+                       lot_diagnosis: dict | None = None,
                        design_feasibility: dict | None = None) -> str:
     """Compose the block appended to a data-analysis final answer.
 
@@ -1403,7 +1466,7 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
     DESIGN_HOLD_DISPLAY: the footer LEADS with a hold banner naming the reason code and
     what was seen (common strata, per-group lot counts, overlap coefficient), then
     prints the engine's ORIGINAL verdict block UNCHANGED below it, labelled
-    参考・変更なし. Stricter-only; never edits the engine output. A feasible / missing /
+    as the original engine output, unchanged. Stricter-only; never edits the engine output. A feasible / missing /
     None design changes nothing.
     """
     hold = design_feasibility_hold(design_feasibility)
@@ -1466,6 +1529,16 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
     hashes = verdict.get("hashes") or {}
     if hashes.get("input_sha256"):
         lines.append("input_sha256: %s" % hashes.get("input_sha256"))
+    # Stratified (within-stratum) estimate -- the DEFAULT analysis once the design has been
+    # judged to hold. Shown ONLY when the caller passed a lot_diagnosis carrying a `strata`
+    # column alongside y/x/lot (all equal-length, non-empty) AND a real engine verdict exists
+    # (i.e. the design-check seam did not block the comparison). When no strata are supplied the
+    # footer is byte-for-byte unchanged. This never touches the frozen engine or its thresholds;
+    # it estimates the exposure contrast WITHIN each shared stratum and pools, so an equipment
+    # effect is never read off product-confounded pooled rows. See relay/stratified_estimate.py.
+    _strat_lines = _stratified_footer_lines(lot_diagnosis)
+    if _strat_lines:
+        lines.extend(_strat_lines)
     lines.append("(事前登録した規則に従って機械的に判定。「採用=正しい」ではない。)")
     lines.append("--- ここまで ---")
     return "\n".join(lines)
@@ -1475,8 +1548,8 @@ def build_judge_footer(*, verdict: dict | None, engine_available: bool,
 #
 # WHY THIS LIVES HERE (and is a pure function). The relay loop (copilot_autopilot_relay.py)
 # reaches a candidate DONE and, for a data-analysis goal, must confirm the final answer passed
-# the judge BEFORE it accepts the DONE -- the owner task. Measured 2026-10-30: the 679かすれ
-# analysis was delivered three times with no judge block and nothing caught it. The relay code
+# the judge BEFORE it accepts the DONE. A prior regression delivered an analysis three times
+# with no judge block and nothing caught it, which is the failure this seam closes. The relay code
 # is not unit-tested in isolation; this seam is, so the decision lives in a tested pure function
 # and the loop only calls it.
 
@@ -1496,7 +1569,7 @@ _VERDICT_TOKENS = ("GO", "HOLD", "NA")
 
 def judge_block_present(final_response) -> bool:
     """True when the delivered answer already carries a judge result OR a stated reason it could
-    not run. Either one satisfies the gate: the owner forbids SILENT omission, not an honest
+    not run. Either one satisfies the gate: SILENT omission is forbidden, not an honest
     'the judge could not run because ...'."""
     if not isinstance(final_response, str) or not final_response.strip():
         return False
@@ -1645,7 +1718,7 @@ def design_feasibility(group_stratum_lots,
 
     The checks are applied in the order (a) then (b) then (c); the FIRST
     failing one sets the reason code.  design_infeasible True means the final
-    display must be forced to "設計不成立(保留)" -- this function never relaxes a
+    display must be forced to a design-infeasible HOLD -- this function never relaxes a
     verdict, it only ever adds a design HOLD.
     """
     gsl = group_stratum_lots or {}
