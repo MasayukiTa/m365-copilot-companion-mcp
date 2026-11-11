@@ -450,6 +450,8 @@ jobs:
             scripts/test_supervisor_zero_conn_recovery.py \
             scripts/test_supervisor_hang_detect.py \
             scripts/test_supervisor_hang_restart_port_copy.py \
+            scripts/test_supervisor_health_fail_restart.py \
+            scripts/test_supervisor_health_fail_restart_port_copy.py \
             scripts/test_supervisor_runner_respawn.py \
             scripts/test_mcp_handshake_monitor.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
