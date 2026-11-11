@@ -120,6 +120,46 @@ def _pending_count() -> int:
         return 0
 
 
+#: How old a leftover "<jid>.json.tmp" must be before a sweep deletes it. fleet_submit writes
+#: the job to "<jid>.json.tmp" and os.replace()s it onto "<jid>.json" (see ~L1150); the rename
+#: is atomic and effectively instant, so a .tmp that is still present seconds later is the
+#: debris of a submitter process that died between open() and os.replace(). 10 minutes is far
+#: longer than any real write yet well under the age of the observed debris: the pending dir
+#: held six 0-byte *.json.tmp whose mtimes were 11/02 16:51 (x3), 11/07 11:49, 11/07 13:49 and
+#: 11/11 05:52 -- hours to days old -- which task_router never claims (it reads only *.json) and
+#: which fleet_queue was counting as "pending". A live submission's tmp is deleted by its own
+#: os.replace long before it reaches this age, so the sweep can never race a healthy write.
+_STALE_TMP_AGE_S = 600
+
+
+def _sweep_stale_tmp(subdir: str = "pending", max_age_s: int = _STALE_TMP_AGE_S) -> int:
+    """Delete leftover "*.json.tmp" files older than max_age_s from one task subdir.
+
+    Best-effort and quiet: returns the number removed, raises nothing, and skips any file that
+    is younger than the cutoff or disappears mid-sweep (a concurrent os.replace winning the
+    race). Only "*.json.tmp" is touched; real "*.json" / "*.txt" task files are never removed.
+    """
+    removed = 0
+    try:
+        d = os.path.join(TR.TASKS, subdir)
+        now = time.time()
+        for name in os.listdir(d):
+            if not name.endswith(".json.tmp"):
+                continue
+            p = os.path.join(d, name)
+            try:
+                if now - os.path.getmtime(p) < max_age_s:
+                    continue
+                os.remove(p)
+                removed += 1
+            except OSError:
+                # Vanished under us (the submitter's os.replace won) or is locked -- leave it.
+                continue
+    except Exception:
+        pass
+    return removed
+
+
 def _waiting_count() -> int:
     """Goals that have arrived and not yet been picked up by a runner.
 
@@ -979,6 +1019,11 @@ def admit_commands_to_pending(state_dir: str) -> int:
 
     Returns the number of goals promoted.
     """
+    # Clear stale "*.json.tmp" debris from pending on this startup/admit path. The coordinator
+    # reaches this sweep whenever it admits cockpit goals, so leftover half-written tmp files
+    # (a submitter that died between open() and os.replace()) are reaped without a separate cron.
+    # Best-effort and only touches tmp older than _STALE_TMP_AGE_S, so it never races a live write.
+    _sweep_stale_tmp("pending")
     if _consumer_is_draining():
         return 0
     from relay import fleet_runner as _fr
@@ -1049,6 +1094,10 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
 
     QUEUED, NOT STARTED. Nothing runs because this was called.
     """
+    # Reap any stale "*.json.tmp" left by an earlier submitter that died between open() and
+    # os.replace() before adding ours, so debris cannot accumulate across submissions. Only tmp
+    # older than _STALE_TMP_AGE_S is removed, so this can never delete a healthy in-flight write.
+    _sweep_stale_tmp("pending")
     resume_conv = " ".join(str(resume_conv or "").split())
     text = " ".join(str(goal or "").split())
     if not text:
@@ -1212,10 +1261,19 @@ def fleet_queue() -> str:
         admit_commands_to_pending(os.path.dirname(TR.TASKS))
     except Exception:
         pass
+    # Drop leftover "*.json.tmp" debris before counting so the queue does not read as a backlog
+    # that no runner can drain. task_router claims only "*.json", so a half-written tmp left by a
+    # submitter that died between open() and os.replace() would otherwise sit in pending forever
+    # and inflate this count (observed: six 0-byte *.json.tmp counted as "pending 6"). Best-effort.
+    _sweep_stale_tmp("pending")
     lines = []
     for sub in ("pending", "running", "awaiting", "for_fleet", "done"):
         try:
-            names = sorted(os.listdir(os.path.join(TR.TASKS, sub)))
+            # Count real task files only. task_router moves/claims "*.json" (and admits "*.txt"
+            # cockpit goals); a "*.json.tmp" is never a claimable task, so counting it told the
+            # owner a goal was waiting when none was. Mirrors _pending_count's ".json" filter.
+            names = sorted(f for f in os.listdir(os.path.join(TR.TASKS, sub))
+                           if f.endswith(".json") or f.endswith(".txt"))
         except Exception:
             names = []
         lines.append("%-9s %d" % (sub, len(names)))
