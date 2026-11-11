@@ -53,6 +53,9 @@ _user32.WindowFromPoint.argtypes = [POINT]
 _user32.WindowFromPoint.restype = wintypes.HWND
 _user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
 _user32.GetAncestor.restype = wintypes.HWND
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                             ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
 GA_ROOT = 2
 
@@ -173,6 +176,23 @@ def process_name(hwnd: int) -> str:
             kernel32.CloseHandle(h)
     except Exception:
         return ""
+
+
+def foreground_facts():
+    """The live foreground reduced to a foreground_guard.Foreground the guard can judge.
+
+    This is the one place the OS is read for the guard: it names what is in front, its class,
+    the process that owns it, and its rectangle. When nothing is in front (the lock screen, a
+    UAC prompt), ``present`` is False and every coordinate is zero, which the guard reads as
+    "no window to act on".
+    """
+    from .foreground_guard import Foreground
+
+    t = foreground_window()
+    if t is None:
+        return Foreground(False, "", "", "", 0, 0, 0, 0)
+    return Foreground(True, t.title or "", t.cls or "",
+                      process_name(t.hwnd), t.left, t.top, t.right, t.bottom)
 
 
 def children_of(hwnd: int, min_side: int = 8) -> List[Target]:

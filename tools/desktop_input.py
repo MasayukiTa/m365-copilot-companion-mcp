@@ -382,6 +382,25 @@ def _require_layout(frame: Frame) -> None:
                width, height, left, top))
 
 
+def _require_foreground(expect, point=None) -> None:
+    """Refuse unless the window in front right now is the application the caller named.
+
+    The whole reason the click/type/press tools take an expected application: a capture names
+    a window, time passes, and by the time the input is sent the stacking may have changed --
+    on the machine that produced this finding, a terminal came to the front twice and a click
+    computed for one window landed in another. So the foreground is read HERE, immediately
+    before the input goes out, and compared against what the caller said it should be. The
+    judgement itself is in tools/foreground_guard.py, which is pure and tested with fabricated
+    windows; this supplies it the live facts.
+    """
+    from . import foreground_guard as FG
+    from . import window_probe as W
+
+    refusal = FG.evaluate(expect, W.foreground_facts(), point=point)
+    if refusal:
+        raise InputRefused(refusal)
+
+
 def _absolute(x: int, y: int) -> Tuple[int, int]:
     """Desktop pixel -> the 0..65535 grid SendInput uses across the virtual desktop.
 
@@ -471,13 +490,17 @@ _BUTTONS = {
 
 
 def click(frame: Frame, x: int, y: int, button: str = "left",
-          count: int = 1) -> Tuple[int, int]:
+          count: int = 1, expect=None) -> Tuple[int, int]:
     """Move and click. Returns where the pointer was when the button went down.
 
     The move and the button press go in ONE SendInput batch so that nothing can
     move the pointer between them. Sent as two calls, a click can be delivered at a
     position the caller never chose -- rare, and correspondingly hard to reproduce
     when it happens.
+
+    `expect` names the application this click is meant for (a process name or a
+    window-title pattern). The foreground is re-read here and the click is refused
+    unless the window in front belongs to it AND the point lies inside that window.
     """
     _require_layout(frame)
     if button not in _BUTTONS:
@@ -485,6 +508,7 @@ def click(frame: Frame, x: int, y: int, button: str = "left",
                            % (button, ", ".join(sorted(_BUTTONS))))
     if not frame.contains_screen(x, y):
         raise InputRefused("(%d, %d) is outside the captured desktop" % (x, y))
+    _require_foreground(expect, point=(x, y))
     down, up = _BUTTONS[button]
     batch = [_mouse(0, x, y)]
     for _ in range(max(1, count)):
@@ -510,7 +534,7 @@ def _unicode_pair(ch: str):
     return [0xD800 + (code >> 10), 0xDC00 + (code & 0x3FF)]
 
 
-def type_text(text: str, per_char_s: float = 0.0) -> int:
+def type_text(text: str, per_char_s: float = 0.0, expect=None) -> int:
     """Type `text` as characters, not as keystrokes. Returns characters sent.
 
     Unaffected by the keyboard layout and by the IME, which is the point: the
@@ -520,7 +544,12 @@ def type_text(text: str, per_char_s: float = 0.0) -> int:
     A newline in `text` is sent as Enter rather than as the character U+000A,
     because in every application that matters those do different things and the
     caller who wrote "\\n" meant the key.
+
+    `expect` names the application the keystrokes are meant for; typing is refused
+    unless the window in front belongs to it. There is no point to check -- text
+    goes to the focused window -- so only the foreground identity is verified.
     """
+    _require_foreground(expect)
     made = []
     for ch in text:
         if ch == "\n":
@@ -557,7 +586,7 @@ def _key_inputs(vk: int, up: bool = False):
     return [INPUT(INPUT_KEYBOARD, _UNION(ki=ki))]
 
 
-def press(*keys: str) -> None:
+def press(*keys: str, expect=None) -> None:
     """Press a key, or a combination: press("ctrl", "s").
 
     Modifiers are held in the order given and released in reverse, which is what
@@ -565,6 +594,11 @@ def press(*keys: str) -> None:
     releasing in order -- leaving Ctrl down after the combination, so that the next
     ordinary keystroke arrives as a shortcut. That residue outlives the call, and
     the damage lands somewhere else entirely.
+
+    `expect` names the application the key press is meant for; it is refused unless
+    the window in front belongs to it. The refused-combination check runs first so
+    that a session-ending combination is reported as such rather than as a
+    foreground mismatch.
     """
     names = [str(k).strip().lower() for k in keys]
     asked = frozenset(names)
@@ -574,6 +608,7 @@ def press(*keys: str) -> None:
                 "refusing %s: it ends the operator's session or their unsaved work, and is "
                 "never part of doing their job. If that really is the intent, a person can "
                 "press it." % "+".join(sorted(combo)))
+    _require_foreground(expect)
     codes = []
     for name in names:
         vk = VK.get(name)
