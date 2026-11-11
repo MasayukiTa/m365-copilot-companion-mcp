@@ -1796,6 +1796,15 @@ $script:ForeignStreak = 0
 function Invoke-TunnelHostingCheck {
     # One tick of tunnel management, once devtunnel is known to be logged in. Uses the main
     # loop's $tunnelMiss / $loggedIn (script scope).
+    #
+    # $LoginJustResumed is $true ONLY on the single tick where devtunnel login flipped from
+    # down to up (see the main loop's "devtunnel now logged in -> resuming tunnel management").
+    # On that tick a 'none' state is a settled fact -- management was PAUSED the whole time it
+    # was logged out, so nothing of ours was hosting it and there is nothing a fast re-host
+    # could knock over. The 'none' branch below uses it (via the pure decider) to skip the
+    # FailuresBeforeAction debounce, closing the ~7-minute sign-in-to-re-host gap measured
+    # 2026-11-11. Defaults to $false, so every other tick behaves exactly as before.
+    param([bool]$LoginJustResumed = $false)
     $conn = Get-TunnelHostConnections
     $ourHost = $false
     $localPid = $null
@@ -1898,6 +1907,19 @@ function Invoke-TunnelHostingCheck {
     Set-TunnelHostStatus -State "none" -Connections $conn -OurHostRunning $false -LocalPid $null -TunnelPid $null
     Clear-DevtunnelLoginCache "tunnel host connections = 0"
     $script:tunnelMiss++
+    # LOGIN-RESUME FAST PATH. On the one tick where login flipped down->up, a 'none' state is a
+    # settled fact (management was PAUSED the whole time it was logged out), so re-host now
+    # instead of spending FailuresBeforeAction strikes (~80 s) -- this is what closed the
+    # ~7-minute sign-in-to-re-host gap measured 2026-11-11. The decision is the cross-language
+    # pure one; a blank/failed answer leaves the ordinary debounce in force. Only the WAIT is
+    # shortened: the re-host below still makes its own live, uncached 'logged in' re-check
+    # before touching devtunnel, so this never re-hosts on a cached login answer.
+    if ($script:tunnelMiss -lt $FailuresBeforeAction -and $LoginJustResumed) {
+        if ((Invoke-LoginResumeRehostDecision -LoginJustResumed $true -TunnelState "none") -eq "rehost_now") {
+            Write-Log "devtunnel login just resumed and tunnel host connections = 0 -> re-hosting now, without the debounce"
+            $script:tunnelMiss = $FailuresBeforeAction
+        }
+    }
     Write-Log "tunnel host connections = 0 ($($script:tunnelMiss)/$FailuresBeforeAction)"
     if ($script:tunnelMiss -ge $FailuresBeforeAction) {
         # NEVER RE-HOST ON A CACHED ANSWER. The cache was just dropped, so this asks
@@ -2770,6 +2792,25 @@ function Invoke-ZeroConnChildKillDecision {
     $pidArg = if ($null -eq $ChildPid -or [int]$ChildPid -le 0) { "None" } else { ([string][int]$ChildPid) }
     try {
         $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_zero_conn_recovery; print(supervisor_zero_conn_recovery.decide_zero_conn_child_kill($secArg, $aliveArg, $pidArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Invoke-LoginResumeRehostDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c
+    # with the module and function both named, so tools/unreached.py credits this caller and
+    # the two cannot drift): "rehost_now" or "debounce" from (login just resumed this tick,
+    # current hosting state). "rehost_now" only when login flipped down->up on this tick AND
+    # nobody hosts the tunnel ('none'), so the login-resume tick skips the FailuresBeforeAction
+    # debounce (measured 2026-11-11: ~7 min from sign-in to re-host). Any failure returns "" so
+    # the caller falls back to the ordinary debounce rather than an un-vetted fast re-host.
+    param([bool]$LoginJustResumed, [string]$TunnelState)
+    $resumedArg = if ($LoginJustResumed) { "True" } else { "False" }
+    $stateArg = if ($null -eq $TunnelState) { "''" } else { "'" + ($TunnelState -replace "'", "") + "'" }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_login_resume; print(supervisor_login_resume.decide_login_resume_rehost($resumedArg, $stateArg))" 2>$null)).Trim()
     } catch {
         return ""
     }
@@ -4419,11 +4460,17 @@ while ($true) {
         }
         $tunnelMiss = 0
     } else {
-        if ($loggedIn -eq $false) { Write-Log "devtunnel now logged in -> resuming tunnel management" }
+        # $loginJustResumed is $true ONLY on this first tick after login flips down->up. It is
+        # passed to Invoke-TunnelHostingCheck so its 'none' branch can skip the debounce and
+        # re-host at once (the ~7-minute sign-in-to-re-host gap measured 2026-11-11). Every
+        # steady-state logged-in tick passes $false and behaves exactly as before.
+        $loginJustResumed = ($loggedIn -eq $false)
+        if ($loginJustResumed) { Write-Log "devtunnel now logged in -> resuming tunnel management" }
         $loggedIn = $true
-        # ours / none (re-host after the debounce) / foreign or shared (another PC serves this
-        # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
-        Invoke-TunnelHostingCheck | Out-Null
+        # ours / none (re-host now on a login-resume tick, else after the debounce) / foreign or
+        # shared (another PC serves this PC's tunnel: report, do not fight) -- see
+        # Resolve-TunnelHostingState.
+        Invoke-TunnelHostingCheck -LoginJustResumed $loginJustResumed | Out-Null
     }
 
     # LAST STEP OF THE TICK: is this process still the code on disk? Stat-only unless a file
