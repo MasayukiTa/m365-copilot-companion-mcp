@@ -425,6 +425,7 @@ jobs:
             ui/test_cockpit_tick_is_crash_safe.py \
             scripts/test_each_edge_profile_is_its_own_sign_in.py \
             scripts/test_nothing_new_is_invisible.py \
+            scripts/test_show_console_is_the_only_window_switch.py \
             scripts/test_a_leftover_tab_is_not_a_locked_door.py \
             scripts/test_a_leftover_wall_tab_does_not_contradict_the_session.py \
             scripts/test_a_silent_death_leaves_its_exit_code.py \

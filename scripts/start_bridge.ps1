@@ -350,7 +350,17 @@ $SignInPollSec = 20
 function Run-BridgeWatched {
     $env:MCP_BRIDGE_SIGNIN_SUPERVISED = "1"   # the bridge reports walls; it does not surface them
     $argList = @('"' + $bridge + '"') + $bridgeArgs
-    $proc = Start-Process -FilePath $py -ArgumentList $argList -NoNewWindow -PassThru
+    # MCP_SHOW_CONSOLE=1 is a DEBUG escape hatch: by default the bridge Python runs with
+    # -NoNewWindow (no visible terminal window, the default on a fresh PC). Set MCP_SHOW_CONSOLE=1
+    # to launch it in its OWN visible console window so a developer can watch stdout/stderr live.
+    # Unset/0/empty keeps the default windowless behaviour byte-for-byte unchanged.
+    $showConsole = $env:MCP_SHOW_CONSOLE -and ($env:MCP_SHOW_CONSOLE -ne '0')
+    if ($showConsole) {
+        Write-Host "MCP_SHOW_CONSOLE set -- launching the bridge in a VISIBLE console window (debug)."
+        $proc = Start-Process -FilePath $py -ArgumentList $argList -PassThru
+    } else {
+        $proc = Start-Process -FilePath $py -ArgumentList $argList -NoNewWindow -PassThru
+    }
     $null = $proc.Handle                        # without this, ExitCode reads empty in PS 5.1
     while (-not $proc.HasExited) {
         Start-Sleep -Seconds $SignInPollSec
