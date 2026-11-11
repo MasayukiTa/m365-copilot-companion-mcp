@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
-"""The startup splash can be minimised (owner request, 2026-09-24).
+"""The startup splash can be minimised.
 
 The splash is TopMost. A startup that waits -- another start_all holding the lock, a slow
 tunnel, a dependency update -- kept it above every other window for the whole wait, and the
-only control on it was the close button. The owner asked for a minimise button so the person
-can get it out of the way without cancelling anything.
+only control on it was the close button. A minimise button lets the person get it out of the
+way without cancelling anything.
 
 This builds the REAL form: it extracts Start-Splash from scripts/start_all.ps1 through the
 PowerShell parser (not a regex over the text), runs it, and reads the constructed Form's
