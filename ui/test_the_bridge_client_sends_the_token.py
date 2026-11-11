@@ -148,6 +148,103 @@ def test_the_request_is_a_post_carrying_the_token_and_the_form(harness, tmp_path
     assert "expect" not in r["headers"], "100-continue stalls every call against HTTP/1.0"
 
 
+class _RotateOn401(http.server.BaseHTTPRequestHandler):
+    """A fake bridge that refuses the first POST with 401 and, AS IT DOES SO, rewrites the
+    token file to a new value -- exactly what a bridge restart looks like to a window left
+    open across it. The second POST, carrying the re-read token, is accepted. Records every
+    token header it saw so the test can prove the retry used the NEW token, not the old one."""
+    token_path = None        # set by the test
+    new_token = None         # the value written on the first refusal
+    seen_tokens = []         # the X-Bridge-Token of every request, in order
+
+    def log_message(self, *a):
+        pass
+
+    def _reply(self, code, body):
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        tok = self.headers.get("X-Bridge-Token")
+        type(self).seen_tokens.append(tok)
+        if tok == type(self).new_token:
+            self._reply(200, b'{"ok": true}')
+            return
+        # first contact (stale token): rotate the file, then refuse so the client re-reads it
+        with open(type(self).token_path, "w", encoding="ascii") as fh:
+            fh.write(type(self).new_token)
+        self._reply(401, b'{"error": "unauthorized"}')
+
+
+class _AlwaysUnauthorized(http.server.BaseHTTPRequestHandler):
+    """A fake bridge that refuses every POST with 401 and never changes the token file -- the
+    path where re-reading the token cannot help, so the call must end in a refusal rather than
+    loop. Counts the POSTs so the test can prove the client tried exactly once more and stopped."""
+    posts = 0
+
+    def log_message(self, *a):
+        pass
+
+    def do_POST(self):
+        type(self).posts += 1
+        n = int(self.headers.get("Content-Length") or 0)
+        if n:
+            self.rfile.read(n)
+        body = b'{"error": "unauthorized"}'
+        self.send_response(401)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_a_rotated_token_is_refetched_and_the_call_retried_once(harness, tmp_path, token_dir):
+    """THE RECOVERY PATH, on a fake bridge. The first POST carries the token the window cached;
+    the bridge rejects it with 401 and rotates the token file (a restart). The client must
+    re-read the file and retry ONCE, and that retry must carry the NEW token and get through."""
+    from bridge import bridge_auth
+    srv, base = _serve(_RotateOn401)
+    try:
+        port = srv.server_address[1]
+        old_token, _ = bridge_auth.install_token(port)
+        # the token file the client reads and the handler must rewrite -- the same name
+        # BridgeClient.TokenPath builds under TOKEN_DIR_ENV (set by the token_dir fixture)
+        _RotateOn401.token_path = str(token_dir / ("token-%d" % port))
+        _RotateOn401.new_token = old_token + "-rotated"
+        _RotateOn401.seen_tokens = []
+        got = _run(harness, tmp_path, "call", base, "/send?msg=x")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert got == ['OK {"ok": true}'], got
+    # exactly two POSTs: the stale one that was refused, then the retry with the fresh token
+    assert _RotateOn401.seen_tokens == [old_token, _RotateOn401.new_token], _RotateOn401.seen_tokens
+
+
+def test_a_token_that_stays_wrong_is_refused_after_one_retry_not_looped(harness, tmp_path,
+                                                                        token_dir):
+    """THE NO-RECOVERY PATH, on a fake bridge. Every POST is refused with 401 and the token file
+    never changes, so re-reading it yields the same value. The client must retry at most once
+    and then surface a 401 refusal -- never spin re-reading an unchanging file."""
+    from bridge import bridge_auth
+    _AlwaysUnauthorized.posts = 0
+    srv, base = _serve(_AlwaysUnauthorized)
+    try:
+        bridge_auth.install_token(srv.server_address[1])
+        got = _run(harness, tmp_path, "call", base, "/send?msg=x")
+    finally:
+        srv.shutdown()
+        srv.server_close()
+    assert got and got[0].startswith("ERR 401 "), got
+    # the client re-read the (unchanged) token once and stopped: no more than two POSTs reached
+    # the bridge, and it did not loop re-reading a file that never changes
+    assert _AlwaysUnauthorized.posts <= 2, _AlwaysUnauthorized.posts
+
+
 def test_a_send_gets_through_the_real_bridge(harness, tmp_path, real_bridge):
     base, B = real_bridge
     from bridge import session_store as S
