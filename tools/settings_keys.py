@@ -467,6 +467,19 @@ KEYS = OrderedDict([
        "goal text); nothing is queued and no prompt or output changes. on is reserved (no "
        "second-stage builder yet) and behaves as off."),
 
+    # Peer work requests (relay/peer_requests.py), roadmap slice C2. SHADOW ONLY: once per
+    # coordinator tick it records which peer REQUEST/OFFER/CLAIM a peer-request protocol would
+    # have produced from the live worker set, beside nothing being posted. The three kinds live
+    # as data in relay/peer_requests.py and are deliberately NOT on relay/board_kinds.REGISTRY,
+    # so the RF hot serialized board path is unchanged. There is deliberately no value that
+    # posts a request or grants a claim.
+    _k("peer_requests", EACH_GATE, "off",
+       "relay/peer_requests.py:mode (every coordinator tick, mtime-cached)",
+       "off|shadow. Re-read every tick with no restart. shadow appends one row per tick that has "
+       "any peer REQUEST/OFFER to .fleet/peer_requests_shadow.jsonl (campaign ids, role names and "
+       "counts, never goal or step text); the board, its kinds, delivery order, budget and the "
+       "coordinator are all unchanged."),
+
     # Campaign board (relay/agent_board.py). The coordinator reads it once when it starts.
     # p1 (workers write) is declared and NOT implemented: it behaves as p0.
     _k("agent_board_mode", SWEEP_START, "off",
@@ -701,14 +714,6 @@ KEYS = OrderedDict([
     _k("deletemode", UI_ONLY, 1, "ui/CopilotChat.cs", "Delete-button behaviour."),
     _k("last_open_conv", UI_ONLY, "", "ui/CopilotChat.cs", "Which conversation to reopen."),
     _k("autoarchive", UI_ONLY, 0, "ui/FleetCockpit.cs", "Archive a run when it finishes."),
-
-    # The supervisor's agents-janitor sweep. Read each time the supervisor decides whether to
-    # delete (every 10 minutes while C: is below the disk threshold), not held across a run, so
-    # each_gate rather than live: it needs no Follower.watch wiring and a change lands on the
-    # next sweep. 1 = delete finished clones (default); 0 = dry-run only, log what it would do.
-    _k("agents_janitor_apply", EACH_GATE, 1,
-       "relay/fleet_runner.py:settings_agents_janitor_apply",
-       "The supervisor's finished-clone janitor deletes (1) or only logs (0); read each sweep."),
 ])
 
 

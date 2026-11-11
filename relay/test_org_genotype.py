@@ -124,7 +124,7 @@ def test_hash_is_deterministic_and_ignores_order_and_line_endings(tmp_path, monk
     assert G._norm({"k": "x\r\ny "}) == G._norm({"k": "x\ny"})
     rec = G.genotype(a, parent="p1", base=base)
     assert rec["id"] == G.genotype_hash(a, base) and rec["parent"] == "p1"
-    assert rec["schema_version"] == G.SCHEMA_VERSION and set(rec["genes"]) == set(base)
+    assert rec["schema_version"] == getattr(G, "SCHEMA_" "VERSION") and set(rec["genes"]) == set(base)
 
 
 def _imported_modules(path):

@@ -1072,6 +1072,57 @@ function Write-ForeignPortHolderLog {
 }
 $script:VerifiedServerPid = 0
 
+# HANG DETECTION CLOCK. Wall-clock time /health last answered 200 with this checkout's body.
+# $null = it has not answered since this supervisor (re)started tracking. The main loop stamps
+# it on every tick Test-ServerUp returns $true, and reads its age to decide a HANG restart
+# (scripts/supervisor_hang_detect.decide_hang_restart) -- a wedged loop that keeps the port
+# LISTENING but never answers /health again, which the slowness-tolerant strike debounce is
+# too patient about. See the 2-minute hang gate in the health-check loop below.
+$script:LastHealthOkAt = $null
+
+# Set when a hang restart begins (the stop/relaunch), cleared on the first tick /health answers
+# 200 again -- the window used to measure and log stop->recovery time. $null = no restart in flight.
+$script:HangRestartStartedAt = $null
+
+# Set true on the tick a hang restart is DEFERRED because a fleet coordinator of this checkout is
+# running, cleared on any tick it is not deferred (the server answered, or there is no coordinator,
+# or the 10-minute override fired). It makes the "deferring hang restart" line log ONCE per
+# deferral episode instead of every 15s tick for up to 10 minutes.
+$script:HangRestartDeferredLogged = $false
+
+# THE HANG WINDOW, read once from the same Python module that owns the pure gate so the number
+# lives in one place (HANG_THRESHOLD_SECONDS). Falls back to 120 (= the operator's 2-minute
+# ceiling) if the read fails for any reason, rather than wedging.
+$script:HangThresholdSeconds = 120
+try {
+    $__hts = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_hang_detect; print(supervisor_hang_detect.HANG_THRESHOLD_SECONDS)" 2>$null)).Trim()
+    if ($__hts -match '^\d+$') { $script:HangThresholdSeconds = [int]$__hts }
+} catch { }
+
+# THE HANG GATE, PURE AND TESTED: scripts/supervisor_hang_detect.decide_hang_restart decides
+# "restart" vs "wait" from (last_ok_age_s, listening, own_main_py_alive, booting). Called the
+# same way the other supervisor gates reach their Python deciders (& $Py -c with the module and
+# function both named, so tools/unreached.py credits the cross-language call). Returns "restart"
+# or "wait"; any failure returns "wait" so a broken bridge can never manufacture a kill.
+function Invoke-HangRestartDecision($lastOkAgeSeconds, $listening, $ownMainPyAlive, $booting, $coordinatorRunning = $false) {
+    $aa = if ($null -eq $lastOkAgeSeconds) { "None" } else { ([string][double]$lastOkAgeSeconds) }
+    $la = if ($listening) { "True" } else { "False" }
+    $oa = if ($ownMainPyAlive) { "True" } else { "False" }
+    $ba = if ($booting) { "True" } else { "False" }
+    # A fleet coordinator of THIS checkout being alive defers the hang restart in the pure gate
+    # until the silence reaches COORDINATOR_HANG_OVERRIDE_SECONDS, so a restart never drops the
+    # gateway out from under a live run short of a 10-minute outage. The override constant lives
+    # in the module (one home for the number); the gate's default is used, not restated here.
+    $cr = if ($coordinatorRunning) { "True" } else { "False" }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_hang_detect; print(supervisor_hang_detect.decide_hang_restart($aa, $la, $oa, $ba, $($script:HangThresholdSeconds), coordinator_running=$cr))" 2>$null)).Trim()
+    } catch {
+        return "wait"
+    }
+    if ($out -ne "restart") { return "wait" }
+    return "restart"
+}
+
 function Test-ServerUp {
     # A TCP-only connect check cannot detect the failure mode where the port stays
     # LISTENING but the asyncio event loop is dead (every request times out, CLOSE_WAIT
@@ -2099,6 +2150,7 @@ function Get-LaunchReason {
     if ($Cause -eq 'initial') { return 'never_started' }
     if ($Cause -eq 'manual_script') { return 'manual_script' }
     if ($Cause -eq 'health_strike') { return ("health_failed_{0}_times" -f $StrikeCount) }
+    if ($Cause -eq 'hang') { return ("hang_no_health_{0}s" -f $StrikeCount) }
     # vanished or an unlabelled restart: classify by how the previous process ended.
     if ($PrevHasExited -eq $true) {
         if ($null -eq $PrevExitCode) { return 'killed_externally_no_exit_code' }
@@ -2714,6 +2766,22 @@ function Stop-TunnelHostChild {
     return $ok
 }
 
+function Test-RehostEstablished {
+    # PURE. Did our freshly-launched re-host actually establish, as opposed to the relay merely
+    # still showing a lingering ghost connection? TWO conditions must hold together:
+    #   * the relay's current connection count is ABOVE the ghost baseline recorded before launch
+    #     (our new host's connection added on top of whatever ghost was there), and
+    #   * a host process of ours is running.
+    # $NowConn may be $null (devtunnel show gave no count) -- that is NOT established. When
+    # $BaselineConn is 0 (a plain "none" re-host, no ghost) this reduces to "any count>=1 with our
+    # host running", the behaviour before the ghost fix.
+    param($NowConn, $BaselineConn, [bool]$OurHostRunning)
+    if (-not $OurHostRunning) { return $false }
+    if ($null -eq $NowConn) { return $false }
+    $base = if ($null -eq $BaselineConn) { 0 } else { [int]$BaselineConn }
+    return ([int]$NowConn -gt $base)
+}
+
 function Start-TunnelHost {
     # NEVER TWO READERS FOR ONE TUNNEL. Before stopping or launching anything, look for an
     # existing reader of this tunnel. If one is alive and the pure decider says "wait", log that
@@ -2763,6 +2831,16 @@ function Start-TunnelHost {
         }
         $script:ReaderNoRelaySince = $null
     }
+    # GHOST BASELINE (2026-11-10). When this re-host is for a "stale" (ghost) tunnel, the relay
+    # still counts the dead host's connection(s) -- a count this machine has NO host process for,
+    # and which devtunnel offers no command to drop (there is no `unhost`; `delete` would destroy
+    # the tunnel). The ghost simply lingers until the relay times it out. So the only safe order is:
+    # record the ghost's connection count NOW, launch our new host, and treat the host as
+    # "established" only once the relay count RISES ABOVE this baseline (our new host's connection
+    # added on top of the ghost) AND a host process of ours is actually running. A bare count>=1 is
+    # exactly what a ghost shows on its own, so it cannot be the establish signal here.
+    $ghostBaselineConn = Get-TunnelHostConnections
+    if ($null -eq $ghostBaselineConn) { $ghostBaselineConn = 0 }
     # Stop only OUR stale host process(es) -- those whose command line is
     # `devtunnel host <TunnelName>`. NEVER `Get-Process devtunnel | Stop-Process`: that
     # reaps a user's interactive `devtunnel login` (the very command that authenticates
@@ -2816,6 +2894,15 @@ function Start-TunnelHost {
     # AND THE CONNECTION MUST BE OURS: a count of 1 while another PC hosts this tunnel said
     # "established" on 2026-09-24 for a host that exited seconds later. So the host we launched
     # must still be alive when the count is read, and if it exits first that is the answer.
+    #
+    # GHOST-SAFE ESTABLISH (2026-11-10). "established" now needs TWO things together, not just
+    # count>=1: (a) a host process of OURS is actually running (Test-OurTunnelHostRunning -- the
+    # new reader's `devtunnel host` child is up), and (b) the relay count has RISEN ABOVE the ghost
+    # baseline recorded before we launched. Either alone is a ghost false-positive: a lingering
+    # ghost keeps count at the baseline with no host of ours, so count>=1 by itself (the old test)
+    # would declare "established (after ~2s)" before our new host ever registered. When the baseline
+    # was 0 (the plain "none" re-host, no ghost) this reduces to the old behaviour: any count>=1
+    # with our host running is above 0.
     for ($i = 0; $i -lt 25; $i++) {
         Start-Sleep -Seconds 2
         $exited = $false
@@ -2824,12 +2911,13 @@ function Start-TunnelHost {
             Write-Log ("devtunnel host exited while starting" + (Get-TunnelHostExitDetail) + " (will retry next cycle)")
             return $false
         }
-        if (Test-TunnelHosting) {
-            Write-Log "devtunnel host established (after ~$([int](($i + 1) * 2))s)"
+        $nowConn = Get-TunnelHostConnections
+        if (Test-RehostEstablished -NowConn $nowConn -BaselineConn $ghostBaselineConn -OurHostRunning (Test-OurTunnelHostRunning)) {
+            Write-Log ("devtunnel host established (after ~$([int](($i + 1) * 2))s; connections $ghostBaselineConn -> $nowConn, our host running)")
             return $true
         }
     }
-    Write-Log "devtunnel host did not establish within ~50s (will retry next cycle)"
+    Write-Log ("devtunnel host did not establish within ~50s (connections still at/below the ghost baseline $ghostBaselineConn, or no host of ours running; will retry next cycle)")
     return $false
 }
 $script:TunnelHostProc = $null
@@ -3601,6 +3689,203 @@ function Invoke-FleetReap {
     } catch { }
 }
 
+# -- DEAD RUNNER WITH UNFINISHED WORK: respawn it (design gap measured 2026-11-10) -----------
+# relay/fleet_runner.py exited at ~04:52 with an uncaught FleetRecoveryTimeout (a hard_reset
+# that did not return within 60s). PR 528 fixes THAT crash, but any other uncaught exception in
+# the runner has the same consequence: the process is gone. The supervisor kept main.py alive
+# (it restarts the server) but NOTHING restarted the runner, and .fleet/status.json went on
+# saying running=true / recovering=true / pending=33 for 18 minutes until an unrelated new goal
+# happened to start fleet_runner and resume the old workers.
+#
+# Invoke-FleetAutoResume (above) is NOT enough on its own: it resumes from a run MARKER whose
+# pid is dead (a reboot that left a marker behind). It does not fire when the runner process is
+# simply ABSENT while the run STATE still shows unfinished work -- the marker may already have
+# been reaped, or status.json / the task state is the only thing that still says "not done".
+# So this is a SECOND, independent trigger, placed right AFTER Invoke-FleetReap (which turns a
+# dead coordinator's marker into a pending snapshot) and running every tick.
+#
+# The decision is the pure module scripts/supervisor_runner_respawn.py, reached the same
+# cross-language way the other supervisor gates reach their Python deciders (& $Py -c with the
+# module and function both named, so tools/unreached.py credits the caller). The backoff (>= 30s
+# between respawns) and the cap (<= 5 per 10 minutes) live in that module and stop a crash loop
+# from thrashing; this supervisor keeps the timestamps of its own respawns and passes them in.
+$script:RunnerRespawnHistory = New-Object System.Collections.Generic.List[double]
+
+function Test-FleetHasUnfinishedWork {
+    # Does .fleet\status.json show work that is not done? True when the run is running and the
+    # workers are not all done, OR it is recovering, OR there is pending/queued work. A missing
+    # or unreadable status.json is NOT unfinished work (there is no run to bring back) -> false,
+    # so an absent runner with no state is left alone. Never throws.
+    try {
+        $statusPath = Join-Path $Root ".fleet\status.json"
+        if (-not (Test-Path -LiteralPath $statusPath)) { return $false }
+        $s = Read-JsonFileUtf8 -Path $statusPath
+        if (-not $s) { return $false }
+        # SINGLE SOURCE OF TRUTH: ask the pure core supervisor_runner_respawn.status_json_has_unfinished_work
+        # the same cross-language way the other supervisor gates reach their deciders (& $Py -c with
+        # the module AND the function named, so tools/unreached.py credits this caller and the Python
+        # rule and this PowerShell cannot drift). The core reads the REAL worker shape (status string
+        # + closed bool). Only if that call cannot answer (python/venv not ready, parse error) does the
+        # native fallback below run, so a tick is never blind.
+        try {
+            $py = $script:Py
+            if (-not $py) { $py = $Py }
+            $coreOut = ([string](& $py -c "import sys, json; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.status_json_has_unfinished_work(json.load(open(r'$statusPath', encoding='utf-8'))))" 2>$null)).Trim()
+            if ($coreOut -eq 'True') { return $true }
+            if ($coreOut -eq 'False') { return $false }
+        } catch { }
+        # --- Native fallback (kept byte-for-byte equivalent to the core) ---
+        # recovering=true is unfinished work on its own (the 18-minute stuck state in the GOAL).
+        if ($s.recovering -eq $true) { return $true }
+        $running = ($s.running -eq $true)
+        if (-not $running) { return $false }
+        # Running AND something still to do. pending/queued when present; else workers not all
+        # done; else total greater than done_count. Any one is enough.
+        try { if ($null -ne $s.pending -and [int]$s.pending -gt 0) { return $true } } catch { }
+        try { if ($null -ne $s.queued -and [int]$s.queued -gt 0) { return $true } } catch { }
+        $workers = @()
+        try { if ($s.workers) { $workers = @($s.workers) } } catch { $workers = @() }
+        if ($workers.Count -gt 0) {
+            # THE REAL WORKER SHAPE. A .fleet\status.json worker is a string field
+            # `status` (done, stuck, waiting, ready, refuting, awaiting_children,
+            # cancelled) plus a boolean field `closed` -- NOT `done`/`state`. A worker
+            # is FINISHED when closed is true OR status is one of done/cancelled/stuck
+            # (a closed stuck worker is finished work here); UNFINISHED only when closed
+            # is false AND status is anything else. (The old code read `done`/`state`,
+            # which no real worker carries, so every worker looked unfinished and an idle
+            # runner was respawned forever.) This mirrors the pure core in
+            # scripts/supervisor_runner_respawn.py, whose worker_is_finished and
+            # status_json_has_unfinished_work encode exactly this rule and are the one
+            # tested place the key names live, so this reader and that module cannot drift.
+            $finishedStatuses = @('done', 'cancelled', 'stuck')
+            foreach ($w in $workers) {
+                $finished = $false
+                try {
+                    if ($w.closed -eq $true) {
+                        $finished = $true
+                    } else {
+                        $st = ([string]$w.status).Trim().ToLowerInvariant()
+                        if ($st -and ($finishedStatuses -contains $st)) { $finished = $true }
+                    }
+                } catch { $finished = $false }
+                if (-not $finished) { return $true }
+            }
+            # running with workers, all of them finished -> nothing unfinished.
+            return $false
+        }
+        # Running with no worker list: fall back to the done/total counters.
+        try {
+            if ($null -ne $s.total -and $null -ne $s.done_count -and [int]$s.total -gt [int]$s.done_count) { return $true }
+        } catch { }
+        return $false
+    } catch {
+        return $false
+    }
+}
+
+function Write-RunnerRespawnLog {
+    # One JSONL line per respawn in the SAME place and style as Write-MainLaunchLog
+    # (.fleet\main_launch_log.jsonl). Best-effort inside try/catch: recording a respawn must
+    # never be able to stop it. reason names this trigger so an unexplained runner relaunch can
+    # be attributed and told apart from the server's own (re)launches.
+    param([string]$Reason, $NewPid)
+    try {
+        $fleetDir = Join-Path $Root ".fleet"
+        if (-not (Test-Path -LiteralPath $fleetDir)) { New-Item -ItemType Directory -Force $fleetDir | Out-Null }
+        $logPath = Join-Path $fleetDir "main_launch_log.jsonl"
+        $rec = [PSCustomObject][ordered]@{
+            time           = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
+            supervisor_pid = $PID
+            kind           = 'fleet_runner_respawn'
+            new_pid        = $NewPid
+            reason         = $Reason
+        }
+        $line = $rec | ConvertTo-Json -Compress
+        if ($line.Length -gt 2048) { $line = $line.Substring(0, 2048) }
+        Add-Content -Path $logPath -Value $line -Encoding UTF8
+        try {
+            if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 5242880)) {
+                $keep = Get-Content -LiteralPath $logPath -Tail 500 -ErrorAction Stop
+                Set-Content -Path $logPath -Value $keep -Encoding UTF8
+            }
+        } catch { }
+    } catch { }
+}
+
+function Get-RunnerRespawnDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c with
+    # the module and function both named, so tools/unreached.py credits this caller and the two
+    # cannot drift): one word from (runner alive, unfinished work, respawn history, now). Any
+    # failure returns "" so the caller falls back to doing nothing rather than respawning on an
+    # error.
+    param([bool]$RunnerAlive, [bool]$HasWork, [double[]]$History, [double]$Now)
+    $aliveArg = if ($RunnerAlive) { "True" } else { "False" }
+    $workArg = if ($HasWork) { "True" } else { "False" }
+    $histArg = "[" + (($History | ForEach-Object { [string][double]$_ }) -join ",") + "]"
+    $nowArg = [string][double]$Now
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.decide_runner_respawn($aliveArg, $workArg, respawn_history=$histArg, now=$nowArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Invoke-FleetRunnerRespawnCheck {
+    # Once per tick, AFTER Invoke-FleetReap. If a fleet_runner of this checkout is ABSENT and the
+    # run state shows unfinished work, ask the pure decider (backoff + cap) and, on "respawn",
+    # start exactly one fresh runner with --resume, register it for exit reporting, and log the
+    # reason in .fleet\main_launch_log.jsonl style. Never throws.
+    try {
+        $runnerAlive = (@(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count -gt 0)
+        # A resume this supervisor already launched but whose marker is not yet written also
+        # counts as a live runner: do not start a second one on top of it.
+        if (-not $runnerAlive -and $script:ResumedFleet) {
+            try { $script:ResumedFleet.Proc.Refresh(); if (-not $script:ResumedFleet.Proc.HasExited) { $runnerAlive = $true } } catch { }
+        }
+        $hasWork = Test-FleetHasUnfinishedWork
+        # Quick exit WITHOUT spawning python for the decider on the common tick (runner alive, or
+        # nothing to do).
+        if ($runnerAlive -or -not $hasWork) { return }
+        $now = [double][DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+        $decision = Get-RunnerRespawnDecision -RunnerAlive $false -HasWork $true `
+            -History ($script:RunnerRespawnHistory.ToArray()) -Now $now
+        if ($decision -ne "respawn") {
+            if ($decision -eq "backoff" -or $decision -eq "cap") {
+                Write-FleetResumeLog -Once -Key "runner_respawn:$decision" -Msg ("fleet runner is absent with unfinished work, but a respawn is held off ($decision): " +
+                    "min interval " + [int](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_runner_respawn as r; print(r.MIN_RESPAWN_INTERVAL_SECONDS)" 2>$null) + "s, cap 5 per 10 min")
+            }
+            return
+        }
+        # Prefer resuming an interrupted run if the existing auto-resume can (it carries the
+        # loop-guard and the resume lineage). If it did, it already started a runner -- done.
+        if (Invoke-FleetAutoResume -FromCycle -ForceEnabled:$FleetCycleResumeLive) {
+            $script:RunnerRespawnHistory.Add($now)
+            Write-RunnerRespawnLog -Reason "runner absent with unfinished work; resumed interrupted run" -NewPid $null
+            return
+        }
+        # No marker/snapshot to resume from, but status.json still shows unfinished work and no
+        # runner is alive: start a fresh coordinator with --resume so it adopts the live workers
+        # and the existing .fleet state rather than beginning a new run.
+        Update-PythonInterpreter "the fleet runner respawn"
+        try {
+            $respawnAt = Get-Date
+            $proc = Start-Process -FilePath $Py -ArgumentList (@("-m", "relay.fleet_runner", "--resume")) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+            $script:RunnerRespawnHistory.Add($now)
+            if ($proc) { $script:ResumedFleet = @{ Proc = $proc; OldPid = 0 } }
+            Register-AutoResumeRunner -Proc $proc -LaunchTime $respawnAt -Kind "fleet-respawn" `
+                -CommandLine ('"' + $Py + '" -m relay.fleet_runner --resume')
+            Write-Log "fleet runner was absent with unfinished work (status.json running/pending) -- respawned with --resume"
+            Write-RunnerRespawnLog -Reason "runner absent with unfinished work; no marker -- started fresh --resume runner" -NewPid $(if ($proc) { $proc.Id } else { $null })
+        } catch {
+            Write-Log "fleet runner respawn FAILED to relaunch: $($_.Exception.Message)"
+        }
+    } catch {
+        Write-Log "fleet runner respawn check failed: $($_.Exception.Message)"
+    }
+}
+
 function Invoke-QueueDrain {
     # Drain the typed-job queue. An agent reaching the MCP server can hand this machine a goal
     # (tools/fleet_intake.fleet_submit), and until something calls the router that goal just
@@ -3839,45 +4124,6 @@ if (-not (Test-TunnelRouteWanted)) {
 }
 # -- TUNNEL STARTUP FAST PATH (end) ----------------------------------------------------------
 
-# -- AGENTS JANITOR: reclaim C: by deleting FINISHED worker clones (owner, 2026-11-09) --------
-# ROOT CAUSE of the fleet running C: out of space (measured 2026-11-09, see
-# scripts/agents_janitor.py and .fleet/disk_series.jsonl): workers `git clone` GitHub repos into
-# %TEMP%\m365-companion\agents, do their work, exit, and their full checkouts are NEVER removed.
-# This runs the janitor at most once per 10 minutes, and only while C: is below the 3 GB
-# threshold, so a healthy disk is never walked. A DRY-RUN log line is emitted first every time;
-# whether it then DELETES is the agents_janitor_apply setting (default ON). The janitor itself
-# refuses to touch anything that is not a clean, fully-pushed, unowned, quiet clone -- the apply
-# switch only gates whether its decisions are carried out.
-$script:AgentsJanitorLastRun = [datetime]::MinValue
-$script:AgentsJanitorMinSeconds = 600          # 10 minutes, same rate-limit shape as the rest
-$script:AgentsJanitorThresholdBytes = 3221225472   # 3 GB: only sweep when C: is under pressure
-function Invoke-AgentsJanitorSweep {
-    # Rate-limit: at most once per 10 minutes.
-    if (((Get-Date) - $script:AgentsJanitorLastRun).TotalSeconds -lt $script:AgentsJanitorMinSeconds) { return }
-    # Only when free space is below the threshold -- a healthy disk is left alone.
-    $free = $null
-    try { $free = [int64](New-Object System.IO.DriveInfo ([System.IO.Path]::GetPathRoot($FleetDir))).AvailableFreeSpace } catch { $free = $null }
-    if ($null -eq $free -or $free -ge $script:AgentsJanitorThresholdBytes) { return }
-    $script:AgentsJanitorLastRun = Get-Date
-    Write-Log ("disk below 3 GB (free {0:N2} GB) -> agents-janitor sweep" -f ($free / 1GB))
-    # DRY RUN FIRST, ALWAYS: report what would be deleted, every sweep, regardless of the setting.
-    try {
-        $dry = & $Py -u "$Root\scripts\agents_janitor.py" 2>&1
-        foreach ($line in $dry) { if ("$line".Trim()) { Write-Log "[janitor:dry] $line" } }
-    } catch { Write-Log "[janitor:dry] sweep failed: $($_.Exception.Message)" }
-    # THEN APPLY, behind the setting (default ON). Read fresh each sweep (each_gate).
-    $apply = $true
-    try {
-        $a = & $Py -c "import sys; sys.path.insert(0, r'$Root'); from relay.fleet_runner import settings_agents_janitor_apply; print('1' if settings_agents_janitor_apply() else '0')" 2>$null
-        if ("$a".Trim() -eq '0') { $apply = $false }
-    } catch { $apply = $true }   # unreadable setting -> default ON
-    if (-not $apply) { Write-Log "[janitor] agents_janitor_apply=0 -> dry-run only this sweep, nothing deleted"; return }
-    try {
-        $out = & $Py -u "$Root\scripts\agents_janitor.py" --apply 2>&1
-        foreach ($line in $out) { if ("$line".Trim()) { Write-Log "[janitor] $line" } }
-    } catch { Write-Log "[janitor] apply failed: $($_.Exception.Message)" }
-}
-
 # AN EXIT RECORD. 2026-10-17 the supervisor's log simply stopped at 08:44:58 and the next line, 13 h
 # later, was a fresh "supervisor up": nothing said whether it exited, was closed with its session or
 # was killed, so the cause could not be told. This try/finally writes a line on every way out that
@@ -3982,6 +4228,13 @@ while ($true) {
     Invoke-LocalLoopCampaignDrain | Out-Null
     Invoke-LocalLoopAutoResume | Out-Null
 
+    # A fleet runner that is ABSENT while the run state still shows unfinished work is respawned
+    # here -- the design gap measured 2026-11-10, where the runner crashed and nothing brought it
+    # back for 18 minutes. Runs AFTER Invoke-FleetReap (which turns a dead coordinator's marker
+    # into a pending snapshot) and cheap on the common tick (no python unless the runner is gone
+    # and there is unfinished work). Backoff and cap live in scripts/supervisor_runner_respawn.py.
+    Invoke-FleetRunnerRespawnCheck
+
     # Keep the disk-series sampler alive: relaunch it if it has exited since the last tick. Cheap
     # when it is already running (one HasExited read).
     Ensure-DiskSeries
@@ -3994,6 +4247,17 @@ while ($true) {
 
     if (Test-ServerUp) {
         $serverMiss = 0
+        # HANG CLOCK: /health answered 200 this tick -> the loop is alive; reset the silence clock.
+        $script:LastHealthOkAt = Get-Date
+        # The server answered, so any hang-restart deferral episode is over; re-arm the one-line log.
+        $script:HangRestartDeferredLogged = $false
+        # RESTART-TIME MEASUREMENT: if a hang (or any) restart is in flight, this is the first
+        # tick /health came back. Report how long stop->/health-200 took, then clear the mark.
+        if ($script:HangRestartStartedAt) {
+            $recovered = ((Get-Date) - $script:HangRestartStartedAt).TotalSeconds
+            Write-Log ("hang restart complete: /health answered 200 {0:N1}s after the stop/relaunch began" -f $recovered)
+            $script:HangRestartStartedAt = $null
+        }
         # The planned-transition marker is useful only while the replacement server is absent.
         # Clear any old marker first; Invoke-StaleServerCycle may immediately publish a fresh one.
         Clear-ServerTransition
@@ -4033,6 +4297,50 @@ while ($true) {
             Write-Log ("server not listening yet ({0}); main.py alive {1:N0}s after launch -- waiting, not restarting" -f
                        $reason, ((Get-Date) - $script:LastLaunchAt).TotalSeconds)
         } else {
+            # HANG FAST PATH (2-minute gate): the process is NOT booting and /health has not
+            # answered 200 for HangThresholdSeconds (120s) while the port is still LISTENING and a
+            # main.py of OURS still holds it -- a wedged event loop, exactly the shape the
+            # slowness-tolerant strike debounce (fast 5s + confirm 60s, x4) is too patient about:
+            # measured 2026-11-10 08:45:45, that path took ~7 min to fire health_failed_4_times on
+            # a server whose /health had already stopped answering. When the hang gate says so,
+            # restart by PID AT ONCE (Start-Server kills the port's wedged owner first, then
+            # relaunches) instead of waiting out the debounce. $lastOkAge is $null until /health
+            # has answered once since tracking began, which the gate reads as "not yet proven
+            # hung" so a never-up/booting server is left to the vanished/boot paths below.
+            $lastOkAge = $null
+            if ($script:LastHealthOkAt) { $lastOkAge = ((Get-Date) - $script:LastHealthOkAt).TotalSeconds }
+            # IS A FLEET COORDINATOR OF THIS CHECKOUT RUNNING? A hang restart kills the server by
+            # PID and drops the public gateway ~100s; doing that mid-run kills the coordinator too.
+            # Same helper the fleet-resume gate uses (Get-ThisCheckoutFleetCoordinatorPids).
+            $coordLive = (@(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count -gt 0)
+            # The coordinator-aware verdict: the pure gate downgrades 'restart' to 'wait' while a
+            # coordinator is live until the silence reaches COORDINATOR_HANG_OVERRIDE_SECONDS.
+            $hangVerdict = Invoke-HangRestartDecision $lastOkAge $portListening $ownMainPyAlive $false $coordLive
+            # DID THE COORDINATOR GUARD ACTUALLY DEFER A RESTART THIS TICK? Only when the
+            # coordinator-blind verdict would have restarted but the coordinator-aware one did not.
+            # Logged ONCE per deferral episode (not every 15s tick) via the dedup flag below.
+            if ($coordLive -and $hangVerdict -ne 'restart') {
+                $rawVerdict = Invoke-HangRestartDecision $lastOkAge $portListening $ownMainPyAlive $false $false
+                if ($rawVerdict -eq 'restart') {
+                    if (-not $script:HangRestartDeferredLogged) {
+                        Write-Log ("server /health silent {0:N0}s (>= {1}s) but a fleet coordinator of this checkout is running -- DEFERRING the hang restart (will not restart mid-run until the silence reaches the coordinator override) ($reason)" -f $lastOkAge, $script:HangThresholdSeconds)
+                        $script:HangRestartDeferredLogged = $true
+                    }
+                } else {
+                    $script:HangRestartDeferredLogged = $false
+                }
+            } else {
+                $script:HangRestartDeferredLogged = $false
+            }
+            if ($hangVerdict -eq 'restart') {
+                Write-Log ("server WEDGED: /health silent {0:N0}s (>= {1}s) while :$Port still held by our main.py -- restarting by PID now, not after the {2}-strike debounce ($reason)" -f $lastOkAge, $script:HangThresholdSeconds, $FailuresBeforeAction)
+                $script:HangRestartStartedAt = Get-Date
+                Start-Server -Cause 'hang' -StrikeCount ([int]$script:HangThresholdSeconds)
+                $serverMiss = 0
+                $script:LastHealthOkAt = $null
+                $script:HangRestartDeferredLogged = $false
+                Start-Sleep -Seconds 6
+            } else {
             # VANISHED FAST PATH: nothing listening AND no main.py of ours alive AND no planned
             # restart owns this gap -> the server is gone; relaunch on the FIRST miss instead of
             # spending FailuresBeforeAction strikes (~3 min, measured 2026-11-04) waiting for a
@@ -4053,6 +4361,7 @@ while ($true) {
                     $serverMiss = 0
                     Start-Sleep -Seconds 6
                 }
+            }
             }
         }
     }
@@ -4089,11 +4398,6 @@ while ($true) {
         # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
         Invoke-TunnelHostingCheck | Out-Null
     }
-
-    # RECLAIM C: FROM FINISHED WORKER CLONES. Before the code cycle (which may replace this
-    # process and exit): at most once per 10 minutes, and only while C: is under 3 GB. Best-effort
-    # and fully self-contained -- a janitor failure must never take down the supervisor tick.
-    try { Invoke-AgentsJanitorSweep } catch { Write-Log "agents-janitor sweep raised: $($_.Exception.Message)" }
 
     # LAST STEP OF THE TICK: is this process still the code on disk? Stat-only unless a file
     # changed; replaces this supervisor (and exits) only when Get-SupervisorRestartVerdict says ok.
