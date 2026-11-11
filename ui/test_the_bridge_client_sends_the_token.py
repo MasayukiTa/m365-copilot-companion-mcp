@@ -243,6 +243,10 @@ def test_a_token_that_stays_wrong_is_refused_after_one_retry_not_looped(harness,
     # the client re-read the (unchanged) token once and stopped: no more than two POSTs reached
     # the bridge, and it did not loop re-reading a file that never changes
     assert _AlwaysUnauthorized.posts <= 2, _AlwaysUnauthorized.posts
+    msg = got[0]
+    assert 're-reading' in msg, msg
+    assert 'restarted' in msg, msg
+    assert 'bridge.log' in msg, msg
 
 
 def test_a_send_gets_through_the_real_bridge(harness, tmp_path, real_bridge):
