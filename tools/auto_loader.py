@@ -72,6 +72,24 @@ def load_auto_tools(package: str = "tools.auto") -> list[tuple[str, Callable]]:
                     continue
             except Exception:
                 continue
+        # These desktop tools have a fixed public surface. Register the actual
+        # callables here; other foundry modules continue to use discovery.
+        if package == "tools.auto" and mod_info.name in {
+            "desktop_snapshot", "desktop_observe", "desktop_act", "desktop_secure"
+        }:
+            if mod_info.name == "desktop_snapshot":
+                desktop_tools = (module.desktop_state, module.capture_window_by_title)
+            elif mod_info.name == "desktop_observe":
+                desktop_tools = (module.screen_full_desktop, module.screen_state_report,
+                                 module.screen_lock_history, module.screen_state_diff)
+            elif mod_info.name == "desktop_act":
+                desktop_tools = (module.screen_msg_click, module.screen_msg_text,
+                                 module.screen_msg_key, module.screen_msg_close,
+                                 module.screen_uia_dump, module.screen_uia_act)
+            else:
+                desktop_tools = (module.screen_secure_status, module.screen_secure_capture)
+            found.extend((mod_info.name, tool) for tool in desktop_tools)
+            continue
         for attr_name, obj in vars(module).items():
             if attr_name.startswith("_") or _is_test_function(attr_name, obj):
                 continue
