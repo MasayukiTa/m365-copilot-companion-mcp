@@ -26,7 +26,7 @@ def test_queue_submitter_reads_the_job_id_from_the_door_reply():
 
 
 def test_queue_submitter_never_marks_a_goal_duplicate():
-    # The door no longer refuses on content resemblance (2026-10-26/27 owner instruction), so no
+    # The door no longer refuses on content resemblance, so no
     # reply maps to a duplicate. A queued-ok reply is ok; anything else is a plain failure.
     msg = "[fleet_submit: could not queue the goal: OSError: disk full]"
     r = QueueSubmitter(fn=lambda *a, **k: msg).submit("[A1] x。")
@@ -160,7 +160,7 @@ def test_without_the_queue_marker_an_unseen_goal_still_fails(tmp_path):
 
 def test_a_goal_is_submitted_as_written_without_rewording(tmp_path):
     # There is no longer any reword-on-duplicate step: the door does not refuse on content
-    # resemblance (2026-10-26/27 owner instruction), so the goal goes out once, as written.
+    # resemblance, so the goal goes out once, as written.
     st = _mk(tmp_path, 1)
     seq = [SubmitResult(ok=True, attempts=1, job_id="j1j1j1j1j1j1")]
     done = Observation(state=DONE, outcome="DONE", answer="要点\n1\n2\n3")

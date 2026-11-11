@@ -79,7 +79,7 @@ class Submitter:
                 res.ok = True
                 return res
             # A near-duplicate reply is no longer a special case: the fleet door does not refuse
-            # on content resemblance (2026-10-26/27 owner instruction), so there is nothing to
+            # on content resemblance, so there is nothing to
             # detect here. A non-zero rc is a real submit failure and is retried/reported as one.
             self.log("submit attempt %d failed (rc=%s): %s" % (n + 1, rc, res.output[-300:].replace("\n", " ")))
             if probe is not None:
@@ -139,7 +139,7 @@ class QueueSubmitter:
             res.ok, res.job_id = True, m.group(1)
         else:
             # The door no longer refuses a goal because it resembles one in flight
-            # (2026-10-26/27 owner instruction), so there is no similar-goal reply to map to a
+            # so there is no similar-goal reply to map to a
             # duplicate here. Anything that is not a queued-ok line is a real failure (too long,
             # queue full, raised) and keeps the door's own message.
             self.log("queue refused: %s" % text[:300])
@@ -151,5 +151,5 @@ class QueueSubmitter:
 
 # fleet_similarity() was removed: it exposed the door's content-resemblance rule so the runner
 # could hold a request back until a similarly-worded one finished. The door no longer refuses on
-# content (2026-10-26/27 owner instruction), so there is nothing to mirror and nothing to hold
+# content, so there is nothing to mirror and nothing to hold
 # back for -- every request is submitted as written.

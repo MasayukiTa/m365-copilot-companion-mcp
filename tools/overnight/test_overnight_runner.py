@@ -148,7 +148,7 @@ def test_already_submitted_guard(tmp_path):
 
 def test_each_goal_is_submitted_once_as_written(tmp_path):
     # No reword-on-duplicate and no 重複-skip any more: the door does not refuse on content
-    # resemblance (2026-10-26/27 owner instruction). Each item is submitted once, as written,
+    # resemblance. Each item is submitted once, as written,
     # and both reach their normal outcome.
     st = _mk(tmp_path, ["a", "b"])
     sub = FakeSubmitter([SubmitResult(ok=True, attempts=1), SubmitResult(ok=True, attempts=1)])
@@ -295,7 +295,7 @@ def test_submitter_calls_the_gui_script_once_per_goal_and_retries_with_backoff()
 def test_submitter_probes_before_retry_and_does_not_double_submit():
     # A timed-out call may have landed anyway; the probe catches that so a retry does not create
     # a second copy. (There is no longer any content-duplicate short-circuit: the door does not
-    # refuse on resemblance -- 2026-10-26/27 owner instruction.)
+    # refuse on resemblance.)
     outs = [(1, "timeout after 5s")]
     calls = []
 

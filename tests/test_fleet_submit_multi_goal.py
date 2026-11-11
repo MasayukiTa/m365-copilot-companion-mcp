@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """fleet_submit_multigoal.jsonl: a prompt packing SEVERAL INDEPENDENT GOALS is NOTED, never refused.
 
-Owner rule 2026-09-12 (jsonl L6695): a real person types one instruction, not a numbered battery
-of them. Following the same owner instruction that governs similarity (never refuse, only record),
-such a submission is QUEUED whole and the count is recorded in fleet_submit_multigoal.jsonl --
-nothing lands in the refusals log.
+A submission containing multiple independent goals is queued whole and the count is recorded
+in fleet_submit_multigoal.jsonl; nothing lands in the refusals log.
 """
 from __future__ import annotations
 

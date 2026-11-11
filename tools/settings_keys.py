@@ -173,14 +173,11 @@ KEYS = OrderedDict([
        "change takes effect on the next fleet_submit with no restart. Absent, unreadable or "
        "anything but on reads as off."),
 
-    # The owner's standing rule after the 2026-11-02 uia incident classified goals asking for UI
-    # automation / computer use on the REAL desktop (desktop_act / screen_uia_act / screen_uia_dump
-    # / Notepad+Calculator automation tests). FLIPPED 2026-11-09 (owner instruction): such a goal
-    # is now ALLOWED by default. desktop_guard is the opt-out -- set it to deny to restore the old
-    # refuse-by-default behaviour. Read live at each worker start, mtime-cached.
+    # Real-desktop automation is allowed by default; desktop_guard=deny opts into refusal.
+    # The setting is read at each worker start and cached by modification time.
     _k("desktop_guard", EACH_GATE, "allow",
        "relay/desktop_guard.py:mode (every worker start, mtime-cached)",
-       "allow|deny. allow (default, owner instruction 2026-11-09): a job whose goal text asks for "
+       "allow|deny. allow (default): a job whose goal text asks for "
        "real-desktop UI automation (desktop_act, screen_uia_act/dump, 'Notepad and Calculator' "
        "automation, '実デスクトップ') is born as a normal worker. deny: "
        "restores the old behaviour -- such a goal is REFUSED before a worker opens, with a reason "

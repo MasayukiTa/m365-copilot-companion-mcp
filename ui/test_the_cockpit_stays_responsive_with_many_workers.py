@@ -188,7 +188,7 @@ def test_interval_never_leaves_its_bounds():
 
 
 def test_a_one_second_tick_does_not_fire_every_700ms():
-    # the owner's words: a tick that costs ~1 s must leave at least a few seconds before the next
+    # A tick that costs about one second must leave several seconds before the next.
     assert next_interval_ms(1000.0) >= 3000.0
 
 

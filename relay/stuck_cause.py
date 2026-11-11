@@ -1,22 +1,9 @@
 # -*- coding: utf-8 -*-
 """A stuck worker's cause, read from what the tools actually returned.
 
-WHY THIS EXISTS (owner requirement, 2026-10-15). When the DB host is unreachable the stuck
-reason must say NETWORK in its first words. Last night's run had 17 stuck goals and the reason
-depended on which code path happened to settle the worker:
-
-  * STUCK     "worker reached the same conclusion on consecutive turns -> settling on its own
-              stated reason ...: <the model's words>"  -- right only if the model said so.
-              Three workers said "locked / session IP not authorised"; five said 10060.
-  * REFUSED   "this was a refusal of the instruction, reword it" -- printed for workers whose
-              very first reply was Copilot's canned non-answer, while the ledger showed the DB
-              host timing out under every sibling.
-  * INFRA_STUCK "tool calls did not reach the gateway" -- a different fault, same shelf.
-
-All three are decided from the model's prose or from a single marker. The tool ledger
-(.fleet/tool_events.jsonl) holds the real outcomes: the ODBC error text with its 10060/08001,
-the lock refusal with the IP it refused. This module reads those, deterministically, and returns
-one typed cause that the harness puts FIRST in the reason.
+When the database host is unreachable, the reason begins with NETWORK. The classifier reads
+network and lock evidence from the tool ledger and returns a typed cause for the harness to
+place first in the reason.
 
 KINDS: "network" | "locked" | "gateway" | "refused".  `refused` is never produced here from
 tool evidence -- it is the name of what is left when nothing above applies, kept in the vocabulary

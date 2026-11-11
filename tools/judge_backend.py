@@ -475,10 +475,7 @@ def bridge_judge(request_json: str) -> str:
 
 # ── the human, who may overrule either layer ──────────────────────────────────────────────
 #
-# "引っかかったものでも問題なしとユーザが明示的に承認したら当然実行OK。それはユーザの責任" --
-# the owner's requirement, and REQUIRE_HUMAN is worth nothing without somewhere to ask. MCP
-# elicitation is that channel: the question reaches the person at the client, and their answer
-# is an explicit approval rather than an inferred one.
+# MCP elicitation provides a channel for explicit human approval when REQUIRE_HUMAN is set.
 #
 # NOT IN SHADOW MODE. Shadow exists to measure without changing behaviour, and a prompt is a
 # change in behaviour -- an interruption on every unrecognised command would be the fastest

@@ -1,9 +1,8 @@
 # -*- coding: utf-8 -*-
 """A stuck worker's reason starts with its real cause, read from the tool ledger.
 
-Owner requirement 2026-10-15: when the DB host is unreachable the reason must say NETWORK in its
-first words. The error strings below are copied from .fleet/tool_events.jsonl (the 2026-10-14
-night run), not invented: the 08001/10060 ODBC report, and the lock refusal naming the session IP.
+When the database host is unreachable, the reason starts with NETWORK. The fixtures exercise
+ODBC error codes and lock refusal classification.
 """
 import types
 

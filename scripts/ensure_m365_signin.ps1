@@ -42,9 +42,8 @@ if ($code -ne 0) {
 # --user-data-dir -- Edge locks a profile to a single process, so concurrent browsers require
 # distinct profiles -- which means their own cookies and their own sign-in.
 #
-# The owner asked on 2026-09-23 whether a sign-in could have gone into one of the two and not
-# the other. It can, and nothing said so: quickstart's step reported the companion and stopped.
-# A person who has just signed in should see, on the same screen, which browsers that covered.
+# A sign-in can cover one profile but not another. Report the coverage so the person
+# can see which browsers are signed in.
 #
 # REPORTED, NOT DRIVEN. Surfacing a second browser to sign it in during setup is a window
 # nobody asked for; doctor carries the per-profile rows with the command to fix each one.

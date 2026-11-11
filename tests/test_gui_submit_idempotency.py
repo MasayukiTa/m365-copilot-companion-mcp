@@ -81,7 +81,7 @@ def test_a_second_command_is_not_written_while_the_first_is_unconsumed():
 
 
 def test_the_live_add_guard_never_keys_on_goal_text():
-    """Content resemblance must never stop a live add (owner instruction 2026-10-26/27). The
+    """Content resemblance must never stop a live add. The
     guard must not hash the goal text: no AddGoalSetKey, no GoalKey(goal), no content-hash
     dictionary in the live-add path.
     """

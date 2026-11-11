@@ -7,8 +7,7 @@
 // (.fleet/tasks/pending, for_fleet) was read, but rendered only inside the EMPTY STATE, i.e.
 // only when there was no run and no history. In the normal state -- a run live, or anything in
 // history -- a submission was invisible until a worker existed, and even then a new worker in
-// status "pending" sorted BELOW every active card. The owner's requirement, verbatim intent:
-// "whatever the queue has or has not registered, show it on top at once."
+// status "pending" sorted below every active card. Submitted tasks should appear at the top.
 //
 // SOURCES, merged and de-duplicated by goal text (whitespace normalised):
 //   (a) LOCAL: added by this window the moment it submits (AddLocal). On screen before any

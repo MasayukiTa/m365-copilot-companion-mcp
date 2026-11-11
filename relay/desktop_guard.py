@@ -1,15 +1,8 @@
 # -*- coding: utf-8 -*-
 """Classify whether a job's goal asks for UI automation on the owner's REAL desktop.
 
-WHY THIS EXISTS. 2026-11-02: an A/B test of a ported UIA tool ("uiaab"/"uiaab2") drove
-Notepad and Calculator on the owner's real desktop, taking their screen and keyboard. The
-owner cancelled it (twice). The durable tombstone (relay/fleet_tombstone.py) stops THOSE
-specific jids from resurrecting. This guard is a standing CLASSIFIER for the same KIND of
-work: a fixed vocabulary that recognises a goal asking for real-desktop computer use.
-
-DEFAULT FLIPPED (owner instruction 2026-11-09). The guard now ALLOWS a matching goal by
-default. The owner asked to stop refusing these goals outright and instead keep an explicit
-OPT-OUT that restores the old refuse-by-default behaviour. So:
+This guard classifies goals that request real-desktop computer use. Matching goals are
+allowed by default; an explicit opt-out restores refusal by default.
 
   * DEFAULT (nothing set)            -> a matching goal is ALLOWED (born as a normal worker).
   * OPT-OUT ``desktop_guard=deny``   -> the old behaviour: a matching goal is REFUSED unless
@@ -186,7 +179,7 @@ REFUSAL = (
 def refuse_reason(goal):
     """The refusal string if this goal must NOT start, else None.
 
-    Default is ALLOW (owner instruction 2026-11-09). A goal is only refused when the operator
+    Default is ALLOW. A goal is only refused when the operator
     has opted back in to the old behaviour with desktop_guard=deny (settings.txt or env), AND
     the goal asks for real-desktop automation, AND it does not carry the allow_real_desktop
     override. Everything else -> allow. Never raises: an error deciding leaves the goal alone

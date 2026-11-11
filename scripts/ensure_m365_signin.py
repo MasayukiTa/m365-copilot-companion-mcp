@@ -264,8 +264,7 @@ def state(port: int, status_url: str = None):
 def _report_every_profile(primary_port: int):
     """One `PROFILE:` line per managed Edge, because each one is a separate sign-in.
 
-    THE OWNER ASKED THE RIGHT QUESTION, 2026-09-23: ":9222 と :9223 で建てるので、その片方に
-    しか入れていない、ということはないか". Structurally, yes it can be. Edge locks a
+    Edge locks a
     user-data-dir to one process, so the companion (:9222), the bridge (:9223) and the
     evaluation browser (:9224) MUST have distinct profiles to run at once -- and distinct
     profiles mean distinct cookie jars. Signing in on one signs in exactly one.

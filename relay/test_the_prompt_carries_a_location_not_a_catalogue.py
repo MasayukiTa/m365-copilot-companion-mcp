@@ -14,7 +14,7 @@ survive one more round of growth. The store holds 216 themes, 36% of them one-sh
 because a theme is minted from the opening words of ANY goal; at ten thousand the question stops
 being which forty to send.
 
-THE OWNER'S INSTRUCTION IS THE DESIGN: "インデックスどころかそれが存在するパスだけ渡せばよい".
+THE DESIGN: pass the location of the index to the worker.
 A worker that judges the past relevant reads it -- the same way it reaches a Skill, by asking
 rather than by being handed a catalogue. One line, and it stays one line however large the store
 grows.

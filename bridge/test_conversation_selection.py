@@ -76,7 +76,7 @@ def test_a_row_that_cannot_be_opened_says_so():
 
 
 def test_every_openable_session_fits_when_there_are_fewer_than_the_cap():
-    """The guarantee the owner asked for: past chats remain listed, and opening one resumes
+    """Past chats remain listed, and opening one resumes
     it. This pins the listing half; /resume owns the other half."""
     rows = [{"sid": "e%d" % i, "conv_url": ""} for i in range(500)]
     rows += [{"sid": "c%d" % i, "conv_url": "sess:%d" % i} for i in range(19)]
