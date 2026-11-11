@@ -5,7 +5,7 @@ from relay import judge_gate
 from relay.relay_fleet import RelayWorker
 
 
-GOAL = "odbc_query で検査件数を集計して表にする"
+GOAL = "odbc_query over SYNDS: aggregate per-lot group_a rate and compute correlation"
 
 
 def worker(folder):
@@ -162,7 +162,7 @@ def test_resolved_case_request_classifies_short_reference(tmp_path):
     folder = tmp_path / "sampleuser_679group_a_study"
     folder.mkdir()
     (folder / "やりたいこと.txt").write_text(
-        "検査データの不良件数とロット別の設備条件を集計し相関を調べる。", encoding="utf-8")
+        "query SYNDS and measurement data to investigate the cause of group_a", encoding="utf-8")
     goal = "sampleuser_679group_a_study　study this"
     result = case_reference_search(goal, roots=[tmp_path])
     request = next(c for c in result["candidates"] if c["kind"] == "directory")

@@ -19,12 +19,10 @@ from relay import judge_gate, relay_fleet, temp_home
 from relay.relay_fleet import RelayWorker
 from tools import search_ops
 
-GOAL = "\u679d\u3055\u3093_679\u304b\u3059\u308c\u8abf\u67fb\u3000\u3053\u308c\u8abf\u3079\u3066"
+GOAL = "sampleuser_679group_a_study\u3000study this"
 # A SYNDS data request -- short reference resolves to this file; its text is what classifies.
-ADAMS_REQUEST = ("\u3053\u306e679\u304b\u3059\u308c\u306b\u95a2\u3057\u3066\u3001"
-                 "\u3042\u3089\u3086\u308b\u8a2d\u5099\u3001\u6750\u6599\u30c7\u30fc\u30bf\u3092"
-                 "\u53d6\u5f97\u3057\u3001ADAMS\u30c7\u30fc\u30bf\u3068\u5b9f\u30c7\u30fc\u30bf\u3092"
-                 "\u53c2\u7167\u3002\u30ed\u30c3\u30c8\u5225\u306e\u76f8\u95a2\u3092\u8abf\u3079\u308b\u3002")
+SYNDS_REQUEST = ("Aggregate the per-lot GROUP_A rate from the data table "
+                 "and compute the correlation.")
 
 
 def _point_temp_home(monkeypatch, tmp_path):
@@ -32,10 +30,10 @@ def _point_temp_home(monkeypatch, tmp_path):
     monkeypatch.setattr(temp_home, "system_temp", lambda: str(tmp_path))
 
 
-def _case(tmp_path, request_text=ADAMS_REQUEST):
-    case = tmp_path / "case" / "\u679d\u3055\u3093_679\u304b\u3059\u308c\u8abf\u67fb"
+def _case(tmp_path, request_text=SYNDS_REQUEST):
+    case = tmp_path / "case" / "sampleuser_679group_a_study"
     case.mkdir(parents=True)
-    (case / "\u3084\u308a\u305f\u3044\u3053\u3068.txt").write_text(request_text, encoding="utf-8")
+    (case / "やりたいこと.txt").write_text(request_text, encoding="utf-8")
     return case
 
 
@@ -131,7 +129,7 @@ def test_request_read_failure_falls_back_to_excerpt(tmp_path, monkeypatch):
                         lambda goal: real(goal, [tmp_path / "case"]))
     # Make the classifier read of the resolved request fail; the excerpt must stand in.
     real_open = open
-    reqfile = str(case / "\u3084\u308a\u305f\u3044\u3053\u3068.txt")
+    reqfile = str(case / "やりたいこと.txt")
 
     def flaky_open(path, *a, **kw):
         if str(path) == reqfile:
