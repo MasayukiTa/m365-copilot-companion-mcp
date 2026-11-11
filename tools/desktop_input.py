@@ -608,7 +608,6 @@ def press(*keys: str, expect=None) -> None:
                 "refusing %s: it ends the operator's session or their unsaved work, and is "
                 "never part of doing their job. If that really is the intent, a person can "
                 "press it." % "+".join(sorted(combo)))
-    _require_foreground(expect)
     codes = []
     for name in names:
         vk = VK.get(name)
@@ -623,6 +622,7 @@ def press(*keys: str, expect=None) -> None:
                 "character on the key, numpad0-9 and the modifiers are all valid names."
                 % (name, (" Did you mean: " + ", ".join(near[:8]) + "?") if near else ""))
         codes.append(vk)
+    _require_foreground(expect)
     # SENT AS SEPARATE EVENTS WITH THE MODIFIER GIVEN TIME TO SETTLE, not as one batch.
     #
     # The first version put every down and every up into a single SendInput call, which
