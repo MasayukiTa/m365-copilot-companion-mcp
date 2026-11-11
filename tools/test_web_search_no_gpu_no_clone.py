@@ -1,7 +1,4 @@
-"""Pin the claim behind ledger row #114: the owner asked whether a job said to
-REQUIRE A GPU could be done by Copilot instead -- by having a Copilot agent use the
-web tools WITHOUT cloning the repository, taking "the tasty part" rather than running
-the original framework.
+"""Verify that a web search can run without a GPU or a repository clone.
 
 The load-bearing fact that makes that possible is a property of this module:
 ``tools.search_web`` reaches the open web through DuckDuckGo with NO API key, NO GPU,
