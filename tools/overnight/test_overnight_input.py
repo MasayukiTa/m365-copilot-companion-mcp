@@ -41,7 +41,7 @@ def test_json_plain_list(tmp_path):
 
 def test_same_wording_is_kept_but_a_duplicate_id_is_skipped(tmp_path):
     # Two requests with nearly identical wording are BOTH kept (content resemblance never drops
-    # a job; 2026-10-26/27 owner instruction). Only a duplicate ID is skipped, because that is an
+    # a job). Only a duplicate ID is skipped, because that is an
     # identity collision, not a resemblance.
     p = _w(tmp_path, "items.txt", "件数を集計して\n 件数を 集計して。\nA1: 別の依頼\nA1: 同じID\n")
     r = parse_items(p)
