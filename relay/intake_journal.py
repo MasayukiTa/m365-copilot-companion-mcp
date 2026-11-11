@@ -12,8 +12,8 @@ they left three different trails -- or none:
   * The cockpit's "開始"/"続き" (SpawnFleet) wrote a goals-file and never touched the queue,
     so a started run had no admission record distinct from the run itself.
 
-The owner's instruction (2026-10-26) is that every route pass through ONE admission entry that
-records the route and the submitter. This module is that entry. It is deliberately tiny and
+Every route passes through ONE admission entry that records the route and the submitter.
+This module is that entry. It is deliberately tiny and
 never raises into a submission: a journal line is an after-the-fact record, exactly like
 tools/fleet_intake._note_possible_duplicate, and a failed append is logged beside the journal,
 not re-raised onto the caller that was only trying to submit work.
