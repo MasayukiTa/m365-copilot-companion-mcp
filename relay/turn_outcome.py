@@ -46,6 +46,7 @@ BLOCKED = "blocked"       # policy / agent blocked: not a capacity signal, never
 SYSTEM = "system"         # upstream failed generically: retry, do not treat as capacity
 LOOP = "loop"             # the service detected a loop in our own driving
 UNKNOWN = "unknown"       # an error we have not seen before -- named, never silently bucketed
+CREDITS = "credits"       # the environment is out of credits: a capacity limit, not a product failure
 
 #: Error code -> class. Extraction, not guesswork: Copilot prints these verbatim.
 CODE_CLASS = {
@@ -107,6 +108,12 @@ def classify(text: str, role: str = "assistant"):
     code = error_code(t)
     if code:
         return CODE_CLASS.get(code, UNKNOWN), code
+    # OUT OF CREDITS. A capacity limit of the Copilot Studio environment, returned as plain
+    # prose in place of an answer (relay/credits_exhausted.py). Detected here so it is one
+    # class, never bucketed as a decline/system fault and never scored as a product failure.
+    from relay import credits_exhausted as _credits
+    if _credits.detect(t):
+        return CREDITS, ""
     low = t.lower()
     if len(t) <= MAX_DECLINE_CHARS and any(m in low for m in _DECLINE):
         return BLOCKED, ""
@@ -153,3 +160,13 @@ def is_capacity_signal(klass: str) -> bool:
     module exists to end.
     """
     return klass == RATE
+
+
+def is_product_failure(klass: str) -> bool:
+    """Whether this class should count toward product failure totals.
+
+    `ok` is a normal reply and `credits` is a capacity limit of the environment (no
+    capacity assigned), which cannot be fixed on this PC and is not a defect of the
+    product -- neither counts. Every other class is a real fault of a turn.
+    """
+    return klass not in (OK, CREDITS)

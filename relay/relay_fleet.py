@@ -48,6 +48,7 @@ from .copilot_autopilot_relay import (
 )
 from relay import settle as _settle
 from relay import socket_capacity
+from relay import credits_exhausted
 from relay import mcp_ready
 from relay import skill_procedure as skill_procedure_mod
 from relay import fanout as fanout_mod
@@ -6735,6 +6736,26 @@ class RelayWorker:
                 and mcp_ready.reply_says_no_tools(resp)
                 and mcp_ready.detector().status(self.name) != "attached"):
             self._recycle_for_missing_tools("the model reports it has no call_tool")
+            return
+        # OUT OF CREDITS. The ENVIRONMENT has no credits, returned as plain prose in place of an
+        # answer (relay/credits_exhausted.py) -- NOT the structured platform-error code below, so
+        # the table there never sees it. It is a capacity limit of the Copilot Studio
+        # environment, not a defect of the agent or this PC: retrying or rewording cannot assign
+        # capacity, so settle it terminally HERE, once, before any retry/recycle path. The
+        # outcome CREDITS_EXHAUSTED is EXCLUDED from failure totals (relay/outcomes.py) and the
+        # cockpit shows this same one line as the reason. Guarded off _resume for the same
+        # reason the platform check is: a resumed conversation is not being newly answered.
+        if not _resume and credits_exhausted.detect(resp):
+            self.status, self.outcome = "stuck", "CREDITS_EXHAUSTED"
+            self.reason = credits_exhausted.MESSAGE
+            self.stuck_cause = "credits"
+            # CREDITS_EXHAUSTED is non-retryable in outcomes.py; this also stops the cockpit
+            # and runner from re-queueing it (a retry cannot make credits appear).
+            self.retryable_override = False
+            try:
+                default_notify("⚠ クレジット不足", credits_exhausted.MESSAGE)
+            except Exception:
+                pass
             return
         # PLATFORM ERROR REPLY (relay/platform_errors.py, one table): transient -> same goal on a
         # fresh conversation; context/payload limit -> the token-limit recycle just below.

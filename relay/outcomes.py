@@ -67,6 +67,12 @@ STATUS_OF = {
     #: Written ONLY by relay/fleet_reaper.py into the sidecars of a dead process; a live
     #: coordinator never holds it. NOT "cancelled": nobody asked for a stop, and the work is
     #: resumable, so showing it as Stopped told the owner healthy workers had been cancelled.
+    #: The Copilot Studio ENVIRONMENT is out of credits -- a capacity limit of the
+    #: environment (relay/credits_exhausted.py), not a defect of the agent or this PC.
+    #: "stuck" so a reader sees it needs attention (the reason carries the one plain line
+    #: of what to do), but it is EXCLUDED from scoring below, never a product failure, and
+    #: not retryable -- retrying cannot assign capacity.
+    "CREDITS_EXHAUSTED": "stuck",
     "INTERRUPTED": "interrupted",
 }
 
@@ -120,6 +126,9 @@ FINISHED = frozenset({
     # (INTERRUPTED is deliberately absent: it did NOT finish, so a recovery must re-queue it.)
     # The worker ran to the end; only the truth of its claim is in question.
     "EVIDENCE_CONTRADICTED",
+    # Out of credits is terminal for the goal: a context-loss recovery must not resurrect it,
+    # because the environment has no capacity to answer it however fresh the browser is.
+    "CREDITS_EXHAUSTED",
 })
 
 
@@ -191,6 +200,14 @@ SCORING = {
     "ERROR": "fail",
     # Fail closed: an interrupted worker has no answer yet. Excluded only with zero turns.
     "INTERRUPTED": "fail",
+    # The ENVIRONMENT is out of credits -- a capacity limit, not an agent that tried and
+    # failed. Scored like INFRA_STUCK: "fail" as the closed-set side when the turn count is
+    # unknown, but EXCLUDED at zero turns (see EXCLUDED_WITHOUT_WORK). It is NEVER counted in
+    # the cockpit's failure/miss totals (ui/FleetCockpit.WorkerState.cs, same lane as
+    # INFRA_STUCK): a missing-capacity environment must not read as a product failure there.
+    # Kept OFF the unconditional-"excluded" path on purpose -- exclusion by label alone is the
+    # gameable shape this module forbids (test_nothing_is_excluded_on_the_strength_of_its_outcome_alone).
+    "CREDITS_EXHAUSTED": "fail",
 }
 
 #: Outcomes that leave the denominator WHEN THE WORKER TOOK NO TURNS, and only then.
@@ -201,7 +218,8 @@ SCORING = {
 #: stopped at turn nine was tried, and an INFRA_STUCK after nine turns is a connection that
 #: died mid-work, not one that never opened. The turn count is what separates them, and it is
 #: the only part of this that cannot be argued with after the fact.
-EXCLUDED_WITHOUT_WORK = frozenset({"CANCELLED", "INFRA_STUCK", "INTERRUPTED"})
+EXCLUDED_WITHOUT_WORK = frozenset({"CANCELLED", "INFRA_STUCK", "INTERRUPTED",
+                                    "CREDITS_EXHAUSTED"})
 
 
 def scoring_of(outcome, turns=None) -> str:
