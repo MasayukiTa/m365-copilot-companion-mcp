@@ -468,6 +468,13 @@ _DECLARED_BEHAVIOUR_CHANGES = {
     "cap_fleet_follow_up_not_rerouted":
         "same fix as cap_fleet_steer_not_rerouted, for the no-live-worker (follow-up) branch "
         "-- see test_at_capacity_a_fleet_conversation_uses_its_own_path",
+    "door_unknown":
+        "a stale conversation with no destination now starts a fresh chat and resends the same "
+        "text instead of showing the bare send_unknown_conv error; the oracle still shows the "
+        "error -- see test_a_stale_conversation_with_no_door_recovers_by_starting_a_new_chat",
+    "door_unknown_source_empty_with_name":
+        "same fix as door_unknown, for a source-less conversation whose Name is not usable as a "
+        "sid -- see test_a_stale_conversation_with_no_door_recovers_by_starting_a_new_chat",
 }
 
 
@@ -554,11 +561,29 @@ def test_a_conversation_already_on_the_page_opens_no_door(results):
     assert out["trace"][-1] == "BeginStream|hello|c1"
 
 
-def test_a_conversation_with_no_identity_is_refused_and_nothing_is_sent(results):
+def test_a_stale_conversation_with_no_door_recovers_by_starting_a_new_chat(results):
+    """FIXED: a conversation that kept no reachable destination (no page, no ConvUrl, no sess:
+    guid, no usable chat sid) but already has messages used to show the bare
+    send_unknown_conv error and leave the person to find the new-chat button by chance. Now the
+    send path starts a fresh conversation and resends the SAME text into it, so nothing is lost
+    and no bare error is shown. The oracle still shows the error -- see _DECLARED_BEHAVIOUR_CHANGES."""
+    stale_history = {"door_unknown": ["U:a", "A:b"],
+                     "door_unknown_source_empty_with_name": ["U:a"]}
     for cid in ("door_unknown", "door_unknown_source_empty_with_name"):
         out = _x(results, cid)
-        assert _said(out) == ["T:send_unknown_conv"], out["trace"]
-        assert not _gets(out) and not any(ln.startswith("BeginStream") for ln in out["trace"])
+        # the bare error is never shown
+        assert "T:send_unknown_conv" not in _said(out), out["trace"]
+        tr = out["trace"]
+        # a new chat is started, then the same text is sent through the /new door into it
+        assert "NewChat" in tr, tr
+        i = tr.index("NewChat")
+        assert tr[i + 1] == "HttpGet|/new|15000", tr
+        assert tr[-1] == "BeginStream|hello|new1", tr
+        # the new conversation carries the typed line, and it is the current one
+        assert out["state"]["current"] == "new1", out["state"]
+        assert out["state"]["convs"]["new1"]["messages"] == ["U:hello"], out["state"]
+        # the stale conversation keeps its own history untouched -- the text did not land there
+        assert out["state"]["convs"]["c1"]["messages"] == stale_history[cid], out["state"]
 
 
 def test_a_door_that_fails_says_so_and_does_not_send(results):

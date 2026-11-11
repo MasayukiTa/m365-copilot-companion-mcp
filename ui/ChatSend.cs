@@ -524,7 +524,17 @@ static class ChatSend
         }
         if (door == DOOR_UNKNOWN)
         {
-            fx.AddAssistant(fx.T("send_unknown_conv"));
+            // A STALE CONVERSATION WITH NO DOOR IS NOT A DEAD END. This is an old conversation
+            // that kept no reachable destination (no page, no ConvUrl, no sess: guid, no chat
+            // sid) yet already has messages, so none of the page doors can open it. The old
+            // behaviour showed the bare "cannot determine the destination of this conversation"
+            // and left the person to find the new-chat button by chance. Instead, start a fresh
+            // conversation and send the SAME text into it: NewChat makes an empty, source-less,
+            // url-less, name-less conversation and makes it current, so the retried DecideDoor
+            // takes DOOR_NEW (Messages.Count == 0) -- never DOOR_UNKNOWN again, so this recurses
+            // exactly once and cannot loop. The typed text is preserved and sent, not dropped.
+            fx.NewChat();
+            SendText(fx, text);
             return;
         }
         if (door != DOOR_ON_PAGE)
