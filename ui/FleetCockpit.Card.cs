@@ -1042,8 +1042,7 @@ partial class CockpitWindow
     //   - resource_wait           : a named resource the lane is blocked on (tab slot, token, lock)
     //   - execution.waiting_reason : the fleet's own human sentence for why it is parked
     // When the lane is boosted but still waiting, we prefix 最優先 so the operator sees the boost
-    // is applied yet something else (a resource, not rank) is holding it — that is the "why it's
-    // still slow despite boosting" answer the owner asked for.
+    // is applied while a resource continues to hold the lane.
     string WhyNotProgressing(Dictionary<string, object> w)
     {
         if (w == null) return "";
