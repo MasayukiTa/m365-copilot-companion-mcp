@@ -105,10 +105,9 @@ partial class CockpitWindow
         return outp;
     }
 
-    // A refused card shows the reason and the complete goal so requests are not silently lost.
-    // card, and a "強制投入" (force) button lets the PERSON overrule the refusal. The button
-    // runs tools.fleet_intake --force-refused <id>, which is force_submit_refused -- an operator
-    // entry deliberately kept out of the MCP tool list, so only a person at this machine reaches it.
+    // A refused card shows the reason in Japanese and the complete goal. A force button lets
+    // the operator override the refusal through tools.fleet_intake --force-refused <id>.
+    // This operator entry is not exposed through the MCP tool list.
     UIElement RefusedCard(RefusedView v)
     {
         bool ja = _lang == 0;
