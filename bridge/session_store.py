@@ -50,6 +50,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from relay.sqlite_journal import use_rollback_journal
@@ -827,48 +828,34 @@ def _like_escape(s):
     return s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+_spool_lock = threading.Lock()
+_spool_last_error = 0.0
+
+
+def _spool_path():
+    return os.path.join(_base_dir(), "fleet-turns.spool.jsonl")
+
+
 def record_fleet_turn(key, obj, name="", goal=""):
-    """Persist one line of a fleet worker's transcript. Never raises.
-
-    THE FLEET DID NOT WRITE HERE AT ALL until now: `session_store` was the bridge's, and a
-    fleet run's conversation only ever reached `.fleet/transcripts/<key>.jsonl`. So "the
-    chat is in a local database" was true of one of the two things that hold conversations.
-
-    Exception-safe to the same standard as the file append it sits beside -- the fleet must
-    never stall on a logging hiccup, and a database is one more thing that can be locked,
-    full, or mid-checkpoint when a turn happens to land.
-    """
+    """Append a worker row without opening the database. Never raises."""
+    global _spool_last_error
     try:
         if not isinstance(obj, dict):
             return False
-        role = obj.get("role")
-        if not role:
-            # meta and guid lines carry no turn; keep them, labelled, so a reader can tell a
-            # conversation that was started and produced nothing from one never started.
-            role = "meta" if obj.get("meta") else ("guid" if obj.get("guid") else "note")
-        extra = {k: v for k, v in obj.items()
-                 if k not in ("turn", "role", "text", "ts")}
-        conn = _db(import_files=False)
-        try:
-            # THE GOAL GOES IN ONCE AND THIS ROW POINTS AT IT. `goal` stays empty; the reader
-            # coalesces, so rows written before 2026-09-14 (which carry their own copy) and
-            # rows written after are indistinguishable to every caller.
-            conn.execute(
-                "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
-                "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
-                (str(key), str(name or ""), _intern_goal(conn, goal),
-                 obj.get("turn"), str(role), str(obj.get("text") or ""),
-                 json.dumps(extra, ensure_ascii=False, default=str),
-                 float(obj.get("ts") or time.time())))
-        finally:
-            conn.close()
+        row = {"id": uuid.uuid4().hex, "key": str(key), "obj": obj,
+               "name": str(name or ""), "goal": str(goal or "")}
+        line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
+        with _spool_lock:
+            _ensure_dir()
+            with open(_spool_path(), "a", encoding="utf-8") as spool:
+                spool.write(line)
+                spool.flush()
         return True
     except Exception as exc:
-        # NOT SWALLOWED (the chat-persist lesson, PR #130: a store that fails silently is a
-        # store that silently holds nothing). The fleet still must not stall, so this returns
-        # False -- but it says so on the log, with the key and the exception type.
-        _log.error("record_fleet_turn failed for key=%r: %s: %s", str(key)[:80],
-                   type(exc).__name__, str(exc)[:200])
+        now = time.monotonic()
+        if now - _spool_last_error >= 60 or not _spool_last_error:
+            _spool_last_error = now
+            _log.error("fleet spool append failed: %s: %s", type(exc).__name__, str(exc)[:200])
         return False
 
 
