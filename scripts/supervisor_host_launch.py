@@ -180,63 +180,57 @@ def decide_child_strike(seconds_with_zero_connections, reader_alive, child_pid,
     return "wait"
 
 
-#: ADOPTING AN ORPHAN READER (measured 2026-11-11/12, owner redid the Dev Tunnel sign-in 4 times
-#: in one night). WHAT WENT WRONG: supervisor pid 25644 died at 23:58:02 (0xC00000FD) but its
-#: devtunnel host reader pid 1144 (started 22:52) kept running as an ORPHAN -- a live reader whose
-#: parent supervisor is gone. At 00:29:46 start_all.ps1 -CoreOnly started a fresh supervisor; at
-#: 00:32:04 it logged 'tunnel host connection looks stale ... re-hosting' and launched reader pid
-#: 33632 while reader pid 1144 was STILL running, i.e. two Dev Tunnel host readers for one tunnel
-#: at once -- exactly the state commit 6cfabfd9's design rule forbids, and which took each other's
-#: relay session in the 2026-11-02 incident decide_host_launch already guards the STEADY-STATE
-#: against.
-#:
-#: THE GAP decide_host_launch did NOT cover: it is consulted inside Start-TunnelHost, which the
-#: fresh supervisor only reaches AFTER its own $script:TunnelHostProc is $null (a new process
-#: tracks no reader). At STARTUP the new supervisor does not yet know the orphan exists as 'its'
-#: reader; without adoption it would start a second one and only later notice the duplicate. The
-#: fix is to ADOPT the live orphan at startup -- record it as $script:TunnelHostProc -- so every
-#: later tick (Test-OurTunnelHostRunning, Get-ExistingTunnelReaders, the relay-gap tracker, and
-#: Start-TunnelHost's own duplicate guard) treats it as the one reader we already have, and no
-#: second reader is ever launched. Adoption NEVER starts, stops or signs anything: it only takes
-#: ownership of a process that is already alive and already hosting this tunnel.
+def decide_orphan_adoption(reader_alive, parent_supervisor_alive, we_track_it):
+    """Whether a newly-started supervisor must ADOPT a live reader instead of launching one.
 
+    THE FAILURE THIS CLOSES (measured 2026-11-11/12, %TEMP%\\m365-companion-supervisor.log).
+    A supervisor (pid 25644) died at 23:58:02 but its reader (pid 1144) and that reader's
+    devtunnel host (pid 23400) stayed alive as ORPHANS -- a reader whose parent supervisor is
+    gone. At 00:29:46 start_all.ps1 -CoreOnly started a NEW supervisor, which at 00:32:04 saw
+    ``connections looks stale ... re-hosting`` and launched a SECOND reader (pid 33632) next to
+    the still-live orphan (pid 1144): two Dev Tunnel host readers for one tunnel at once, the
+    exact state commit 6cfabfd9 forbids. 23 minutes later the token cache was 0 bytes.
 
-def decide_adopt_reader(found_reader_count, our_reader_tracked):
-    """Whether a fresh supervisor should ADOPT an existing orphan reader instead of launching one.
+    :func:`decide_host_launch` already answers ``wait`` while a reader is alive and inside its
+    reconnect window, but it does NOT tell the caller to take ownership of that reader -- a fresh
+    supervisor that is not yet tracking anything would keep polling and, on the next ``stale``
+    verdict, replace-or-relaunch rather than keep the orphan as its own. This decider is the
+    missing ADOPT step: a live reader whose parent supervisor is gone, and which THIS supervisor
+    does not already track, must be adopted (kept and monitored as ours) -- never duplicated.
 
-    Inputs (both measured by the caller, see Invoke-AdoptOrphanReader in scripts/supervisor.ps1
-    and the -CoreOnly adopt note in scripts/start_all.ps1):
+    Inputs (all measured by the caller, see Get-ExistingTunnelReaders / Adopt-OrphanTunnelReader):
 
-      * ``found_reader_count`` -- how many live ``relay.tunnel_host_log <tunnel>`` readers for
-        THIS tunnel the caller can see right now (command-line scoped to this tunnel's bare name,
-        so an unrelated tunnel is never counted). ``None`` / non-numeric reads as 0.
-      * ``our_reader_tracked`` -- does this supervisor ALREADY track a live reader of its own
-        (``$script:TunnelHostProc`` set and not exited)? A process that already owns its reader has
-        nothing to adopt.
+      * ``reader_alive`` -- is an existing ``relay.tunnel_host_log <tunnel>`` reader alive now?
+      * ``parent_supervisor_alive`` -- is that reader's PARENT process still alive? ``False`` /
+        ``None`` means the reader is an orphan (its supervisor is gone). ``True`` means some
+        supervisor still owns it. A non-boolean / unknown value reads as "cannot tell" and, to
+        avoid fighting a reader another supervisor may own, is treated as "owned" (not orphan).
+      * ``we_track_it`` -- does THIS supervisor already track that reader as its own
+        ($script:TunnelHostProc is that pid)? If so there is nothing to adopt.
 
-    Returns one of two words:
+    Returns one of three words:
 
-      * ``"adopt"`` -- this supervisor tracks no reader of its own, yet at least one live reader
-        for this tunnel exists: take ownership of it (record it as $script:TunnelHostProc) rather
-        than launching a second one. This is the ONLY path that prevents the two-readers-at-once
-        state at startup, before Start-TunnelHost's steady-state guard is ever reached.
-      * ``"none"`` -- nothing to adopt: either this supervisor already tracks its own reader
-        (``our_reader_tracked`` true), or no live reader for this tunnel exists (the ordinary
-        first-boot case, where Start-TunnelHost launches exactly one in the normal way).
+      * ``"adopt"``  -- a reader is alive, it is an orphan (parent supervisor gone), and we do
+        not already track it: take ownership, do NOT launch a second reader.
+      * ``"skip"``   -- a reader is alive and either we already track it, or it still has a live
+        parent supervisor: leave it alone, do NOT launch a second reader.
+      * ``"launch"`` -- no reader is alive: there is nothing to adopt, launch exactly one.
 
-    Pure: no I/O, no clock, no process inspection. The caller does the discovery (which processes
-    are live readers of this tunnel, which one is ours) and performs the single adoption; this
-    only decides. A missing or malformed count reads as 0 -> "none" (never adopt on an unreadable
-    count, so an unreadable process table is never the reason a supervisor claims a reader).
+    Pure: no I/O, no clock, no process inspection. The caller discovers the reader, its parent,
+    and whether it already owns it, and acts on the word. ``parent_supervisor_alive`` is
+    tolerant: only an explicit ``False``/``None`` counts as orphan; any value that cannot be read
+    as "parent is gone" is treated as still-owned, so an unreadable parent is never the reason a
+    reader is seized from another supervisor.
     """
-    if our_reader_tracked:
-        # We already own a live reader -- adopting another would be claiming a second one.
-        return "none"
-    try:
-        n = int(found_reader_count)
-    except (TypeError, ValueError):
-        return "none"
-    if n >= 1:
-        # An orphan reader is alive and we own none: adopt it instead of starting a rival.
+    if not reader_alive:
+        # No reader to adopt -> the launch path (decide_host_launch) owns this.
+        return "launch"
+    if we_track_it:
+        # Already ours: nothing to adopt, and certainly nothing to duplicate.
+        return "skip"
+    # Orphan only when we can positively tell the parent supervisor is gone. None or an explicit
+    # False both mean "no live parent"; anything else (True, or an unreadable value) is treated as
+    # still-owned so we never seize a reader another supervisor may still manage.
+    if parent_supervisor_alive is None or parent_supervisor_alive is False:
         return "adopt"
-    return "none"
+    return "skip"
