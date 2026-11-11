@@ -3,7 +3,7 @@ r"""When devtunnel login returns, re-host the tunnel at once -- skip the debounc
 
 WHY THIS EXISTS (measured 2026-11-11, the GOAL's incident window)
 -----------------------------------------------------------------
-The Dev Tunnel 'resonac-mcp' was unhosted from 16:39:30 to 17:42:26 (63 min). The
+The Dev Tunnel was unhosted from 16:39:30 to 17:42:26 (63 min). The
 devtunnel CLI login had expired ('Not logged in'), so scripts/supervisor.ps1 PAUSED
 tunnel management (it must not touch devtunnel while logged out -- a `devtunnel host`
 launched then fails and can reap an interactive `devtunnel login` the owner is running).

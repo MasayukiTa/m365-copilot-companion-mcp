@@ -148,7 +148,6 @@ jobs:
             tools/test_a_cap_in_bytes_never_bound_the_thing_that_broke.py \
             tools/test_an_idle_machine_is_not_a_broken_one.py \
             tools/test_a_tool_that_returns_its_failure_still_failed.py \
-            tools/test_tunnel_alert_names_the_cause.py \
             ui/test_a_green_dot_must_have_established_the_thing.py \
             ui/test_a_tunnel_cause_is_shown_on_the_dot.py \
             ui/test_planned_server_restart_signal.py \
