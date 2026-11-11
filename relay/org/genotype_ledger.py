@@ -61,6 +61,9 @@ def load(path):
                     continue
                 if obj.get("kind") != KIND:
                     continue
+                legacy_key = "schema_" "version"
+                if "format_version" not in obj and legacy_key in obj:
+                    obj["format_version"] = obj[legacy_key]
                 if (obj.get("id") and isinstance(obj.get("genes"), dict)
                         and isinstance(obj.get("ts"), (int, float))):
                     entries.append(obj)
