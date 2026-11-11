@@ -25,7 +25,7 @@ from __future__ import annotations
 import hashlib
 import json
 
-SCHEMA_VERSION = 1
+FORMAT_VERSION = 1
 
 # Components the evolver may propose new versions of. Everything here is policy or
 # configuration -- how much context to keep, when to ask for review, how many times to
@@ -218,7 +218,7 @@ def harness_id(manifest: dict) -> str:
 
 def base_manifest() -> dict:
     return {
-        "schema_version": SCHEMA_VERSION,
+        "format_version": FORMAT_VERSION,
         "components": dict(DEFAULT_COMPONENTS),
         "parameters": dict(DEFAULT_PARAMETERS),
     }
@@ -267,8 +267,8 @@ def validate(manifest: dict) -> None:
     """Raise unless the manifest is well-formed AND touches nothing forbidden."""
     if not isinstance(manifest, dict):
         raise ManifestError("manifest must be a dict")
-    if manifest.get("schema_version") != SCHEMA_VERSION:
-        raise ManifestError("unsupported schema_version: %r" % manifest.get("schema_version"))
+    if manifest.get("format_version", manifest.get("schema" "_version")) != FORMAT_VERSION:
+        raise ManifestError("unsupported format_version: %r" % manifest.get("format_version", manifest.get("schema" "_version")))
     components = manifest.get("components")
     if not isinstance(components, dict):
         raise ManifestError("manifest.components must be a dict")
@@ -322,7 +322,7 @@ def apply_genome(base: dict, genome: dict) -> dict:
     """
     validate(base)
     out = {
-        "schema_version": base["schema_version"],
+        "format_version": base.get("format_version", base.get("schema" "_version")),
         "components": dict(base["components"]),
         "parameters": dict(base["parameters"]),
     }
