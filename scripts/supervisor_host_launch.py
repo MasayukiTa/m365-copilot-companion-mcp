@@ -178,3 +178,65 @@ def decide_child_strike(seconds_with_zero_connections, reader_alive, child_pid,
         # in-place recovery window -> the child is wedged, not reconnecting. Strike only it.
         return "strike"
     return "wait"
+
+
+#: ADOPTING AN ORPHAN READER (measured 2026-11-11/12, owner redid the Dev Tunnel sign-in 4 times
+#: in one night). WHAT WENT WRONG: supervisor pid 25644 died at 23:58:02 (0xC00000FD) but its
+#: devtunnel host reader pid 1144 (started 22:52) kept running as an ORPHAN -- a live reader whose
+#: parent supervisor is gone. At 00:29:46 start_all.ps1 -CoreOnly started a fresh supervisor; at
+#: 00:32:04 it logged 'tunnel host connection looks stale ... re-hosting' and launched reader pid
+#: 33632 while reader pid 1144 was STILL running, i.e. two Dev Tunnel host readers for one tunnel
+#: at once -- exactly the state commit 6cfabfd9's design rule forbids, and which took each other's
+#: relay session in the 2026-11-02 incident decide_host_launch already guards the STEADY-STATE
+#: against.
+#:
+#: THE GAP decide_host_launch did NOT cover: it is consulted inside Start-TunnelHost, which the
+#: fresh supervisor only reaches AFTER its own $script:TunnelHostProc is $null (a new process
+#: tracks no reader). At STARTUP the new supervisor does not yet know the orphan exists as 'its'
+#: reader; without adoption it would start a second one and only later notice the duplicate. The
+#: fix is to ADOPT the live orphan at startup -- record it as $script:TunnelHostProc -- so every
+#: later tick (Test-OurTunnelHostRunning, Get-ExistingTunnelReaders, the relay-gap tracker, and
+#: Start-TunnelHost's own duplicate guard) treats it as the one reader we already have, and no
+#: second reader is ever launched. Adoption NEVER starts, stops or signs anything: it only takes
+#: ownership of a process that is already alive and already hosting this tunnel.
+
+
+def decide_adopt_reader(found_reader_count, our_reader_tracked):
+    """Whether a fresh supervisor should ADOPT an existing orphan reader instead of launching one.
+
+    Inputs (both measured by the caller, see Invoke-AdoptOrphanReader in scripts/supervisor.ps1
+    and the -CoreOnly adopt note in scripts/start_all.ps1):
+
+      * ``found_reader_count`` -- how many live ``relay.tunnel_host_log <tunnel>`` readers for
+        THIS tunnel the caller can see right now (command-line scoped to this tunnel's bare name,
+        so an unrelated tunnel is never counted). ``None`` / non-numeric reads as 0.
+      * ``our_reader_tracked`` -- does this supervisor ALREADY track a live reader of its own
+        (``$script:TunnelHostProc`` set and not exited)? A process that already owns its reader has
+        nothing to adopt.
+
+    Returns one of two words:
+
+      * ``"adopt"`` -- this supervisor tracks no reader of its own, yet at least one live reader
+        for this tunnel exists: take ownership of it (record it as $script:TunnelHostProc) rather
+        than launching a second one. This is the ONLY path that prevents the two-readers-at-once
+        state at startup, before Start-TunnelHost's steady-state guard is ever reached.
+      * ``"none"`` -- nothing to adopt: either this supervisor already tracks its own reader
+        (``our_reader_tracked`` true), or no live reader for this tunnel exists (the ordinary
+        first-boot case, where Start-TunnelHost launches exactly one in the normal way).
+
+    Pure: no I/O, no clock, no process inspection. The caller does the discovery (which processes
+    are live readers of this tunnel, which one is ours) and performs the single adoption; this
+    only decides. A missing or malformed count reads as 0 -> "none" (never adopt on an unreadable
+    count, so an unreadable process table is never the reason a supervisor claims a reader).
+    """
+    if our_reader_tracked:
+        # We already own a live reader -- adopting another would be claiming a second one.
+        return "none"
+    try:
+        n = int(found_reader_count)
+    except (TypeError, ValueError):
+        return "none"
+    if n >= 1:
+        # An orphan reader is alive and we own none: adopt it instead of starting a rival.
+        return "adopt"
+    return "none"
