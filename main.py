@@ -1831,6 +1831,37 @@ def _install_faulthandler() -> None:
         # dump_traceback_later(). They are DISTINCT so the two never interleave.
         _crash_fh = open(crash_path, "a", encoding="utf-8", buffering=1)
         faulthandler.enable(file=_crash_fh)
+        # SESSION BANNER. enable()'s crash dump is already on its own handle (above), so the
+        # heartbeat never interleaves it. But the crash file is append-only across process
+        # generations: several deaths pile up with no timestamp and no divider between them,
+        # so when the next crash lands you cannot tell which thread block -- which faulting
+        # module -- belongs to WHICH crash, or whether a block is leftover from a prior boot.
+        # Observed 2026-11-11: three stacked crashes (two access violations + one 0xc0000374
+        # heap corruption) sat in faulthandler-crash.log with no divider, so the faulting
+        # frame of the heap corruption could not be isolated from the earlier deaths.
+        # faulthandler writes no header of its own, so write one ourselves, once, at startup:
+        # a dated per-process divider turns the append-only pile into readable sections. The
+        # crash dump that follows this banner belongs to THIS process generation; anything
+        # above the banner is a previous life. This writes to the crash handle only -- the
+        # heartbeat file is untouched -- so the two streams stay separate.
+        try:
+            import datetime as _dt
+            import sys as _sys
+
+            _banner = (
+                "\n===== faulthandler crash log | session start "
+                + _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+                + " | pid=" + str(os.getpid())
+                + " | python=" + _sys.version.split()[0]
+                + " =====\n"
+                "# A crash trace below this line belongs to THIS process. Anything above a\n"
+                "# newer banner is from an earlier run. faulthandler prints the faulting\n"
+                "# thread's stack first; read the first stack after the LAST banner.\n"
+            )
+            _crash_fh.write(_banner)
+            _crash_fh.flush()
+        except Exception:
+            pass
         _fh = open(dump_path, "a", encoding="utf-8", buffering=1)
         # Every 5 min, dump all thread stacks. On a healthy server this is just a periodic
         # heartbeat; when the loop is stuck the dump shows exactly which tool is blocking.
