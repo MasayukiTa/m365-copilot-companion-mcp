@@ -3,8 +3,11 @@ import zlib
 from pathlib import Path
 from typing import Optional
 
-import httpx
-
+# httpx is deferred to call time (see render_diagram). httpx imports in ~1.5 s standalone
+# (measured 2026-11-11, median of 5) and is only ever used by this one network tool, so it is
+# imported inside the function to keep this module's import off the start->listen path. NOTE:
+# the server's dominant startup cost is the fastmcp/mcp import tree (~6-8 s), which cannot be
+# deferred past port bind; this change trims the httpx tail only.
 from .file_ops import _validate_path
 from .security import require_unlocked
 
@@ -49,6 +52,7 @@ def render_diagram(
     locked = require_unlocked()
     if locked:
         return locked
+    import httpx  # deferred: keep module import light so startup stays off the network stack
     try:
         kind_l = kind.lower().strip()
         if kind_l not in SUPPORTED:
