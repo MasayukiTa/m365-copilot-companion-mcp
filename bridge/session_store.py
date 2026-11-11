@@ -139,10 +139,13 @@ class StoreUnavailable(RuntimeError):
         self.cause = cause
 
 
+_connection_options = threading.local()
+
+
 def _connect():
     path = _db_path()
     try:
-        conn = sqlite3.connect(path, timeout=10.0, isolation_level=None)
+        conn = sqlite3.connect(path, timeout=getattr(_connection_options, "timeout", 10.0), isolation_level=None)
         conn.row_factory = sqlite3.Row
         # BEFORE ANY OTHER PRAGMA THAT WRITES. auto_vacuum is fixed at the first write to a new
         # database and can only be changed afterwards by a full VACUUM. Setting journal_mode
@@ -866,24 +869,48 @@ def _spool_file_lock():
 
 
 def record_fleet_turn(key, obj, name="", goal=""):
-    """Append a worker row without opening the database. Never raises."""
+    """Commit a worker row immediately, or queue it for the spool drain. Never raises."""
     global _spool_last_error
+    if not isinstance(obj, dict):
+        return False
     try:
-        if not isinstance(obj, dict):
-            return False
-        row = {"id": uuid.uuid4().hex, "key": str(key), "obj": obj,
-               "name": str(name or ""), "goal": str(goal or "")}
-        line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
-        with _spool_file_lock():
-            with open(_spool_path(), "a", encoding="utf-8") as spool:
-                spool.write(line)
-                spool.flush()
+        role = obj.get("role")
+        if not role:
+            role = "meta" if obj.get("meta") else ("guid" if obj.get("guid") else "note")
+        extra = {k: v for k, v in obj.items() if k not in ("turn", "role", "text", "ts")}
+        _connection_options.timeout = 0.2
+        try:
+            conn = _db(import_files=False)
+        finally:
+            del _connection_options.timeout
+        try:
+            conn.execute(
+                "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                (str(key), str(name or ""), _intern_goal(conn, goal),
+                 obj.get("turn"), str(role), str(obj.get("text") or ""),
+                 json.dumps(extra, ensure_ascii=False, default=str),
+                 float(obj.get("ts") or time.time())))
+        finally:
+            conn.close()
         return True
     except Exception as exc:
         now = time.monotonic()
         if now - _spool_last_error >= 60 or not _spool_last_error:
             _spool_last_error = now
-            _log.error("fleet spool append failed: %s: %s", type(exc).__name__, str(exc)[:200])
+            _log.error("record_fleet_turn failed for key=%r: %s: %s; queuing in spool",
+                       str(key)[:80], type(exc).__name__, str(exc)[:200])
+        try:
+            row = {"id": uuid.uuid4().hex, "key": str(key), "obj": obj,
+                   "name": str(name or ""), "goal": str(goal or "")}
+            line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
+            with _spool_file_lock():
+                with open(_spool_path(), "a", encoding="utf-8") as spool:
+                    spool.write(line)
+                    spool.flush()
+        except Exception as spool_exc:
+            _log.error("fleet spool append failed: %s: %s", type(spool_exc).__name__,
+                       str(spool_exc)[:200])
         return False
 
 

@@ -21,9 +21,11 @@ def stored():
         conn.close()
 
 
-def test_drains_once_even_after_replay(isolated_store):
-    for n in range(3):
-        assert store.record_fleet_turn("worker", {"turn": n, "text": str(n)})
+def test_drains_once_even_after_replay(isolated_store, monkeypatch):
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_db", lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+        for n in range(3):
+            assert store.record_fleet_turn("worker", {"turn": n, "text": str(n)}) is False
     with open(store._spool_path(), encoding="utf-8") as f:
         original = f.read()
     assert store.drain_fleet_spool(store) == 3
@@ -35,7 +37,9 @@ def test_drains_once_even_after_replay(isolated_store):
 
 
 def test_failed_commit_keeps_spool_for_retry(isolated_store, monkeypatch):
-    assert store.record_fleet_turn("worker", {"turn": 1, "text": "hello"})
+    with monkeypatch.context() as patch:
+        patch.setattr(store, "_db", lambda **kwargs: (_ for _ in ()).throw(sqlite3.OperationalError("locked")))
+        assert store.record_fleet_turn("worker", {"turn": 1, "text": "hello"}) is False
     original_db = store._open_spool_db
 
     class FailedCommit:
@@ -60,8 +64,13 @@ def test_record_does_not_wait_for_database_writer(isolated_store):
     try:
         conn.execute("BEGIN IMMEDIATE")
         start = time.perf_counter()
-        assert store.record_fleet_turn("worker", {"turn": 1})
-        assert time.perf_counter() - start < 0.05
+        assert store.record_fleet_turn("worker", {"turn": 1}) is False
+        assert time.perf_counter() - start < 0.5
+        assert open(store._spool_path(), encoding="utf-8").read()
     finally:
         conn.rollback()
         conn.close()
+
+    assert store.drain_fleet_spool(store) == 1
+    assert store.drain_fleet_spool(store) == 0
+    assert stored() == [("worker", 1, "")]
