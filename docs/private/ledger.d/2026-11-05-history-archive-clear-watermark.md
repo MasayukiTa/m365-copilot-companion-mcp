@@ -1,12 +1,6 @@
-## 2026-11-05 - archiving completed history must also stamp the clear watermark (the trim that came back)
+## Archiving completed history must also stamp the clear watermark
 
-- Problem. The owner asked for the 500+ completed fleet runs to be moved out of the on-screen
-  history into the archive and kept out. Moving them is not sufficient: `.fleet/history.json` is
-  NOT the source of truth -- it is rebuilt from the append-only `.fleet/socket_route.jsonl` by the
-  WPF cockpit at startup (`ui/FleetCockpit.History.cs` ArchiveTerminal, each idle tick) and by
-  `python -m tools.rebuild_history`. Measured 2026-11-05: 504 completed rows pulled out of
-  `history.json` were back ~45 seconds later. The live writer is `FleetCockpit.exe` (pid 8596),
-  and `socket_route.jsonl` (75 MB) was still being appended to while this was diagnosed.
+- Problem. Archived history must remain out of the on-screen history. Moving rows alone is insufficient: `.fleet/history.json` is rebuilt from the append-only `.fleet/socket_route.jsonl` by the WPF cockpit and by `python -m tools.rebuild_history`.
 
 - Root cause. `relay/fleet_retention.history_archive` wrote the gzip archive under `.fleet/archive`
   and trimmed `history.json` to the most recent `keep` (default 200) -- but recorded nothing in
@@ -44,15 +38,3 @@
   Local: 64 passed (new + test_completed_jobs_move_to_archive_then_leave_history + test_fleet_
   retention + test_a_cleared_history_stays_cleared). PR #455.
 
-- Not done here, on purpose. The running cockpit was not stopped and the live `.fleet` was read
-  only -- no production history was hand-edited, because the append-only ledger would undo it; the
-  watermark is the only durable lever and it lands through this retention path once merged and the
-  cockpit is restarted (ui/rebuild_ui.ps1 / relaunch FleetCockpit.exe).
-
-## 2026-11-05 01:0x - operational: prod rollout status (PR #455 merged as ad766de8)
-
-- main updated ff-only to ad766de8 (local main + origin/main); CI all green including a windows-install-smoke rerun that passed. The first fail was a transient hang in the Windows-only step, unrelated to this change.
-- Prod fleet_runner reads relay/fleet_retention.py from the prod working tree, which is currently on branch feat/judge-gate-confirm-overlap-order with unrelated uncommitted work. That file is WATERMARK_ABSENT (48 lines behind main for this file).
-- Not switching the prod working tree to main: it holds unrelated in-progress work; per the owner fixed condition (do not stop or relocate an in-flight worker on my own), the checkout is left to whoever owns that branch.
-- No extra restart needed: retention runs ONCE at fleet_runner startup (fleet_runner.py ~L4400). Once the prod tree is back on main, the next natural fleet_runner start reads the new history_archive and stamps the watermark. Running fleet_runner pids 11596/23680 left untouched (active_contract.active=false, still not stopped on my own).
-- Interim hand-archive from 08:48 (history.json.pre-archive-20261105-084824 + archive/history_completed_20261105-084824.jsonl.gz, 504 rows) stays in place as agreed.
