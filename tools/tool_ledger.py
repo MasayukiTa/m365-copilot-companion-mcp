@@ -47,7 +47,7 @@ LEDGER_PATH = os.path.join(_REPO, ".fleet", "tool_events.jsonl")
 #: tools.secret_store.REDACTION_FAILED_MARKER (SEC-18, e822fb6).
 _REDACTION_FAILED_MARKER = "[redaction failed: content withheld]"
 
-SCHEMA_VERSION = 1
+RECORD_SCHEMA_VERSION = 1
 
 #: How much of an argument blob or a result is kept inline. Enough to recognise what happened,
 #: bounded so a ledger cannot become the thing that fills the disk -- which on this machine is
@@ -592,7 +592,7 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
     task, worker, _how = _identity_for(tool, arguments, _sess, task, worker, _ts)
     _mono = time.monotonic()
     row = {
-        "schema": SCHEMA_VERSION,
+        "schema": RECORD_SCHEMA_VERSION,
         "event": "call",
         "id": cid,
         "ts": _ts,
@@ -676,7 +676,7 @@ def record_outcome(call_id: str, *, ok: bool, result=None, error: str = "",
         _timing["ts_start"] = _start[0]
         _timing["dur_mono_s"] = round(max(0.0, _end_mono - _start[1]), 4)
     _append({
-        "schema": SCHEMA_VERSION,
+        "schema": RECORD_SCHEMA_VERSION,
         "event": "outcome",
         "id": str(call_id or ""),
         "ts": _end_ts,

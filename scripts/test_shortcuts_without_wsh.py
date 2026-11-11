@@ -220,8 +220,8 @@ function global:New-ScheduledTaskAction {
 }
 function global:New-ScheduledTaskTrigger {
     [CmdletBinding()]
-    param([switch]$AtLogOn)
-    return @{ AtLogOn = [bool]$AtLogOn }
+    param([switch]$AtLogOn, $User)
+    return @{ AtLogOn = [bool]$AtLogOn; User = $User }
 }
 function global:New-ScheduledTaskPrincipal {
     [CmdletBinding()]
@@ -247,7 +247,9 @@ function global:Register-ScheduledTask {
         $out = "TaskName=" + $TaskName + [Environment]::NewLine +
                "Execute=" + $Action.Execute + [Environment]::NewLine +
                "Argument=" + $Action.Argument + [Environment]::NewLine +
-               "WorkingDirectory=" + $Action.WorkingDirectory
+               "WorkingDirectory=" + $Action.WorkingDirectory + [Environment]::NewLine +
+               "TriggerUser=" + $Trigger.User + [Environment]::NewLine +
+               "PrincipalUserId=" + $Principal.UserId
         [System.IO.File]::WriteAllText($log, $out)
     }
     return $null
@@ -355,3 +357,35 @@ def test_register_supervisor_records_autostart_decision_either_way(tmp_path):
     assert r.returncode == 0, r.stdout + r.stderr
     marker = (tree / ".setup" / "convenience_provisioned").read_text(encoding="utf-8")
     assert "autostart=yes" in marker, marker
+
+
+def test_register_supervisor_logon_trigger_is_bound_to_this_user(tmp_path):
+    """The AtLogOn trigger must be bound to THIS user (New-ScheduledTaskTrigger -AtLogOn -User),
+    matching the per-user Principal -- not an all-users trigger. register-supervisor.ps1 promises
+    a 'per-user' logon autostart at the top of the file; an unbound AtLogOn trigger paired with a
+    single-user Principal contradicts that. Here the stub records both the Trigger's -User and the
+    Principal's -UserId so we can assert they agree and are non-empty."""
+    tree = _build_tree(tmp_path)
+    startup = tmp_path / "Startup"
+    startup.mkdir()
+    task_log = tmp_path / "task_action.txt"
+
+    r = _run_register_supervisor(tree, "1", startup, task_log)
+    assert r.returncode == 0, r.stdout + r.stderr
+
+    assert task_log.is_file(), "the stubbed Register-ScheduledTask was never called"
+    action = task_log.read_text(encoding="utf-8")
+
+    trig = ""
+    princ = ""
+    for line in action.splitlines():
+        if line.startswith("TriggerUser="):
+            trig = line.split("=", 1)[1].strip()
+        elif line.startswith("PrincipalUserId="):
+            princ = line.split("=", 1)[1].strip()
+
+    assert trig, "AtLogOn trigger has no -User binding (all-users trigger): %s" % action
+    assert princ, "Principal has no UserId: %s" % action
+    assert trig.lower() == princ.lower(), \
+        "trigger -User (%r) must match Principal -UserId (%r)" % (trig, princ)
+    assert "\\" in trig, "expected DOMAIN\\USER form for the per-user trigger: %r" % trig
