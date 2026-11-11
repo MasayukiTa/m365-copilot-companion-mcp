@@ -115,14 +115,14 @@ def test_prediction_accuracy_watches_the_proposer_not_the_harness():
 
 def test_security_can_never_be_named_as_an_evolvable_component():
     with pytest.raises(M.ManifestError):
-        M.validate({"schema_version": 1, "components": {"security": "v2"}, "parameters": {}})
+        M.validate({"format_version": 1, "components": {"security": "v2"}, "parameters": {}})
 
 
 def test_the_judge_and_the_holdout_are_equally_off_limits():
     for name in ("frozen", "grader", "sealed_answers", "permissions", "authorization",
                  "untrusted", "provenance"):
         with pytest.raises(M.ManifestError):
-            M.validate({"schema_version": 1, "components": {name: "v9"}, "parameters": {}})
+            M.validate({"format_version": 1, "components": {name: "v9"}, "parameters": {}})
 
 
 def test_a_genome_cannot_smuggle_in_a_forbidden_component():
@@ -209,7 +209,7 @@ def test_an_invalid_manifest_on_disk_falls_back_to_a_known_configuration(monkeyp
     tmp = tempfile.mkdtemp(prefix="rc5_")
     path = os.path.join(tmp, "bad.json")
     with open(path, "w", encoding="utf-8") as fh:
-        json.dump({"schema_version": 1, "components": {"security": "v2"}, "parameters": {}}, fh)
+        json.dump({"format_version": 1, "components": {"security": "v2"}, "parameters": {}}, fh)
     monkeypatch.setenv(RC.OVERRIDE_ENV, path)
     RC.active_manifest(refresh=True)
     assert RC.active_harness_id() == M.harness_id(M.base_manifest())
@@ -218,7 +218,7 @@ def test_an_invalid_manifest_on_disk_falls_back_to_a_known_configuration(monkeyp
 def test_activating_a_forbidden_manifest_is_refused():
     tmp = tempfile.mkdtemp(prefix="rc6_")
     with pytest.raises(M.ManifestError):
-        RC.write_active({"schema_version": 1, "components": {"frozen": "v0"},
+        RC.write_active({"format_version": 1, "components": {"frozen": "v0"},
                          "parameters": {}}, path=os.path.join(tmp, "a.json"))
 
 
