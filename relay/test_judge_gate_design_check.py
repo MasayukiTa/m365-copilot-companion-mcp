@@ -14,7 +14,7 @@ judge request and ADDS two facts to the judge footer and to judge_result.json, u
 
 These fields only ADD INFORMATION. They never change the engine verdict and never loosen
 order_ok -- those belong to other parts of the harness. All fixtures here are synthetic: no
-measurement row, no employee id, only column names / product labels / counts.
+only generic column names / product labels / counts.
 """
 from __future__ import annotations
 

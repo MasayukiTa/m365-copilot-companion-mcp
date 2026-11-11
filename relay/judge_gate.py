@@ -560,7 +560,7 @@ def _validate_lot(lot) -> str:
 # information to the judge footer / judge_result.json.
 #
 # FIELD NAMESPACE. Results are emitted under the single key `design_check` so this block does
-# not collide with any field the separate confound_gate owner adds; the two can be merged by key
+# not collide with any field the separate confound_gate adds; the two can be merged by key
 # without overwriting each other. (As of this change confound_gate has no implementation in the
 # repository, so there is no existing field shape to mirror; `design_check` is deliberately a
 # self-contained sub-object.)
@@ -572,7 +572,7 @@ def _validate_lot(lot) -> str:
 #       "<group label>": {"<product name>": <int count>, ...}, ...
 #     }
 #   }
-# No measurement rows, no employee ids -- only column names, product labels and counts.
+# Only generic column names, product labels and counts.
 
 def _validate_design_check(dc) -> str:
     """'' when the design_check section is usable; else a message naming the EXACT bad field.
