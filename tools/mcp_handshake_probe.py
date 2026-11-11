@@ -42,6 +42,7 @@ if _ROOT not in sys.path:
 
 from scripts import mcp_handshake_monitor as core  # noqa: E402
 from scripts import tunnel_login_state as login_core  # noqa: E402  (pure token-file login decider; never the CLI)
+from tools import probe_alert
 from tools import childproc  # noqa: E402  (headless_creationflags: these children must never pop a console)
 
 LOCAL_URL = "http://127.0.0.1:8000/mcp"
@@ -226,6 +227,20 @@ def run_tick(key, tunnel_name, prev_counts):
         public_raw, public_result, public_hop, host_conn = None, None, core.HOP_UNKNOWN, None
         login_state = read_login_state()
 
+    for scope, result in (("local", local_result), ("public", public_result)):
+        if result is None:
+            continue
+        reason = result["reason"]
+        kind = {"auth": probe_alert.KIND_AUTH, "slow": probe_alert.KIND_SLOW}.get(reason)
+        if kind is None:
+            if scope == "public" and reason == "not_found_404":
+                kind = probe_alert.KIND_NO_HOST
+            elif scope == "local" and reason == "no_answer":
+                kind = probe_alert.KIND_LOCAL_DOWN
+            else:
+                kind = probe_alert.KIND_ERROR
+        probe_alert.record_probe_result(scope, result["ok"], kind)
+
     new_counts = {
         "local": core.update_consecutive_failures(prev_counts.get("local"), local_result),
         "public": core.update_consecutive_failures(prev_counts.get("public"), public_result),
@@ -236,6 +251,7 @@ def run_tick(key, tunnel_name, prev_counts):
     four_oh_four_zero_host = core.correlates_404_with_zero_host_connections(public_result, host_conn)
 
     record = {
+        "recent_probe_alerts": probe_alert.recent_alerts(),
         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "local": {"raw": local_raw, "result": local_result, "hop": local_hop,
                   "consecutive_failures": new_counts["local"], "alert": local_alert},

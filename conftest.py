@@ -444,6 +444,8 @@ DELIBERATELY_NOT_REDIRECTED = {
     # file someone would open to find out who was rejected. Caught twice, independently: by
     # running scripts/status.py and reading what it printed, and by this registry, which is the
     # systematic form of the same check and did not need anyone to look.
+    ("tools.probe_alert", "_ALERTS_FILE"):
+        "resolved through MCP_PROBE_ALERTS_FILE, set to a per-run temp file by conftest",
     ("tools.auth_stats", "_REJECTIONS_FILE"):
         "resolved through the MCP_AUTH_REJECTIONS_FILE environment variable, which conftest "
         "points at a per-run temp file; the .fleet path is only its fallback",
@@ -1536,6 +1538,11 @@ _os.environ.setdefault(
 _os.environ.setdefault(
     "MCP_AUTH_REJECTIONS_FILE",
     _sandbox_path("auth_rejections_pytest_%s.jsonl"))
+
+
+_os.environ.setdefault(
+    "MCP_PROBE_ALERTS_FILE",
+    _sandbox_path("probe_alerts_pytest_%s.jsonl"))
 
 
 # And the toast watchdog's record of WHO fired a notification. It gained a name on 2026-09-18 --
