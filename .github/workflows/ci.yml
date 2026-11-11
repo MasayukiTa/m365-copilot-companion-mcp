@@ -442,6 +442,7 @@ jobs:
             scripts/test_supervisor_dead_tunnel_host_replaced.py \
             scripts/test_supervisor_zero_conn_recovery.py \
             scripts/test_supervisor_hang_detect.py \
+            scripts/test_supervisor_hang_restart_port_copy.py \
             scripts/test_supervisor_runner_respawn.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
