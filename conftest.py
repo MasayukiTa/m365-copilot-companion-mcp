@@ -690,6 +690,8 @@ DELIBERATELY_NOT_REDIRECTED = {
         "falls back to SESS_DIR, already redirected above (bridge.session_store), and first "
         "checks MCP_SESSION_STORE_DIR, which this file's own session-scoped "
         "_isolate_session_store fixture points at a temp directory before any test runs",
+    ("bridge.session_store", "_spool_path"):
+        "Uses _base_dir, which is isolated by the session store fixture.",
     ("bridge.session_store", "_db_path"):
         "derived from _base_dir(), same protection",
     ("tools.tool_ledger", "_repo_path"):

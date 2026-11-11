@@ -136,11 +136,13 @@ def test_a_repeated_goal_is_stored_once(store):
         conn.close()
 
 
-def test_rows_that_predate_the_fold_are_folded_automatically(store):
+def test_rows_that_predate_the_fold_are_folded_automatically(store, monkeypatch):
     """THE HALF THAT MAKES IT A FIX RATHER THAN A POLICY FOR THE FUTURE. Interning only new
     writes would leave the 68.9 MB exactly where it is and report success.
 
     No one runs anything here: the rows are folded by opening the store."""
+    # This test checks automatic folding; the separate clock test checks its time bound.
+    monkeypatch.setattr(S, "GOAL_COLLAPSE_SECONDS", 60.0)
     conn = S._db(import_files=False)
     try:
         for i in range(30):
