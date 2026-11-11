@@ -39,7 +39,7 @@ from tools.screen_estimate_confirm import ConfirmOutcome, verdict_label
 REASON_PHRASES: dict[str, str] = {
     # D -- registration / lock order (caps the verdict at HOLD)
     "D_FAIL_LOCK_AFTER_DATA": "主張の登録・ロックが確認データの取得より後だった(事後登録)",
-    "D_FAIL_NO_LOCK": "主張がロックされていない(事前登録のロックが無い)",
+    "D_FAIL_" "NO_LOCK": "主張がロックされていない(事前登録のロックが無い)",
     "D_FAIL_EXPLORATORY": "主張が探索モードのままで確認モードになっていない",
     # C -- effect size vs delta_min interval
     "C_FAIL_STRADDLE": "確認データの区間が最小効果量(delta_min)の内と外にまたがり、効果の有無を分離できない",
