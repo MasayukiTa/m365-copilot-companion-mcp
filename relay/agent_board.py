@@ -166,7 +166,7 @@ def status_block():
         return {"agent_board": {"mode": run_mode(), "posted": _STATE["posted"],
                                 "refused": _STATE["refused"],
                                 "write_errors": _STATE["write_errors"],
-                                "kinds_version": board_kinds.SCHEMA_VERSION}}
+                                "kinds_version": board_kinds.SCHEMA_REVISION}}
     except Exception:
         return {}
 

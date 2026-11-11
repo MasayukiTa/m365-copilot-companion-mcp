@@ -43,7 +43,7 @@ def test_every_goal_is_one_line_and_judged_split(made):
 
 def test_goal_text_is_public_only(made):
     _root, goals = made
-    banned = ["reso" + "nac", "DBB", "D" + "LP", "社員", "http://", "https://"]
+    banned = ["reso" + "nac", "D" + "BB", "D" + "LP", "社員", "http://", "https://"]
     for g in goals:
         for w in banned:
             assert w.lower() not in g["text"].lower(), (g["goal_id"], w)

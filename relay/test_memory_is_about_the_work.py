@@ -54,7 +54,7 @@ def test_the_harness_talking_about_itself_is_not_a_memory(note):
 
 
 @pytest.mark.parametrize("note", [
-    "V_製品検査データ が正規の DBA 検査ビュー。他の名前は別物",
+    "V_metrics が正規の集計ビュー。他の名前は別物",
     "the failing assert is in tests/test_parser.py::test_nested, not in the parser",
     "MAXDOP 1 kills the parallel read-ahead; that is the real mechanism",
     "pip needs --trusted-host here; the corporate TLS proxy breaks verification",
