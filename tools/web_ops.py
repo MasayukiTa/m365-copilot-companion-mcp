@@ -2,8 +2,12 @@ import re
 from typing import Optional
 from urllib.parse import urlparse
 
-import httpx
-
+# httpx is deferred to call time (see web_fetch; github_file reaches it via web_fetch).
+# httpx imports in ~1.5 s standalone (measured 2026-11-11, median of 5) and is only used by
+# web_fetch here, so it is imported inside that function to keep this module's import off the
+# start->listen path. (render_page uses playwright, not httpx.) NOTE: the server's dominant
+# startup cost is the fastmcp/mcp import tree (~6-8 s), which cannot be deferred past port
+# bind; this change trims the httpx tail only.
 from ._untrusted import wrap_untrusted
 
 USER_AGENT = "m365-copilot-companion-mcp/0.1 (+local agent)"
@@ -116,6 +120,7 @@ def web_fetch(
             is here so a page that lies can still be read without reimplementing the fetch.
     """
     try:
+        import httpx  # deferred: keep module import light so startup stays off the network stack
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             return "[web_fetch error: only http/https URLs are allowed]"

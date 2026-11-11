@@ -114,6 +114,8 @@ jobs:
           TMPDIR: ${{ runner.temp }}
         run: |
           pytest -q \
+            scripts/test_tunnel_login_state.py \
+            scripts/test_probe_never_shells_out_to_devtunnel.py \
             tests/test_security_xff.py \
             tests/test_session_store_fleet_async.py \
             tests/test_session_store_spool_drain.py \
@@ -126,6 +128,7 @@ jobs:
             tests/test_sessions_search_migration.py \
             tools/test_child_env_credentials.py \
             tools/test_childproc_timeout_kills_tree_no_thread_leak.py \
+            tools/test_code_exec_popen_closed_no_handle_leak.py \
             tools/test_childproc_imports_without_root_on_path.py \
             tools/test_childproc_output_via_tempfile_no_reader_thread.py \
             tools/test_ocr_native_thread_leak.py \
@@ -147,6 +150,7 @@ jobs:
             tools/test_a_tool_that_returns_its_failure_still_failed.py \
             tools/test_tunnel_alert_names_the_cause.py \
             ui/test_a_green_dot_must_have_established_the_thing.py \
+            ui/test_a_tunnel_cause_is_shown_on_the_dot.py \
             ui/test_planned_server_restart_signal.py \
             ui/test_planned_server_restart_expiry.py \
             ui/test_planned_server_restart_exact_poll.py \
@@ -449,6 +453,7 @@ jobs:
             scripts/test_supervisor_hang_detect.py \
             scripts/test_supervisor_hang_restart_port_copy.py \
             scripts/test_supervisor_runner_respawn.py \
+            scripts/test_mcp_handshake_monitor.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
@@ -565,6 +570,7 @@ jobs:
             tools/test_state_store_integrity.py \
             tools/test_agent_memory_ops.py \
             tools/test_auth_stats.py \
+            tools/test_probe_alert.py \
             tools/test_an_alert_you_cannot_act_on.py \
             tools/test_a_record_that_was_cut_must_say_it_was_cut.py \
             tools/test_provenance_survives_both_writers.py \
@@ -610,6 +616,7 @@ jobs:
             scripts/test_bridge_startup_reporting.py \
             scripts/test_start_companion_edge_headless.py \
             bridge/test_bridge_sessions.py \
+            bridge/test_agent_url_seed_surface.py \
             bridge/test_a_resume_does_not_open_a_page.py \
             bridge/test_cdp_watchdog.py \
             bridge/test_consent_chain.py \
@@ -872,6 +879,7 @@ jobs:
             tests/test_outcome_reporting.py \
             tests/test_run_end_pages.py \
             tests/test_faulthandler_rotation.py \
+            tests/test_faulthandler_crash_banner.py \
             tests/test_verify_stack_interrupted.py \
             tests/test_resume_interrupted.py \
             tests/test_fleet_resume_phase2.py \
