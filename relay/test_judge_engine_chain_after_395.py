@@ -1,27 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Regression tests for the three defects visible in job 04daa4a59ba3's judge_result.json
-(branch fix/judge-engine-chain-after-395, after PR #395 engaged the final-step judge for a
-goal that was only a path to a request folder).
-
-The defects, taken from that job's judge_request.json shape (claim_id 'example_analysis', a
-manifest whose .path was the DATA FOLDER and whose .result was a PATH STRING, and NO
-registration section at all):
-
-  1. 'registered claim not found for id example_analysis' with claim_source null -- the worker
-     named a claim id but the request carried no registration.claim and the engine had no
-     pre-registered configs/<id>.json, so the engine could not run and the worker was never
-     told, in correctable terms, what to send. A worker that DOES follow the documented path
-     (include registration.claim with id == claim_id) must make the engine run end to end.
-  2. 'manifest.result must be an object ... got str' -- the worker put a path string where the
-     analysis-result OBJECT belongs; the correction must show a minimal valid example.
-  3. 'manifest: not run: [Errno 13] Permission denied: <request folder>' -- manifest.path was a
-     DIRECTORY, so record_manifest opened the folder for writing. The contract must reject a
-     directory by name BEFORE the harness opens it, and record_manifest must not open a folder.
-
-HERMETIC: no real folders of the owner. A FAKE engine root (a tiny `python -m validity` that
-echoes a JSON verdict) and a FAKE case folder built under tmp_path stand in for everything.
-No secret data, measurement row or employee id appears here.
-"""
+"""Test request validation and the judge engine chain with isolated fixtures."""
 from __future__ import annotations
 
 import json
@@ -41,7 +19,7 @@ vh = pytest.importorskip(
 
 from relay.judge_gate import complete_judge_request, run_engine_judge
 
-CLAIM_ID = "example_analysis"
+CLAIM_ID = "claim_fixture_01"
 
 # A minimal analysis-result OBJECT, the shape manifest.result must carry (defect 2). No real
 # measurements -- synthetic lot ids and numbers only.
@@ -64,7 +42,7 @@ def _fake_engine_root(tmp_path, *, with_configs_id=None):
                         "dataset_id": "synthetic", "source": "human-configs"}),
             encoding="utf-8")
     verdict = {"id": CLAIM_ID, "verdict": "HOLD", "verdict_ja": "\u4fdd\u7559",
-               "finding": None, "claim_supported": None, "reasons": ["D_FAIL_NO_LOCK"],
+               "finding": None, "claim_supported": None, "reasons": ["TEST_REASON"],
                "notes": [], "evidence": {"K": 2}, "hashes": {"input_sha256": "0" * 64}}
     script = (
         "import json, os, sys\n"
@@ -86,8 +64,7 @@ def _fake_engine_root(tmp_path, *, with_configs_id=None):
 
 
 def _case_folder(tmp_path):
-    """A fake case/output folder with a data FILE inside it (stands in for the owner's request
-    folder, which must never be touched)."""
+    """Create a fixture output folder containing a data file."""
     out = tmp_path / "job_out"
     out.mkdir()
     data = out / "data.csv"
@@ -108,13 +85,13 @@ def test_manifest_result_path_string_is_corrected_with_example(tmp_path, monkeyp
     # The exact defect-2 shape: result is a PATH STRING, not an object.
     _write_request(out, {
         "claim_id": CLAIM_ID, "data_location": str(data),
-        "fetched_at": "2026-11-01T00:00:00+09:00",
+        "fetched_at": "2026-01-02T00:00:00+09:00",
         "manifest": {"path": "manifest.json", "dataset_id": CLAIM_ID,
                      "result": str(out / "report.xlsx")},
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -133,14 +110,14 @@ def test_manifest_path_directory_is_rejected_by_name_not_errno13(tmp_path, monke
     folder.mkdir()
     _write_request(out, {
         "claim_id": CLAIM_ID, "data_location": str(data),
-        "fetched_at": "2026-11-01T00:00:00+09:00",
+        "fetched_at": "2026-01-02T00:00:00+09:00",
         # path is a DIRECTORY (the exact defect-3 mistake), result now a valid object so only
         # the directory path is wrong.
         "manifest": {"path": str(folder), "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -159,7 +136,7 @@ def test_record_manifest_refuses_a_directory_path(tmp_path):
     folder.mkdir()
     with pytest.raises(IsADirectoryError):
         vh.record_manifest(str(folder), dataset_id=CLAIM_ID, data_path=str(data),
-                           result=RESULT_OBJECT, fetched_at="2026-11-01T00:00:00+09:00")
+                           result=RESULT_OBJECT, fetched_at="2026-01-02T00:00:00+09:00")
 
 
 # ---- defect 1: no claim anywhere -> correctable; with registration -> runs ----
@@ -171,12 +148,12 @@ def test_missing_claim_is_a_named_correction_naming_registration_claim(tmp_path,
     # The exact defect-1 shape: a valid manifest, but NO registration section at all.
     _write_request(out, {
         "claim_id": CLAIM_ID, "data_location": str(data),
-        "fetched_at": "2026-11-01T00:00:00+09:00",
+        "fetched_at": "2026-01-02T00:00:00+09:00",
         "manifest": {"path": "manifest.json", "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -195,18 +172,18 @@ def test_worker_following_the_documented_path_makes_the_engine_run(tmp_path, mon
     registry_root.mkdir()
     _write_request(out, {
         "claim_id": CLAIM_ID, "data_location": str(data),
-        "fetched_at": "2026-11-01T00:00:00+09:00",
+        "fetched_at": "2026-01-02T00:00:00+09:00",
         "manifest": {"path": "manifest.json", "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
         "registration": {
             "root": str(registry_root),
             "claim": {"id": CLAIM_ID, "claim_type": "between_lot", "dataset_id": CLAIM_ID,
                       "source": "worker-registered"},
-            "registered_at": "2026-10-01T00:00:00+09:00",
+            "registered_at": "2026-01-01T00:00:00+09:00",
         },
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     # With a matching registration.claim and no field problems, the engine runs: no correction.
     assert correction is None, detail

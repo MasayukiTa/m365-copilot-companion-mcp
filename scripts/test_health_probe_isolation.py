@@ -7,13 +7,22 @@ misread a slow /health as a dead server, dropping every worker into `token_wait`
 
 The fix moved the sub-probes onto a DEDICATED pool (_HEALTH_POOL) bounded by one short
 deadline (_HEALTH_PROBE_BUDGET_S) via _gather_health_probes(). These tests pin that
-contract: a slow probe is dropped, fast probes still merge, and the whole call returns well
-inside the budget. They exercise the gather helper directly -- no socket, no uvicorn.
+contract: a slow probe is dropped, fast probes still merge, and a probe that cannot get a
+worker on a saturated DEFAULT pool is unaffected because /health has its own pool. They
+exercise the gather helper directly -- no socket, no uvicorn.
+
+DETERMINISTIC, NOT TIMED. The earlier cut used time.sleep() to stand in for a slow probe and
+real CPU-burner threads to saturate the default pool, then asserted a wall-clock ceiling. On a
+shared 2-vCPU runner under that saturation the dedicated pool's own dispatch could slip past
+the ceiling, or the slow probe's worker could grab a slot a hair before a fast probe, so
+'fast2 == ok' read None and the time-assert flaked (PR 526 CI). Every slow/saturating element
+here is now a threading.Event or a Barrier the test controls, so a probe is 'slow' because it
+is HELD, not because it sleeps, and the default pool is 'saturated' because its workers are
+HELD, not because they burn CPU. The invariants proven are unchanged.
 """
 import asyncio
 import os
 import threading
-import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -43,23 +52,52 @@ def test_fast_probes_all_merge():
 
 
 def test_slow_probe_is_dropped_and_call_stays_within_budget(monkeypatch):
-    """A probe that blocks far longer than the budget must NOT delay the answer, and its
-    field must be absent while the fast probes are still present."""
-    monkeypatch.setattr(main, "_HEALTH_PROBE_BUDGET_S", 0.3, raising=False)
+    """A probe that cannot return until the test releases it must NOT delay the answer, and its
+    field must be absent while the fast probes are still present.
+
+    DETERMINISTIC: the 'slow' probe blocks on a threading.Event the test releases only AFTER
+    the gather returns, instead of sleeping for a fixed wall-clock span. Because it can never
+    return in time, the gather is guaranteed to drop it on every run -- there is no race
+    between a sleep duration and the budget, which is what let 'fast2' read None under load.
+    The two fast probes signal a Barrier so the test can confirm BOTH of them actually ran and
+    merged before the gather returned; the health pool has four workers, so the fast probes
+    always get their slots even with the blocker holding one."""
+    # A comfortable budget: the fast probes return the instant they rendezvous, and the slow
+    # probe never returns until released AFTER the gather, so it is dropped on every run no
+    # matter how large the budget is. There is no wall-clock assertion, so the budget's exact
+    # value cannot make this flaky -- it only has to be large enough that the two fast probes'
+    # own dispatch comfortably fits, which decouples the result from runner scheduling jitter.
+    monkeypatch.setattr(main, "_HEALTH_PROBE_BUDGET_S", 2.0, raising=False)
+
+    release = threading.Event()
+    # Barrier(2): the two fast probes rendezvous with EACH OTHER (not this thread), which both
+    # proves both ran and keeps them off the critical path of the test thread. They release the
+    # instant the second one arrives.
+    fast_barrier = threading.Barrier(2)  # fast + fast2
+
+    def fast():
+        fast_barrier.wait(timeout=10)
+        return {"fast": "ok"}
+
+    def fast2():
+        fast_barrier.wait(timeout=10)
+        return {"fast2": "ok"}
 
     def slow():
-        time.sleep(5.0)          # simulates a pool-starving tool body
+        # Blocks until released -- stands in for a pool-starving tool body, with no fixed sleep
+        # that could finish early (dropping the determinism) or late (hanging teardown).
+        release.wait(10)
         return {"slow": "late"}
 
-    probes = [lambda: {"fast": "ok"}, slow, lambda: {"fast2": "ok"}]
-    t0 = time.time()
-    out = _run(main._gather_health_probes(probes))
-    elapsed = time.time() - t0
+    probes = [fast, slow, fast2]
+    try:
+        out = _run(main._gather_health_probes(probes))
+    finally:
+        release.set()  # let the slow worker exit so it never pins the pool
 
-    assert elapsed < 2.0, "gather must return near the budget, not wait on the slow probe"
     assert out.get("fast") == "ok"
     assert out.get("fast2") == "ok"
-    assert "slow" not in out, "a probe slower than the budget must contribute nothing"
+    assert "slow" not in out, "a probe held past the budget must contribute nothing"
 
 
 def test_raising_probe_never_breaks_the_gather():
@@ -96,70 +134,69 @@ def test_budget_is_overridable_by_env(monkeypatch):
     assert main._HEALTH_PROBE_BUDGET_S > 0.0
 
 
-def test_health_pool_survives_a_saturated_default_executor_under_cpu_load(monkeypatch):
-    """THE ROOT-CAUSE REGRESSION, with a real artificial CPU load.
+def test_health_pool_survives_a_saturated_default_executor(monkeypatch):
+    """THE ROOT-CAUSE REGRESSION, with the default executor DETERMINISTICALLY saturated.
 
-    Reproduce the 2026-11-04 starvation: flood the loop's DEFAULT ThreadPoolExecutor with
-    CPU-bound spinners (the stand-in for pwsh_exec/find_files/run_python tool bodies), then
-    show that /health's probes -- which run on the DEDICATED _HEALTH_POOL via
-    _gather_health_probes -- still answer inside the budget. Before the fix the probes shared
-    that saturated default pool and could not get a worker, so /health timed out. The spinners
-    hold GIL-bound CPU, so the default pool's worker threads are genuinely occupied, not merely
-    sleeping.
-    """
+    Reproduce the 2026-11-04 starvation: fill EVERY worker of the loop's DEFAULT
+    ThreadPoolExecutor so that nothing new submitted to it can get a worker, then show that
+    /health's probes -- which run on the DEDICATED _HEALTH_POOL via _gather_health_probes --
+    still answer. Before the fix the probes shared that saturated default pool, got no worker,
+    and _gather_health_probes returned an EMPTY dict: fast/fast2 were simply absent. So the
+    presence of both fields is the true, deterministic proof of isolation.
+
+    DETERMINISTIC, NOT A CPU RACE. The earlier cut occupied the default pool with real
+    CPU-burner loops and then gated on a wall-clock ceiling (budget + 8s). On a shared 2-vCPU
+    runner that saturation added seconds of scheduling jitter to even the dedicated pool, and
+    the ceiling flaked (seen 2026-11-08: 2.85s). Here each default-pool worker is pinned by a
+    threading.Event the test releases in a finally, and a Barrier confirms every default worker
+    is occupied BEFORE the health gather runs -- so the default pool is provably, fully
+    saturated with zero CPU burned and zero dependence on the clock. The only thing asserted is
+    ISOLATION: both health fields come back even though the default pool can serve nobody."""
     monkeypatch.setattr(main, "_HEALTH_PROBE_BUDGET_S", 1.0, raising=False)
 
-    stop = threading.Event()
-
-    def burn():
-        # Tight CPU-bound loop: real load on a default-pool worker thread until released.
-        x = 0
-        while not stop.is_set():
-            x = (x * 1103515245 + 12345) & 0x7FFFFFFF
-        return x
-
     loop = asyncio.new_event_loop()
+    release = threading.Event()
+    n_workers = (os.cpu_count() or 4) + 4
+    occupied = threading.Barrier(n_workers + 1)  # every default worker + this thread
+
+    def hold():
+        # Occupy a default-pool worker without burning CPU: signal we hold it, then wait.
+        occupied.wait(timeout=20)
+        release.wait(20)
+        return None
+
     try:
-        # Saturate the loop's DEFAULT executor: fill every default worker with a CPU burner.
-        # default max_workers = min(32, cpu_count+4); submit generously to occupy them all.
-        default_pool = ThreadPoolExecutor(max_workers=(os.cpu_count() or 4) + 4)
+        # Saturate the loop's DEFAULT executor: fill every default worker and block it.
+        default_pool = ThreadPoolExecutor(max_workers=n_workers)
         loop.set_default_executor(default_pool)
-        burners = [loop.run_in_executor(None, burn)
-                   for _ in range((os.cpu_count() or 4) + 4)]
+        holders = [loop.run_in_executor(None, hold) for _ in range(n_workers)]
+
+        # Confirm EVERY default worker is now occupied before we run the health gather, so the
+        # saturation is a proven precondition rather than a hoped-for timing coincidence.
+        occupied.wait(timeout=20)
 
         async def drive():
-            t0 = time.time()
-            out = await main._gather_health_probes(
+            return await main._gather_health_probes(
                 [lambda: {"fast": "ok"}, lambda: {"fast2": "ok"}])
-            return out, time.time() - t0
 
-        out, elapsed = loop.run_until_complete(drive())
+        out = loop.run_until_complete(drive())
+
         # THE INVARIANT UNDER TEST IS ISOLATION, NOT A WALL-CLOCK RACE. The dedicated health
         # pool is independent of the saturated default pool, so the probes STILL RETURN THEIR
-        # RESULTS even under full CPU load -- that is the regression this pins. Before the fix
-        # the probes shared the saturated default pool, got no worker, and _gather_health_probes
-        # returned an EMPTY dict within the budget: fast/fast2 were simply absent. So the
-        # presence of both fields is the true, deterministic proof of isolation.
+        # RESULTS even though the default pool can serve no one -- that is the regression this
+        # pins. The presence of both fields is the deterministic proof of isolation.
         assert out.get("fast") == "ok"
         assert out.get("fast2") == "ok"
-        # Timing stays bounded, but with a generous margin over the budget: a shared CI runner
-        # (2 vCPUs) under deliberate GIL-bound saturation can add seconds of scheduling jitter
-        # to even the dedicated pool's dispatch. Gate on the configured budget plus a wide
-        # fixed margin instead of a brittle hard-coded 2.0s wall clock that flaked on
-        # CPU-saturated runners (seen 2026-11-08: elapsed 2.85s on the resubmission).
-        budget = main._HEALTH_PROBE_BUDGET_S
-        assert elapsed < (budget + 8.0), (
-            "health probes must still answer in bounded time even when the default/tool "
-            f"executor is CPU-saturated (budget={budget:.2f}s, elapsed={elapsed:.2f}s)")
     finally:
-        stop.set()
-        for b in burners:
+        release.set()
+        for b in holders:
             try:
                 b.result(timeout=5)
             except Exception:
                 pass
         default_pool.shutdown(wait=False)
         loop.close()
+
 
 def test_health_handler_actually_merges_probe_fields(monkeypatch):
     """END-TO-END: the /health handler must AWAIT _gather_health_probes and merge its result
@@ -191,4 +228,3 @@ def test_health_handler_actually_merges_probe_fields(monkeypatch):
     assert body.get("probe_marker_auth") == "yes", "handler did not merge _auth_stats probe"
     # server_uptime_s is pure arithmetic set before the probes; it must always be present.
     assert "server_uptime_s" in body
-

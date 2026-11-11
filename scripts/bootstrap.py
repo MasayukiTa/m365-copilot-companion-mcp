@@ -86,6 +86,34 @@ STATE_FILE = STATE_DIR / "state.json"
 VENV_PYTHON = ROOT / ".venv" / "Scripts" / "python.exe"  # Windows layout
 GENERATED_DIR = ROOT / "generated"
 
+# HOW LONG A VENV-PROBE CHILD MAY TAKE BEFORE WE CALL THE VENV BROKEN.
+#
+# _venv_runs/_venv_version/_venv_has_pip each spawn the venv's python and wait for it. The
+# wait was a hard-coded 60s. On a BRAND-NEW machine that is not always enough: measured on a
+# fresh PC, a bare `python -c "import sys"` took ~8-9s and `python -m venv` (which re-spawns
+# python for ensurepip) ran well past 60s, because real-time AV scanning and a cold file
+# cache tax every interpreter start. A healthy venv was then mis-judged "cannot run", STEP
+# 1/7 looped on rebuilding a venv that was fine, and the install never advanced. The fix is
+# to give the probe a generous default and let a slow box raise it further via one env var,
+# rather than bake a number that is right only on a warm developer machine.
+_VENV_PROBE_TIMEOUT_DEFAULT = 180.0
+_VENV_PROBE_TIMEOUT_ENV = "MCP_VENV_PROBE_TIMEOUT"
+
+
+def _venv_probe_timeout() -> float:
+    """Seconds a single venv-probe child may take. Default 180, override with
+    ``MCP_VENV_PROBE_TIMEOUT`` (seconds). An unset/blank/invalid/non-positive value falls back
+    to the default, so a bad env var can never make the timeout zero and flap the probe."""
+    raw = (os.environ.get(_VENV_PROBE_TIMEOUT_ENV) or "").strip()
+    if raw:
+        try:
+            v = float(raw)
+            if v > 0:
+                return v
+        except ValueError:
+            pass
+    return _VENV_PROBE_TIMEOUT_DEFAULT
+
 DEFAULT_TUNNEL_NAME = "m365-copilot-companion"
 
 # Privacy guard: some tunnel names leak an identifying (organization/user) token to the
@@ -318,8 +346,12 @@ def _venv_runs() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
-        res = _run_child([str(VENV_PYTHON), "-c", "import sys"], timeout=60)
+        res = _run_child([str(VENV_PYTHON), "-c", "import sys"],
+                         timeout=_venv_probe_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
@@ -335,9 +367,13 @@ def _venv_version() -> tuple | None:
     if not VENV_PYTHON.exists():
         return None
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         res = _run_child([str(VENV_PYTHON), "-c",
-                          "import sys; print('%d.%d' % sys.version_info[:2])"], timeout=60)
+                          "import sys; print('%d.%d' % sys.version_info[:2])"],
+                         timeout=_venv_probe_timeout())
     except (OSError, subprocess.SubprocessError):
         return None
     if res.returncode != 0:
@@ -356,8 +392,12 @@ def _venv_has_pip() -> bool:
     if not VENV_PYTHON.exists():
         return False
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
-        res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"], timeout=60)
+        res = _run_child([str(VENV_PYTHON), "-m", "pip", "--version"],
+                         timeout=_venv_probe_timeout())
     except (OSError, subprocess.SubprocessError):
         return False
     return res.returncode == 0
@@ -798,6 +838,9 @@ def distributions_missing_files(paths=None) -> list:
 def _broken_distributions(py: str) -> list:
     """distributions_missing_files() as seen by the interpreter `py` (the venv pip just wrote
     into). A check that cannot run reports nothing: the import sentinel after it still runs."""
+    import sys as _sys
+    if str(ROOT) not in _sys.path:
+        _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
     from tools.childproc import run as _run_child
     try:
         r = _run_child([py, str(Path(__file__).resolve()), "--list-broken-dists"], timeout=300)
@@ -828,6 +871,9 @@ def venv_unsatisfied(req: Path = None) -> list:
     nothing about the venv's."""
     if _running_in_project_venv() or not VENV_PYTHON.exists():
         return unsatisfied_requirements(req)
+    import sys as _sys
+    if str(ROOT) not in _sys.path:
+        _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
     from tools.childproc import run as _run_child
     args = [str(VENV_PYTHON), str(Path(__file__).resolve()), "--list-unsatisfied"]
     if req is not None:
@@ -1929,6 +1975,9 @@ def _dt_run(dt: str, *args: str) -> subprocess.CompletedProcess:
     """Run a devtunnel subcommand, capturing output, never raising. Returns the
     CompletedProcess (rc 124-style sentinel on timeout/spawn failure)."""
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         return _run_child([dt, *args], timeout=60)
     except (OSError, subprocess.SubprocessError):
@@ -2093,6 +2142,9 @@ def _devtunnel_logged_in(dt: str) -> bool:
     """Best-effort: returns True only if 'devtunnel user show' clearly reports a
     logged-in account. Any error / 'not logged in' text -> False (we pause)."""
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         out = _run_child([dt, "user", "show"], timeout=20)
     except (OSError, subprocess.SubprocessError):
@@ -2422,6 +2474,9 @@ def _import_main_in_venv(for_install: bool = False):
         if not (env.get("MCP_API_KEY") or "").strip():
             env["MCP_API_KEY"] = "install-verify-placeholder"
     try:
+        import sys as _sys
+        if str(ROOT) not in _sys.path:
+            _sys.path.insert(0, str(ROOT))  # brand-new-PC STEP 1/7: tools package must resolve before this import
         from tools.childproc import run as _run_child
         res = _run_child([py, "-c", code], cwd=str(ROOT), env=env,
                          timeout=VERIFY_IMPORT_TIMEOUT_S)

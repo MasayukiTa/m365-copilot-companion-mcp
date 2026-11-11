@@ -1022,18 +1022,6 @@ def settings_autoscale():
     return on, ceiling
 
 
-def settings_agents_janitor_apply(default=1):
-    """Whether the supervisor's agents-janitor sweep DELETES (1) or only dry-runs (0).
-
-    ON by default: the janitor's whole purpose is to reclaim C: during fleet runs, and its four
-    conjoined safety checks (clean tree, nothing unpushed, no live worker, quiet 60 min) already
-    refuse to touch anything that is not a finished, fully-saved clone. An operator who wants to
-    watch it decide without deleting sets agents_janitor_apply=0 and reads the dry-run log lines.
-    Cockpit-settable; adopted on the next supervisor tick that falls below the disk threshold.
-    """
-    return _settings_int("agents_janitor_apply", default) == 1
-
-
 def settings_effort(default="auto"):
     """The cockpit's chosen effort mode (`effort=min|max|ultra|auto` in settings.txt). This is the
     UI selector the user picks for BOTH fleet and single runs; the CLI --effort overrides it when
@@ -1606,6 +1594,16 @@ def _write_scope_tick(workers):
         pass
 
 
+def _peer_requests_tick(workers, queued=0, run_id=""):
+    """Once per tick: in shadow, record the peer REQUEST/OFFER/CLAIM a peer-request protocol
+    would have produced (relay/peer_requests.py). Never raises, never blocks, posts nothing."""
+    try:
+        from relay import peer_requests as _pr
+        _pr.shadow_tick(workers, queued=queued, run_id=run_id)
+    except Exception:
+        pass
+
+
 def _resident_tools_block():
     """`resident_tools`: "off"|"on", additive. The production caller of
     relay.resident_guard.status_block (and so of its mode reader). Nothing acts on the value
@@ -1677,6 +1675,16 @@ def _relay_findings_block():
         return {}
 
 
+def _peer_requests_block():
+    """`peer_requests`: {mode, recorded, requests, offers, claims}, additive. The production
+    caller of relay.peer_requests.status_block (and so of its mode reader). {} on any failure."""
+    try:
+        from relay import peer_requests as _pr
+        return _pr.status_block()
+    except Exception:
+        return {}
+
+
 def _auto_resume_block():
     """`auto_resume`: {setting, last_decision, pending_snapshots}, additive. The production caller
     of relay.fleet_resume.auto_resume_report; the screen shows whether an interrupted run is
@@ -1715,6 +1723,20 @@ AUTO_RESUME_REFRESH_S = 20.0
 import threading as _threading_mod                      # noqa: E402
 _AUTO_RESUME_LOCK = _threading_mod.Lock()
 _AUTO_RESUME_CACHE = {"value": {}, "at": 0.0, "running": False}
+
+
+def _orphan_readd_block():
+    """`orphan_readd`: {count, jids, at}, additive -- how many acknowledged-but-dropped goals
+    this run's start re-queued (relay/orphan_readd.resubmit_orphans_on_start records it at
+    startup). {} when there is no record or it cannot be read. A cheap single-file read, off the
+    hot path: the record changes only once per start."""
+    try:
+        from relay import orphan_readd as _orphan_readd
+        state_dir = _ACTIVE_STATE_DIR or os.path.join(_repo_root(), ".fleet")
+        rec = _orphan_readd.read_record(state_dir)
+        return {"orphan_readd": rec} if rec else {}
+    except Exception:
+        return {}
 
 
 def _conversation_saving_block():
@@ -2269,9 +2291,11 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
     _snap.update(_result_cache_block())
     _snap.update(_team_formation_block())
     _snap.update(_relay_findings_block())
+    _snap.update(_peer_requests_block())
     _snap.update(_agent_board_block())
     _snap.update(_roster_block(_snap["workers"]))
     _snap.update(_auto_resume_block())
+    _snap.update(_orphan_readd_block())
     _snap.update(_conversation_saving_block())
     return _snap
 
@@ -4557,6 +4581,26 @@ def main():
     except Exception as _exc:                     # never let housekeeping stop a run
         print("fleet retention skipped: %s" % _exc, flush=True)
 
+    # ORPHANED-AFTER-ACK RE-ADD. Measured 2026-11-10: each cold start (05:10 and 14:08 that day)
+    # silently dropped every goal that had been acknowledged ('landed': acks/<jid>.ack and
+    # tasks/done/<jid>.landed.json both present) but had no outcome file -- status.json read
+    # workers=1 total=1 while five ShuttleScope goals and several orchestrator goals waited for
+    # hours with no worker and no outcome. The admission survived on disk (intake_journal.jsonl /
+    # for_fleet/<jid>.txt); nothing re-queued it. This re-adds each such jid to the for_fleet
+    # queue exactly once, carrying a resubmitted_after_restart marker, and NEVER re-adds a jid
+    # that already has an outcome, a live worker, or a refused record. It sits here, on the same
+    # startup path as the resume/reconcile housekeeping above and before the goals are finalised,
+    # and -- like retention -- never lets a failure stop the run. The count lands in status.json
+    # via _orphan_readd_block (snapshot build). See relay/orphan_readd.py.
+    try:
+        from relay import orphan_readd as _orphan_readd
+        _readded = _orphan_readd.resubmit_orphans_on_start(args.state_dir)
+        if _readded:
+            print("orphan re-add: %d acknowledged goal(s) dropped by a restart re-queued"
+                  % len(_readded), flush=True)
+    except Exception as _exc:                     # housekeeping must never stop a run
+        print("orphan re-add skipped: %s" % _exc, flush=True)
+
     # KeyboardInterrupt already knows this state_dir from the early single-instance gate above.
 
     # ULTRA ACCURACY preset: maximise CLEAN correctness, ignore time. Wires the verified accuracy
@@ -5425,7 +5469,8 @@ def main():
         # only the still-unfinished goals. Cheap (in-memory scan + one atomic write).
         _timed("update_done_map", lambda: _update_done_map(args.state_dir, workers))
         _sample_free_space(args.state_dir, disk_box[0])
-        _timed("write_scope_tick", lambda: _write_scope_tick(workers))      # shadow: record overlapping sibling writes (off = no-op)
+        _timed("write_scope_tick", lambda: _write_scope_tick(workers))
+        _timed("peer_requests_tick", lambda: _peer_requests_tick(workers, len(add_box or []), run_label))      # shadow: record peer REQUEST/OFFER/CLAIM (off = no-op)      # shadow: record overlapping sibling writes (off = no-op)
         try:
             _timed("snapshot", lambda: _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
