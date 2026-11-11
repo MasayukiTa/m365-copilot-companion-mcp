@@ -482,7 +482,17 @@ def _run_with_tree_timeout(command, timeout, cwd):
     So the fix belongs here, at the moment the timeout fires and the parent is still known.
     taskkill /T walks the tree from a live pid; nothing else on Windows reliably does.
     """
-    proc = subprocess.Popen(
+    # with-BLOCK FOR THE HANDLE. subprocess.Popen(stdout=PIPE, stderr=PIPE) opens two kernel
+    # pipe handles (plus, on Windows, the child's process and primary-thread handles held by
+    # the Popen object). The old body never closed the Popen explicitly: on the timeout path
+    # the second proc.communicate(timeout=5) can itself raise, and on EVERY path the Popen was
+    # left for __del__ to close at some later GC. Until that GC ran the pipe handles stayed
+    # open, so each timed-out run_python/shell_exec leaked handles that accumulated in main.py
+    # (measured 2026-11-11: main.py's handle count climbed 1445 -> 2300 over ~17 min, with a
+    # +570 step during a burst of tool calls). Popen is a context manager; its __exit__ closes
+    # stdout/stderr/stdin and waits, and it runs on return, on the timeout return, and on any
+    # exception -- so the handles are released deterministically at end of call, not at GC.
+    with subprocess.Popen(
         command,
         shell=True,
         stdout=subprocess.PIPE,
@@ -494,30 +504,30 @@ def _run_with_tree_timeout(command, timeout, cwd):
         cwd=cwd,
         env=sanitized_child_env(),
         **childproc.tree_popen_kwargs(headless=True),
-    )
-    # ATTRIBUTE THE SPAWN TO THE WORKER (see _run_python_tree). A shell_exec child is a tree
-    # root too, so a worker that is closed/cancelled can reap it before any timeout.
-    try:
-        proc_registry.register(proc.pid, tool="shell_exec")
-    except Exception:
-        pass
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
+    ) as proc:
+        # ATTRIBUTE THE SPAWN TO THE WORKER (see _run_python_tree). A shell_exec child is a tree
+        # root too, so a worker that is closed/cancelled can reap it before any timeout.
         try:
-            out, err = proc.communicate(timeout=5)
+            proc_registry.register(proc.pid, tool="shell_exec")
         except Exception:
-            out, err = b"", b""
-        tail = _decode(err or b"").strip()[-400:]
-        return ("[timeout: exceeded %s seconds; the command and every process it started were "
-                "killed]%s" % (timeout, ("\n[stderr]\n" + tail) if tail else ""))
+            pass
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=5)
+            except Exception:
+                out, err = b"", b""
+            tail = _decode(err or b"").strip()[-400:]
+            return ("[timeout: exceeded %s seconds; the command and every process it started were "
+                    "killed]%s" % (timeout, ("\n[stderr]\n" + tail) if tail else ""))
 
-    class _R(object):
-        pass
-    result = _R()
-    result.stdout, result.stderr, result.returncode = out, err, proc.returncode
-    return _format_output(result, "shell_exec")
+        class _R(object):
+            pass
+        result = _R()
+        result.stdout, result.stderr, result.returncode = out, err, proc.returncode
+        return _format_output(result, "shell_exec")
 
 
 def _cmd_shell_syntax_guard(command):
@@ -601,7 +611,13 @@ def _run_python_tree(argv, timeout, cwd):
     stdin is DEVNULL for the same reason shell_exec closes it: a child that blocks on a prompt
     nobody can answer is how a slow call becomes a permanent one.
     """
-    proc = subprocess.Popen(
+    # with-BLOCK FOR THE HANDLE. See _run_with_tree_timeout for the full rationale: PIPE opens
+    # kernel pipe handles (and, on Windows, the child process/thread handles the Popen holds),
+    # and the timeout path's second proc.communicate(timeout=5) can raise, so a bare `proc =`
+    # left those handles to be closed only at a later GC. Popen's __exit__ closes the pipes and
+    # waits on return, on the re-raised TimeoutExpired, and on any exception -- releasing the
+    # handles at end of call instead of accumulating them in main.py.
+    with subprocess.Popen(
         argv,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -609,29 +625,29 @@ def _run_python_tree(argv, timeout, cwd):
         cwd=cwd,
         env=sanitized_child_env(),
         **childproc.tree_popen_kwargs(headless=True),
-    )
-    # ATTRIBUTE THE SPAWN TO THE WORKER, AT THE SOURCE. register() reads the worker from the
-    # ContextVar the gateway set for this call; outside a worker turn it is a no-op. Never
-    # raises into the tool.
-    try:
-        proc_registry.register(proc.pid, tool="run_python")
-    except Exception:
-        pass
-    try:
-        out, err = proc.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        _kill_tree(proc)
+    ) as proc:
+        # ATTRIBUTE THE SPAWN TO THE WORKER, AT THE SOURCE. register() reads the worker from the
+        # ContextVar the gateway set for this call; outside a worker turn it is a no-op. Never
+        # raises into the tool.
         try:
-            out, err = proc.communicate(timeout=5)
+            proc_registry.register(proc.pid, tool="run_python")
         except Exception:
-            out, err = b"", b""
-        raise
+            pass
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            _kill_tree(proc)
+            try:
+                out, err = proc.communicate(timeout=5)
+            except Exception:
+                out, err = b"", b""
+            raise
 
-    class _R(object):
-        pass
-    result = _R()
-    result.stdout, result.stderr, result.returncode = out, err, proc.returncode
-    return _format_output(result, "run_python")
+        class _R(object):
+            pass
+        result = _R()
+        result.stdout, result.stderr, result.returncode = out, err, proc.returncode
+        return _format_output(result, "run_python")
 
 
 #: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
