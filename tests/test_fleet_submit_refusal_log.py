@@ -65,7 +65,7 @@ def _observed(state):
 
 
 def test_a_resemblance_is_observed_not_refused(state, monkeypatch):
-    # Content resemblance NEVER refuses (owner instruction 2026-10-26/27). Even when the
+    # Content resemblance NEVER refuses. Even when the
     # heuristic finds a 90%-overlap in-flight goal, the submission is QUEUED; the match is only
     # recorded in fleet_submit_similarity.jsonl, and nothing lands in the refusals log.
     monkeypatch.setattr(FI, "_duplicate_of", lambda text: ("job123abc", 0.9))
