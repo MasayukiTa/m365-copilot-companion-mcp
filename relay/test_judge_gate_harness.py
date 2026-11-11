@@ -201,13 +201,13 @@ def test_relay_loop_calls_the_judge_gate():
 # only ever STOPS (true->false), never relaxes.
 
 def test_confirm_overlap_fraction_counts_only_openings_before_registration():
-    reg = "2026-11-02T20:56:46+09:00"
+    reg = "2026-01-07T00:00:00+09:00"
     # three confirmation lots; two were opened BEFORE registration, one AFTER.
     confirm_lots = ["A|0", "A|1", "B|0"]
     prior_opened = {
-        "A|0": "2026-10-01T00:00:00+09:00",   # before reg -> overlap
-        "A|1": "2026-10-02T00:00:00+09:00",   # before reg -> overlap
-        "B|0": "2026-11-03T00:00:00+09:00",   # AFTER reg -> not an overlap
+        "A|0": "2026-01-04T00:00:00+09:00",   # before reg -> overlap
+        "A|1": "2026-01-05T00:00:00+09:00",   # before reg -> overlap
+        "B|0": "2026-01-09T00:00:00+09:00",   # AFTER reg -> not an overlap
     }
     out = confirm_overlap_fraction(confirm_lots, prior_opened, registered_at=reg)
     assert out["n_lots"] == 3
@@ -219,8 +219,8 @@ def test_confirm_overlap_fraction_counts_only_openings_before_registration():
 def test_confirm_overlap_fraction_zero_when_all_opened_after_registration():
     reg = "2026-01-01T00:00:00+09:00"
     confirm_lots = ["L1", "L2"]
-    prior_opened = [{"lot": "L1", "opened_at": "2026-06-01T00:00:00+09:00"},
-                    {"lot": "L2", "opened_at": "2026-06-02T00:00:00+09:00"}]
+    prior_opened = [{"lot": "L1", "opened_at": "2026-01-02T00:00:00+09:00"},
+                    {"lot": "L2", "opened_at": "2026-01-03T00:00:00+09:00"}]
     out = confirm_overlap_fraction(confirm_lots, prior_opened, registered_at=reg)
     assert out["fraction"] == 0.0 and out["n_overlap"] == 0
 
@@ -231,10 +231,10 @@ def test_confirm_overlap_fraction_empty_is_zero():
 
 
 def test_confirm_overlap_triple_lot_keys_are_normalised():
-    reg = "2026-11-02T20:56:46+09:00"
+    reg = "2026-01-07T00:00:00+09:00"
     # [exposure, response, lot] triples; the first was opened before registration.
     confirm_lots = [["Ftype", "loss", "w53"], ["Ftype", "loss", "w01"]]
-    prior_opened = {"Ftype|loss|w53": "2026-10-20T00:00:00+09:00"}
+    prior_opened = {"Ftype|loss|w53": "2026-01-06T00:00:00+09:00"}
     out = confirm_overlap_fraction(confirm_lots, prior_opened, registered_at=reg)
     assert out["n_overlap"] == 1 and out["overlap_lots"] == ["Ftype|loss|w53"]
 
@@ -267,8 +267,8 @@ def test_apply_confirm_independence_zero_overlap_leaves_true_true():
 
 
 def test_footer_states_confirmation_not_independent_and_order_false():
-    order = {"order_ok": True, "registered_at": "2026-11-02T20:56:46+09:00",
-             "data_fetched_at": "2026-11-02T21:00:00+09:00"}
+    order = {"order_ok": True, "registered_at": "2026-01-07T00:00:00+09:00",
+             "data_fetched_at": "2026-01-08T00:00:00+09:00"}
     overlap = {"fraction": 0.25, "n_lots": 8, "n_overlap": 2, "overlap_lots": ["x", "y"]}
     apply_confirm_independence(order, overlap)
     verdict = {"id": "example_L1", "verdict": "HOLD", "verdict_ja": "保留",
@@ -280,7 +280,7 @@ def test_footer_states_confirmation_not_independent_and_order_false():
 
 
 def test_footer_no_independence_line_when_check_absent():
-    order = {"order_ok": True, "registered_at": "2026-11-02T20:56:46+09:00",
+    order = {"order_ok": True, "registered_at": "2026-01-07T00:00:00+09:00",
              "data_fetched_at": "2999-01-01T00:00:00+09:00"}
     verdict = {"id": "S", "verdict": "GO", "verdict_ja": "採用", "finding": "EFFECT",
                "claim_supported": True, "reasons": [], "notes": [], "evidence": {"K": 6},
