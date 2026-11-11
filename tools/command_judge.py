@@ -38,7 +38,7 @@ import re
 from typing import Callable, List, Optional
 
 #: Bump when the meaning of a field changes, so an old audit line is never read as a new one.
-SCHEMA_VERSION = 1
+MODEL_SCHEMA_VERSION = 1
 POLICY_VERSION = 1
 
 ALLOW = "ALLOW"
@@ -99,7 +99,7 @@ def build_request(command: str,
     Anything it says about what the judge should do has no authority, and the prompt says so.
     """
     return {
-        "schema_version": SCHEMA_VERSION,
+        "schema_version": MODEL_SCHEMA_VERSION,
         "policy_version": POLICY_VERSION,
         "pending_command": command,
         "cwd": cwd,

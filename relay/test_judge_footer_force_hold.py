@@ -5,10 +5,10 @@ WHAT THIS SLICE OWNS, AND WHAT IT DOES NOT. Task 1 (feat/design-feasibility-core
 produces a design_feasibility RESULT by inspecting the comparison design WITHOUT
 reading the response/outcome column. THIS slice is the WIRING that consumes that
 result at the final step: when the design is infeasible, the FINAL DISPLAY is forced
-to 設計不成立(保留) regardless of the engine verdict, the reason code and what was
+to a design-infeasible HOLD regardless of the engine verdict, the reason code and what was
 seen (common strata, per-group lot counts, overlap coefficient) are named on the
-judge票, and the engine's ORIGINAL output is preserved unchanged (footer: labelled
-参考・変更なし; record: separate key design_feasibility_hold + top-level final_display,
+the judge footer, and the engine's ORIGINAL output is preserved unchanged (footer: labelled
+as the original engine output, unchanged; record: separate key design_feasibility_hold + top-level final_display,
 with `verdict` untouched).
 
 These tests consume a plain dict (the contract shape), so they are independent of

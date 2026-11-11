@@ -222,7 +222,7 @@ def test_engine_refuses_a_manifest_with_a_different_fetch_time(tmp_path):
     assert "fetch time" in verdict["unavailable_reason"]
 
 
-# --- trusted registration order (欠け 2026-11-01) --------------------------------------------
+# --- trusted registration order (regression guard for a previously missing check) ---------
 
 def _lock_rec(root):
     import pathlib
