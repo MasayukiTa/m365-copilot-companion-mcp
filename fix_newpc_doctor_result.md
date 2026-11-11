@@ -21,8 +21,7 @@ the agent or this PC, and no retry can make credits appear.
 - `relay/relay_fleet.py` -- on detect, settles the worker as
   `status="stuck", outcome="CREDITS_EXHAUSTED"`, carries `credits_exhausted.MESSAGE`
   as the worker `reason`, and notifies ("クレジット不足"). Non-retryable.
-- `relay/turn_outcome.py` -- adds the `CREDITS` turn outcome;
-  `is_product_failure(CREDITS)` is `False`.
+- `relay/turn_outcome.py` -- adds the `CREDITS` turn outcome.
 - `relay/outcomes.py` -- `CREDITS_EXHAUSTED` is a closed-set member mapped to
   `stuck`, `excluded` from the miss totals at zero turns, fail-closed otherwise,
   and non-retryable.
@@ -76,5 +75,5 @@ source text (WPF, not unit-compilable), in the style of the sibling
    (`IsCreditsExhausted`, `isCredits`, `OneLine(reason)`).
 3. It is carved out of `IsOperatorAttention`.
 4. It is not in the C# retryable set.
-5. The Python contract it mirrors holds (`is_product_failure` False, `scoring_of`
+5. The Python contract it mirrors holds (`scoring_of`
    `excluded` at zero turns, non-retryable).

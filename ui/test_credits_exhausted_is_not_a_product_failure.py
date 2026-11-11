@@ -82,10 +82,9 @@ def test_python_side_excludes_credits_from_product_failure():
     import sys
     if REPO not in sys.path:
         sys.path.insert(0, REPO)
-    from relay import outcomes, turn_outcome, credits_exhausted
+    from relay import outcomes, credits_exhausted
     # the one plain line exists and is what the worker reason carries
     assert credits_exhausted.MESSAGE.strip()
-    # excluded from failure totals: never a product failure class, excluded at zero turns
-    assert turn_outcome.is_product_failure(turn_outcome.CREDITS) is False
+    # excluded from failure totals at zero turns
     assert outcomes.scoring_of("CREDITS_EXHAUSTED", 0) == "excluded"
     assert outcomes.is_retryable("CREDITS_EXHAUSTED") is False

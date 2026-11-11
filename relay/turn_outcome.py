@@ -161,12 +161,3 @@ def is_capacity_signal(klass: str) -> bool:
     """
     return klass == RATE
 
-
-def is_product_failure(klass: str) -> bool:
-    """Whether this class should count toward product failure totals.
-
-    `ok` is a normal reply and `credits` is a capacity limit of the environment (no
-    capacity assigned), which cannot be fixed on this PC and is not a defect of the
-    product -- neither counts. Every other class is a real fault of a turn.
-    """
-    return klass not in (OK, CREDITS)

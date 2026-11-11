@@ -186,14 +186,14 @@ def test_autostart_is_asked_about_at_all():
     assert "register-supervisor.ps1" in QS
 
 
-def test_autostart_defaults_to_no_and_the_launcher_to_yes():
+def test_autostart_and_launcher_default_to_no():
     """Defaults carry the weight here, because most people press Enter. A desktop icon is
-    trivially reversible; something that runs at every logon is not, so it has to be asked for
-    rather than merely not-refused."""
+    a change outside the checkout, so both require an explicit yes."""
     i = QS.index("automatically when you log on")
     assert "[y/N]" in QS[i:i + 120]
     j = QS.index("Create a one-click")
-    assert "[Y/n]" in QS[j:j + 160]
+    assert "[y/N]" in QS[j:j + 160]
+    assert 'if /i "!MKLNK!"=="y" set "PROV_SHORTCUT=yes"' in QS[j:j + 200]
 
 
 def test_quickstart_no_longer_tells_the_reader_to_run_other_commands():
