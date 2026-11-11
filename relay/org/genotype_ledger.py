@@ -6,7 +6,7 @@ and which of them are the same program, so that later slices have a list to eval
 JSON files scattered on a desktop. It evaluates nothing, applies nothing, and no run reads it.
 
 THE LEDGER, `<fleet dir>/org_genotypes.jsonl`, one JSON object per line:
-  {"kind":"genotype", "ts", "id", "archive_id", "base", "parent", "genes", "schema_version"}
+  {"kind":"genotype", "ts", "id", "archive_id", "base", "parent", "genes", "format_version"}
 `id` is relay/org/genotype's hash of the filled-in gene values; `archive_id` is the id the
 selfimprove archive gives the same content (archive.genome_id with the "org" key), so a row here
 and a row in an archive can be joined. No goal text and no prompt text.
@@ -61,6 +61,9 @@ def load(path):
                     continue
                 if obj.get("kind") != KIND:
                     continue
+                legacy_key = "schema_" "version"
+                if "format_version" not in obj and legacy_key in obj:
+                    obj["format_version"] = obj[legacy_key]
                 if (obj.get("id") and isinstance(obj.get("genes"), dict)
                         and isinstance(obj.get("ts"), (int, float))):
                     entries.append(obj)
@@ -94,7 +97,7 @@ def record(path, genes, parent="", base=None, now=None) -> dict:
             row = {"kind": KIND, "ts": float(time.time() if now is None else now),
                    "id": rec["id"], "archive_id": archive_id(rec["genes"]), "base": rec["base"],
                    "parent": rec["parent"], "genes": rec["genes"],
-                   "schema_version": rec["schema_version"]}
+                   "format_version": rec["format_version"]}
             os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
             with io.open(path, "a", encoding="utf-8", newline="\n") as fh:
                 fh.write(json.dumps(row, ensure_ascii=False, sort_keys=True) + "\n")

@@ -107,7 +107,7 @@ def build(*, episode_id, experiment_id="", task_class="", failure_class=None,
         # written during a later analysis pass claim to be from the run.
         not_recorded.append("ts")
     return {
-        "schema_version": 1,
+        "format_version": 1,
         "not_recorded": not_recorded,
         "episode_id": episode_id,
         "experiment_id": experiment_id,
@@ -184,7 +184,7 @@ def compact(record) -> dict:
     Kept separate from the raw trace deliberately. A summary that carries every tool call is
     a transcript with a header, and the thing people actually read is the summary.
     """
-    keep = ("schema_version", "not_recorded", "episode_id", "experiment_id", "task_class",
+    keep = ("format_version", "not_recorded", "episode_id", "experiment_id", "task_class",
             "failure_class", "harness_id", "execution_profile", "git_commit",
             "candidate_parent", "model", "pool", "pool_version", "random_seed",
             "grader_version", "security_policy_version", "start_state_hash",
@@ -196,6 +196,8 @@ def compact(record) -> dict:
             "component_versions", "verification",
             "raw_trace_path", "ts")
     out = {key: record.get(key) for key in keep if key in record}
+    if "format_version" not in out and "schema" "_version" in record:
+        out["format_version"] = record["schema" "_version"]
     # COUNTS, NOT CONTENTS -- except where nothing was recorded, which is None rather than 0.
     # "Telemetry was not collected" and "no events occurred" are different facts, and only one
     # of them is reassuring.

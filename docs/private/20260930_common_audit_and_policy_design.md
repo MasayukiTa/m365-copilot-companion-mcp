@@ -68,7 +68,7 @@ Proposals, never auto-applied: `scripts/lane_policy_propose.py` reads shadow `wo
 Illustrative only (fleet lane, then a bench arm); the actions are only `allow`/`deny`, there is no `ask`:
 
 ```json
-{ "schema_version": 1,
+{ "format_version": 1,
   "lanes": {
     "fleet": {
       "match": {"actor": "fleet:*"},
