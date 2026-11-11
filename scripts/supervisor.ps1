@@ -1819,7 +1819,11 @@ function Read-GatewayMonitorState {
     # monitor cannot pin an old 'down' verdict -- stale evidence is no evidence.
     if (-not (Test-Path $script:GatewayMonitorStatePath)) { return $null }
     try {
-        $j = Get-Content $script:GatewayMonitorStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+        # The monitor writes this state file with Python as UTF-8 (ensure_ascii=False); read it with
+        # Read-JsonFileUtf8, not `Get-Content -Raw | ConvertFrom-Json`, which decodes BOM-less UTF-8 as
+        # ANSI (cp932) in Windows PowerShell 5.1 and corrupts the content (same class as the 2026-10-23
+        # .fleet snapshot failure).
+        $j = Read-JsonFileUtf8 -Path $script:GatewayMonitorStatePath
     } catch { return $null }
     if ($null -eq $j) { return $null }
     try {
