@@ -389,21 +389,41 @@ function Test-TunnelRouteWanted {
     # $false when NO Dev Tunnel is wanted: the agent's route is connector-less AND no external
     # client needs the local server published. The agent's tool_transport says how the AGENT
     # reaches its tools; it does NOT say whether an outside client (a separate session on another
-    # machine) reaches the local server through the tunnel. host_tunnel_for_external_clients (ON
-    # by default) keeps the tunnel hosted and watched for that client whatever the route is; when
-    # it is off the old rule stands and a connector-less route hosts no tunnel. Both are asked of
-    # the product's own readers, at most once a minute, so a change in the GUI is followed without
-    # a restart and a tick pays nothing. A host that is ALREADY running is left alone (this
-    # supervisor never kills a live tunnel): it just stops being managed.
+    # machine) reaches the local server through the tunnel. On the connector-less route the
+    # supervisor hosts NO tunnel by default (host_tunnel_for_external_clients defaults OFF); only
+    # when the operator turns host_tunnel_for_external_clients ON is a tunnel hosted and watched
+    # for that external client. The connector route always hosts (its agent reaches its tools
+    # through the tunnel). Both inputs are asked of the product's own readers, at most once a
+    # minute, so a GUI change is followed without a restart and a tick pays nothing. A host that
+    # is ALREADY running is left alone (this supervisor never kills a live tunnel): it just stops
+    # being managed. The host/no-host rule itself lives in one pure place,
+    # scripts/supervisor_tunnel_decision.py (decide_host_tunnel/host_reason), so this caller and
+    # doctor.ps1 cannot drift: an explicit tool_transport=connector-less already beats a stale
+    # MCP_TUNNEL_NAME/MCP_TUNNEL_URL footprint in relay/tool_bridge.py, so a copied .env cannot
+    # make a connector-less PC re-host a tunnel.
     $now = [DateTime]::UtcNow
     if ($script:TunnelRouteAt -and (($now - $script:TunnelRouteAt).TotalSeconds -lt 60)) { return $script:TunnelRouteWanted }
     $t = Get-ToolTransport -Python $Py -RepoRoot $Root
-    $hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"
-    $wanted = ($t -ne "connector-less") -or $hostForExternal
+    $setting = Get-HostTunnelForExternalClientsSetting
+    $reason = "connector"
+    try {
+        $decExpr = "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_tunnel_decision as d; print(d.decide_host_tunnel(r'$t', r'$setting') + '|' + d.host_reason(r'$t', r'$setting'))"
+        $dec = ([string](& $Py -c $decExpr 2>$null)).Trim()
+    } catch { $dec = "" }
+    $parts = $dec -split '\|'
+    if ($parts.Count -ge 2 -and ($parts[0] -eq "host" -or $parts[0] -eq "no_host")) {
+        $wanted = ($parts[0] -eq "host")
+        $reason = $parts[1]
+    } else {
+        # Fail-safe if the decider could not be run: keep the connector route hosting, and let an
+        # explicit connector-less route host only when the setting is on.
+        $hostForExternal = ($setting -eq "on")
+        $wanted = ($t -ne "connector-less") -or $hostForExternal
+        $reason = if ($wanted -and ($t -eq "connector-less") -and $hostForExternal) { "external-client" } elseif ($wanted) { "connector" } else { "none" }
+    }
     if ($null -ne $script:TunnelRouteWanted -and $script:TunnelRouteWanted -ne $wanted) {
         Write-Log ("tool route changed: " + $t + " -> Dev Tunnel management " + $(if ($wanted) { "resumes" } else { "stops (no tunnel is needed)" }))
     }
-    $reason = if ($wanted -and ($t -eq "connector-less") -and $hostForExternal) { "external-client" } elseif ($wanted) { "connector" } else { "none" }
     if ($script:TunnelRouteReason -ne $reason) {
         if ($reason -eq "external-client") {
             Write-Log "tool route is connector-less, but host_tunnel_for_external_clients=on -> Dev Tunnel is hosted and watched for an external client"

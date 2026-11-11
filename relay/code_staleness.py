@@ -28,7 +28,13 @@ SELF_RESTART_DEFAULT = "on"
 SELF_RESTART_MODES = ("off", "on")
 
 HOST_TUNNEL_KEY = "host_tunnel_for_external_clients"
-HOST_TUNNEL_DEFAULT = "on"
+#: DEFAULT off: on the connector-less route the supervisor hosts NO Dev Tunnel unless the operator
+#: explicitly turns this on. A connector-less agent reaches its tools in-process and needs no
+#: tunnel; hosting one by default re-published the local server after every reboot even when no
+#: external client wanted it, and a machine carrying a stale MCP_TUNNEL_NAME/MCP_TUNNEL_URL from a
+#: copied .env then re-hosted a tunnel nobody used. The connector route is unaffected: it hosts a
+#: tunnel because its agent's tool_transport is `connector`, not because of this key.
+HOST_TUNNEL_DEFAULT = "off"
 HOST_TUNNEL_MODES = ("off", "on")
 
 #: Files whose change makes a running supervisor stale. supervisor.ps1 dot-sources the second.
@@ -66,12 +72,14 @@ def self_restart_setting():
 
 def host_tunnel_for_external_clients_setting():
     """The `host_tunnel_for_external_clients` setting, "on" or "off". Read from settings.txt on
-    every call; absent, empty or unrecognised means the default, on. Never raises.
+    every call; absent, empty or unrecognised means the default, off. Never raises.
 
-    on: the supervisor hosts and watches a Dev Tunnel even on the connector-less route, because an
-    EXTERNAL client (not a fleet agent) reaches the local server through that tunnel; whether a
-    tunnel is wanted is therefore independent of the agent's own tool_transport. off: the old
-    behaviour -- a connector-less route hosts no tunnel."""
+    off (default): on the connector-less route the supervisor hosts NO Dev Tunnel. A connector-less
+    agent reaches its tools in-process and needs no tunnel, so nothing is published for it. on: the
+    operator has explicitly asked the supervisor to host and watch a Dev Tunnel even on the
+    connector-less route, because an EXTERNAL client (not a fleet agent) reaches the local server
+    through that tunnel. Either way this is independent of the connector route, which hosts a
+    tunnel because its agent's tool_transport is `connector`."""
     try:
         from tools.settings_path import settings_file
         path = settings_file()

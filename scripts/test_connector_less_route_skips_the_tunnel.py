@@ -108,26 +108,40 @@ def test_supervisor_still_gates_hosting_on_whether_a_tunnel_is_wanted():
     assert "if (-not (Test-TunnelRouteWanted)) {" in sup
 
 
-def test_connector_less_still_hosts_a_tunnel_for_an_external_client_by_default():
-    # The new default (host_tunnel_for_external_clients=on) is what keeps the tunnel up after a
-    # reboot on a connector-less PC: Test-TunnelRouteWanted reads the setting and, when on, wants
-    # the tunnel whatever the route is. The reason is logged so the tick that hosts it explains why.
+def test_connector_less_hosts_no_tunnel_by_default_but_can_for_an_external_client():
+    # The default (host_tunnel_for_external_clients=off) means a connector-less PC hosts NO Dev
+    # Tunnel: Test-TunnelRouteWanted turns the route and the setting into the host/no-host verdict
+    # via the one pure module, and only the setting being on makes a connector-less route want the
+    # tunnel (for an external client). The decider is the single source of truth, so the gate and
+    # doctor cannot drift.
     sup = _read("scripts/supervisor.ps1")
     assert "host_tunnel_for_external_clients_setting" in sup
-    assert '$wanted = ($t -ne "connector-less") -or $hostForExternal' in sup
-    assert "Dev Tunnel is hosted and watched for an external client" in sup
+    assert "supervisor_tunnel_decision" in sup
+    assert "d.decide_host_tunnel(" in sup and "d.host_reason(" in sup
+    # the external-client reason label is still produced (and surfaced), so a hosted-on-connector-less
+    # tick can explain itself
+    import supervisor_tunnel_decision as d
+    assert d.decide_host_tunnel("connector-less", "off") == "no_host"
+    assert d.decide_host_tunnel("connector-less", "on") == "host"
+    assert d.host_reason("connector-less", "on") == "external-client"
 
 
-def test_off_restores_the_old_connector_less_behaviour():
-    # With the setting off, the one condition that makes the tunnel wanted is the route being not
-    # connector-less -- i.e. exactly the pre-change rule. The Python reader that supervisor.ps1
-    # calls returns the connector-less default (on) unless the file says off, and off only.
+def test_connector_route_always_hosts_and_default_is_off():
+    # The connector route hosts a tunnel whatever the setting (its agent reaches its tools through
+    # the tunnel); the connector-less default is OFF, so a standard PC hosts none. The Python reader
+    # that supervisor.ps1 calls returns the connector-less default (off) unless the file says on.
     from relay import code_staleness
-    assert code_staleness.HOST_TUNNEL_DEFAULT == "on"
+    assert code_staleness.HOST_TUNNEL_DEFAULT == "off"
     assert code_staleness.HOST_TUNNEL_MODES == ("off", "on")
+    import supervisor_tunnel_decision as d
+    # connector route hosts regardless of the setting
+    assert d.decide_host_tunnel("connector", "off") == "host"
+    assert d.decide_host_tunnel("connector", "on") == "host"
+    # an unreadable/unknown route is treated as connector (fail-safe: keep hosting)
+    assert d.decide_host_tunnel("", "off") == "host"
     sup = _read("scripts/supervisor.ps1")
-    # off -> $hostForExternal is false -> $wanted collapses to ($t -ne "connector-less"), the old rule
-    assert '$hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"' in sup
+    # the setting is still read through the product's reader and handed to the decider
+    assert "Get-HostTunnelForExternalClientsSetting" in sup
 
 
 def test_doctor_replaces_the_tunnel_chain_with_one_info_row():
@@ -136,6 +150,9 @@ def test_doctor_replaces_the_tunnel_chain_with_one_info_row():
     end = doc.index("# 4. Companion Edge (:9222) for the fleet/agent")
     section = doc[start:end]
     assert 'Check "tool_route"' in section and "-Info" in section
+    # The separate tunnel_mode row reports the opt-in; the route row must not contradict it.
+    route_row = section[section.index('Check "tool_route"'):section.index('} else {', section.index('Check "tool_route"'))]
+    assert "no Dev Tunnel" not in route_row
     for cid in ("tunnel_cli", "tunnel_login", "tunnel_exists", "tunnel_serving", "tunnel_supervisor_match"):
         # each connector check sits in the else branch, after the single row
         assert section.index('"%s"' % cid) > section.index("} else {")
