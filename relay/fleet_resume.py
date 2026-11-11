@@ -486,7 +486,7 @@ def child_requeue_goal(cid, fam, child):
 #: Hard ceiling on what one resume may queue: max(RESUME_CAP_FLOOR, RESUME_CAP_FACTOR x the
 #: interrupted run's own goal count). Membership scoping is the real fix; this is the net that
 #: turns any future membership mistake into a refusal instead of hundreds of queued goals.
-RESUME_CAP_FLOOR = 20
+RESUME_CAP_FLOOR = 120
 RESUME_CAP_FACTOR = 4
 #: Bounds for the campaign plans embedded in an interrupted snapshot.
 SNAPSHOT_MAX_CAMPAIGNS = 40

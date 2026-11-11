@@ -95,6 +95,10 @@ desktop.ini
 *.swo
 .vscode/
 .idea/
+# Agent/tool-generated dirs that land at the checkout root. Not product code; ignored rather
+# than left stray (see docs/root_placement_rules.md rule 4).
+.claude/
+.benchmarks/
 *.local.*
 *.private.*
 
@@ -141,6 +145,11 @@ ui/_buildcheck/
 !/docs/agent_contract.md
 # the connector-less route: setup and switching back, for a user (generic, no host names)
 !/docs/connector_less_route.md
+# where fleet workers may write under the checkout, and the measured stray count behind it.
+# Tracked because the rule and the checker that enforces it (scripts/check_root_is_clean.py)
+# are useless if the rule they point to lives only on one machine.
+!/docs/root_placement_rules.md
+!/docs/root_placement_measurement.md
 /docs/validation/
 # generic how-to for when a custom MCP connection cannot be created
 !/docs/custom_mcp_fallback_route.md
