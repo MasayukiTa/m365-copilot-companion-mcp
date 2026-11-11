@@ -114,6 +114,21 @@ def test_sparse_reports_not_computable_and_no_fake_interval():
     assert "区間なし" in s or "該当なし" in s
 
 
+def test_legacy_reason_code_uses_current_phrase(monkeypatch):
+    monkeypatch.setitem(REASON_PHRASES, "D_FAIL_MISSING_ENTRY", "missing entry")
+    o = _straddle()
+    o.reasons = ["D_FAIL_NO_ENTRY"]
+    assert "missing entry" in cause_clause(o)
+
+
+def test_current_reason_code_takes_precedence_over_legacy_normalization(monkeypatch):
+    monkeypatch.setitem(REASON_PHRASES, "D_FAIL_NO_ENTRY", "original phrase")
+    monkeypatch.setitem(REASON_PHRASES, "D_FAIL_MISSING_ENTRY", "other phrase")
+    o = _straddle()
+    o.reasons = ["D_FAIL_NO_ENTRY"]
+    assert "original phrase" in cause_clause(o)
+
+
 def test_unmapped_reason_code_is_surfaced_verbatim_not_dropped():
     o = _straddle()
     o.reasons = ["Z_FAIL_SOMETHING_NEW"]

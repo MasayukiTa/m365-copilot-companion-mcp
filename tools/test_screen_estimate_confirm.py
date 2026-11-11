@@ -79,7 +79,7 @@ def _classify(lo: float, hi: float, d: float):
     if hi < -d:
         return "EFFECT_OPPOSITE"
     if lo >= -d and hi <= d:
-        return "PRACTIC" "AL_NULL" if lo <= 0.0 <= hi else "EFFECT_BELOW_MDES"
+        return "EFFECT_NEGLIGIBLE" if lo <= 0.0 <= hi else "EFFECT_BELOW_MDES"
     return None
 
 
