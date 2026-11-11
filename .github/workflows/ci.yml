@@ -1211,7 +1211,8 @@ jobs:
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
             tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
             relay/test_a_stale_coordinator_restarts_only_when_idle.py \
-            relay/test_a_wedged_hard_reset_in_recovery_is_caught_not_fatal.py
+            relay/test_a_wedged_hard_reset_in_recovery_is_caught_not_fatal.py \
+            scripts/test_supervisor_watchdog_gate.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
