@@ -87,6 +87,31 @@ FLEET_TOOLS = {
     "screen_windows":   "what is open, which is often enough to decide without a picture",
 }
 
+# Locked-session desktop tools follow the existing desktop run-kind policy.
+# The Win32 modules load only on Windows; the secure helper client is portable.
+import sys as _sys
+
+_LOCKED_DESKTOP_TOOLS = {
+    "screen_secure_status": "inspect the secure desktop helper status",
+    "screen_secure_capture": "capture the secure desktop when available",
+}
+if _sys.platform == "win32":
+    _LOCKED_DESKTOP_TOOLS.update({
+        "desktop_state": "inspect the desktop while the session is locked",
+        "capture_window_by_title": "capture a window on the default desktop",
+        "screen_full_desktop": "capture the full default desktop",
+        "screen_state_report": "inspect the default desktop state",
+        "screen_lock_history": "inspect recent session lock events",
+        "screen_state_diff": "compare the current desktop state",
+        "screen_uia_dump": "inspect window accessibility elements",
+        "screen_msg_click": "click a window using a message",
+        "screen_msg_text": "send text to a window",
+        "screen_msg_key": "send a key to a window",
+        "screen_msg_close": "request a window to close",
+        "screen_uia_act": "act on an accessibility element",
+    })
+FLEET_TOOLS.update(_LOCKED_DESKTOP_TOOLS)
+
 # THE RUN-KIND DISTINCTION THAT THE BLOCK ABOVE SAID THIS FILE COULD NOT EXPRESS.
 #
 # The six screen_* tools are in FLEET_TOOLS because this list is consulted for EVERY fleet
@@ -102,7 +127,7 @@ FLEET_TOOLS = {
 OFFICE_ONLY_TOOLS = frozenset((
     "screen_look", "screen_click", "screen_scroll",
     "screen_type", "screen_press", "screen_windows",
-))
+)) | frozenset(_LOCKED_DESKTOP_TOOLS)
 
 # Set by the caller that knows it is a bench run (the bench harness exports it to its worker
 # child, see bench/companionbench/fleet_agent.py). Absent for an office-work run and for the
@@ -233,7 +258,8 @@ _OFFICE = ("create_docx create_pptx docx_from_markdown docx_info pdf_info read_d
 _DATA = ("odbc_columns odbc_connections odbc_drivers odbc_tables sqlite_schema sqlite_tables "
          "find_db_objects data_aliases_add data_aliases_list data_memory_status "
          "data_report_explain data_report_plan data_report_run verify_table_stat "
-         "semantic_resolve metric_sql catalog_search catalog_describe catalog_joins").split()
+         "semantic_resolve metric_sql catalog_search catalog_describe catalog_joins "
+         "sec_report_run").split()
 _MEMORY = ("agent_memory_list agent_memory_read agent_memory_save agent_memory_search "
            "memory_delete memory_list memory_load memory_save procedural_memory_delete "
            "procedural_memory_import_markdown procedural_memory_save procedural_memory_search "

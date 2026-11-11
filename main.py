@@ -208,6 +208,11 @@ from tools.search_ops import find_files, glob
 from tools.security import derive_identity, list_unlocked, unlock
 from tools.task_ops import todo_clear, todo_list, todo_write
 from tools.web_ops import github_file, render_page, web_fetch
+# screen->estimate->confirm workflow (hold-out confirmatory analysis) + plain-Japanese report.
+# sec_report_run is the production caller of screen_estimate_confirm.run_workflow, which chains
+# split_lots/rows_for_lots/screen/select_hypotheses/build_claim/lock_claims/write_confirm_set/
+# confirm; unlock-gated, reachable via call_tool.
+from tools.sec_tool import sec_report_run
 
 load_dotenv()
 from tools.secret_store import require_api_key
@@ -1098,6 +1103,10 @@ TOOLS = (
     # generic data -> chart tools (gateway-only: appended after the priority set and past
     # the MCP_TOOL_MAP_MAX cut, reachable via call_tool; all three are unlock-gated)
     chart_render, excel_chart_export, chart_from_python,
+    # screen->estimate->confirm confirmatory workflow + plain-Japanese report (gateway-only,
+    # reachable via call_tool; the sole production caller of run_workflow, which drives the
+    # whole screen_estimate_confirm pipeline).
+    sec_report_run,
 )
 
 # --- Tool-gateway mode (MCP_TOOL_MAP=1) --------------------------------------------------
@@ -1999,13 +2008,27 @@ async def _observe_inbound(scope, receive):
     try:
         http_method = str(scope.get("method") or "")
         if http_method != "POST":
-            # Non-POST never wraps the body stream (we return the original receive), so settle the
-            # journal here. Block only this submit's own tiny future, briefly; the GET path reads
-            # no body, so there is nothing to stall behind.
+            # Non-POST (notably GET /health) never wraps the body stream (we return the original
+            # receive), so there is no later settle point -- we journal here, right now.
+            #
+            # The previous code did `fut.result(timeout=5)` here: a SYNCHRONOUS wait on the event
+            # loop thread. #471 made the POST path non-blocking (asyncio.wrap_future, which YIELDS
+            # the loop while the dedicated-pool thread writes) but left this GET path on a blocking
+            # .result(). Under the 2026-11-07 CPU saturation (99.5%), whenever both _OBS_POOL
+            # workers were momentarily busy this wait stalled the loop for up to 5s PER GET -- and
+            # a sync .result() does not yield, so it froze the WHOLE loop, not just this request.
+            # That is why GET /health still measured 29.6s/25.3s/... even after #471: the stall is
+            # upstream of the handler, in this observer's settle.
+            #
+            # Fix: settle the same way the POST path does -- await the dedicated-pool future via
+            # asyncio.wrap_future, which suspends ONLY this coroutine and lets the loop keep
+            # running other tasks (e.g. the /health probe itself). The line is still durable before
+            # we return (so observability is unchanged), but the loop is never blocked. A failed
+            # submit or journal error is swallowed (best-effort bookkeeping).
             fut = _offload([("HTTP " + http_method, "")])
             if fut is not None:
                 try:
-                    fut.result(timeout=5)
+                    await asyncio.wrap_future(fut)
                 except Exception:
                     pass
             return receive
@@ -2268,5 +2291,17 @@ if __name__ == "__main__":
     # Last line before the socket is bound. The gap between 'registration-complete' and this
     # event is pure pre-listen setup (watchers, log config); everything tool-registration had
     # to do is already done. See _startup_trace for why this proves the ordering.
+    # Port is 8000 in production and is left at 8000 when MCP_PORT is unset, so this
+    # changes nothing for the primary. The cold-standby watcher (scripts/standby_watch.ps1)
+    # starts a SECOND copy of this same main.py on :8002 only when the primary stops
+    # answering /health, and the standby test harness runs throwaway copies on 18000/18002;
+    # both need a way to pick the listen port without editing this file. An out-of-range or
+    # non-integer MCP_PORT falls back to 8000 rather than crashing the server at boot.
+    try:
+        _listen_port = int(os.environ.get("MCP_PORT", "8000"))
+        if not (1 <= _listen_port <= 65535):
+            _listen_port = 8000
+    except (TypeError, ValueError):
+        _listen_port = 8000
     _startup_trace("about-to-listen")
-    uvicorn.run(app, host="127.0.0.1", port=8000, timeout_graceful_shutdown=30, **_run_kwargs)
+    uvicorn.run(app, host="127.0.0.1", port=_listen_port, timeout_graceful_shutdown=30, **_run_kwargs)

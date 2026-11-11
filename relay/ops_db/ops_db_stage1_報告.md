@@ -6,7 +6,7 @@
 
 | ファイル | 役割 |
 |---|---|
-| `__init__.py` | パッケージ定義 / `SCHEMA_VERSION` |
+| `__init__.py` | Package initialization |
 | `schema.py` | DDL(テーブル・索引・FTS・reason_codes 種) |
 | `migrations.py` | `user_version` 版管理・`connect()`・冪等マイグレーション |
 | `views.py` | KPI ビュー(infra 停止率・復旧・最終完了・turn 誤り率・手動介入率・稼働率) |
