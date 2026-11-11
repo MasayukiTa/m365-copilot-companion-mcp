@@ -1999,13 +1999,27 @@ async def _observe_inbound(scope, receive):
     try:
         http_method = str(scope.get("method") or "")
         if http_method != "POST":
-            # Non-POST never wraps the body stream (we return the original receive), so settle the
-            # journal here. Block only this submit's own tiny future, briefly; the GET path reads
-            # no body, so there is nothing to stall behind.
+            # Non-POST (notably GET /health) never wraps the body stream (we return the original
+            # receive), so there is no later settle point -- we journal here, right now.
+            #
+            # The previous code did `fut.result(timeout=5)` here: a SYNCHRONOUS wait on the event
+            # loop thread. #471 made the POST path non-blocking (asyncio.wrap_future, which YIELDS
+            # the loop while the dedicated-pool thread writes) but left this GET path on a blocking
+            # .result(). Under the 2026-11-07 CPU saturation (99.5%), whenever both _OBS_POOL
+            # workers were momentarily busy this wait stalled the loop for up to 5s PER GET -- and
+            # a sync .result() does not yield, so it froze the WHOLE loop, not just this request.
+            # That is why GET /health still measured 29.6s/25.3s/... even after #471: the stall is
+            # upstream of the handler, in this observer's settle.
+            #
+            # Fix: settle the same way the POST path does -- await the dedicated-pool future via
+            # asyncio.wrap_future, which suspends ONLY this coroutine and lets the loop keep
+            # running other tasks (e.g. the /health probe itself). The line is still durable before
+            # we return (so observability is unchanged), but the loop is never blocked. A failed
+            # submit or journal error is swallowed (best-effort bookkeeping).
             fut = _offload([("HTTP " + http_method, "")])
             if fut is not None:
                 try:
-                    fut.result(timeout=5)
+                    await asyncio.wrap_future(fut)
                 except Exception:
                     pass
             return receive

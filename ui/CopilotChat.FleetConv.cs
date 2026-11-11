@@ -299,7 +299,7 @@ partial class ChatWindow
         bool running = FleetRunningFresh();
         string liveTranscriptPath = wkr != null ? SS(wkr, "transcript") : "";
         // A WORKER NAME IS NOT A CONVERSATION. w0, w1, ... are reused by every run, so "the newest
-        // transcript of w1" is some other conversation (that is how the DBB conversation grew a
+        // transcript of w1" is some other conversation (that is how the ACME conversation grew a
         // computer-use transcript at its end). A conversation is its Copilot id, or -- with no id
         // -- its transcript file. The live transcript is the one in this conversation's own
         // status.json worker (found by conv_url, or by the "fleet:<name>" key of the CURRENT

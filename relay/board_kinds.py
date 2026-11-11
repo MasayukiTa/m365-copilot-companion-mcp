@@ -9,9 +9,9 @@ the digest. Nothing in agent_board.py names a kind literally any more; it reads 
 is the "room to grow without a code change" the owner asked for -- a code change to ONE data table,
 not to the logic around it.
 
-VERSION. `SCHEMA_VERSION` is the version of THIS vocabulary (the kinds and their fields), separate
+VERSION. `SCHEMA_REVISION` is the version of THIS vocabulary (the kinds and their fields), separate
 from the per-row `v` that agent_board writes (the on-disk row format, agent_board.SCHEMA). Bumping
-SCHEMA_VERSION records that the kind set changed; old rows of a removed kind simply stop being
+SCHEMA_REVISION records that the kind set changed; old rows of a removed kind simply stop being
 well-formed and are skipped on read, exactly like any other unknown kind.
 
 ORDERLY, NOT SILENT. Every kind lists EXACTLY its allowed fields. agent_board.validate refuses an
@@ -26,7 +26,7 @@ from __future__ import annotations
 
 #: The version of the kind vocabulary itself (not the on-disk row format). Bump when the set of
 #: kinds or their fields changes, so a reader can tell which vocabulary produced a digest.
-SCHEMA_VERSION = 2
+SCHEMA_REVISION = 2
 
 #: Per-field length ceilings (characters). A field name not here is not allowed to appear.
 FIELD_LIMITS = {"subject": 60, "text": 200, "ref": 200}
@@ -40,7 +40,7 @@ FIELD_LIMITS = {"subject": 60, "text": 200, "ref": 200}
 #:   ttl_s    -- how long an entry of this kind stays visible, in seconds.
 #:   template -- a %-format string over the kind's fields, rendered into one digest line.
 #:
-#: TO ADD A KIND: add one row here and bump SCHEMA_VERSION. No other file needs editing for the
+#: TO ADD A KIND: add one row here and bump SCHEMA_REVISION. No other file needs editing for the
 #: store, the validator, the digest or the filters to understand it -- they all read this table.
 REGISTRY = {
     "claim": {
