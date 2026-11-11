@@ -1,13 +1,7 @@
 # -*- coding: utf-8 -*-
-"""Replay the owner's own submissions through the connector-less (socket) route and
-measure whether the new route stays stable under real use.
+"""Replay recorded inputs through the connector-less (socket) route and measure stability.
 
-Why this exists. The connector-less route (docs/connector_less_route.md) is the default
-on a new PC: the agent writes tool calls as fenced blocks and this PC runs them, with no
-connector and no tunnel. The owner asked whether its stability is being confirmed with
-REAL use -- the sentences the owner actually typed -- rather than with goals a handler
-wrote for a test (the owner's standing rule: only what the owner typed may be an input).
-This module is the harness that does that confirmation and reports the result.
+The harness loads inputs from a separate file and reports route behavior.
 
 What it measures, from the fleet's OWN records (not from a synthetic oracle):
   * submit-to-start latency (median / p90 / max), from history.json phase_events;
@@ -123,8 +117,7 @@ class OwnerInput:
 
 
 def load_verbatim_inputs(path: str = _VERBATIM) -> list[OwnerInput]:
-    """Read the committed verbatim file -- never inline the owner's words here, so the
-    harness and the recorded provenance cannot drift apart."""
+    """Read the input file separately so the harness and recorded provenance stay aligned."""
     out: list[OwnerInput] = []
     with open(path, encoding="utf-8") as fh:
         for line in fh:
