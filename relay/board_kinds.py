@@ -6,8 +6,7 @@ so adding a kind meant editing validation, the digest renderer and the tests at 
 whole vocabulary is one table, `REGISTRY`, keyed by kind name. A new kind is one more row: its
 required fields, which field (if any) is its subject for filtering, and a one-line template for
 the digest. Nothing in agent_board.py names a kind literally any more; it reads this table. That
-is the "room to grow without a code change" the owner asked for -- a code change to ONE data table,
-not to the logic around it.
+allows the vocabulary to grow by changing ONE data table, without changing the logic around it.
 
 VERSION. `SCHEMA_REVISION` is the version of THIS vocabulary (the kinds and their fields), separate
 from the per-row `v` that agent_board writes (the on-disk row format, agent_board.SCHEMA). Bumping
