@@ -10,7 +10,7 @@ from tools import search_ops
 
 GOAL = "fixture_42_case investigate"
 # The request text supplies data-analysis classification evidence.
-FIXTURE_REQUEST = "?????????????????????"
+FIXTURE_REQUEST = "\u30c7\u30fc\u30bf\u3092\u53d6\u5f97\u3057\u3001\u30ed\u30c3\u30c8\u5225\u306e\u76f8\u95a2\u3092\u5206\u6790\u3059\u308b\u3002"
 
 
 
