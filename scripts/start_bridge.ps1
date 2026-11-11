@@ -35,7 +35,7 @@
 param(
     [int]$CdpPort     = $(if ($env:MCP_BRIDGE_CDP_PORT) { [int]$env:MCP_BRIDGE_CDP_PORT } else { 9223 }),
     [int]$BridgePort  = $(if ($env:MCP_BRIDGE_PORT)     { [int]$env:MCP_BRIDGE_PORT }     else { 8765 }),
-    [string]$Profile  = "copilot-bridge-edge",
+    [string]$Profile  = $(if ($env:MCP_BRIDGE_PROFILE) { $env:MCP_BRIDGE_PROFILE } else { "copilot-bridge-edge" }),
     [switch]$HardReset,
     [switch]$Keepalive,
     [switch]$SignIn,       # force a VISIBLE window now to sign in (normally automatic on demand)
@@ -113,6 +113,53 @@ function Edge-IsHeaded {
                            $_.CommandLine -notmatch '--headless' }
         return ([bool]$procs)
     } catch { return $false }
+}
+
+# HARD DEMOTE IS NOW OPT-IN. The old behaviour -- quit the bridge Edge and relaunch it headless
+# after a sign-in (Demote-ToHeadless) -- threw away the session cookies the sign-in had just
+# established, so the sign-in page came straight back (measured on a new PC: the wall reappeared
+# after every single sign-in, and the watchdog restarted the bridge every one to two minutes,
+# each restart opening new tabs). The keepalive loop now only MINIMISES the window
+# (Minimize-BridgeEdge) and leaves the signed-in process running, which keeps the cookies. The
+# quit-and-relaunch path is kept only for callers that explicitly ask for it by setting
+# MCP_BRIDGE_HARD_DEMOTE=1.
+function Use-HardDemote {
+    return ($env:MCP_BRIDGE_HARD_DEMOTE -eq "1")
+}
+
+# MINIMISE THE BRIDGE EDGE WINDOW -- DO NOT QUIT IT. This is the keep-the-session replacement for
+# the quit-and-relaunch the bridge used to do after a sign-in. Quitting the bridge Edge dropped
+# its session cookies, so the sign-in page came back every time; minimising leaves the signed-in
+# session fully intact and merely takes the window off the desk. SW_MINIMIZE (6) via user32, for
+# every top-level window owned by a msedge.exe process whose command line names THIS bridge
+# profile. Best-effort and bounded: a failure to minimise is never worth taking the bridge down
+# for, so every error is swallowed. Returns the number of windows minimised.
+function Minimize-BridgeEdge {
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]'Win32MinBridge').Type) {
+            Add-Type -Namespace '' -Name 'Win32MinBridge' -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("user32.dll")]
+public static extern bool ShowWindowAsync(System.IntPtr hWnd, int nCmdShow);
+'@ -ErrorAction SilentlyContinue
+        }
+        # The browser process (not --type= renderer/GPU children) carries the profile on its
+        # command line; its MainWindowHandle is the real window to minimise.
+        $procs = Get-CimInstance Win32_Process -Filter "Name='msedge.exe'" -ErrorAction Stop |
+            Where-Object { $_.CommandLine -and
+                           $_.CommandLine -match [regex]::Escape($Profile) -and
+                           $_.CommandLine -notmatch '--type=' }
+        $minimised = 0
+        foreach ($p in $procs) {
+            try {
+                $proc = Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue
+                if ($proc -and $proc.MainWindowHandle -ne [System.IntPtr]::Zero) {
+                    [Win32MinBridge]::ShowWindowAsync($proc.MainWindowHandle, 6) | Out-Null  # SW_MINIMIZE
+                    $minimised++
+                }
+            } catch { }
+        }
+        return $minimised
+    } catch { return 0 }
 }
 
 # Put a headed Edge back into the background once the sign-in it was opened for is finished.
@@ -200,6 +247,62 @@ function Needs-SignIn {
     return ((Invoke-SignInHelper @("--check-only")) -notmatch 'VERDICT:\s*signed_in')
 }
 
+# PURE back-off decision: may the watchdog surface/act on a sign-in wall right now? It may act
+# when there is a wall AND either it has never surfaced this run ($LastSurfaceEpoch is $null) or
+# the last surface is older than the back-off window. Pure (depends only on its arguments) so it
+# can be unit-tested without a browser or a clock. This is what stops a wedged sign-in page from
+# driving a restart every one to two minutes: between surfaces the watchdog leaves the window
+# alone instead of restarting the bridge or opening new tabs.
+function Test-WatchdogMayAct([bool]$WallUp, $LastSurfaceEpoch, [long]$NowEpoch, [int]$BackoffSec) {
+    if (-not $WallUp) { return $false }
+    if ($null -eq $LastSurfaceEpoch) { return $true }
+    return (($NowEpoch - [long]$LastSurfaceEpoch) -ge $BackoffSec)
+}
+
+# The one clear line the log and the doctor both show while a sign-in wall is up on the bridge
+# Edge. Named so the keepalive loop and any test render the identical sentence.
+function Format-SigninNeededLine {
+    return ("M365 sign-in needed on the bridge Edge (profile " + $Profile + ", CDP :" + $CdpPort + ") -- sign in in the window that was brought to the front; the bridge continues automatically and the watchdog will not restart it while you do.")
+}
+
+# WAIT FOR THE SIGN-IN TO FINISH, THEN MINIMISE -- NEVER QUIT. This is the default (non-hard)
+# counterpart to Demote-ToHeadless: it watches the same wall with the same clear rule (the wall
+# must be ABSENT for three checks in a row AND either it was seen or a minute has passed), but on
+# completion it only minimises the signed-in window (Minimize-BridgeEdge) instead of quitting and
+# relaunching the Edge. Keeping the process alive keeps the session cookies, so the sign-in is not
+# lost. Bounded by the same grace period; if it runs out the window is minimised anyway (an
+# unattended wall is not a reason to keep a window on the desk). The keeper pause file is
+# refreshed every check so the minimise keeper does not re-minimise a window someone is typing an
+# MFA code into. Returns "cleared", "closed" or "timeout".
+function Wait-SignInThenMinimize([int]$GraceMinutes = 15) {
+    $started = Get-Date
+    $deadline = $started.AddMinutes($GraceMinutes)
+    $sawWall = $false; $clear = 0; $outcome = "timeout"
+    $pause = Join-Path $root ".fleet\edge_keep_pause"
+    while ((Get-Date) -lt $deadline) {
+        try { Set-Content -Path $pause -Value ([DateTimeOffset]::UtcNow.ToUnixTimeSeconds()) -Encoding ascii } catch { }
+        if (-not (Test-Cdp)) { $outcome = "closed"; break }
+        if (Needs-SignIn) { $sawWall = $true; $clear = 0 }
+        else {
+            $clear++
+            if ($clear -ge 3 -and ($sawWall -or ((Get-Date) - $started).TotalSeconds -ge 60)) { $outcome = "cleared"; break }
+        }
+        Start-Sleep -Seconds 5
+    }
+    try { Remove-Item $pause -Force -ErrorAction SilentlyContinue } catch { }
+    if ($outcome -eq "cleared") {
+        Write-Host "Sign-in complete -- keeping the bridge Edge signed in and minimising its window (session preserved)."
+        Invoke-SignInHelper @("--rearm") | Out-Null
+    } elseif ($outcome -eq "closed") {
+        Write-Host "The sign-in window was closed before the sign-in finished -- it will not be reopened until the app is started again."
+        return $outcome
+    } else {
+        Write-Host "Sign-in still not completed after $GraceMinutes min -- minimising the window anyway; the session is left intact."
+    }
+    Minimize-BridgeEdge | Out-Null
+    return $outcome
+}
+
 # "Should the window come forward NOW?" -- asked of the checker, which also applies the rules:
 # once per sign-in need (a latch; starting the app again re-arms it), and never while a chat turn
 # is live on this bridge (GET /status only). Prints DECISION: <word>; only "surface" acts.
@@ -226,7 +329,14 @@ function Show-SignIn($BridgeProc) {
         try { $BridgeProc.WaitForExit(15000) | Out-Null } catch { }
     }
     Ensure-Edge -Visible -Url "https://m365.cloud.microsoft/chat" | Out-Null
-    Demote-ToHeadless | Out-Null
+    # DEFAULT: keep the signed-in Edge alive and only minimise its window once the sign-in is done,
+    # so the session cookies the sign-in established are not thrown away. Quit-and-relaunch
+    # (Demote-ToHeadless) is kept only when the caller opts in with MCP_BRIDGE_HARD_DEMOTE=1.
+    if (Use-HardDemote) {
+        Demote-ToHeadless | Out-Null
+    } else {
+        Wait-SignInThenMinimize | Out-Null
+    }
 }
 
 # Run the bridge ONCE, watching its browser for a sign-in wall while it runs.
@@ -320,16 +430,64 @@ if (-not $Keepalive) {
 # is now explicit and immediate (Demote-ToHeadless, right after the sign-in), with the top of the
 # loop kept as a net for a headed Edge this supervisor did not start.
 Write-Host "Keepalive mode: supervising the bridge (headless). Ctrl-C to stop."
+# BACK-OFF STATE while a sign-in wall is up. $signInSurfaceEpoch is the Unix time we last surfaced
+# the sign-in window (or re-stated the one clear line); $null means we have not surfaced in this
+# run. While a wall is detected and this is less than 10 minutes old, the watchdog does NOT
+# restart the bridge Edge or open new tabs -- it leaves the window alone so the person can finish.
+# Without this, a wedged sign-in page drove a restart every 1-2 minutes, each opening new tabs.
+$signInSurfaceEpoch = $null
+$signInBackoffSec = 600
+if ($env:MCP_BRIDGE_SIGNIN_BACKOFF_SEC) {
+    $parsedBackoff = 0
+    if ([int]::TryParse($env:MCP_BRIDGE_SIGNIN_BACKOFF_SEC, [ref]$parsedBackoff) -and $parsedBackoff -gt 0) { $signInBackoffSec = $parsedBackoff }
+}
 while ($true) {
+    $nowEpoch = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    # Is the bridge Edge sitting on a sign-in page right now? (Only ask when CDP answers; a dead
+    # CDP is a different problem handled below.)
+    $signInWall = $false
+    if (Test-Cdp) {
+        try { $signInWall = (Needs-SignIn) } catch { $signInWall = $false }
+    }
+    if ($signInWall) {
+        # ONE CLEAR LINE, NOT A LOOP OF WEDGED RESTARTS. State the need plainly in the log and
+        # record it for the doctor to read; do nothing that would restart the bridge or open a
+        # tab while the person is signing in. At most one surface per back-off window.
+        if (Test-WatchdogMayAct $true $signInSurfaceEpoch $nowEpoch $signInBackoffSec) {
+            Write-Host (Format-SigninNeededLine)
+            # Record the state where the doctor can see it as one line (best-effort).
+            try {
+                $signinState = Join-Path $root ".fleet\bridge_signin_needed"
+                New-Item -ItemType Directory -Force (Split-Path $signinState) -ErrorAction SilentlyContinue | Out-Null
+                Set-Content -Path $signinState -Value ((Format-SigninNeededLine) + " (since " + $nowEpoch + ")") -Encoding ascii
+            } catch { }
+            $signInSurfaceEpoch = $nowEpoch
+        }
+        # Do NOT restart the Edge or open tabs; let the watched run surface the window (once per
+        # need, bounded by the back-off) and wait.
+        Run-BridgeWatched | Out-Null
+        Start-Sleep -Seconds 3
+        continue
+    }
+    # No sign-in wall: clear any recorded need and resume normal supervision.
+    if ($null -ne $signInSurfaceEpoch) {
+        $signInSurfaceEpoch = $null
+        try { Remove-Item (Join-Path $root ".fleet\bridge_signin_needed") -Force -ErrorAction SilentlyContinue } catch { }
+    }
     if (-not (Test-Cdp)) {
         Write-Host "CDP :$CdpPort not answering -- re-bringing up the bridge Edge (headless)..."
         Ensure-Edge -Hard | Out-Null
     } elseif ((Edge-IsHeaded) -and -not (Needs-SignIn)) {
-        Write-Host "bridge Edge has a window but no sign-in wall is up -- returning it to headless..."
-        Ensure-Edge -Hard | Out-Null
+        Write-Host "bridge Edge has a window but no sign-in wall is up -- returning it to the background..."
+        # Keep the session: minimise rather than quit/relaunch, unless hard demote is requested.
+        if (Use-HardDemote) {
+            Ensure-Edge -Hard | Out-Null
+        } else {
+            Minimize-BridgeEdge | Out-Null
+        }
     }
     # Watched: a sign-in wall is brought to the person WHILE the bridge runs (once per need,
-    # never mid-turn), then the Edge goes back to headless and this loop restarts the bridge.
+    # never mid-turn), then the Edge is minimised (session kept) and this loop restarts the bridge.
     Run-BridgeWatched | Out-Null
     Start-Sleep -Seconds 3
 }
