@@ -21,8 +21,7 @@ manifest.PARAMETER_TYPES; defaults are read through the live readers. Hierarchic
 is on by default.
 
 IDENTITY IS THE MATERIALISED VALUES. A candidate that names a gene at its base value, and one
-that leaves it out, are the same program and get the same hash (the manifest.materialize incident,
-where two names gave one harness_id). `same_program` compares hashes of the filled-in values.
+that leaves it out, are the same program and get the same hash. `same_program` compares hashes of the filled-in values.
 
 manifest.apply_genome is NOT used: manifest.py is frozen and skips any key outside components and
 parameters, so a tree gene would pass through it as a no-op and an A/A would look like a pair.
@@ -192,7 +191,7 @@ def base_org_id():
 
 
 def genotype(genes, parent="", base=None):
-    """The record for one candidate: schema_version, materialised genes, base org id, parent, id."""
+    """Build a candidate record from its materialised genes and ancestry."""
     full = materialize(genes, base)
     return {"schema_version": SCHEMA_VERSION, "genes": full, "base": base_org_id(),
             "parent": str(parent or ""), "id": genotype_hash(full)}

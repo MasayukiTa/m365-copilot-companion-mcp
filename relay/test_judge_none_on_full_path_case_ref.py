@@ -2,7 +2,7 @@
 """Regression for job bfa6b22fac93: a one-turn DONE with "judge: none" on a goal that only
 POINTS at a request file.
 
-The real goal was an absolute Downloads path to the case folder followed by 「これ調べて」. Two
+The real goal was an absolute Downloads path to the case folder followed by a short Japanese instruction to investigate it. Two
 things went wrong and both are pinned here:
   (1) case_reference_search did not recognise the full-path shape, so the request file was never
       read and is_data_analysis_goal classified the goal (text only) as non-analysis. After the

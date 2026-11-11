@@ -191,3 +191,68 @@ def test_slow_inbound_log_does_not_block_event_loop(monkeypatch):
             await task
 
     asyncio.run(run())
+
+
+def test_slow_inbound_log_on_get_does_not_block_the_loop(monkeypatch):
+    """Regression (GET /health hang, 2026-11-07): the non-POST branch of _observe_inbound used to
+    settle its journal line with fut.result(timeout=5) -- a SYNCHRONOUS wait on the loop thread.
+    When the observer pool was contended under CPU saturation this froze the WHOLE event loop for
+    up to 5s per GET, so /health hung even after #471 fixed the POST path. The branch must instead
+    settle via asyncio.wrap_future, which yields the loop while the dedicated pool writes.
+
+    We block the journal on its pool thread, drive a GET through _observe_inbound, and assert the
+    loop stays LIVE -- another coroutine keeps making progress -- while the settle is in flight.
+    The pre-fix sync .result() would freeze this loop, so the concurrent ticker could not advance.
+    """
+    import threading
+    entered = threading.Event()
+    release = threading.Event()
+
+    def slow_log(*args, **kwargs):
+        entered.set()
+        release.wait(5)
+
+    monkeypatch.setattr(obs_log, "log_inbound", slow_log)
+    scope = {"type": "http", "method": "GET", "path": "/health", "headers": [],
+             "client": ("127.0.0.1", 1)}
+
+    async def run():
+        async def receive():
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        ticks = {"n": 0}
+
+        async def ticker():
+            # Proof the loop is alive: this must keep advancing while the GET journal is blocked.
+            while not release.is_set():
+                ticks["n"] += 1
+                await asyncio.sleep(0.01)
+
+        tick_task = asyncio.create_task(ticker())
+        # Settle the GET observer concurrently; it awaits the (blocked) journal via wrap_future.
+        obs_task = asyncio.create_task(main._observe_inbound(scope, receive))
+        try:
+            # Wait until the journal is actually running on its pool thread (still blocked).
+            for _ in range(200):
+                if entered.is_set():
+                    break
+                await asyncio.sleep(0.01)
+            assert entered.is_set(), "journal never started"
+            # The GET observer is suspended on wrap_future, NOT done -- but the loop is not frozen.
+            assert not obs_task.done()
+            before = ticks["n"]
+            await asyncio.sleep(0.1)
+            assert ticks["n"] > before, ("event loop was frozen while the GET journal blocked "
+                                         "(sync .result regression)")
+        finally:
+            release.set()
+            returned = await obs_task
+            tick_task.cancel()
+            try:
+                await tick_task
+            except asyncio.CancelledError:
+                pass
+        # GET must not wrap the receive -- the original is handed back unchanged.
+        assert returned is receive
+
+    asyncio.run(run())

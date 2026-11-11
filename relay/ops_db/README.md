@@ -24,7 +24,7 @@ turn 完了・稼働率・手動介入)を、**単一の SQL クエリ**で日�
 
 | ファイル | 役割 |
 |---|---|
-| `__init__.py` | パッケージ定義 / `SCHEMA_VERSION` |
+| `__init__.py` | パッケージ定義 / `SCHEMA_REVISION` |
 | `schema.py` | DDL(テーブル・索引・FTS5・reason_codes 種) |
 | `migrations.py` | 版管理・`connect()`・冪等マイグレーション |
 | `views.py` | KPI ビュー(SQL) |
