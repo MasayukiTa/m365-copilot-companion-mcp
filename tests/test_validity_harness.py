@@ -72,7 +72,7 @@ def _make_fake_sessions_db(path: str) -> None:
             "INSERT INTO validity_audit VALUES (?,?,?,?,?,?,?,?,?)",
             ("example_D1", "run0001", 1, "tool_result", 1001.0,
              json.dumps({"id": "example_D1", "verdict": "HOLD",
-                         "reasons": ["D_FAIL_" "NO_LOCK"],
+                         "reasons": ["D_FAIL_MISSING_LOCK"],
                          "notes": ["LOT_INDEPENDENCE_" "NOT_CHECKED"],
                          "hashes": {"input_sha256": "0" * 64}}),
              "tool_events.jsonl", "outcome:abc", json.dumps({"ok": True})),
@@ -124,7 +124,7 @@ def test_record_manifest_writes_data_and_result_hashes():
         data = os.path.join(td, "d.csv")
         with open(data, "w", encoding="utf-8") as f:
             f.write("lot,y,x\n1,0.1,0\n1,0.2,1\n")
-        result = {"id": "SYN1", "verdict": "HOLD", "reasons": ["D_FAIL_" "NO_LOCK"]}
+        result = {"id": "SYN1", "verdict": "HOLD", "reasons": ["D_FAIL_MISSING_LOCK"]}
         man_path = os.path.join(td, "manifest.json")
         entry = vh.record_manifest(man_path, dataset_id="SYN1", data_path=data,
                                    result=result, fetched_at="2026-10-30T00:00:00+09:00")

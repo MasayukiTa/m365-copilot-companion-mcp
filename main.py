@@ -208,6 +208,11 @@ from tools.search_ops import find_files, glob
 from tools.security import derive_identity, list_unlocked, unlock
 from tools.task_ops import todo_clear, todo_list, todo_write
 from tools.web_ops import github_file, render_page, web_fetch
+# screen->estimate->confirm workflow (hold-out confirmatory analysis) + plain-Japanese report.
+# sec_report_run is the production caller of screen_estimate_confirm.run_workflow, which chains
+# split_lots/rows_for_lots/screen/select_hypotheses/build_claim/lock_claims/write_confirm_set/
+# confirm; unlock-gated, reachable via call_tool.
+from tools.sec_tool import sec_report_run
 
 load_dotenv()
 from tools.secret_store import require_api_key
@@ -1098,6 +1103,10 @@ TOOLS = (
     # generic data -> chart tools (gateway-only: appended after the priority set and past
     # the MCP_TOOL_MAP_MAX cut, reachable via call_tool; all three are unlock-gated)
     chart_render, excel_chart_export, chart_from_python,
+    # screen->estimate->confirm confirmatory workflow + plain-Japanese report (gateway-only,
+    # reachable via call_tool; the sole production caller of run_workflow, which drives the
+    # whole screen_estimate_confirm pipeline).
+    sec_report_run,
 )
 
 # --- Tool-gateway mode (MCP_TOOL_MAP=1) --------------------------------------------------
