@@ -3,7 +3,7 @@
 
 These pin the three conditions of the design gate: the comparison design is
 judged WITHOUT the response column, and a two-group exposure contrast is held as
-設計不成立(保留) when (a) there is no stratifier information, (b) the groups share no
+a design-infeasible HOLD when (a) there is no stratifier information, (b) the groups share no
 stratum or too few common strata clear k_min lots in BOTH groups, or (c) the groups'
 stratum mixes barely overlap (Overlap coefficient < threshold).
 

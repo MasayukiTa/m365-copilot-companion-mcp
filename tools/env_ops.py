@@ -74,9 +74,23 @@ def _pip_version() -> str:
         return "(unavailable)"
 
 
+def _canon(path: str) -> str:
+    """Canonical form for comparing two paths that may name the SAME directory.
+
+    Uses os.path.realpath, not os.path.abspath: on Windows a path can reach the harness's
+    venv through an 8.3 short name, a directory junction or a symlink, none of which abspath
+    expands. Two such spellings compare UNEQUAL under abspath while pointing at one directory,
+    which is exactly how a worker whose cwd arrived in short form slipped the production venv
+    past the harness-prefix check and would have pip-installed into the environment that runs
+    the server. realpath resolves all of these to one string.
+    """
+    return os.path.normcase(os.path.realpath(path))
+
+
 # The harness's own environment, resolved once. A worker's checkout may hold a venv of its
-# own; that is where its dependencies belong.
-_HARNESS_PREFIX = os.path.normcase(os.path.abspath(sys.prefix))
+# own; that is where its dependencies belong. Canonicalised (realpath) so that an alternate
+# spelling of this same directory -- short name, junction, symlink -- still matches it.
+_HARNESS_PREFIX = _canon(sys.prefix)
 
 
 def _project_interpreter() -> Optional[str]:
@@ -86,17 +100,21 @@ def _project_interpreter() -> Optional[str]:
     worker is its checkout -- and returns its interpreter. Returns None rather than falling
     back to `sys.executable`, because falling back is what put an open-source project's
     requirements into the server's environment.
+
+    The harness check compares CANONICAL paths (see _canon): the production checkout's .venv
+    is the harness's own environment, and a worker whose cwd names it through a short name or
+    a junction must not be handed it as an install target.
     """
     here = os.path.abspath(os.getcwd())
     for name in (".venv", "venv", "env"):
         for rel in (os.path.join("Scripts", "python.exe"), os.path.join("bin", "python")):
             cand = os.path.join(here, name, rel)
             if os.path.isfile(cand):
-                if os.path.normcase(os.path.abspath(os.path.dirname(os.path.dirname(cand))))                         != _HARNESS_PREFIX:
+                if _canon(os.path.dirname(os.path.dirname(cand))) != _HARNESS_PREFIX:
                     return cand
     # An explicitly activated environment that is not the harness's is fine too.
     ve = os.environ.get("VIRTUAL_ENV")
-    if ve and os.path.normcase(os.path.abspath(ve)) != _HARNESS_PREFIX:
+    if ve and _canon(ve) != _HARNESS_PREFIX:
         for rel in (os.path.join("Scripts", "python.exe"), os.path.join("bin", "python")):
             cand = os.path.join(ve, rel)
             if os.path.isfile(cand):

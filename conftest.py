@@ -178,6 +178,9 @@ LIVE_RECORD_REDIRECTS = {
     # The log lives under this file's .fleet directory, so the redirect also keeps a test off the
     # operator's records.
     "relay.relay_findings": {"LOG": "relay_findings_shadow.jsonl"},
+    # peer_requests=shadow would append a row for a peer REQUEST/OFFER/CLAIM no operator
+    # saw, into the operator's own .fleet; isolate test writes like every other shadow log.
+    "relay.peer_requests": {"LOG": "peer_requests_shadow.jsonl"},
     # THE CAMPAIGN BOARD. A test that drives a child to DONE with agent_board_mode on would
     # append pointer rows for children that never ran, and board_digest would show them to a
     # real sibling as settled work.
