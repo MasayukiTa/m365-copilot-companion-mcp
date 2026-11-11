@@ -165,7 +165,7 @@ Check "env_api_key" ".env has a readable Bearer token (legacy or DPAPI-protected
 
 Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
     { ($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']) } `
-    "double-click configure_env.bat and paste the Copilot Studio agent URL (README STEP 4)"
+    "double-click configure_env.bat and paste the agent URL: open the agent in Microsoft 365 Copilot, then copy the address of the page whose path contains /agent/ followed by two ids joined by a dot (README STEP 4)"
 
 # NO REQUEST TEMPLATE = EVERY GOAL WAITS FOR A TOKEN FOR EVER. A capture never sends a Copilot turn, so
 # the request template for the agent comes from the donor shipped in relay\seed_donor, written by

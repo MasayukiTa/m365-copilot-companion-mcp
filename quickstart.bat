@@ -564,8 +564,11 @@ if not defined CFG_DIALOG_BLOCKED goto :after_cfg_fallback
 findstr /b /r "MCP_IMPL_AGENT_URL=..*" ".env" >nul 2>nul
 if not errorlevel 1 goto :after_cfg_fallback
 echo.
-echo   Paste the main agent URL (the address bar URL when the agent is open in
-echo   M365 Copilot). Leave it blank to set it later with configure_env.bat.
+echo   Paste the main agent URL. Open the agent in Microsoft 365 Copilot, then copy
+echo   the address of the page whose path contains /agent/ followed by two ids joined
+echo   by a dot. An address with no agent id (the generic chat page, or a one-id
+echo   titleId) has nothing to connect to and will be refused. Leave it blank to set
+echo   it later with configure_env.bat.
 set "IMPL_URL="
 set /p IMPL_URL="   MCP_IMPL_AGENT_URL: "
 if "!IMPL_URL!"=="" echo   Left unset. Chat and fleet will not work until it is set.

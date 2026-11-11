@@ -30,8 +30,23 @@ import time
 
 _GUID = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
 #: The agent id as it appears in a chat page's address: `T_<guid>.<guid>` (the second part is the agent).
-_AGENT_IN_URL = re.compile(r"/agent/(T_%s\.%s)(?=[?#/]|$)" % (_GUID, _GUID))
+#: Two address shapes carry it, on either of the two product hosts (m365.cloud.microsoft and
+#: copilot.cloud.microsoft), with or without a query string:
+#:   .../chat/agent/T_<guid>.<guid>[?...]            (the shape the product pattern expects)
+#:   .../agents/copilotstudio/T_<guid>.<guid>[?...]  (the shape the browser redirects an agent to)
+#: A generic chat address (/chat/?titleId=...) and a one-guid titleId carry no T_<guid>.<guid> and do
+#: not match -- there is no agent id to use, which is the whole point of refusing them.
+_AGENT_IN_URL = re.compile(r"/(?:agent|agents/copilotstudio)/(T_%s\.%s)(?=[?#/]|$)" % (_GUID, _GUID))
 _BARE_ID = re.compile(r"^(T_%s\.%s)$" % (_GUID, _GUID))
+
+#: One plain sentence, no jargon: what is wrong and exactly what to paste. Surfaced verbatim by the
+#: bridge SeedError, by quickstart.bat option R, by configure_env.bat and in the doctor output, so
+#: a person who pasted the wrong address is told the same thing wherever they hit it.
+NO_AGENT_ID_MESSAGE = (
+    "That address has no agent id, so there is nothing to connect to: open the agent in "
+    "Microsoft 365 Copilot, then copy the address of the page whose path contains /agent/ "
+    "followed by two ids joined by a dot."
+)
 
 
 class SeedError(ValueError):
@@ -43,7 +58,7 @@ def agent_id_from_url(url_or_id: str) -> str:
     text = (url_or_id or "").strip()
     m = _BARE_ID.match(text) or _AGENT_IN_URL.search(text)
     if not m:
-        raise SeedError("no agent id (T_<guid>.<guid>) found in the address")
+        raise SeedError(NO_AGENT_ID_MESSAGE)
     return m.group(1)
 
 
