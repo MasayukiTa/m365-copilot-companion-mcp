@@ -73,7 +73,7 @@ def test_the_owners_two_uia_goals_still_classify_as_real_desktop(name):
 
 @pytest.mark.parametrize("name", ["g_uia_ab.txt", "g_uia_ab2.txt"])
 def test_matching_goals_are_allowed_by_default(name):
-    # Owner instruction 2026-11-09: the flipped default ALLOWS a matching goal (no refusal).
+    # The default allows a matching goal without refusal.
     text = _goal_text(name)
     assert dg.mode() == "allow"
     assert dg.refuse_reason({"text": text}) is None
