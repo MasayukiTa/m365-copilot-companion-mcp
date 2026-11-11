@@ -8,9 +8,9 @@ from relay import judge_gate, relay_fleet, temp_home
 from relay.relay_fleet import RelayWorker
 from tools import search_ops
 
-GOAL = "fixture case analyze data"
+GOAL = "fixture_42_case investigate"
 # The request text supplies data-analysis classification evidence.
-FIXTURE_REQUEST = "Analyze data and correlations by lot."
+FIXTURE_REQUEST = "?????????????????????"
 
 
 
@@ -20,7 +20,7 @@ def _point_temp_home(monkeypatch, tmp_path):
 
 
 def _case(tmp_path, request_text=FIXTURE_REQUEST):
-    case = tmp_path / "case" / "fixture case analyze data"
+    case = tmp_path / "case" / "fixture_42_case"
     case.mkdir(parents=True)
     (case / "\u3084\u308a\u305f\u3044\u3053\u3068.txt").write_text(request_text, encoding="utf-8")
     return case
