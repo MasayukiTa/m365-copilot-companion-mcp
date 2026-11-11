@@ -239,6 +239,10 @@ jobs:
             scripts/test_watch_grade.py \
             scripts/test_ensure_m365_signin.py \
             scripts/test_bridge_signin_is_brought_to_the_person.py \
+            scripts/test_bridge_keeps_its_signin.py \
+            scripts/test_bridge_demote_keeps_session.py \
+            scripts/test_bridge_profile_env.py \
+            scripts/test_bridge_signin_backoff.py \
             scripts/test_ensure_m365_signin_state.py \
             scripts/test_check_no_identifying_names.py \
             scripts/test_check_no_identifying_names_metadata.py \

@@ -1083,6 +1083,19 @@ Check "edge_bridge" "Bridge Edge running (:9223 -- the chat window's browser)" `
     { Test-EdgeCdp 9223 } `
     "powershell -File scripts\start_bridge.ps1 -Keepalive"
 
+# ONE CLEAR LINE WHILE A SIGN-IN IS PENDING, NOT A STREAM OF WEDGED RESTARTS. start_bridge.ps1's
+# keepalive supervisor, while the bridge Edge sits on a sign-in page, backs off (it does not
+# restart the bridge or open tabs) and records the need in .fleet\bridge_signin_needed. Surface
+# that here as a single INFO row so the state is visible in the doctor output, exactly as it is in
+# the log. Read-only; absent file means no pending sign-in.
+$script:bridgeSigninNeeded = Join-Path $repo ".fleet\bridge_signin_needed"
+if (Test-Path $script:bridgeSigninNeeded) {
+    Check "bridge_signin_needed" "Bridge Edge sign-in pending" `
+        { $false } `
+        "sign-in needed: open the bridge Edge window and finish the sign-in" `
+        -Info
+}
+
 # 4c. The chat backend itself. edge_bridge above probes the Edge the bridge DRIVES; this is
 #     the HTTP server CopilotChat talks to, and nothing looked at it -- so a bridge that holds
 #     the port without serving read as ALL GREEN. Seen doing exactly that: / answered 200 while
