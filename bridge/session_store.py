@@ -40,6 +40,7 @@ transcripts (.fleet/transcripts/*.jsonl):
 from __future__ import annotations
 
 import hashlib
+import contextlib
 import atexit
 import json
 import logging
@@ -836,6 +837,34 @@ def _spool_path():
     return os.path.join(_base_dir(), "fleet-turns.spool.jsonl")
 
 
+@contextlib.contextmanager
+def _spool_file_lock():
+    """Serialize short spool file operations across fleet processes."""
+    _ensure_dir()
+    with _spool_lock:
+        with open(_spool_path() + ".lock", "a+b") as lock:
+            if os.name == "nt":
+                import msvcrt
+                lock.seek(0)
+                while True:
+                    try:
+                        msvcrt.locking(lock.fileno(), msvcrt.LK_NBLCK, 1)
+                        break
+                    except OSError:
+                        time.sleep(0.01)
+            else:
+                import fcntl
+                fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                if os.name == "nt":
+                    lock.seek(0)
+                    msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def record_fleet_turn(key, obj, name="", goal=""):
     """Append a worker row without opening the database. Never raises."""
     global _spool_last_error
@@ -845,8 +874,7 @@ def record_fleet_turn(key, obj, name="", goal=""):
         row = {"id": uuid.uuid4().hex, "key": str(key), "obj": obj,
                "name": str(name or ""), "goal": str(goal or "")}
         line = json.dumps(row, ensure_ascii=False, default=str) + "\n"
-        with _spool_lock:
-            _ensure_dir()
+        with _spool_file_lock():
             with open(_spool_path(), "a", encoding="utf-8") as spool:
                 spool.write(line)
                 spool.flush()
@@ -857,6 +885,97 @@ def record_fleet_turn(key, obj, name="", goal=""):
             _spool_last_error = now
             _log.error("fleet spool append failed: %s: %s", type(exc).__name__, str(exc)[:200])
         return False
+
+
+_spool_drain_lock = threading.Lock()
+_spool_thread_lock = threading.Lock()
+_spool_thread = None
+
+
+def _open_spool_db(store):
+    conn = sqlite3.connect(store._db_path(), timeout=30.0, isolation_level=None)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def drain_fleet_spool(store, max_rows=20):
+    """Commit a bounded spool prefix and remove it only after a successful commit."""
+    limit = min(20, max(0, int(max_rows)))
+    if not limit:
+        return 0
+    with _spool_drain_lock:
+        with _spool_file_lock():
+            try:
+                with open(_spool_path(), "r", encoding="utf-8", newline="") as spool:
+                    lines = [spool.readline() for _ in range(limit)]
+            except FileNotFoundError:
+                return 0
+        lines = [line for line in lines if line]
+        if not lines:
+            return 0
+        rows = [json.loads(line) for line in lines]
+        conn = _open_spool_db(store)
+        try:
+            conn.execute("PRAGMA busy_timeout=30000")
+            conn.execute("BEGIN")
+            try:
+                conn.execute("CREATE TABLE IF NOT EXISTS fleet_goals (goal_id INTEGER PRIMARY KEY AUTOINCREMENT, goal TEXT NOT NULL UNIQUE)")
+                conn.execute("CREATE TABLE IF NOT EXISTS fleet_turns (id INTEGER PRIMARY KEY AUTOINCREMENT, key TEXT NOT NULL, name TEXT NOT NULL DEFAULT '', goal TEXT NOT NULL DEFAULT '', goal_id INTEGER, turn INTEGER, role TEXT NOT NULL, text TEXT NOT NULL DEFAULT '', extra TEXT NOT NULL DEFAULT '{}', ts REAL NOT NULL)")
+                conn.execute("CREATE TABLE IF NOT EXISTS fleet_spool_ids (id TEXT PRIMARY KEY)")
+                for row in rows:
+                    inserted = conn.execute("INSERT OR IGNORE INTO fleet_spool_ids (id) VALUES (?)",
+                                            (row["id"],)).rowcount
+                    if not inserted:
+                        continue
+                    obj = row["obj"]
+                    role = obj.get("role") or ("meta" if obj.get("meta") else
+                                               ("guid" if obj.get("guid") else "note"))
+                    extra = {k: v for k, v in obj.items() if k not in ("turn", "role", "text", "ts")}
+                    conn.execute(
+                        "INSERT INTO fleet_turns (key, name, goal, goal_id, turn, role, text, extra, ts) "
+                        "VALUES (?, ?, '', ?, ?, ?, ?, ?, ?)",
+                        (row["key"], row["name"], _intern_goal(conn, row["goal"]), obj.get("turn"),
+                         str(role), str(obj.get("text") or ""),
+                         json.dumps(extra, ensure_ascii=False, default=str),
+                         float(obj.get("ts") or time.time())))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+        finally:
+            conn.close()
+        with _spool_file_lock():
+            with open(_spool_path(), "r", encoding="utf-8", newline="") as spool:
+                current = spool.readlines()
+            if current[:len(lines)] == lines:
+                temp = _spool_path() + "." + uuid.uuid4().hex + ".tmp"
+                try:
+                    with open(temp, "w", encoding="utf-8", newline="") as spool:
+                        spool.writelines(current[len(lines):])
+                    os.replace(temp, _spool_path())
+                finally:
+                    if os.path.exists(temp):
+                        os.remove(temp)
+        return len(lines)
+
+
+def start_fleet_spool_drain():
+    """Start one coordinator-owned background spool consumer."""
+    global _spool_thread
+    with _spool_thread_lock:
+        if _spool_thread is not None and _spool_thread.is_alive():
+            return
+        def run():
+            import sys
+            while True:
+                try:
+                    if os.path.exists(_spool_path()) and os.path.getsize(_spool_path()):
+                        drain_fleet_spool(sys.modules[__name__])
+                except Exception:
+                    _log.exception("fleet spool drain failed")
+                time.sleep(2)
+        _spool_thread = threading.Thread(target=run, name="fleet-spool-drain", daemon=True)
+        _spool_thread.start()
 
 
 _fleet_turn_queue = queue.Queue()

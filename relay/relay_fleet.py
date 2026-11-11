@@ -2338,7 +2338,8 @@ class _Transcript:
         bridge package that is somehow unavailable cannot take the fleet down with it.
         """
         try:
-            from bridge.session_store import record_fleet_turn_async
+            from bridge.session_store import record_fleet_turn_async, start_fleet_spool_drain
+            start_fleet_spool_drain()
             record_fleet_turn_async(self.key, obj, name=getattr(self, "_name", ""),
                                     goal=getattr(self, "_goal", ""))
         except Exception as exc:
@@ -2370,7 +2371,8 @@ class _Transcript:
         ever bites, is flagged on the row.
         """
         try:
-            from bridge.session_store import record_wire_turn
+            from bridge.session_store import record_wire_turn, start_fleet_spool_drain
+            start_fleet_spool_drain()
             ok = record_wire_turn(self.key, turn, text, name=getattr(self, "_name", ""),
                                   goal=getattr(self, "_goal", ""), run_id=run_id,
                                   route=route, round=round)
