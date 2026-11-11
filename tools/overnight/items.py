@@ -129,11 +129,7 @@ def parse_items(path, max_items: int = DEFAULT_MAX_ITEMS) -> ParseResult:
         if len(ask) > MAX_ASK_CHARS:
             res.warnings.append("%s: request longer than %d chars was cut" % (iid, MAX_ASK_CHARS))
             ask = ask[:MAX_ASK_CHARS]
-        # TWO REQUESTS WITH THE SAME WORDING ARE BOTH KEPT. This used to drop a later entry whose
-        # normalised ask matched an earlier one's -- a content match, exactly what the owner said
-        # must never stop a job (2026-10-26/27). Duplicate IDs are still rejected above, because
-        # that is an identity collision (two rows claiming the same id), not a resemblance
-        # between two different requests.
+        # Keep requests with matching wording; reject duplicate IDs as identity collisions.
         seen_id.add(iid)
         if len(res.items) >= max_items:
             res.skipped.append((iid, "over the item limit (%d)" % max_items, ask))
