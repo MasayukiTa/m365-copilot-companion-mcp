@@ -122,7 +122,14 @@ $Log = Join-Path $env:TEMP "m365-companion-supervisor.log"
 # Alias under WindowsApps -- which is not an interpreter; run with arguments it returns an error
 # code. The loop would then fail identically twice a pass, every fifteen seconds, forever, while
 # reporting itself as running. Saying it once and stopping is better than doing nothing loudly.
+# Prefer the 3.12 venv when present. main.py crashes under Python 3.10.0 with a native
+# access violation / heap corruption (seen 2026-11-09 20:47 and 08:18 via faulthandler);
+# .venv312 (Python 3.12.14) was verified healthy (parallel :8001 /health 200). The live
+# .venv cannot be renamed while in use, so we select by path here instead.
+# TO REVERT: delete the .venv312 directory -- this falls back to .venv automatically.
+$VenvPy312 = Join-Path $Root ".venv312\Scripts\python.exe"
 $VenvPy = Join-Path $Root ".venv\Scripts\python.exe"
+if (Test-Path $VenvPy312) { $VenvPy = $VenvPy312 }
 $Py = $VenvPy
 if (-not (Test-Path $Py)) {
     $fallback = Get-Command python -ErrorAction SilentlyContinue | Select-Object -First 1

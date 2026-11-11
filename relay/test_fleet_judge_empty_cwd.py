@@ -1,16 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The empty-output-folder precondition that silently skipped the final-step judge.
-
-Job 81cac23dfc28 was a data-analysis goal (SYNDS request behind a short case reference) whose
-worker cwd was empty. The injected "write judge_request.json in the output folder ..."
-instruction was gated on ``self.cwd`` being truthy, so with an empty cwd nothing was injected
-and completion passed an empty folder to the judge gate -- the quiet marker "judge: none".
-
-These tests pin the fix: a data-analysis goal with no explicit cwd gets a stable per-job output
-folder; the SAME folder is named in the sent prompt and checked at completion; an explicit cwd
-is preserved; a directory-creation failure is reported (not silent); and a request-read failure
-falls back to the case-lookup excerpt as classification evidence.
-"""
+"""Test judge output folder selection and request classification."""
 import json
 
 import pytest
@@ -19,12 +8,10 @@ from relay import judge_gate, relay_fleet, temp_home
 from relay.relay_fleet import RelayWorker
 from tools import search_ops
 
-GOAL = "\u679d\u3055\u3093_679\u304b\u3059\u308c\u8abf\u67fb\u3000\u3053\u308c\u8abf\u3079\u3066"
-# A SYNDS data request -- short reference resolves to this file; its text is what classifies.
-ADAMS_REQUEST = ("\u3053\u306e679\u304b\u3059\u308c\u306b\u95a2\u3057\u3066\u3001"
-                 "\u3042\u3089\u3086\u308b\u8a2d\u5099\u3001\u6750\u6599\u30c7\u30fc\u30bf\u3092"
-                 "\u53d6\u5f97\u3057\u3001ADAMS\u30c7\u30fc\u30bf\u3068\u5b9f\u30c7\u30fc\u30bf\u3092"
-                 "\u53c2\u7167\u3002\u30ed\u30c3\u30c8\u5225\u306e\u76f8\u95a2\u3092\u8abf\u3079\u308b\u3002")
+GOAL = "fixture_42_case investigate"
+# The request text supplies data-analysis classification evidence.
+FIXTURE_REQUEST = "\u30c7\u30fc\u30bf\u3092\u53d6\u5f97\u3057\u3001\u30ed\u30c3\u30c8\u5225\u306e\u76f8\u95a2\u3092\u5206\u6790\u3059\u308b\u3002"
+
 
 
 def _point_temp_home(monkeypatch, tmp_path):
@@ -32,8 +19,8 @@ def _point_temp_home(monkeypatch, tmp_path):
     monkeypatch.setattr(temp_home, "system_temp", lambda: str(tmp_path))
 
 
-def _case(tmp_path, request_text=ADAMS_REQUEST):
-    case = tmp_path / "case" / "\u679d\u3055\u3093_679\u304b\u3059\u308c\u8abf\u67fb"
+def _case(tmp_path, request_text=FIXTURE_REQUEST):
+    case = tmp_path / "case" / "fixture_42_case"
     case.mkdir(parents=True)
     (case / "\u3084\u308a\u305f\u3044\u3053\u3068.txt").write_text(request_text, encoding="utf-8")
     return case
@@ -78,7 +65,7 @@ def test_completion_checks_the_same_injected_folder(tmp_path, monkeypatch):
 
     # Present file in that SAME folder -> the judge is called.
     request = {"claim_id": "SYN1", "data_location": str(tmp_path / "data.csv"),
-               "fetched_at": "2026-10-30T00:00:00+09:00"}
+               "fetched_at": "2026-01-01T00:00:00+09:00"}
     (__import__("pathlib").Path(out) / "judge_request.json").write_text(
         json.dumps(request), encoding="utf-8")
     calls = []

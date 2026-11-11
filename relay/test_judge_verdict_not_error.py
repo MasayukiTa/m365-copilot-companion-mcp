@@ -1,35 +1,5 @@
 # -*- coding: utf-8 -*-
-"""The judge must not deliver a bare verdict=ERROR / INPUT_MISSING_KEY for a worker's analysis
-when the real problem is that the worker's free-text claim was never mapped into the engine's
-structured claim shape -- and a post-hoc (late) registration must be shown HONESTLY as a HOLD-cap
-condition (D_FAIL_LOCK_AFTER_DATA), never mislabelled as an input error.
-
-WHY THIS EXISTS (observed in a prior fleet run). Three sample judge folders (sample_claim, sample_claim,
-sample_claim) each delivered verdict=ERROR, reason INPUT_MISSING_KEY, note
-LOT_EFFECT_MODEL_DECLARED_NOT_TESTABLE, loo_n=0, K=null, and order_ok=false. The engine input in
-each (engine_claim_<id>.json) carried only {id, statement, data_location}: a free-text claim. The
-engine's claim loader REQUIRES 12+ structured keys (validity/claim.py REQUIRED_KEYS plus
-assumptions), so it returned ERROR before any analysis ran. PR #400 wired the worker claim to the
-engine but never mapped it into the engine shape, and its tests used an already-structured fake
-claim, so the gap was invisible.
-
-WHAT THESE TESTS PIN.
-  - engine_claim_schema_gap names exactly which engine-required keys a free-text claim lacks, and
-    is empty for a structured claim; it never fabricates values.
-  - At completion, a worker claim that lacks engine keys produces a correction that NAMES the
-    missing keys and the expected shape -- BEFORE the engine is run -- instead of an opaque
-    INPUT_MISSING_KEY. The three sample folder shapes are reproduced as hermetic fixtures.
-  - post_hoc_order_note states a late registration plainly: it is NOT an input error, the engine
-    rule caps it at HOLD (D_FAIL_LOCK_AFTER_DATA), and it names what would make it valid. It is
-    empty when the order is fine.
-  - The footer shows the post-hoc line for order_ok=False and never calls it ERROR.
-  - When the engine itself returns ERROR for a genuinely structured-but-late claim, the harness
-    surfaces the engine's own reason (not hidden) alongside the post-hoc explanation.
-
-All fixtures are synthetic: no secret engine, no measurement row, no employee id. The engine is
-not invoked (run_engine_judge is stubbed) except where a test explicitly checks the pass-through
-of an engine-returned verdict.
-"""
+"""Test claim schema validation, registration order, and verdict reporting."""
 from __future__ import annotations
 
 import json
@@ -39,7 +9,7 @@ import pytest
 from relay import judge_gate
 
 
-GOAL = "odbc_query over SYNDS: aggregate per-lot group_a rate and compute correlation"
+GOAL = "odbc_query analyze data by group"
 
 # The engine's required claim keys, as the frozen loader lists them (mirrored, engine is READ-ONLY).
 _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierarchy",
@@ -47,19 +17,19 @@ _ENGINE_KEYS = ("id", "dataset_id", "data_kind", "response", "exposure", "hierar
                 "assumptions")
 
 
-def _free_text_claim(claim_id="sample_claim"):
-    """The sample shape a worker registered: a free-text statement, no engine schema keys."""
+def _free_text_claim(claim_id="claim_fixture_01"):
+    """Create a free-text claim without engine schema keys."""
     return {"id": claim_id,
-            "statement": "679group_a shows no significant correlation with trace data (all 95%CIs cross 0).",
+            "statement": "The fixture variables have no significant correlation.",
             "data_location": "C:/Users/x/Downloads/_clean.csv"}
 
 
-def _structured_claim(claim_id="sample_claim"):
+def _structured_claim(claim_id="claim_fixture_01"):
     """A claim with every engine-required key present (values are synthetic placeholders; the
     PRESENCE is what the harness screens, the engine still owns value validation)."""
     return {
-        "id": claim_id, "dataset_id": "ds_group_a", "data_kind": "public",
-        "response": {"column": "group_a", "type": "binary"},
+        "id": claim_id, "dataset_id": "ds_kasure", "data_kind": "public",
+        "response": {"column": "kasure", "type": "binary"},
         "exposure": {"column": "flow_L", "kind": "numeric", "level": "between_lot",
                      "contrast": {"type": "per_unit", "value": 1.0}},
         "hierarchy": {"unit_column": "lot"},
@@ -67,21 +37,20 @@ def _structured_claim(claim_id="sample_claim"):
         "direction": "either",
         "delta_min": {"value": 0.3, "scale": "standardized", "rationale": "r",
                       "source": "preregistration"},
-        "mode": "confirmatory", "family": {"id": "group_a", "m": 1},
+        "mode": "confirmatory", "family": {"id": "kasure", "m": 1},
         "assumptions": {"distribution": "gaussian", "balance": "unbalanced"},
     }
 
 
-def _request(claim, *, claim_id="sample_claim", registered_at="2020-01-02T10:00:00+09:00",
-             fetched_at="2020-01-02T01:00:00+09:00"):
-    """A judge_request shaped like the three sample folders: free-text-or-structured claim plus the
-    analysis the worker DID produce (manifest.result, lot_diagnosis y/x/lot)."""
+def _request(claim, *, claim_id="claim_fixture_01", registered_at="2026-01-05T00:00:00+09:00",
+             fetched_at="2026-01-04T00:00:00+09:00"):
+    """Create a request containing a claim and analysis results."""
     return {
         "claim_id": claim_id, "data_location": "data.csv", "fetched_at": fetched_at,
-        "manifest": {"path": "manifest.json", "dataset_id": "ds_group_a",
-                     "result": {"n_products": 12, "overall_rate": 0.4}},
+        "manifest": {"path": "manifest.json", "dataset_id": "ds_kasure",
+                     "result": {"n_products": 2, "overall_rate": 0.5}},
         "registration": {"root": "reg", "claim": claim, "registered_at": registered_at},
-        "lot_diagnosis": {"y": [0.5, 0.0], "x": [1.0, 2.0], "lot": ["P1", "P2"]},
+        "lot_diagnosis": {"y": [1.0, 0.0], "x": [2.0, 1.0], "lot": ["L1", "L2"]},
     }
 
 
@@ -127,9 +96,9 @@ def test_gap_is_empty_on_a_non_dict():
 
 # --- 2. completion names the missing keys BEFORE the engine runs ----------------------------
 
-@pytest.mark.parametrize("claim_id", ["sample_claim", "sample_claim", "sample_claim"])
+@pytest.mark.parametrize("claim_id", ["claim_fixture_01", "claim_fixture_01", "claim_fixture_01"])
 def test_free_text_claim_is_corrected_before_engine_with_named_keys(tmp_path, monkeypatch, claim_id):
-    """Reproduces the three sample folders: a free-text claim + the analysis data. The harness must
+    """Reproduces the three real folders: a free-text claim + the analysis data. The harness must
     hand back a correction that NAMES the missing engine keys, and must NOT have run the engine."""
     ran = {"engine": False}
 
@@ -158,14 +127,14 @@ def test_structured_claim_does_not_trigger_the_schema_correction(tmp_path, monke
     def _engine(cid, **kw):
         seen["claim"] = kw.get("registered_claim")
         return {"engine_available": True, "verdict": "GO", "verdict_ja": "採用",
-                "finding": "PRACTICAL_NULL", "claim_supported": True, "reasons": ["A_OK"],
+                "finding": "fixture finding", "claim_supported": True, "reasons": ["A_OK"],
                 "notes": [], "evidence": {"K": 6}, "hashes": {"input_sha256": "a" * 64},
                 "claim_source": "worker-registered via harness registry"}
 
     monkeypatch.setattr(judge_gate, "run_engine_judge", _engine)
     # registered_at BEFORE fetched_at so order_ok can be True (not the subject of this test)
-    _write(tmp_path, _request(_structured_claim(), registered_at="2020-01-01T00:00:00+09:00",
-                              fetched_at="2020-01-05T00:00:00+09:00"))
+    _write(tmp_path, _request(_structured_claim(), registered_at="2026-01-01T00:00:00+09:00",
+                              fetched_at="2026-01-02T00:00:00+09:00"))
     accept, detail, correction = judge_gate.complete_judge_request(
         GOAL, str(tmp_path), correction_budget=2, correction_attempt=0)
     # no schema-gap correction; the engine ran with the structured claim
@@ -176,8 +145,8 @@ def test_structured_claim_does_not_trigger_the_schema_correction(tmp_path, monke
 # --- 3. post_hoc_order_note is honest, not an input error ------------------------------------
 
 def test_post_hoc_note_names_hold_cap_and_not_error():
-    order = {"order_ok": False, "registered_at": "2020-01-02T10:00:00+09:00",
-             "data_file_mtime": "2020-01-01T00:00:00+09:00"}
+    order = {"order_ok": False, "registered_at": "2026-01-05T00:00:00+09:00",
+             "data_file_mtime": "2026-01-03T00:00:00+09:00"}
     note = judge_gate.post_hoc_order_note(order)
     assert note
     assert "post-hoc" in note or "事後登録" in note
@@ -194,9 +163,9 @@ def test_post_hoc_note_is_empty_when_order_is_ok():
 
 
 def test_footer_shows_post_hoc_and_never_calls_it_error():
-    order = {"order_ok": False, "registered_at": "2020-01-02T10:00:00+09:00",
-             "data_fetched_at": "2020-01-02T01:00:00+09:00",
-             "data_file_mtime": "2020-01-01T00:00:00+09:00"}
+    order = {"order_ok": False, "registered_at": "2026-01-05T00:00:00+09:00",
+             "data_fetched_at": "2026-01-04T00:00:00+09:00",
+             "data_file_mtime": "2026-01-03T00:00:00+09:00"}
     # engine unavailable here: the footer still must carry the honest post-hoc explanation
     footer = judge_gate.build_judge_footer(
         verdict={"unavailable_reason": "x"}, engine_available=False, order_record=order)
@@ -218,8 +187,8 @@ def test_engine_error_for_a_late_structured_claim_is_surfaced_not_hidden(tmp_pat
 
     monkeypatch.setattr(judge_gate, "run_engine_judge", _engine)
     # structured claim, but registered AFTER the data (post-hoc)
-    _write(tmp_path, _request(_structured_claim(), registered_at="2020-01-02T10:00:00+09:00",
-                              fetched_at="2020-01-02T01:00:00+09:00"))
+    _write(tmp_path, _request(_structured_claim(), registered_at="2026-01-05T00:00:00+09:00",
+                              fetched_at="2026-01-04T00:00:00+09:00"))
     accept, detail, correction = judge_gate.complete_judge_request(
         GOAL, str(tmp_path), correction_budget=2, correction_attempt=0)
     # the engine's own HOLD + reason is surfaced, and the post-hoc note is present, not hidden
