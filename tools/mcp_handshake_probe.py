@@ -4,8 +4,9 @@ r"""Resident synthetic MCP-handshake monitor (the I/O side).
 This is the part that actually TALKS to the network: it sends the real MCP handshake
 (``initialize`` -> ``notifications/initialized`` -> ``tools/list``) against BOTH the local
 server (http://127.0.0.1:8000/mcp) and the PUBLIC URL (MCP_TUNNEL_URL from .env, plus
-/mcp), measures status and latency, reads the devtunnel ``Host connections`` count, probes
-the c2c entrance, and hands every measured fact to the PURE decision core in
+/mcp), measures status and latency, reads the devtunnel LOGIN state from the token FILE
+(size + mtime -- never the devtunnel CLI), probes the c2c entrance, and hands every measured
+fact to the PURE decision core in
 scripts/mcp_handshake_monitor.py, which decides the words (pass/fail, which hop, alert,
 404-vs-zero-host correlation, gateway-down verdict).
 
@@ -40,6 +41,8 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 from scripts import mcp_handshake_monitor as core  # noqa: E402
+from scripts import tunnel_login_state as login_core  # noqa: E402  (pure token-file login decider; never the CLI)
+from tools import probe_alert
 from tools import childproc  # noqa: E402  (headless_creationflags: these children must never pop a console)
 
 LOCAL_URL = "http://127.0.0.1:8000/mcp"
@@ -139,26 +142,39 @@ def handshake(url, key, timeout=REQUEST_TIMEOUT):
     return out
 
 
-def read_host_connections(tunnel_name):
-    """The devtunnel 'Host connections' count for the tunnel, or None if unreadable.
+def _token_file_path():
+    """Path to the devtunnel token FILE, or None. A path string only -- never the CLI.
 
-    Mirrors Get-TunnelHostConnections in scripts/supervisor.ps1 (`devtunnel show <name>`).
+    %LOCALAPPDATA%\\DevTunnels\\devtunnels-tokens-microsoft (measured 2026-11-11: 4182 bytes
+    when a login is valid, 0 bytes when logged out). Reading this file's os.stat is the ONLY
+    way this module learns login state; it must never run a devtunnel subprocess, because
+    concurrent devtunnel CLI bursts were observed to drop a fresh login within a minute.
     """
-    if not tunnel_name:
+    base = os.environ.get("LOCALAPPDATA") or ""
+    if not base:
         return None
+    return os.path.join(base, "DevTunnels", "devtunnels-tokens-microsoft")
+
+
+def read_login_state():
+    """Devtunnel LOGIN state decided from the token FILE alone -- never the devtunnel CLI.
+
+    Reads the token file's size and mtime with os.stat (no subprocess) and hands them to the
+    pure decider scripts/tunnel_login_state.decide_login_state. Returns one of
+    login_core.LOGIN_VALID / LOGIN_NONE / LOGIN_UNKNOWN. Whether the relay actually has a live
+    host is answered by the PUBLIC handshake result (404 vs 200), not by this file.
+    """
+    path = _token_file_path()
+    if not path:
+        return login_core.LOGIN_UNKNOWN
     try:
-        # headless_creationflags: unattended, reads output only (never prompts), so it must not
-        # allocate a console on a windowless desktop. encoding/errors stated so the decode is not
-        # left to the locale (the child-output ratchet).
-        out = subprocess.run(["devtunnel", "show", tunnel_name],
-                             capture_output=True, text=True, encoding="utf-8", errors="replace",
-                             timeout=20,
-                             creationflags=childproc.headless_creationflags()).stdout or ""
-    except Exception:
-        return None
-    import re
-    m = re.search(r"Host connections\s*:\s*(\d+)", out)
-    return int(m.group(1)) if m else None
+        stt = os.stat(path)
+        size, mtime = stt.st_size, stt.st_mtime
+    except FileNotFoundError:
+        size, mtime = None, None
+    except OSError:
+        return login_core.LOGIN_UNKNOWN
+    return login_core.decide_login_state(size, mtime, now=time.time())
 
 
 def probe_c2c_entrance(timeout=20):
@@ -199,12 +215,31 @@ def run_tick(key, tunnel_name, prev_counts):
     pub_url = _public_url()
     if pub_url:
         public_raw = handshake(pub_url, key)
-        # Read the host-connection count every tick so a 404 can be correlated with it.
-        host_conn = read_host_connections(tunnel_name)
+        # Decide host state from the PUBLIC handshake result, and login state from the token
+        # FILE -- never from a devtunnel subprocess. host_connections is left None because the
+        # exact count is only obtainable via the CLI we are forbidden to call; a 404 with a
+        # logged-out token is the 'relay has no host' signal the alert reports instead.
+        host_conn = None
+        login_state = read_login_state()
         public_result = core.classify_handshake(public_raw["initialize_status"], public_raw["initialize_latency_s"])
         public_hop = core.classify_hop("public", public_result, host_connections=host_conn)
     else:
         public_raw, public_result, public_hop, host_conn = None, None, core.HOP_UNKNOWN, None
+        login_state = read_login_state()
+
+    for scope, result in (("local", local_result), ("public", public_result)):
+        if result is None:
+            continue
+        reason = result["reason"]
+        kind = {"auth": probe_alert.KIND_AUTH, "slow": probe_alert.KIND_SLOW}.get(reason)
+        if kind is None:
+            if scope == "public" and reason == "not_found_404":
+                kind = probe_alert.KIND_NO_HOST
+            elif scope == "local" and reason == "no_answer":
+                kind = probe_alert.KIND_LOCAL_DOWN
+            else:
+                kind = probe_alert.KIND_ERROR
+        probe_alert.record_probe_result(scope, result["ok"], kind)
 
     new_counts = {
         "local": core.update_consecutive_failures(prev_counts.get("local"), local_result),
@@ -216,11 +251,13 @@ def run_tick(key, tunnel_name, prev_counts):
     four_oh_four_zero_host = core.correlates_404_with_zero_host_connections(public_result, host_conn)
 
     record = {
+        "recent_probe_alerts": probe_alert.recent_alerts(),
         "ts": time.strftime("%Y-%m-%d %H:%M:%S", time.gmtime()),
         "local": {"raw": local_raw, "result": local_result, "hop": local_hop,
                   "consecutive_failures": new_counts["local"], "alert": local_alert},
         "public": {"url_configured": bool(pub_url), "raw": public_raw, "result": public_result,
                    "hop": public_hop, "host_connections": host_conn,
+                   "login_state": login_state,
                    "consecutive_failures": new_counts["public"], "alert": public_alert},
         "gateway": gateway,
         "four_oh_four_coincides_with_zero_host_connections": four_oh_four_zero_host,
@@ -244,6 +281,10 @@ def _alert_sentence(record):
                      "(relay has no host connection)")
     elif pub.get("host_connections") is not None:
         parts.append("devtunnel host connections = %d" % pub["host_connections"])
+    # Login state is read from the token FILE (never the CLI); a logged-out token beside a
+    # public failure is the 'relay has no host' cause the operator must see.
+    if pub.get("login_state") == login_core.LOGIN_NONE:
+        parts.append("devtunnel token FILE is empty/absent = logged out (relay will have no host)")
     return "; ".join(parts) or "MCP handshake monitor alert"
 
 
