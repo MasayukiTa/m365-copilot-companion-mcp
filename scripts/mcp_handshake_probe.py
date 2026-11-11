@@ -125,3 +125,59 @@ def probe_once(url, key, is_public, login_state, timeout=90):
         else:
             result["ok"] = True
     return result
+
+
+def _default_urls():
+    """The two endpoints the supervisor probes: local main.py and the public tunnel.
+
+    The public URL comes from MCP_TUNNEL_URL (the same variable the gateway publishes under);
+    when it is unset only the local hop is probed. No subprocess, no devtunnel CLI.
+    """
+    urls = [("http://127.0.0.1:8000/mcp", False)]
+    pub = os.environ.get("MCP_TUNNEL_URL", "").strip().rstrip("/")
+    if pub:
+        urls.append((pub + "/mcp", True))
+    return urls
+
+
+def _resolve_key():
+    """The bearer token, resolved exactly as the server does, and never printed.
+
+    Loads .env if python-dotenv is present, then tools.secret_store.require_api_key. Returns
+    an empty string when no key is configured so main() can report that without raising.
+    """
+    try:
+        from dotenv import load_dotenv  # type: ignore
+        load_dotenv()
+    except Exception:
+        pass
+    try:
+        from tools.secret_store import require_api_key  # type: ignore
+        return require_api_key() or ""
+    except Exception:
+        return os.environ.get("MCP_API_KEY", "") or ""
+
+
+def main(argv=None):
+    """Probe BOTH hops once and print one JSON line per hop; return non-zero if any failed.
+
+    This is the supervisor-side entry: it reads login state from the token FILE (via
+    read_token_login_state -> token_file_path + decide_login_state), then runs the real
+    handshake against each url with probe_once. It NEVER calls the devtunnel CLI and never
+    prints the bearer token.
+    """
+    login_state = read_token_login_state()
+    key = _resolve_key()
+    failed = False
+    for url, is_public in _default_urls():
+        res = probe_once(url, key, is_public, login_state)
+        res["login_state"] = login_state
+        print(json.dumps(res, ensure_ascii=False))
+        if not res.get("ok"):
+            failed = True
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    import sys
+    sys.exit(main())

@@ -211,3 +211,46 @@ def classify_local_hop(status, elapsed_s, slow_s=SLOW_SECONDS):
         except (TypeError, ValueError):
             pass
     return HOP_OK, ""
+
+
+def main(argv=None):
+    """Self-check the pure deciders on the MEASURED facts and print the verdicts, one JSON
+    line per case. No network, no filesystem, no clock, no devtunnel CLI -- it feeds the
+    functions the 2026-11-11 measurements (4182-byte valid token / 0-byte logged-out token;
+    the public relay answering 404 after 50-60 s while logged out; a fast healthy 200) and
+    prints what decide_login_state / classify_public_hop / classify_local_hop return, so the
+    contract can be eyeballed from the command line without standing anything up.
+
+    Returns 0 when the self-check matches the measured expectations, 1 otherwise, so it can
+    double as a smoke test in a shell.
+    """
+    import json
+    import sys
+
+    login_out = decide_login_state(0)                 # 0 bytes -> logged out
+    login_in = decide_login_state(4182)               # 4182 bytes -> logged in
+    pub_no_host = classify_public_hop(404, 55.0, login_out)   # measured no-host shape
+    pub_ok = classify_public_hop(200, 1.2, login_in)          # fast healthy 200
+    local_down = classify_local_hop("ERR", 90.0)              # local main.py not answering
+    local_ok = classify_local_hop(200, 0.5)                   # fast healthy 200
+
+    cases = [
+        ("login_logged_out", login_out, LOGIN_NONE),
+        ("login_logged_in", login_in, LOGIN_VALID),
+        ("public_no_host", pub_no_host[0], HOP_PUBLIC_NO_HOST),
+        ("public_ok", pub_ok[0], HOP_OK),
+        ("local_down", local_down[0], HOP_LOCAL_DOWN),
+        ("local_ok", local_ok[0], HOP_OK),
+    ]
+    ok = True
+    for name, got, want in cases:
+        passed = got == want
+        ok = ok and passed
+        print(json.dumps({"case": name, "got": got, "want": want, "pass": passed},
+                         ensure_ascii=False))
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    import sys as _sys
+    _sys.exit(main())
