@@ -11993,9 +11993,9 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # Durable at the moment of settling: see RelayWorker._settle_done.
         _nw.priority = bool(goal_item.get("priority")) if isinstance(goal_item, dict) else False
         _nw.on_settled_done = _note_one_finished
-        # OWNER'S REAL-DESKTOP SETTING, consulted at the one place a goal becomes a worker (each
+        # REAL-DESKTOP SETTING, consulted at the one place a goal becomes a worker (each
         # use, so an operator flipping desktop_guard reaches the next worker start). The default
-        # is ALLOW (owner instruction 2026-11-09): a goal that asks for real-desktop UI automation
+        # is ALLOW: a goal that asks for real-desktop UI automation
         # is born as a normal worker. It is only REFUSED here when the operator has opted back in
         # with desktop_guard=deny (settings.txt or env MCP_DESKTOP_GUARD), and even then a goal
         # carrying the explicit operator field allow_real_desktop is let through. refuse_reason
@@ -12026,8 +12026,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         """Lift boosted goals to the front of the admission queue, stably.
 
         A boost is a human act stored as .fleet/tasks/boosts/<jid>.json and read through
-        relay/priority_boost.py (the read side the owner asked to keep separate from the act of
-        moving work). This is the consumer: once per sweep it partitions `pend` into boosted and
+        relay/priority_boost.py (the read side, separate from the act of moving work). This is the consumer: once per sweep it partitions `pend` into boosted and
         non-boosted, keeping each group's existing order, and rewrites `pend` in place as
         boosted-then-rest. Because admission walks `pend` from the front and defers (never kills)
         when a slot or the disk is short, lifting a boosted goal here is exactly what makes it
