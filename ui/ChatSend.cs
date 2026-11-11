@@ -73,6 +73,7 @@ interface IChatSendEffects
     void AddUser(string text);
     void AddAssistant(string text);
     void NewChat();
+    void OfferNewChat(Conversation target, string text, string message);
     string HttpGet(string path, int timeoutMs);   // to the bridge; throws on any failure
     void SetBridgeReachable(bool ok);
     void SetDot(string state);
@@ -525,6 +526,8 @@ static class ChatSend
         if (door == DOOR_UNKNOWN)
         {
             fx.AddAssistant(fx.T("send_unknown_conv"));
+            fx.RestoreInput(text);
+            fx.OfferNewChat(target, text, fx.T("send_unknown_conv"));
             return;
         }
         if (door != DOOR_ON_PAGE)
@@ -539,7 +542,13 @@ static class ChatSend
                 else fx.HttpGet("/new", 15000);
                 fx.SetPageConversation(target);
             }
-            catch { fx.AddAssistant(fx.T("send_wrong_page")); return; }
+            catch
+            {
+                fx.AddAssistant(fx.T("send_wrong_page"));
+                fx.RestoreInput(text);
+                if (door != DOOR_NEW) fx.OfferNewChat(target, text, fx.T("send_wrong_page"));
+                return;
+            }
         }
 
         fx.MarkSendInFlight();

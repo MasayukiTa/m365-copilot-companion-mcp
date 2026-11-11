@@ -212,6 +212,18 @@ partial class ChatWindow
     void IChatSendEffects.AddUser(string text) { AddUser(text); PersistSentTurn(); }
     void IChatSendEffects.AddAssistant(string text) { AddAssistant(text); }
     void IChatSendEffects.NewChat() { NewChat(); }
+    void IChatSendEffects.OfferNewChat(Conversation target, string text, string message)
+    {
+        ShowRecoveryBanner(message, T("send_new_chat"), delegate
+        {
+            HideBanner();
+            // Do not overwrite edits or act on a different conversation.
+            if (_conv != target || _input.Text != text) return;
+            NewChat();
+            _input.Text = text;
+            _input.CaretIndex = text.Length;
+        });
+    }
     // The interface keeps its historical name (the send-path oracle records "HttpGet|..."); it is
     // an authenticated POST now, like every other bridge call from this window.
     string IChatSendEffects.HttpGet(string path, int timeoutMs) { return BridgeCall(path, timeoutMs); }

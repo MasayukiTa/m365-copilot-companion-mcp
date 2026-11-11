@@ -216,6 +216,7 @@ PROTECTED = {
 }
 # Writers of regenerable or per-run documents; losing one costs a re-run, not knowledge.
 AUDITED = {
+    "tools/deploy_main_to_live.py": "per-run backup report created in a new backup directory before changes",
     "tools/backfill_conversation_ids.py": "one-shot, dry run by default; --apply backs the file up, replaces it through a temp file and re-checks the counts. Run it while the fleet is idle: the runner rewrites the same registry",
     "relay/capture_status.py": "latest capture status snapshot, overwritten every time",
     "relay/consumer_watch.py": "alarm marker file",
