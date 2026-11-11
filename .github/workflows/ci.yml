@@ -872,6 +872,7 @@ jobs:
             tests/test_outcome_reporting.py \
             tests/test_run_end_pages.py \
             tests/test_faulthandler_rotation.py \
+            tests/test_faulthandler_crash_banner.py \
             tests/test_verify_stack_interrupted.py \
             tests/test_resume_interrupted.py \
             tests/test_fleet_resume_phase2.py \
