@@ -42,7 +42,7 @@ if _ROOT not in sys.path:
 
 from scripts import mcp_handshake_monitor as core  # noqa: E402
 from scripts import tunnel_login_state as login_core  # noqa: E402  (pure token-file login decider; never the CLI)
-from tools import probe_alert
+from tools import probe_alert, tunnel_alert
 from tools import childproc  # noqa: E402  (headless_creationflags: these children must never pop a console)
 
 LOCAL_URL = "http://127.0.0.1:8000/mcp"
@@ -206,6 +206,9 @@ def probe_c2c_entrance(timeout=20):
     return results
 
 
+_last_tunnel_cause = None
+
+
 def run_tick(key, tunnel_name, prev_counts):
     """One monitoring tick. Returns (record, new_counts). prev_counts is {scope: int}."""
     local_raw = handshake(LOCAL_URL, key)
@@ -240,6 +243,28 @@ def run_tick(key, tunnel_name, prev_counts):
             else:
                 kind = probe_alert.KIND_ERROR
         probe_alert.record_probe_result(scope, result["ok"], kind)
+
+    # Unknown login or an unconfigured public URL cannot support a diagnosis.
+    global _last_tunnel_cause
+    if (login_state in (login_core.LOGIN_VALID, login_core.LOGIN_NONE)
+            and public_result is not None
+            and (login_state == login_core.LOGIN_NONE
+                 or (local_result["reason"] != "auth" and public_result["reason"] != "auth"))):
+        observation = tunnel_alert.ProbeObservation(
+            logged_in=login_state == login_core.LOGIN_VALID,
+            host_connections=host_conn,
+            local_health_ok=local_result["ok"],
+            public_health_ok=public_result["ok"],
+        )
+        cause = tunnel_alert.classify_probe(observation)
+        if cause is not None and cause != _last_tunnel_cause:
+            try:
+                tunnel_alert.raise_tunnel_alert(observation)
+            except Exception:
+                pass  # notification failure must not stop monitoring
+        _last_tunnel_cause = cause
+    else:
+        _last_tunnel_cause = None
 
     new_counts = {
         "local": core.update_consecutive_failures(prev_counts.get("local"), local_result),
