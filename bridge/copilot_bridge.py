@@ -6058,6 +6058,24 @@ def _close_duplicate_agent_tabs(ctx, keep_pg, base_url):
                     "a live owner", closed, skipped_claimed)
 
 
+def validate_impl_agent_url(url: str) -> None:
+    """Raise SystemExit with the one shared plain sentence when a configured MCP_IMPL_AGENT_URL has
+    no usable agent id (a generic chat page, or a link carrying only one guid). An empty value is
+    left alone -- startup falls back to any open agent tab, as before. A valid address returns None.
+
+    This is the bridge SeedError surface the task names: the same NO_AGENT_ID_MESSAGE that
+    configure_env, quickstart option R and the doctor print, so a person who pasted the wrong
+    address reads the same instruction wherever they hit it."""
+    text = (url or "").strip()
+    if not text:
+        return
+    from relay import template_seed as _ts
+    try:
+        _ts.agent_id_from_url(text)
+    except _ts.SeedError:
+        raise SystemExit(_ts.NO_AGENT_ID_MESSAGE)
+
+
 def _find_or_open_agent(ctx):
     url = os.environ.get("MCP_IMPL_AGENT_URL", "").strip()
     if url:
@@ -7790,6 +7808,10 @@ def _page_main(cdp, fresh):
         br = p.chromium.connect_over_cdp(cdp)
         ctx = br.contexts[0] if br.contexts else br.new_context()
         CTX = ctx
+        # Refuse a pasted agent address that has no agent id BEFORE opening a tab on it (a generic
+        # chat page or a one-guid link silently reaches the default Copilot). The one shared plain
+        # sentence is printed -- the same words doctor, configure_env and quickstart option R use.
+        validate_impl_agent_url(os.environ.get("MCP_IMPL_AGENT_URL", ""))
         PAGE = _find_or_open_agent(ctx)
         DRIVER = CopilotWebDriver(PAGE)
         # bare agent URL (a fresh chat) for /new; strip any /conversation/<id> suffix
