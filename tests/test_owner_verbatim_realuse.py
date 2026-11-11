@@ -16,10 +16,8 @@ _INPUTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
 
 
 def _owner_records():
-    return [
-        {"text": "Please review the sample chart.", "resume_conv": "session-a", "provenance": {"source_file": "fixture", "source_line": 1}},
-        {"text": "Please inspect the sample dataset and explain the trends in its summary.", "resume_conv": "session-b", "provenance": {"source_file": "fixture", "source_line": 2}},
-    ]
+    with open(_INPUTS, encoding="utf-8") as fh:
+        return [json.loads(line) for line in fh if line.strip()]
 
 
 @pytest.fixture(autouse=True)
