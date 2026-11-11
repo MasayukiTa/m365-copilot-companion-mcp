@@ -64,6 +64,7 @@ _ISOLATE = Path(__file__).resolve().parent / "run_isolated.py"
 #:                                emitted. The password itself WAS removed, so a
 #:                                stale expectation rather than a leak
 SUITES = {
+    "relay/test_a_cap_that_fires_only_after_the_wedge_is_too_late.py": None,
     "relay/test_acceptance.py": None,
     "relay/test_code_task.py": None,
     "relay/test_continue_escalation.py": None,
@@ -84,6 +85,7 @@ SUITES = {
     "relay/test_unlock_inject.py": None,
     "relay/test_unlock_redelivery_framing.py": None,
     "relay/test_watchdog.py": None,
+    "relay/test_watchdog_preemptive_recycle.py": None,
 }
 
 #: Per-suite budget. relay/test_fleet_refute.py is the slowest at a few seconds; the

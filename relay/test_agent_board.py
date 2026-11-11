@@ -595,7 +595,7 @@ def test_the_status_block_reports_what_the_run_applies(tmp_path, monkeypatch):
     AB.post_result("cA", 1, "cA-1")
     assert AB.status_block() == {"agent_board": {"mode": "p0", "posted": 1, "refused": 0,
                                                  "write_errors": 0,
-                                                 "kinds_version": AB.board_kinds.SCHEMA_VERSION}}
+                                                 "kinds_version": AB.board_kinds.SCHEMA_REVISION}}
     from relay import fleet_runner as FR
     assert FR._agent_board_block() == AB.status_block()
 

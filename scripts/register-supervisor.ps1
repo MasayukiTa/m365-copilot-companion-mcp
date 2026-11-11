@@ -125,13 +125,22 @@ try {
     } else {
         $action = New-ScheduledTaskAction -Execute $psExe -Argument $ps1Args -WorkingDirectory $repo
     }
-    $trigger = New-ScheduledTaskTrigger -AtLogOn
+    # Per-user logon trigger: bind -User to THIS account so the AtLogOn trigger fires only
+    # for this user, matching the per-user Principal below (and the "per-user" promise at the
+    # top of this script). Without -User, New-ScheduledTaskTrigger -AtLogOn builds an
+    # all-users trigger, which disagrees with the single-user Principal.
+    $thisUser = "{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME
+    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $thisUser
 
+    # Best-effort 15s delay so logon isn't slowed; surface whether it stuck instead of
+    # swallowing the failure silently (some trigger objects lack a settable .Delay).
     try {
         $trigger.Delay = 'PT15S'
-    } catch {}
+    } catch {
+        Write-Host "Note: could not set 15s logon delay on the Task Scheduler trigger ($($_.Exception.Message)); task will fire immediately at logon."
+    }
 
-    $principal = New-ScheduledTaskPrincipal -UserId ("{0}\{1}" -f $env:USERDOMAIN, $env:USERNAME) `
+    $principal = New-ScheduledTaskPrincipal -UserId $thisUser `
                                              -LogonType Interactive `
                                              -RunLevel Limited
     $settings  = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries `

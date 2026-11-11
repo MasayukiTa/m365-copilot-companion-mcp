@@ -125,6 +125,8 @@ jobs:
             tests/test_sessions_search_migration.py \
             tools/test_child_env_credentials.py \
             tools/test_childproc_timeout_kills_tree_no_thread_leak.py \
+            tools/test_childproc_imports_without_root_on_path.py \
+            tools/test_childproc_output_via_tempfile_no_reader_thread.py \
             tools/test_ocr_native_thread_leak.py \
             tools/test_ocr_thread_leak.py \
             tools/test_web_fetch_encoding.py \
@@ -149,6 +151,8 @@ jobs:
             relay/test_a_worker_that_wrote_about_limits_was_thrown_away.py \
             relay/test_a_control_that_does_nothing_is_worse_than_none.py \
             relay/test_goal_during_cleanup_window.py \
+            relay/test_stratified_estimation.py \
+            relay/test_design_stratum_counts.py \
             relay/test_auto_rephrase_continue.py \
             scripts/test_status_tool_does_not_mislead.py \
             scripts/test_health_probe_isolation.py \
@@ -179,6 +183,7 @@ jobs:
             relay/test_fleet_case_reference.py \
             relay/test_judge_none_on_full_path_case_ref.py \
             relay/test_judge_gate_harness.py \
+            relay/test_design_feasibility_core.py \
               relay/test_judge_engine_messages.py \
             relay/test_fleet_judge_request.py \
             relay/test_judge_correction_turn.py \
@@ -298,6 +303,7 @@ jobs:
             relay/test_a_cold_start_offers_the_priority_goal_first.py \
             relay/test_resume_conv_survives_every_delivery_route.py \
             relay/test_resume_from_state.py \
+            relay/test_an_acked_goal_dropped_by_a_restart_is_readded_once.py \
             relay/test_fleet_tombstone.py \
             relay/test_fleet_child_no_resurrect.py \
             relay/test_fleet_close_descendants.py \
@@ -315,6 +321,7 @@ jobs:
             relay/test_result_cache.py \
             relay/test_team_formation.py \
             relay/test_agent_board.py \
+            relay/test_peer_requests.py \
             relay/test_roster.py \
             relay/test_org_versions.py \
             relay/test_org_genotype.py \
@@ -346,6 +353,7 @@ jobs:
             relay/test_action_timeout_resend_safety.py \
             relay/test_verify_delivery_before_giving_up.py \
             relay/test_delivered_timeout_continues.py \
+            relay/test_resume_unknown_delivery_timeout.py \
             relay/test_live_acting_turn_wait.py \
             relay/test_a_job_marked_done_reads_as_dispatched_not_finished.py \
             tests/test_fleet_landing_ack_e2e.py \
@@ -425,6 +433,8 @@ jobs:
             scripts/test_supervisor_no_duplicate_host.py \
             scripts/test_supervisor_dead_tunnel_host_replaced.py \
             scripts/test_supervisor_zero_conn_recovery.py \
+            scripts/test_supervisor_hang_detect.py \
+            scripts/test_supervisor_runner_respawn.py \
             scripts/test_a_ported_env_cannot_leave_the_server_silent.py \
             scripts/test_a_submitted_job_is_picked_up_at_once.py \
             scripts/test_a_failing_entry_point_says_why.py \
@@ -570,6 +580,7 @@ jobs:
             scripts/test_install_path_python_version.py \
             scripts/test_install_path_powershell.py \
             scripts/test_install_path_batch.py \
+            scripts/test_venv_probe_timeout.py \
             tools/test_file_scope_fails_closed.py \
             scripts/test_repair_unlock_output.py \
             scripts/test_repair_children_are_windowless.py \
@@ -1119,8 +1130,10 @@ jobs:
             scripts/test_task_kind.py \
             scripts/test_load_routing_report.py \
             scripts/test_load_routing_pairwise.py \
+            scripts/test_phase_c_exit_report.py \
             scripts/test_result_cache_report.py \
             scripts/test_team_formation_report.py \
+            scripts/test_peer_requests_report.py \
             bench/test_attempt_budget.py \
             bench/test_grade_reasons.py \
             scripts/test_bootstrap_transcript.py \
@@ -1186,7 +1199,8 @@ jobs:
             tests/test_response_telemetry.py \
             tests/test_heavy_libraries_are_not_imported_at_startup.py \
             tools/test_a_bash_assignment_does_not_reach_shellexecute.py \
-            relay/test_a_stale_coordinator_restarts_only_when_idle.py
+            relay/test_a_stale_coordinator_restarts_only_when_idle.py \
+            relay/test_a_wedged_hard_reset_in_recovery_is_caught_not_fatal.py
 
       - name: Run script-style tracer tests
         run: python tools/test_trace.py
@@ -1398,6 +1412,23 @@ jobs:
         run: |
           Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
           $result = Invoke-Pester .\scripts\test_main_launch_log.Tests.ps1 -PassThru
+          if ($result.FailedCount -gt 0) {
+            exit 1
+          }
+
+      # ADDED 2026-11-11: ghost-safe tunnel re-host establish order. When a stale (ghost) tunnel
+      # re-host leaves the relay still counting the dead host's connection(s), the old establish
+      # test (connection count >= 1) was satisfied by the ghost alone, so Start-TunnelHost could
+      # log 'established' before the new host ever registered. The pure decider Test-RehostEstablished
+      # treats the re-host as established only once the count RISES ABOVE the ghost baseline AND a
+      # host process of ours is running. These Pester 3.4.0 tests extract that pure function from
+      # supervisor.ps1 (no dot-source, no side effects) and pin all 11 cases. Engine pinned to 3.4.0
+      # for the same Should Be vs Should -Be reason as heal_tunnel above.
+      - name: Run tunnel re-host ghost-establish unit tests
+        shell: powershell
+        run: |
+          Import-Module Pester -RequiredVersion 3.4.0 -ErrorAction Stop
+          $result = Invoke-Pester .\scripts\test_rehost_ghost_establish.Tests.ps1 -PassThru
           if ($result.FailedCount -gt 0) {
             exit 1
           }
