@@ -289,6 +289,7 @@ jobs:
             relay/test_bridged_reply_checks.py \
             relay/test_bridge_bench_selfcheck.py \
             relay/test_template_seed.py \
+            relay/test_agent_url_forms.py \
             relay/test_template_seed_bundled.py \
             relay/test_memory_is_about_the_work.py \
             relay/test_fanout_carries_the_procedure.py \
@@ -598,6 +599,7 @@ jobs:
             scripts/test_bridge_startup_reporting.py \
             scripts/test_start_companion_edge_headless.py \
             bridge/test_bridge_sessions.py \
+            bridge/test_agent_url_seed_surface.py \
             bridge/test_a_resume_does_not_open_a_page.py \
             bridge/test_cdp_watchdog.py \
             bridge/test_consent_chain.py \
