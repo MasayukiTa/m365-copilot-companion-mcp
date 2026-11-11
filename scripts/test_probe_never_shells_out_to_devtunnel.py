@@ -28,12 +28,16 @@ import os
 import re
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+REPO_ROOT = os.path.dirname(HERE)
 
-#: Every probe-side module that MUST stay CLI-free. Kept explicit so a new probe file is a
-#: deliberate addition here, not an accidental omission.
+#: Every probe-side module that MUST stay CLI-free, as repo-root-relative paths. Kept explicit
+#: so a new probe file is a deliberate addition here, not an accidental omission. The RESIDENT
+#: I/O probe tools/mcp_handshake_probe.py (merged in #595) is included on purpose: it was the
+#: module that actually shelled out to `devtunnel show` every tick, which this test forbids.
 PROBE_MODULES = (
-    "tunnel_login_state.py",
-    "mcp_handshake_probe.py",
+    os.path.join("scripts", "tunnel_login_state.py"),
+    os.path.join("scripts", "mcp_handshake_probe.py"),
+    os.path.join("tools", "mcp_handshake_probe.py"),
 )
 
 #: Process-spawning APIs. A "devtunnel" argument flowing into any of these is the shell-out we
@@ -45,7 +49,7 @@ _SPAWN_RE = re.compile(
 
 
 def _module_paths():
-    return [os.path.join(HERE, name) for name in PROBE_MODULES]
+    return [os.path.join(REPO_ROOT, name) for name in PROBE_MODULES]
 
 
 def test_probe_modules_exist():
