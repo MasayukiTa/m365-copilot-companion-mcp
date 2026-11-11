@@ -833,7 +833,6 @@ def _like_escape(s):
 
 
 _spool_lock = threading.Lock()
-_spool_last_error = 0.0
 
 
 def _spool_path():
@@ -870,7 +869,6 @@ def _spool_file_lock():
 
 def record_fleet_turn(key, obj, name="", goal=""):
     """Commit a worker row immediately, or queue it for the spool drain. Never raises."""
-    global _spool_last_error
     if not isinstance(obj, dict):
         return False
     try:
@@ -895,11 +893,8 @@ def record_fleet_turn(key, obj, name="", goal=""):
             conn.close()
         return True
     except Exception as exc:
-        now = time.monotonic()
-        if now - _spool_last_error >= 60 or not _spool_last_error:
-            _spool_last_error = now
-            _log.error("record_fleet_turn failed for key=%r: %s: %s; queuing in spool",
-                       str(key)[:80], type(exc).__name__, str(exc)[:200])
+        _log.error("record_fleet_turn failed for key=%r: %s: %s; queuing in spool",
+                   str(key)[:80], type(exc).__name__, str(exc)[:200])
         try:
             row = {"id": uuid.uuid4().hex, "key": str(key), "obj": obj,
                    "name": str(name or ""), "goal": str(goal or "")}

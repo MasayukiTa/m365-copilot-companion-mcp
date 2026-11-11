@@ -115,6 +115,9 @@ def test_a_failed_write_is_logged_not_swallowed(store, monkeypatch, caplog):
     msgs = " ".join(r.getMessage() for r in caplog.records)
     assert "record_refuter_turn failed" in msgs and "OperationalError" in msgs
     assert "record_fleet_turn failed" in msgs
+    caplog.clear()
+    assert S.record_fleet_turn("k1", {"role": "user", "text": "again"}) is False
+    assert any("record_fleet_turn failed" in r.getMessage() for r in caplog.records)
 
 
 def test_existing_rows_and_schema_are_untouched(store):
