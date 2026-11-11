@@ -22,6 +22,7 @@ import re
 import sys
 import threading
 import time
+from unittest.mock import Mock
 
 import pytest
 
@@ -100,7 +101,9 @@ def test_serve_forever_restarts_with_backoff_and_logs_exit_codes(tmp_path, monke
     # patched so the backoff is recorded without the test actually waiting.
     log = tmp_path / "ts.log"
     slept = []
-    monkeypatch.setattr(thl.time, "sleep", lambda s: slept.append(s))
+    clock = Mock(wraps=time)
+    clock.sleep = lambda s: slept.append(s)
+    monkeypatch.setattr(thl, "time", clock)
     prog = "import sys; sys.exit(3)"
     fake = [sys.executable, "-c", prog]
     # Point serve_forever at our fake by overriding the command it builds: devtunnel bin is
@@ -127,7 +130,9 @@ def test_serve_forever_restarts_with_backoff_and_logs_exit_codes(tmp_path, monke
 def test_serve_forever_survives_a_missing_binary(tmp_path, monkeypatch):
     # If the host binary cannot be started, the loop records it rather than crashing.
     log = tmp_path / "ts.log"
-    monkeypatch.setattr(thl.time, "sleep", lambda s: None)
+    clock = Mock(wraps=time)
+    clock.sleep = lambda s: None
+    monkeypatch.setattr(thl, "time", clock)
 
     def _boom(cmd, sink, on_exit=None, hook=None, read_conn=None, grace=None, poll=None):
         raise FileNotFoundError("devtunnel not found")
@@ -286,7 +291,9 @@ def test_serve_forever_restarts_at_once_after_a_zero_conn_recycle(tmp_path, monk
     # When run_once reports a recycle, serve_forever must NOT back off and must NOT count it
     # as a failure: a fresh host comes up at once. sleep is patched to record any wait.
     slept = []
-    monkeypatch.setattr(thl.time, "sleep", lambda s: slept.append(s))
+    clock = Mock(wraps=time)
+    clock.sleep = lambda s: slept.append(s)
+    monkeypatch.setattr(thl, "time", clock)
     outcomes = iter([(0, True), (0, True)])  # two recycles, then stop at max_restarts
     monkeypatch.setattr(
         thl, "run_once",
@@ -304,7 +311,9 @@ def test_serve_forever_restarts_at_once_after_a_zero_conn_recycle(tmp_path, monk
 def test_serve_forever_still_backs_off_a_real_crash(tmp_path, monkeypatch):
     # A non-recycle exit (recycled=False) keeps the old fast-fail backoff, unchanged.
     slept = []
-    monkeypatch.setattr(thl.time, "sleep", lambda s: slept.append(s))
+    clock = Mock(wraps=time)
+    clock.sleep = lambda s: slept.append(s)
+    monkeypatch.setattr(thl, "time", clock)
     monkeypatch.setattr(
         thl, "run_once",
         lambda cmd, sink, on_exit=None, hook=None, read_conn=None, grace=None, poll=None:
