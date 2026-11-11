@@ -164,12 +164,7 @@ class Runner:
         return len(self.st.by_status(S.SUBMITTING, S.SUBMITTED, S.RUNNING))
 
     def _submit_some(self) -> None:
-        # CONTENT RESEMBLANCE NEVER HOLDS A REQUEST BACK. This used to skip any pending item
-        # that read like one already in flight (_similar_to_active), because the fleet door
-        # would have refused it as a near-duplicate. The door no longer refuses on content
-        # (see tools/fleet_intake.fleet_submit, 2026-10-26/27 owner instruction), so there is
-        # nothing to pre-empt: every pending request is submitted in order. Two requests that
-        # share wording both run; they are kept apart downstream by job id, not by text.
+        # Submit pending requests in order; job IDs distinguish requests with similar wording.
         while self._inflight() < self.cfg.get("max_inflight", DEFAULT_MAX_INFLIGHT):
             pend = self.st.by_status(S.PENDING)
             if not pend or self._past_deadline():
@@ -192,11 +187,7 @@ class Runner:
             self.log("%s: already submitted with this goal, not sent again" % iid)
             return
         (self.out_dir / iid).mkdir(parents=True, exist_ok=True)
-        # ONE SUBMIT, NO REWORDING. This used to loop: if the fleet door refused the goal as a
-        # near-duplicate, it reworded the request once (variant 1) and, if still refused, SKIPPED
-        # it as "重複で拒否". The door no longer refuses on content resemblance (2026-10-26/27
-        # owner instruction), so there is no duplicate reply to reword around or skip on -- the
-        # goal is submitted as written, and anything that is not an ok is a real failure.
+        # Submit the goal as written; report unsuccessful submissions as failures.
         self.st.set_status(iid, S.SUBMITTING, goal=goal, goal_hash=goal_hash(goal),
                            variant=0, attempts=rec["attempts"] + 1)
         res = self.submitter.submit(goal, probe=lambda i=iid: self._in_fleet(i))
