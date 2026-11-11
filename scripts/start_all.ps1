@@ -3279,9 +3279,7 @@ function Report-OtherProfileSignIns {
 
       Each managed browser runs on its own --user-data-dir (Edge locks a profile to one
       process, so running them at once REQUIRES distinct profiles), and a distinct profile is a
-      distinct cookie jar. Signing in on the companion signs in the companion. The owner asked
-      whether a sign-in could have landed in one of the two browsers and not the other, on
-      2026-09-23: structurally, yes, and until now nothing looked.
+      distinct cookie jar. Signing in on one profile does not sign in another.
 
       REPORTED, NOT ESCALATED. Surfacing a second browser to sign it in is exactly what the
       comment above spent 751 MB learning not to do at startup. A line the operator can act on
