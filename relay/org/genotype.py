@@ -192,7 +192,7 @@ def base_org_id():
 
 
 def genotype(genes, parent="", base=None):
-    """The record for one candidate: schema_version, materialised genes, base org id, parent, id."""
+    """Build a candidate record from its materialised genes and ancestry."""
     full = materialize(genes, base)
     return {"schema_version": SCHEMA_VERSION, "genes": full, "base": base_org_id(),
             "parent": str(parent or ""), "id": genotype_hash(full)}
