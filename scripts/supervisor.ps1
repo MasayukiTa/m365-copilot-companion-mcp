@@ -1773,6 +1773,88 @@ function Set-TunnelHostStatus {
 $script:TunnelState = ""
 $script:ForeignStreak = 0
 
+# -- SYNTHETIC HANDSHAKE MONITOR (2026-11-11) ----------------------------------------------------
+# WHY: a /health GET answered 200 everywhere while the owner's client's REAL MCP handshake got a
+# 404 after ~60s and no tool call ever arrived. /health is an async loopback route; it cannot see
+# a relay that answers 404 while it has no host connection. tools/mcp_handshake_monitor.py runs the
+# REAL handshake (initialize -> notifications/initialized -> tools/list) against the local server
+# AND the public URL every 60s and writes .setup/logs/mcp_handshake_monitor_state.json. THE
+# SUPERVISOR DECIDES THE GATEWAY IS DOWN FROM THAT RESULT, NOT FROM /health: a server whose /health
+# answers 200 can still be unreachable to the client through the relay, and only the real handshake
+# catches it.
+$script:HandshakeMonitorProc = $null
+$script:GatewayDownState = ""
+$script:GatewayMonitorStatePath = Join-Path $Root ".setup\logs\mcp_handshake_monitor_state.json"
+
+function Start-HandshakeMonitor {
+    # Launch the permanent synthetic monitor if it is not already running. It loops on its own
+    # (60s), so this only has to (re)start it when absent. Windowless, its stdout folded into the
+    # setup logs. A failure to launch is logged once and never wedges the supervisor.
+    if ($script:HandshakeMonitorProc) {
+        try { $script:HandshakeMonitorProc.Refresh(); if (-not $script:HandshakeMonitorProc.HasExited) { return } } catch { }
+    }
+    # Someone else's monitor (a hand start, or a supervisor that restarted) counts too: match the
+    # command line so two do not run at once.
+    $running = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" -ErrorAction SilentlyContinue |
+                 Where-Object { ([string]$_.CommandLine) -like '*mcp_handshake_monitor.py*' })
+    if ($running.Count -gt 0) { return }
+    $py = Join-Path $Root ".venv\Scripts\python.exe"
+    if (-not (Test-Path $py)) { $py = "python" }
+    $script = Join-Path $Root "tools\mcp_handshake_monitor.py"
+    if (-not (Test-Path $script)) { return }
+    $out = Join-Path $Root ".setup\logs\mcp_handshake_monitor.out.log"
+    try {
+        $script:HandshakeMonitorProc = Start-Process -FilePath $py -ArgumentList @("-X", "utf8", $script) `
+            -WorkingDirectory $Root -WindowStyle Hidden -PassThru `
+            -RedirectStandardOutput $out -RedirectStandardError ($out + ".err")
+        Write-Log "synthetic handshake monitor started (pid $($script:HandshakeMonitorProc.Id))"
+    } catch {
+        Write-Log "could not start the synthetic handshake monitor: $($_.Exception.Message)"
+    }
+}
+
+function Read-GatewayMonitorState {
+    # PURE-ISH: read the monitor's latest state file, or $null when it is absent/unreadable/stale.
+    # A state older than 5 minutes is treated as absent (the monitor is not writing), so a dead
+    # monitor cannot pin an old 'down' verdict -- stale evidence is no evidence.
+    if (-not (Test-Path $script:GatewayMonitorStatePath)) { return $null }
+    try {
+        $j = Get-Content $script:GatewayMonitorStatePath -Raw -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
+    } catch { return $null }
+    if ($null -eq $j) { return $null }
+    try {
+        $age = ((Get-Date).ToUniversalTime() - ([datetimeoffset]$j.ts).UtcDateTime).TotalSeconds
+        if ($age -gt 300) { return $null }
+    } catch { }
+    return $j
+}
+
+function Invoke-GatewayMonitorCheck {
+    # ONE TICK of gateway supervision from the synthetic monitor. Keeps the monitor alive, reads
+    # its verdict, and logs a transition when the gateway goes down or recovers. Returns the state
+    # string ('down' / 'up' / '' when there is no readable monitor result). This is the signal the
+    # supervisor uses to judge the PUBLIC gateway -- Test-ServerUp still judges the LOCAL process.
+    Start-HandshakeMonitor
+    $state = Read-GatewayMonitorState
+    if ($null -eq $state) {
+        # No readable, fresh monitor result: no evidence either way. Do not change the verdict.
+        return $script:GatewayDownState
+    }
+    $down = [bool]$state.gateway_is_down
+    $now = if ($down) { "down" } else { "up" }
+    if ($now -ne $script:GatewayDownState) {
+        if ($down) {
+            $alert = [string]$state.alert
+            if (-not $alert) { $alert = "gateway handshake failing (local_hop=$($state.local_hop), public_hop=$($state.public_hop), host_connections=$($state.host_connections))" }
+            Write-Log ("GATEWAY DOWN (synthetic handshake, not /health): " + $alert)
+        } else {
+            Write-Log ("gateway handshake recovered (local_hop=$($state.local_hop), public_hop=$($state.public_hop), host_connections=$($state.host_connections))")
+        }
+        $script:GatewayDownState = $now
+    }
+    return $now
+}
+
 function Invoke-TunnelHostingCheck {
     # One tick of tunnel management, once devtunnel is known to be logged in. Uses the main
     # loop's $tunnelMiss / $loggedIn (script scope).
@@ -4405,6 +4487,13 @@ while ($true) {
         # PC's tunnel: report, do not fight) -- see Resolve-TunnelHostingState.
         Invoke-TunnelHostingCheck | Out-Null
     }
+
+    # GATEWAY LIVENESS FROM THE REAL HANDSHAKE, NOT /health. Keeps the synthetic monitor alive and
+    # reads its verdict: a server whose loopback /health answers 200 can still be unreachable to the
+    # client through the relay (a 404 after ~60s while host connections = 0). This is logged as the
+    # authoritative gateway up/down signal; the monitor's own state file carries which hop failed
+    # and whether a 404 coincided with host connections = 0.
+    Invoke-GatewayMonitorCheck | Out-Null
 
     # LAST STEP OF THE TICK: is this process still the code on disk? Stat-only unless a file
     # changed; replaces this supervisor (and exits) only when Get-SupervisorRestartVerdict says ok.

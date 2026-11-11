@@ -1110,6 +1110,7 @@ jobs:
             tools/test_env_portability.py \
             tools/test_the_one_secret_nobody_downstream_can_scrub.py \
             tools/test_secret_store.py \
+            tools/test_mcp_handshake_monitor.py \
             tools/test_secrets_are_not_readable.py \
             tools/test_setup_tls.py \
             tools/test_shell_timeout_tree.py \
