@@ -151,8 +151,8 @@ def pointer_lines():
 def worker_lines():
     """The how-to lines added to a CHILD's prompt so a worker reads the board before it starts
     and writes what it finds while it works -- P1 ONLY. "" in off and p0, so a child's prompt is
-    unchanged to the character except under p1. This is the p1 difference the owner asked for:
-    the coordinator still points at results (pointer_lines), and now the workers share findings
+    unchanged to the character except under p1. In p1, the coordinator still points at results
+    (pointer_lines), and the workers share findings
     mid-run too."""
     return "\n".join(WORKER_LINES) if run_mode() == "p1" else ""
 
