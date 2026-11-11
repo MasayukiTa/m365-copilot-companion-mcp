@@ -3,11 +3,11 @@
 (branch fix/judge-engine-chain-after-395, after PR #395 engaged the final-step judge for a
 goal that was only a path to a request folder).
 
-The defects, taken from that job's judge_request.json shape (claim_id 'example_analysis', a
+The defects, taken from that job's judge_request.json shape (claim_id 'claim_ad3158c1cb', a
 manifest whose .path was the DATA FOLDER and whose .result was a PATH STRING, and NO
 registration section at all):
 
-  1. 'registered claim not found for id example_analysis' with claim_source null -- the worker
+  1. 'registered claim not found for id claim_ad3158c1cb' with claim_source null -- the worker
      named a claim id but the request carried no registration.claim and the engine had no
      pre-registered configs/<id>.json, so the engine could not run and the worker was never
      told, in correctable terms, what to send. A worker that DOES follow the documented path
@@ -41,7 +41,7 @@ vh = pytest.importorskip(
 
 from relay.judge_gate import complete_judge_request, run_engine_judge
 
-CLAIM_ID = "example_analysis"
+CLAIM_ID = "claim_ad3158c1cb"
 
 # A minimal analysis-result OBJECT, the shape manifest.result must carry (defect 2). No real
 # measurements -- synthetic lot ids and numbers only.
@@ -64,7 +64,7 @@ def _fake_engine_root(tmp_path, *, with_configs_id=None):
                         "dataset_id": "synthetic", "source": "human-configs"}),
             encoding="utf-8")
     verdict = {"id": CLAIM_ID, "verdict": "HOLD", "verdict_ja": "\u4fdd\u7559",
-               "finding": None, "claim_supported": None, "reasons": ["D_FAIL_NO_LOCK"],
+               "finding": None, "claim_supported": None, "reasons": ["TEST_REASON"],
                "notes": [], "evidence": {"K": 2}, "hashes": {"input_sha256": "0" * 64}}
     script = (
         "import json, os, sys\n"
@@ -113,8 +113,8 @@ def test_manifest_result_path_string_is_corrected_with_example(tmp_path, monkeyp
                      "result": str(out / "report.xlsx")},
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -139,8 +139,8 @@ def test_manifest_path_directory_is_rejected_by_name_not_errno13(tmp_path, monke
         "manifest": {"path": str(folder), "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -175,8 +175,8 @@ def test_missing_claim_is_a_named_correction_naming_registration_claim(tmp_path,
         "manifest": {"path": "manifest.json", "dataset_id": CLAIM_ID, "result": RESULT_OBJECT},
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     assert correction is not None
     joined = "\n".join(correction["messages"])
@@ -205,8 +205,8 @@ def test_worker_following_the_documented_path_makes_the_engine_run(tmp_path, mon
         },
     })
     accept, detail, correction = complete_judge_request(
-        "DBB/analysis db を照会し相関を出す", str(out),
-        request_text="DBB/analysis db を照会し相関を出す",
+        "analyze database records", str(out),
+        request_text="analyze database records",
         correction_budget=2, correction_attempt=0)
     # With a matching registration.claim and no field problems, the engine runs: no correction.
     assert correction is None, detail
