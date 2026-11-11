@@ -59,3 +59,67 @@ def test_pip_install_no_longer_names_sys_executable_as_the_command():
     src = inspect.getsource(EO.pip_install)
     assert '[sys.executable, "-m", "pip"' not in src
     assert '[target, "-m", "pip"' in src
+
+
+def _make_venv(root):
+    rel = os.path.join("Scripts", "python.exe") if os.name == "nt" else os.path.join("bin", "python")
+    cand = os.path.join(str(root), ".venv", rel)
+    os.makedirs(os.path.dirname(cand), exist_ok=True)
+    with open(cand, "w"):
+        pass
+    return cand
+
+
+def test_the_production_venv_is_refused_through_an_aliased_path(tmp_path, monkeypatch):
+    """The production checkout's .venv IS the harness environment. Reaching it through a
+    different spelling of the same directory -- a symlink here, an 8.3 short name or a
+    junction in the field -- must still be refused, not handed back as an install target.
+
+    This is the hole 'refuse pip into production venv' closes: abspath compares two spellings
+    of one directory as unequal, so the harness-prefix check passed and the server's own venv
+    was offered to pip.
+    """
+    real = tmp_path / "real"
+    real.mkdir()
+    _make_venv(real)
+    # The harness runs out of real/.venv.
+    monkeypatch.setattr(EO, "_HARNESS_PREFIX", EO._canon(str(real / ".venv")))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
+    # Same directory, reached through a symlink alias. If the platform cannot make one, the
+    # canonical-path guarantee is not exercised here -- skip rather than assert nothing.
+    alias = tmp_path / "alias"
+    try:
+        os.symlink(str(real), str(alias), target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError):
+        import pytest
+        pytest.skip("platform does not permit creating a directory symlink")
+
+    assert EO._canon(str(alias)) == EO._canon(str(real))
+    monkeypatch.chdir(str(alias))
+    assert EO._project_interpreter() is None
+
+
+def test_an_aliased_worker_checkout_is_still_accepted(tmp_path, monkeypatch):
+    """Canonicalising must not over-refuse: a worker's OWN venv, reached through an alias,
+    is a different directory from the harness and must remain a valid target."""
+    harness = tmp_path / "harness"
+    harness.mkdir()
+    _make_venv(harness)
+    monkeypatch.setattr(EO, "_HARNESS_PREFIX", EO._canon(str(harness / ".venv")))
+    monkeypatch.delenv("VIRTUAL_ENV", raising=False)
+
+    work = tmp_path / "work"
+    work.mkdir()
+    cand = _make_venv(work)
+    alias = tmp_path / "work_alias"
+    try:
+        os.symlink(str(work), str(alias), target_is_directory=True)
+    except (OSError, NotImplementedError, AttributeError):
+        import pytest
+        pytest.skip("platform does not permit creating a directory symlink")
+
+    monkeypatch.chdir(str(alias))
+    got = EO._project_interpreter()
+    assert got is not None
+    assert EO._canon(got) == EO._canon(cand)

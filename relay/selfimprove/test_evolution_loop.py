@@ -58,7 +58,7 @@ def test_concluding_does_not_touch_the_proposal():
     led = _ledger()
     original = dict(_propose(led))
     led.conclude(experiment_id="e1", verdict="reject",
-                 actual_effect={"target_class": "-1pp"})
+                 actual_effect={"metric": "-1pp"})
     assert led.proposal_for("e1")["hypothesis"] == original["hypothesis"]
     assert led.proposal_for("e1")["predicted_effect"] == original["predicted_effect"]
 

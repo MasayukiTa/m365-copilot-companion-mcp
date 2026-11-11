@@ -26,7 +26,7 @@ import pytest
 
 from .migrations import connect, apply_migrations
 from . import backfill as bf
-from . import SCHEMA_VERSION
+from . import SCHEMA_REVISION
 
 
 # ---------------------------------------------------------------------------
@@ -72,10 +72,10 @@ def _add_infra(con, incident_id, detected_at, recovered_at):
 # ---------------------------------------------------------------------------
 
 def test_migration_reaches_latest_version(db):
-    assert int(db.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
+    assert int(db.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_REVISION
     row = db.execute(
         "SELECT COUNT(*) FROM schema_migrations WHERE version=?",
-        (SCHEMA_VERSION,),
+        (SCHEMA_REVISION,),
     ).fetchone()
     assert row[0] == 1
 
@@ -85,7 +85,7 @@ def test_migration_is_idempotent(db):
     apply_migrations(db)
     after = db.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
     assert before == after
-    assert int(db.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_VERSION
+    assert int(db.execute("PRAGMA user_version").fetchone()[0]) == SCHEMA_REVISION
 
 
 def test_reason_codes_seeded(db):
