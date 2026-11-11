@@ -29,20 +29,9 @@ MAX_BYTES = 20 * 1024 * 1024
 
 INBOUND_NAME = "mcp_inbound.jsonl"
 REFUSALS_NAME = "fleet_submit_refusals.jsonl"
-#: Where content-similarity is NOTED without refusing anything. The owner's instruction
-#: (2026-10-26/27) is that a goal must never be stopped because its wording resembles another
-#: goal's -- normalisation/similarity may run, but only to RECORD, never to block. A separate
-#: file from REFUSALS_NAME on purpose: a row here is an observation, not a refusal, and must not
-#: be miscounted as one.
+#: Content similarity is recorded without blocking a goal, separately from refusals.
 SIMILAR_OBSERVED_NAME = "fleet_submit_similarity.jsonl"
-#: Where a submission carrying SEVERAL INDEPENDENT GOALS in one prompt is NOTED without refusing
-#: it. The owner's instruction (2026-09-12, jsonl L6695) is that "複数のゴールは投げるべきでは
-#: ない。人間はそこまで詳細にプロンプトを書くはずがない" -- a real person types one instruction,
-#: not a numbered battery of them, so a prompt packed with many goals is the agent over-specifying,
-#: not the person. Following the same owner rule that governs similarity (2026-10-26/27), this is
-#: RECORDED, never refused: the goal is queued whole and the observation only keeps the pattern
-#: visible. A separate file from REFUSALS_NAME and SIMILAR_OBSERVED_NAME on purpose, so a row here
-#: is never miscounted as a refusal or as a near-duplicate.
+#: Multi-goal submissions are queued whole and recorded separately from refusals and similarity.
 MULTI_GOAL_OBSERVED_NAME = "fleet_submit_multigoal.jsonl"
 
 _LOCK = threading.Lock()
@@ -313,9 +302,8 @@ def log_similarity_observed(goal_text: str, source: str, similar_to: str = "",
                             similarity: float = 0.0) -> None:
     """Record that an incoming goal RESEMBLED one already in flight -- WITHOUT refusing it.
 
-    This is the 'normalise in the background' half of the owner's instruction: the goal is
-    queued normally, and the resemblance is noted here only so the pattern stays visible. It
-    is written to SIMILAR_OBSERVED_NAME, never REFUSALS_NAME, because nothing was refused.
+    The goal is queued normally and the resemblance is recorded in SIMILAR_OBSERVED_NAME,
+    separate from refusals.
     Never raises.
     """
     try:
@@ -334,11 +322,8 @@ def log_similarity_observed(goal_text: str, source: str, similar_to: str = "",
 def log_multi_goal_observed(goal_text: str, source: str, goal_count: int) -> None:
     """Record that an incoming prompt carried SEVERAL INDEPENDENT GOALS -- WITHOUT refusing it.
 
-    The owner's rule (2026-09-12, jsonl L6695) is that a person does not write one prompt packed
-    with many goals; a submission that does is the agent over-specifying. Following the same
-    owner instruction that governs similarity (never refuse, only record), the goal is queued
-    whole and the count is noted here only so the pattern stays visible. Written to
-    MULTI_GOAL_OBSERVED_NAME, never REFUSALS_NAME, because nothing was refused. Never raises.
+    The goal is queued whole and the count is recorded in MULTI_GOAL_OBSERVED_NAME,
+    separate from refusals. Never raises.
     """
     try:
         row = {"goal_len": len(str(goal_text or "")),
