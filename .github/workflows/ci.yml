@@ -239,6 +239,7 @@ jobs:
             scripts/test_bridge_signin_is_brought_to_the_person.py \
             scripts/test_ensure_m365_signin_state.py \
             scripts/test_check_no_identifying_names.py \
+            scripts/test_check_commit_identities.py \
             scripts/test_check_no_identifying_names_metadata.py \
             scripts/test_check_integration_evidence.py \
             scripts/test_stale_server_check.py \
