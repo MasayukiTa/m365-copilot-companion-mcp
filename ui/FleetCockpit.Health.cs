@@ -625,8 +625,19 @@ partial class CockpitWindow
             // the truthful state; red or amber here would send the repair at a tunnel nobody uses.
             SetDot(1, HealthState.Gray, T("hs_tun_detail_notused"), now);
         }
-        else if (tunHost != null && (tunHost.State == "foreign" || tunHost.State == "shared"))
+        else if (tunHost != null && TunnelStateIsReportedDown(tunHost.State))
         {
+            // THE SUPERVISOR/PROBE ALREADY NAMED THE CAUSE. Beyond the cross-PC verdicts
+            // (foreign/shared), the always-on tunnel probe writes an explicit down-cause into
+            // .fleet\tunnel_host.json when the public path is broken in a way a probe through
+            // the tunnel cannot itself distinguish or must surface within 60s: the devtunnel
+            // login expired (not_logged_in), no host of this PC is running (no_host), the
+            // local server is down (local_down), or the public URL does not answer
+            // (public_down). Each of these is an operator-actionable outage, not a transient
+            // the supervisor silently self-heals -- so the dot goes RED and shows the file's
+            // own plain message and action verbatim, which already say WHICH cause it is.
+            // "none"/"stale"/"ours" are NOT in this set: those are re-hosted automatically and
+            // fall through to the probe below, exactly as before.
             string detail = tunHost.Message;
             if (!string.IsNullOrEmpty(tunHost.Action)) detail = detail + "  " + tunHost.Action;
             if (string.IsNullOrEmpty(detail)) detail = T("hs_tun_detail_bad");  // file present, no text -- never show a blank dot
@@ -1031,6 +1042,31 @@ partial class CockpitWindow
         public string State = "";
         public string Message = "";
         public string Action = "";
+    }
+
+    // THE SET OF tunnel_host.json STATES THAT MEAN "the public path is down and a person must
+    // act", which the dot shows RED with the file's own message/action. It is a CLOSED,
+    // explicit allow-list rather than "anything that is not ours/none", because the states that
+    // the supervisor re-hosts by itself ("none"/"stale") and the healthy one ("ours") must keep
+    // falling through to the live probe below -- reddening those would send the operator at an
+    // outage the machine is already fixing. The four cause states are written by the always-on
+    // tunnel probe (scripts/probes) so the dot can name WHICH cause within 60s of the failure:
+    //   not_logged_in  devtunnel login expired -- no host can be (re)started until a person
+    //                  signs in; the probe's action opens a VISIBLE console to sign in.
+    //   no_host        login is fine but no devtunnel host of this PC is running.
+    //   local_down     the local MCP server itself is not answering, so even a good tunnel
+    //                  forwards to nothing.
+    //   public_down    the public URL (…/health) does not answer though the local server does
+    //                  -- the break is on the public path, not in this process.
+    // foreign/shared are the pre-existing cross-PC verdicts and stay red here unchanged.
+    static readonly HashSet<string> _tunnelDownStates = new HashSet<string>(StringComparer.OrdinalIgnoreCase)
+    {
+        "foreign", "shared", "not_logged_in", "no_host", "local_down", "public_down",
+    };
+
+    static bool TunnelStateIsReportedDown(string state)
+    {
+        return !string.IsNullOrEmpty(state) && _tunnelDownStates.Contains(state);
     }
 
     // Read tunnel_host.json, but ONLY while the supervisor_pid it names is still alive. A file

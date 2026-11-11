@@ -602,20 +602,22 @@ KEYS = OrderedDict([
        "the same idle rule the server's stale-code cycle uses."),
 
     # Whether to host a Dev Tunnel for an EXTERNAL client even on the connector-less route
-    # (relay/code_staleness.py). ON by default. The agent's tool_transport says how the AGENT
+    # (relay/code_staleness.py). OFF by default. The agent's tool_transport says how the AGENT
     # reaches its tools; it does NOT say whether an outside client (a separate Claude session,
-    # say) needs the local server published through a tunnel. When those two were conflated the
-    # tunnel went unhosted after a reboot on a connector-less PC and the outside client could not
-    # connect. The supervisor reads this each cycle: on means Test-TunnelRouteWanted returns true
-    # whatever the route is; off restores the old behaviour (connector-less hosts no tunnel).
-    _k("host_tunnel_for_external_clients", EACH_GATE, "on",
+    # say) needs the local server published through a tunnel. A connector-less agent needs no
+    # tunnel, so by default the supervisor hosts none -- hosting one anyway re-published the
+    # server after every reboot even when no external client wanted it, and a machine carrying a
+    # stale MCP_TUNNEL_NAME/MCP_TUNNEL_URL from a copied .env then re-hosted a tunnel nobody used.
+    # The supervisor reads this each cycle: on means Test-TunnelRouteWanted returns true whatever
+    # the route is; off (default) leaves a connector-less route hosting no tunnel.
+    _k("host_tunnel_for_external_clients", EACH_GATE, "off",
        "relay/code_staleness.py:host_tunnel_for_external_clients_setting (every supervisor cycle)",
        "off|on. on: the supervisor hosts and watches a Dev Tunnel even when tool_transport is "
        "connector-less, because an external client (not a fleet agent) reaches the local server "
-       "through that tunnel. off: the old behaviour, a connector-less route hosts no tunnel. "
+       "through that tunnel. off (default): a connector-less route hosts no tunnel. "
        "Re-read each supervisor cycle with no restart. A tunnel already running is left alone "
-       "either way. Default on: the reboot that left the tunnel unhosted stranded an outside "
-       "client that depended on it."),
+       "either way. Default off: a connector-less agent needs no tunnel, so none is hosted unless "
+       "the operator turns this on for an outside client."),
 
     # The bridge's tool-call probe (bridge/copilot_bridge.py). It decides when to send, so the
     # timer re-reads this every few minutes; "each_gate" is the nearest declared boundary: a

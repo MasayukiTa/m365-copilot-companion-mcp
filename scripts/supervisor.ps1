@@ -389,21 +389,41 @@ function Test-TunnelRouteWanted {
     # $false when NO Dev Tunnel is wanted: the agent's route is connector-less AND no external
     # client needs the local server published. The agent's tool_transport says how the AGENT
     # reaches its tools; it does NOT say whether an outside client (a separate session on another
-    # machine) reaches the local server through the tunnel. host_tunnel_for_external_clients (ON
-    # by default) keeps the tunnel hosted and watched for that client whatever the route is; when
-    # it is off the old rule stands and a connector-less route hosts no tunnel. Both are asked of
-    # the product's own readers, at most once a minute, so a change in the GUI is followed without
-    # a restart and a tick pays nothing. A host that is ALREADY running is left alone (this
-    # supervisor never kills a live tunnel): it just stops being managed.
+    # machine) reaches the local server through the tunnel. On the connector-less route the
+    # supervisor hosts NO tunnel by default (host_tunnel_for_external_clients defaults OFF); only
+    # when the operator turns host_tunnel_for_external_clients ON is a tunnel hosted and watched
+    # for that external client. The connector route always hosts (its agent reaches its tools
+    # through the tunnel). Both inputs are asked of the product's own readers, at most once a
+    # minute, so a GUI change is followed without a restart and a tick pays nothing. A host that
+    # is ALREADY running is left alone (this supervisor never kills a live tunnel): it just stops
+    # being managed. The host/no-host rule itself lives in one pure place,
+    # scripts/supervisor_tunnel_decision.py (decide_host_tunnel/host_reason), so this caller and
+    # doctor.ps1 cannot drift: an explicit tool_transport=connector-less already beats a stale
+    # MCP_TUNNEL_NAME/MCP_TUNNEL_URL footprint in relay/tool_bridge.py, so a copied .env cannot
+    # make a connector-less PC re-host a tunnel.
     $now = [DateTime]::UtcNow
     if ($script:TunnelRouteAt -and (($now - $script:TunnelRouteAt).TotalSeconds -lt 60)) { return $script:TunnelRouteWanted }
     $t = Get-ToolTransport -Python $Py -RepoRoot $Root
-    $hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"
-    $wanted = ($t -ne "connector-less") -or $hostForExternal
+    $setting = Get-HostTunnelForExternalClientsSetting
+    $reason = "connector"
+    try {
+        $decExpr = "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_tunnel_decision as d; print(d.decide_host_tunnel(r'$t', r'$setting') + '|' + d.host_reason(r'$t', r'$setting'))"
+        $dec = ([string](& $Py -c $decExpr 2>$null)).Trim()
+    } catch { $dec = "" }
+    $parts = $dec -split '\|'
+    if ($parts.Count -ge 2 -and ($parts[0] -eq "host" -or $parts[0] -eq "no_host")) {
+        $wanted = ($parts[0] -eq "host")
+        $reason = $parts[1]
+    } else {
+        # Fail-safe if the decider could not be run: keep the connector route hosting, and let an
+        # explicit connector-less route host only when the setting is on.
+        $hostForExternal = ($setting -eq "on")
+        $wanted = ($t -ne "connector-less") -or $hostForExternal
+        $reason = if ($wanted -and ($t -eq "connector-less") -and $hostForExternal) { "external-client" } elseif ($wanted) { "connector" } else { "none" }
+    }
     if ($null -ne $script:TunnelRouteWanted -and $script:TunnelRouteWanted -ne $wanted) {
         Write-Log ("tool route changed: " + $t + " -> Dev Tunnel management " + $(if ($wanted) { "resumes" } else { "stops (no tunnel is needed)" }))
     }
-    $reason = if ($wanted -and ($t -eq "connector-less") -and $hostForExternal) { "external-client" } elseif ($wanted) { "connector" } else { "none" }
     if ($script:TunnelRouteReason -ne $reason) {
         if ($reason -eq "external-client") {
             Write-Log "tool route is connector-less, but host_tunnel_for_external_clients=on -> Dev Tunnel is hosted and watched for an external client"
@@ -2546,6 +2566,80 @@ function Ensure-DiskSeries {
     }
 }
 
+# -- SYNTHETIC MCP-HANDSHAKE MONITOR (2026-11-11) ---------------------------------------------
+# WHY: Test-ServerUp above does a loopback GET /health only. Measured 2026-11-11: the owner's
+# chat client 'muse' saw the MCP *handshake* (initialize) fail with HTTP 404 after ~60 s while
+# our /health was 200 everywhere -- the loopback liveness and the PUBLIC MCP route the client
+# uses can disagree. tools/mcp_handshake_probe.py runs the REAL handshake (initialize ->
+# notifications/initialized -> tools/list) against BOTH 127.0.0.1:8000/mcp and the public
+# MCP_TUNNEL_URL+/mcp every 60 s, records status/latency/which-hop into
+# .setup\logs\mcp_synthetic_monitor_status.json, and raises an alert after 2 consecutive
+# failures. The supervisor HOSTS it for the same reason it hosts disk-series: it is the one
+# process alive the whole time. Launched exactly like Ensure-DiskSeries (venv python, hidden
+# window, output redirected, -PassThru so a later tick can see it exit).
+$script:McpMonitorProc = $null
+# Last gateway verdict from the synthetic monitor, so the down/recovered transition is logged once.
+$script:LastMcpGatewayVerdict = "unknown"
+
+function Ensure-McpHandshakeMonitor {
+    # Keep exactly one tools.mcp_handshake_probe resident alive. Never throws -- a monitor that
+    # could take down the supervisor would be worse than a gap in the series.
+    try {
+        if ($script:McpMonitorProc) {
+            try {
+                $script:McpMonitorProc.Refresh()
+                if (-not $script:McpMonitorProc.HasExited) { return }
+            } catch { }
+        }
+        Update-PythonInterpreter "the MCP handshake monitor"
+        $logDir = Join-Path $Root ".setup\logs"
+        try { if (-not (Test-Path $logDir)) { New-Item -ItemType Directory -Force $logDir | Out-Null } } catch { }
+        $mmOut = Join-Path $logDir "mcp-monitor.out.log"
+        $mmErr = Join-Path $logDir "mcp-monitor.err.log"
+        try {
+            $script:McpMonitorProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "tools.mcp_handshake_probe", "--interval=60")) `
+                -WorkingDirectory $Root -WindowStyle Hidden `
+                -RedirectStandardOutput $mmOut -RedirectStandardError $mmErr -PassThru
+        } catch {
+            Write-Log "mcp handshake monitor output could not be redirected ($($_.Exception.Message)); starting without it"
+            $script:McpMonitorProc = Start-Process -FilePath $Py -ArgumentList (@("-m", "tools.mcp_handshake_probe", "--interval=60")) `
+                -WorkingDirectory $Root -WindowStyle Hidden -PassThru
+        }
+        Write-Log "mcp handshake monitor launched (.setup\logs\mcp_synthetic_monitor_status.json / _alert.json)"
+    } catch {
+        Write-Log "mcp handshake monitor could not be started: $($_.Exception.Message)"
+    }
+}
+
+function Get-McpGatewayVerdict {
+    # GOAL item 4: decide the gateway is down from the synthetic monitor's REAL-handshake
+    # result, not from the loopback /health. PURE DECISION IS IN PYTHON
+    # (scripts/mcp_handshake_monitor.decide_gateway_from_monitor, tested on the CI runner); this
+    # only reads the status file and its age and asks that function. Returns the verdict string
+    # ('down' / 'up' / 'stale' / 'unknown') or 'unknown' on any error. 'down' is the only value
+    # a caller should act on; 'stale'/'unknown' mean "fall back to the loopback checks".
+    try {
+        $statusPath = Join-Path $Root ".setup\logs\mcp_synthetic_monitor_status.json"
+        if (-not (Test-Path $statusPath)) { return "unknown" }
+        $ageSec = ((Get-Date) - (Get-Item $statusPath).LastWriteTime).TotalSeconds
+        $verdict = & $Py "-c" @"
+import json, sys
+sys.path.insert(0, r'$Root')
+from scripts.mcp_handshake_monitor import decide_gateway_from_monitor
+try:
+    st = json.load(open(r'$statusPath', encoding='utf-8'))
+except Exception:
+    st = None
+print(decide_gateway_from_monitor(st, float(sys.argv[1]))['verdict'])
+"@ ([string]$ageSec) 2>$null
+        $verdict = ([string]$verdict).Trim()
+        if ($verdict) { return $verdict }
+        return "unknown"
+    } catch {
+        return "unknown"
+    }
+}
+
 # -- NEVER TWO READERS FOR ONE TUNNEL (2026-11-02) --------------------------------------------
 # Measured 2026-11-02: a <1 min outbound network drop at 07:34 made the reader started at 21:23
 # (python -m relay.tunnel_host_log, a supervisor child) lose its relay connection; it was
@@ -4038,6 +4132,12 @@ Invoke-LocalLoopAutoResume | Out-Null
 # tick (below) to relaunch it if it ever exits, the same single-resident shape as the server.
 Ensure-DiskSeries
 
+# Start the synthetic MCP-handshake monitor resident once, before the loop; relaunched every
+# tick (below) if it exits. It watches the REAL handshake on both the loopback and the public
+# MCP route, which Test-ServerUp's /health GET cannot see (measured 2026-11-11: muse's
+# initialize 404'd after ~60 s while /health was 200).
+Ensure-McpHandshakeMonitor
+
 # THE DEBOUNCE IS FOR A SERVER THAT MIGHT COME BACK, NOT FOR ONE THAT WAS NEVER STARTED.
 # Starting at zero meant the FIRST launch waited out four consecutive failures. MEASURED on
 # this machine: "supervisor up" at 11:44:39, "MCP server process launched" at 11:45:52 -- 73
@@ -4245,6 +4345,22 @@ while ($true) {
     # Keep the disk-series sampler alive: relaunch it if it has exited since the last tick. Cheap
     # when it is already running (one HasExited read).
     Ensure-DiskSeries
+
+    # Keep the synthetic MCP-handshake monitor alive, same single-resident shape.
+    Ensure-McpHandshakeMonitor
+
+    # GOAL item 4: decide the gateway is down from the monitor's REAL handshake, not from the
+    # loopback /health below. Only 'down' (public handshake failed >= 2 consecutive ticks in a
+    # fresh status) is acted on; 'stale'/'unknown' fall through to the /health checks as before.
+    # Logged here so a public-only outage (the muse 404-after-60s case) is named even while
+    # Test-ServerUp still reports the loopback 200 as healthy.
+    $mcpGatewayVerdict = Get-McpGatewayVerdict
+    if ($mcpGatewayVerdict -eq 'down' -and $script:LastMcpGatewayVerdict -ne 'down') {
+        Write-Log 'MCP gateway DOWN per the synthetic handshake monitor (public initialize failed >= 2 consecutive ticks) while the loopback /health may still be 200 -- see .setup\logs\mcp_synthetic_monitor_alert.json'
+    } elseif ($mcpGatewayVerdict -ne 'down' -and $script:LastMcpGatewayVerdict -eq 'down') {
+        Write-Log ('MCP gateway recovered per the synthetic handshake monitor (verdict now ' + $mcpGatewayVerdict + ')')
+    }
+    $script:LastMcpGatewayVerdict = $mcpGatewayVerdict
 
     # Report any tracked fleet/review/LOCAL_LOOP auto-resume runner that has exited since the last tick.
     # Every tick, not just after a relaunch, because the runner that needs reporting may still

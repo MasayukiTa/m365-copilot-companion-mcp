@@ -1,15 +1,16 @@
 # -*- coding: utf-8 -*-
 """The template must state what a STANDARD (default) setup gets for the Dev Tunnel.
 
-The standard setup hosts a Dev Tunnel for external clients. This behavior is
-implemented (PR #295: host_tunnel_for_external_clients, ON by default, hosts a tunnel for an
-external client even on the connector-less default route) and declared in tools/settings_keys.py,
-but a person reading .env.example to decide what their machine does could not find it: the Dev
-Tunnel section spoke only of anonymous access. The conclusion now lives in the template, and this
-test keeps it true to the implementation so the two cannot drift.
+WHY THIS EXISTS. The owner asked, of the env/tunnel work, "standard no kankyou settei wo shita
+hito wa dou naru?" -- what happens to someone who left this template unchanged. The answer now is:
+a standard, connector-less setup hosts NO Dev Tunnel, because host_tunnel_for_external_clients is
+OFF by default (tools/settings_keys.py) -- the supervisor does not host or re-host a tunnel on the
+connector-less route unless the operator turns that setting on for an external client. A person
+reading .env.example to decide what their machine does must find this, so the conclusion lives in
+the template, and this test keeps it true to the implementation so the two cannot drift.
 
 The assertions below bind the TEMPLATE PROSE to the CODE DEFAULTS, not to any particular wording,
-so an edit that changes the default (say, host_tunnel_for_external_clients off by default) fails
+so an edit that changes the default (say, host_tunnel_for_external_clients on by default) fails
 here until the template is corrected too. It reads files only; it is portable across OSes.
 """
 from __future__ import annotations
@@ -59,31 +60,30 @@ def test_the_section_names_the_connector_less_default_route():
     assert "public url" in low
 
 
-def test_the_section_agrees_with_the_host_tunnel_default_being_on():
+def test_the_section_agrees_with_the_host_tunnel_default_being_off():
     from relay import code_staleness
 
     # Guard the facts the prose leans on. If these change, the prose below is no longer true.
-    assert code_staleness.HOST_TUNNEL_DEFAULT == "on"
+    assert code_staleness.HOST_TUNNEL_DEFAULT == "off"
     assert code_staleness.HOST_TUNNEL_MODES == ("off", "on")
     assert code_staleness.HOST_TUNNEL_KEY == "host_tunnel_for_external_clients"
 
     section = _standard_setup_section(_env_example_text())
-    # the prose must name the setting and state it is ON by default (that is what gives a
-    # standard, connector-less setup a hosted tunnel for an external client)
+    # the prose must name the setting and state it is OFF by default (that is what makes a
+    # standard, connector-less setup host no tunnel)
     assert "host_tunnel_for_external_clients" in section
     low = section.lower()
-    assert "on by default" in low
+    assert "off by default" in low
+    # the on case (turn it on for an external client) must still be stated
     assert "external client" in low
-    # and the off case (a connector-less PC then hosts no tunnel) must be stated, matching the
-    # declared modes
-    assert "off" in low
+    assert "turn that setting on" in low
 
 
 def test_the_section_agrees_with_the_settings_declaration():
     from tools import settings_keys
 
     key = settings_keys.KEYS["host_tunnel_for_external_clients"]
-    assert key.default == "on"
+    assert key.default == "off"
     section = _standard_setup_section(_env_example_text())
     # the prose points the reader at where the toggle lives, matching the declaration's home
     assert "settings_keys.py" in section

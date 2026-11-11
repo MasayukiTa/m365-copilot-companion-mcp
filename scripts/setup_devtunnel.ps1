@@ -2,14 +2,16 @@
 #
 # Fixes the three first-run defects seen on a fresh PC:
 #   1. winget did not install devtunnel  -> falls back to the official DIRECT DOWNLOAD (no winget).
-#   2. `devtunnel login` browser did not open / Entra ID failed -> falls back to DEVICE-CODE sign-in
-#      (works on any machine, no browser popup: shows a code to enter at microsoft.com/devicelogin).
+#   2. `devtunnel login` needs an interactive Microsoft sign-in -> this script opens it in a
+#      VISIBLE console window. DEVICE-CODE SIGN-IN IS NEVER USED: this tenant's Entra forbids it
+#      (it silently blocks for ~15 min and fails with "Verification code expired"), and a hidden
+#      `devtunnel user login` fails with "A window handle must be configured" and used to fall
+#      back to the blocked device code. Interactive login now runs in a window the user can see.
 #   3. the Dev Tunnel URL never appeared -> this script CREATES the tunnel + port and PRINTS the
 #      public URL (and records it + the tunnel name in .env) so you can paste it into Copilot Studio.
 #
 # Idempotent: an already-installed CLI / existing sign-in / existing tunnel are reused, not recreated.
 #   .\setup_devtunnel.ps1                 # install+login+ensure tunnel, print the URL
-#   .\setup_devtunnel.ps1 -DeviceCode     # force device-code sign-in (no browser)
 #   .\setup_devtunnel.ps1 -TunnelName foo # use/create a specific tunnel name
 # Exit codes: 0 ready (URL recorded, an access grant in place); 1 failed; 3 set up and URL recorded
 # but NO access grant (none chosen); 4 the chosen grant (A/T) is not on the tunnel when read back.
@@ -24,8 +26,7 @@ param(
     # reads $env: first and then takes the FIRST matching .env line, so a stale key or an
     # inherited variable silently overrode a fresh choice.
     [switch]$ForceAnonymous,
-    [int]$Port = 8000,
-    [switch]$DeviceCode
+    [int]$Port = 8000
 )
 $ErrorActionPreference = "Continue"
 # This script lives in <repo>\scripts; the .env it records the tunnel name/URL into is at the
@@ -611,32 +612,29 @@ if ($who -match 'Logged in as') {
     Write-Host "      the sign-in happens then, not before."
     exit 3
 } else {
-    Write-Host "[2/4] sign-in required. A browser (or a device code) will appear -- complete the Entra ID / Microsoft sign-in."
-    if ($DeviceCode) {
-        # User forced device-code directly: this prints the URL + code and blocks until done.
-        & $script:DtExe user login -d
-    } else {
-        # Launch the browser login WITHOUT blocking, then poll for up to 120s so a legitimate MFA
-        # browser sign-in has time to complete. We never start the device-code flow while this one
-        # may still be running -- only after this window closes without success.
-        Start-Process $script:DtExe -ArgumentList @("user", "login") -WindowStyle Hidden | Out-Null
-        $signedIn = $false
-        for ($i = 0; $i -lt 24; $i++) {
-            if (((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true; break }
-            $remaining = 120 - ($i * 5)
-            Write-Host "      Waiting for you to finish the Microsoft sign-in in the browser... ${remaining}s"
-            Start-Sleep -Seconds 5
-        }
-        if (-not $signedIn -and ((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true }
-        if (-not $signedIn) {
-            Write-Host "      The browser sign-in did not complete in time -> DEVICE CODE."
-            Write-Host "      A URL and a short code will be shown below. Open https://microsoft.com/devicelogin and enter the code:"
-            & $script:DtExe user login -d
-        }
+    Write-Host "[2/4] sign-in required. A VISIBLE console window will open for the Entra ID / Microsoft sign-in."
+    # DEVICE CODE IS NEVER USED (cause 4, 2026-11-11): this tenant's Entra forbids device-code
+    # login, and `devtunnel user login -d` blocks ~15 min then fails with "Verification code
+    # expired". The older code ran `Start-Process ... -WindowStyle Hidden`, which fails with
+    # "A window handle must be configured" because an interactive sign-in needs a real console;
+    # it then silently fell back to the blocked device code. So we open the sign-in in a VISIBLE
+    # console window (Start-Process ... -WindowStyle Normal, a window devtunnel can attach to),
+    # poll `user show` for up to 120s, and NEVER touch `-d`. If it still is not done, we say so
+    # and stop -- no device-code path exists to fall through to.
+    Write-Host "      A sign-in window has opened. Complete the Microsoft sign-in there; this is NOT a device code."
+    Start-Process $script:DtExe -ArgumentList @("user", "login") -WindowStyle Normal | Out-Null
+    $signedIn = $false
+    for ($i = 0; $i -lt 24; $i++) {
+        if (((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true; break }
+        $remaining = 120 - ($i * 5)
+        Write-Host "      Waiting for you to finish the Microsoft sign-in in the window that opened... ${remaining}s"
+        Start-Sleep -Seconds 5
     }
+    if (-not $signedIn -and ((Dt user show) -join " ") -match 'Logged in as') { $signedIn = $true }
     $who = (Dt user show) -join " "
     if ($who -notmatch 'Logged in as') {
-        Write-Host "      ERROR: still not signed in. Run  devtunnel user login -d  manually (device code), then re-run this."
+        Write-Host "      ERROR: still not signed in. Open a VISIBLE console and run  devtunnel user login  (NOT -d;"
+        Write-Host "      device code is blocked in this tenant), finish the sign-in there, then re-run this."
         exit 1
     }
     Write-Host ("      signed in -- " + $who)

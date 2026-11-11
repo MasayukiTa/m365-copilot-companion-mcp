@@ -165,7 +165,7 @@ Check "env_api_key" ".env has a readable Bearer token (legacy or DPAPI-protected
 
 Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
     { ($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']) } `
-    "double-click configure_env.bat and paste the Copilot Studio agent URL (README STEP 4)"
+    "double-click configure_env.bat and paste the agent URL: open the agent in Microsoft 365 Copilot, then copy the address of the page whose path contains /agent/ followed by two ids joined by a dot (README STEP 4)"
 
 # NO REQUEST TEMPLATE = EVERY GOAL WAITS FOR A TOKEN FOR EVER. A capture never sends a Copilot turn, so
 # the request template for the agent comes from the donor shipped in relay\seed_donor, written by
@@ -427,8 +427,21 @@ Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
 # for each check it replaces. The connector route keeps every check below, unchanged.
 # The answer comes from relay/tool_bridge.py through Get-ToolTransport (tunnel_name_util.ps1).
 $script:ToolRoute = Get-ToolTransport -Python (Join-Path $repo ".venv\Scripts\python.exe") -RepoRoot $repo
+# ONE LINE saying which tunnel mode is active and WHY. The route and the
+# host_tunnel_for_external_clients setting are turned into the same host/no-host verdict the
+# supervisor uses, by the one pure module scripts/supervisor_tunnel_decision.py, so doctor and the
+# supervisor never disagree about whether a Dev Tunnel is hosted.
+$script:TunnelModeLine = "Tunnel mode: unknown (could not read the tool route / setting)"
+try {
+    $__docPy = (Join-Path $repo ".venv\Scripts\python.exe")
+    if (-not (Test-Path $__docPy)) { $__docPy = "python" }
+    $__hostSetting = ([string](& $__docPy -c "import sys; sys.path.insert(0, r'$repo'); from relay import code_staleness; print(code_staleness.host_tunnel_for_external_clients_setting())" 2>$null)).Trim()
+    $__line = ([string](& $__docPy -c "import sys; sys.path.insert(0, r'$repo\scripts'); import supervisor_tunnel_decision as d; print(d.doctor_line(r'$($script:ToolRoute)', r'$__hostSetting'))" 2>$null)).Trim()
+    if ($__line) { $script:TunnelModeLine = $__line }
+} catch { }
+Check "tunnel_mode" $script:TunnelModeLine { $true } "" -Info
 if ($script:ToolRoute -eq "connector-less") {
-    Check "tool_route" "Tool route: connector-less (no custom connector, no Dev Tunnel - tunnel checks not applicable)" `
+    Check "tool_route" "Tool route: connector-less (no custom connector - connector tunnel checks not applicable)" `
         { $false } `
         "to use the connector route instead: Settings > Tools > Tool route > Connector, then run quickstart.bat" -Info
 } else {
@@ -1082,6 +1095,19 @@ foreach ($line in ($signinOut -split "`r?`n")) {
 Check "edge_bridge" "Bridge Edge running (:9223 -- the chat window's browser)" `
     { Test-EdgeCdp 9223 } `
     "powershell -File scripts\start_bridge.ps1 -Keepalive"
+
+# ONE CLEAR LINE WHILE A SIGN-IN IS PENDING, NOT A STREAM OF WEDGED RESTARTS. start_bridge.ps1's
+# keepalive supervisor, while the bridge Edge sits on a sign-in page, backs off (it does not
+# restart the bridge or open tabs) and records the need in .fleet\bridge_signin_needed. Surface
+# that here as a single INFO row so the state is visible in the doctor output, exactly as it is in
+# the log. Read-only; absent file means no pending sign-in.
+$script:bridgeSigninNeeded = Join-Path $repo ".fleet\bridge_signin_needed"
+if (Test-Path $script:bridgeSigninNeeded) {
+    Check "bridge_signin_needed" "Bridge Edge sign-in pending" `
+        { $false } `
+        "sign-in needed: open the bridge Edge window and finish the sign-in" `
+        -Info
+}
 
 # 4c. The chat backend itself. edge_bridge above probes the Edge the bridge DRIVES; this is
 #     the HTTP server CopilotChat talks to, and nothing looked at it -- so a bridge that holds
