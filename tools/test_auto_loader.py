@@ -156,3 +156,18 @@ def test_a_gate_that_raises_counts_as_closed(auto_pkg):
             return 1
     ''')
     assert load() == []
+
+
+def test_locked_desktop_tools_are_registered_once():
+    """The fixed desktop surface is registered as real callables by the loader."""
+    expected = {"screen_secure_status", "screen_secure_capture"}
+    if sys.platform == "win32":
+        expected.update({
+            "desktop_state", "capture_window_by_title", "screen_full_desktop",
+            "screen_state_report", "screen_lock_history", "screen_state_diff",
+            "screen_msg_click", "screen_msg_text", "screen_msg_key",
+            "screen_msg_close", "screen_uia_dump", "screen_uia_act",
+        })
+    names = [func.__name__ for _, func in auto_loader.load_auto_tools()]
+    for name in expected:
+        assert names.count(name) == 1
