@@ -427,10 +427,34 @@ Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
 # for each check it replaces. The connector route keeps every check below, unchanged.
 # The answer comes from relay/tool_bridge.py through Get-ToolTransport (tunnel_name_util.ps1).
 $script:ToolRoute = Get-ToolTransport -Python (Join-Path $repo ".venv\Scripts\python.exe") -RepoRoot $repo
+# ONE LINE SAYING WHICH TUNNEL MODE IS ACTIVE AND WHY. On the connector-less route the agent holds
+# no connector and reaches its tools without a tunnel, so by default NO Dev Tunnel is hosted and
+# every Dev Tunnel check below is not applicable. The one exception is the explicit opt-in
+# host_tunnel_for_external_clients=on (GUI: Settings > Tools): the user has an EXTERNAL client that
+# reaches the local server through a tunnel, so the supervisor does host one even here -- and doctor
+# must say so rather than claim "no tunnel". Read the setting through its own product reader so this
+# line agrees with what the supervisor actually does (relay/code_staleness.py).
+function Get-HostTunnelForExternalClientsDoctor {
+    try {
+        $py = Join-Path $repo ".venv\Scripts\python.exe"
+        if (-not (Test-Path $py)) { $py = "python" }
+        $v = ([string](& $py -c "import sys; sys.path.insert(0, r'$repo'); from relay import code_staleness; print(code_staleness.host_tunnel_for_external_clients_setting())" 2>$null)).Trim()
+        if ($v -eq "on" -or $v -eq "off") { return $v }
+    } catch { }
+    return "off"
+}
 if ($script:ToolRoute -eq "connector-less") {
-    Check "tool_route" "Tool route: connector-less (no custom connector, no Dev Tunnel - tunnel checks not applicable)" `
-        { $false } `
-        "to use the connector route instead: Settings > Tools > Tool route > Connector, then run quickstart.bat" -Info
+    $hostExternal = (Get-HostTunnelForExternalClientsDoctor) -eq "on"
+    if ($hostExternal) {
+        # Opt-in: a tunnel IS hosted on the connector-less route for an external client.
+        Check "tool_route" ("Tunnel mode: connector-less route, but host_tunnel_for_external_clients=on - a Dev Tunnel IS hosted for an external client (the detailed tunnel checks below still apply)") `
+            { $true } `
+            "to stop hosting a tunnel on this route: Settings > Tools > host_tunnel_for_external_clients > off" -Info
+    } else {
+        Check "tool_route" "Tunnel mode: connector-less route, host_tunnel_for_external_clients=off - no Dev Tunnel is hosted (tunnel checks not applicable)" `
+            { $false } `
+            "to use the connector route instead: Settings > Tools > Tool route > Connector, then run quickstart.bat" -Info
+    }
 } else {
 $turl = $envv['MCP_TUNNEL_URL']
 $tname = $envv['MCP_TUNNEL_NAME']

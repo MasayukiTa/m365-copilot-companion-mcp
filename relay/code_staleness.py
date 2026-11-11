@@ -28,7 +28,7 @@ SELF_RESTART_DEFAULT = "on"
 SELF_RESTART_MODES = ("off", "on")
 
 HOST_TUNNEL_KEY = "host_tunnel_for_external_clients"
-HOST_TUNNEL_DEFAULT = "on"
+HOST_TUNNEL_DEFAULT = "off"
 HOST_TUNNEL_MODES = ("off", "on")
 
 #: Files whose change makes a running supervisor stale. supervisor.ps1 dot-sources the second.
@@ -66,12 +66,14 @@ def self_restart_setting():
 
 def host_tunnel_for_external_clients_setting():
     """The `host_tunnel_for_external_clients` setting, "on" or "off". Read from settings.txt on
-    every call; absent, empty or unrecognised means the default, on. Never raises.
+    every call; absent, empty or unrecognised means the default, off. Never raises.
 
-    on: the supervisor hosts and watches a Dev Tunnel even on the connector-less route, because an
-    EXTERNAL client (not a fleet agent) reaches the local server through that tunnel; whether a
-    tunnel is wanted is therefore independent of the agent's own tool_transport. off: the old
-    behaviour -- a connector-less route hosts no tunnel."""
+    off (the default): a connector-less route hosts NO Dev Tunnel -- the supervisor neither hosts
+    nor re-hosts one, because the agent reaches its tools without a tunnel and nothing external is
+    declared to need the local server published. on: the user has explicitly asked that a Dev Tunnel
+    be hosted and watched even on the connector-less route, because an EXTERNAL client (not a fleet
+    agent) reaches the local server through that tunnel; only then is a tunnel wanted whatever the
+    agent's own tool_transport says."""
     try:
         from tools.settings_path import settings_file
         path = settings_file()

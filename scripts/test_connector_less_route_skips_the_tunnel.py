@@ -108,26 +108,32 @@ def test_supervisor_still_gates_hosting_on_whether_a_tunnel_is_wanted():
     assert "if (-not (Test-TunnelRouteWanted)) {" in sup
 
 
-def test_connector_less_still_hosts_a_tunnel_for_an_external_client_by_default():
-    # The new default (host_tunnel_for_external_clients=on) is what keeps the tunnel up after a
-    # reboot on a connector-less PC: Test-TunnelRouteWanted reads the setting and, when on, wants
-    # the tunnel whatever the route is. The reason is logged so the tick that hosts it explains why.
+def test_connector_less_hosts_no_tunnel_by_default():
+    # THE RULE OF THIS TASK. On the connector-less route the supervisor must NOT host or re-host a
+    # Dev Tunnel unless the user explicitly turned external-client hosting on. That makes the
+    # setting's default OFF: with nothing set, $hostForExternal is false and $wanted collapses to
+    # ($t -ne "connector-less"), i.e. a connector-less PC wants no tunnel. The Python reader that
+    # supervisor.ps1 calls returns the connector-less default (off) unless the file says on, and on
+    # only.
+    from relay import code_staleness
+    assert code_staleness.HOST_TUNNEL_DEFAULT == "off"
+    assert code_staleness.HOST_TUNNEL_MODES == ("off", "on")
+    sup = _read("scripts/supervisor.ps1")
+    assert "host_tunnel_for_external_clients_setting" in sup
+    # off (the default) -> $hostForExternal is false -> $wanted is ($t -ne "connector-less") only
+    assert '$hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"' in sup
+    assert '$wanted = ($t -ne "connector-less") -or $hostForExternal' in sup
+
+
+def test_on_opts_a_connector_less_pc_into_hosting_for_an_external_client():
+    # The ONLY way a connector-less PC hosts a tunnel: the user explicitly sets
+    # host_tunnel_for_external_clients=on. Test-TunnelRouteWanted then reads the setting and, when
+    # on, wants the tunnel whatever the route is. The reason is logged so the tick that hosts it
+    # explains why.
     sup = _read("scripts/supervisor.ps1")
     assert "host_tunnel_for_external_clients_setting" in sup
     assert '$wanted = ($t -ne "connector-less") -or $hostForExternal' in sup
     assert "Dev Tunnel is hosted and watched for an external client" in sup
-
-
-def test_off_restores_the_old_connector_less_behaviour():
-    # With the setting off, the one condition that makes the tunnel wanted is the route being not
-    # connector-less -- i.e. exactly the pre-change rule. The Python reader that supervisor.ps1
-    # calls returns the connector-less default (on) unless the file says off, and off only.
-    from relay import code_staleness
-    assert code_staleness.HOST_TUNNEL_DEFAULT == "on"
-    assert code_staleness.HOST_TUNNEL_MODES == ("off", "on")
-    sup = _read("scripts/supervisor.ps1")
-    # off -> $hostForExternal is false -> $wanted collapses to ($t -ne "connector-less"), the old rule
-    assert '$hostForExternal = (Get-HostTunnelForExternalClientsSetting) -eq "on"' in sup
 
 
 def test_doctor_replaces_the_tunnel_chain_with_one_info_row():
@@ -139,6 +145,28 @@ def test_doctor_replaces_the_tunnel_chain_with_one_info_row():
     for cid in ("tunnel_cli", "tunnel_login", "tunnel_exists", "tunnel_serving", "tunnel_supervisor_match"):
         # each connector check sits in the else branch, after the single row
         assert section.index('"%s"' % cid) > section.index("} else {")
+
+
+def test_doctor_says_in_one_line_which_tunnel_mode_is_active_and_why():
+    # TASK (3): doctor must say in one line which tunnel mode is active and why. On the
+    # connector-less route the single info row names the mode AND the reason, and it tells the two
+    # connector-less sub-modes apart: off (the default) -> no tunnel hosted; on -> a tunnel IS
+    # hosted for an external client. It reads the same product setting the supervisor does so the
+    # line cannot disagree with what actually runs.
+    doc = _read("scripts/doctor.ps1")
+    start = doc.index('$script:ToolRoute = Get-ToolTransport')
+    end = doc.index("# 4. Companion Edge (:9222) for the fleet/agent")
+    section = doc[start:end]
+    # the setting is read through its own product reader (code_staleness), not guessed
+    assert "host_tunnel_for_external_clients_setting" in section
+    # OFF (default): one line, mode + reason, no tunnel
+    assert "host_tunnel_for_external_clients=off" in section
+    assert "no Dev Tunnel is hosted" in section
+    # ON (opt-in): one line, mode + reason, a tunnel IS hosted for an external client
+    assert "host_tunnel_for_external_clients=on" in section
+    assert "a Dev Tunnel IS hosted for an external client" in section
+    # both are the single informational tool_route row
+    assert section.count('Check "tool_route"') == 2
 
 
 # ------------------------------------------------------------------ bootstrap

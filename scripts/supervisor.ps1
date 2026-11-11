@@ -389,9 +389,10 @@ function Test-TunnelRouteWanted {
     # $false when NO Dev Tunnel is wanted: the agent's route is connector-less AND no external
     # client needs the local server published. The agent's tool_transport says how the AGENT
     # reaches its tools; it does NOT say whether an outside client (a separate session on another
-    # machine) reaches the local server through the tunnel. host_tunnel_for_external_clients (ON
-    # by default) keeps the tunnel hosted and watched for that client whatever the route is; when
-    # it is off the old rule stands and a connector-less route hosts no tunnel. Both are asked of
+    # machine) reaches the local server through the tunnel. host_tunnel_for_external_clients (OFF
+    # by default) is the opt-in that keeps the tunnel hosted and watched for that client whatever the
+    # route is; while it is off (the default) a connector-less route hosts and re-hosts no tunnel at
+    # all -- the supervisor must not host one the user did not ask for. Both are asked of
     # the product's own readers, at most once a minute, so a change in the GUI is followed without
     # a restart and a tick pays nothing. A host that is ALREADY running is left alone (this
     # supervisor never kills a live tunnel): it just stops being managed.
