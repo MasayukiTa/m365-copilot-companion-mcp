@@ -93,7 +93,7 @@ def test_without_request_text_the_old_behaviour_is_unchanged():
     assert 679 in vals
 
 
-# -- the real rejected answer now PASSES except for genuinely unsupported numbers ----------
+# Generic fixture.
 
 def test_real_679_answer_passes_when_statistics_are_recomputed():
     r = ap.check_answer_provenance(REAL_ANSWER, REAL_COMPUTED, is_analysis=True,
