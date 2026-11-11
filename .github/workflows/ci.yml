@@ -1181,6 +1181,7 @@ jobs:
             tests/test_a_failed_redaction_withholds_the_text.py \
             tests/test_doctor_self_test_is_not_a_key_mismatch.py \
             scripts/test_connector_less_route_skips_the_tunnel.py \
+            scripts/test_supervisor_tunnel_decision.py \
             scripts/test_tunnel_served_by_another_pc.py \
             scripts/test_start_all_ten_clicks.py \
             scripts/test_heal_tunnel_never_adopts_a_foreign_tunnel.py \

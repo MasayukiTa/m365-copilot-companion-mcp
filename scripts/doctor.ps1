@@ -427,8 +427,21 @@ Check "server_up" "MCP server up (http://127.0.0.1:8000/health)" `
 # for each check it replaces. The connector route keeps every check below, unchanged.
 # The answer comes from relay/tool_bridge.py through Get-ToolTransport (tunnel_name_util.ps1).
 $script:ToolRoute = Get-ToolTransport -Python (Join-Path $repo ".venv\Scripts\python.exe") -RepoRoot $repo
+# ONE LINE saying which tunnel mode is active and WHY. The route and the
+# host_tunnel_for_external_clients setting are turned into the same host/no-host verdict the
+# supervisor uses, by the one pure module scripts/supervisor_tunnel_decision.py, so doctor and the
+# supervisor never disagree about whether a Dev Tunnel is hosted.
+$script:TunnelModeLine = "Tunnel mode: unknown (could not read the tool route / setting)"
+try {
+    $__docPy = (Join-Path $repo ".venv\Scripts\python.exe")
+    if (-not (Test-Path $__docPy)) { $__docPy = "python" }
+    $__hostSetting = ([string](& $__docPy -c "import sys; sys.path.insert(0, r'$repo'); from relay import code_staleness; print(code_staleness.host_tunnel_for_external_clients_setting())" 2>$null)).Trim()
+    $__line = ([string](& $__docPy -c "import sys; sys.path.insert(0, r'$repo\scripts'); import supervisor_tunnel_decision as d; print(d.doctor_line(r'$($script:ToolRoute)', r'$__hostSetting'))" 2>$null)).Trim()
+    if ($__line) { $script:TunnelModeLine = $__line }
+} catch { }
+Check "tunnel_mode" $script:TunnelModeLine { $true } "" -Info
 if ($script:ToolRoute -eq "connector-less") {
-    Check "tool_route" "Tool route: connector-less (no custom connector, no Dev Tunnel - tunnel checks not applicable)" `
+    Check "tool_route" "Tool route: connector-less (no custom connector - connector tunnel checks not applicable)" `
         { $false } `
         "to use the connector route instead: Settings > Tools > Tool route > Connector, then run quickstart.bat" -Info
 } else {
