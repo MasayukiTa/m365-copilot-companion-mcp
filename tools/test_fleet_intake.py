@@ -453,3 +453,94 @@ def test_resume_conv_whitespace_is_normalised():
     fields so a stray newline never becomes part of the id the fleet matches on."""
     FI.fleet_submit("continue", resume_conv="  sess:trim  ")
     assert _jobs()[0]["payload"]["resume_conv"] == "sess:trim"
+
+
+# -- the phantom "pending N" from half-written tmp files --------------------------------------
+#
+# A submission that dies between open() and os.replace leaves a 0-byte `<jid>.json.tmp`. The
+# router skips anything not ending in `.json`, so it is never claimed and never removed. Six of
+# them read as "pending 6" for over a week (measured 2026-11-11). These pin the origin-side fix:
+# fleet_queue counts only real jobs, and the tmp residue is swept where it is made.
+
+import time as _time  # noqa: E402
+
+
+def _write_tmp_orphan(sub, name, age_s):
+    """Create a `<name>` under tasks/<sub> and backdate its mtime by age_s seconds."""
+    d = os.path.join(TR.TASKS, sub)
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, name)
+    with open(p, "w", encoding="utf-8") as fh:
+        fh.write("")
+    old = _time.time() - age_s
+    os.utime(p, (old, old))
+    return p
+
+
+def test_fleet_queue_does_not_count_json_tmp_orphans():
+    """THE PHANTOM COUNT. Six 0-byte `*.json.tmp` files in pending/ once read as 'pending 6'
+    because fleet_queue listed every entry. A tmp is a half-written submission the router will
+    never claim; it must not be counted as a waiting job."""
+    for i in range(6):
+        _write_tmp_orphan("pending", "orphan%d.json.tmp" % i, age_s=0)
+    out = FI.fleet_queue()
+    pending_line = [l for l in out.splitlines() if l.startswith("pending")][0]
+    assert pending_line.split()[1] == "0", out
+
+
+def test_fleet_queue_counts_real_json_jobs():
+    """The filter removes tmp residue, not real jobs: a genuine `.json` still counts."""
+    FI.fleet_submit("a real goal")
+    _write_tmp_orphan("pending", "orphan.json.tmp", age_s=0)
+    out = FI.fleet_queue()
+    pending_line = [l for l in out.splitlines() if l.startswith("pending")][0]
+    assert pending_line.split()[1] == "1", out
+
+
+def test_fleet_queue_pending_agrees_with_pending_count():
+    """The display and the MAX_PENDING admission check must mean the same thing by 'pending'.
+    _pending_count already filtered to `.json`; fleet_queue now does too."""
+    FI.fleet_submit("goal one")
+    FI.fleet_submit("goal two")
+    _write_tmp_orphan("pending", "orphan.json.tmp", age_s=0)
+    out = FI.fleet_queue()
+    pending_line = [l for l in out.splitlines() if l.startswith("pending")][0]
+    assert int(pending_line.split()[1]) == FI._pending_count()
+
+
+def test_sweep_removes_stale_tmp_but_keeps_fresh():
+    """The sweep deletes a `*.json.tmp` older than STALE_TMP_SECONDS and leaves a fresh one --
+    a submission still mid-write (its tmp seconds old) is never raced, while week-old residue
+    goes. Backdated well past the 600s cutoff so the test does not depend on wall-clock timing."""
+    stale = _write_tmp_orphan("pending", "stale.json.tmp", age_s=FI.STALE_TMP_SECONDS + 60)
+    fresh = _write_tmp_orphan("pending", "fresh.json.tmp", age_s=1)
+    removed = FI._sweep_stale_tmp(TR.TASKS)
+    assert removed == 1
+    assert not os.path.exists(stale)
+    assert os.path.exists(fresh)
+
+
+def test_sweep_spans_every_subdirectory():
+    """Orphans are not unique to pending/: the same half-write leaves residue wherever a job is
+    written (measured: dozens sat in closed/). The sweep walks every task subdirectory."""
+    a = _write_tmp_orphan("pending", "a.json.tmp", age_s=FI.STALE_TMP_SECONDS + 60)
+    b = _write_tmp_orphan("done", "b.json.tmp", age_s=FI.STALE_TMP_SECONDS + 60)
+    removed = FI._sweep_stale_tmp(TR.TASKS)
+    assert removed == 2
+    assert not os.path.exists(a) and not os.path.exists(b)
+
+
+def test_fleet_submit_sweeps_stale_tmp_residue():
+    """A machine that keeps submitting never accumulates orphans even if nobody calls
+    fleet_queue: the write path sweeps stale residue after its own os.replace succeeds."""
+    stale = _write_tmp_orphan("pending", "old.json.tmp", age_s=FI.STALE_TMP_SECONDS + 60)
+    out = FI.fleet_submit("trigger a write")
+    assert "queued" in out
+    assert not os.path.exists(stale)
+
+
+def test_fleet_submit_does_not_touch_a_fresh_tmp_from_another_submission():
+    """A concurrent submission mid-write has a seconds-old tmp; the sweep must not delete it."""
+    fresh = _write_tmp_orphan("pending", "inflight.json.tmp", age_s=1)
+    FI.fleet_submit("trigger a write")
+    assert os.path.exists(fresh)

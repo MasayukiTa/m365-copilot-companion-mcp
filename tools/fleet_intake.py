@@ -120,6 +120,54 @@ def _pending_count() -> int:
         return 0
 
 
+#: A `<jid>.json.tmp` is the half-written file fleet_submit() creates just before it renames it
+#: to `<jid>.json` with os.replace (below, ~L1150). The rename is atomic and near-instant, so a
+#: tmp that is still present long after it was written is a submission whose process died between
+#: open() and os.replace -- a 0-byte orphan the router never claims (it skips non-.json) and that
+#: nothing else ever removes. MEASURED 2026-11-11: six such orphans sat in tasks/pending with
+#: mtimes spanning 11/02 16:51 .. 11/11 05:52 (3 of them 9 days old), every one 0 bytes; they had
+#: inflated the pending count for over a week. A real rename completes in milliseconds, so 10
+#: minutes is many orders of magnitude above any legitimate tmp lifetime while being far below
+#: the age of the youngest orphan seen -- it removes residue without racing a submission still in
+#: flight. Chosen as the sweep cutoff for exactly that reason.
+STALE_TMP_SECONDS = 600
+
+
+def _sweep_stale_tmp(tasks_dir: str, max_age_s: int = STALE_TMP_SECONDS) -> int:
+    """Delete `*.json.tmp` orphans older than max_age_s from every task subdirectory.
+
+    Returns the number removed. Best-effort and total: a file that vanishes under us (another
+    submission's os.replace winning the race, or a concurrent sweep) is not an error, and one
+    unreadable entry must not stop the rest. This is the origin-side fix for the inflated count
+    -- the residue is removed where it is made, not merely hidden from the counter.
+    """
+    removed = 0
+    cutoff = time.time() - max_age_s
+    try:
+        subs = os.listdir(tasks_dir)
+    except Exception:
+        return 0
+    for sub in subs:
+        d = os.path.join(tasks_dir, sub)
+        try:
+            names = os.listdir(d)
+        except Exception:
+            continue
+        for name in names:
+            if not name.endswith(".json.tmp"):
+                continue
+            p = os.path.join(d, name)
+            try:
+                if os.path.getmtime(p) < cutoff:
+                    os.remove(p)
+                    removed += 1
+            except FileNotFoundError:
+                pass
+            except Exception:
+                pass
+    return removed
+
+
 def _waiting_count() -> int:
     """Goals that have arrived and not yet been picked up by a runner.
 
@@ -1155,6 +1203,16 @@ def fleet_submit(goal: str, note: str = "", source: str = "",
         _log_refusal("other", text, source)
         return "[fleet_submit: could not queue the goal: %s: %s]" % (type(exc).__name__, exc)
 
+    # SWEEP THE RESIDUE ON THE WRITE PATH, NOT ONLY WHEN SOMEONE LOOKS. This submission's own
+    # tmp has just been renamed away; any `*.json.tmp` still present is an EARLIER submission
+    # that died between open() and os.replace. Clearing stale ones here means a machine that
+    # keeps submitting never accumulates orphans even if fleet_queue() is never called. Nested
+    # in its own guard: the goal is already safely queued and nothing below may undo that.
+    try:
+        _sweep_stale_tmp(TR.TASKS)
+    except Exception:
+        pass
+
     # ONE ADMISSION ENTRY, SHARED WITH EVERY ROUTE. The job is safely on disk; record that an
     # mcp submission arrived, by whom, so this door leaves the SAME receipt the cockpit and CLI
     # routes leave (relay/intake_journal). Never raises -- a journal line is an after-the-fact
@@ -1212,10 +1270,25 @@ def fleet_queue() -> str:
         admit_commands_to_pending(os.path.dirname(TR.TASKS))
     except Exception:
         pass
+    # REMOVE THE RESIDUE THAT INFLATES THE COUNT, AT ITS SOURCE. A `<jid>.json.tmp` left by a
+    # submission that died before os.replace is never claimed by the router and never cleaned by
+    # anything else; six of them read as "pending 6" for over a week (see _sweep_stale_tmp). The
+    # sweep is best-effort -- a failure must never stop the owner from seeing the queue.
+    try:
+        _sweep_stale_tmp(TR.TASKS)
+    except Exception:
+        pass
     lines = []
     for sub in ("pending", "running", "awaiting", "for_fleet", "done"):
         try:
-            names = sorted(os.listdir(os.path.join(TR.TASKS, sub)))
+            # COUNT REAL JOBS, NOT HALF-WRITTEN TMP FILES. os.listdir returned every entry,
+            # including `<jid>.json.tmp` orphans, so a tmp that the router will never claim was
+            # reported as a waiting job -- the exact defect behind the phantom "pending 6". A
+            # real job file ends in `.json`; a `.json.tmp` does not and must not be counted.
+            # This matches _pending_count() above, which already filtered to `.json`, so the
+            # MAX_PENDING admission check and this display now agree on what "pending" means.
+            names = [n for n in os.listdir(os.path.join(TR.TASKS, sub))
+                     if not n.endswith(".json.tmp")]
         except Exception:
             names = []
         lines.append("%-9s %d" % (sub, len(names)))
