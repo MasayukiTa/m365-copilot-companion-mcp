@@ -136,7 +136,7 @@ def test_auth_hop_for_401():
 
 # -- parse_host_connections -----------------------------------------------------
 def test_parse_host_connections():
-    out = ("Tunnel ID             : resonac-mcp.jpe1\n"
+    out = ("Tunnel ID             : companion-mcp.jpe1\n"
            "Host connections      : 0\n"
            "Client connections    : 0\n")
     assert mon.parse_host_connections(out) == 0

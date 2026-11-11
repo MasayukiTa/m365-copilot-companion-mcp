@@ -243,6 +243,7 @@ AUDITED = {
     "tools/data_ops.py": "write_json tool: the caller supplies the whole document",
     "tools/evalbench/fairness.py": "report output",
     "tools/fleet_intake.py": "one job file per submission",
+    "tools/mcp_handshake_monitor.py": "monitor state snapshot: the whole current-tick status (streaks, last statuses, alert flag) is replaced atomically via tmp + os.replace; it carries no accumulated history -- the append-only record is the separate .jsonl, not this file",
     "tools/lock_state.py": "lock/refusal state, rewritten whole by design",
     "tools/rebuild_history.py": "rebuilt from source records",
     "tools/screen_ops.py": "one frame file per capture",

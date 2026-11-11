@@ -47,9 +47,9 @@ from tools import childproc  # noqa: E402
 
 # -- constants ------------------------------------------------------------------
 LOCAL_URL = "http://127.0.0.1:8000/mcp"
-TUNNEL_NAME = "resonac-mcp"
-C2C_WELL_KNOWN = "https://codex-with-chatgpt.shuttle-scope.com/.well-known/oauth-protected-resource/mcp"
-C2C_HEALTH = "https://codex-with-chatgpt.shuttle-scope.com/health"
+TUNNEL_NAME = "companion-mcp"
+C2C_WELL_KNOWN = "https://example-c2c.invalid/.well-known/oauth-protected-resource/mcp"
+C2C_HEALTH = "https://example-c2c.invalid/health"
 
 #: A response is a failure when it is slower than this, even if it would be 200.
 SLOW_THRESHOLD_S = 30.0
