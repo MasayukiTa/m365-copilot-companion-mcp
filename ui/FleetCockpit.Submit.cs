@@ -105,9 +105,7 @@ partial class CockpitWindow
         return outp;
     }
 
-    // A "refused, not submitted" card: a goal fleet_submit turned away. The owner asked that the
-    // system never silently drop a request -- so the reason is shown IN JAPANESE (for a near-
-    // duplicate, naming the job it looked like and the measured overlap), the whole goal is on the
+    // A refused card shows the reason and the complete goal so requests are not silently lost.
     // card, and a "強制投入" (force) button lets the PERSON overrule the refusal. The button
     // runs tools.fleet_intake --force-refused <id>, which is force_submit_refused -- an operator
     // entry deliberately kept out of the MCP tool list, so only a person at this machine reaches it.
