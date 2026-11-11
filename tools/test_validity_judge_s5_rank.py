@@ -6,7 +6,7 @@ Canon: ツール依存可能な主張一覧.md §5 item 5 (line 157):
     (A verdict whose grounds are only D-group / ledger state B-or-below defaults to HOLD.)
 
 These trials use a strong synthetic effect interval (would be GO+EFFECT on its own) and vary
-ONLY the cited-evidence rank. No real data, no prior verdict. The point under test is that the
+ONLY the cited-evidence rank. The point under test is that the
 rank gate (R_*) caps a would-be GO to HOLD, and that it is NOT the order/lock dcap (D_FAIL_*).
 """
 import tools.validity_judge as vj

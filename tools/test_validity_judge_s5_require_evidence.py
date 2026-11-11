@@ -12,7 +12,7 @@ it: a missing/None ground on the GO path becomes R_EVIDENCE_UNKNOWN -> HOLD. The
 (require_evidence=False) preserves the pure 5-arg behaviour for callers that have not opted in.
 
 Strong synthetic effect interval (would be GO+EFFECT on its own); only the evidence handling
-varies. No real data. These rows map 1:1 to the entry-to-output control table in the ELN.
+varies. These synthetic rows cover the entry-to-output control table.
 """
 import tools.validity_judge as vj
 
