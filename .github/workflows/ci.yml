@@ -450,6 +450,7 @@ jobs:
             scripts/test_supervisor_no_duplicate_host.py \
             scripts/test_supervisor_adopt_orphan_reader.py \
             scripts/test_supervisor_dead_tunnel_host_replaced.py \
+            scripts/test_tunnel_token_backup.py \
             scripts/test_supervisor_zero_conn_recovery.py \
             scripts/test_supervisor_login_resume_rehost.py \
             scripts/test_supervisor_hang_detect.py \
