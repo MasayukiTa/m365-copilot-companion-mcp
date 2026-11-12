@@ -567,7 +567,7 @@ def _declared_identity(tool: str, arguments, session: str):
 
 
 def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
-                turn=None, call_id: str = "", ts: float = None) -> str:
+                turn=None, call_id: str = "", ts: float = None, record=None) -> str:
     """Write the CALL record, BEFORE the tool runs. Returns the id to pass to record_outcome.
 
     Before, not after, so a call that never returns still leaves a trace. A ledger written only
@@ -635,6 +635,8 @@ def record_call(tool: str, arguments=None, *, task: str = "", worker: str = "",
         _CALL_STARTS[cid] = (row["ts"], _mono)
     _remember_tool(cid, tool)
     _append(row)
+    if record is not None:
+        record.update(row)
     return cid
 
 
