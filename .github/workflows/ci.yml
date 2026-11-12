@@ -1144,6 +1144,7 @@ jobs:
             tools/test_turn_window_attribution.py \
             tools/test_job_to_campaign_identity.py \
             relay/test_a_coordinator_turn_writes_its_context.py \
+            scripts/test_ledger_dump.py \
             scripts/test_tool_event_report.py \
             scripts/test_sibling_dup_report.py \
             scripts/test_sibling_cost_report.py \
