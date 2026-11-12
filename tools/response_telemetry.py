@@ -264,6 +264,72 @@ def _client_ip(scope):
     return peer
 
 
+# Largest request body peeked for its JSON-RPC envelope. A bigger one is summarised as
+# {"method": "(oversize)"} and its bytes are dropped, so the peek can never grow the request's
+# memory without bound. 1 MB matches tools.obs_log.MAX_PEEK_BYTES.
+_MAX_PEEK_BYTES = 1024 * 1024
+
+
+def _rpc_summary(body):
+    """Summarise a JSON-RPC request body for the telemetry line WITHOUT recording any argument
+    value. Returns a dict with, for the first message of a single or batch body:
+
+      * ``rpc_method``  -- the JSON-RPC ``method`` (e.g. ``tools/call``, ``initialize``), or
+                           ``(unparsed)`` when the body is not JSON.
+      * ``rpc_id``      -- the JSON-RPC ``id`` as a string (so a cut call can be matched to the
+                           client's request), when present.
+      * ``tool``        -- for ``tools/call`` only, ``params.name`` (the tool being invoked).
+      * ``arg_keys``    -- for ``tools/call`` only, the SORTED KEY NAMES of ``params.arguments``
+                           (never any value), so a reader can see the shape of the call.
+      * ``arg_count``   -- for ``tools/call`` only, how many argument keys there were.
+      * ``rpc_batch``   -- the number of messages, only when the body is a JSON-RPC batch (>1).
+
+    Only method names, the tool name, the id, and argument KEY NAMES/COUNT are ever read; a
+    secret passed as an argument VALUE never reaches this function's output. Never raises -- any
+    fault collapses to an empty dict so telemetry can never break a request.
+    """
+    try:
+        if not body:
+            return {}
+        if len(body) > _MAX_PEEK_BYTES:
+            return {"rpc_method": "(oversize)"}
+        try:
+            doc = json.loads(bytes(body).decode("utf-8", "replace"))
+        except Exception:
+            return {"rpc_method": "(unparsed)"}
+        msgs = doc if isinstance(doc, list) else [doc]
+        out = {}
+        if isinstance(doc, list) and len(msgs) > 1:
+            out["rpc_batch"] = len(msgs)
+        first = None
+        for m in msgs:
+            if isinstance(m, dict):
+                first = m
+                break
+        if first is None:
+            out["rpc_method"] = "(non-object)"
+            return out
+        method = str(first.get("method") or "(response)")[:80]
+        out["rpc_method"] = method
+        rid = first.get("id")
+        if rid is not None and not isinstance(rid, (dict, list)):
+            out["rpc_id"] = str(rid)[:80]
+        if method == "tools/call":
+            params = first.get("params")
+            if isinstance(params, dict):
+                name = params.get("name")
+                if name is not None:
+                    out["tool"] = str(name)[:80]
+                args = params.get("arguments")
+                if isinstance(args, dict):
+                    keys = sorted(str(k)[:60] for k in args)[:40]
+                    out["arg_keys"] = keys
+                    out["arg_count"] = len(args)
+        return out
+    except Exception:
+        return {}
+
+
 class ResponseTelemetry:
     """Outermost ASGI wrapper. Records one JSON line per HTTP request; never alters
     the response. Non-HTTP scopes (lifespan, websocket) pass straight through."""
@@ -301,6 +367,14 @@ class ResponseTelemetry:
             "is_sse": False,
             "error": False,
             "disconnected": False,   # http.disconnect from receive before completion
+            # --- request-envelope summary and split timing (added 2026-11-12) ---
+            "req_buf": bytearray(),  # request body peeked for its JSON-RPC envelope (<= _MAX_PEEK_BYTES)
+            "req_over": False,       # request body exceeded the peek cap; bytes dropped
+            "req_done": False,       # whole request body received (more_body false seen)
+            "rpc": None,             # dict from _rpc_summary once the body is complete
+            "t_req_done": None,      # time.time() when the request body finished arriving
+            "t_resp_start": None,    # time.time() of the first http.response.start handed to send
+            "t_disconnect": None,    # time.time() when http.disconnect was observed
         }
 
         # uvicorn on this host accepts an entire single-shot body into its transport buffer
@@ -317,9 +391,34 @@ class ResponseTelemetry:
                 while True:
                     message = await receive()
                     try:
-                        if (message.get("type") == "http.disconnect"
-                                and not state["final_seen"]):
-                            state["disconnected"] = True
+                        mt = message.get("type")
+                        if mt == "http.request":
+                            # Peek the request body for its JSON-RPC envelope only (method, tool
+                            # name, id, argument KEY NAMES). Argument values are never read.
+                            # Bounded by _MAX_PEEK_BYTES so the peek cannot grow memory without
+                            # bound; past the cap the buffer is dropped and the call is summarised
+                            # as (oversize).
+                            if not state["req_done"]:
+                                chunk = message.get("body") or b""
+                                if not state["req_over"]:
+                                    if len(state["req_buf"]) + len(chunk) > _MAX_PEEK_BYTES:
+                                        state["req_over"] = True
+                                        state["req_buf"] = bytearray()
+                                    else:
+                                        state["req_buf"].extend(chunk)
+                                if not message.get("more_body"):
+                                    state["req_done"] = True
+                                    state["t_req_done"] = time.time()
+                                    if state["req_over"]:
+                                        state["rpc"] = {"rpc_method": "(oversize)"}
+                                    else:
+                                        state["rpc"] = _rpc_summary(state["req_buf"])
+                                    state["req_buf"] = bytearray()
+                        elif mt == "http.disconnect":
+                            if state["t_disconnect"] is None:
+                                state["t_disconnect"] = time.time()
+                            if not state["final_seen"]:
+                                state["disconnected"] = True
                     except Exception:
                         pass
                     await inbox.put(message)
@@ -337,6 +436,12 @@ class ResponseTelemetry:
             mtype = message.get("type")
             try:
                 if mtype == "http.response.start":
+                    if state["t_resp_start"] is None:
+                        # First byte the app hands back. The gap from t_req_done to here is the
+                        # tool body + handler time; the gap from t0 to t_req_done is intake /
+                        # network wait. Recording both lets a reader tell a slow tool from a slow
+                        # client/transport.
+                        state["t_resp_start"] = time.time()
                     state["status"] = message.get("status", 0)
                     dcl = -1
                     for (k, v) in (message.get("headers") or []):
@@ -421,7 +526,13 @@ class ResponseTelemetry:
                 watcher.cancel()
                 try:
                     await watcher
-                except Exception:
+                except BaseException:
+                    # Awaiting a just-cancelled task re-raises CancelledError, which is a
+                    # BaseException (NOT an Exception) on 3.8+. Catching only Exception let it
+                    # escape the wrapper and fail the whole request whenever the watcher was still
+                    # blocked in receive() at response end -- the common keep-alive case where no
+                    # http.disconnect has arrived yet. Swallow every stop-the-watcher outcome: the
+                    # response is already delivered and the watcher is pure bookkeeping.
                     pass
             try:
                 self._record(t0, method, path, ip, ua, state)
@@ -434,9 +545,39 @@ class ResponseTelemetry:
                 _inflight_exit()
 
     def _record(self, t0, method, path, ip, ua, state):
-        duration_ms = round((time.time() - t0) * 1000.0, 1)
+        t_end = time.time()
+        duration_ms = round((t_end - t0) * 1000.0, 1)
         declared = state["declared"]
         sent = state["sent"]
+
+        # Split the wall-clock duration into intake/network wait and tool-body time so a slow
+        # tool can be told apart from a slow client or transport:
+        #   wait_ms : t0 -> request body fully received (intake + reading the request off the
+        #             socket; the client's upload / network leg).
+        #   tool_ms : request body received -> first response byte handed to send (FastMCP
+        #             auth + the tool body itself; the server's own work).
+        # Either is None when its boundary was never observed (e.g. a GET with no body, or a
+        # request the app never answered).
+        t_req_done = state.get("t_req_done")
+        t_resp_start = state.get("t_resp_start")
+        wait_ms = None
+        tool_ms = None
+        if t_req_done is not None:
+            wait_ms = round((t_req_done - t0) * 1000.0, 1)
+            if t_resp_start is not None and t_resp_start >= t_req_done:
+                tool_ms = round((t_resp_start - t_req_done) * 1000.0, 1)
+        elif t_resp_start is not None:
+            # No request body boundary seen (e.g. GET): everything up to the first response byte
+            # is the server's own work.
+            tool_ms = round((t_resp_start - t0) * 1000.0, 1)
+
+        # When the client vanished mid-response, how long from the request body arriving to the
+        # disconnect being observed -- i.e. how long the client waited before giving up.
+        recv_to_disconnect_ms = None
+        t_disc = state.get("t_disconnect")
+        if t_disc is not None:
+            base = t_req_done if t_req_done is not None else t0
+            recv_to_disconnect_ms = round(max(0.0, t_disc - base) * 1000.0, 1)
 
         if state["error"]:
             end_reason = "error"
@@ -471,6 +612,18 @@ class ResponseTelemetry:
             "end_reason": end_reason,
             "duration_ms": duration_ms,
         }
+        # Split timing (ms). Present when the relevant boundary was observed.
+        if wait_ms is not None:
+            rec["wait_ms"] = wait_ms
+        if tool_ms is not None:
+            rec["tool_ms"] = tool_ms
+        if recv_to_disconnect_ms is not None:
+            rec["recv_to_disconnect_ms"] = recv_to_disconnect_ms
+        # JSON-RPC envelope summary for /mcp (method, tool name, id, argument KEY NAMES/COUNT).
+        # Only ever on a path that carried a JSON-RPC body; never any argument value.
+        rpc = state.get("rpc")
+        if isinstance(rpc, dict):
+            rec.update(rpc)
         _ring_add(t0, end_reason == "client_gone", short)
         _writer().submit(rec)
 
