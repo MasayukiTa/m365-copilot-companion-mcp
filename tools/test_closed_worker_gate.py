@@ -58,12 +58,23 @@ def test_read_only_passes(state):
     assert call(side_effecting=False) is None
 
 
-def test_tombstone_event_refuses(state):
-    (state / 'status.json').write_text('{}', encoding='utf-8')
+def test_tombstone_jid_refuses(state):
+    (state / 'status.json').write_text(json.dumps({'workers': [
+        {'name': 'w1', 'status': 'running', 'jid': 'j1'}]}), encoding='utf-8')
     folder = state / 'tasks' / 'closed'
     folder.mkdir(parents=True)
     (folder / 'j1.json').write_text(json.dumps({'jid': 'j1', 'events': [{'worker': 'w1'}]}), encoding='utf-8')
     assert call() == gate.REFUSAL
+
+
+def test_tombstone_event_for_reused_name_passes(state):
+    (state / 'status.json').write_text(json.dumps({'workers': [
+        {'name': 'w1', 'status': 'running', 'jid': 'new-job'}]}), encoding='utf-8')
+    folder = state / 'tasks' / 'closed'
+    folder.mkdir(parents=True)
+    (folder / 'old-job.json').write_text(json.dumps({
+        'jid': 'old-job', 'events': [{'worker': 'w1'}]}), encoding='utf-8')
+    assert call() is None
 
 
 def test_direct_registration_refuses_before_execution(state, monkeypatch):
