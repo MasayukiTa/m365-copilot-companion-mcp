@@ -236,6 +236,53 @@ def test_unparsed_and_oversize_bodies_are_labelled_not_dropped(telem):
     assert "tool" not in row
 
 
+# ---- tests: the gateway inner tool name -----------------------------------------------------
+
+def test_call_tool_records_inner_tool_without_inner_arg_values(telem):
+    # A tools/call whose tool is the gateway 'call_tool'. The inner tool name lives in
+    # params.arguments['name']; the inner call's own arguments are under params.arguments
+    # ['arguments']. Only the inner tool NAME must be recorded as inner_tool; no inner argument
+    # value (and no inner arg key name) may appear in the serialised line.
+    body = _tools_call_body(
+        tool="call_tool",
+        args={"name": "read_file",
+              "arguments": {"path": "C:/secret/location", "token": "hunter2-secret"}},
+        rpc_id=55)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert row["inner_tool"] == "read_file"
+    # The outer arguments shape is still recorded (keys name/arguments), but NO inner value or
+    # inner arg key name leaks anywhere in the line.
+    blob = json.dumps(row, ensure_ascii=False)
+    assert "C:/secret/location" not in blob
+    assert "hunter2-secret" not in blob
+    # 'path' and 'token' are INNER arg key names -- they must not be recorded either.
+    assert "token" not in blob
+
+
+def test_call_tool_empty_inner_name_is_recorded_as_index(telem):
+    # The gateway's index lookup passes name='' -- recorded as '(index)', not an empty string.
+    body = _tools_call_body(tool="call_tool", args={"name": "", "arguments": {}}, rpc_id=56)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+    row = telem()[-1]
+    assert row["inner_tool"] == "(index)"
+
+
+def test_call_tool_non_string_inner_name_does_not_raise_or_record(telem):
+    # When the inner 'name' is not a string, no inner_tool is recorded and nothing raises.
+    body = _tools_call_body(tool="call_tool",
+                            args={"name": {"not": "a string"}, "arguments": {}}, rpc_id=57)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert "inner_tool" not in row
+
+
 # ---- tests: the slow-call report ----------------------------------------------------------
 
 def test_slow_tool_calls_collect_filters_and_sorts(tmp_path):
@@ -258,6 +305,23 @@ def test_slow_tool_calls_collect_filters_and_sorts(tmp_path):
     # Only the two tools/call rows over 5 s, slowest first; initialize is excluded even though
     # it is over the threshold.
     assert [h["tool"] for h in hits] == ["slow_b", "slow_a"]
+
+
+def test_slow_tool_calls_fmt_row_shows_inner_tool(tmp_path):
+    from scripts import slow_tool_calls as stc
+
+    # A call through the gateway: tool=call_tool with an inner_tool. The formatted line must show
+    # BOTH the gateway tool and the inner tool.
+    row = {"ts": "2026-11-12T21:10:00", "path": "/mcp", "rpc_method": "tools/call",
+           "tool": "call_tool", "inner_tool": "read_file", "duration_ms": 9000.0,
+           "end_reason": "complete"}
+    line = stc._fmt_row(row)
+    assert "call_tool" in line
+    assert "inner=read_file" in line
+    # A plain call without inner_tool must not print an empty inner= field.
+    plain = stc._fmt_row({"ts": "2026-11-12T21:10:00", "tool": "screen_layout",
+                          "duration_ms": 9000.0, "end_reason": "complete"})
+    assert "inner=" not in plain
 
 
 def test_slow_tool_calls_since_ts_filters_by_timestamp(tmp_path):

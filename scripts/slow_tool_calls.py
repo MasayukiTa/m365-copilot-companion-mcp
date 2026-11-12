@@ -110,6 +110,10 @@ def _fmt_row(row: dict) -> str:
         "%-28s" % str(tool)[:28],
         "end=%s" % (row.get("end_reason") or "?"),
     ]
+    # For a call through the gateway (tool=call_tool), show the inner tool name so the actual
+    # slow tool is visible alongside the gateway tool.
+    if row.get("inner_tool") is not None:
+        parts.append("inner=%s" % str(row.get("inner_tool"))[:28])
     if row.get("wait_ms") is not None:
         parts.append("wait=%sms" % row.get("wait_ms"))
     if row.get("tool_ms") is not None:

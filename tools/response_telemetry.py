@@ -282,6 +282,12 @@ def _rpc_summary(body):
       * ``arg_keys``    -- for ``tools/call`` only, the SORTED KEY NAMES of ``params.arguments``
                            (never any value), so a reader can see the shape of the call.
       * ``arg_count``   -- for ``tools/call`` only, how many argument keys there were.
+      * ``inner_tool``  -- for ``tools/call`` where ``params.name == 'call_tool'`` (the gateway
+                           entry tool) only: the inner tool name from ``params.arguments['name']``
+                           (<= 80 chars), so the actual tool invoked through the gateway is
+                           visible. An empty inner name (the gateway's index lookup) is recorded
+                           as ``(index)``. The inner call's argument VALUES and argument KEY NAMES
+                           are never read -- only the inner tool name string.
       * ``rpc_batch``   -- the number of messages, only when the body is a JSON-RPC batch (>1).
 
     Only method names, the tool name, the id, and argument KEY NAMES/COUNT are ever read; a
@@ -325,6 +331,16 @@ def _rpc_summary(body):
                     keys = sorted(str(k)[:60] for k in args)[:40]
                     out["arg_keys"] = keys
                     out["arg_count"] = len(args)
+                # call_tool is the gateway entry tool: it invokes another tool, whose name is in
+                # params.arguments['name']. Record ONLY that inner tool name as inner_tool so the
+                # actual slow tool is visible; a tools/call with tool=call_tool would otherwise
+                # hide which inner tool was slow. The inner arguments' VALUES (and the inner
+                # arg KEY NAMES) are never read -- only the inner tool name string. An empty
+                # inner name is the gateway's index lookup, recorded as '(index)'.
+                if name == "call_tool" and isinstance(args, dict):
+                    inner = args.get("name")
+                    if isinstance(inner, str):
+                        out["inner_tool"] = inner[:80] if inner != "" else "(index)"
         return out
     except Exception:
         return {}
