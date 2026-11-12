@@ -227,3 +227,43 @@ def test_get_tool_transport_returns_connector_unless_the_product_says_connector_
     out = dict(l.split("=", 1) for l in r.stdout.split() if "=" in l)
     assert out == {"missing": "connector", "noroot": "connector", "less": "connector-less",
                    "conn": "connector", "junk": "connector"}, (r.stdout, r.stderr)
+
+
+def test_explicit_host_choice_wins_and_cockpit_default_agrees(tmp_path, monkeypatch):
+    from relay import code_staleness
+    from tools import settings_path
+    settings = tmp_path / "settings.txt"
+    monkeypatch.setattr(settings_path, "settings_file", lambda: str(settings))
+    assert code_staleness.host_tunnel_for_external_clients_setting() == "off"
+    settings.write_text("host_tunnel_for_external_clients=on\n", encoding="utf-8")
+    assert code_staleness.host_tunnel_for_external_clients_setting() == "on"
+    assert settings.read_text(encoding="utf-8") == "host_tunnel_for_external_clients=on\n"
+    view = _read("ui/EffortPolicy.cs").split("public static class HostTunnelExternalView", 1)[1].split("public static class", 1)[0]
+    assert 'public const string Default = "off";' in view
+
+
+def test_doctor_reports_different_registered_agents_on_one_actionable_line(tmp_path):
+    import json
+    import shutil
+    import subprocess
+    powershell = shutil.which("powershell") or shutil.which("pwsh")
+    if not powershell:
+        pytest.skip("PowerShell is unavailable")
+    source = _read("scripts/doctor.ps1")
+    snippet = source[source.index("function Get-AgentAddressId"):source.index("# NO REQUEST TEMPLATE")]
+    harness = '''param($main, $fleet)
+$envv = @{ MCP_IMPL_AGENT_URL = $main; MCP_FLEET_AGENT_URL = $fleet }
+$script:warn = 0
+function Add-Result { }
+''' + snippet
+    script = tmp_path / "agent-check.ps1"
+    script.write_text(harness, encoding="utf-8")
+    a = "https://example.invalid/chat/agent/T_old.one"
+    b = "https://example.invalid/chat/?titleId=T_new.two"
+    def run(main, fleet):
+        return subprocess.run([powershell, "-NoProfile", "-File", str(script), main, fleet],
+                              capture_output=True, text=True, check=True).stdout.strip().splitlines()
+    lines = run(a, b)
+    assert len(lines) == 1 and "different agents" in lines[0] and "configure_env.bat" in lines[0]
+    assert run(a, "https://example.invalid/chat/?titleId=T_old.one&x=1") == []
+    assert run(a, "") == []
