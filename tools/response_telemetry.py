@@ -282,11 +282,17 @@ def _rpc_summary(body):
       * ``arg_keys``    -- for ``tools/call`` only, the SORTED KEY NAMES of ``params.arguments``
                            (never any value), so a reader can see the shape of the call.
       * ``arg_count``   -- for ``tools/call`` only, how many argument keys there were.
+      * ``inner_tool``  -- for the gateway tool ``call_tool`` only, the value of
+                           ``params.arguments['name']`` (the INNER tool being dispatched), capped
+                           at 80 chars. The empty string (the index/catalogue call) is recorded as
+                           ``(index)``. Only this one string is read -- never the inner call's
+                           argument values and never the inner argument KEY NAMES.
       * ``rpc_batch``   -- the number of messages, only when the body is a JSON-RPC batch (>1).
 
-    Only method names, the tool name, the id, and argument KEY NAMES/COUNT are ever read; a
-    secret passed as an argument VALUE never reaches this function's output. Never raises -- any
-    fault collapses to an empty dict so telemetry can never break a request.
+    Only method names, the tool name, the id, argument KEY NAMES/COUNT, and -- for call_tool --
+    the inner tool NAME are ever read; a secret passed as an argument VALUE never reaches this
+    function's output. Never raises -- any fault collapses to an empty dict so telemetry can never
+    break a request.
     """
     try:
         if not body:
@@ -325,6 +331,15 @@ def _rpc_summary(body):
                     keys = sorted(str(k)[:60] for k in args)[:40]
                     out["arg_keys"] = keys
                     out["arg_count"] = len(args)
+                    # call_tool is the gateway entry point: params.arguments['name'] is the INNER
+                    # tool being dispatched, and WITHOUT this the telemetry only ever sees
+                    # tool=call_tool and cannot say which inner tool was slow. Record ONLY that one
+                    # string (<=80 chars). The empty name is the index/catalogue call. Never read
+                    # the inner call's argument values or inner argument key names.
+                    if name == "call_tool":
+                        inner = args.get("name")
+                        if isinstance(inner, str):
+                            out["inner_tool"] = "(index)" if inner == "" else inner[:80]
         return out
     except Exception:
         return {}
