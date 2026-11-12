@@ -199,10 +199,12 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
         Set-TestFile (Join-Path $client ".env") "SECRET=kept"
         Set-TestFile (Join-Path $client ".config/settings.txt") "my setting"
         Set-TestFile (Join-Path $client "untracked.txt") "my note"
+        $originalIndex = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $client ".git/index")))
         $result = Invoke-RewrittenUpstreamRecovery `
             -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120002"
         if (-not $result.Success) { throw $result.Error }
         Assert-Equal $result.Success $true
+        Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes("$($result.SavedCopy).index"))) $originalIndex
         Assert-Equal (Get-Content (Join-Path $result.SavedCopy "version.txt") -Raw).Trim() "my conflict resolution"
         Assert-Equal (Get-Content (Join-Path $result.SavedCopy "untracked.txt") -Raw).Trim() "my note"
         Assert-Equal (Get-Content (Join-Path $client ".env") -Raw).Trim() "SECRET=kept"

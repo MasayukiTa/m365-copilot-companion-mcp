@@ -153,8 +153,10 @@ function Invoke-RewrittenUpstreamRecovery {
             if ($LASTEXITCODE -ge 8) { throw "copy failed (robocopy exit $LASTEXITCODE)" }
             # Preserve the index as well as the visible files, including staged
             # versions and the three conflict stages. Git objects remain in this repo.
-            $indexPath = (& git -C $RepoRoot rev-parse --path-format=absolute --git-path index | Select-Object -First 1)
-            if ($LASTEXITCODE -ne 0 -or -not $indexPath) { throw "could not locate Git index" }
+            $indexOutput = @(& git -C $RepoRoot rev-parse --path-format=absolute --git-path index 2>$null)
+            $indexExit = $LASTEXITCODE
+            $indexPath = $indexOutput | Select-Object -First 1
+            if ($indexExit -ne 0 -or -not $indexPath) { throw "could not locate Git index (git exit $indexExit)" }
             Copy-Item -LiteralPath $indexPath -Destination "$copyPath.index" -ErrorAction Stop
             $result.SavedCopy = $copyPath
         } catch {
