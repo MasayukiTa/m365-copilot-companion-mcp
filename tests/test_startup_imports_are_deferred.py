@@ -42,7 +42,12 @@ ROOT = Path(__file__).resolve().parent.parent
 # (it imports numpy and, in this project's version, pyarrow); docx/pptx are the
 # document builders; matplotlib is listed defensively -- nothing should import it
 # at startup either.
-HEAVY = ("pandas", "numpy", "pyarrow", "docx", "pptx", "matplotlib")
+# httpx is added here (2026-11-11): web_ops/diagram_ops imported it at module load,
+# dragging in anyio/h11/certifi on the launch->listen path though it is only needed
+# when a web/diagram tool actually runs. It was moved into those functions; this guards
+# the regression. (httpx2, imported by fastmcp.server itself, is framework-required and
+# intentionally NOT listed here -- nothing in this repo can defer it.)
+HEAVY = ("pandas", "numpy", "pyarrow", "docx", "pptx", "matplotlib", "httpx")
 
 
 def _child_env() -> dict:

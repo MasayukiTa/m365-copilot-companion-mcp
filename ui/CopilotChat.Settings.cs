@@ -157,7 +157,8 @@ partial class ChatWindow
         if (k == "signin_open")   return ja ? "Fleet Cockpit を開く" : "Open Fleet Cockpit";
         // ── send-target pinning / reachability fallback errors (nothing was sent) ────
         if (k == "send_wrong_page")  return ja ? "送信先の会話に接続できませんでした — 送信は行われていません" : "Could not connect to the target conversation — nothing was sent.";
-        if (k == "send_unknown_conv") return ja ? "この会話の送信先を特定できません。会話を開き直してください。" : "Can't identify where to send this — please reopen the conversation.";
+        if (k == "send_new_chat") return ja ? "同じ文章で新しいチャットを開く" : "Start a new chat with this text";
+        if (k == "send_unknown_conv") return ja ? "この会話に送信できません。送信は行われていません。" : "Cannot reach this conversation — nothing was sent.";
         // ── fleet conversations: the message goes to the fleet, not to the bridge page ──
         if (k == "fleet_steer_sent")  return ja ? "実行中のワーカーに追加指示を渡しました。次のターンから反映されます。" : "Handed to the running worker -- it takes effect on its next turn.";
         if (k == "fleet_goal_empty") return ja ? "/goal のあとに内容がありません。新しいゴールの本文を書いてください。" : "/goal was given with no text. Write the new goal after it.";

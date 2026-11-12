@@ -1150,6 +1150,63 @@ function Invoke-HangRestartDecision($lastOkAgeSeconds, $listening, $ownMainPyAli
     return "restart"
 }
 
+
+# ---------------------------------------------------------------------------------------------
+# HEALTH-FAIL RESTART (fix 2, measured 2026-11-11): a THIRD liveness trigger beside the strike
+# debounce and the 2-minute full-silence hang gate. It catches the one shape both miss: /health
+# that keeps ANSWERING but is FAILED-or-too-SLOW for N ticks in a row. On 2026-11-11 main.py
+# (pid 24076) answered /health slowly (the supervisor logged "slow (3 s) but answering -- not
+# restarting") from ~17:22 to ~17:26 while the process stayed alive; decide_liveness_strike
+# resets the strike streak on any answer, and the hang gate needs FULL silence, so neither
+# acted and only a manual restart recovered it. The pure gate + the two constants live in
+# scripts/supervisor_health_fail_restart; read them here so the numbers (30s bound, N=4) have
+# one home, with safe fallbacks if the read fails rather than wedging.
+$script:SlowHealthBoundSeconds = 30
+$script:SlowHealthFailStreakN  = 4
+try {
+    $__shb = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_health_fail_restart as M; print(M.SLOW_HEALTH_BOUND_SECONDS)" 2>$null)).Trim()
+    if ($__shb -match '^\d+$') { $script:SlowHealthBoundSeconds = [int]$__shb }
+    $__shn = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_health_fail_restart as M; print(M.SLOW_HEALTH_FAIL_STREAK)" 2>$null)).Trim()
+    if ($__shn -match '^\d+$') { $script:SlowHealthFailStreakN = [int]$__shn }
+} catch { }
+
+# Consecutive UNHEALTHY /health checks (failed OR answered but >= the slow bound). The caller
+# (Test-ServerUp) advances it every tick via the pure next_streak; a single healthy (fast,
+# answered) check resets it to 0 so a lone slow tick on a busy box never provokes a restart.
+$script:HealthFailStreak = 0
+
+# THE HEALTH-FAIL STREAK UPDATE, PURE AND TESTED: supervisor_health_fail_restart.next_streak
+# folds (prev_streak, answered, seconds) into the streak after this check. Called the same way
+# the other gates reach their Python deciders. Any failure leaves the streak unchanged so a
+# broken bridge can neither manufacture nor erase a restart.
+function Update-HealthFailStreak($answered, $seconds) {
+    $an = if ($answered) { "True" } else { "False" }
+    $sec = if ($null -eq $seconds) { "0" } else { ([string][double]$seconds) }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_health_fail_restart as M; print(M.next_streak($($script:HealthFailStreak), $an, $sec, $($script:SlowHealthBoundSeconds)))" 2>$null)).Trim()
+        if ($out -match '^\d+$') { $script:HealthFailStreak = [int]$out }
+    } catch { }
+    return $script:HealthFailStreak
+}
+
+# THE HEALTH-FAIL RESTART GATE, PURE AND TESTED:
+# supervisor_health_fail_restart.decide_health_fail_restart decides "restart" vs "wait" from
+# (streak, listening, own_main_py_alive, booting, N, coordinator_running). Returns "restart"
+# only when N unhealthy checks in a row have landed on a port still held by a live main.py of
+# ours that is not booting and has no coordinator run in flight; any failure returns "wait".
+function Invoke-HealthFailRestartDecision($streak, $listening, $ownMainPyAlive, $booting, $coordinatorRunning = $false) {
+    $la = if ($listening) { "True" } else { "False" }
+    $oa = if ($ownMainPyAlive) { "True" } else { "False" }
+    $ba = if ($booting) { "True" } else { "False" }
+    $cr = if ($coordinatorRunning) { "True" } else { "False" }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_health_fail_restart as M; print(M.decide_health_fail_restart($($streak), $la, $oa, $ba, $($script:SlowHealthFailStreakN), coordinator_running=$cr))" 2>$null)).Trim()
+    } catch {
+        return "wait"
+    }
+    if ($out -ne "restart") { return "wait" }
+    return "restart"
+}
 function Test-ServerUp {
     # A TCP-only connect check cannot detect the failure mode where the port stays
     # LISTENING but the asyncio event loop is dead (every request times out, CLOSE_WAIT
@@ -1218,7 +1275,12 @@ function Test-ServerUp {
             $confirm = Confirm-ServerSlow
             $verdict = Invoke-LivenessStrikeDecision $false $confirm.Ok $confirm.Seconds
             if ($verdict -eq "alive") {
-                $script:LastServerCheck = ("server slow ({0:N0} s) but answering -- not restarting" -f $confirm.Seconds)
+                # The strike debounce treats any answer as alive, so a server that keeps answering
+                # slowly is never struck. Advance the health-fail streak instead: a confirmation that
+                # took >= the slow bound (30s) counts this tick UNHEALTHY; the main loop restarts by
+                # PID once the streak reaches N. This is the 2026-11-11 "slow but answering" shape.
+                [void](Update-HealthFailStreak $true $confirm.Seconds)
+                $script:LastServerCheck = ("server slow ({0:N0} s) but answering (health-fail streak {1}/{2}) -- not restarting unless it persists" -f $confirm.Seconds, $script:HealthFailStreak, $script:SlowHealthFailStreakN)
                 Write-Log $script:LastServerCheck
                 return $true
             }
@@ -1248,6 +1310,9 @@ function Test-ServerUp {
         # restart-loop a healthy server on a machine where process details are unreadable.
         if ($v.Ours -eq $true) { $script:VerifiedServerPid = $serverPid }
     }
+    # A fast, authenticated /health 200: a single healthy check RESETS the health-fail streak
+    # (next_streak returns 0 on a fast answer), so only CONSECUTIVE unhealthy checks accumulate.
+    [void](Update-HealthFailStreak $true 0)
     $script:LastServerCheck = "ok"
     return $true
 }
@@ -2717,10 +2782,14 @@ function Get-ExistingTunnelReaders {
         if (-not $cl) { continue }
         if ($cl -notmatch '(?i)relay[\\/.]tunnel_host_log') { continue }
         if ($bare -and ($cl -notmatch ('(?i)\s"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))) { continue }
-        $out += @{ Pid = [int]$p.ProcessId; CommandLine = $cl }
+        # ParentPid carries the reader's PARENT (its supervisor). A reader whose parent is gone is
+        # an ORPHAN -- the state a fresh -CoreOnly supervisor must ADOPT, not duplicate (see
+        # Adopt-OrphanTunnelReader / supervisor_host_launch.decide_orphan_adoption).
+        $out += @{ Pid = [int]$p.ProcessId; CommandLine = $cl; ParentPid = [int]$p.ParentProcessId }
     }
     if ($trackedPid -and -not (@($out | Where-Object { $_.Pid -eq $trackedPid }).Count)) {
-        $out += @{ Pid = $trackedPid; CommandLine = "(the reader this supervisor launched)" }
+        # The reader this supervisor itself launched is ours by definition; parent is this process.
+        $out += @{ Pid = $trackedPid; CommandLine = "(the reader this supervisor launched)"; ParentPid = $PID }
     }
     return @($out)
 }
@@ -2840,6 +2909,90 @@ function Invoke-HostLaunchDecision {
     return $out
 }
 
+function Invoke-OrphanAdoptionDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c with the
+    # module and function both named, so tools/unreached.py credits this caller and the two cannot
+    # drift): "adopt", "skip" or "launch" from (reader alive, parent supervisor alive, we already
+    # track it). Any failure returns "" so the caller falls back to its old launch path rather than
+    # wrongly adopt or duplicate on an error.
+    param([bool]$ReaderAlive, $ParentSupervisorAlive, [bool]$WeTrackIt)
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    # $null parent -> None (orphan: parent could not be told to be alive). $true/$false map through.
+    $parentArg = if ($null -eq $ParentSupervisorAlive) { "None" } elseif ($ParentSupervisorAlive) { "True" } else { "False" }
+    $trackArg = if ($WeTrackIt) { "True" } else { "False" }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_host_launch; print(supervisor_host_launch.decide_orphan_adoption($aliveArg, $parentArg, $trackArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Test-ProcessAlive {
+    # Is a pid a live process right now? $false for a missing/zero pid or any pid with no process.
+    # Used to tell a reader's PARENT (its supervisor) apart from a gone one -- a reader whose parent
+    # is gone is the ORPHAN that Adopt-OrphanTunnelReader takes over instead of duplicating.
+    param($ProcessId)
+    if ($null -eq $ProcessId) { return $false }
+    $n = 0
+    if (-not [int]::TryParse([string]$ProcessId, [ref]$n)) { return $false }
+    if ($n -le 0) { return $false }
+    try {
+        $p = Get-Process -Id $n -ErrorAction Stop
+        return ($null -ne $p)
+    } catch {
+        return $false
+    }
+}
+
+function Adopt-OrphanTunnelReader {
+    # ADOPT A LIVE ORPHAN READER INSTEAD OF STARTING A SECOND ONE. A supervisor that died can leave
+    # its reader (relay.tunnel_host_log) and that reader's devtunnel host alive as orphans. A fresh
+    # supervisor (including the one start_all.ps1 -CoreOnly starts) must TAKE OWNERSHIP of such a
+    # reader -- track it as $script:TunnelHostProc and keep monitoring it -- not launch a parallel
+    # reader, which is the two-hosts-for-one-tunnel state commit 6cfabfd9 forbids (and which
+    # preceded the 0-byte token cache on 2026-11-12). Returns $true when it adopted a reader (the
+    # caller must then NOT launch), $false when there is nothing to adopt (caller proceeds as before).
+    #
+    # Scope and safety: only readers Get-ExistingTunnelReaders already matched for THIS tunnel are
+    # considered; the orphan test is positive (parent pid is known AND not alive); a reader we
+    # already track is never "adopted" again; the existing live host is left completely untouched
+    # (no kill, no re-host, no devtunnel CLI call here).
+    $readers = @(Get-ExistingTunnelReaders $TunnelName)
+    if ($readers.Count -eq 0) { return $false }
+    $trackedPid = 0
+    if ($script:TunnelHostProc) {
+        try { $script:TunnelHostProc.Refresh(); if (-not $script:TunnelHostProc.HasExited) { $trackedPid = [int]$script:TunnelHostProc.Id } } catch { }
+    }
+    foreach ($r in $readers) {
+        $rp = [int]$r.Pid
+        if ($rp -le 0) { continue }
+        $weTrackIt = ($trackedPid -gt 0 -and $rp -eq $trackedPid)
+        # Parent known? Only then can we say orphan-or-not. An unknown/zero parent reads as
+        # $null -> the decider treats that as "no live parent" (orphan), which is correct here: a
+        # reader we did not start and whose parent we cannot see is not owned by any live supervisor
+        # we can point to. A parent pid that IS a live process means some supervisor still owns it.
+        $parentAlive = $null
+        if ($null -ne $r.ParentPid -and [int]$r.ParentPid -gt 0) {
+            $parentAlive = [bool](Test-ProcessAlive ([int]$r.ParentPid))
+        }
+        $decision = Invoke-OrphanAdoptionDecision -ReaderAlive $true -ParentSupervisorAlive $parentAlive -WeTrackIt $weTrackIt
+        if ($decision -eq "adopt") {
+            try {
+                $proc = Get-Process -Id $rp -ErrorAction Stop
+                $script:TunnelHostProc = $proc
+                Write-Log ("adopted orphan devtunnel host reader pid $rp (its parent supervisor is gone) -- " +
+                           "tracking it as ours instead of starting a second reader (one tunnel, one host)")
+                return $true
+            } catch {
+                Write-Log ("orphan reader pid $rp vanished before it could be adopted -- proceeding normally")
+                return $false
+            }
+        }
+    }
+    return $false
+}
+
 function Get-TunnelReaderChildPid {
     # The pid of the devtunnel host child this reader spawned, or 0 when none is found.
     # Same match Stop-TunnelReaderTree uses: a devtunnel.exe whose ParentProcessId is this
@@ -2937,6 +3090,16 @@ function Start-TunnelHost {
     # a reader that has been at zero connections past the measured grace has its HOST CHILD ended
     # -- only the devtunnel.exe it spawned, never the reader. The reader's serve_forever() then
     # sees the host exit and starts a new host (~8 s to re-register). Still exactly one reader.
+    #
+    # ADOPT A LIVE ORPHAN BEFORE ANYTHING ELSE. A supervisor that died can leave its reader + host
+    # alive as orphans (parent supervisor gone). A fresh supervisor must TAKE OWNERSHIP of that
+    # reader -- track it, leave its host untouched -- rather than launch a second reader (the
+    # two-hosts-for-one-tunnel state commit 6cfabfd9 forbids, which preceded the 0-byte token cache
+    # on 2026-11-12). When Adopt-OrphanTunnelReader adopts one, return as the existing host: the
+    # reader is now ours and the live host is left exactly as it was (no kill, no re-host, no CLI).
+    if (Adopt-OrphanTunnelReader) {
+        return $true
+    }
     $existingReaders = @(Get-ExistingTunnelReaders $TunnelName)
     if ($existingReaders.Count -gt 0) {
         $waited = Get-ReaderSecondsWithoutRelay
@@ -4415,17 +4578,46 @@ while ($true) {
         $script:LastHealthOkAt = Get-Date
         # The server answered, so any hang-restart deferral episode is over; re-arm the one-line log.
         $script:HangRestartDeferredLogged = $false
-        # RESTART-TIME MEASUREMENT: if a hang (or any) restart is in flight, this is the first
-        # tick /health came back. Report how long stop->/health-200 took, then clear the mark.
-        if ($script:HangRestartStartedAt) {
-            $recovered = ((Get-Date) - $script:HangRestartStartedAt).TotalSeconds
-            Write-Log ("hang restart complete: /health answered 200 {0:N1}s after the stop/relaunch began" -f $recovered)
-            $script:HangRestartStartedAt = $null
+        # HEALTH-FAIL RESTART (fix 2, measured 2026-11-11): Test-ServerUp returns $true even when
+        # /health only answered SLOWLY (>= the 30s bound) -- it folds each such tick into
+        # $script:HealthFailStreak. A single fast answer resets that streak to 0, so reaching N here
+        # means N CONSECUTIVE slow/failed-but-answering checks: the "slow (3 s) but answering -- not
+        # restarting" degradation that ran 17:22-17:26 untouched. When the pure gate says so, restart
+        # by PID now (Start-Server kills the port's owner first, then relaunches) rather than leaving
+        # a wedged-but-answering loop up. The port is listening (we just got a 200) and the answer was
+        # not proof of ownership; verify the listener before restarting. A live fleet coordinator defers (the hang
+        # gate's 10-minute override owns a genuinely wedged run, so a run is never cut on slowness).
+        $hfRestartedThisTick = $false
+        if ($script:HealthFailStreak -ge $script:SlowHealthFailStreakN) {
+            $hfCoordLive = (@(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count -gt 0)
+            $hfListeners = Get-PortListenerPids
+            $hfOwn = @($hfListeners.Pids | ForEach-Object { Get-ProcessVerdict $_ } | Where-Object { $_.Ours -eq $true }).Count -gt 0
+            $hfVerdict = Invoke-HealthFailRestartDecision $script:HealthFailStreak ([bool]$hfListeners.Queried -and @($hfListeners.Pids).Count -gt 0) $hfOwn $false $hfCoordLive
+            if ($hfVerdict -eq 'restart') {
+                Write-Log ("server DEGRADED: /health failed or answered >= {0}s for {1} checks in a row while :$Port still held by our main.py -- restarting by PID now (not after the {2}-strike debounce) ({3})" -f $script:SlowHealthBoundSeconds, $script:HealthFailStreak, $FailuresBeforeAction, $script:LastServerCheck)
+                $script:HangRestartStartedAt = Get-Date
+                Start-Server -Cause 'health-fail' -StrikeCount ([int]$script:HealthFailStreak)
+                $serverMiss = 0
+                $script:HealthFailStreak = 0
+                $script:LastHealthOkAt = $null
+                $script:HangRestartDeferredLogged = $false
+                $hfRestartedThisTick = $true
+                Start-Sleep -Seconds 6
+            }
         }
-        # The planned-transition marker is useful only while the replacement server is absent.
-        # Clear any old marker first; Invoke-StaleServerCycle may immediately publish a fresh one.
-        Clear-ServerTransition
-        Invoke-StaleServerCycle
+        if (-not $hfRestartedThisTick) {
+            # RESTART-TIME MEASUREMENT: if a hang (or any) restart is in flight, this is the first
+            # tick /health came back. Report how long stop->/health-200 took, then clear the mark.
+            if ($script:HangRestartStartedAt) {
+                $recovered = ((Get-Date) - $script:HangRestartStartedAt).TotalSeconds
+                Write-Log ("hang restart complete: /health answered 200 {0:N1}s after the stop/relaunch began" -f $recovered)
+                $script:HangRestartStartedAt = $null
+            }
+            # The planned-transition marker is useful only while the replacement server is absent.
+            # Clear any old marker first; Invoke-StaleServerCycle may immediately publish a fresh one.
+            Clear-ServerTransition
+            Invoke-StaleServerCycle
+        }
     } else {
         # DO NOT KILL A SERVER THAT IS STILL STARTING. main.py takes 10-25 seconds just to
         # import (fastmcp alone is ~19s) before it binds, and longer while the machine is
@@ -4474,7 +4666,7 @@ while ($true) {
             $lastOkAge = $null
             if ($script:LastHealthOkAt) { $lastOkAge = ((Get-Date) - $script:LastHealthOkAt).TotalSeconds }
             # IS A FLEET COORDINATOR OF THIS CHECKOUT RUNNING? A hang restart kills the server by
-            # PID and drops the public gateway ~100s; doing that mid-run kills the coordinator too.
+        # PID and drops the public gateway ~100s; doing that mid-run kills the coordinator too.
             # Same helper the fleet-resume gate uses (Get-ThisCheckoutFleetCoordinatorPids).
             $coordLive = (@(Get-ThisCheckoutFleetCoordinatorPids | Where-Object { $_ }).Count -gt 0)
             # The coordinator-aware verdict: the pure gate downgrades 'restart' to 'wait' while a

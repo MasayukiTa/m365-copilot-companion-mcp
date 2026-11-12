@@ -53,8 +53,19 @@ _user32.WindowFromPoint.argtypes = [POINT]
 _user32.WindowFromPoint.restype = wintypes.HWND
 _user32.GetAncestor.argtypes = [wintypes.HWND, ctypes.c_uint]
 _user32.GetAncestor.restype = wintypes.HWND
+_user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND,
+                                             ctypes.POINTER(wintypes.DWORD)]
+_user32.GetWindowThreadProcessId.restype = wintypes.DWORD
 
 GA_ROOT = 2
+
+#: A foreground-window check that only looks at the title is cheated by any window that
+#: borrows a title -- a browser tab reading "Mail", an editor showing a file called
+#: "chat". The process behind the window is the identity that cannot be spoofed by
+#: renaming a caption, so the guard matches on EITHER the process image name OR the
+#: title, and the process name is what makes "a terminal is never the expected app
+#: unless named" decidable at all.
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 
 _ENUMPROC = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
 
@@ -136,6 +147,52 @@ def foreground_window() -> Optional[Target]:
     make_process_dpi_aware()
     hwnd = _user32.GetForegroundWindow()
     return describe(int(hwnd)) if hwnd else None
+
+
+def process_name(hwnd: int) -> str:
+    """The executable name (e.g. "notepad.exe") of the process owning `hwnd`, or "".
+
+    Lower-cased, basename only. "" when the process cannot be opened or the query
+    fails -- a guard that has no process name to check falls back to the title alone,
+    and an empty string here must never read as a match for anything.
+    """
+    try:
+        kernel32 = ctypes.windll.kernel32
+        pid = wintypes.DWORD(0)
+        _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+        if not pid.value:
+            return ""
+        h = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid.value)
+        if not h:
+            return ""
+        try:
+            size = wintypes.DWORD(260)
+            buf = ctypes.create_unicode_buffer(size.value)
+            if not kernel32.QueryFullProcessImageNameW(h, 0, buf, ctypes.byref(size)):
+                return ""
+            import os as _os
+            return _os.path.basename(buf.value).lower()
+        finally:
+            kernel32.CloseHandle(h)
+    except Exception:
+        return ""
+
+
+def foreground_facts():
+    """The live foreground reduced to a foreground_guard.Foreground the guard can judge.
+
+    This is the one place the OS is read for the guard: it names what is in front, its class,
+    the process that owns it, and its rectangle. When nothing is in front (the lock screen, a
+    UAC prompt), ``present`` is False and every coordinate is zero, which the guard reads as
+    "no window to act on".
+    """
+    from .foreground_guard import Foreground
+
+    t = foreground_window()
+    if t is None:
+        return Foreground(False, "", "", "", 0, 0, 0, 0)
+    return Foreground(True, t.title or "", t.cls or "",
+                      process_name(t.hwnd), t.left, t.top, t.right, t.bottom)
 
 
 def children_of(hwnd: int, min_side: int = 8) -> List[Target]:
