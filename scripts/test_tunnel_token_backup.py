@@ -240,3 +240,15 @@ def test_cli_sees_restored_cache_or_is_skipped(tmp_path):
             return
     pytest.skip("installed devtunnel CLI does not honour a redirected cache dir on this "
                 "runner; file-level restore is the verified claim")
+
+
+def test_supervisor_runs_token_tick_once_per_health_cycle():
+    from pathlib import Path
+    supervisor = (Path(REPO) / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
+    loop = supervisor[supervisor.index("while ($true) {", supervisor.index("# Checked once, here")):]
+    assert loop.count('tunnel_token_backup_tick.ps1') == 1
+    tick = loop.index('& $tokenTick -RepoRoot $Root -Python $Py -ErrorAction Stop')
+    assert loop.rfind('try {', 0, tick) != -1
+    assert 'catch {' in loop[tick:loop.index('if (-not (Test-TunnelRouteWanted))', tick)]
+    assert 'Write-Log ("devtunnel token backup tick: "' in loop[tick:]
+    assert tick < loop.index('Test-DevtunnelLoggedInCached', tick)
