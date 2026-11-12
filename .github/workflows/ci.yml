@@ -565,6 +565,7 @@ jobs:
             tools/test_lock_state.py \
             tools/test_notify_ops.py \
             tools/test_ocr_ops.py \
+            tools/test_ocr_batch_child.py \
             tools/test_untrusted_coverage.py \
             tools/test_evidence_trace.py \
             tools/test_auto_loader.py \
