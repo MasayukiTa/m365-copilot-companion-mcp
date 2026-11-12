@@ -1438,7 +1438,8 @@ function Invoke-PostUpdateTail {
     param(
         [string]$Title,
         [string]$OldRef,
-        [int]$Behind
+        [int]$Behind,
+        [string]$RecoveryNote = ""
     )
     # If the update changed any ui/*.cs, rebuild the UI exes (non-fatal if it fails).
     # NOTE: the success dialog below is deliberately the SAME text regardless of which
@@ -1479,7 +1480,7 @@ function Invoke-PostUpdateTail {
         Write-Host "[update] stale-server check skipped (error): $($_.Exception.Message)"
     }
 
-    Show-OwnedDialog ("Updated to the latest version.{0}" -f $rebuildNote) $Title "OK" "Information" | Out-Null
+    Show-OwnedDialog ("Updated to the latest version.{0}{1}" -f $RecoveryNote, $rebuildNote) $Title "OK" "Information" | Out-Null
 
     # DESIGN NOTE: the update above just landed new files on disk, but THIS process
     # is still running the OLD (pre-update) start_all.ps1 that was already loaded
@@ -1994,18 +1995,18 @@ function Check-ForUpdates {
             $recovery = Invoke-RewrittenUpstreamRecovery -RepoRoot $root -Upstream "@{u}" -Timestamp $stamp
             if (-not $recovery.Success) {
                 Write-Host "[update] recovery aborted: $($recovery.Error)"
-                Show-OwnedDialog "Update could not complete. Your current version is kept." $title "OK" "Warning" | Out-Null
+                Show-OwnedDialog ("Update could not complete: $($recovery.Error). Saved copy: $($recovery.SavedCopy); backup branch: $($recovery.BackupBranch); stash: $($recovery.StashRef)") $title "OK" "Warning" | Out-Null
                 return
             }
             Write-Host ("[update] recovery: reset to @{{u}} succeeded " +
                         "(backup=$($recovery.BackupBranch) stashed=$($recovery.StashCreated) " +
-                        "stashRef=$($recovery.StashRef))")
+                        "stashRef=$($recovery.StashRef) savedCopy=$($recovery.SavedCopy))")
 
             # Same shared tail (rebuild + generic success dialog + re-exec) as the
             # fast-forward path -- diff the ui-rebuild check from the PRE-RESET sha
             # captured above rather than HEAD@{1} (still valid after reset --hard, but
             # the explicit sha is unambiguous and documents the intent).
-            Invoke-PostUpdateTail -Title $title -OldRef $recovery.OldSha -Behind $behind
+            Invoke-PostUpdateTail -Title $title -OldRef $recovery.OldSha -Behind $behind -RecoveryNote "`n`nLocal work saved: copy $($recovery.SavedCopy); stash $($recovery.StashRef); previous commits on branch $($recovery.BackupBranch)."
             return
         }
 

@@ -134,6 +134,8 @@ $script:DevtunnelLoginAnswerWasCached = $false
 $script:DevtunnelLoginRecheckReason = "first check"
 $script:LiveChecks = 0
 $script:LiveAnswer = $true
+# This test exercises the login-answer cache independently of the token-file gate.
+function Get-DevtunnelTokenCachePath { return $null }
 function Test-DevtunnelLoggedIn { $script:LiveChecks++; return $script:LiveAnswer }
 """
 
