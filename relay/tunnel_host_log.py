@@ -26,6 +26,17 @@ has the counts without re-reading the whole log on every poll.
 The decision helpers (:func:`millis_stamp`, :func:`backoff_seconds`, :class:`RotatingLog`
 and :func:`pump_stream`) take no devtunnel and no real clock dependency, so the hermetic CI
 suite exercises them on Linux with a fake command.
+
+WHY A LOG WRITE THAT FAILS MUST NOT KILL THE READER (2026-11-12). The host log stopped mid
+stack-trace at 18:41:35 and was silent for hours while the reader (pid 24664) and the host
+(devtunnel.exe, pid 32472, the reader's child) were both still alive. The only way that
+happens is an exception escaping ``RotatingLog.write_line`` (the ``self._fh.write`` was the
+one file op outside a ``try``): it unwinds out of ``pump_stream``'s read loop and kills the
+stdout/stderr pump thread. With nobody draining the host's pipes they fill and the host
+blocks on write -- the exact 2026-10-31 structure described above. So write_line now SWALLOWS
+write/flush/tell failures (it drops the line and counts it, retrying to reopen at most once
+every 30 s), and pump_stream reads to EOF even if a per-line sink/hook call raises. Keeping
+the pipe drained is the first priority; losing a few log lines is the acceptable cost.
 """
 from __future__ import annotations
 
@@ -54,6 +65,12 @@ from tools import childproc
 
 DEFAULT_MAX_BYTES = 20 * 1024 * 1024
 DEFAULT_BACKUPS = 5
+
+#: Minimum seconds between reopen attempts while writes keep failing. A full disk or a log
+#: directory that vanished will fail every line; reopening on every failed line would spin the
+#: CPU and hammer the filesystem. We try at most once per this interval and otherwise just drop
+#: and count, which keeps the pump thread cheap and alive until the condition clears.
+REOPEN_THROTTLE_SECONDS = 30.0
 
 
 def millis_stamp(epoch=None):
@@ -87,24 +104,48 @@ class RotatingLog:
     * rotates when the file would exceed ``max_bytes``: ``name`` -> ``name.1`` -> ... up to
       ``backups`` old files, the oldest discarded,
     * survives process restarts because it always appends to the live name.
+
+    RESILIENT TO WRITE FAILURE. A write that raises ``OSError`` (disk full, directory gone,
+    handle invalidated) must never escape :meth:`write_line` -- an escaping exception killed
+    the pump thread and stalled the host (see module docstring). On failure the line is
+    dropped and counted, a reopen is attempted at most once every
+    :data:`REOPEN_THROTTLE_SECONDS`, and the first successful write after a failure streak is
+    preceded by one ``(N lines dropped ...)`` notice so the gap is visible in the log itself.
     """
 
-    def __init__(self, path, max_bytes=DEFAULT_MAX_BYTES, backups=DEFAULT_BACKUPS):
+    def __init__(self, path, max_bytes=DEFAULT_MAX_BYTES, backups=DEFAULT_BACKUPS,
+                 reopen_throttle=REOPEN_THROTTLE_SECONDS, now=time.time):
         self.path = path
         self.max_bytes = int(max_bytes)
         self.backups = int(backups)
         self._lock = threading.Lock()
         self._fh = None
+        # Write-failure accounting. _dropped counts lines lost since the last successful
+        # write; _last_reopen_attempt is when we last tried to reopen (None = never), used to
+        # throttle reopen attempts while writes keep failing. _now is injectable so the test
+        # drives the 30 s throttle with a fake clock.
+        self._dropped = 0
+        self._last_reopen_attempt = None
+        self._reopen_throttle = float(reopen_throttle)
+        self._now = now
         d = os.path.dirname(path)
         if d:
             try:
                 os.makedirs(d, exist_ok=True)
             except OSError:
                 pass
+        # A failed initial open must not prevent construction: the reader still has to drain
+        # the host's pipes even if the log cannot be written yet. _open() swallows and leaves
+        # _fh = None; write_line then counts drops and retries the open on its throttle.
         self._open()
 
     def _open(self):
-        self._fh = self._open_shared(self.path)
+        """(Re)open the log for append. Never raises: on failure leaves ``_fh`` None."""
+        self._last_reopen_attempt = self._now()
+        try:
+            self._fh = self._open_shared(self.path)
+        except OSError:
+            self._fh = None
 
     @staticmethod
     def _open_shared(path):
@@ -118,7 +159,7 @@ class RotatingLog:
                 # shared-read on this platform too; we keep the hook explicit so the intent
                 # is recorded and a future tightening has one place to change.
                 return open(path, "a", encoding="utf-8", buffering=1)
-            except Exception:
+            except ImportError:
                 return open(path, "a", encoding="utf-8", buffering=1)
         return open(path, "a", encoding="utf-8", buffering=1)
 
@@ -150,30 +191,88 @@ class RotatingLog:
                 pass
         self._open()
 
+    def _maybe_reopen_locked(self):
+        """Try to reopen a dead handle, but at most once every throttle interval.
+
+        Called under ``_lock`` while writes are failing. Returns True if ``_fh`` is usable
+        after the call. Reopening on every failed line would spin the CPU and hammer the
+        filesystem on a persistent fault (full disk, vanished directory), so a reopen is
+        attempted only when at least ``_reopen_throttle`` seconds have passed since the last
+        attempt; otherwise the line is simply dropped and counted.
+        """
+        if self._fh is not None:
+            return True
+        last = self._last_reopen_attempt
+        if last is not None and (self._now() - last) < self._reopen_throttle:
+            return False
+        self._open()  # sets _last_reopen_attempt; leaves _fh None on failure
+        return self._fh is not None
+
+    def _format(self, text):
+        return millis_stamp() + " " + text.rstrip("\r\n") + "\n"
+
     def write_line(self, text):
-        """Stamp ``text`` and append it, rotating first if it would cross the size cap."""
-        line = millis_stamp() + " " + text.rstrip("\r\n") + "\n"
+        """Stamp ``text`` and append it, rotating first if it would cross the size cap.
+
+        NEVER RAISES. Any ``OSError`` from tell/rotate/write/flush is caught: the line is
+        dropped, ``_dropped`` is incremented, and a reopen is attempted on the 30 s throttle.
+        The first line written after a failure streak is preceded by one notice naming how
+        many lines were dropped, so the gap is self-describing in the log.
+        """
+        line = self._format(text)
         data = line.encode("utf-8")
         with self._lock:
+            if not self._maybe_reopen_locked():
+                # No usable handle and not time to retry the open yet: drop and count.
+                self._dropped += 1
+                return
             try:
-                size = self._fh.tell()
-            except (OSError, ValueError):
-                size = 0
-            if size and size + len(data) > self.max_bytes:
-                self._rotate_locked()
-            self._fh.write(line)
-            try:
-                self._fh.flush()
+                try:
+                    size = self._fh.tell()
+                except (OSError, ValueError):
+                    size = 0
+                if size and size + len(data) > self.max_bytes:
+                    self._rotate_locked()
+                    if self._fh is None:
+                        # rotation reopened and failed; drop and count without raising.
+                        self._dropped += 1
+                        return
+                # If we dropped lines since the last success, say so ONCE, first -- best
+                # effort: if this notice itself fails we fall through to the OSError handler
+                # and keep the drop count, so it is retried before the next real line.
+                if self._dropped:
+                    notice = self._format(
+                        "(%d lines dropped while the log could not be written)"
+                        % self._dropped)
+                    self._fh.write(notice)
+                    self._dropped = 0
+                self._fh.write(line)
+                try:
+                    self._fh.flush()
+                except OSError:
+                    pass
             except OSError:
-                pass
+                # The write (or the drop notice) failed. Count this line as dropped and
+                # invalidate the handle so the next call retries the open on its throttle.
+                # Crucially we do NOT re-raise: the caller is the pump thread draining the
+                # host's pipes, and it must keep reading.
+                self._dropped += 1
+                try:
+                    if self._fh is not None:
+                        self._fh.close()
+                except Exception:
+                    pass
+                self._fh = None
 
     def close(self):
         with self._lock:
             try:
-                self._fh.flush()
-                self._fh.close()
+                if self._fh is not None:
+                    self._fh.flush()
+                    self._fh.close()
             except Exception:
                 pass
+            self._fh = None
 
 
 def pump_stream(stream, sink, on_line=None):
@@ -182,19 +281,33 @@ def pump_stream(stream, sink, on_line=None):
     Blocks in its own thread; returns when the stream closes. ``on_line`` (optional) is
     called with each raw line after it is written -- the analyzer hook uses it. Decoding
     errors never stop the pump: a line that will not decode is replaced, not dropped.
+
+    READING TO EOF IS THE FIRST PRIORITY. This thread is the only drain of the host's
+    stdout/stderr pipe; if it stops, the pipe fills and the host blocks (the 2026-10-31 /
+    2026-11-12 stall). So a failure inside ``sink.write_line`` or ``on_line`` for one line
+    must NEVER end the loop -- both calls are wrapped, their exceptions swallowed and counted,
+    and the loop continues to the next line until the stream is truly at EOF. The count is
+    returned for the tests (production ignores it).
     """
     if isinstance(stream, io.TextIOBase):
         iterator = stream
     else:
         iterator = io.TextIOWrapper(stream, encoding="utf-8", errors="replace")
+    errors = 0
     for line in iterator:
         text = line.rstrip("\r\n")
-        sink.write_line(text)
+        # write_line is contracted not to raise, but we still guard it: a bug or an
+        # unexpected non-OSError there must not stop the pipe from being drained.
+        try:
+            sink.write_line(text)
+        except Exception:
+            errors += 1
         if on_line is not None:
             try:
                 on_line(text)
             except Exception:
-                pass
+                errors += 1
+    return errors
 
 
 # THE RECONNECT LIMIT, SHARED WITH THE SUPERVISOR. scripts/supervisor_zero_conn_recovery.py
