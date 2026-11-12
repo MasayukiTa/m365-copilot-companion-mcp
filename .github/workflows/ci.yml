@@ -220,6 +220,7 @@ jobs:
             tools/overnight/test_overnight_report.py \
             tools/overnight/test_overnight_queue.py \
             tools/test_a_locked_out_worker_should_not_clone_its_own_work.py \
+            tools/test_closed_worker_gate.py \
             tools/test_a_shared_tail_of_common_rules_is_not_a_duplicate.py \
             tools/test_a_short_request_that_names_a_different_thing_is_not_a_duplicate.py \
             tests/test_security_state_is_not_readable.py \

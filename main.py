@@ -1391,11 +1391,28 @@ if os.environ.get("MCP_TOOL_MAP") == "1":
         if isinstance(_args, dict):
             _task = str(_args.pop("_task", "") or "")
             _worker = str(_args.pop("_worker", "") or "")
+        _call_record = {}
         try:
             from tools import tool_ledger as _ledger
-            _cid = _ledger.record_call(name, _args, task=_task, worker=_worker)
+            _cid = _ledger.record_call(name, _args, task=_task, worker=_worker, record=_call_record)
         except Exception:
             _ledger = None
+        try:
+            from tools import closed_worker_gate as _closed_gate
+            _side_effecting = (name in _closed_gate.ALWAYS_SIDE_EFFECTING or
+                               not bool((_TOOL_ANNOTATIONS or {}).get(name, {}).get('readOnlyHint')))
+            _refusal = _closed_gate.check(name, _call_record, _side_effecting)
+            if _refusal:
+                try:
+                    if _ledger and _cid:
+                        _ledger.record_outcome(_cid, ok=False, error=_refusal)
+                    if _sec is not None and _tok_handle is not None:
+                        _sec.reset_presented_token(_tok_handle)
+                except Exception:
+                    pass
+                return _refusal
+        except Exception:
+            pass
         # BIND THE WORKER FOR ANY PROCESS THIS CALL SPAWNS. A tool that starts a child
         # (run_python, shell_exec) records the child under this worker via tools.proc_registry,
         # so RelayWorker.close()/cancel() -- and the coordinator-start sweep -- can kill the
@@ -1721,17 +1738,19 @@ try:
 except Exception:
     pass
 
+from tools.closed_worker_gate import ALWAYS_SIDE_EFFECTING as _GATE_SIDE_EFFECTING
+
 for tool in TOOLS:
     _name = getattr(tool, "__name__", "")
     _ann = _TOOL_ANNOTATIONS.get(_name)
     try:
         if _ann:
-            mcp.tool(annotations=_ann)(register(tool))
+            mcp.tool(annotations=_ann)(register(tool, side_effecting=(_name in _GATE_SIDE_EFFECTING or not bool((_ann or {}).get('readOnlyHint')))))
         else:
-            mcp.tool()(register(tool))
+            mcp.tool()(register(tool, side_effecting=(_name in _GATE_SIDE_EFFECTING or not bool((_ann or {}).get('readOnlyHint')))))
     except Exception:
         # Never let one tool's annotation attachment block the rest of registration.
-        mcp.tool()(register(tool))
+        mcp.tool()(register(tool, side_effecting=(_name in _GATE_SIDE_EFFECTING or not bool((_ann or {}).get('readOnlyHint')))))
 
 # Auto-register forged tools (operator A). Safe when tools/auto is empty:
 # load_auto_tools() returns [] and any failing forged module is skipped.
@@ -1743,7 +1762,7 @@ try:
         if _forged in TOOLS:
             continue
         try:
-            mcp.tool()(register(_forged))
+            mcp.tool()(register(_forged, side_effecting=True))
         except Exception:
             pass
 except Exception:
