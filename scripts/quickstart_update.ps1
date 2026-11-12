@@ -94,12 +94,10 @@ try {
         $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
         $recovery = Invoke-RewrittenUpstreamRecovery -RepoRoot $RepoRoot -Upstream "@{u}" -Timestamp $stamp
         if (-not $recovery.Success) {
-            Write-Host "[quickstart-update] recovery aborted: $($recovery.Error)"
+            Write-Host "[quickstart-update] Update failed: $($recovery.Error). Saved copy: $($recovery.SavedCopy); stash: $($recovery.StashRef); backup branch: $($recovery.BackupBranch)."
             exit 1
         }
-        Write-Host ("[quickstart-update] recovery: reset to @{{u}} succeeded " +
-                    "(backup=$($recovery.BackupBranch) stashed=$($recovery.StashCreated) " +
-                    "stashRef=$($recovery.StashRef))")
+        Write-Host "[quickstart-update] Updated to upstream. Local work saved: copy $($recovery.SavedCopy); stash $($recovery.StashRef); previous commits on branch $($recovery.BackupBranch)."
         exit 0
     }
 
