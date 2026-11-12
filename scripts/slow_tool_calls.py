@@ -5,7 +5,8 @@ WHAT THIS ANSWERS. When a client reports that a call "hangs" or is "cut after N 
 first question is WHICH tool and HOW the call ended -- did the server take too long, or did the
 client give up and disconnect first? The response telemetry
 (tools/response_telemetry.py -> .setup/logs/response_telemetry.jsonl) now records, per /mcp
-request, the JSON-RPC method, the tools/call tool name, the JSON-RPC id, and a split of the
+request, the JSON-RPC method, the tools/call tool name, the inner tool name dispatched through
+the call_tool gateway (inner_tool), the JSON-RPC id, and a split of the
 wall-clock time into intake/network wait (`wait_ms`) and the tool body itself (`tool_ms`), plus
 `end_reason` (complete / client_gone / error / stream) and, for a client that vanished,
 `recv_to_disconnect_ms`. This script reads that log and prints every tools/call at or above a
@@ -110,6 +111,10 @@ def _fmt_row(row: dict) -> str:
         "%-28s" % str(tool)[:28],
         "end=%s" % (row.get("end_reason") or "?"),
     ]
+    # For the call_tool gateway, tool=call_tool alone cannot say which inner tool was slow; the
+    # telemetry records that as inner_tool. Show it when present so the slow inner tool is visible.
+    if row.get("inner_tool") is not None:
+        parts.append("inner=%s" % str(row.get("inner_tool"))[:28])
     if row.get("wait_ms") is not None:
         parts.append("wait=%sms" % row.get("wait_ms"))
     if row.get("tool_ms") is not None:

@@ -162,6 +162,70 @@ def test_initialize_records_method_but_no_tool(telem):
     assert "arg_keys" not in row
 
 
+# ---- tests: call_tool gateway records the INNER tool name, never the inner values ----------
+
+def test_call_tool_records_inner_tool_without_inner_argument_values(telem):
+    # call_tool is the gateway: params.name == 'call_tool', and params.arguments['name'] is the
+    # inner tool being dispatched, with the inner call's own arguments nested under
+    # params.arguments['arguments']. The telemetry must record inner_tool but NEVER any inner
+    # argument value.
+    body = _tools_call_body(
+        tool="call_tool",
+        args={"name": "read_file",
+              "arguments": {"path": "C:/secret/inner_location",
+                            "token": "SUPER_SECRET_VALUE_42"}},
+        rpc_id=101)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert row["inner_tool"] == "read_file"
+    # The inner argument VALUES, and the inner argument KEY NAMES, must not appear anywhere in the
+    # serialised line.
+    blob = json.dumps(row, ensure_ascii=False)
+    assert "C:/secret/inner_location" not in blob
+    assert "SUPER_SECRET_VALUE_42" not in blob
+    assert "token" not in blob
+
+
+def test_call_tool_empty_inner_name_is_recorded_as_index(telem):
+    # The index/catalogue call passes name='' to list the categories. inner_tool must be the
+    # literal '(index)', never the empty string.
+    body = _tools_call_body(tool="call_tool", args={"name": "", "arguments": {}}, rpc_id=102)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert row["inner_tool"] == "(index)"
+
+
+def test_call_tool_non_string_inner_name_does_not_raise_or_record(telem):
+    # A non-string (or missing) inner name must not raise and must not record inner_tool.
+    body = _tools_call_body(tool="call_tool",
+                            args={"name": {"not": "a string"}, "arguments": {}},
+                            rpc_id=103)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert "inner_tool" not in row
+
+
+def test_non_call_tool_does_not_get_inner_tool(telem):
+    # A normal (non-gateway) tools/call must never carry inner_tool even if it happens to have an
+    # argument named 'name'.
+    body = _tools_call_body(tool="screen_layout", args={"name": "not_inner"}, rpc_id=104)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+
+    row = telem()[-1]
+    assert row["tool"] == "screen_layout"
+    assert "inner_tool" not in row
+
+
 def _receive_body_then_late_disconnect(body, disconnect_after_s):
     """Deliver the request body at once, then an http.disconnect only AFTER disconnect_after_s --
     long enough that a slow-but-completing response has already finished (final_seen=True), so the
@@ -274,3 +338,20 @@ def test_slow_tool_calls_since_ts_filters_by_timestamp(tmp_path):
 
     hits = stc.collect([str(p)], threshold_ms=5000.0, since_ts="2026-11-12T20:30:00")
     assert [h["tool"] for h in hits] == ["new"]
+
+
+def test_slow_tool_calls_fmt_row_shows_inner_tool():
+    # A call_tool row must print both the outer tool (call_tool) and the inner tool it dispatched.
+    from scripts import slow_tool_calls as stc
+
+    row = {"ts": "2026-11-12T21:20:00", "path": "/mcp", "rpc_method": "tools/call",
+           "tool": "call_tool", "inner_tool": "read_file", "duration_ms": 8000.0,
+           "end_reason": "complete"}
+    line = stc._fmt_row(row)
+    assert "call_tool" in line
+    assert "inner=read_file" in line
+
+    # A plain tools/call row with no inner_tool must not print an inner= field.
+    plain = {"ts": "2026-11-12T21:21:00", "path": "/mcp", "rpc_method": "tools/call",
+             "tool": "screen_layout", "duration_ms": 8000.0, "end_reason": "complete"}
+    assert "inner=" not in stc._fmt_row(plain)
