@@ -279,6 +279,11 @@ def _rpc_summary(body):
       * ``rpc_id``      -- the JSON-RPC ``id`` as a string (so a cut call can be matched to the
                            client's request), when present.
       * ``tool``        -- for ``tools/call`` only, ``params.name`` (the tool being invoked).
+      * ``inner_tool``  -- for a ``tools/call`` of the ``call_tool`` gateway only, the NAME of the
+                           inner tool it runs (``params.arguments['name']``, <=80 chars). The
+                           empty name (an index lookup) is recorded as ``(index)``. A non-string
+                           or missing inner name is not recorded. The inner arguments' values and
+                           key names are never read.
       * ``arg_keys``    -- for ``tools/call`` only, the SORTED KEY NAMES of ``params.arguments``
                            (never any value), so a reader can see the shape of the call.
       * ``arg_count``   -- for ``tools/call`` only, how many argument keys there were.
@@ -325,6 +330,16 @@ def _rpc_summary(body):
                     keys = sorted(str(k)[:60] for k in args)[:40]
                     out["arg_keys"] = keys
                     out["arg_count"] = len(args)
+                # call_tool is the gateway entry point: the ACTUAL tool it runs is named by
+                # params.arguments['name']. Without this, every slow tools/call is recorded as
+                # tool=call_tool and the real inner tool is invisible. Record ONLY that inner
+                # tool NAME (string, <=80 chars) as inner_tool; the empty name is the index
+                # lookup, recorded as '(index)'. The inner arguments' VALUES and KEY NAMES are
+                # never read -- only the inner tool's own name.
+                if str(name) == "call_tool" and isinstance(args, dict):
+                    inner = args.get("name")
+                    if isinstance(inner, str):
+                        out["inner_tool"] = "(index)" if inner == "" else inner[:80]
         return out
     except Exception:
         return {}

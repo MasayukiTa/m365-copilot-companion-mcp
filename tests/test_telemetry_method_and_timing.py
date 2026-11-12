@@ -274,3 +274,74 @@ def test_slow_tool_calls_since_ts_filters_by_timestamp(tmp_path):
 
     hits = stc.collect([str(p)], threshold_ms=5000.0, since_ts="2026-11-12T20:30:00")
     assert [h["tool"] for h in hits] == ["new"]
+
+
+# ---- tests: call_tool gateway records the inner tool name, no inner value leaks -----------
+
+def test_call_tool_records_inner_tool_name_without_inner_values(telem):
+    # call_tool is the gateway: params.name == 'call_tool', and the tool it actually runs is
+    # named by params.arguments['name']. The inner tool's OWN arguments carry a secret value
+    # that must never reach the telemetry line.
+    secret = "S3CRET-inner-arg-value-should-never-appear"
+    args = {"name": "read_file",
+            "arguments": {"path": "C:/secret/" + secret, "password": secret}}
+    body = _tools_call_body(tool="call_tool", args=args, rpc_id=101)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert row["inner_tool"] == "read_file"
+    # The whole serialised line must not contain the inner argument VALUE, nor the inner
+    # argument KEY NAMES ('path'/'password' belong to the inner tool, not to call_tool).
+    blob = json.dumps(row, ensure_ascii=False)
+    assert secret not in blob
+    # arg_keys/arg_count describe call_tool's OWN arguments ({name, arguments}), never the inner
+    # tool's arguments.
+    assert row["arg_keys"] == ["arguments", "name"]
+    assert row["arg_count"] == 2
+
+
+def test_call_tool_empty_inner_name_is_recorded_as_index(telem):
+    # The index lookup is call_tool with an empty inner name; it is recorded as '(index)',
+    # never as an empty string.
+    args = {"name": "", "arguments": {}}
+    body = _tools_call_body(tool="call_tool", args=args, rpc_id=102)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert row["inner_tool"] == "(index)"
+
+
+def test_call_tool_non_string_inner_name_does_not_raise_and_is_not_recorded(telem):
+    # A non-string inner name (here a dict) must not raise and must not be recorded as
+    # inner_tool; the request still completes and is logged.
+    args = {"name": {"unexpected": "object"}, "arguments": {}}
+    body = _tools_call_body(tool="call_tool", args=args, rpc_id=103)
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+    asyncio.run(_run(_scope(), _receive_from(messages), _collecting_send()[0]))
+    row = telem()[-1]
+    assert row["tool"] == "call_tool"
+    assert "inner_tool" not in row
+
+
+def test_rpc_summary_non_string_inner_name_returns_cleanly():
+    # Direct unit check on _rpc_summary: a non-string inner name does not raise and yields no
+    # inner_tool key.
+    doc = {"jsonrpc": "2.0", "id": 5, "method": "tools/call",
+           "params": {"name": "call_tool", "arguments": {"name": 123, "arguments": {}}}}
+    out = rt._rpc_summary(json.dumps(doc).encode("utf-8"))
+    assert out["tool"] == "call_tool"
+    assert "inner_tool" not in out
+
+
+def test_slow_tool_calls_fmt_row_shows_inner_tool():
+    from scripts import slow_tool_calls as stc
+
+    row = {"ts": "2026-11-12T21:10:00", "path": "/mcp", "rpc_method": "tools/call",
+           "tool": "call_tool", "inner_tool": "run_python", "duration_ms": 7000.0,
+           "end_reason": "complete"}
+    line = stc._fmt_row(row)
+    assert "call_tool" in line
+    assert "inner=run_python" in line
