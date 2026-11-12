@@ -40,9 +40,6 @@ def _closed_workers(state_dir):
             with open(os.path.join(tomb_dir, name), encoding='utf-8-sig') as f:
                 item = json.load(f)
             tombstones.add(str(item.get('jid', '')))
-            for event in item.get('events', []):
-                if event.get('worker'):
-                    closed.add(str(event['worker']))
         for worker in workers:
             name = str(worker.get('name') or worker.get('worker') or '')
             jid = str(worker.get('jid') or worker.get('task_id') or '')
