@@ -70,8 +70,7 @@ backup = T.default_backup_dir()
 if not cache or not backup:
     print("skipped-no-localappdata")
     sys.exit(0)
-b = T.do_backup(cache, backup)
-r = T.do_restore(cache, backup, login_running=login_running)
+b, r = T.run_cycle(cache, backup, login_running=login_running)
 print("backup=%s restore=%s" % (b, r))
 '@
 

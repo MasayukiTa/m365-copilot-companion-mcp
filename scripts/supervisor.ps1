@@ -4531,6 +4531,21 @@ while ($true) {
     # First, the interpreter every python launch of this tick uses (D2): one Test-Path unless a
     # .venv has appeared that this supervisor is not using yet. See Update-PythonInterpreter.
     Update-PythonInterpreter "this tick's reaper and queue drain"
+    # Run the token safety net once per health cycle before the login check.
+    # A failed helper must never interrupt supervision.
+    try {
+        $tokenTick = Join-Path $Root "scripts\tunnel_token_backup_tick.ps1"
+        $tokenResult = & $tokenTick -RepoRoot $Root -Python $Py -ErrorAction Stop
+        $tokenLine = $tokenResult -join ' '
+        Write-Log ("devtunnel token backup tick: " + $tokenLine)
+        if ($tokenLine -match 'restore=failed-disk-full') {
+            Write-Log "ALERT: devtunnel token cache is zeroed and restore failed because the disk is full; free disk space. Restore will be retried on the next cycle."
+        } elseif ($tokenLine -match 'backup=failed-disk-full') {
+            Write-Log "ALERT: devtunnel token backup write failed because the disk is full; free disk space. Backup will be retried on the next cycle."
+        }
+    } catch {
+        Write-Log ("devtunnel token backup tick failed: " + $_.Exception.Message)
+    }
     # SUPERVISOR FORENSICS: one heartbeat per loop iteration, so a hard kill leaves a last-seen
     # pid, time and resource reading for the NEXT start to read (see Invoke-SupervisorPreviousDeathCheck).
     $script:HeartbeatIteration++

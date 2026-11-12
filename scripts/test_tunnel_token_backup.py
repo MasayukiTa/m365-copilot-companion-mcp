@@ -240,3 +240,56 @@ def test_cli_sees_restored_cache_or_is_skipped(tmp_path):
             return
     pytest.skip("installed devtunnel CLI does not honour a redirected cache dir on this "
                 "runner; file-level restore is the verified claim")
+
+
+@pytest.mark.parametrize("number,winerror,expected", [
+    (28, None, True), (5, 112, True), (13, None, False), (None, None, False),
+])
+def test_disk_full_classification_requires_destination_write(number, winerror, expected):
+    error = T.CopyWriteError(number, "write failed")
+    error.winerror = winerror
+    assert T.is_disk_full_write(error) is expected
+    assert not T.is_disk_full_write(OSError(number, "read or stat failed"))
+
+
+def test_disk_full_restore_is_reported_and_retried(tmp_path, monkeypatch):
+    import builtins
+    cache = _make_cache_copy(tmp_path, HEALTHY)
+    backup = str(tmp_path / "backup")
+    assert T.do_backup(cache, backup) == "backed-up"
+    live = os.path.join(cache, T.TOKEN_CACHE_NAME)
+    with open(live, "wb") as fh:
+        fh.truncate(0)
+    real_open = builtins.open
+
+    def full_on_destination(path, mode="r", *args, **kwargs):
+        if mode == "wb" and str(path).startswith(live + ".tmp."):
+            raise OSError(28, "disk full")
+        return real_open(path, mode, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(builtins, "open", full_on_destination)
+        assert T.run_cycle(cache, backup, False) == ("skipped-unhealthy", "failed-disk-full")
+    assert os.path.getsize(live) == 0
+    assert T.run_cycle(cache, backup, False) == ("skipped-unhealthy", "restored")
+    assert open(live, "rb").read() == HEALTHY
+
+
+def test_disk_full_backup_does_not_prevent_restore_check(tmp_path, monkeypatch):
+    cache = _make_cache_copy(tmp_path)
+    backup = str(tmp_path / "backup")
+    def fail(*args):
+        raise T.CopyWriteError(28, "disk full")
+    monkeypatch.setattr(T, "_atomic_copy", fail)
+    assert T.run_cycle(cache, backup, False) == ("failed-disk-full", "skipped-live-ok")
+
+
+def test_supervisor_logs_disk_full_and_retries_tick_each_cycle():
+    from pathlib import Path
+    supervisor = (Path(REPO) / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
+    loop = supervisor[supervisor.index("while ($true) {", supervisor.index("# Checked once, here")):]
+    assert loop.count("tunnel_token_backup_tick.ps1") == 1
+    assert "restore=failed-disk-full" in loop
+    assert "backup=failed-disk-full" in loop
+    assert "Restore will be retried on the next cycle" in loop
+    assert loop.index("& $tokenTick") < loop.index("Test-DevtunnelLoggedInCached")
