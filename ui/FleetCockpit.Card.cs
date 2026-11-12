@@ -218,6 +218,10 @@ partial class CockpitWindow
         // gets the distinct ORANGE インフラ待ち treatment: a warning rail/pill, its actionable reason
         // shown as-is, and a 再投入 re-queue action — NOT the red stuck/error recovery surface.
         bool isInfra = !closed && !internalControl && IsInfraStuck(w);
+        // CREDITS_EXHAUSTED gets the same non-red carve-out as INFRA_STUCK, but WITHOUT a re-queue
+        // action (retrying cannot make credits appear). Its reason is the one plain line
+        // (relay/credits_exhausted.MESSAGE), shown verbatim below.
+        bool isCredits = !closed && !internalControl && IsCreditsExhausted(w);
         bool isLocalRuntimeWait = !closed
             && status == "waiting_runtime"
             && string.Equals(S(w, "execution_profile"), "LOCAL_LOOP", StringComparison.OrdinalIgnoreCase)
@@ -238,7 +242,7 @@ partial class CockpitWindow
         // said, in the one shape the operator has objected to for months.
         bool isDone = status == "done" || string.Equals(S(w, "outcome"), "DONE", StringComparison.OrdinalIgnoreCase);
         string chipKind = internalControl ? "neutral"
-            : (isDone ? "success" : (isInfra ? "warning" : Theme.StatusKind(status)));
+            : (isDone ? "success" : ((isInfra || isCredits) ? "warning" : Theme.StatusKind(status)));
         // Fan-out PARENT: its real status is done/FANOUT on purpose, which reads as "finished"
         // while its children still run. The coordinator-side derived display_label (waiting etc.)
         // replaces the chip text only; status/outcome are untouched.
@@ -325,7 +329,8 @@ partial class CockpitWindow
         var chip = Pill(internalControl
             ? (_lang == 0 ? "内部制御" : "Internal control")
             : (isAgentSetupWait ? (_lang == 0 ? "エージェント設定待ち" : "Agent setup required")
-                : (isInfra ? T("infra_wait") : (parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang)))), chipKind);
+                : (isCredits ? (_lang == 0 ? "クレジット不足" : "Out of credits")
+                : (isInfra ? T("infra_wait") : (parentLabel.Length > 0 ? parentLabel : Theme.StatusLabel(status, _lang))))), chipKind);
         chip.Margin = new Thickness(2, 0, 5, 0);
         if (status == "interrupted" && !string.IsNullOrEmpty(reason)) chip.ToolTip = reason;
         DockPanel.SetDock(chip, Dock.Left); left.Children.Add(chip);
@@ -376,6 +381,32 @@ partial class CockpitWindow
                     };
                     col.Children.Add(runtimeReason);
                 }
+            }
+            else if (isCredits)
+            {
+                // CREDITS_EXHAUSTED collapsed row: show the one plain line (the worker reason,
+                // = relay/credits_exhausted.MESSAGE) VERBATIM -- the same words the doctor path
+                // prints -- then only an Open-conversation shortcut. No re-queue: retrying cannot
+                // assign capacity. NOT the red error surface, and excluded from the failure count.
+                if (!string.IsNullOrEmpty(reason))
+                {
+                    var cr = new TextBlock
+                    {
+                        Text = OneLine(reason),
+                        Foreground = Muted, FontSize = 12.5,
+                        TextTrimming = TextTrimming.CharacterEllipsis,
+                        TextWrapping = TextWrapping.NoWrap,
+                        Margin = new Thickness(24, 4, 0, 0)
+                    };
+                    col.Children.Add(cr);
+                }
+                var creditsRow = new StackPanel { Orientation = Orientation.Horizontal, Margin = new Thickness(24, 6, 0, 2) };
+                creditsRow.MouseLeftButtonUp += delegate (object s2, MouseButtonEventArgs e2) { e2.Handled = true; };
+                var creditsOpen = AttentionBtn(_lang == 0 ? "会話を開く" : "Open conversation");
+                string creditsNm = name; string creditsUrl = conv;
+                creditsOpen.Click += delegate (object s2, RoutedEventArgs e2) { e2.Handled = true; FlashOpen(card); OpenWorker(creditsNm, creditsUrl); };
+                creditsRow.Children.Add(creditsOpen);
+                col.Children.Add(creditsRow);
             }
             else if (isInfra)
             {

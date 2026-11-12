@@ -397,8 +397,8 @@ echo   first and your answer is recorded. Say no and nothing is created.
 echo.
 set "PROV_SHORTCUT=no"
 set "PROV_AUTOSTART=no"
-set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [Y/n] "
-if /i not "!MKLNK!"=="n" set "PROV_SHORTCUT=yes"
+set /p MKLNK="   Create a one-click 'M365 Companion' launcher on your Desktop? [y/N] "
+if /i "!MKLNK!"=="y" set "PROV_SHORTCUT=yes"
 set /p MKAUTO="   Start the background supervisor automatically when you log on? [y/N] "
 if /i "!MKAUTO!"=="y" set "PROV_AUTOSTART=yes"
 
