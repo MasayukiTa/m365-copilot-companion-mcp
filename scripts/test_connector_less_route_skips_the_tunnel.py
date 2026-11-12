@@ -246,6 +246,7 @@ def test_doctor_reports_different_registered_agents_on_one_actionable_line(tmp_p
     import json
     import shutil
     import subprocess
+    from tools.childproc import decode
     powershell = shutil.which("powershell") or shutil.which("pwsh")
     if not powershell:
         pytest.skip("PowerShell is unavailable")
@@ -261,8 +262,9 @@ function Add-Result { }
     a = "https://example.invalid/chat/agent/T_old.one"
     b = "https://example.invalid/chat/?titleId=T_new.two"
     def run(main, fleet):
-        return subprocess.run([powershell, "-NoProfile", "-File", str(script), main, fleet],
-                              capture_output=True, text=True, check=True).stdout.strip().splitlines()
+        result = subprocess.run([powershell, "-NoProfile", "-File", str(script), main, fleet],
+                                capture_output=True, check=True)
+        return decode(result.stdout).strip().splitlines()
     lines = run(a, b)
     assert len(lines) == 1 and "different agents" in lines[0] and "configure_env.bat" in lines[0]
     assert run(a, "https://example.invalid/chat/?titleId=T_old.one&x=1") == []
