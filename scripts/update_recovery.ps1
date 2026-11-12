@@ -90,6 +90,7 @@ function Invoke-RewrittenUpstreamRecovery {
         HadLocalChanges = $false
         StashCreated = $false
         StashRef = ""
+        SavedCopy = ""
     }
 
     if (-not $Timestamp) {
@@ -124,13 +125,8 @@ function Invoke-RewrittenUpstreamRecovery {
     }
     $result.BackupBranch = $backupBranch
 
-    # A checkout can be stranded mid-operation by an earlier pull that began a
-    # merge (or rebase/cherry-pick) against a since-rewritten upstream and left
-    # an unmerged index behind. In that state `git stash push -u` refuses to run,
-    # so the stash step below would fail before the reset ever happens. The
-    # original HEAD is already safe on the backup branch created above, so abort
-    # any in-progress operation first and clear the index. We never touch the
-    # backup branch or any stash here.
+    # An unmerged index cannot be stashed. Copy the checkout before aborting:
+    # a branch protects commits, not conflict resolutions or other worktree edits.
     $inProgress = $false
     foreach ($marker in @("MERGE_HEAD", "REBASE_HEAD", "CHERRY_PICK_HEAD")) {
         & git -C $RepoRoot rev-parse --verify --quiet $marker > $null 2>&1
@@ -141,6 +137,32 @@ function Invoke-RewrittenUpstreamRecovery {
         if ($unmerged.Count -gt 0) { $inProgress = $true }
     }
     if ($inProgress) {
+        $parent = Split-Path -Parent ([IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/'))
+        $copyBase = Join-Path $parent ("update-saved-$Timestamp")
+        $copyPath = $copyBase
+        $copySuffix = 2
+        while (Test-Path -LiteralPath $copyPath) {
+            $copyPath = "$copyBase-$copySuffix"
+            $copySuffix++
+        }
+        try {
+            New-Item -ItemType Directory -Path $copyPath -ErrorAction Stop | Out-Null
+            # /XJ avoids traversing junctions; /XD excludes Git's administrative
+            # directory, not ignored user files such as .env and .config.
+            & robocopy $RepoRoot $copyPath /E /XJ /XD (Join-Path $RepoRoot ".git") /R:0 /W:0 /NFL /NDL /NJH /NJS /NP | Out-Null
+            if ($LASTEXITCODE -ge 8) { throw "copy failed (robocopy exit $LASTEXITCODE)" }
+            # Preserve the index as well as the visible files, including staged
+            # versions and the three conflict stages. Git objects remain in this repo.
+            $indexOutput = @(& git -C $RepoRoot rev-parse --path-format=absolute --git-path index 2>$null)
+            $indexExit = $LASTEXITCODE
+            $indexPath = $indexOutput | Select-Object -First 1
+            if ($indexExit -ne 0 -or -not $indexPath) { throw "could not locate Git index (git exit $indexExit)" }
+            Copy-Item -LiteralPath $indexPath -Destination "$copyPath.index" -ErrorAction Stop
+            $result.SavedCopy = $copyPath
+        } catch {
+            $result.Error = "could not save worktree copy at $copyPath; recovery stopped: $($_.Exception.Message)"
+            return [pscustomobject]$result
+        }
         & git -C $RepoRoot merge --abort 2>$null | Out-Null
         if ($LASTEXITCODE -ne 0) {
             # Not a merge (or merge --abort unavailable for this operation):

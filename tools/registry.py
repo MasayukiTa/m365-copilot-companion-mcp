@@ -121,7 +121,7 @@ def _to_async(fn: Callable) -> Callable:
     return async_wrapper
 
 
-def register(fn: Callable) -> Callable:
+def register(fn: Callable, side_effecting: bool = False) -> Callable:
     """Decorator that records a tool's name and first-line docstring for introspection.
 
     Two transparent wrappers are applied, innermost first:
@@ -139,10 +139,10 @@ def register(fn: Callable) -> Callable:
     _REGISTERED.append({"name": fn.__name__, "summary": summary})
     # trace wrapper first (innermost), then offload to a thread so the trace timing also
     # measures the real work and the whole thing runs off-loop.
-    return _to_async(_wrap_for_evidence(wrap_for_trace(fn), fn))
+    return _to_async(_wrap_for_evidence(wrap_for_trace(fn), fn, side_effecting))
 
 
-def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
+def _wrap_for_evidence(wrapped: Callable, original: Callable, side_effecting: bool = False) -> Callable:
     """Record DIRECTLY-CALLED tools in the evidence trace.
 
     The trace was instrumented at the `call_tool` gateway on the reasoning that the gateway
@@ -186,6 +186,7 @@ def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
         if args:
             _recorded_args["_positional"] = list(args)
         _cid = None
+        _call_record = {}
         try:
             from tools import tool_probe as _probe
             _probe.note_inbound(original.__name__, _recorded_args)
@@ -193,10 +194,22 @@ def _wrap_for_evidence(wrapped: Callable, original: Callable) -> Callable:
             pass
         try:
             from tools import tool_ledger as _ledger
-            _cid = _ledger.record_call(original.__name__, _recorded_args)
+            _cid = _ledger.record_call(original.__name__, _recorded_args, record=_call_record)
         except Exception:
             _cid = None
 
+        try:
+            from tools import closed_worker_gate as _closed_gate
+            _refusal = _closed_gate.check(original.__name__, _call_record, side_effecting)
+            if _refusal:
+                try:
+                    if _cid:
+                        _ledger.record_outcome(_cid, ok=False, error=_refusal)
+                except Exception:
+                    pass
+                return _refusal
+        except Exception:
+            pass
         def _finish(ok, result):
             # The failure text goes in `error`, not `result`: the ledger's readers filter on
             # ok and then read one field, and a failure whose reason sits in the success slot

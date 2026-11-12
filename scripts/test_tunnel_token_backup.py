@@ -293,3 +293,15 @@ def test_supervisor_logs_disk_full_and_retries_tick_each_cycle():
     assert "backup=failed-disk-full" in loop
     assert "Restore will be retried on the next cycle" in loop
     assert loop.index("& $tokenTick") < loop.index("Test-DevtunnelLoggedInCached")
+
+
+def test_supervisor_runs_token_tick_once_per_health_cycle():
+    from pathlib import Path
+    supervisor = (Path(REPO) / "scripts" / "supervisor.ps1").read_text(encoding="utf-8")
+    loop = supervisor[supervisor.index("while ($true) {", supervisor.index("# Checked once, here")):]
+    assert loop.count('tunnel_token_backup_tick.ps1') == 1
+    tick = loop.index('& $tokenTick -RepoRoot $Root -Python $Py -ErrorAction Stop')
+    assert loop.rfind('try {', 0, tick) != -1
+    assert 'catch {' in loop[tick:loop.index('if (-not (Test-TunnelRouteWanted))', tick)]
+    assert 'Write-Log ("devtunnel token backup tick: "' in loop[tick:]
+    assert tick < loop.index('Test-DevtunnelLoggedInCached', tick)

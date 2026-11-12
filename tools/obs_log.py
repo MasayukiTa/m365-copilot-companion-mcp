@@ -53,6 +53,30 @@ def _state_dir() -> str:
     return os.path.dirname(str(tool_ledger._repo_path()))
 
 
+def _diag(exc: BaseException) -> str:
+    """A short, value-free description of a write failure: the exception type and, for an
+    OSError, its errno / winerror and the OS's own message (strerror). This is what tells apart
+    the two OSErrors this machine actually hits -- a full disk (errno 28, ENOSPC) from a Windows
+    sharing violation / lock (winerror 32) when several processes rotate the same jsonl at once.
+    strerror is the OS's standard, non-secret description of the errno; no path, argument or body
+    is included. Never raises.
+    """
+    try:
+        parts = [type(exc).__name__]
+        errno = getattr(exc, "errno", None)
+        if errno is not None:
+            parts.append("errno=%s" % errno)
+        winerror = getattr(exc, "winerror", None)
+        if winerror is not None:
+            parts.append("winerror=%s" % winerror)
+        strerror = getattr(exc, "strerror", None)
+        if strerror:
+            parts.append(str(strerror)[:120])
+        return " ".join(parts)
+    except Exception:
+        return type(exc).__name__ if exc is not None else ""
+
+
 def _note_failure(exc: BaseException) -> None:
     global _WARNED
     if _WARNED:
@@ -60,7 +84,7 @@ def _note_failure(exc: BaseException) -> None:
     _WARNED = True
     try:
         sys.stderr.write("obs_log: write failed (%s); further failures are silent\n"
-                         % type(exc).__name__)
+                         % _diag(exc))
     except Exception:
         pass
 

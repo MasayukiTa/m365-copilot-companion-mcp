@@ -194,8 +194,21 @@ Describe "Invoke-RewrittenUpstreamRecovery integration" {
         Assert-Equal (Test-Path (Join-Path $client ".git\MERGE_HEAD")) $true
         Assert-Equal (@(& git -C $client ls-files -u).Count -gt 0) $true
 
+        Set-TestFile (Join-Path $client "version.txt") "my conflict resolution"
+        Set-TestFile (Join-Path $client ".git/info/exclude") ".env`n.config/`n"
+        Set-TestFile (Join-Path $client ".env") "SECRET=kept"
+        Set-TestFile (Join-Path $client ".config/settings.txt") "my setting"
+        Set-TestFile (Join-Path $client "untracked.txt") "my note"
+        $originalIndex = [Convert]::ToBase64String([IO.File]::ReadAllBytes((Join-Path $client ".git/index")))
         $result = Invoke-RewrittenUpstreamRecovery `
             -RepoRoot $client -Upstream "@{u}" -Timestamp "20260725-120002"
+        if (-not $result.Success) { throw $result.Error }
+        Assert-Equal $result.Success $true
+        Assert-Equal ([Convert]::ToBase64String([IO.File]::ReadAllBytes("$($result.SavedCopy).index"))) $originalIndex
+        Assert-Equal (Get-Content (Join-Path $result.SavedCopy "version.txt") -Raw).Trim() "my conflict resolution"
+        Assert-Equal (Get-Content (Join-Path $result.SavedCopy "untracked.txt") -Raw).Trim() "my note"
+        Assert-Equal (Get-Content (Join-Path $client ".env") -Raw).Trim() "SECRET=kept"
+        Assert-Equal (Get-Content (Join-Path $client ".config/settings.txt") -Raw).Trim() "my setting"
 
         Assert-Equal $result.Success $true
         Assert-Equal $result.Error ""

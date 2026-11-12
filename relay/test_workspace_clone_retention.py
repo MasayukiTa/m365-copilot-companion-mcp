@@ -47,12 +47,13 @@ def _touch(path, size=64, age_days=0.0, now=None):
     return path
 
 
-def _record_scandir(monkeypatch):
+def _record_scandir(monkeypatch, thread_id=None):
     seen = []
     real = os.scandir
 
     def spy(path="."):
-        seen.append(os.path.normcase(os.path.abspath(os.fspath(path))))
+        if thread_id is None or threading.get_ident() == thread_id:
+            seen.append(os.path.normcase(os.path.abspath(os.fspath(path))))
         return real(path)
 
     monkeypatch.setattr(os, "scandir", spy)
@@ -202,18 +203,40 @@ def test_perf_sanity_hundreds_of_files_no_extra_stat_per_file(tmp_path, monkeypa
     getmtime_calls = []
     real_stat = os.stat
     real_getmtime = os.path.getmtime
+    sweep_thread = threading.get_ident()
 
     def spy_stat(*a, **k):
-        stat_calls.append(a[0] if a else None)
+        if threading.get_ident() == sweep_thread:
+            stat_calls.append(a[0] if a else None)
         return real_stat(*a, **k)
 
     def spy_getmtime(*a, **k):
-        getmtime_calls.append(a[0] if a else None)
+        if threading.get_ident() == sweep_thread:
+            getmtime_calls.append(a[0] if a else None)
         return real_getmtime(*a, **k)
 
     monkeypatch.setattr(os, "stat", spy_stat)
     monkeypatch.setattr(os.path, "getmtime", spy_getmtime)
-    scandir_calls = _record_scandir(monkeypatch)
+    scandir_calls = _record_scandir(monkeypatch, thread_id=sweep_thread)
+
+    # The patches are process-wide. Exercise unrelated calls while the sweep is active so
+    # another test's background thread (or a plugin) cannot contaminate these counts.
+    work_root = str(tmp_path / "swe" / "work")
+    background_calls = []
+
+    def in_use_with_background_calls(path):
+        if not background_calls:
+            def unrelated():
+                os.stat(work_root)
+                os.path.getmtime(work_root)
+                with os.scandir(work_root):
+                    pass
+                background_calls.append(True)
+
+            thread = threading.Thread(target=unrelated)
+            thread.start()
+            thread.join()
+        return False
 
     # DRY RUN. This test's job is to bound the DISCOVERY walk -- _newest_mtime_and_size() and
     # the scandir of swe/work itself -- which is the part this module's own code controls and
@@ -226,10 +249,12 @@ def test_perf_sanity_hundreds_of_files_no_extra_stat_per_file(tmp_path, monkeypa
     # this module's own code being unchanged. dry_run=True exercises the same discovery walk
     # every real run also does, without shutil.rmtree in the picture.
     t0 = time.time()
-    freed, removed = R._clone_sweep_run_once(str(tmp_path), 14, _not_in_use, now, dry_run=True)
+    freed, removed = R._clone_sweep_run_once(
+        str(tmp_path), 14, in_use_with_background_calls, now, dry_run=True)
     elapsed = time.time() - t0
 
     assert len(removed) == n_clones
+    assert background_calls == [True]
 
     # os.scandir() is called exactly once per DIRECTORY entered: once for swe/work itself (the
     # leftover-.deleting- pass), once again for swe/work to list the clones, then once per

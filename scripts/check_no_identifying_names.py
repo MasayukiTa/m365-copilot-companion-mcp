@@ -372,7 +372,19 @@ def _commit_range(repo):
             # HEAD may already BE the base (checked out main with nothing ahead). Comparing a
             # ref to itself yields no commits, which is the honest answer, not an error.
             if head.returncode == 0 and head.stdout.strip() == rev.stdout.strip():
-                return "HEAD~1..HEAD"
+                # HEAD is the base, so the honest set is "the commits this branch adds over
+                # base" = just HEAD itself. Expressing that as HEAD~1..HEAD breaks on a shallow
+                # clone or a single-commit history, where HEAD~1 does not resolve and git log
+                # raises -- turning a benign "nothing ahead" into CHECK COULD NOT RUN and
+                # blocking every commit. Only reach back to the parent when it actually exists;
+                # otherwise check the tip commit alone.
+                parent = _run_git_or_fail(repo, ["rev-parse", "--verify", "-q", "HEAD~1"])
+                if parent.returncode == 0:
+                    return "HEAD~1..HEAD"
+                # No parent (shallow depth-1 or the very first commit): log HEAD alone. It stays
+                # a single token git accepts as a revision, and on a shallow clone it yields just
+                # the tip -- exactly the commit worth checking -- instead of raising.
+                return "HEAD"
             return "%s..HEAD" % base
     return "HEAD"
 
