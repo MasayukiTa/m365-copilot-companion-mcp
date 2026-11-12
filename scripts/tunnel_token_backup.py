@@ -42,6 +42,7 @@ mistaken for the empty state that triggers a restore.
 from __future__ import annotations
 
 import os
+import errno
 
 #: A live cache at least this many bytes is treated as healthy and worth copying. The two
 #: measured healthy sizes were 4182 B and 4214 B; the broken size was 0 B. 1000 B sits well
@@ -94,6 +95,30 @@ def should_restore(live_size, login_running, backup_size):
     return True
 
 
+class CopyWriteError(OSError):
+    """A destination write or flush failed during an atomic copy."""
+
+
+def is_disk_full_write(error):
+    """Classify only destination write errors; never inspect drive free space."""
+    return isinstance(error, CopyWriteError) and (
+        error.errno == errno.ENOSPC or getattr(error, "winerror", None) == 112
+    )
+
+
+def run_cycle(cache_dir, backup_dir, login_running):
+    """Return independently reported backup and restore outcomes for one retryable cycle."""
+    def attempt(action):
+        try:
+            return action()
+        except OSError as exc:
+            return "failed-disk-full" if is_disk_full_write(exc) else "failed-io"
+
+    backup = attempt(lambda: do_backup(cache_dir, backup_dir))
+    restore = attempt(lambda: do_restore(cache_dir, backup_dir, login_running))
+    return backup, restore
+
+
 def default_cache_dir(localappdata=None):
     """The directory the live Dev Tunnel token cache lives in.
 
@@ -142,10 +167,15 @@ def _atomic_copy(src, dst):
     with open(src, "rb") as fh:
         data = fh.read()
     try:
-        with open(tmp, "wb") as out:
-            out.write(data)
-            out.flush()
-            os.fsync(out.fileno())
+        try:
+            with open(tmp, "wb") as out:
+                out.write(data)
+                out.flush()
+                os.fsync(out.fileno())
+        except OSError as exc:
+            wrapped = CopyWriteError(exc.errno, str(exc))
+            wrapped.winerror = getattr(exc, "winerror", None)
+            raise wrapped from exc
         os.replace(tmp, dst)
     finally:
         try:
@@ -174,8 +204,9 @@ def do_backup(cache_dir, backup_dir, name=TOKEN_CACHE_NAME):
     if prev_size is not None and prev_size > MIN_HEALTHY_BYTES:
         try:
             _atomic_copy(dst, dst + ".prev")
-        except OSError:
-            pass
+        except OSError as exc:
+            if is_disk_full_write(exc):
+                raise
     _atomic_copy(src, dst)
     return "backed-up"
 

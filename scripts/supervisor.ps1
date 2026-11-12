@@ -4536,7 +4536,13 @@ while ($true) {
     try {
         $tokenTick = Join-Path $Root "scripts\tunnel_token_backup_tick.ps1"
         $tokenResult = & $tokenTick -RepoRoot $Root -Python $Py -ErrorAction Stop
-        Write-Log ("devtunnel token backup tick: " + ($tokenResult -join ' '))
+        $tokenLine = $tokenResult -join ' '
+        Write-Log ("devtunnel token backup tick: " + $tokenLine)
+        if ($tokenLine -match 'restore=failed-disk-full') {
+            Write-Log "ALERT: devtunnel token cache is zeroed and restore failed because the disk is full; free disk space. Restore will be retried on the next cycle."
+        } elseif ($tokenLine -match 'backup=failed-disk-full') {
+            Write-Log "ALERT: devtunnel token backup write failed because the disk is full; free disk space. Backup will be retried on the next cycle."
+        }
     } catch {
         Write-Log ("devtunnel token backup tick failed: " + $_.Exception.Message)
     }
