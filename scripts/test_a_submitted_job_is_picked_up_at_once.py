@@ -108,11 +108,86 @@ def _supervisor_source() -> str:
         return fh.read()
 
 
+_EXTRACTED_FUNC_RE = re.compile(r"function\s+([A-Za-z][\w-]*)")
+# Call sites to a function whose name starts with one of the supervisor's own verb prefixes.
+# \b before the verb keeps 'Reset-Get-Thing' or a '-Get-X' parameter from matching; the name
+# must stand as its own token. Only these four verbs are checked -- they are the ones the
+# extracted bodies use for intra-file helpers (the omission this guards against was a Get-).
+_HELPER_CALL_RE = re.compile(r"(?<![\w-])((?:Get|Test|Clear|Wait)-[A-Za-z][\w-]*)")
+
+
+def _extracted_function_names() -> set:
+    """The function names _FUNCTIONS pulls into the driver (the bare name, no 'function ')."""
+    names = set()
+    for marker in _FUNCTIONS:
+        m = _EXTRACTED_FUNC_RE.search(marker)
+        if m:
+            names.add(m.group(1).lower())
+    return names
+
+
+def _supervisor_defined_functions(src: str) -> set:
+    """Every function name supervisor.ps1 defines (lowercased)."""
+    return {m.group(1).lower() for m in _EXTRACTED_FUNC_RE.finditer(src)}
+
+
+def _missing_driver_dependencies(src: str) -> dict:
+    """Helpers an extracted body calls that the driver will not have.
+
+    For each function _FUNCTIONS extracts, scan its body for Get-/Test-/Clear-/Wait- call
+    sites. A call is a problem only when the callee is DEFINED in supervisor.ps1 (so it is a
+    real intra-file helper, not a cmdlet) yet is NEITHER extracted by _FUNCTIONS NOR supplied
+    by the driver (_DRIVER_PROVIDED). Returns {caller: [sorted missing callees]} -- empty when
+    the driver is self-contained. This is what makes the 21340c7c-style omission (three new
+    helpers added to supervisor.ps1 and called from Test-DevtunnelLoggedInCached, but never
+    added here) fail loudly at the top of the run instead of as an opaque driver non-zero exit.
+    """
+    defined = _supervisor_defined_functions(src)
+    extracted = _extracted_function_names()
+    provided = extracted | _DRIVER_PROVIDED
+    missing = {}
+    for marker in _FUNCTIONS:
+        body = _extract_braced_block(src, marker)
+        caller = _EXTRACTED_FUNC_RE.search(marker).group(1)
+        gaps = set()
+        for call in _HELPER_CALL_RE.findall(body):
+            low = call.lower()
+            if low == caller.lower():
+                continue  # a function may name itself (recursion / comment)
+            if low in defined and low not in provided:
+                gaps.add(call)
+        if gaps:
+            missing[caller] = sorted(gaps)
+    return missing
+
+
 _FUNCTIONS = (
     "function Get-PendingJobNames",
     "function Wait-ForNextTick",
     "function Clear-DevtunnelLoginCache",
+    # Test-DevtunnelLoggedInCached calls these three helpers; they must be extracted into the
+    # driver (in dependency order, before their caller) or driver.ps1 fails at runtime with
+    # "Get-DevtunnelTokenCachePath is not recognized". The check below guards against this
+    # exact omission recurring for any future helper the extracted bodies come to call.
+    "function Get-DevtunnelTokenCachePath",
+    "function Get-DevtunnelTokenCacheState",
+    "function Get-DevtunnelTokenCacheAlertLine",
     "function Test-DevtunnelLoggedInCached",
+)
+
+# Functions the driver supplies by other means than extraction from supervisor.ps1: PowerShell
+# built-ins the extracted bodies call (Get-Item, Get-Date, Get-Content, ...) and the stubs the
+# driver header/footer define in place of the real thing (Test-DevtunnelLoggedIn, Write-Log).
+# The missing-dependency check treats a call to any of these as satisfied. Built-ins are listed
+# explicitly rather than guessed so a genuine supervisor.ps1 function that happens to share a
+# verb prefix is never waved through.
+_DRIVER_PROVIDED = frozenset(
+    name.lower() for name in (
+        # built-in cmdlets the extracted bodies invoke
+        "Get-Item", "Get-Date", "Get-Content", "Get-ChildItem",
+        # stubs defined in the driver header/footer
+        "Test-DevtunnelLoggedIn", "Write-Log",
+    )
 )
 
 _DRIVER_HEADER = r"""
@@ -298,6 +373,33 @@ def deadline(tmp_path_factory):
 @pytest.fixture(scope="module")
 def cache(tmp_path_factory):
     return _run_scenario(tmp_path_factory.mktemp("cache"), "cache")
+
+
+# -- the driver has every helper the extracted bodies call (every platform) --------------------
+
+def test_the_driver_extracts_every_helper_the_bodies_call():
+    """Guards against the 21340c7c regression: supervisor.ps1 grew three helpers
+    (Get-DevtunnelTokenCachePath / -State / -AlertLine) that Test-DevtunnelLoggedInCached
+    calls, but _FUNCTIONS did not extract them, so driver.ps1 failed at runtime with
+    'Get-DevtunnelTokenCachePath is not recognized' and the opaque assert was the non-zero
+    exit of _run_scenario. This reads the same facts statically and names the gap."""
+    src = _supervisor_source()
+    # Sanity: every marker in _FUNCTIONS names a function that supervisor.ps1 actually defines,
+    # and its braces balance (so _extract_braced_block will not raise mid-run).
+    defined = _supervisor_defined_functions(src)
+    for marker in _FUNCTIONS:
+        name = _EXTRACTED_FUNC_RE.search(marker).group(1)
+        assert name.lower() in defined, "_FUNCTIONS names %r, absent from supervisor.ps1" % name
+        block = _extract_braced_block(src, marker)
+        assert block.count("{") == block.count("}"), (
+            "braces do not balance in the extracted block for %s" % name)
+    missing = _missing_driver_dependencies(src)
+    assert not missing, (
+        "driver.ps1 would call supervisor.ps1 helpers it does not have -- add each to "
+        "_FUNCTIONS (in dependency order, before its caller) or stub it in the driver and "
+        "list it in _DRIVER_PROVIDED:\n"
+        + "\n".join("  %s calls: %s" % (caller, ", ".join(names))
+                    for caller, names in sorted(missing.items())))
 
 
 # -- the wait loop ---------------------------------------------------------------------------
