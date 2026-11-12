@@ -3018,6 +3018,14 @@ function Invoke-Startup {
     if ($CoreOnly) {
         # Everything a connection test needs is up. The browser, the bridge and the UI are not
         # part of that path and are left for the full run at STEP 7.
+        #
+        # NEVER A SECOND DEV TUNNEL READER FROM -CoreOnly. This path starts the supervisor only
+        # (mutex-guarded) and starts NO devtunnel host reader itself. When a previous supervisor
+        # died leaving its reader + host alive as orphans, the supervisor this -CoreOnly start
+        # brings up ADOPTS that live orphan reader (Adopt-OrphanTunnelReader in supervisor.ps1,
+        # decided by supervisor_host_launch.decide_orphan_adoption) instead of launching a second
+        # one -- the two-hosts-for-one-tunnel state commit 6cfabfd9 forbids, which preceded the
+        # 0-byte token cache on 2026-11-12. The existing live host is left untouched here.
         Write-Host "[core] server and tunnel are up; browser, bridge and UI left for STEP 7"
         return
     }

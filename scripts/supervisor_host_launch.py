@@ -178,3 +178,59 @@ def decide_child_strike(seconds_with_zero_connections, reader_alive, child_pid,
         # in-place recovery window -> the child is wedged, not reconnecting. Strike only it.
         return "strike"
     return "wait"
+
+
+def decide_orphan_adoption(reader_alive, parent_supervisor_alive, we_track_it):
+    """Whether a newly-started supervisor must ADOPT a live reader instead of launching one.
+
+    THE FAILURE THIS CLOSES (measured 2026-11-11/12, %TEMP%\\m365-companion-supervisor.log).
+    A supervisor (pid 25644) died at 23:58:02 but its reader (pid 1144) and that reader's
+    devtunnel host (pid 23400) stayed alive as ORPHANS -- a reader whose parent supervisor is
+    gone. At 00:29:46 start_all.ps1 -CoreOnly started a NEW supervisor, which at 00:32:04 saw
+    ``connections looks stale ... re-hosting`` and launched a SECOND reader (pid 33632) next to
+    the still-live orphan (pid 1144): two Dev Tunnel host readers for one tunnel at once, the
+    exact state commit 6cfabfd9 forbids. 23 minutes later the token cache was 0 bytes.
+
+    :func:`decide_host_launch` already answers ``wait`` while a reader is alive and inside its
+    reconnect window, but it does NOT tell the caller to take ownership of that reader -- a fresh
+    supervisor that is not yet tracking anything would keep polling and, on the next ``stale``
+    verdict, replace-or-relaunch rather than keep the orphan as its own. This decider is the
+    missing ADOPT step: a live reader whose parent supervisor is gone, and which THIS supervisor
+    does not already track, must be adopted (kept and monitored as ours) -- never duplicated.
+
+    Inputs (all measured by the caller, see Get-ExistingTunnelReaders / Adopt-OrphanTunnelReader):
+
+      * ``reader_alive`` -- is an existing ``relay.tunnel_host_log <tunnel>`` reader alive now?
+      * ``parent_supervisor_alive`` -- is that reader's PARENT process still alive? ``False`` /
+        ``None`` means the reader is an orphan (its supervisor is gone). ``True`` means some
+        supervisor still owns it. A non-boolean / unknown value reads as "cannot tell" and, to
+        avoid fighting a reader another supervisor may own, is treated as "owned" (not orphan).
+      * ``we_track_it`` -- does THIS supervisor already track that reader as its own
+        ($script:TunnelHostProc is that pid)? If so there is nothing to adopt.
+
+    Returns one of three words:
+
+      * ``"adopt"``  -- a reader is alive, it is an orphan (parent supervisor gone), and we do
+        not already track it: take ownership, do NOT launch a second reader.
+      * ``"skip"``   -- a reader is alive and either we already track it, or it still has a live
+        parent supervisor: leave it alone, do NOT launch a second reader.
+      * ``"launch"`` -- no reader is alive: there is nothing to adopt, launch exactly one.
+
+    Pure: no I/O, no clock, no process inspection. The caller discovers the reader, its parent,
+    and whether it already owns it, and acts on the word. ``parent_supervisor_alive`` is
+    tolerant: only an explicit ``False``/``None`` counts as orphan; any value that cannot be read
+    as "parent is gone" is treated as still-owned, so an unreadable parent is never the reason a
+    reader is seized from another supervisor.
+    """
+    if not reader_alive:
+        # No reader to adopt -> the launch path (decide_host_launch) owns this.
+        return "launch"
+    if we_track_it:
+        # Already ours: nothing to adopt, and certainly nothing to duplicate.
+        return "skip"
+    # Orphan only when we can positively tell the parent supervisor is gone. None or an explicit
+    # False both mean "no live parent"; anything else (True, or an unreadable value) is treated as
+    # still-owned so we never seize a reader another supervisor may still manage.
+    if parent_supervisor_alive is None or parent_supervisor_alive is False:
+        return "adopt"
+    return "skip"

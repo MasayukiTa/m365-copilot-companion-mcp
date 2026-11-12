@@ -56,6 +56,7 @@ partial class CockpitWindow
         return w != null
             && !IsLocalLoopControlGoal(S(w, "goal"))
             && !IsInfraStuck(w)
+            && !IsCreditsExhausted(w)
             && IsAttentionStatus(S(w, "status"));
     }
 
@@ -107,6 +108,16 @@ partial class CockpitWindow
     static bool IsInfraStuck(Dictionary<string, object> w)
     {
         return string.Equals(S(w, "outcome"), "INFRA_STUCK", StringComparison.OrdinalIgnoreCase);
+    }
+
+    // CREDITS_EXHAUSTED: the Copilot Studio ENVIRONMENT is out of credits -- a capacity limit,
+    // not a task failure and not a lane a person can clear on this screen (retrying cannot assign
+    // capacity). Like INFRA_STUCK it is carved out of the red attention lane: its own pill, its
+    // reason (relay/credits_exhausted.MESSAGE, the one plain line) shown verbatim, and excluded
+    // from the failure/miss counts (Theme.CountsAsNeedsAttention, relay/outcomes.py).
+    static bool IsCreditsExhausted(Dictionary<string, object> w)
+    {
+        return string.Equals(S(w, "outcome"), "CREDITS_EXHAUSTED", StringComparison.OrdinalIgnoreCase);
     }
 
     // MIRRORS relay/outcomes.py RETRYABLE. A copy, and copies drift -- so a test fails if

@@ -285,6 +285,11 @@ static class Theme
         if (s != "stuck" && s != "maxturns") return false;
         string o = outcome == null ? "" : outcome.Trim().ToUpperInvariant();
         if (o == "INFRA_STUCK") return false;  // being retried automatically, not a person's lane
+        // CREDITS_EXHAUSTED is a CAPACITY LIMIT of the Copilot Studio environment (no credits
+        // assigned) -- not a defect of the agent or this PC, and not a lane a person can clear by
+        // acting here. relay/outcomes.py keeps it out of the failure totals; this is the matching
+        // exclusion so neither screen tallies a missing-capacity environment as needs-attention.
+        if (o == "CREDITS_EXHAUSTED") return false;
         return true;
     }
 

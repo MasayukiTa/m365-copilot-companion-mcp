@@ -352,13 +352,14 @@ _FUNCTIONS = (
     # the two helpers it calls there must be in the driver too, or a timed-out case (tcp)
     # reaches an undefined function and the whole driver aborts mid-loop.
     "function Confirm-ServerSlow", "function Invoke-LivenessStrikeDecision",
-    "function Test-ServerUp", "function Get-ServerExitRecord", "function Start-Server",
+    "function Update-HealthFailStreak", "function Test-ServerUp", "function Get-ServerExitRecord", "function Start-Server",
 )
 _INIT_LINES = (
     "$script:PyRecheckSeconds =", "$script:PyRejectedAt = $null", "$script:PyRejectedWhy = $null",
     "$script:ForeignHolderKey =", "$script:ForeignHolderLoggedAt =", "$script:VerifiedServerPid =",
     # the slow-vs-down confirmation timeout Confirm-ServerSlow reads ($LivenessConfirmSeconds)
     "$script:LivenessConfirmSeconds = 60",
+    "$script:HealthFailStreak = 0", "$script:SlowHealthBoundSeconds = 30",
 )
 
 

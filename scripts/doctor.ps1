@@ -167,6 +167,21 @@ Check "agent_url" "Agent URL configured (Copilot Studio agent pasted)" `
     { ($envv['MCP_FLEET_AGENT_URL']) -or ($envv['MCP_IMPL_AGENT_URL']) } `
     "double-click configure_env.bat and paste the agent URL: open the agent in Microsoft 365 Copilot, then copy the address of the page whose path contains /agent/ followed by two ids joined by a dot (README STEP 4)"
 
+# Both addresses may intentionally name different agents. Report the difference without
+# changing either: a fleet URL left behind after a route switch takes precedence over main.
+function Get-AgentAddressId([string]$url) {
+    if ($url -match '(?i)(?:/agent/|[?&]titleId=)([TP]_[^/?&#\s]+)') { return $matches[1] }
+    return ""
+}
+$mainAgentId = Get-AgentAddressId ([string]$envv['MCP_IMPL_AGENT_URL'])
+$fleetAgentId = Get-AgentAddressId ([string]$envv['MCP_FLEET_AGENT_URL'])
+if ($mainAgentId -and $fleetAgentId -and $mainAgentId -ine $fleetAgentId) {
+    $agentMismatch = "Main and fleet agent URLs name different agents; fleet takes precedence. If the fleet URL is old, run configure_env.bat and update or clear it."
+    Add-Result "agent_url_mismatch" $false $agentMismatch "run configure_env.bat and update or clear MCP_FLEET_AGENT_URL" $true $false $false
+    Write-Host ("  [WARN] " + $agentMismatch) -ForegroundColor Yellow
+    $script:warn++
+}
+
 # NO REQUEST TEMPLATE = EVERY GOAL WAITS FOR A TOKEN FOR EVER. A capture never sends a Copilot turn, so
 # the request template for the agent comes from the donor shipped in relay\seed_donor, written by
 # start_all.bat. Without it the cockpit only says "waiting for token", which looks like a slow login.

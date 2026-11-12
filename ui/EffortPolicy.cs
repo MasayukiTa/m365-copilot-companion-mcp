@@ -1211,7 +1211,7 @@ public static class ResidentToolsView
 
 // The host-tunnel-for-external-clients selector's words and parsing, WPF-free. The Python side
 // decides: scripts/supervisor.ps1 asks relay/code_staleness.py host_tunnel_for_external_clients_setting
-// (on|off, default on) every supervisor cycle. on: a Dev Tunnel is hosted and watched even on the
+// (on|off, default off) every supervisor cycle. on: a Dev Tunnel is hosted and watched even on the
 // connector-less route, because an external client (not a fleet agent) reaches the local server
 // through it. off: the old behaviour, a connector-less route hosts no tunnel. A tunnel already
 // running is never killed either way.
@@ -1219,14 +1219,14 @@ public static class HostTunnelExternalView
 {
     //: must equal tools/settings_keys.py and relay/code_staleness.py KEY / DEFAULT / MODES.
     public const string Key = "host_tunnel_for_external_clients";
-    public const string Default = "on";
+    public const string Default = "off";
 
     public static readonly string[] Modes = { "off", "on" };
 
     public static bool IsMode(string v) { return v == "off" || v == "on"; }
 
     /// <summary>The mode named by one host_tunnel_for_external_clients= line; null when the line is
-    /// not that key or the value is not off|on (the caller keeps its value, on). A byte order mark
+    /// not that key or the value is not off|on (the caller keeps its value, off). A byte order mark
     /// is tolerated and the value is case-insensitive, as in Python.</summary>
     public static string ParseLine(string line)
     {

@@ -209,7 +209,7 @@ def _unavailable_or_error(tool: str, exc: BaseException) -> str:
 
 
 def screen_click(image: str, x: int, y: int, button: str = "left",
-                 count: int = 1) -> str:
+                 count: int = 1, expect: str = "") -> str:
     """Click at a pixel of an image taken by screen_look.
 
     Args:
@@ -217,6 +217,15 @@ def screen_click(image: str, x: int, y: int, button: str = "left",
         x, y: The position IN THAT IMAGE, not on the desktop.
         button: left, right or middle.
         count: 1 for a click, 2 for a double click.
+        expect: The application this click is meant for -- a process name
+            ("notepad.exe") or a window-title pattern. REQUIRED in effect: the
+            foreground window is re-read immediately before clicking and the click
+            is refused unless that window belongs to `expect` AND the point lies
+            inside it. This is what stops a click from landing in a mail or chat
+            window that drifted in front between the capture and the click. If you
+            leave it empty the click is refused, unless an operator has set
+            MCP_SCREEN_ALLOW_ANY_FOREGROUND=1 in the settings (off by default). A
+            terminal/console in front is never accepted unless you name it here.
     """
     locked = require_unlocked()
     if locked:
@@ -228,7 +237,8 @@ def screen_click(image: str, x: int, y: int, button: str = "left",
         frame = _load_frame(image)
         sx, sy = frame.to_screen(int(x), int(y))
         before = W.window_at(sx, sy)
-        DI.click(frame, sx, sy, button=button, count=int(count))
+        DI.click(frame, sx, sy, button=button, count=int(count),
+                 expect=(expect or None))
         # What was there is reported back because a click that landed somewhere
         # unexpected is only visible if somebody says where it landed. An agent that
         # is told "clicked" and nothing else will keep going on a wrong premise.
@@ -256,13 +266,20 @@ def screen_scroll(image: str, x: int, y: int, clicks: int = -3,
         return _unavailable_or_error("screen_scroll", e)
 
 
-def screen_type(text: str) -> str:
+def screen_type(text: str, expect: str = "") -> str:
     """Type text into whatever has keyboard focus.
 
     The characters are sent as characters, not as key presses, so the result does
     not depend on the keyboard layout and the IME is not involved -- Japanese
     arrives as written. Click the field first; this types where focus already is.
     A newline in `text` is sent as the Enter key, and a tab as Tab.
+
+    `expect` names the application the text is meant for -- a process name or a
+    window-title pattern. Typing is refused unless the window in front belongs to
+    it, so a keystroke cannot be sent into a window that came to the front since the
+    field was clicked. Empty `expect` is refused unless the operator has set
+    MCP_SCREEN_ALLOW_ANY_FOREGROUND=1 (off by default); a terminal/console is never
+    accepted unless named here.
     """
     locked = require_unlocked()
     if locked:
@@ -270,14 +287,23 @@ def screen_type(text: str) -> str:
     try:
         from . import desktop_input as DI
 
-        n = DI.type_text(text or "")
+        n = DI.type_text(text or "", expect=(expect or None))
         return "typed %d character(s)" % n
     except Exception as e:
         return _unavailable_or_error("screen_type", e)
 
 
-def screen_press(keys: str) -> str:
+def screen_press(keys: str, expect: str = "") -> str:
     """Press a key or a combination: "enter", "ctrl s", "ctrl shift tab", "win d".
+
+    `expect` names the application the key press is meant for -- a process name or a
+    window-title pattern. The press is refused unless the window in front belongs to
+    it, so a shortcut cannot be delivered to a window that came to the front since.
+    Empty `expect` is refused unless the operator has set
+    MCP_SCREEN_ALLOW_ANY_FOREGROUND=1 (off by default); a terminal/console is never
+    accepted unless named here. The four session-ending combinations are still
+    refused regardless of `expect`.
+
 
     The whole keyboard is available -- letters, digits, f1-f24, arrows, punctuation
     named by the character on the key, the numpad, and the modifiers. This used to be
@@ -302,7 +328,7 @@ def screen_press(keys: str) -> str:
         parts = [p for p in str(keys or "").replace(",", " ").split() if p]
         if not parts:
             return "[screen_press error: no keys given]"
-        DI.press(*parts)
+        DI.press(*parts, expect=(expect or None))
         return "pressed %s" % "+".join(parts)
     except Exception as e:
         return _unavailable_or_error("screen_press", e)
