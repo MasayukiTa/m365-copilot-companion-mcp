@@ -1,35 +1,28 @@
 # -*- coding: utf-8 -*-
-"""OS-level native-thread-leak regression for the OCR path (2026-10-31).
+"""OS-level thread-count regression for the OCR path, child-process edition (2026-11-12).
 
-tools/test_ocr_thread_leak.py pins the STRUCTURAL property (OCR work runs on the single
-dedicated ocr-easyocr thread). THIS test measures what the 22h leak was actually made of:
-the PROCESS's OS thread count before and after a burst of OCR calls arriving on many
-different worker threads -- and asserts it returns to baseline.
+WHAT CHANGED. The leak this file used to measure came from torch's native CPU thread pool
+being attached, once per OS thread, to whichever gateway thread ran readtext. The fix on
+2026-11-12 moved EasyOCR/torch OUT OF THE GATEWAY PROCESS entirely, into a short-lived
+child (tools/_easyocr_child.py). So torch now attaches its native pool to a CHILD process
+that then exits -- the parent (gateway) process never grows at all.
 
-THE LEAK. EasyOCR runs on PyTorch. PyTorch's CPU backend builds an OpenMP/MKL intra-op
-NATIVE thread pool the first time a torch op runs ON A GIVEN OS THREAD, ties it to that
-thread, and never releases it when the thread returns. FastMCP runs every tool on a fresh
-anyio worker thread, so OCR on the calling thread attached a fresh native pool per distinct
-worker thread. Those threads carry no Python frame -> invisible to py-spy and absent from
-threading.enumerate() (matching the live finding: py-spy saw 24 Python threads while
-Windows reported 524 OS threads, ~500 native and parked in Wait).
+WHAT THIS TEST ASSERTS. After a burst of OCR calls arriving on many different worker
+threads, the GATEWAY process's OS thread count returns to its pre-burst baseline. Each OCR
+call spawns a child, reads it, and the child exits; no native pool is ever attached to a
+parent thread, so there is nothing to leak. A regression that moved torch back in-process
+would reattach a native pool per worker thread and this would grow.
 
-WHY toolhelp, NOT threading.enumerate(). The leaked threads are NATIVE, so only an OS-level
-count (Win32 toolhelp snapshot) sees them -- the very reason the live 500 were py-spy- and
-enumerate()-invisible.
+WHY A STUB CHILD, NOT REAL TORCH. Loading torch under this host's test launcher fails
+(WinError 1114) and a real Reader needs a model download. The stub child only prints a JSON
+line and exits -- it never imports easyocr/torch -- which is exactly the parent-side
+behaviour under test: spawn, read, child exits, parent unchanged.
 
-WHY A CreateThread FAKE, NOT REAL TORCH. Loading torch's c10.dll fails under this host's
-test subprocess launcher (WinError 1114), and a real EasyOCR Reader needs a model download.
-The fake reader reproduces the exact leak SHAPE -- un-joined native OS threads attached, once
-per OS thread, to whichever thread runs readtext -- using CreateThread. If ocr_ops funnels
-readtext onto its one dedicated executor, the fake attaches its native threads exactly once;
-if readtext runs on the caller, the fake attaches a fresh batch per distinct worker thread.
-So this test fails (RED) against calling-thread execution and passes (GREEN) against the fix.
-Measured: 40 workers -> RED +200 / GREEN +0; MCP_LEAK_REPRO_ITERS=200 -> RED +1000 / GREEN +0.
-
-ITERATIONS. Default is small for quick CI; set MCP_LEAK_REPRO_ITERS=200 for the full
-200-call reproduction the investigation called for. The assertion is the same either way:
-after the burst the OS thread count is back at its pre-burst baseline.
+WHY toolhelp, NOT threading.enumerate(). The historical leak was NATIVE threads with no
+Python frame, invisible to threading.enumerate() and py-spy; only an OS-level (Win32
+toolhelp) count sees them. The gauge is kept so a regression to in-process torch -- whose
+leak is native -- would still be caught. The gauge is Windows-only, so the whole module is
+skipped off Windows (the leak's only platform); on Linux CI it collects zero items.
 """
 from __future__ import annotations
 
@@ -56,8 +49,6 @@ import ctypes.wintypes as w  # noqa: E402
 from tools import ocr_ops  # noqa: E402
 
 _k = ctypes.windll.kernel32
-_k.CreateThread.restype = w.HANDLE
-_k.CreateThread.argtypes = [w.LPVOID, ctypes.c_size_t, w.LPVOID, w.LPVOID, w.DWORD, w.LPDWORD]
 
 
 def _os_thread_count() -> int:
@@ -83,41 +74,13 @@ def _os_thread_count() -> int:
     return n
 
 
-_THREADPROC = ctypes.WINFUNCTYPE(w.DWORD, w.LPVOID)
-_kept = []  # keep handles/callback alive
-
-
-@_THREADPROC
-def _native_worker(p):
-    _k.Sleep(0xFFFFFFFF)
-    return 0
-
-
-_wp = ctypes.cast(_native_worker, w.LPVOID)
-_NATIVE_PER_POOL = 5
-_tls = threading.local()
-
-
-def _attach_native_pool_once():
-    """One native pool per OS thread, created on first use and never released -- the torch
-    CPU-backend behaviour. threading.local keys it to the running OS thread, so a second
-    call on the SAME OS thread adds nothing (pool reused) while a NEW OS thread adds one."""
-    if not getattr(_tls, "warm", False):
-        for _ in range(_NATIVE_PER_POOL):
-            tid = w.DWORD(0)
-            _kept.append(_k.CreateThread(None, 0, _wp, None, 0, ctypes.byref(tid)))
-        _tls.warm = True
-
-
-class _FakeReader:
-    def readtext(self, arr, detail=0):
-        _attach_native_pool_once()
-        return ["ok"]
-
-
 class _FakeImage:
     def convert(self, mode):
         return self
+
+    def save(self, path, format=None):
+        with open(path, "wb") as fh:
+            fh.write(b"\x89PNG\r\n")
 
 
 def _iters() -> int:
@@ -128,19 +91,26 @@ def _iters() -> int:
     return max(1, n)
 
 
-def test_ocr_burst_returns_os_thread_count_to_baseline(monkeypatch):
-    import importlib
-    if importlib.util.find_spec("numpy") is None:
-        pytest.skip("numpy not installed")
-    import numpy as np
-    # The fake image already yields the array; avoid needing real pixels.
-    monkeypatch.setattr(np, "array", lambda x: x)
+def _write_stub_child(tmp_path) -> str:
+    p = tmp_path / "stub_child.py"
+    p.write_text(
+        "import json, sys\n"
+        "sys.stdout.write(json.dumps({'ok': True, 'text': 'ok'}))\n"
+        "sys.stdout.write('\\n')\n",
+        encoding="utf-8",
+    )
+    return str(p)
 
-    monkeypatch.setitem(ocr_ops._EASYOCR_READERS, "en", _FakeReader())
+
+def test_ocr_burst_returns_gateway_thread_count_to_baseline(tmp_path, monkeypatch):
+    """Many OCR calls on distinct worker threads must leave the GATEWAY process's OS thread
+    count where it started: torch runs in child processes that exit, so nothing attaches a
+    native pool to a parent thread."""
+    child = _write_stub_child(tmp_path)
+    monkeypatch.setattr(ocr_ops, "_EASYOCR_CHILD", child)
     im = _FakeImage()
 
-    # Warm-up: first call builds the one dedicated executor and attaches its single native
-    # pool. After this, a correctly-funnelled implementation attaches nothing further.
+    # Warm-up: first call spawns and reaps one child; afterwards the parent is steady.
     assert ocr_ops._easyocr_image_text(im, "eng") == "ok"
     time.sleep(0.3)
     base = _os_thread_count()
@@ -156,11 +126,8 @@ def test_ocr_burst_returns_os_thread_count_to_baseline(monkeypatch):
         time.sleep(0.2)
     grew = _os_thread_count() - base
 
-    # Funnelled onto one thread => native pool built once, reused => zero net growth.
-    # A regression to calling-thread execution adds _NATIVE_PER_POOL per distinct worker
-    # (e.g. +200 over 40 iters, +1000 over 200), so a small ceiling cleanly separates them.
     assert grew <= 2, (
-        "OS thread count grew by %d after %d OCR calls on distinct worker threads -- the "
-        "native (torch-shaped) pool is leaking per worker thread; OCR work is not pinned to "
-        "the single dedicated ocr-easyocr thread" % (grew, iters)
+        "GATEWAY OS thread count grew by %d after %d OCR calls on distinct worker threads "
+        "-- torch work is no longer isolated in a child process and a native pool is leaking "
+        "onto parent threads again" % (grew, iters)
     )

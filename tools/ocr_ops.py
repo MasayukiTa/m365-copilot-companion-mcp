@@ -1,3 +1,9 @@
+import json
+import logging
+import os
+import subprocess
+import sys
+import tempfile
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -6,28 +12,42 @@ from typing import Optional
 from .file_ops import _validate_path
 from ._untrusted import wrap_if_content
 
-# EasyOCR reader cache. Building a Reader loads the detection + recognition models
-# (a few hundred MB the first time, then cached on disk), which takes ~10-20s, so we
-# keep one per language set for the life of the process.
+_log = logging.getLogger(__name__)
+
+# EasyOCR reader cache. Kept for backward compatibility only: the Reader is now built
+# INSIDE the child process (see _easyocr_image_text), so this process no longer caches
+# readers. Tests that pre-seed a fake reader here still find the attribute.
 _EASYOCR_READERS: dict = {}
 
-# Thread-leak fix (2026-10-31). EasyOCR runs on PyTorch, whose CPU backend (OpenMP/MKL)
-# spins up an intra-op native thread pool THE FIRST TIME a torch op runs ON A GIVEN OS
-# THREAD, and that pool is tied to that thread and is NOT released when the thread
-# returns to its caller. The MCP server dispatches every tool on a fresh anyio worker
-# thread, so running OCR on the calling thread leaks ~9-11 native (py-spy-invisible,
-# Wait-state) threads per distinct worker thread -- hundreds over a long-lived server.
-# Measured: 40 distinct worker threads each running one torch op -> +360 OS threads;
-# funnelling the same work through ONE dedicated worker thread -> +0.
-# Fix: every EasyOCR call (Reader build + readtext) runs on a single dedicated worker,
-# so the torch native pool is created once and reused. Lazily created, daemon, so it
-# never blocks shutdown and costs nothing until the first OCR call.
+# Crash isolation (2026-11-12). EasyOCR runs on PyTorch, whose native layer (c10.dll)
+# crashed the gateway's python.exe with an access violation (exception 0xc0000005,
+# offset 0x8f5a4) three times on 2026-11-12 (17:58:59, 19:22:13, 19:32:03), each taking
+# the public endpoint down for 1-4 minutes. A native crash cannot be caught by a Python
+# try/except -- it takes the whole process with it, so the previous in-process fix (a
+# single dedicated worker thread) could stop the THREAD leak but could not stop a crash
+# from killing the server.
+#
+# Fix: run every EasyOCR call in a short-lived CHILD process (tools/_easyocr_child.py).
+# If torch crashes, only the child dies; the parent sees a non-zero exit code, logs it,
+# returns None, and the caller falls back to Tesseract. The gateway process never imports
+# torch at all.
+#
+# Concurrency: at most ONE child runs at a time (this machine is RAM-constrained, and the
+# old design also funnelled all OCR through a single worker). A semaphore serialises child
+# launches; a blocked caller waits rather than spawning a second torch process.
+_OCR_CHILD_TIMEOUT_S = 120
+_OCR_CHILD_SEM = threading.Semaphore(1)
+
+# Kept for backward compatibility. The executor is no longer on the OCR execution path
+# (the work now runs in a child process), but the symbol is preserved so existing callers
+# and tests that reference it keep importing.
 _OCR_EXECUTOR: Optional[ThreadPoolExecutor] = None
 _OCR_EXECUTOR_LOCK = threading.Lock()
 
 
 def _ocr_executor() -> ThreadPoolExecutor:
-    """The one worker thread that all EasyOCR/torch work runs on (see module note)."""
+    """Legacy single-worker executor. No longer on the OCR path (work runs in a child
+    process now); retained for backward compatibility with callers that imported it."""
     global _OCR_EXECUTOR
     if _OCR_EXECUTOR is None:
         with _OCR_EXECUTOR_LOCK:
@@ -36,6 +56,78 @@ def _ocr_executor() -> ThreadPoolExecutor:
                     max_workers=1, thread_name_prefix="ocr-easyocr"
                 )
     return _OCR_EXECUTOR
+
+
+# The child script that imports torch/easyocr and does the actual recognition.
+_EASYOCR_CHILD = str(Path(__file__).with_name("_easyocr_child.py"))
+
+# Windows: do not pop up a console window for the child. 0 elsewhere.
+_CREATE_NO_WINDOW = 0x08000000 if os.name == "nt" else 0
+
+
+def _run_easyocr_child(image_path: str, langs: list, timeout: float = _OCR_CHILD_TIMEOUT_S) -> Optional[str]:
+    """Run EasyOCR on image_path in a child process and return its text, or None.
+
+    Returns None (never raises) on every failure path so the caller can fall back to
+    Tesseract: the child could not be launched, the child exited non-zero (including a
+    native 0xc0000005 crash), it printed no parseable JSON line, it reported ok=false,
+    or it ran past the timeout (in which case the child -- and only the child -- is
+    killed). At most one child runs at a time (RAM-constrained host).
+    """
+    langs_csv = ",".join(langs)
+    with _OCR_CHILD_SEM:
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, _EASYOCR_CHILD, image_path, langs_csv],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=_CREATE_NO_WINDOW,
+            )
+        except Exception as exc:
+            _log.warning("easyocr child could not start: %s", exc)
+            return None
+        try:
+            out, _err = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            try:
+                proc.communicate(timeout=10)
+            except Exception:
+                pass
+            _log.warning("easyocr child timed out after %ss; killed", timeout)
+            return None
+        except Exception as exc:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            _log.warning("easyocr child read failed: %s", exc)
+            return None
+
+        rc = proc.returncode
+        if rc != 0:
+            # Non-zero includes native crashes. On Windows an access violation surfaces as
+            # a large unsigned/negative code (0xC0000005); log it so the crash leaves a
+            # one-line trace and the server keeps running.
+            _log.warning("easyocr child exited with code %s (0x%08X); falling back",
+                         rc, rc & 0xFFFFFFFF)
+            return None
+
+        line = (out or b"").decode("utf-8", "replace").strip().splitlines()
+        if not line:
+            _log.warning("easyocr child produced no output; falling back")
+            return None
+        try:
+            data = json.loads(line[-1])
+        except Exception as exc:
+            _log.warning("easyocr child output was not JSON: %s", exc)
+            return None
+        if not isinstance(data, dict) or not data.get("ok"):
+            if isinstance(data, dict) and data.get("error"):
+                _log.warning("easyocr child reported: %s", data.get("error"))
+            return None
+        text = data.get("text") or ""
+        return text or None
 
 
 def _wants_japanese(lang: str) -> bool:
@@ -80,42 +172,35 @@ def _easyocr_langs(lang: str) -> list:
 
 
 def _easyocr_image_text(im, lang: str) -> Optional[str]:
-    """OCR an already-open PIL image with EasyOCR. None when unavailable/empty.
+    """OCR an already-open PIL image with EasyOCR, in a child process. None on failure.
 
-    Takes a numpy array rather than a path: EasyOCR loads paths through OpenCV,
-    whose Windows imread returns None for any path containing non-ASCII characters
-    (and then fails deep inside the library). Passing pixels sidesteps that entirely.
+    Crash isolation (see the module note): EasyOCR/torch runs in a separate, short-lived
+    child process, never in the gateway process. A native torch crash (0xc0000005) kills
+    only the child; this function then returns None and the caller falls back to
+    Tesseract. At most one child runs at a time.
 
-    The actual EasyOCR/torch work is funnelled through one dedicated worker thread
-    (see the module note on _OCR_EXECUTOR) so PyTorch's native CPU thread pool is
-    created once and reused, instead of leaking a fresh pool onto every anyio worker
-    thread the MCP server happens to dispatch an OCR call on.
+    The image is written to a temporary PNG and the child is handed the PATH. EasyOCR
+    itself reads paths through OpenCV, whose Windows imread cannot open non-ASCII paths,
+    so the temp file is created with an ASCII-only name under the system temp directory.
     """
-    try:
-        import numpy as np
-    except ImportError:
-        return None
     langs = _easyocr_langs(lang)
-    key = "+".join(sorted(langs))
-
-    def _run() -> Optional[str]:
+    tmp_path = None
+    try:
+        fd, tmp_path = tempfile.mkstemp(suffix=".png", prefix="ocr_")
+        os.close(fd)
         try:
-            reader = _EASYOCR_READERS.get(key)
-            if reader is None:
-                import easyocr
-                reader = easyocr.Reader(langs, gpu=False, verbose=False)
-                _EASYOCR_READERS[key] = reader
-            arr = np.array(im.convert("RGB"))
-            parts = reader.readtext(arr, detail=0)
-            text = "\n".join(s for s in (str(x).strip() for x in parts) if s)
-            return text or None
+            im.convert("RGB").save(tmp_path, format="PNG")
         except Exception:
             return None
-
-    try:
-        return _ocr_executor().submit(_run).result()
+        return _run_easyocr_child(tmp_path, langs)
     except Exception:
         return None
+    finally:
+        if tmp_path:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
 
 
 def _easyocr_text(p: Path, lang: str) -> Optional[str]:
