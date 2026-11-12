@@ -18,9 +18,36 @@ import argparse
 import json
 import os
 import sys
+import time
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, REPO)
+
+
+def _prefix_query(prefix):
+    """Return an indexed range covering all valid Unicode strings with this prefix."""
+    upper = None
+    for i in range(len(prefix) - 1, -1, -1):
+        code = ord(prefix[i])
+        if code < 0x10ffff:
+            code += 1
+            if code == 0xd800:
+                code = 0xe000
+            upper = prefix[:i] + chr(code)
+            break
+    sql = ("SELECT id, key, role, turn, text, extra, ts FROM fleet_turns "
+           "WHERE key >= ? ")
+    args = [prefix]
+    if upper is not None:
+        sql += "AND key < ? "
+        args.append(upper)
+    sql += "AND role LIKE 'refuter\\_%' ESCAPE '\\' ORDER BY ts, id"
+    return sql, args
+
+
+def _prefix_rows(conn, prefix):
+    sql, args = _prefix_query(prefix)
+    return [row for row in conn.execute(sql, args) if row["key"].startswith(prefix)]
 
 
 def dump(key):
@@ -28,10 +55,7 @@ def dump(key):
     conn = S._db(import_files=False)
     try:
         prefix = key + "__refuter_"
-        rows = conn.execute(
-            "SELECT id, key, role, turn, text, extra, ts FROM fleet_turns "
-            "WHERE substr(key, 1, ?) = ? AND role LIKE 'refuter\\_%' ESCAPE '\\' ORDER BY ts, id",
-            (len(prefix), prefix)).fetchall()
+        rows = _prefix_rows(conn, prefix)
     finally:
         conn.close()
     turns = []
@@ -55,11 +79,13 @@ def main(argv=None):
     ns = ap.parse_args(argv)
     if ns.store_dir:
         os.environ["MCP_SESSION_STORE_DIR"] = ns.store_dir
+    start = time.monotonic()
     try:
         out = dump(ns.key)
     except Exception as exc:
         out = {"key": ns.key, "turns": [], "recorded": False,
-               "error": "%s: %s" % (type(exc).__name__, str(exc)[:200])}
+               "error": "Elapsed %.2f s: %s: %s" %
+                        (time.monotonic() - start, type(exc).__name__, str(exc))}
     sys.stdout.buffer.write((json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8"))
     return 0
 

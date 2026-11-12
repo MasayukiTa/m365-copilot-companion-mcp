@@ -723,6 +723,14 @@ partial class CockpitWindow
                                               Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap });
             return;
         }
+        string error = S(d, "error");
+        if (!string.IsNullOrEmpty(error))
+        {
+            if (error.Length > 240) error = error.Substring(0, 240) + "…";
+            body.Children.Add(new TextBlock { Text = (ja ? "台帳を読めませんでした: " : "Could not read the ledger: ") + error,
+                                              Foreground = Muted, FontSize = 12, TextWrapping = TextWrapping.Wrap });
+            return;
+        }
         var turns = d.ContainsKey("turns") ? d["turns"] as System.Collections.IEnumerable : null;
         bool any = false;
         if (turns != null)
