@@ -57,10 +57,6 @@ _CONSOLE_PROCESS_NAMES = frozenset({
 })
 
 
-class ExpectRefused(RuntimeError):
-    """The action was not performed because the foreground was not the window meant."""
-
-
 class Foreground(NamedTuple):
     """What the live desktop said is in front, reduced to the facts the guard judges on.
 
