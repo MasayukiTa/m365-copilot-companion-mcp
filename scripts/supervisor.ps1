@@ -2003,6 +2003,57 @@ function Invoke-TunnelHostingCheck {
     return $state
 }
 
+# THE DEV TUNNEL TOKEN CACHE, AS A STATE OF ITS OWN. devtunnel keeps its login token in an
+# MSAL cache file under %LOCALAPPDATA%\DevTunnels. A 0-byte cache is NOT the same as "not logged
+# in": it is the signature of the token file having been TRUNCATED (measured 2026-11-11/12 --
+# the file went 4214 B -> 0 B at 00:55:47 with no sign-in window open, and `devtunnel user show`
+# then reports not-logged-in and, worse, a devtunnel CLI call while the file is 0 B can race a
+# concurrent writer and cement the truncation). This supervisor must therefore treat a 0-byte
+# cache as a DISTINCT, alert-worthy state and must NOT call the devtunnel CLI at all while it is
+# 0 B -- see Test-DevtunnelLoggedInCached's gate. These helpers are PURE (path in, verdict out)
+# so they are unit-tested without touching the live cache; see
+# scripts\test_devtunnel_token_cache_state.Tests.ps1.
+function Get-DevtunnelTokenCachePath {
+    # The MSAL token cache devtunnel writes. Resolved from %LOCALAPPDATA% so a test can point it
+    # at a COPY by setting $env:LOCALAPPDATA; never the live file in normal unit tests.
+    $base = $env:LOCALAPPDATA
+    if (-not $base) { return $null }
+    return (Join-Path $base "DevTunnels\devtunnels-tokens-microsoft")
+}
+
+function Get-DevtunnelTokenCacheState {
+    # PURE: given a path, classify the token cache without any side effects or CLI calls.
+    #   'missing' -- no file (first run / never logged in on this profile)
+    #   'empty'   -- the file exists and is 0 bytes (TRUNCATED: the distinct state (C) is about)
+    #   'present' -- the file exists and holds bytes (a normal, possibly-valid token cache)
+    # A $null/blank path is reported 'missing' (nothing to read), never 'empty'.
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return 'missing' }
+    $item = $null
+    try { $item = Get-Item -LiteralPath $Path -ErrorAction Stop } catch { return 'missing' }
+    if ($item.PSIsContainer) { return 'missing' }
+    if ($item.Length -eq 0) { return 'empty' }
+    return 'present'
+}
+
+function Get-DevtunnelTokenCacheAlertLine {
+    # PURE: build the one alert line for a 0-byte cache. It NAMES THE FILE and its MODIFIED TIME
+    # (the two facts an operator needs to correlate the truncation with the supervisor log), and
+    # states plainly that the CLI will not be called until the file is non-empty again. $Mtime may
+    # be $null (file vanished between the state read and here) -- then the time reads 'unknown'.
+    param([string]$Path, $Mtime)
+    $when = if ($Mtime) { ([datetime]$Mtime).ToString('yyyy-MM-dd HH:mm:ss') } else { 'unknown' }
+    return ("devtunnel token cache is 0 BYTES (truncated): '$Path' (mtime=$when). " +
+            "Treating this as a distinct state: NOT calling the devtunnel CLI while the cache is " +
+            "empty (a CLI call can race a concurrent writer), and leaving any existing live host " +
+            "untouched. The login token must be restored (or re-done once) before tunnel " +
+            "management can resume.")
+}
+
+# One alert per truncation episode, not one per tick: set when the 0-byte state is first seen,
+# cleared the moment the cache is non-empty again (so a later truncation alerts afresh).
+$script:DevtunnelTokenCacheZeroAlerted = $false
+
 function Test-DevtunnelLoggedIn {
     # Gate ALL tunnel management on an authenticated devtunnel CLI. When NOT logged in,
     # `devtunnel host` cannot work AND -- critically -- the supervisor must not touch any
@@ -2052,6 +2103,30 @@ function Clear-DevtunnelLoginCache {
 
 function Test-DevtunnelLoggedInCached {
     $now = Get-Date
+    # ZERO-BYTE TOKEN CACHE: A DISTINCT STATE, HANDLED BEFORE ANY CLI CALL. A 0-byte cache means
+    # the token file was truncated (see Get-DevtunnelTokenCacheState's comment). While it is 0 B
+    # the supervisor must NOT run `devtunnel user show` (or any CLI call) -- a call can race a
+    # concurrent writer and cement the truncation -- so this gate returns BEFORE the cached-answer
+    # branch and before Test-DevtunnelLoggedIn. Returning $false routes the main loop into its
+    # "paused, do not touch devtunnel" arm, which leaves any existing live host untouched. One
+    # alert per truncation episode names the file and its mtime; it clears when the cache is
+    # non-empty again so a later truncation alerts afresh. The cache-valid timer is dropped too,
+    # so the instant the token is restored the next tick re-asks live.
+    $tokenPath = Get-DevtunnelTokenCachePath
+    if ($tokenPath -and (Get-DevtunnelTokenCacheState -Path $tokenPath) -eq 'empty') {
+        $script:DevtunnelLoginCachedUntil = [datetime]::MinValue
+        $script:DevtunnelLoginAnswerWasCached = $false
+        if (-not $script:DevtunnelTokenCacheZeroAlerted) {
+            $mtime = $null
+            try { $mtime = (Get-Item -LiteralPath $tokenPath -ErrorAction Stop).LastWriteTime } catch { }
+            Write-Log (Get-DevtunnelTokenCacheAlertLine -Path $tokenPath -Mtime $mtime)
+            $script:DevtunnelTokenCacheZeroAlerted = $true
+        }
+        return $false
+    }
+    # The cache is present or missing (missing = handled live by Test-DevtunnelLoggedIn exactly as
+    # before). Either way the 0-byte episode, if any, is over: let a future truncation alert again.
+    $script:DevtunnelTokenCacheZeroAlerted = $false
     if ($now -lt $script:DevtunnelLoginCachedUntil) {
         $script:DevtunnelLoginAnswerWasCached = $true
         if (-not $script:DevtunnelLoginCacheUseLogged) {
