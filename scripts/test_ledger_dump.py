@@ -15,7 +15,7 @@ def test_prefix_range_matches_old_query_and_uses_index(tmp_path, prefix):
                  "turn INTEGER, text TEXT, extra TEXT, ts REAL)")
     conn.execute("CREATE INDEX fleet_turns_key_idx ON fleet_turns(key, id)")
     keys = ["", "a", "abc", "abcd", "abd", "日本", "日本語", "日木", "\ud7ff",
-            "\ue000", "\ufffe", "\uffff", "\uffffz", "\U00010000",
+            "\ue000", "\ufffe", "\uffff", "\uffffz", chr(0x10000),
             "\U0010ffff", "\U0010ffffx", "a\U0010ffff", "a\U0010ffffx", "b"]
     for i, key in enumerate(keys):
         conn.execute("INSERT INTO fleet_turns VALUES (?, ?, ?, 0, '', '', ?)",
