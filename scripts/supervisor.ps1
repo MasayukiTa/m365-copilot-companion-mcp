@@ -2782,10 +2782,14 @@ function Get-ExistingTunnelReaders {
         if (-not $cl) { continue }
         if ($cl -notmatch '(?i)relay[\\/.]tunnel_host_log') { continue }
         if ($bare -and ($cl -notmatch ('(?i)\s"?' + [regex]::Escape($bare) + '(\.[a-z0-9]+)?("|\s|$)'))) { continue }
-        $out += @{ Pid = [int]$p.ProcessId; CommandLine = $cl }
+        # ParentPid carries the reader's PARENT (its supervisor). A reader whose parent is gone is
+        # an ORPHAN -- the state a fresh -CoreOnly supervisor must ADOPT, not duplicate (see
+        # Adopt-OrphanTunnelReader / supervisor_host_launch.decide_orphan_adoption).
+        $out += @{ Pid = [int]$p.ProcessId; CommandLine = $cl; ParentPid = [int]$p.ParentProcessId }
     }
     if ($trackedPid -and -not (@($out | Where-Object { $_.Pid -eq $trackedPid }).Count)) {
-        $out += @{ Pid = $trackedPid; CommandLine = "(the reader this supervisor launched)" }
+        # The reader this supervisor itself launched is ours by definition; parent is this process.
+        $out += @{ Pid = $trackedPid; CommandLine = "(the reader this supervisor launched)"; ParentPid = $PID }
     }
     return @($out)
 }
@@ -2905,6 +2909,90 @@ function Invoke-HostLaunchDecision {
     return $out
 }
 
+function Invoke-OrphanAdoptionDecision {
+    # PURE DECIDER, reached the cross-language way the other supervisor gates are (& $Py -c with the
+    # module and function both named, so tools/unreached.py credits this caller and the two cannot
+    # drift): "adopt", "skip" or "launch" from (reader alive, parent supervisor alive, we already
+    # track it). Any failure returns "" so the caller falls back to its old launch path rather than
+    # wrongly adopt or duplicate on an error.
+    param([bool]$ReaderAlive, $ParentSupervisorAlive, [bool]$WeTrackIt)
+    $aliveArg = if ($ReaderAlive) { "True" } else { "False" }
+    # $null parent -> None (orphan: parent could not be told to be alive). $true/$false map through.
+    $parentArg = if ($null -eq $ParentSupervisorAlive) { "None" } elseif ($ParentSupervisorAlive) { "True" } else { "False" }
+    $trackArg = if ($WeTrackIt) { "True" } else { "False" }
+    try {
+        $out = ([string](& $Py -c "import sys; sys.path.insert(0, r'$Root\scripts'); import supervisor_host_launch; print(supervisor_host_launch.decide_orphan_adoption($aliveArg, $parentArg, $trackArg))" 2>$null)).Trim()
+    } catch {
+        return ""
+    }
+    return $out
+}
+
+function Test-ProcessAlive {
+    # Is a pid a live process right now? $false for a missing/zero pid or any pid with no process.
+    # Used to tell a reader's PARENT (its supervisor) apart from a gone one -- a reader whose parent
+    # is gone is the ORPHAN that Adopt-OrphanTunnelReader takes over instead of duplicating.
+    param($ProcessId)
+    if ($null -eq $ProcessId) { return $false }
+    $n = 0
+    if (-not [int]::TryParse([string]$ProcessId, [ref]$n)) { return $false }
+    if ($n -le 0) { return $false }
+    try {
+        $p = Get-Process -Id $n -ErrorAction Stop
+        return ($null -ne $p)
+    } catch {
+        return $false
+    }
+}
+
+function Adopt-OrphanTunnelReader {
+    # ADOPT A LIVE ORPHAN READER INSTEAD OF STARTING A SECOND ONE. A supervisor that died can leave
+    # its reader (relay.tunnel_host_log) and that reader's devtunnel host alive as orphans. A fresh
+    # supervisor (including the one start_all.ps1 -CoreOnly starts) must TAKE OWNERSHIP of such a
+    # reader -- track it as $script:TunnelHostProc and keep monitoring it -- not launch a parallel
+    # reader, which is the two-hosts-for-one-tunnel state commit 6cfabfd9 forbids (and which
+    # preceded the 0-byte token cache on 2026-11-12). Returns $true when it adopted a reader (the
+    # caller must then NOT launch), $false when there is nothing to adopt (caller proceeds as before).
+    #
+    # Scope and safety: only readers Get-ExistingTunnelReaders already matched for THIS tunnel are
+    # considered; the orphan test is positive (parent pid is known AND not alive); a reader we
+    # already track is never "adopted" again; the existing live host is left completely untouched
+    # (no kill, no re-host, no devtunnel CLI call here).
+    $readers = @(Get-ExistingTunnelReaders $TunnelName)
+    if ($readers.Count -eq 0) { return $false }
+    $trackedPid = 0
+    if ($script:TunnelHostProc) {
+        try { $script:TunnelHostProc.Refresh(); if (-not $script:TunnelHostProc.HasExited) { $trackedPid = [int]$script:TunnelHostProc.Id } } catch { }
+    }
+    foreach ($r in $readers) {
+        $rp = [int]$r.Pid
+        if ($rp -le 0) { continue }
+        $weTrackIt = ($trackedPid -gt 0 -and $rp -eq $trackedPid)
+        # Parent known? Only then can we say orphan-or-not. An unknown/zero parent reads as
+        # $null -> the decider treats that as "no live parent" (orphan), which is correct here: a
+        # reader we did not start and whose parent we cannot see is not owned by any live supervisor
+        # we can point to. A parent pid that IS a live process means some supervisor still owns it.
+        $parentAlive = $null
+        if ($null -ne $r.ParentPid -and [int]$r.ParentPid -gt 0) {
+            $parentAlive = [bool](Test-ProcessAlive ([int]$r.ParentPid))
+        }
+        $decision = Invoke-OrphanAdoptionDecision -ReaderAlive $true -ParentSupervisorAlive $parentAlive -WeTrackIt $weTrackIt
+        if ($decision -eq "adopt") {
+            try {
+                $proc = Get-Process -Id $rp -ErrorAction Stop
+                $script:TunnelHostProc = $proc
+                Write-Log ("adopted orphan devtunnel host reader pid $rp (its parent supervisor is gone) -- " +
+                           "tracking it as ours instead of starting a second reader (one tunnel, one host)")
+                return $true
+            } catch {
+                Write-Log ("orphan reader pid $rp vanished before it could be adopted -- proceeding normally")
+                return $false
+            }
+        }
+    }
+    return $false
+}
+
 function Get-TunnelReaderChildPid {
     # The pid of the devtunnel host child this reader spawned, or 0 when none is found.
     # Same match Stop-TunnelReaderTree uses: a devtunnel.exe whose ParentProcessId is this
@@ -3002,6 +3090,16 @@ function Start-TunnelHost {
     # a reader that has been at zero connections past the measured grace has its HOST CHILD ended
     # -- only the devtunnel.exe it spawned, never the reader. The reader's serve_forever() then
     # sees the host exit and starts a new host (~8 s to re-register). Still exactly one reader.
+    #
+    # ADOPT A LIVE ORPHAN BEFORE ANYTHING ELSE. A supervisor that died can leave its reader + host
+    # alive as orphans (parent supervisor gone). A fresh supervisor must TAKE OWNERSHIP of that
+    # reader -- track it, leave its host untouched -- rather than launch a second reader (the
+    # two-hosts-for-one-tunnel state commit 6cfabfd9 forbids, which preceded the 0-byte token cache
+    # on 2026-11-12). When Adopt-OrphanTunnelReader adopts one, return as the existing host: the
+    # reader is now ours and the live host is left exactly as it was (no kill, no re-host, no CLI).
+    if (Adopt-OrphanTunnelReader) {
+        return $true
+    }
     $existingReaders = @(Get-ExistingTunnelReaders $TunnelName)
     if ($existingReaders.Count -gt 0) {
         $waited = Get-ReaderSecondsWithoutRelay
