@@ -322,3 +322,177 @@ def test_serve_forever_still_backs_off_a_real_crash(tmp_path, monkeypatch):
     thl.serve_forever("any-tunnel", root=str(tmp_path), devtunnel="x",
                       max_restarts=3, watch_connections=True)
     assert slept[:2] == [2.0, 4.0]  # unchanged growing backoff for genuine failures
+
+
+# -- WRITE FAILURE MUST NOT KILL THE PUMP THREAD ----------------------------------------------
+# 2026-11-12: the host log stopped mid stack-trace at 18:41:35 and was silent for hours while
+# the reader (pid 24664) and its host child (pid 32472) were both alive. The only way that
+# happens is an exception escaping RotatingLog.write_line (self._fh.write was the one file op
+# outside a try), unwinding out of pump_stream and killing the pipe-drain thread; with nobody
+# reading, the host's stdout/stderr pipes fill and the host blocks (the 2026-10-31 structure).
+# These tests pin: (a) write_line swallows OSError, (b) pump_stream reads to EOF even while
+# every write fails, (c) after recovery a single 'N lines dropped' notice precedes normal lines,
+# and that the reopen attempt is throttled to once per 30 s using an injected clock.
+
+
+class _RaisingFile:
+    """A file-like sink whose write() raises OSError until ``fail`` is cleared.
+
+    ``fail`` True -> every write raises. Flip it to False to simulate recovery. tell()/flush()
+    are provided and honour the same flag so the whole write path is exercised.
+    """
+    def __init__(self):
+        self.fail = True
+        self.lines = []
+        self.closed = False
+
+    def write(self, s):
+        if self.fail:
+            raise OSError(28, "No space left on device")
+        self.lines.append(s)
+        return len(s)
+
+    def tell(self):
+        if self.fail:
+            raise OSError(28, "No space left on device")
+        return sum(len(x) for x in self.lines)
+
+    def flush(self):
+        if self.fail:
+            raise OSError(28, "No space left on device")
+
+    def close(self):
+        self.closed = True
+
+
+def _fixed_clock():
+    """A clock whose value the test advances explicitly via the returned setter."""
+    state = {"t": 1000.0}
+    def now():
+        return state["t"]
+    def advance(dt):
+        state["t"] += dt
+    return now, advance
+
+
+def _log_with_fake_file(tmp_path, fake, now):
+    # Build a RotatingLog whose handle is our fake. __init__ calls _open(); we let it open the
+    # real file once (harmless) and then swap in the fake, pointing _open at the fake too so a
+    # throttled reopen returns the same controllable object.
+    log = thl.RotatingLog(str(tmp_path / "ts.log"), max_bytes=10 * 1024 * 1024, now=now)
+    log._fh = fake
+    log._open = lambda: (setattr(log, "_last_reopen_attempt", log._now()),
+                         setattr(log, "_fh", fake))[-1]
+    return log
+
+
+def test_write_line_never_raises_on_oserror(tmp_path):
+    now, _ = _fixed_clock()
+    fake = _RaisingFile()
+    log = _log_with_fake_file(tmp_path, fake, now)
+    # Every write raises OSError; write_line must swallow it and count the drop, not raise.
+    for i in range(5):
+        log.write_line("line-%d" % i)  # must not raise
+    assert log._dropped == 5
+    assert fake.lines == []  # nothing got through while failing
+
+
+def test_pump_stream_reads_to_eof_while_every_write_fails(tmp_path):
+    now, _ = _fixed_clock()
+    fake = _RaisingFile()
+    log = _log_with_fake_file(tmp_path, fake, now)
+    # A finite in-memory stream of 100 lines. Even though write_line fails on every one, the
+    # pump must iterate the WHOLE stream to EOF (keeping the real host's pipe drained).
+    import io
+    payload = "".join("host-line-%03d\n" % i for i in range(100))
+    stream = io.StringIO(payload)
+    errors = thl.pump_stream(stream, log)
+    # write_line itself does not raise (it swallows), so pump's own guard counts 0 errors,
+    # but every line was dropped by the sink -- the proof the loop ran to the end.
+    assert errors == 0
+    assert log._dropped == 100
+    # And the stream was fully consumed.
+    assert stream.read() == ""
+
+
+def test_pump_stream_survives_a_sink_that_itself_raises(tmp_path):
+    # Belt and braces: even if a sink breaks its contract and RAISES, pump_stream must still
+    # read to EOF and count the failures rather than dying.
+    import io
+    class _AlwaysRaises:
+        def write_line(self, text):
+            raise RuntimeError("sink is broken")
+    stream = io.StringIO("a\nb\nc\n")
+    errors = thl.pump_stream(stream, _AlwaysRaises())
+    assert errors == 3
+    assert stream.read() == ""
+
+
+def test_dropped_notice_is_written_once_after_recovery(tmp_path):
+    now, advance = _fixed_clock()
+    fake = _RaisingFile()
+    log = _log_with_fake_file(tmp_path, fake, now)
+    # Three lines fail (dropped=3). Then recover and write a normal line: the first write
+    # after recovery must be preceded by exactly one '(3 lines dropped ...)' notice, then the
+    # normal line, and the counter resets.
+    for i in range(3):
+        log.write_line("lost-%d" % i)
+    assert log._dropped == 3
+    fake.fail = False
+    # The failing writes invalidated the handle; a reopen is throttled to once per 30 s, so
+    # advance the clock past the window before the recovery write so the reopen is permitted
+    # (this mirrors real elapsed time -- the fault clears, then the next poll succeeds).
+    advance(thl.REOPEN_THROTTLE_SECONDS + 0.001)
+    log.write_line("recovered-line")
+    joined = "".join(fake.lines)
+    assert joined.count("lines dropped") == 1
+    assert "(3 lines dropped while the log could not be written)" in joined
+    assert "recovered-line" in joined
+    # The notice comes before the recovered line.
+    assert joined.index("lines dropped") < joined.index("recovered-line")
+    assert log._dropped == 0
+    # A subsequent successful write adds NO further dropped notice.
+    log.write_line("another-line")
+    assert "".join(fake.lines).count("lines dropped") == 1
+
+
+def test_reopen_is_throttled_to_once_per_30s(tmp_path):
+    # While writes fail, write_line must not try to reopen on every single line -- at most
+    # once per REOPEN_THROTTLE_SECONDS. We count _open() calls across a burst inside one 30 s
+    # window, then after advancing the clock past the window.
+    now, advance = _fixed_clock()
+    log = thl.RotatingLog(str(tmp_path / "ts.log"), max_bytes=10 * 1024 * 1024, now=now)
+    # Invalidate the handle so each write_line wants to reopen; count reopen attempts.
+    opens = {"n": 0}
+    def _counting_open():
+        opens["n"] += 1
+        log._last_reopen_attempt = log._now()
+        log._fh = None  # reopen keeps failing (simulates the persistent fault)
+    log._open = _counting_open
+    log._fh = None
+    log._last_reopen_attempt = None  # never attempted yet -> first call may try
+    # Burst of 10 writes at the SAME clock value: only the first is allowed to attempt reopen.
+    for _ in range(10):
+        log.write_line("x")
+    assert opens["n"] == 1, "reopen must be throttled inside the 30 s window"
+    # Advance past the throttle: the next write is allowed one more attempt.
+    advance(thl.REOPEN_THROTTLE_SECONDS + 0.001)
+    log.write_line("x")
+    assert opens["n"] == 2
+    # Still within the new window: no further attempts.
+    for _ in range(5):
+        log.write_line("x")
+    assert opens["n"] == 2
+    assert log._dropped == 16  # all 16 lines dropped (handle never recovered)
+
+
+def test_a_failed_initial_open_does_not_prevent_construction(tmp_path, monkeypatch):
+    # If the very first open fails, RotatingLog must still construct (so the reader can keep
+    # draining pipes) with _fh None and drops counted, not raise out of __init__.
+    def _boom(path):
+        raise OSError(13, "permission denied")
+    monkeypatch.setattr(thl.RotatingLog, "_open_shared", staticmethod(_boom))
+    log = thl.RotatingLog(str(tmp_path / "nope" / "ts.log"))  # must not raise
+    assert log._fh is None
+    log.write_line("while-broken")  # must not raise
+    assert log._dropped == 1
