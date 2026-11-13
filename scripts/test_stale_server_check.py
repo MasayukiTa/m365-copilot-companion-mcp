@@ -403,3 +403,82 @@ def test_liveness_seconds_is_tolerated_in_any_shape():
     assert S.decide_liveness_strike(False, True, None) == "alive"
     assert S.decide_liveness_strike(False, True, "not-a-number") == "alive"
     assert S.decide_liveness_strike(False, False, None) == "strike"
+
+
+# -------------------------------------------------- _server_code_changed_between (doctor)
+# The piece the doctor CLI now computes so a commit that moved HEAD without touching code the
+# server imports does NOT read as stale. It reads `git diff --name-only started..current` and
+# defers the verdict to python_side_changed; None on any failure keeps the SHA-only rule.
+
+def test_server_code_changed_between_same_sha_short_circuits_false():
+    # Identical SHAs cannot have a diff, so nothing imported changed -- without calling git.
+    assert S._server_code_changed_between("abc123", "abc123") is False
+
+
+def test_server_code_changed_between_missing_sha_is_none():
+    # No SHA to compare -> cannot tell -> None (classify_staleness then keeps the SHA rule).
+    assert S._server_code_changed_between("", "newsha") is None
+    assert S._server_code_changed_between("oldsha", "") is None
+    assert S._server_code_changed_between(None, "newsha") is None
+
+
+def test_server_code_changed_between_unknown_sha_in_repo_is_none():
+    # SHAs the object store does not have cannot be diffed; defer rather than guess.
+    assert S._server_code_changed_between("0" * 40, "1" * 40) is None
+
+
+def _git(repo, *args):
+    import subprocess
+    subprocess.run(["git", "-C", str(repo), *args],
+                   check=True, capture_output=True, text=True)
+
+
+def _commit_file(repo, relpath, content):
+    import subprocess
+    p = repo / relpath
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(content, encoding="utf-8")
+    _git(repo, "add", "-A")
+    _git(repo, "commit", "-q", "-m", "c")
+    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                          check=True, capture_output=True, text=True).stdout.strip()
+
+
+def test_server_code_changed_between_docs_only_commit_is_false(tmp_path):
+    """THE CRYING-WOLF CASE. A commit that touches only docs moved HEAD; the server imports
+    none of it, so doctor must read current, not amber. This is the exact regression the
+    doctor CLI shipped with -- a different SHA alone was treated as stale."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    a = _commit_file(repo, "docs/readme.md", "one\n")
+    b = _commit_file(repo, "docs/readme.md", "two\n")
+    assert S._server_code_changed_between(a, b, repo=str(repo)) is False
+
+
+def test_server_code_changed_between_tools_commit_is_true(tmp_path):
+    """A commit that edits tools/ IS code the running server imports -- genuinely stale."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    a = _commit_file(repo, "docs/readme.md", "one\n")
+    b = _commit_file(repo, "tools/tool_probe.py", "x = 1\n")
+    assert S._server_code_changed_between(a, b, repo=str(repo)) is True
+
+
+def test_server_code_changed_between_feeds_classify_to_current_on_docs_move(tmp_path):
+    """End to end over the pure core: a docs-only HEAD move yields watched_changed False, and
+    classify_staleness then reports current -- the dot stays green through the branch switch."""
+    repo = tmp_path / "r"
+    repo.mkdir()
+    _git(repo, "init", "-q")
+    _git(repo, "config", "user.email", "t@t")
+    _git(repo, "config", "user.name", "t")
+    a = _commit_file(repo, "docs/readme.md", "one\n")
+    b = _commit_file(repo, "docs/readme.md", "two\n")
+    wc = S._server_code_changed_between(a, b, repo=str(repo))
+    assert S.classify_staleness(a, b, server_running=True, watched_changed=wc) == "current"
