@@ -132,8 +132,11 @@ def run_python(
             f.write(code)
             tmp_path = f.name
 
-        return _run_python_tree(
-            [sys.executable, tmp_path], timeout, _working_dir(working_dir))
+        _cwd = _working_dir(working_dir)
+        _warm = _run_python_warm(tmp_path, timeout, _cwd)
+        if _warm is not None:
+            return _warm
+        return _run_python_tree([sys.executable, tmp_path], timeout, _cwd)
     except subprocess.TimeoutExpired:
         return f"[timeout: exceeded {timeout} seconds]"
     except Exception as e:
@@ -629,25 +632,51 @@ def _run_python_tree(argv, timeout, cwd):
         # ATTRIBUTE THE SPAWN TO THE WORKER, AT THE SOURCE. register() reads the worker from the
         # ContextVar the gateway set for this call; outside a worker turn it is a no-op. Never
         # raises into the tool.
-        try:
-            proc_registry.register(proc.pid, tool="run_python")
-        except Exception:
-            pass
-        try:
-            out, err = proc.communicate(timeout=timeout)
-        except subprocess.TimeoutExpired:
-            _kill_tree(proc)
-            try:
-                out, err = proc.communicate(timeout=5)
-            except Exception:
-                out, err = b"", b""
-            raise
+        return _collect(proc, timeout)
 
-        class _R(object):
-            pass
-        result = _R()
-        result.stdout, result.stderr, result.returncode = out, err, proc.returncode
-        return _format_output(result, "run_python")
+
+def _collect(proc, timeout):
+    """Register the child to the worker, wait for it, and format its output.
+
+    Shared by the plain Popen path and the warm-interpreter path so both keep exactly the
+    same timeout (whole-tree kill) and output behaviour.
+    """
+    try:
+        proc_registry.register(proc.pid, tool="run_python")
+    except Exception:
+        pass
+    try:
+        out, err = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_tree(proc)
+        try:
+            out, err = proc.communicate(timeout=5)
+        except Exception:
+            out, err = b"", b""
+        raise
+
+    class _R(object):
+        pass
+    result = _R()
+    result.stdout, result.stderr, result.returncode = out, err, proc.returncode
+    return _format_output(result, "run_python")
+
+
+def _run_python_warm(tmp_path, timeout, cwd):
+    """Run the script in a pre-started interpreter; None means 'use the plain path'."""
+    try:
+        from . import runpy_pool
+        if runpy_pool.pool_size() <= 0:
+            return None
+        proc = runpy_pool.take()
+        if proc is None:
+            return None
+        if not runpy_pool.send(proc, tmp_path, cwd):
+            return None
+    except Exception:
+        return None
+    with proc:
+        return _collect(proc, timeout)
 
 
 #: This tool runs caller-supplied code, so the evidence trace cannot see what it did:
