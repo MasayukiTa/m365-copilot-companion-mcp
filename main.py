@@ -431,6 +431,25 @@ COMPACT_INSTRUCTIONS = (
     "call_tool(name='fleet_submit', arguments={...}). QUEUED means not started."
 )
 
+def _session_idle_timeout_s(environ=None):
+    """Seconds a streamable-HTTP session may sit unused before the server drops it.
+
+    fastmcp's own default is None = sessions never expire. Clients that open a session and
+    never send DELETE (one-shot scripts, probes) then pile up until the MCP SDK's
+    max_sessions (10000) is hit and every initialize gets HTTP 503 (the SDK's
+    "sessions are already open" warning). Measured 2026-11-13: ~15000 initialize calls in ~13 h (about 12000 of the
+    successful ones from one-shot script clients), server up 02:37, 503s from 12:14. 1800 s
+    is the MCP SDK's own default; at the measured ~17 initialize/min it bounds open sessions
+    near 500. MCP_SESSION_IDLE_S overrides; 0 or invalid falls back to 1800.
+    """
+    env = os.environ if environ is None else environ
+    try:
+        v = float(env.get("MCP_SESSION_IDLE_S", "1800"))
+    except (TypeError, ValueError):
+        return 1800.0
+    return v if v > 0 and v != float("inf") and v == v else 1800.0
+
+
 mcp = FastMCP(
     "m365-copilot-companion-mcp",
     auth=auth,
@@ -2296,7 +2315,8 @@ if __name__ == "__main__":
     # _BearerPrefix (the outermost layer: raw-key -> "Bearer <key>", and the 401 observer) is
     # defined at module level above, so the tests can wrap the real app with it.
     app = mcp.http_app(path="/mcp", transport="streamable-http",
-                       json_response=True, middleware=[Middleware(_AcceptBoth)])
+                       json_response=True, middleware=[Middleware(_AcceptBoth)],
+                       session_idle_timeout=_session_idle_timeout_s())
 
     # Wrap OUTERMOST so the raw-key -> "Bearer <key>" rewrite happens before FastMCP's
     # auth middleware sees the request (see _BearerPrefix docstring). Lifespan events pass
