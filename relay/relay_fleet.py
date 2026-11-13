@@ -5331,7 +5331,18 @@ class RelayWorker:
         # The goal waits here, and the monitor's probe decides when one turn may go out again.
         try:
             from relay import provider_health as _ph
-            if _ph.get_monitor().send_blocked():
+            # Pass this run's state dir (the directory holding status.json) so a state change is
+            # logged to <state_dir>/provider_health.jsonl. get_monitor is process-wide and only
+            # adopts a state dir while it still has none, so whichever of this gate or
+            # fleet_runner._provider_block runs first sets it; passing it here too means the log
+            # works even on a sweep where the standby gate runs before the snapshot. fleet_runner
+            # is imported lazily to avoid a module-load cycle.
+            try:
+                from relay import fleet_runner as _fr
+                _sd = getattr(_fr, "_ACTIVE_STATE_DIR", None)
+            except Exception:
+                _sd = None
+            if _ph.get_monitor(_sd).send_blocked():
                 self.reason = "standby: provider outage, no turn sent; goal waits"
                 return
         except Exception:

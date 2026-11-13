@@ -54,6 +54,22 @@ PROBE_TIMEOUT_S = 5.0
 #: success can be a blip; two in a row shows the path is stable enough to spend one turn.
 PROBE_PASSES_REQUIRED = 2
 
+#: Seconds to wait for a reply after a probe turn actually went out before re-arming a new
+#: probe cycle. Reason: the one allowed probe turn can get no reply (the provider is still
+#: down, or the turn was lost); without a timeout the monitor would wait on that one turn
+#: forever, because recovery requires a reply and none is coming. Two probe intervals: long
+#: enough for a real slow reply to land, short enough that a dead probe turn does not strand
+#: the fleet.
+PROBE_REPLY_TIMEOUT_S = 120.0
+
+#: Seconds to wait after the allowance is granted but before any turn is sent, before
+#: re-arming. Reason: send_blocked() may report "may send" and then a later gate (send
+#: pacing, rate headroom, a steer) aborts the send, so note_sent() never runs and the
+#: allowance is spent on nothing. Without this the allowance is lost and the one-turn window
+#: never comes back. Longer than the reply timeout so a granted-and-used allowance is judged
+#: by PROBE_REPLY_TIMEOUT_S, and only a granted-but-never-sent one falls through to here.
+PROBE_ALLOW_TIMEOUT_S = 180.0
+
 #: Host of the provider socket. Same host as relay/chathub.py WS_BASE. A test checks that.
 SOCKET_HOST = "substrate.office.com"
 SOCKET_PORT = 443
@@ -126,11 +142,17 @@ def probe_reachable():
 class ProviderMonitor:
     """Holds the counters and the state. Thread-safe; all times come from the caller."""
 
-    def __init__(self, state_dir=None, probe=probe_reachable, clock=time.time):
+    def __init__(self, state_dir=None, probe=probe_reachable, clock=time.time,
+                 probe_async=True):
         self._lock = threading.Lock()
         self._state_dir = state_dir
         self._probe = probe
         self._clock = clock
+        #: Run the probe on a background thread (production) so a slow connect never blocks
+        #: tick(). Tests set this False to fold the probe result in on the same tick for a
+        #: deterministic pass counter; the slow-probe test keeps it True to assert tick()
+        #: returns immediately.
+        self._probe_async = bool(probe_async)
         self.counters = _new_counters()
         self.state = "ok"
         self.reason = "no turns yet"
@@ -139,10 +161,26 @@ class ProviderMonitor:
         self._passes = 0
         self._probe_turn_allowed = False
         self._probe_turn_out = False
+        #: When the allowance was granted (caller clock). Used to re-arm if it is granted but
+        #: no turn is ever sent (a later gate aborted the send).
+        self._allow_ts = 0.0
+        #: When the one probe turn actually went out. Used to re-arm if no reply arrives.
+        self._probe_out_ts = 0.0
+        #: Async probe state. The TCP probe runs on a background thread so a slow or hung
+        #: connect never blocks the coordinator tick. tick() starts one probe at a time and
+        #: reads the result on a later tick; it never joins the thread.
+        self._probe_thread = None
+        self._probe_result = None  # None = running/none, True/False = last finished result
 
     # -- accounting -------------------------------------------------------
     def note_sent(self):
-        """A turn went out. Returns its absolute index for note_reply."""
+        """A turn went out. Returns its absolute index for note_reply.
+
+        This is the point where a turn REALLY goes out, so the one-turn probe allowance is
+        consumed here, not in send_blocked(). send_blocked() only reports whether a send may
+        proceed; a later gate can still abort the send, and if the allowance had already been
+        spent there it would be lost with no turn ever sent (the deadlock this fixes).
+        """
         with self._lock:
             c = self.counters
             idx = c["turns_sent"]
@@ -152,6 +190,13 @@ class ProviderMonitor:
                 drop = len(c["recent"]) - HISTORY_KEEP
                 del c["recent"][:drop]
                 c["base"] += drop
+            if self._probe_turn_allowed:
+                # The allowed probe turn is now really going out: spend the allowance and
+                # start the reply clock. tick() re-arms a new cycle if no reply lands.
+                self._probe_turn_allowed = False
+                self._allow_ts = 0.0
+                self._probe_turn_out = True
+                self._probe_out_ts = float(self._clock())
             return idx
 
     def note_reply(self, idx, ts=None):
@@ -166,6 +211,7 @@ class ProviderMonitor:
             if self._probe_turn_out:
                 # Recovery needs a real reply. A probe success alone never restores ok.
                 self._probe_turn_out = False
+                self._probe_out_ts = 0.0
                 self._evaluate_locked(None, None)
 
     def set_queued(self, n):
@@ -177,33 +223,105 @@ class ProviderMonitor:
         """True when a worker must NOT send a turn now (outage standby).
 
         In outage, exactly one turn is allowed after PROBE_PASSES_REQUIRED passing probes.
-        Calling this consumes that allowance.
+        This method only REPORTS whether a send may proceed; it does not consume the
+        allowance. The allowance is consumed in note_sent(), the point where a turn really
+        goes out, because a later gate can still abort this send. This makes send_blocked()
+        idempotent: calling it twice while allowed returns False both times and changes
+        nothing, so a second check (or a check followed by an aborted send) cannot strand the
+        allowance.
         """
         with self._lock:
             if self.state != "outage":
                 return False
             if self._probe_turn_allowed:
-                self._probe_turn_allowed = False
-                self._probe_turn_out = True
                 return False
             return True
 
     def tick(self, token_wait_s=None, socket_fallbacks=0, now=None):
-        """Re-evaluate the state and run the probe when due. Call about once a second."""
+        """Re-evaluate the state and run the probe when due. Call about once a second.
+
+        The probe never runs inline: a TCP connect to an unreachable provider can block for
+        the whole PROBE_TIMEOUT_S, and doing that here would stall the coordinator tick. tick()
+        instead starts one probe on a background thread and reads its result on a later tick,
+        so tick() returns immediately no matter how slow the probe is.
+        """
         now = float(self._clock() if now is None else now)
-        if self.state == "outage" and now - self._last_probe >= PROBE_INTERVAL_S:
-            self._last_probe = now
+        if self.state == "outage":
+            with self._lock:
+                self._rearm_locked(now)
+                self._consume_probe_result_locked()
+                due = now - self._last_probe >= PROBE_INTERVAL_S
+                idle = self._probe_thread is None or not self._probe_thread.is_alive()
+                if due and idle:
+                    self._last_probe = now
+                    if self._probe_async:
+                        self._start_probe_locked()
+                    else:
+                        self._run_probe_sync_locked()
+                        self._consume_probe_result_locked()
+        with self._lock:
+            self._evaluate_locked(token_wait_s, socket_fallbacks, now)
+
+    def _run_probe_sync_locked(self):
+        """Run the probe inline (test mode) and store its result for the same tick."""
+        try:
+            ok = bool(self._probe())
+        except Exception:
             ok = False
+        self._probe_result = ok
+
+    def _start_probe_locked(self):
+        """Launch one probe on a background thread. Never joins; the result is read later."""
+        self._probe_result = None
+
+        def _run():
             try:
                 ok = bool(self._probe())
             except Exception:
                 ok = False
             with self._lock:
-                self._passes = self._passes + 1 if ok else 0
-                if self._passes >= PROBE_PASSES_REQUIRED and not self._probe_turn_out:
-                    self._probe_turn_allowed = True
-        with self._lock:
-            self._evaluate_locked(token_wait_s, socket_fallbacks, now)
+                self._probe_result = ok
+
+        t = threading.Thread(target=_run, name="provider-probe", daemon=True)
+        self._probe_thread = t
+        t.start()
+
+    def _consume_probe_result_locked(self):
+        """Fold a finished probe's result into the pass counter and the allowance."""
+        if self._probe_result is None:
+            return
+        ok = self._probe_result
+        self._probe_result = None
+        self._passes = self._passes + 1 if ok else 0
+        if (self._passes >= PROBE_PASSES_REQUIRED
+                and not self._probe_turn_out and not self._probe_turn_allowed):
+            self._probe_turn_allowed = True
+            self._allow_ts = float(self._clock())
+
+    def _rearm_locked(self, now):
+        """Recover a probe cycle that got stuck. Two ways it can stick:
+
+        * a probe turn went out (note_sent set _probe_turn_out) and no reply arrived within
+          PROBE_REPLY_TIMEOUT_S -- recovery needs a reply and none is coming, so start over;
+        * the allowance was granted (send_blocked said "may send") but no turn was sent within
+          PROBE_ALLOW_TIMEOUT_S -- a later gate aborted the send, note_sent never ran, and
+          without this the one-turn window would never return.
+
+        Resetting the flags and the pass counter lets tick() grant a fresh allowance after
+        PROBE_PASSES_REQUIRED more passing probes.
+        """
+        if (self._probe_turn_out and self._probe_out_ts
+                and now - self._probe_out_ts >= PROBE_REPLY_TIMEOUT_S):
+            self._probe_turn_out = False
+            self._probe_out_ts = 0.0
+            self._probe_turn_allowed = False
+            self._allow_ts = 0.0
+            self._passes = 0
+        elif (self._probe_turn_allowed and self._allow_ts
+                and now - self._allow_ts >= PROBE_ALLOW_TIMEOUT_S):
+            self._probe_turn_allowed = False
+            self._allow_ts = 0.0
+            self._passes = 0
 
     def _evaluate_locked(self, token_wait_s, socket_fallbacks, now=None):
         now = float(self._clock() if now is None else now)
@@ -221,8 +339,11 @@ class ProviderMonitor:
         self.since = now
         self._passes = 0
         self._probe_turn_allowed = False
+        self._allow_ts = 0.0
+        self._probe_result = None
         if state != "outage":
             self._probe_turn_out = False
+            self._probe_out_ts = 0.0
         self._write_change(frm, state, reason, now)
 
     def _write_change(self, frm, to, reason, now):

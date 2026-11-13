@@ -2067,17 +2067,25 @@ def _submitter_of(jid):
 def _provider_block(workers):
     """Top-level status.json fields for the provider health monitor.
 
-    Queued goals = workers not yet started (pending or ready). The token-wait input is not
-    passed here (None): the token rule then never fires from the snapshot, and only the
-    no-reply rule runs. Never raises: a status write must not fail on this.
+    Queued goals = workers not yet started (pending or ready). The monitor is created with
+    this run's state dir (the directory that holds status.json) the first time, so a state
+    change is logged to <state_dir>/provider_health.jsonl. The token wait passed to tick() is
+    the oldest held-goal wait in seconds (TokenHold.summary()'s oldest_s), so the token-wait
+    outage rule can fire even when no turn has been sent recently. Never raises: a status
+    write must not fail on this.
     """
     try:
         from relay import provider_health as _ph
-        mon = _ph.get_monitor()
+        mon = _ph.get_monitor(_ACTIVE_STATE_DIR)
         queued = sum(1 for w in (workers or [])
                      if getattr(w, "status", "") in ("pending", "ready"))
         mon.set_queued(queued)
-        mon.tick(token_wait_s=None, socket_fallbacks=0)
+        try:
+            _tw = _token_provider.status_block().get("oldest_s")
+            token_wait_s = float(_tw) if _tw is not None else None
+        except Exception:
+            token_wait_s = None
+        mon.tick(token_wait_s=token_wait_s, socket_fallbacks=0)
         blk = mon.status_block()
         return {"provider_state": blk["provider_state"],
                 "provider_reason": blk["provider_reason"],
