@@ -109,6 +109,104 @@ def test_a_data_file_is_not_staleness(tree):
     assert F.newer_than(time.time() - 3600, root=str(tree)) == []
 
 
+# -- content hash: a touch that does not change the bytes is not staleness -----------------
+#
+# THE BUG THIS PINS. git checkout / pull / merge rewrites the working tree and bumps the
+# mtime of a watched file even when its bytes are identical (a branch switch touching an
+# unrelated file; a fast-forward re-materialising a file to the same content). The old
+# mtime-only rule then said 'stale', the supervisor cycled the live server, and an outside
+# client saw a 20s-2min outage for a change the server never needed to load. The content
+# rule below is immune: only a real byte change counts.
+
+def test_file_sha256_matches_hashlib_and_is_empty_for_missing(tree):
+    import hashlib
+    p = tree / "tools" / "a.py"
+    expect = hashlib.sha256(p.read_bytes()).hexdigest()
+    assert F.file_sha256(str(p)) == expect
+    assert F.file_sha256(str(tree / "tools" / "nope.py")) == ""
+
+
+def test_fingerprint_covers_the_same_files_newer_than_would(tree):
+    fp = F.fingerprint(root=str(tree))
+    # The seed tree has tools/a.py and main.py; both are watched, both hashed.
+    assert set(fp) == {os.path.join("tools", "a.py").replace("\\", "/"), "main.py"}
+    assert all(len(h) == 64 for h in fp.values())
+
+
+def test_fingerprint_excludes_tests_caches_and_data(tree):
+    (tree / "tools" / "test_a.py").write_text("x = 2\n", encoding="utf-8")
+    (tree / "tools" / "conftest.py").write_text("x = 2\n", encoding="utf-8")
+    (tree / "tools" / "notes.md").write_text("hello", encoding="utf-8")
+    cache = tree / "tools" / "__pycache__"
+    cache.mkdir()
+    (cache / "a.cpython-310.pyc").write_bytes(b"\x00")
+    fp = F.fingerprint(root=str(tree))
+    assert set(fp) == {os.path.join("tools", "a.py").replace("\\", "/"), "main.py"}
+
+
+def test_a_touch_with_the_same_bytes_is_not_a_content_change(tree):
+    """THE CORE OF THE FIX. Re-stamp a watched file to a NEW mtime without changing its bytes
+    (exactly what git checkout does) -- newer_than reports it, changed_against does not."""
+    base = F.fingerprint(root=str(tree))
+    touch(tree / "tools" / "a.py")   # mtime moves, bytes identical
+    assert [f for f, _ in F.newer_than(time.time() - 3600, root=str(tree))] == [
+        os.path.join("tools", "a.py")]
+    assert F.changed_against(base, root=str(tree)) == []
+
+
+def test_a_real_byte_change_is_a_content_change(tree):
+    base = F.fingerprint(root=str(tree))
+    (tree / "tools" / "a.py").write_text("x = 999\n", encoding="utf-8")
+    assert F.changed_against(base, root=str(tree)) == [
+        os.path.join("tools", "a.py").replace("\\", "/")]
+
+
+def test_a_new_watched_file_is_a_content_change(tree):
+    base = F.fingerprint(root=str(tree))
+    (tree / "relay" / "b.py").write_text("y = 1\n", encoding="utf-8")
+    assert F.changed_against(base, root=str(tree)) == [
+        os.path.join("relay", "b.py").replace("\\", "/")]
+
+
+def test_a_deleted_watched_file_is_a_content_change(tree):
+    base = F.fingerprint(root=str(tree))
+    (tree / "tools" / "a.py").unlink()
+    assert F.changed_against(base, root=str(tree)) == [
+        os.path.join("tools", "a.py").replace("\\", "/")]
+
+
+def test_check_with_baseline_drops_a_same_bytes_touch(tree, monkeypatch):
+    """check(baseline=...) is what /health uses: a server whose watched files were re-stamped
+    by a checkout but not changed in content is FRESH, not stale."""
+    started = time.time() - 3600
+    monkeypatch.setattr(F, "server_processes", lambda pattern="main.py": [(1, started)])
+    base = F.fingerprint(root=str(tree))
+    touch(tree / "tools" / "a.py")       # mtime after 'started', same bytes
+    touch(tree / "main.py")
+    r = F.check(root=str(tree), baseline=base)
+    assert r["fresh"] is True and r["stale_files"] == []
+
+
+def test_check_with_baseline_still_reports_a_real_change(tree, monkeypatch):
+    started = time.time() - 3600
+    monkeypatch.setattr(F, "server_processes", lambda pattern="main.py": [(1, started)])
+    base = F.fingerprint(root=str(tree))
+    (tree / "tools" / "a.py").write_text("x = 2\n", encoding="utf-8")
+    r = F.check(root=str(tree), baseline=base)
+    assert r["fresh"] is False
+    assert os.path.join("tools", "a.py").replace("\\", "/") in r["stale_files"]
+
+
+def test_check_without_baseline_keeps_the_old_mtime_rule(tree, monkeypatch):
+    """No baseline -> the conservative mtime-only behaviour is unchanged."""
+    started = time.time() - 3600
+    monkeypatch.setattr(F, "server_processes", lambda pattern="main.py": [(1, started)])
+    touch(tree / "tools" / "a.py")
+    r = F.check(root=str(tree))
+    assert r["fresh"] is False
+    assert os.path.join("tools", "a.py") in r["stale_files"]
+
+
 # -- against the real repository -----------------------------------------------------------
 
 def test_it_answers_about_this_machine_without_raising():

@@ -493,6 +493,23 @@ _BOOT_PID = os.getpid()
 _BOOT_TS = time.time()
 
 
+#: Captured once, at import: the sha256 of every file this server imports (tools/, relay/,
+#: main.py). The staleness check compares the disk against THIS, not against mtimes -- so a
+#: ``git checkout`` / ``pull`` / ``merge`` that re-stamps a watched file to the SAME bytes
+#: (a branch switch, a fast-forward) does not read as stale and the supervisor does not cycle
+#: a server whose code never actually changed. Empty {} on any failure, which makes every
+#: file read as changed on the first compare -- the conservative side.
+def _boot_fingerprint():
+    try:
+        from tools.deploy_freshness import fingerprint
+        return fingerprint()
+    except Exception:
+        return {}
+
+
+_BOOT_FINGERPRINT = _boot_fingerprint()
+
+
 # /HEALTH HAS ITS OWN SMALL THREAD POOL, SEPARATE FROM asyncio's DEFAULT EXECUTOR.
 #
 # The sub-probes below (_server_identity, _auth_stats_summary, ...) were each run with
@@ -631,10 +648,19 @@ _watched_refreshing = {"busy": False}
 def _watched_recompute():
     """Walk the watched tree once and store the result. Runs ONLY on the background thread
     (or synchronously on the very first, pre-traffic call), never on a /health poll under
-    load. Never raises -- an unreadable tree means 'changed' (stale), the conservative side."""
+    load. Never raises -- an unreadable tree means 'changed' (stale), the conservative side.
+
+    CONTENT, NOT mtime. This used to ask newer_than(_BOOT_TS), which dates watched files by
+    mtime -- and ``git checkout`` / ``pull`` / ``merge`` bumps the mtime of a watched file
+    even when its bytes are unchanged (a branch switch touching an unrelated file, a
+    fast-forward re-materialising a file to the same content). That made this server report
+    'stale', the supervisor cycled it, and an outside client saw a 20s-2min outage for a
+    change the live process never needed to load. changed_against(_BOOT_FINGERPRINT) compares
+    the recorded sha256 of each imported file to the disk, so only a real byte change -- the
+    thing a restart actually makes live -- counts."""
     try:
-        from tools.deploy_freshness import newer_than
-        changed = bool(newer_than(_BOOT_TS))
+        from tools.deploy_freshness import changed_against
+        changed = bool(changed_against(_BOOT_FINGERPRINT))
     except Exception:
         changed = True
     _watched_cache["at"], _watched_cache["changed"] = time.time(), changed
@@ -647,7 +673,9 @@ def _watched_code_changed():
     """Has a file THIS SERVER IMPORTS changed since it started?
 
     tools/deploy_freshness owns the list (WATCHED, pinned by its own test against main.py's
-    real imports) and newer_than() answers with mtimes rather than a subprocess.
+    real imports). changed_against() compares the recorded sha256 of each imported file to
+    the disk, so a git checkout/pull that only re-stamps a file's mtime (same bytes) is NOT
+    reported as a change -- only a real byte change is.
 
     GWSLOW stale-while-revalidate: this is called from a /health sub-probe that runs under a
     short shared deadline. The watched-tree walk is too slow to do on that path when the CPU
