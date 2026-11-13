@@ -5326,6 +5326,16 @@ class RelayWorker:
         if getattr(self, "_mcp_conv_fresh", False):
             if self._mcp_gate_blocked():
                 return
+        # PROVIDER STANDBY (relay/provider_health.py). While the provider is in outage, no turn
+        # is sent for queued goals: each sent turn spends the goal's budget and gets no answer.
+        # The goal waits here, and the monitor's probe decides when one turn may go out again.
+        try:
+            from relay import provider_health as _ph
+            if _ph.get_monitor().send_blocked():
+                self.reason = "standby: provider outage, no turn sent; goal waits"
+                return
+        except Exception:
+            pass
         # SOCKET WORKERS DO NOT SPEND A TAB SLOT, but their generative turns still spend the
         # shared Copilot/Dataverse request budget. Gate that budget HERE, at the operation that
         # actually consumes it, rather than leaving socket workers PENDING behind a tab/worker
@@ -5499,6 +5509,15 @@ class RelayWorker:
             from relay import quota_meter as _qm
             _qm.record_turn(worker=getattr(self, "name", ""), conv=getattr(self, "conv_url", ""),
                             ts=self._turn_sent_at)
+        except Exception:
+            pass
+        # REPLY ACCOUNTING (relay/provider_health.py): one more turn sent by this worker, and
+        # its index in the provider-wide counters so the reply can be matched to it later.
+        # Placed after the quota meter, which must stay within 900 characters of the turn.
+        try:
+            from relay import provider_health as _ph
+            self._provider_idx = _ph.get_monitor().note_sent()
+            self.turns_sent = int(getattr(self, "turns_sent", 0) or 0) + 1
         except Exception:
             pass
         # AND WHO ELSE WAS IN FLIGHT. Placed AFTER the quota meter on purpose: a test asserts
@@ -6663,6 +6682,17 @@ class RelayWorker:
         self.last_response = resp
         if not _resume:
             self._tx.assistant(self.turn, resp)    # persist the full Copilot reply for this turn
+            # A REPLY is a non-empty assistant message for the turn that was sent. Counted here
+            # and nowhere else, so recovery from an outage needs a real answer, not a send.
+            if resp and str(resp).strip():
+                try:
+                    from relay import provider_health as _ph
+                    self.replies_received = int(getattr(self, "replies_received", 0) or 0) + 1
+                    self.last_reply_ts = time.time()
+                    _ph.get_monitor().note_reply(getattr(self, "_provider_idx", -1),
+                                                 ts=self.last_reply_ts)
+                except Exception:
+                    pass
             self._note_first_reply(resp)           # did the agent act on the first message?
         # HEAP PER TURN, RECORDED. The recycle threshold above is provisional and the only way
         # to replace it with a measured one is to know MB-per-turn on real work -- a worker's

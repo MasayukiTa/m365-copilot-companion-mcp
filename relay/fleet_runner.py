@@ -2064,6 +2064,30 @@ def _submitter_of(jid):
         return ""
 
 
+def _provider_block(workers):
+    """Top-level status.json fields for the provider health monitor.
+
+    Queued goals = workers not yet started (pending or ready). The token-wait input is not
+    passed here (None): the token rule then never fires from the snapshot, and only the
+    no-reply rule runs. Never raises: a status write must not fail on this.
+    """
+    try:
+        from relay import provider_health as _ph
+        mon = _ph.get_monitor()
+        queued = sum(1 for w in (workers or [])
+                     if getattr(w, "status", "") in ("pending", "ready"))
+        mon.set_queued(queued)
+        mon.tick(token_wait_s=None, socket_fallbacks=0)
+        blk = mon.status_block()
+        return {"provider_state": blk["provider_state"],
+                "provider_reason": blk["provider_reason"],
+                "provider_state_since": blk["provider_state_since"],
+                "provider_turns_sent": blk["provider_turns_sent"],
+                "provider_replies_received": blk["provider_replies_received"]}
+    except Exception:
+        return {}
+
+
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
               reunlock=None, command_rejections=None, newest_source_mtime=0.0):
@@ -2153,6 +2177,9 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         # NEVER a password: apply_reunlock builds "reason" only from deliver_steers' own log
         # lines, which never format the turn text.
         "reunlock": reunlock,
+        # PROVIDER HEALTH (relay/provider_health.py): ok / degraded / outage with the reason,
+        # and since when. Standby (no turns for queued goals) follows from the outage state.
+        **_provider_block(workers),
         # COMMANDS THIS RUN REFUSED (SEC-08), newest last, at most MAX_REJECTIONS_KEPT:
         # {"ts","keys","errors"} from record_command_rejection. A command that fails the
         # channel's schema is not applied at all, and without this a refused pause or floor
@@ -2177,6 +2204,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
             "color": STATUS_PILL.get(w.status, (w.status, "muted"))[1],
             "outcome": w.outcome,
             "turn": w.turn,
+            # Reply accounting, beside the unchanged "turn" field: sent N / replied M.
+            "turns_sent": int(getattr(w, "turns_sent", 0) or 0),
+            "replies_received": int(getattr(w, "replies_received", 0) or 0),
+            "last_reply_ts": float(getattr(w, "last_reply_ts", 0.0) or 0.0),
             "max_turns": w.max_turns,
             "reason": w.reason,
             "closed": getattr(w, "closed", False),
@@ -4339,8 +4370,9 @@ def _print_table(workers, total=None):
     def _turn_str(w):
         # max_turns=0 means unlimited; show "t10/∞" to avoid "t10/0" confusion.
         cap = ("∞" if not w.max_turns else str(w.max_turns))
-        return "%s[%s t%d/%s]" % (w.name, STATUS_PILL.get(w.status, (w.status,))[0],
-                                   w.turn, cap)
+        return "%s[%s t%d/%s sent %d/replied %d]" % (
+            w.name, STATUS_PILL.get(w.status, (w.status,))[0], w.turn, cap,
+            int(getattr(w, "turns_sent", 0) or 0), int(getattr(w, "replies_received", 0) or 0))
     line = "  ".join(_turn_str(w) for w in workers)
     sys.stdout.write("\r\033[K[fleet %d/%d] %s" % (done, total, line))
     sys.stdout.flush()
