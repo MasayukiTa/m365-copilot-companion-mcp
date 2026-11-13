@@ -237,3 +237,48 @@ Describe "main_launch_log retention: keep only the newest 200 lines" {
         }
     }
 }
+
+Describe "fleet_runner_respawn record obeys the same 300-byte line budget" {
+    # The SECOND writer into .fleet\main_launch_log.jsonl is Write-RunnerRespawnLog. It shares the
+    # file with Write-MainLaunchLog, so its line must honour the SAME 300-byte/line budget or it
+    # would break the file's per-line guarantee. Write-RunnerRespawnLog is pure-I/O and depends on
+    # $Root/$PID, so (as with the retention block above) this re-creates its record shape and its
+    # exact over-cap marker expression rather than dot-sourcing it. The worst case is the longest
+    # reason string the respawn paths pass plus int32-max PIDs.
+    function New-RespawnRecord([string]$Reason, $NewPid) {
+        [PSCustomObject][ordered]@{
+            time           = '2026-11-09 12:59:23'
+            supervisor_pid = 2147483647
+            kind           = 'fleet_runner_respawn'
+            new_pid        = $NewPid
+            reason         = $Reason
+        }
+    }
+
+    It "serialises a worst-case respawn record to 300 bytes or fewer" {
+        $rec = New-RespawnRecord -Reason 'runner absent with unfinished work; resumed interrupted run' -NewPid 2147483647
+        $line = $rec | ConvertTo-Json -Compress
+        [System.Text.Encoding]::UTF8.GetByteCount($line) | Should BeLessThan 301
+    }
+
+    It "still fits when the reason is padded to the 64-char field cap" {
+        $rec = New-RespawnRecord -Reason ('x' * 64) -NewPid 2147483647
+        $line = $rec | ConvertTo-Json -Compress
+        [System.Text.Encoding]::UTF8.GetByteCount($line) | Should BeLessThan 301
+    }
+
+    It "replaces an over-cap line with a marker that still parses and keeps the attribution facts" {
+        # Force the over-cap branch with an absurd reason, then run the SAME marker expression the
+        # writer uses and confirm the fallback both parses as JSON and still names who/when/what.
+        $rec = New-RespawnRecord -Reason ('o' * 5000) -NewPid 4242
+        $line = $rec | ConvertTo-Json -Compress
+        [System.Text.Encoding]::UTF8.GetByteCount($line) | Should BeGreaterThan 300
+        $marker = (([PSCustomObject][ordered]@{ time = $rec.time; supervisor_pid = $rec.supervisor_pid; kind = $rec.kind; new_pid = $rec.new_pid; reason = 'capped' }) | ConvertTo-Json -Compress)
+        [System.Text.Encoding]::UTF8.GetByteCount($marker) | Should BeLessThan 301
+        $parsed = $marker | ConvertFrom-Json
+        $parsed.kind | Should Be 'fleet_runner_respawn'
+        $parsed.new_pid | Should Be 4242
+        $parsed.supervisor_pid | Should Be 2147483647
+        $parsed.reason | Should Be 'capped'
+    }
+}

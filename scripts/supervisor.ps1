@@ -4180,11 +4180,20 @@ function Write-RunnerRespawnLog {
             reason         = $Reason
         }
         $line = $rec | ConvertTo-Json -Compress
-        if ($line.Length -gt 2048) { $line = $line.Substring(0, 2048) }
+        # SAME 300-BYTE/LINE and NEWEST-200-LINES invariant as Write-MainLaunchLog: both writers
+        # append to the one .fleet\main_launch_log.jsonl, so this path must honour the same budget
+        # or a respawn line would break the file's per-line/size guarantees. Measure UTF-8 BYTES
+        # (not chars); an over-cap line is replaced by a marker that still parses and still carries
+        # the facts that attribute the respawn (time, supervisor_pid, kind, new_pid, reason).
+        if ([System.Text.Encoding]::UTF8.GetByteCount($line) -gt 300) {
+            $line = (([PSCustomObject][ordered]@{ time = $rec.time; supervisor_pid = $rec.supervisor_pid; kind = $rec.kind; new_pid = $rec.new_pid; reason = 'capped' }) | ConvertTo-Json -Compress)
+        }
         Add-Content -Path $logPath -Value $line -Encoding UTF8
+        # KEEP ONLY THE NEWEST 200 LINES, trimming from the front, identical to Write-MainLaunchLog.
         try {
-            if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 5242880)) {
-                $keep = Get-Content -LiteralPath $logPath -Tail 500 -ErrorAction Stop
+            $all = @(Get-Content -LiteralPath $logPath -ErrorAction Stop)
+            if ($all.Count -gt 200) {
+                $keep = $all[($all.Count - 200)..($all.Count - 1)]
                 Set-Content -Path $logPath -Value $keep -Encoding UTF8
             }
         } catch { }
