@@ -658,6 +658,46 @@ def _cli_ui_stale() -> int:
     return 0
 
 
+def _server_code_changed_between(started_head, current_head, repo=None):
+    """Did any file the running server imports change between two commits?
+
+    Returns True/False, or None when it cannot be told (missing SHA, or git not
+    answering) -- None makes classify_staleness fall back to the SHA-only rule, the
+    conservative side. Pure of judgement: the decision stays in classify_staleness /
+    python_side_changed; this only reads ``git diff --name-only started..current`` and
+    hands the path list to :func:`python_side_changed`.
+
+    Identical SHAs are a short-circuit False -- no diff can exist, so nothing the server
+    imports changed. A diff that lists only docs / ui / scripts / tests / .github is
+    False; one that lists any relay/ tools/ main.py requirements.txt entry is True.
+    """
+    from tools.childproc import run as _run_child
+
+    sh = (started_head or "").strip()
+    cur = (current_head or "").strip()
+    if not sh or not cur:
+        return None
+    if sh == cur:
+        return False
+    repo = repo or _REPO_ROOT
+    try:
+        # childproc.run decodes stdout/stderr itself (UTF-8, then local codepage, then
+        # errors="replace"); it refuses text=/encoding=. A single non-cp932 byte in git's
+        # output must not lose the whole diff and misclassify staleness.
+        out = _run_child(
+            ["git", "-C", repo, "diff", "--name-only", "%s..%s" % (sh, cur)],
+            capture_output=True, timeout=10,
+        )
+    except Exception:
+        return None
+    if out.returncode != 0:
+        # A SHA the local object store does not have (not fetched) cannot be diffed; we
+        # cannot tell what changed, so defer to the SHA rule rather than guess.
+        return None
+    paths = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    return python_side_changed(paths)
+
+
 def main(argv=None) -> int:
     """CLI.
 
@@ -713,7 +753,17 @@ def main(argv=None) -> int:
     if len(args) >= 3:
         server_running = args[2].strip() not in ("0", "", "false", "False")
     started_head = _read_marker(marker_path)
-    verdict = classify_staleness(started_head, current_head, server_running)
+    # SEPARATE "the commit moved" from "this server's code moved". classify_staleness has
+    # taken a watched_changed argument since 2026-09-17 precisely so a commit that touches
+    # only docs / ui / tests / .github does not read as stale -- but this CLI never supplied
+    # it, so doctor fell back to the SHA-only rule and went amber on every branch switch or
+    # pull that moved HEAD, exactly the crying-wolf the argument exists to stop. Compute it
+    # here (I/O stays in the CLI): the server-code files changed BETWEEN the SHA the server
+    # started on and the SHA the checkout is on now. None on any failure keeps the
+    # conservative SHA-only behaviour.
+    watched_changed = _server_code_changed_between(started_head, current_head)
+    verdict = classify_staleness(started_head, current_head, server_running,
+                                 watched_changed=watched_changed)
     print(verdict)
     return 0
 
