@@ -29,7 +29,7 @@ spinner, no wall-clock threshold, no dependence on runner load:
      leaves a sleeping worker pinned in the pool.
 
   2. _watched_code_changed NEVER WALKS THE WATCHED TREE ON THE /health PATH ONCE WARM. The
-     synchronous tree walk (tools.deploy_freshness.newer_than, hundreds of stat()s) was the
+     synchronous tree walk (tools.deploy_freshness.changed_against, hundreds of stat()s) was the
      slow sub-probe on 2026-11-07. The fix is stale-while-revalidate: serve the cached answer
      instantly and refresh off-thread, starting at most ONE background walk no matter how many
      callers hit a stale cache at once. We assert the walk runs on a background thread, never
@@ -161,7 +161,7 @@ def test_watched_code_changed_refreshes_off_thread_not_on_the_health_path(monkey
     walk_entered = threading.Event()
     release_walk = threading.Event()
 
-    def _blocking_newer_than(_ts):
+    def _blocking_changed_against(_baseline, root=None, watched=None):
         with walk_lock:
             walk_calls["n"] += 1
             walk_threads.add(threading.get_ident())
@@ -172,7 +172,7 @@ def test_watched_code_changed_refreshes_off_thread_not_on_the_health_path(monkey
         return False
 
     import tools.deploy_freshness as df
-    monkeypatch.setattr(df, "newer_than", _blocking_newer_than, raising=True)
+    monkeypatch.setattr(df, "changed_against", _blocking_changed_against, raising=True)
 
     # Make the cache look stale so the next call triggers a refresh.
     main._watched_cache["at"] = 0.0
