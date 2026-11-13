@@ -496,6 +496,8 @@ $arguments += @(
     "--disable-extensions",
     "--disable-sync",
     "--disable-component-update",
+    # skip the default-apps setup pages on first run
+    "--disable-default-apps",
     "--disable-features=Translate,MediaRouter,OptimizationHints",
     "--process-per-site",
     # BOUND THE CACHE AT LAUNCH, then let relay\edge_disk_cap.py hold the real number. Left
@@ -534,6 +536,8 @@ $arguments += @(
     # NOT the spare renderer, which measured 2.8 MB. Turning it off would trade a
     # measurable latency for a rounding error.
     "--disable-gpu",
+    # host the GPU work in the browser process instead of starting a separate gpu-process
+    "--in-process-gpu",
     $Url
 )
 
