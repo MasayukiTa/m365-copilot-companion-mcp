@@ -3,7 +3,8 @@
 # .fleet\main_launch_log.jsonl:
 #   * Get-LaunchReason          -- maps (cause, prev exit facts) -> one reason label
 #   * Test-AncestryManualScript -- detects a hand-run start_all/quickstart ancestor
-#   * Build-MainLaunchLogRecord -- assembles the ordered JSONL record, length-capped
+#   * Build-MainLaunchLogRecord -- assembles the ordered JSONL record, kept under 300 bytes/line
+#                                  (log paths as basenames; no tails/ancestry on the line)
 #   * Get-ServerExitRecord      -- (already shipped) read a real child's exit code
 #
 # supervisor.ps1 CANNOT be dot-sourced here: it does real work at the bottom of the file
@@ -106,33 +107,41 @@ Describe "Build-MainLaunchLogRecord" {
         Invoke-Expression (Import-SupervisorFunction "Build-MainLaunchLogRecord")
     }
 
-    It "produces the documented fields in order" {
-        $rec = Build-MainLaunchLogRecord -LocalTime '2026-11-09 12:59:23' -OldPid 4636 -ExitCode 3 -ExitCodeHex '0x00000003' -OldProcWasRunning $false -SupervisorPid 4636 -StdoutTail 'line1' -StderrTail 'line2' -LastHealth 'ok 12ms' -Reason 'exit_code_nonzero' -StdoutPath 'a.log' -StderrPath 'b.log' -Ancestry $null
+    It "carries the three required facts: exit code, how it ended (reason), and the launch context" {
+        # (1) exit_code / exit_code_hex is the previous process's code; (2) reason is how it ended
+        # AND why this launch happened (one label); (3) time/supervisor_pid/old_pid say when and by
+        # whom. All three must survive on the record.
+        $rec = Build-MainLaunchLogRecord -LocalTime '2026-11-09 12:59:23' -OldPid 4636 -ExitCode 3 -ExitCodeHex '0x00000003' -OldProcWasRunning $false -SupervisorPid 4636 -StdoutTail 'line1' -StderrTail 'line2' -LastHealth 'ok 12ms' -Reason 'exit_code_nonzero' -StdoutPath 'x' -StderrPath 'y' -Ancestry $null
         $rec.time | Should Be '2026-11-09 12:59:23'
         $rec.old_pid | Should Be 4636
         $rec.exit_code | Should Be 3
+        $rec.exit_code_hex | Should Be '0x00000003'
+        $rec.supervisor_pid | Should Be 4636
         $rec.reason | Should Be 'exit_code_nonzero'
-        $rec.stdout_log | Should Be 'a.log'
-        $rec.stderr_log | Should Be 'b.log'
     }
 
-    It "caps a pathological stderr tail so the JSON line stays small" {
+    It "stores log paths as basenames, not full paths (the directory is fixed .setup\logs)" {
+        $rec = Build-MainLaunchLogRecord -LocalTime 't' -OldPid 1 -ExitCode 0 -ExitCodeHex '0x0' -OldProcWasRunning $false -SupervisorPid 2 -StdoutTail '' -StderrTail '' -LastHealth 'h' -Reason 'exit_code_zero' -StdoutPath 'C:\Users\someone\resonac-mcp\.setup\logs\server.log' -StderrPath 'C:\Users\someone\resonac-mcp\.setup\logs\server.err.log' -Ancestry $null
+        $rec.stdout_log | Should Be 'server.log'
+        $rec.stderr_log | Should Be 'server.err.log'
+    }
+
+    It "does not carry stdout/stderr tails or ancestry (they live elsewhere; kept off the 300-byte line)" {
         $huge = ('x' * 5000)
-        $rec = Build-MainLaunchLogRecord -LocalTime 't' -OldPid 1 -ExitCode 1 -ExitCodeHex '0x1' -OldProcWasRunning $false -SupervisorPid 2 -StdoutTail $huge -StderrTail $huge -LastHealth 'h' -Reason 'exit_code_nonzero' -StdoutPath 'o' -StderrPath 'e' -Ancestry $null
-        ($rec.stderr_tail.Length) | Should Be 700
-        ($rec.stdout_tail.Length) | Should Be 700
+        $anc = @([PSCustomObject]@{ pid = 1; name = 'powershell.exe'; commandline = ('c' * 5000) })
+        $rec = Build-MainLaunchLogRecord -LocalTime 't' -OldPid 1 -ExitCode 1 -ExitCodeHex '0x1' -OldProcWasRunning $false -SupervisorPid 2 -StdoutTail $huge -StderrTail $huge -LastHealth 'h' -Reason 'manual_script' -StdoutPath 'o' -StderrPath 'e' -Ancestry $anc
+        ($rec.PSObject.Properties.Name -contains 'stdout_tail') | Should Be $false
+        ($rec.PSObject.Properties.Name -contains 'stderr_tail') | Should Be $false
+        ($rec.PSObject.Properties.Name -contains 'ancestry')    | Should Be $false
     }
 
-    It "keeps at most 3 ancestry entries and caps each field" {
-        $anc = @(
-            [PSCustomObject]@{ pid = 1; name = 'a'; commandline = ('c' * 5000) },
-            [PSCustomObject]@{ pid = 2; name = 'b'; commandline = 'x' },
-            [PSCustomObject]@{ pid = 3; name = 'c'; commandline = 'y' },
-            [PSCustomObject]@{ pid = 4; name = 'd'; commandline = 'z' }
-        )
-        $rec = Build-MainLaunchLogRecord -LocalTime 't' -OldPid 1 -ExitCode 0 -ExitCodeHex '0x0' -OldProcWasRunning $false -SupervisorPid 2 -StdoutTail '' -StderrTail '' -LastHealth '' -Reason 'manual_script' -StdoutPath 'o' -StderrPath 'e' -Ancestry $anc
-        @($rec.ancestry).Count | Should Be 3
-        ($rec.ancestry[0].commandline.Length) | Should Be 300
+    It "stays at or under 300 bytes even with worst-case inputs" {
+        # Longest realistic values for every field: a crash code and its hex, max-width pids, a
+        # 30-char reason label, and a last_health longer than its cap. The whole compact JSON line
+        # must still fit the 300-byte budget the writer enforces.
+        $rec = Build-MainLaunchLogRecord -LocalTime '2026-11-09 12:59:23' -OldPid 2147483647 -ExitCode 2147483647 -ExitCodeHex '0xFFFFFFFF' -OldProcWasRunning $true -SupervisorPid 2147483647 -StdoutTail '' -StderrTail '' -LastHealth ('A' * 999) -Reason 'killed_externally_no_exit_code' -StdoutPath 'C:\a\b\.setup\logs\server.log' -StderrPath 'C:\a\b\.setup\logs\server.err.log' -Ancestry $null
+        $line = $rec | ConvertTo-Json -Compress
+        ([System.Text.Encoding]::UTF8.GetByteCount($line)) | Should BeLessThan 301
     }
 }
 
@@ -181,5 +190,50 @@ Describe "Get-ServerExitRecord against real child processes" {
         # the point is the supervisor can now READ it and classify the launch, instead of the
         # pre-change behaviour where the Process object was discarded and nothing was recorded.
         (Get-LaunchReason -Cause 'vanished' -PrevHasExited $rec.HasExited -PrevExitCode $rec.ExitCode) | Should Not Be 'never_started'
+    }
+}
+
+Describe "main_launch_log retention: keep only the newest 200 lines" {
+    # Write-MainLaunchLog cannot be dot-sourced (it needs $Root and the live process context), so
+    # this exercises the EXACT trim expression it runs after each append -- keep the last 200 of
+    # whatever is on disk, dropping from the front so the oldest launch is lost and the newest is
+    # never the one dropped. A temp file under the agent's own TEMP area stands in for the real
+    # .fleet\main_launch_log.jsonl; it is removed in AfterAll.
+    BeforeAll {
+        $script:LogFile = Join-Path ([System.IO.Path]::GetTempPath()) ("mll_retention_" + [guid]::NewGuid().ToString('N') + ".jsonl")
+        function Invoke-Trim([string]$Path) {
+            $all = @(Get-Content -LiteralPath $Path -ErrorAction Stop)
+            if ($all.Count -gt 200) {
+                $keep = $all[($all.Count - 200)..($all.Count - 1)]
+                Set-Content -Path $Path -Value $keep -Encoding UTF8
+            }
+        }
+    }
+    AfterAll {
+        if (Test-Path -LiteralPath $script:LogFile) { Remove-Item -LiteralPath $script:LogFile -Force }
+    }
+
+    It "trims a 201-line file down to 200 lines" {
+        1..201 | ForEach-Object { Add-Content -Path $script:LogFile -Value "line$_" -Encoding UTF8 }
+        Invoke-Trim $script:LogFile
+        (@(Get-Content -LiteralPath $script:LogFile)).Count | Should Be 200
+    }
+
+    It "drops the oldest line and keeps the newest after trimming" {
+        $lines = @(Get-Content -LiteralPath $script:LogFile)
+        $lines[0] | Should Be 'line2'
+        $lines[-1] | Should Be 'line201'
+    }
+
+    It "leaves a file of 200 or fewer lines untouched" {
+        $small = Join-Path ([System.IO.Path]::GetTempPath()) ("mll_small_" + [guid]::NewGuid().ToString('N') + ".jsonl")
+        try {
+            1..200 | ForEach-Object { Add-Content -Path $small -Value "x$_" -Encoding UTF8 }
+            Invoke-Trim $small
+            (@(Get-Content -LiteralPath $small)).Count | Should Be 200
+            (@(Get-Content -LiteralPath $small))[0] | Should Be 'x1'
+        } finally {
+            if (Test-Path -LiteralPath $small) { Remove-Item -LiteralPath $small -Force }
+        }
     }
 }

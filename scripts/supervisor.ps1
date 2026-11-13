@@ -2352,25 +2352,25 @@ function Get-LaunchReason {
     return 'killed_externally_no_exit_code'
 }
 
-function Get-FileTailText {
-    # Read the last N lines of a text file, best-effort. Returns '' when the file is absent or
-    # unreadable -- a launch log that throws because a server.log was mid-write would be worse
-    # than one missing field. The result is length-capped by the caller (Build-MainLaunchLogRecord).
-    param([string]$Path, [int]$Lines = 5)
-    try {
-        if (-not (Test-Path -LiteralPath $Path)) { return '' }
-        $tail = Get-Content -LiteralPath $Path -Tail $Lines -ErrorAction Stop
-        return ($tail -join "`n")
-    } catch {
-        return ''
-    }
-}
-
 function Build-MainLaunchLogRecord {
     # PURE. Assemble the ordered object written as one JSONL line per (re)launch. No I/O, no
-    # secrets: callers pass only process facts and already-read log tails. Every string field is
-    # truncated so a single pathological value (a megabyte of traceback on one line) cannot blow
-    # the 2 KB/line cap the writer enforces; the writer re-checks the whole line too.
+    # secrets: callers pass only process facts. Every field is deliberately small so the whole
+    # JSON line stays UNDER 300 BYTES -- the writer re-checks and replaces an over-cap line.
+    #
+    # WHY SO SMALL (and what is deliberately NOT here). The brief for this log is one line <=300
+    # bytes, kept to the newest 200 lines. The three facts it must carry are (1) the previous
+    # process's exit code, (2) how it ended, and (3) why this launch happened -- all three live in
+    # exit_code/exit_code_hex and the single `reason` label (exit_code_zero|exit_code_nonzero|
+    # vanished|hang_no_health_Ns|health_failed_N_times|killed_externally_no_exit_code|
+    # manual_script|never_started). The stdout/stderr TAILS and the manual-script ANCESTRY that an
+    # earlier, 2 KB-per-line version carried are NOT dropped information: the tails are preserved
+    # in full, with a per-launch header, in .setup\logs\server.{out,err}.history.log (see the
+    # history-log block in Start-Server), and a manual-script launch is already recorded by the
+    # `manual_script` reason. Repeating either here would blow the 300-byte line for no new fact.
+    #
+    # Log PATHS are stored as BASENAMES (server.log / server.err.log). Their directory is the
+    # fixed .setup\logs under the checkout, so the full path adds ~260 bytes of constant per line
+    # and would alone break the 300-byte cap; the basename says which stream without that cost.
     param(
         [string]$LocalTime,
         $OldPid,
@@ -2387,18 +2387,7 @@ function Build-MainLaunchLogRecord {
         $Ancestry
     )
     $cap = [ScriptBlock]::Create('param($s,$n) if ($null -eq $s) { return "" } $t = [string]$s; if ($t.Length -gt $n) { return $t.Substring(0, $n) } return $t')
-    # Ancestry is only present for a manual_script launch; cap each entry and keep at most 3.
-    $anc = @()
-    if ($Ancestry) {
-        foreach ($a in @($Ancestry)) {
-            $anc += ,([PSCustomObject][ordered]@{
-                pid         = $a.pid
-                name        = (& $cap $a.name 64)
-                commandline = (& $cap $a.commandline 300)
-            })
-            if ($anc.Count -ge 3) { break }
-        }
-    }
+    $base = [ScriptBlock]::Create('param($p) if ($null -eq $p -or $p -eq "") { return "" } try { return [System.IO.Path]::GetFileName([string]$p) } catch { return [string]$p }')
     [PSCustomObject][ordered]@{
         time              = $LocalTime
         old_pid           = $OldPid
@@ -2406,22 +2395,20 @@ function Build-MainLaunchLogRecord {
         exit_code         = $ExitCode
         exit_code_hex     = (& $cap $ExitCodeHex 32)
         supervisor_pid    = $SupervisorPid
-        last_health       = (& $cap $LastHealth 300)
+        last_health       = (& $cap $LastHealth 24)
         reason            = (& $cap $Reason 64)
-        stdout_log        = (& $cap $StdoutPath 260)
-        stderr_log        = (& $cap $StderrPath 260)
-        stdout_tail       = (& $cap $StdoutTail 700)
-        stderr_tail       = (& $cap $StderrTail 700)
-        ancestry          = $anc
+        stdout_log        = (& $base $StdoutPath)
+        stderr_log        = (& $base $StderrPath)
     }
 }
 
 function Write-MainLaunchLog {
     # I/O wrapper: build the record (pure), serialise it to one compact JSON line, and append it
     # to .fleet\main_launch_log.jsonl. Best-effort and fully self-contained in try/catch: recording
-    # a launch must NEVER be able to stop the launch. Enforces a 2 KB/line cap (a line over the cap
-    # is replaced by a compact marker that still parses) and rotates the file at ~5 MB, keeping the
-    # newest tail, so an unattended machine cannot fill its disk with launch records.
+    # a launch must NEVER be able to stop the launch. Enforces a 300-BYTE/line cap (a line over the
+    # cap is replaced by a compact marker that still parses and still carries the three required
+    # facts: exit code, how it ended, why it launched) and keeps only the NEWEST 200 LINES, so an
+    # unattended machine that restart-loops cannot grow this file without bound.
     param(
         $OldProc,
         $ExitRecord,
@@ -2460,17 +2447,29 @@ function Write-MainLaunchLog {
             } catch { $ancestry = $null }
         }
         $reason = Get-LaunchReason -Cause $effectiveCause -PrevHasExited $prevHasExited -PrevExitCode $exitCode -StrikeCount $StrikeCount
-        $outTail = Get-FileTailText -Path $StdoutPath -Lines 5
-        $errTail = Get-FileTailText -Path $StderrPath -Lines 5
-        $rec = Build-MainLaunchLogRecord -LocalTime (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -OldPid $oldPid -ExitCode $exitCode -ExitCodeHex $exitHex -OldProcWasRunning $oldRunning -SupervisorPid $PID -StdoutTail $outTail -StderrTail $errTail -LastHealth ([string]$script:LastServerCheck) -Reason $reason -StdoutPath $StdoutPath -StderrPath $StderrPath -Ancestry $ancestry
+        # Tails are NOT carried in this record (they live in .setup\logs\server.{out,err}.history.log
+        # with a per-launch header); the manual-script ancestry is already summarised by the
+        # `manual_script` reason. Both were dropped to meet the 300-byte/line cap -- see
+        # Build-MainLaunchLogRecord's header. $StdoutPath/$StderrPath are passed only so the record
+        # can name which stream (as a basename).
+        $rec = Build-MainLaunchLogRecord -LocalTime (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') -OldPid $oldPid -ExitCode $exitCode -ExitCodeHex $exitHex -OldProcWasRunning $oldRunning -SupervisorPid $PID -StdoutTail '' -StderrTail '' -LastHealth ([string]$script:LastServerCheck) -Reason $reason -StdoutPath $StdoutPath -StderrPath $StderrPath -Ancestry $ancestry
         $line = $rec | ConvertTo-Json -Compress
-        if ($line.Length -gt 2048) {
-            $line = (([PSCustomObject][ordered]@{ time = $rec.time; supervisor_pid = $rec.supervisor_pid; reason = $rec.reason; note = 'record exceeded 2KB cap; tails dropped' }) | ConvertTo-Json -Compress)
+        # BYTES, NOT CHARS. The cap is a byte budget (a non-ASCII last_health or path would make
+        # .Length under-count), so measure the UTF-8 encoding. An over-cap line is replaced by a
+        # marker that still parses and still carries the three required facts (exit code, how it
+        # ended via reason, and -- via supervisor_pid/time -- when and by which supervisor).
+        if ([System.Text.Encoding]::UTF8.GetByteCount($line) -gt 300) {
+            $line = (([PSCustomObject][ordered]@{ time = $rec.time; supervisor_pid = $rec.supervisor_pid; exit_code = $rec.exit_code; reason = $rec.reason; note = 'capped' }) | ConvertTo-Json -Compress)
         }
         Add-Content -Path $logPath -Value $line -Encoding UTF8
+        # KEEP ONLY THE NEWEST 200 LINES. Counted, not sized: the brief is 200 lines. Trim from the
+        # front so the oldest launch is dropped and the newest is never the one lost. Reading the
+        # whole file is bounded -- 200 short lines after each append is cheap, and the file cannot
+        # have grown large because this same trim ran on the previous append.
         try {
-            if ((Test-Path -LiteralPath $logPath) -and ((Get-Item -LiteralPath $logPath).Length -gt 5242880)) {
-                $keep = Get-Content -LiteralPath $logPath -Tail 500 -ErrorAction Stop
+            $all = @(Get-Content -LiteralPath $logPath -ErrorAction Stop)
+            if ($all.Count -gt 200) {
+                $keep = $all[($all.Count - 200)..($all.Count - 1)]
                 Set-Content -Path $logPath -Value $keep -Encoding UTF8
             }
         } catch { }
