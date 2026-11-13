@@ -683,7 +683,7 @@ def _server_code_changed_between(started_head, current_head, repo=None):
     try:
         out = subprocess.run(
             ["git", "-C", repo, "diff", "--name-only", "%s..%s" % (sh, cur)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, timeout=10,
         )
     except Exception:
         return None
@@ -691,7 +691,16 @@ def _server_code_changed_between(started_head, current_head, repo=None):
         # A SHA the local object store does not have (not fetched) cannot be diffed; we
         # cannot tell what changed, so defer to the SHA rule rather than guess.
         return None
-    paths = [ln for ln in out.stdout.splitlines() if ln.strip()]
+    # Decode the child's bytes ourselves with errors="replace" instead of text=True. text=True
+    # would decode with the locale codec (cp932 on the Windows box this runs on), and one
+    # non-cp932 byte would raise in the reader thread and lose the WHOLE path list -- the exact
+    # failure tools/test_child_output_is_not_decoded_by_luck.py enforces against. git emits
+    # UTF-8 forward-slash paths on every platform; a stray undecodable byte becomes U+FFFD in
+    # one path and the rest still parse. scripts/ ships without the server's package tree, so
+    # it cannot import tools.childproc; the replace policy is written inline here, which the
+    # ratchet's own rule explicitly permits.
+    stdout = out.stdout.decode("utf-8", "replace")
+    paths = [ln for ln in stdout.splitlines() if ln.strip()]
     return python_side_changed(paths)
 
 

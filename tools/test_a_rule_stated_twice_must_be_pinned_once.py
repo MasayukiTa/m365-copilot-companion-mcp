@@ -100,21 +100,27 @@ def test_an_unreadable_answer_still_reports_stale(main_mod):
     answer stands. Reporting stale when it might be is the right side of a question about
     whether a fix is live."""
     main = main_mod
-    real_newer = None
+    real_changed_against = None
     try:
         import tools.deploy_freshness as DF
-        real_newer = DF.newer_than
+        # PATCH changed_against, NOT newer_than. _watched_recompute() in main.py was moved to
+        # tools.deploy_freshness.changed_against (it compares each imported file's recorded
+        # sha256 to disk, so a checkout that only re-stamps mtime is not a change). newer_than
+        # is no longer on that code path, so patching it proved nothing -- the real reader
+        # never raised. Patching changed_against to raise is what actually exercises the
+        # "unreadable means changed" fallback the assertion below checks.
+        real_changed_against = DF.changed_against
 
         def _boom(*_a, **_k):
             raise OSError("cannot walk the tree")
 
-        DF.newer_than = _boom
+        DF.changed_against = _boom
         main._watched_cache["changed"] = None
         assert main._watched_code_changed() is True
     finally:
-        if real_newer is not None:
+        if real_changed_against is not None:
             import tools.deploy_freshness as DF
-            DF.newer_than = real_newer
+            DF.changed_against = real_changed_against
         main._watched_cache["changed"] = None
 
 
