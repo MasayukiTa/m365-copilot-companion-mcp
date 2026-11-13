@@ -428,20 +428,20 @@ def test_server_code_changed_between_unknown_sha_in_repo_is_none():
 
 
 def _git(repo, *args):
-    import subprocess
-    subprocess.run(["git", "-C", str(repo), *args],
-                   check=True, capture_output=True, text=True)
+    from tools.childproc import run as _run_child
+    _run_child(["git", "-C", str(repo), *args],
+               check=True, capture_output=True)
 
 
 def _commit_file(repo, relpath, content):
-    import subprocess
     p = repo / relpath
     p.parent.mkdir(parents=True, exist_ok=True)
     p.write_text(content, encoding="utf-8")
     _git(repo, "add", "-A")
     _git(repo, "commit", "-q", "-m", "c")
-    return subprocess.run(["git", "-C", str(repo), "rev-parse", "HEAD"],
-                          check=True, capture_output=True, text=True).stdout.strip()
+    from tools.childproc import run as _run_child
+    return _run_child(["git", "-C", str(repo), "rev-parse", "HEAD"],
+                      check=True, capture_output=True).stdout.strip()
 
 
 def test_server_code_changed_between_docs_only_commit_is_false(tmp_path):

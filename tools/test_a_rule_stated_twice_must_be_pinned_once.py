@@ -100,21 +100,24 @@ def test_an_unreadable_answer_still_reports_stale(main_mod):
     answer stands. Reporting stale when it might be is the right side of a question about
     whether a fix is live."""
     main = main_mod
-    real_newer = None
+    real_changed = None
     try:
         import tools.deploy_freshness as DF
-        real_newer = DF.newer_than
+        real_changed = DF.changed_against
 
         def _boom(*_a, **_k):
             raise OSError("cannot walk the tree")
 
-        DF.newer_than = _boom
+        # _watched_recompute imports changed_against from tools.deploy_freshness and runs it
+        # inside a try/except that treats any exception as changed=True. Patch the attribute
+        # the live code path actually calls, so an unreadable tree is exercised end to end.
+        DF.changed_against = _boom
         main._watched_cache["changed"] = None
         assert main._watched_code_changed() is True
     finally:
-        if real_newer is not None:
+        if real_changed is not None:
             import tools.deploy_freshness as DF
-            DF.newer_than = real_newer
+            DF.changed_against = real_changed
         main._watched_cache["changed"] = None
 
 

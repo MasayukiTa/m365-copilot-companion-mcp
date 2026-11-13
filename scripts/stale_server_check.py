@@ -671,7 +671,7 @@ def _server_code_changed_between(started_head, current_head, repo=None):
     imports changed. A diff that lists only docs / ui / scripts / tests / .github is
     False; one that lists any relay/ tools/ main.py requirements.txt entry is True.
     """
-    import subprocess
+    from tools.childproc import run as _run_child
 
     sh = (started_head or "").strip()
     cur = (current_head or "").strip()
@@ -681,9 +681,12 @@ def _server_code_changed_between(started_head, current_head, repo=None):
         return False
     repo = repo or _REPO_ROOT
     try:
-        out = subprocess.run(
+        # childproc.run decodes stdout/stderr itself (UTF-8, then local codepage, then
+        # errors="replace"); it refuses text=/encoding=. A single non-cp932 byte in git's
+        # output must not lose the whole diff and misclassify staleness.
+        out = _run_child(
             ["git", "-C", repo, "diff", "--name-only", "%s..%s" % (sh, cur)],
-            capture_output=True, text=True, timeout=10,
+            capture_output=True, timeout=10,
         )
     except Exception:
         return None
