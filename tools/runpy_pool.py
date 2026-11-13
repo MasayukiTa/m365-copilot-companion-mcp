@@ -18,6 +18,7 @@ MCP_RUNPY_POOL = number of warm interpreters (default 2, 0 = off, read on every 
 """
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import subprocess
@@ -46,6 +47,7 @@ _BOOT = (
 _lock = threading.Lock()
 _pool: List[subprocess.Popen] = []
 _filling = False
+_atexit_set = False
 
 
 def pool_size() -> int:
@@ -97,6 +99,10 @@ def ensure_filling() -> None:
         if _filling:
             return
         _filling = True
+    global _atexit_set
+    if not _atexit_set:
+        _atexit_set = True
+        atexit.register(shutdown)
     try:
         threading.Thread(target=_top_up, name="runpy-pool-fill", daemon=True).start()
     except Exception:
@@ -125,6 +131,7 @@ def send(proc: subprocess.Popen, path: str, cwd: str) -> bool:
         proc.stdin.write((json.dumps({"path": path, "cwd": cwd}) + "\n").encode("utf-8"))
         proc.stdin.flush()
         proc.stdin.close()
+        proc.stdin = None  # communicate() must not flush a closed pipe (POSIX)
         return True
     except Exception:
         try:
