@@ -79,7 +79,9 @@ def probe_host(host: str, role: str, timeout: float = TIMEOUT_S) -> dict:
 
     t0 = time.monotonic()
     try:
-        tls_sock = ssl.create_default_context().wrap_socket(sock, server_hostname=host)
+        tls_ctx = ssl.create_default_context()
+        tls_ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+        tls_sock = tls_ctx.wrap_socket(sock, server_hostname=host)
     except Exception as exc:  # noqa: BLE001
         sock.close()
         row.update(fail_layer="tls", error=type(exc).__name__)
