@@ -277,3 +277,122 @@ def test_health_counts_large_window_still_caps_tail(tmp_path):
     lines = tc._recent_lines(path, cutoff=-10**10)
     assert sum(len(line.encode()) + 1 for line in lines) <= 32 * 1024 * 1024
     assert 0 < tc.health_counts(str(path), now=1000, window_s=10**10)["tunnel_channels"] < 34 * 1024
+
+
+def _append_one_channel(log, jsonl, offset, cid):
+    """Append one open+close pair to the host log and tail it into the jsonl. One record."""
+    line = ("2026-10-31 21:40:01.000 SshChannel(Type: forwarded-tcpip, "
+            f"Id: {cid}, RemoteId: {cid}) opened.\n"
+            "2026-10-31 21:40:03.500 SshChannel(Type: forwarded-tcpip, "
+            f"Id: {cid}, RemoteId: {cid}) closed locally. (S: 1335, R: 746)\n")
+    with open(log, "a", encoding="utf-8") as fh:
+        fh.write(line)
+    return tc.append_new_records(str(log), str(jsonl), str(offset))
+
+
+def test_rotate_if_too_big_moves_to_one_generation_and_discards_the_previous(tmp_path):
+    # The size-cap primitive, exercised directly: under the cap it does nothing; over the cap
+    # it moves the live file onto ".1"; a second rotation overwrites that ".1" (one generation)
+    # and never keeps a ".2".
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    jsonl.write_text("small\n", encoding="utf-8")
+    assert tc._rotate_if_too_big(str(jsonl), max_bytes=1024) is False
+    assert jsonl.exists() and not (tmp_path / "tunnel_channels.jsonl.1").exists()
+
+    jsonl.write_text("A" * 2048, encoding="utf-8")
+    assert tc._rotate_if_too_big(str(jsonl), max_bytes=1024) is True
+    assert not jsonl.exists()
+    assert (tmp_path / "tunnel_channels.jsonl.1").read_text(encoding="utf-8") == "A" * 2048
+
+    # A fresh live file grows past the cap again; rotating replaces the old ".1" rather than
+    # stacking a ".2". Only one generation is ever kept.
+    jsonl.write_text("B" * 2048, encoding="utf-8")
+    assert tc._rotate_if_too_big(str(jsonl), max_bytes=1024) is True
+    assert (tmp_path / "tunnel_channels.jsonl.1").read_text(encoding="utf-8") == "B" * 2048
+    assert not (tmp_path / "tunnel_channels.jsonl.2").exists()
+
+
+def test_rotate_if_too_big_tolerates_a_missing_file(tmp_path):
+    # Housekeeping must never raise: an absent file is simply "nothing to rotate".
+    assert tc._rotate_if_too_big(str(tmp_path / "nope.jsonl"), max_bytes=1) is False
+
+
+def test_append_rotates_when_the_jsonl_passes_the_cap(monkeypatch, tmp_path):
+    # The real write path: once the accumulated jsonl crosses the cap, the NEXT append rotates
+    # it onto ".1" and the live file starts fresh -- so the live file never grows without
+    # bound, which is the whole point. Drive the threshold with a tiny cap so a handful of
+    # short records is enough to trip it.
+    monkeypatch.setattr(tc, "_JSONL_MAX_BYTES", 400)
+    log = tmp_path / "devtunnel-host-ts.log"
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    offset = tmp_path / "off"
+
+    rotated_at = None
+    for cid in range(100, 120):
+        _append_one_channel(log, jsonl, offset, cid)
+        if (tmp_path / "tunnel_channels.jsonl.1").exists():
+            rotated_at = cid
+            break
+    assert rotated_at is not None, "the jsonl never rotated despite passing the cap"
+    # After a rotation the live file is small again (fresh, below the cap) while the sidecar
+    # holds the bulk -- bounded, not unbounded.
+    assert (tmp_path / "tunnel_channels.jsonl.1").stat().st_size > 0
+    live = jsonl.stat().st_size if jsonl.exists() else 0
+    assert live <= tc._JSONL_MAX_BYTES
+
+
+def test_append_keeps_only_one_generation_across_many_rotations(monkeypatch, tmp_path):
+    # Over a long run the file rotates many times; disk use stays bounded because each
+    # rotation discards the previous ".1". There is never a ".2".
+    monkeypatch.setattr(tc, "_JSONL_MAX_BYTES", 300)
+    log = tmp_path / "devtunnel-host-ts.log"
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    offset = tmp_path / "off"
+    for cid in range(200, 260):
+        _append_one_channel(log, jsonl, offset, cid)
+    assert not (tmp_path / "tunnel_channels.jsonl.2").exists()
+
+
+def test_rotation_does_not_disturb_the_offset(monkeypatch, tmp_path):
+    # The offset file tracks the HOST LOG, not the jsonl, so rotating the jsonl must leave it
+    # pointing exactly at the end of the host log -- a following append reads no record twice.
+    monkeypatch.setattr(tc, "_JSONL_MAX_BYTES", 300)
+    log = tmp_path / "devtunnel-host-ts.log"
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    offset = tmp_path / "off"
+    for cid in range(300, 320):
+        _append_one_channel(log, jsonl, offset, cid)
+    assert (tmp_path / "tunnel_channels.jsonl.1").exists(), "precondition: it rotated"
+    # The offset equals the host log's size: everything written has been consumed exactly once.
+    assert int(offset.read_text(encoding="utf-8").strip()) == log.stat().st_size
+    # A further append with no new host-log bytes adds nothing (no re-emission after rotation).
+    assert tc.append_new_records(str(log), str(jsonl), str(offset)) == 0
+
+
+def test_health_counts_after_rotation_is_zero_not_absent(tmp_path):
+    # Immediately after a rotation the live jsonl is gone (moved onto ".1") until the next
+    # append recreates it. The reader tails the LIVE file, so it finds an absent/empty file --
+    # but the stream exists, so /health must read 0, not the -1 that means "never written".
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    (tmp_path / "tunnel_channels.jsonl.1").write_text(
+        json.dumps({"time": time.time(), "no_response": False,
+                    "remote_closed_early": False}) + "\n", encoding="utf-8")
+    assert not jsonl.exists()
+    counts = tc.health_counts(str(jsonl), now=time.time())
+    assert counts == {"tunnel_channels": 0, "tunnel_no_response": 0,
+                      "tunnel_remote_closed_early": 0}
+    # A truly absent stream (no live file AND no sidecar) still reads -1 for each.
+    absent = tc.health_counts(str(tmp_path / "never.jsonl"))
+    assert absent == {"tunnel_channels": -1, "tunnel_no_response": -1,
+                      "tunnel_remote_closed_early": -1}
+
+
+def test_reader_works_on_a_fresh_empty_jsonl_after_rotation(tmp_path):
+    # After rotation the next append recreates the live file; a reader hitting it while it is
+    # still empty (zero bytes) must return 0, not raise and not -1.
+    jsonl = tmp_path / "tunnel_channels.jsonl"
+    (tmp_path / "tunnel_channels.jsonl.1").write_text("", encoding="utf-8")
+    jsonl.write_text("", encoding="utf-8")  # fresh, empty live file
+    counts = tc.health_counts(str(jsonl), now=time.time())
+    assert counts == {"tunnel_channels": 0, "tunnel_no_response": 0,
+                      "tunnel_remote_closed_early": 0}

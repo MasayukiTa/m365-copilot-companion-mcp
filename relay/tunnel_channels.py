@@ -50,6 +50,17 @@ import time
 # Each record is one short line, so the lock is held only briefly and /health stays fast.
 _JSONL_LOCK = threading.Lock()
 
+# The jsonl grows about 400 bytes a minute with no ceiling, so left alone it reached 257 MB
+# -- big enough that the new BIGLOG watcher warned at 50 MB, and big enough that the old
+# whole-file read made /health slow before PR 510 switched the reader to a bounded tail.
+# When an append would push the file past this size, the current file is rotated to a single
+# ".1" sidecar (the previous ".1" is discarded -- one generation only) and a fresh empty
+# jsonl starts. The reader tails the live file, so after a rotation it simply sees an empty
+# or absent file until the next append; health_counts treats that as zero, not as "absent".
+# The rotation only moves the jsonl; the offset file tracks the HOST LOG, not the jsonl, so
+# rotating the jsonl cannot disturb offset bookkeeping.
+_JSONL_MAX_BYTES = 20 * 1024 * 1024
+
 # A ts-stamped line written by relay.tunnel_host_log looks like:
 #   2026-10-31 21:40:12.345 <the devtunnel line>
 # The leading stamp is optional here: a raw devtunnel line (no stamp) still parses, so a
@@ -225,9 +236,38 @@ def append_new_records(log_path, jsonl_path, offset_path=None):
                 for rec in parse_channel_events(chunk):
                     out.write(json.dumps(rec, ensure_ascii=False) + "\n")
                     appended += 1
+            # Rotate AFTER the append, under the same lock a reader takes, so a size check and
+            # the os.replace that acts on it cannot straddle a concurrent read of the file.
+            _rotate_if_too_big(jsonl_path)
     with open(offset_path, "w", encoding="utf-8") as fh:
         fh.write(str(new_offset))
     return appended
+
+
+def _rotate_if_too_big(jsonl_path, max_bytes=None):
+    """If ``jsonl_path`` is over ``max_bytes``, move it onto a single ``.1`` sidecar.
+
+    ``max_bytes`` defaults to the module-level ``_JSONL_MAX_BYTES`` read AT CALL TIME, not
+    bound into the signature -- so the threshold can be overridden (a test does this) and the
+    override is actually seen. One generation only: a pre-existing ``.1`` is overwritten, so
+    disk use is bounded at roughly two files of ``max_bytes`` rather than growing without
+    limit. os.replace is atomic on both Windows and POSIX, so a reader taking _JSONL_LOCK
+    either side of this sees the whole old file or a fresh (absent, then empty) one -- never a
+    half-moved path. Call with _JSONL_LOCK held. Never raises on a missing file or a failed
+    move: rotation is a housekeeping step and must not break the append that triggered it.
+    """
+    if max_bytes is None:
+        max_bytes = _JSONL_MAX_BYTES
+    try:
+        if os.path.getsize(jsonl_path) <= max_bytes:
+            return False
+    except OSError:
+        return False
+    try:
+        os.replace(jsonl_path, jsonl_path + ".1")
+        return True
+    except OSError:
+        return False
 
 
 def _recent_lines(path, cutoff, max_bytes=32 * 1024 * 1024):
@@ -271,22 +311,35 @@ def health_counts(jsonl_path, now=None, window_s=600):
     """Counts for the last ``window_s`` seconds, for the /health route.
 
     Returns a dict with ``tunnel_channels``, ``tunnel_no_response`` and
-    ``tunnel_remote_closed_early``. When the jsonl file is absent, every value is -1
-    (what /health shows then). Records without a usable time are counted as current so a
-    sample with no stamp is not silently dropped.
+    ``tunnel_remote_closed_early``. When no jsonl has ever been written, every value is -1
+    (what /health shows then). Immediately after a size rotation the live file is briefly
+    gone -- moved onto its ``.1`` sidecar with no new file yet -- and that is NOT absence:
+    it is an empty current window, so the counts are 0 (never -1) as long as the sidecar
+    exists. Records without a usable time are counted as current so a sample with no stamp
+    is not silently dropped.
     """
     keys = ("tunnel_channels", "tunnel_no_response", "tunnel_remote_closed_early")
     if not os.path.exists(jsonl_path):
+        # A rotation moves the live file onto ".1" and the next append recreates it; between
+        # the two the live path is missing but the stream exists, so report an empty window
+        # (0) rather than absence (-1). Only when neither the live file nor its sidecar
+        # exists has nothing ever been written.
+        if os.path.exists(jsonl_path + ".1"):
+            return {k: 0 for k in keys}
         return {k: -1 for k in keys}
     if now is None:
         now = time.time()
     cutoff = now - window_s
     total = no_resp = remote_early = 0
-    # Take the bounded snapshot under the shared append lock; parse it after release.
+    # Take the bounded snapshot under the shared append lock; parse it after release. A
+    # rotation between the exists() check and the lock leaves the live file gone; treat that
+    # as an empty window when the sidecar is present, consistent with the absence check above.
     try:
         with _JSONL_LOCK:
             snapshot = _recent_lines(jsonl_path, cutoff)
     except OSError:
+        if os.path.exists(jsonl_path + ".1"):
+            return {k: 0 for k in keys}
         return {k: -1 for k in keys}
     for line in snapshot:
         line = line.strip()
