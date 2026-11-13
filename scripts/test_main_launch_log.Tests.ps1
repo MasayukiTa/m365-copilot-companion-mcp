@@ -121,7 +121,7 @@ Describe "Build-MainLaunchLogRecord" {
     }
 
     It "stores log paths as basenames, not full paths (the directory is fixed .setup\logs)" {
-        $rec = Build-MainLaunchLogRecord -LocalTime 't' -OldPid 1 -ExitCode 0 -ExitCodeHex '0x0' -OldProcWasRunning $false -SupervisorPid 2 -StdoutTail '' -StderrTail '' -LastHealth 'h' -Reason 'exit_code_zero' -StdoutPath 'C:\Users\someone\resonac-mcp\.setup\logs\server.log' -StderrPath 'C:\Users\someone\resonac-mcp\.setup\logs\server.err.log' -Ancestry $null
+        $rec = Build-MainLaunchLogRecord -LocalTime 't' -OldPid 1 -ExitCode 0 -ExitCodeHex '0x0' -OldProcWasRunning $false -SupervisorPid 2 -StdoutTail '' -StderrTail '' -LastHealth 'h' -Reason 'exit_code_zero' -StdoutPath 'C:\Users\someone\example-mcp\.setup\logs\server.log' -StderrPath 'C:\Users\someone\example-mcp\.setup\logs\server.err.log' -Ancestry $null
         $rec.stdout_log | Should Be 'server.log'
         $rec.stderr_log | Should Be 'server.err.log'
     }
