@@ -130,6 +130,10 @@ LIVE_RECORD_REDIRECTS = {
     "tools.send_failure_report": {"DEFAULT_LOG": "send_failures.jsonl"},
     "tools.page_count_report": {"DEFAULT_LOG": "page_counts.jsonl"},
     "tools.judge_report": {"DEFAULT_LOG": "judge.jsonl"},
+    # Provider health evidence rows, appended by each probe run. A test that runs either probe's
+    # main() would otherwise add rows to the operator's .fleet/provider_health.jsonl.
+    "tools.provider_layer_probe": {"HEALTH_LOG": "provider_health.jsonl"},
+    "tools.provider_page_probe": {"HEALTH_LOG": "provider_health.jsonl"},
     "relay.selfimprove.pending": {"QUEUE_PATH": "pending_decisions.jsonl"},
     "relay.selfimprove.record_summary": {"CACHE_PATH": "record_summaries.json"},
     "relay.capture_status": {"STATUS_PATH": "capture_status.json"},
