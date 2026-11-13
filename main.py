@@ -436,8 +436,8 @@ def _session_idle_timeout_s(environ=None):
 
     fastmcp's own default is None = sessions never expire. Clients that open a session and
     never send DELETE (one-shot scripts, probes) then pile up until the MCP SDK's
-    max_sessions (10000) is hit and every initialize gets HTTP 503 ("Refusing to open a new
-    session"). Measured 2026-11-13: ~15000 initialize calls in ~13 h (about 12000 of the
+    max_sessions (10000) is hit and every initialize gets HTTP 503 (the SDK's
+    "sessions are already open" warning). Measured 2026-11-13: ~15000 initialize calls in ~13 h (about 12000 of the
     successful ones from one-shot script clients), server up 02:37, 503s from 12:14. 1800 s
     is the MCP SDK's own default; at the measured ~17 initialize/min it bounds open sessions
     near 500. MCP_SESSION_IDLE_S overrides; 0 or invalid falls back to 1800.
