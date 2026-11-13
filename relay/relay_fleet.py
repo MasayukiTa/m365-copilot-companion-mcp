@@ -12575,7 +12575,8 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # current open count, so no in-flight goal is dropped. Both signals are read defensively;
         # a failure to read either leaves the existing cap untouched.
         try:
-            from relay.fleet_runner import _preemptive_tab_ceiling as _pre_ceiling
+            from relay.fleet_runner import (_preemptive_tab_ceiling as _pre_ceiling,
+                                             EDGE_WEDGE_RAM_FLOOR_MB)
             try:
                 # COUNT ONLY THE FLEET'S OWN companion-Edge processes, not every "msedge"
                 # process on the machine. _msedge_cmdlines() matches the name substring, so it
