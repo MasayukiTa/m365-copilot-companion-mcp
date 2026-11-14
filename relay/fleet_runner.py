@@ -2090,7 +2090,8 @@ def _provider_block(workers):
 
 def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paused=False,
               ram_floor_mb=0.0, directive="", run_label="", goal_count=0, queued=0,
-              reunlock=None, command_rejections=None, newest_source_mtime=0.0):
+              reunlock=None, command_rejections=None, newest_source_mtime=0.0,
+              admission_brake=None):
     from relay import priority_boost
     boosted_workers = priority_boost.effective_workers(workers)
     from relay.relay_fleet import (free_disk_gb, floor_source as _floor_source,
@@ -2111,6 +2112,10 @@ def _snapshot(workers, started, total, max_concurrent=0, disk_floor_gb=0.0, paus
         "total": total,
         "done_count": done,
         "queued": int(queued or 0),
+        # Admission brake (pre-wedge tab ceiling). None until a sweep evaluates it; then
+        # {clamped: bool, reason: str, free_mb, companion_msedge, ceiling}. Present so the
+        # operator can see WHY max_concurrent is what it is without reading logs.
+        "admission_brake": admission_brake,
         # RUNNING MEANS THERE IS WORK, NOT THAT A WORKER EXISTS YET. `queued` counts goals
         # accepted but not yet turned into workers, and without it a fan-out run declares
         # itself finished the instant it splits: the parent goes terminal at turn 1 and its
@@ -5157,6 +5162,7 @@ def main():
     print("       resolver   : %s" % (getattr(_settings_float, "__module__", "?"),))
 
     mc_box = [max_conc]                # live concurrency cap (cockpit can change it)
+    brake_box = [None]                 # admission-brake state {clamped,reason,counts}; shown in status.json
     # BUILT HERE, AFTER EVERY BOX EXISTS. This used to be an inline block 56 lines up,
     # where four closures referenced these lists lazily and the ordering never mattered.
     # Extracting it turned those closures into arguments, and arguments are resolved at
@@ -5563,7 +5569,7 @@ def main():
         _timed("write_scope_tick", lambda: _write_scope_tick(workers))
         _timed("peer_requests_tick", lambda: _peer_requests_tick(workers, len(add_box or []), run_label))      # shadow: record peer REQUEST/OFFER/CLAIM (off = no-op)      # shadow: record overlapping sibling writes (off = no-op)
         try:
-            _timed("snapshot", lambda: _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0],
+            _timed("snapshot", lambda: _write_atomic(status_path, _snapshot(workers, started, len(goals), mc_box[0], admission_brake=brake_box[0],
                                                  disk_floor_gb=disk_box[0], paused=pause_box[0],
                                                  ram_floor_mb=ram_box[0], directive=directive,
                                                  run_label=run_label, goal_count=goal_count,
@@ -6043,6 +6049,7 @@ def main():
                                       max_turns=args.max_turns, poll_s=args.poll_s,
                                       notify=default_notify, on_tick=on_tick,
                                       max_concurrent=max_conc, mc_box=mc_box, add_box=add_box,
+                                      brake_box=brake_box,
                                       refuter=args.refuter,
                                       max_refute=args.max_refute, plan_mode=args.plan,
                                       max_research=args.max_research,

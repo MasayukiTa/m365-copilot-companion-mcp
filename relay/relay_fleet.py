@@ -11199,7 +11199,7 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
                     ram_box=None,
                     transcript_dir=None, run_id="", busy_writer=None,
                      pause_box=None, stop_box=None, resilience_profile="off",
-                     max_fresh_replays=0, fanout=True):
+                     max_fresh_replays=0, fanout=True, brake_box=None):
     """Drive len(goals) autonomous relays in parallel to completion, but never with
     more than `max_concurrent` tabs open at once (defaults to what free RAM allows).
     A goal's tab is opened only when a slot frees and CLOSED the moment it finishes.
@@ -12575,14 +12575,49 @@ def run_relay_fleet(context, goals, agent_url, max_turns=1000, poll_s=1.0,
         # current open count, so no in-flight goal is dropped. Both signals are read defensively;
         # a failure to read either leaves the existing cap untouched.
         try:
-            from relay.fleet_runner import _preemptive_tab_ceiling as _pre_ceiling
+            from relay.fleet_runner import (_preemptive_tab_ceiling as _pre_ceiling,
+                                             EDGE_WEDGE_RAM_FLOOR_MB)
             try:
-                from relay.edge_recover import _msedge_cmdlines as _edge_cmds
-                _msedge_n = len(_edge_cmds())
+                # COUNT ONLY THE FLEET'S OWN companion-Edge processes, not every "msedge"
+                # process on the machine. _msedge_cmdlines() matches the name substring, so it
+                # also returns msedgewebview2.exe (Windows widgets / other apps) and sibling
+                # Edge profiles/ports; on this desk that was 60 processes with only ONE the
+                # companion browser, so the ceiling clamped the fleet to its single open lane
+                # even with ample RAM. fleet_companion_proc_count keys on the same owner
+                # (profile user-data-dir + CDP port) owns_edge() already uses for a reset.
+                from relay.edge_recover import (_msedge_cmdlines as _edge_cmds,
+                                                fleet_companion_proc_count as _own_edge_n)
+                _msedge_n = _own_edge_n(_edge_cmds())
             except Exception:
                 _msedge_n = None
-            _socket_cap = min(_socket_cap, _pre_ceiling(
-                active_worker_count(workers), avail_phys_mb(), _msedge_n))
+            _free_mb_now = avail_phys_mb()
+            _ceiling = _pre_ceiling(active_worker_count(workers), _free_mb_now, _msedge_n)
+            _brake_on = _ceiling < _socket_cap
+            _socket_cap = min(_socket_cap, _ceiling)
+            # VISIBLE AND HONEST: one line per STATE CHANGE (not per sweep) and a status.json
+            # field, so "max_concurrent is 1" never has to be reverse-engineered. The brake
+            # may only LOWER the cap for as long as the pressure lasts; it never pins the
+            # operator's setting -- once pressure clears, _ceiling is a huge sentinel and the
+            # setting governs again.
+            if brake_box is not None:
+                _was_on = bool(brake_box[0] and brake_box[0].get("clamped"))
+                if _brake_on:
+                    _reason = ("free RAM %s MB <= floor" % _free_mb_now) if (
+                        _free_mb_now is not None and _free_mb_now <= EDGE_WEDGE_RAM_FLOOR_MB)                         else ("companion msedge %s >= cap" % _msedge_n)
+                    brake_box[0] = {"clamped": True, "reason": _reason,
+                                    "free_mb": _free_mb_now, "companion_msedge": _msedge_n,
+                                    "ceiling": _ceiling}
+                    if not _was_on:
+                        print("[admission-brake] CLAMP: %s; free_mb=%s companion_msedge=%s "
+                              "ceiling=%s" % (_reason, _free_mb_now, _msedge_n, _ceiling),
+                              flush=True)
+                else:
+                    brake_box[0] = {"clamped": False, "reason": "",
+                                    "free_mb": _free_mb_now, "companion_msedge": _msedge_n,
+                                    "ceiling": None}
+                    if _was_on:
+                        print("[admission-brake] RELEASE: free_mb=%s companion_msedge=%s"
+                              % (_free_mb_now, _msedge_n), flush=True)
         except Exception:
             pass
         _priority_ram_cap = socket_capacity.ram_safeguard_cap(

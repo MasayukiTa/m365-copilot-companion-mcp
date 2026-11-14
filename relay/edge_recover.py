@@ -222,6 +222,53 @@ def owns_edge(cmdline, data_dir, port):
     return bool(re.search(r'--remote-debugging-port=' + re.escape(str(port)) + r'(?:\s|"|$)', cmd))
 
 
+def fleet_companion_proc_count(cmdlines, port=9222):
+    """How many msedge processes belong to THE FLEET'S OWN companion Edge (profile+port).
+
+    This is the number the preemptive tab ceiling must weigh -- NOT ``len(_msedge_cmdlines())``.
+    _msedge_cmdlines() returns every process whose name contains "msedge", which on a real
+    machine is dominated by things the fleet does not drive and whose pressure a fleet reset
+    would not relieve:
+
+      * msedgewebview2.exe -- WebView2 hosts for Windows widgets, Copilot-in-Windows, Office,
+        and other apps. Observed 36 of them in one sample, none driven by the fleet.
+      * sibling Edge profiles -- copilot-bridge-edge (:9223), copilot-eval-edge (:9224), and
+        unrelated automation on other ports (e.g. a profile on :9231). A reset of the fleet's
+        :9222 companion does not touch these, so counting them cannot justify holding the
+        fleet back.
+
+    Counting that whole population is why the ceiling fired at a desk with 60 "msedge"
+    processes but only ONE of them the companion browser: proc_cap (40) was compared against a
+    number that has almost nothing to do with the companion Edge, and new socket goals -- which
+    hold NO browser tab at all -- were held behind a single running goal.
+
+    The owner key is the one owns_edge() already defines: the companion profile's
+    --user-data-dir AND (for the main process) its --remote-debugging-port. So this reuses
+    owns_edge() rather than re-deriving "ours", and the data_dir is built from the same
+    launcher mapping (_profile_for_port -> profile_dir) the rest of the module uses. The count
+    is the whole owned process TREE (main browser + its --type= children), which is the right
+    proxy for the companion's own process/tab pressure the ceiling was measured against.
+
+    Pure: it takes command-line strings, so it is unit-tested with synthetic cmdlines and no
+    psutil. Returns 0 (never raises) when the profile/path cannot be resolved -- the same
+    "no evidence of pressure" the ceiling treats as "impose no ceiling".
+    """
+    try:
+        data_dir = profile_dir(_profile_for_port(port))
+    except Exception:
+        return 0
+    if not data_dir:
+        return 0
+    n = 0
+    for cmd in (cmdlines or []):
+        try:
+            if owns_edge(cmd, data_dir, port):
+                n += 1
+        except Exception:
+            continue
+    return n
+
+
 def other_fleet_runs(port=9222, exclude_pid=None):
     """PIDs of OTHER fleet runs driving the same companion Edge. [] if none or unknown.
 
